@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { DurableStreamTestServer, type TestServerOptions } from '@electric-circuits/ds-rust'
-import { mtlsAccess, testPhysicalPath } from './ds-mtls-access.js'
+import { mtlsAccess, testPhysicalPath, type DsTransport } from './ds-mtls-access.js'
 import { type ApiServer, createApiServer } from '@electric-circuits/api'
 import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-circuits/client'
 import { createPgOracle, createPgTables, type Oracle } from '@electric-circuits/oracle'
@@ -207,6 +207,8 @@ export interface Harness {
 }
 
 export interface BootOptions {
+  /** Exercise the production DS client transport; defaults to the existing mTLS fixture. */
+  dsTransport?: DsTransport
   /** Test-only durable-streams persistence mode. Recovery tests use explicit WAL on every host. */
   durableStreamsDurability?: TestServerOptions['durability']
   /** TEST-ONLY: inject an engine fault (e.g. 'drop_deletes', 'off_by_one_cmp') for negative controls. */
@@ -329,7 +331,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
     server = new DurableStreamTestServer({ port: 0, durability: opts.durableStreamsDurability })
     const dsUrl = await server.start()
     engineDs = await opts.wrapEngineDs?.(dsUrl)
-    access = await mtlsAccess(engineDs?.url ?? dsUrl)
+    access = await mtlsAccess(engineDs?.url ?? dsUrl, opts.dsTransport)
     const engineDsUrl = access.url
     const tables = Object.keys(schema.tables)
     let spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, { ...(access?.env ?? {}), ...(opts.engineEnv ?? {}) })

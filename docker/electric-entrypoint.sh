@@ -60,7 +60,9 @@ export BIND_HOST="$DS_HOST"
 : "${ELECTRIC_CIRCUITS_DS_URL:=http://${DS_HOST}:${DS_PORT}}"
 export ELECTRIC_CIRCUITS_DS_URL
 # This image owns both processes and keeps the stream server on loopback. The engine's production
-# image never enables this mode and still requires the HTTPS/mTLS storage boundary.
+# image never enables this test mode. Amendment (2026-09-16): private-subnet plaintext HTTP with
+# security-group scoping and API-brokered client access is the supported production DS mode;
+# TLS/mTLS is optional.
 : "${ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST:=1}"
 export ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST
 : "${ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE:=1}"

@@ -60,7 +60,7 @@ pub struct Config {
     pub pg_url: Option<String>,
     /// Durable-streams base URL (`ELECTRIC_CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
-    /// Fully validated HTTPS/mTLS storage connection and immutable path scope.
+    /// Validated HTTP(S) storage connection with optional TLS material and immutable path scope.
     pub ds_connection: Option<DsConnectionConfig>,
     /// Loopback HTTP store selected explicitly by the self-contained conformance image.
     pub ds_in_process_test_url: Option<String>,
@@ -321,9 +321,9 @@ impl Config {
                 (
                     Some(DsConnectionConfig::new(
                         base_url,
-                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CA_BUNDLE")?),
-                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_CERT")?),
-                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_KEY")?),
+                        g("ELECTRIC_CIRCUITS_DS_CA_BUNDLE").map(std::path::PathBuf::from),
+                        g("ELECTRIC_CIRCUITS_DS_CLIENT_CERT").map(std::path::PathBuf::from),
+                        g("ELECTRIC_CIRCUITS_DS_CLIENT_KEY").map(std::path::PathBuf::from),
                         scope,
                     )?),
                     None,
@@ -817,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_streams_requires_complete_https_identity_and_scope() {
+    fn durable_streams_requires_complete_identity_and_scope() {
         let config = pilot_ds_config();
         let resolved = try_cfg(&config).expect("complete pilot configuration resolves");
         assert_eq!(resolved.ds_connection.as_ref().unwrap().scope.stack_namespace, "pilot-stack");
@@ -825,9 +825,62 @@ mod tests {
         let mut missing = config.clone();
         missing.retain(|(key, _)| *key != "ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID");
         assert!(try_cfg(&missing).is_err());
-        let mut http = pilot_ds_config();
-        http[0].1 = "http://127.0.0.1:4437";
-        assert!(try_cfg(&http).is_err());
+    }
+
+    fn ds_without_tls_material() -> Vec<(&'static str, &'static str)> {
+        pilot_ds_config()
+            .into_iter()
+            .filter(|(key, _)| {
+                !matches!(
+                    *key,
+                    "ELECTRIC_CIRCUITS_DS_CA_BUNDLE"
+                        | "ELECTRIC_CIRCUITS_DS_CLIENT_CERT"
+                        | "ELECTRIC_CIRCUITS_DS_CLIENT_KEY"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn durable_streams_http_without_certificates() {
+        let mut config = ds_without_tls_material();
+        config[0].1 = "http://durable-streams.internal:8791";
+        let resolved = try_cfg(&config).expect("private-subnet HTTP needs no TLS material");
+        assert!(resolved.ds_connection.is_some());
+        assert!(resolved.ds_in_process_test_url.is_none());
+    }
+
+    #[test]
+    fn durable_streams_https_without_certificates() {
+        let resolved = try_cfg(&ds_without_tls_material()).expect("HTTPS defaults to system roots without mTLS");
+        assert!(resolved.ds_connection.is_some());
+    }
+
+    #[test]
+    fn durable_streams_https_with_client_pair_without_custom_ca() {
+        let mut config = pilot_ds_config();
+        config.retain(|(key, _)| *key != "ELECTRIC_CIRCUITS_DS_CA_BUNDLE");
+        assert!(try_cfg(&config).expect("mTLS can use system roots").ds_connection.is_some());
+    }
+
+    #[test]
+    fn durable_streams_https_rejects_each_half_configured_client_pair() {
+        for key in ["ELECTRIC_CIRCUITS_DS_CLIENT_CERT", "ELECTRIC_CIRCUITS_DS_CLIENT_KEY"] {
+            let mut config = ds_without_tls_material();
+            config.push((key, "/missing/material.pem"));
+            let error = try_cfg(&config).expect_err("both client identity paths are required together").to_string();
+            assert!(error.contains("ELECTRIC_CIRCUITS_DS_CLIENT_CERT"), "{error}");
+            assert!(error.contains("ELECTRIC_CIRCUITS_DS_CLIENT_KEY"), "{error}");
+            assert!(error.contains("together"), "{error}");
+        }
+    }
+
+    #[test]
+    fn durable_streams_http_ignores_even_partial_tls_material() {
+        let mut config = ds_without_tls_material();
+        config[0].1 = "http://durable-streams.internal:8791";
+        config.push(("ELECTRIC_CIRCUITS_DS_CLIENT_KEY", "/missing/key.pem"));
+        assert!(try_cfg(&config).expect("HTTP ignores TLS settings").ds_connection.is_some());
     }
 
     #[test]

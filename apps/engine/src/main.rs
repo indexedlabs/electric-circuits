@@ -117,14 +117,14 @@ async fn main() -> Result<()> {
     } else {
         let Some(ds_connection) = config.ds_connection.clone() else {
             refuse_boot(
-                "configuration",
-                &anyhow::anyhow!("a complete ELECTRIC_CIRCUITS_DS_URL HTTPS/mTLS configuration is required"),
+                "Durable Streams connection/readiness configuration",
+                &anyhow::anyhow!("ELECTRIC_CIRCUITS_DS_URL and its store identity/scope configuration are required"),
             )
         };
         let store_bound = StoreBound::coupled_v1(&ds_connection.scope);
         let ds = match DsClient::connect(ds_connection).await {
             Ok(ds) => ds,
-            Err(e) => refuse_boot("Durable Streams mTLS configuration", &e),
+            Err(e) => refuse_boot("Durable Streams connection/readiness configuration", &e),
         };
         (ds, store_bound)
     };

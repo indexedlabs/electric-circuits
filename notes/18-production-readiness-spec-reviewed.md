@@ -643,9 +643,13 @@ metrics, or read row diagnostics. Audit every admin attempt.
 
 **Depends:** `OPS-001A`, `SEC-001`, `E2E-002R`. **Profiles:** all. **Boundary:** TLS/connectors.
 
-Implement gateway HTTPS, PG query-pool and walsender verify-full TLS, DS Rust client TLS, and TLS/mTLS
-or one named verified mesh for internal listeners. Test CA/hostname/validity/client identity/plaintext/
-stripping independently. No fallback to `NoTls` or plain HTTP in production.
+**Amendment (2026-09-16):** Private-subnet plaintext HTTP between the engine and Durable Streams,
+with security-group scoping and API-brokered client access, is the supported production mode;
+DS TLS/mTLS is optional. Selected profiles must record and verify that DS network/access boundary.
+Gateway HTTPS, PG query-pool and walsender verify-full TLS, and TLS/mTLS or one named verified mesh
+for other internal listeners remain required. Test CA/hostname/validity/client identity/plaintext/
+stripping for configured TLS independently; no fallback to `NoTls` or plaintext outside the explicit
+DS HTTP mode.
 
 ### SEC-006B — Secret/key reload, rotation, and revocation
 
@@ -955,9 +959,14 @@ adds the same downstream fencing token before this task may run there.
 **Boundary:** config/preflight.
 
 Use an exhaustive key/schema; unknown/no-op/malformed values are fatal. Reject memory/wrong-UUID/
-recovering DS, public/overlapping debug binds, plaintext, unlimited/broken budgets, missing spill,
+recovering DS, public/overlapping debug binds, undeclared plaintext, unlimited/broken budgets, missing spill,
 invalid retention and unsupported profile flags. Implement or reject dedicated metrics port. Emit a
 redacted effective config; demo defaults fail when labelled production.
+
+**Amendment (2026-09-16):** Attestation accepts plaintext DS when the explicit private-DS HTTP mode
+from `SEC-006A` is declared and its private subnet, security-group scoping, and API-brokered access
+are verified. DS TLS/mTLS checks apply only when selected; store identity, durability, recovery, and
+resource checks remain mandatory in either mode.
 
 ### ENG-014 — Make purge acknowledgement match retirement completion
 

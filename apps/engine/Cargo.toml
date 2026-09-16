@@ -52,9 +52,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-# Production Durable Streams traffic is authenticated HTTPS; in-process test stores are the only
-# HTTP exception and never use this transport configuration.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Durable Streams supports private HTTP and verified HTTPS with optional client authentication.
+# Native roots provide the system trust store when no explicit CA bundle is configured.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Postgres source: logical-replication slot polling (test_decoding) + backfill queries.

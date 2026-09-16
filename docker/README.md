@@ -78,10 +78,17 @@ CI publishes all three images to the GitHub Container Registry on every push to 
 tags (`.github/workflows/docker.yml`):
 
 ```bash
-docker pull ghcr.io/balegas/electric-circuits/engine:main
-docker pull ghcr.io/balegas/electric-circuits/node:main
-docker pull ghcr.io/balegas/electric-circuits/electric:main   # single fleet image
+docker pull ghcr.io/indexedlabs/electric-circuits/engine:main
+docker pull ghcr.io/indexedlabs/electric-circuits/node:main
+docker pull ghcr.io/indexedlabs/electric-circuits/electric:main   # single fleet image
 ```
+
+The workflow derives the registry path from `github.repository`. After this change merges into
+`indexedlabs/electric-circuits:main`, it publishes the engine to
+`ghcr.io/indexedlabs/electric-circuits/engine:main` and a `sha-…` tag. This replaces the Indexed
+infrastructure's current `ghcr.io/mwildehahn/electric-circuits/engine` source. Pin the resulting
+registry digest in lane `ds-infra`; a PR build does not publish a registry image. If a manual
+post-merge publish is needed, run `gh workflow run docker.yml --repo indexedlabs/electric-circuits --ref main`.
 
 ## Building images individually
 
@@ -91,9 +98,34 @@ docker build -f docker/Dockerfile.node   -t electric-circuits-node .     # API s
 docker build -f docker/Dockerfile.ds     -t electric-circuits-ds .       # durable-streams server (Rust)
 ```
 
-The engine image is a plain-HTTP binary (no TLS backend compiled in) on `debian:bookworm-slim`; the
+The engine image includes rustls and system CA certificates on `debian:bookworm-slim`; the
 node image runs the API (`docker/api-server.ts`); the ds image runs the Rust `durable-streams-server` binary
 via `tsx`.
+
+## Durable Streams transport amendment (2026-09-16)
+
+TLS is optional. Private-subnet plaintext is the supported production mode when the API brokers
+access to Durable Streams. Set `ELECTRIC_CIRCUITS_DS_URL=http://durable-streams.internal:8791`;
+this uses HTTP/1.1 and ignores all DS certificate settings without reading their files.
+
+For `https://` URLs, server verification remains mandatory:
+
+- `ELECTRIC_CIRCUITS_DS_CA_BUNDLE`: optional PEM CA bundle path. Absent or empty uses system roots;
+  present replaces system roots with this bundle.
+- `ELECTRIC_CIRCUITS_DS_CLIENT_CERT` and `ELECTRIC_CIRCUITS_DS_CLIENT_KEY`: optional PEM paths,
+  supplied together for mTLS. Both absent or empty selects server-auth TLS only; exactly one
+  nonempty value is a configuration error.
+
+The URL must be an HTTP(S) origin, without credentials, path prefix, query, or fragment.
+Store readiness, identity and namespace checks still apply. Required settings alongside the URL:
+`ELECTRIC_CIRCUITS_DS_NAMESPACE`, `ELECTRIC_CIRCUITS_DS_STORE_ID`,
+`ELECTRIC_CIRCUITS_DS_STORE_GENERATION`, `ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION`,
+`ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION`, `ELECTRIC_CIRCUITS_DS_DURABILITY_MODE`,
+`ELECTRIC_CIRCUITS_DS_WAL_SHARDS`, `ELECTRIC_CIRCUITS_DS_STREAM_LANES`,
+`ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID`, and `ELECTRIC_CIRCUITS_QUERY_GENERATION`.
+`ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1` remains an explicit first-boot opt-in.
+`ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST` retains its existing loopback-only, feature-gated behavior;
+production HTTP does not use that bypass. PostgreSQL TLS requirements are independent.
 
 ## Env knobs
 

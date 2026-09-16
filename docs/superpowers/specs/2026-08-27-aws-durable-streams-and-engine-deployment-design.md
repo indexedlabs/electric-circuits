@@ -4,6 +4,21 @@
 **Status:** architecture contract revised after independent GPT-5.6 Sol xhigh review; not production-qualified  
 **Authority:** subordinate to [`notes/18-production-readiness-spec-reviewed.md`](../../../notes/18-production-readiness-spec-reviewed.md)
 
+## Transport amendment — 2026-09-16 user decision
+
+TLS between the engine and Durable Streams is optional. **Private-subnet plaintext is the supported
+production mode**, with the API brokering client access. This supersedes mandatory engine-to-DS
+mTLS statements in decision 5, the topology, and the access-boundary sections below; mTLS remains
+available when selected. The remaining identity, namespace, readiness, durability and recovery
+contracts still apply, and this amendment is not release qualification.
+
+`ELECTRIC_CIRCUITS_DS_URL=http://…` uses HTTP/1.1 and ignores DS certificate settings.
+For `https://…`, `ELECTRIC_CIRCUITS_DS_CA_BUNDLE` is optional (system roots when unset);
+`ELECTRIC_CIRCUITS_DS_CLIENT_CERT` plus `ELECTRIC_CIRCUITS_DS_CLIENT_KEY` are optional together
+(present: mTLS; absent: server-auth TLS; half pair: startup error). See the
+[exact environment contract](../../../docker/README.md#durable-streams-transport-amendment-2026-09-16).
+PostgreSQL TLS and the explicit in-process test mode are unchanged.
+
 ## 1. Goal and profiles
 
 Define the AWS topology and lifecycle for:
