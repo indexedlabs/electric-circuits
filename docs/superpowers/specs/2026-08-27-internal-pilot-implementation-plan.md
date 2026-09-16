@@ -168,28 +168,37 @@ contract independently.
 
 ### 2.4 Access boundary
 
-The pilot access boundary is a small Rust reverse-proxy binary, `durable-streams-access`, built and
-pinned alongside the Durable Streams server. Durable Streams itself remains HTTP on
-`127.0.0.1:4437`; the proxy alone listens on private port 8443. The proxy:
+**Amendment (2026-09-16):** The supported production boundary is private-subnet HTTP to Durable
+Streams, scoped by security groups to the engine and API/broker services. Public clients and agent
+producers have no direct DS access. The authenticated API/gateway enforces service roles, method/
+prefix permissions, per-run authorization, and request budgets. Infrastructure evidence verifies
+the private listener and allowed callers. TLS/mTLS and the `DS-02` proxy are optional.
 
-- terminates TLS 1.3 and requires a client certificate issued by the environment AWS Private CA;
-- maps the certificate URI SAN to a configured service identity;
-- authorizes HTTP method plus normalized stream prefix before forwarding;
-- exposes `GET /_admin/ready` only to the storage-administrator and configured pilot Circuits-engine
-  identities, and exposes `/_admin/inventory` only to storage-administrator/retention identities;
+When TLS is selected, a small Rust reverse-proxy binary, `durable-streams-access`, is built and
+pinned alongside the server. Durable Streams then remains HTTP on `127.0.0.1:4437`; the proxy alone
+listens on private port 8443. The proxy:
+
+- terminates TLS 1.3; client certificates are required only when mTLS is selected;
+- when mTLS is selected, validates the environment CA and maps certificate URI SANs to service
+  identities, enforcing method/prefix policy before forwarding;
+- for server-auth TLS, retains security-group scoping and API-brokered authorization as in HTTP mode;
+- in mTLS mode, exposes `GET /_admin/ready` only to storage-administrator/engine identities and
+  `/_admin/inventory` only to storage-administrator/retention identities; server-auth TLS retains
+  the network/API restrictions on these routes;
 - forwards streaming reads without buffering the full body and applies explicit body/time limits;
 - emits structured authorization, queue, upstream, and trace logs to stdout/CloudWatch; and
-- enforces per-identity concurrency and append-rate limits before reaching the server.
+- enforces per-identity concurrency and append-rate limits in mTLS mode; the API enforces those
+  limits for brokered requests in HTTP and server-auth TLS modes.
 
-Certificates and private keys are delivered through Secrets Manager to the task and rotated by a
-controlled task replacement. A versioned, read-only policy file is rendered by IaC; its SHA-256 is
+When configured, certificates and private keys are delivered through Secrets Manager to the task and
+rotated by a controlled task replacement. A versioned, read-only policy file is rendered by IaC; its SHA-256 is
 logged at startup and included in deployment evidence. Policy parse failure, unknown identities,
-ambiguous prefix matches, unnormalized paths, missing client certificates, and inability to obtain
+ambiguous prefix matches, unnormalized paths, missing client certificates in mTLS mode, and inability to obtain
 storage reserve state all fail closed.
 
 Agent producers do not connect directly. The authenticated Indexed API/gateway owns run assignment
-and writes on the producer's behalf using the `agent-writer` service identity. The storage boundary
-then enforces
+and writes on the producer's behalf using the `agent-writer` service identity. The API/gateway
+(and the certificate-aware proxy when mTLS is selected) enforces
 `agent-writer -> /agent-runs/v1/<stack>/stores/<store-generation>/runs/` and the gateway enforces the
 exact assigned opaque run ID. Similarly, the client gateway resolves a public handle before using
 its read-only storage identity. This avoids inventing per-run storage credentials while preserving
@@ -236,7 +245,7 @@ treats task exit or slot release as a drain receipt.
 ```text
 EC-01 namespace + StoreBound ---------+----> EC-02 shutdown + source fence ----+
                                       |                                       |
-DS-01 manifest + lock + readiness ----+----> DS-02 access boundary ------------+--> INFRA-01
+DS-01 manifest + lock + readiness ----+----> DS-02 (TLS only) -----------------+--> INFRA-01
                                                                               |
 EC-03 in-process transaction seam --------------------------------------------+
                                                                               v
@@ -249,6 +258,10 @@ IDX-01 gateway/control contracts ---------> IDX-02 committed chat ------------> 
 
 Only `EC-01` and `DS-01` begin immediately. They operate in different repositories and freeze the
 lineage contract consumed by every later task.
+
+**Amendment (2026-09-16):** The `DS-02` node and its downstream edges apply only when TLS/mTLS is
+selected. Private HTTP proceeds from `DS-01`, `EC-01`, and `EC-02` to `INFRA-01` without that node;
+`IDX-01` requires `DS-01` and `EC-01`, adding `DS-02` only for TLS/mTLS.
 
 ## 4. Concrete tasks
 
@@ -349,17 +362,21 @@ Acceptance:
 Verify with `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, and the
 existing WAL simulation/recovery suites.
 
-### DS-02 — Build and qualify the mTLS access boundary
+### DS-02 — Build and qualify the optional TLS/mTLS access boundary
 
 **Depends on:** `DS-01`  
+**Applicability (2026-09-16):** Only deployments selecting TLS/mTLS; not required for private HTTP.
+
 **Repository:** `durable-streams-rust`  
 **Owns:** a new `durable-streams-access` binary/library, policy schema, container packaging, and proxy
 integration tests. It does not change WAL/storage semantics.
 
-Implement the contract in section 2.4, including method/prefix policy, URI normalization, certificate
-identity, streaming proxy behavior, trace propagation, timeouts, admin isolation, and the fixed
-capacity profile. Test every service identity against every verb and own/foreign prefix. Add overload,
-slow-reader, lost-upstream-response, certificate rotation, and agent-budget isolation tests.
+Implement the selected TLS contract in section 2.4, including streaming proxy behavior, trace
+propagation, timeouts, admin isolation, and the fixed capacity profile. For mTLS, also implement
+certificate identity, method/prefix policy, and URI normalization; test each identity against every
+verb and own/foreign prefix. Test overload, slow readers, lost upstream responses, rotation of
+configured certificates, and agent-budget isolation. Private HTTP qualifies its network and API
+access controls through `INFRA-01` and `IDX-01` instead.
 
 ### EC-02 — Make pilot handoff observable and fail closed
 
@@ -392,7 +409,8 @@ binary, a durable input consumer, N/N-1 negotiation, or an independent deploymen
 
 ### INFRA-01 — Provision persistent storage and controlled deployments
 
-**Depends on:** `DS-01`, `DS-02`, `EC-01`, `EC-02`  
+**Depends on:** `DS-01`, `EC-01`, `EC-02`; additionally `DS-02` only when TLS/mTLS is selected (2026-09-16).
+
 **Repository:** `indexed`  
 **Owns:** Pulumi components, AMI/user-data mount gate, ECS task/service definitions, service discovery,
 IAM/KMS/Private CA/Secrets Manager/SSM policy, alarms, and the deployment controller.
@@ -406,24 +424,29 @@ Deliver:
   data directory;
 - explicit bootstrap runbook/automation guarded by a per-stack one-shot authorization that defaults
   off, is scoped to the exact volume/store/generation tuple, and is off before ECS registration;
-- singleton Durable Streams service with the server and access-boundary containers;
+- singleton Durable Streams service with the server; add the access-boundary container only for TLS/mTLS;
 - a server task command that supplies `--store-id`, `--store-generation`, `--protocol-version`,
   `--layout-version`, `--filesystem-uuid`, and `--artifact-digest` on every ordinary start;
 - engine service using stop-confirm-start, source-fence polling, and rollback to the incumbent provider;
-- security groups exposing only the proxy, plus exact service identities and prefix policy;
-- the proxy HTTPS endpoint, CA bundle, and engine client-certificate/key mounts rendered into the
-  engine task, with startup refusal for missing or unreadable TLS material;
+- security groups allowing only the engine and API/broker services to reach the private DS endpoint,
+  with service roles and prefix policy enforced by the API (and by the proxy when mTLS is selected);
+- the private HTTP DS origin rendered into the engine task, with no TLS mounts required. When HTTPS
+  is selected, render the proxy origin and optional CA bundle (system roots when absent); mount an
+  optional client certificate/key pair together for mTLS. Refuse half pairs or unreadable configured
+  material; HTTP ignores TLS paths (2026-09-16);
 - alarms for free bytes/inodes, lock/readiness, WAL recovery, request budgets, latency, and task/host
   replacement; and
 - dev first, then production-account deployment with both product flags default-off.
 
 Infrastructure tests must prove a task revision retains the volume, a second task cannot become ready,
 a root-volume fallback cannot register, and host replacement reattaches the exact volume only after
-former-host fencing.
+former-host fencing. Access tests prove that public clients cannot reach DS and only the declared
+engine/API security groups can reach its selected private listener; API authorization remains required.
 
 ### IDX-01 — Add gateway, handle, and agent-run control contracts
 
-**Depends on:** `DS-02`, `EC-01`  
+**Depends on:** `DS-01`, `EC-01`; additionally `DS-02` only when TLS/mTLS is selected (2026-09-16).
+
 **Repository:** `indexed`  
 **Owns:** authenticated server-side Circuits handles, agent-run registry/leases, provider feature flags,
 and DS client configuration.
@@ -512,9 +535,10 @@ Start only:
 1. `EC-01` in `electric-circuits`; and
 2. `DS-01` in `durable-streams-rust`.
 
-Review their shared JSON identity contract before either merges. Then start `DS-02`, `EC-02`, and
-`EC-03` in parallel. Infrastructure and product work begin only after `DS-02` and `EC-02` make their
-storage, access, and handoff contracts executable. `EC-03` gates only future code that consumes the
+Review their shared JSON identity contract before either merges. Then start `EC-02` and `EC-03`,
+adding `DS-02` only when TLS/mTLS is selected (2026-09-16). Infrastructure and product work follow
+their dependencies above; private HTTP has no `DS-02` gate. Storage and handoff contracts must be
+executable, and `INFRA-01`/`IDX-01` qualify network/API access controls. `EC-03` gates only code consuming the
 in-process transaction seam. This prevents Pulumi, gateway, and iOS code from hard-coding guessed
 storage or path behavior.
 

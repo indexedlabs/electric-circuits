@@ -959,9 +959,14 @@ adds the same downstream fencing token before this task may run there.
 **Boundary:** config/preflight.
 
 Use an exhaustive key/schema; unknown/no-op/malformed values are fatal. Reject memory/wrong-UUID/
-recovering DS, public/overlapping debug binds, plaintext, unlimited/broken budgets, missing spill,
+recovering DS, public/overlapping debug binds, undeclared plaintext, unlimited/broken budgets, missing spill,
 invalid retention and unsupported profile flags. Implement or reject dedicated metrics port. Emit a
 redacted effective config; demo defaults fail when labelled production.
+
+**Amendment (2026-09-16):** Attestation accepts plaintext DS when the explicit private-DS HTTP mode
+from `SEC-006A` is declared and its private subnet, security-group scoping, and API-brokered access
+are verified. DS TLS/mTLS checks apply only when selected; store identity, durability, recovery, and
+resource checks remain mandatory in either mode.
 
 ### ENG-014 — Make purge acknowledgement match retirement completion
 
