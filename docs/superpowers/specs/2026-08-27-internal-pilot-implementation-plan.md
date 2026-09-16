@@ -266,13 +266,14 @@ Implement:
   parsed from the independent per-environment deployment configuration;
 - a `StreamScope` value that maps validated logical paths to the physical pilot prefix exactly once;
 - treat the engine's existing `stream_url`/`streamUrl` response as an internal compatibility surface,
-  not a pilot client contract: it may identify the private mTLS endpoint during EC-01, but no iOS or
+  not a pilot client contract: it may identify the private DS endpoint during EC-01, but no iOS or
   web client may receive or use it; `IDX-01` replaces it at the product boundary with an authenticated
   opaque gateway handle before either product flag can be enabled;
-- Durable Streams HTTP-client configuration from explicit CA-bundle and client-certificate/key
-  paths; pilot configuration requires an HTTPS storage URL, server verification, and client
-  authentication, while plain HTTP exists only through explicit in-process test stores and never an
-  environment fallback;
+- **Amendment (2026-09-16):** Private-subnet plaintext HTTP to Durable Streams, with security-group
+  scoping and API-brokered client access, is the supported production mode. TLS/mTLS is optional:
+  HTTPS verifies the server using an optional CA bundle (system roots when absent), with an optional
+  client certificate/key pair configured together. HTTP ignores TLS paths; the explicit in-process
+  test-store mode remains separate;
 - `StoreReadinessV1` decoding and full expected/observed identity comparison: perform
   `GET /_admin/ready` as the first network operation after configuration validation and before
   constructing or starting PostgreSQL setup; a non-`ready`, malformed, unauthorized, or mismatched
