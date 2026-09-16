@@ -54,7 +54,7 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 # Durable Streams supports private HTTP and verified HTTPS with optional client authentication.
 # Native roots provide the system trust store when no explicit CA bundle is configured.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Postgres source: logical-replication slot polling (test_decoding) + backfill queries.
