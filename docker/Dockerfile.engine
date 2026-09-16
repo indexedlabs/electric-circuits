@@ -5,7 +5,7 @@
 # Build context is the repo root:
 #   docker build -f docker/Dockerfile.engine -t electric-circuits-engine .
 #
-# The engine speaks HTTPS with mTLS to the durable-streams access boundary. PostgreSQL query and
+# The engine supports private HTTP or verified HTTPS with optional mTLS to Durable Streams. PostgreSQL query and
 # logical-replication connections use rustls with an explicit CA bundle; no OpenSSL runtime is
 # required.
 
@@ -21,6 +21,7 @@ COPY apps/engine apps/engine
 RUN cargo build --release --locked -p electric-circuits-engine
 
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /repo/target/release/electric-circuits-engine /usr/local/bin/electric-circuits-engine
 COPY docker/aws-rds-us-east-1-bundle.pem /etc/ssl/certs/aws-rds-us-east-1-bundle.pem
 

@@ -60,7 +60,7 @@ pub struct Config {
     pub pg_url: Option<String>,
     /// Durable-streams base URL (`ELECTRIC_CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
-    /// Fully validated HTTPS/mTLS storage connection and immutable path scope.
+    /// Validated HTTP(S) storage connection with optional TLS material and immutable path scope.
     pub ds_connection: Option<DsConnectionConfig>,
     /// Loopback HTTP store selected explicitly by the self-contained conformance image.
     pub ds_in_process_test_url: Option<String>,
@@ -321,9 +321,9 @@ impl Config {
                 (
                     Some(DsConnectionConfig::new(
                         base_url,
-                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CA_BUNDLE")?),
-                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_CERT")?),
-                        std::path::PathBuf::from(required("ELECTRIC_CIRCUITS_DS_CLIENT_KEY")?),
+                        g("ELECTRIC_CIRCUITS_DS_CA_BUNDLE").map(std::path::PathBuf::from),
+                        g("ELECTRIC_CIRCUITS_DS_CLIENT_CERT").map(std::path::PathBuf::from),
+                        g("ELECTRIC_CIRCUITS_DS_CLIENT_KEY").map(std::path::PathBuf::from),
                         scope,
                     )?),
                     None,

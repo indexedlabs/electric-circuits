@@ -15,27 +15,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::store_identity::{StoreIdentityV1, StreamScope};
 
-/// HTTPS and mTLS material for the production Durable Streams access boundary.
+/// Scoped Durable Streams connection with optional TLS material.
+/// HTTP ignores all certificate paths. HTTPS uses system roots unless a CA bundle is supplied,
+/// and sends a client identity only when both certificate and key paths are supplied.
 #[derive(Clone, Debug)]
 pub struct DsConnectionConfig {
     pub base_url: String,
-    pub ca_bundle_path: PathBuf,
-    pub client_certificate_path: PathBuf,
-    pub client_key_path: PathBuf,
+    pub ca_bundle_path: Option<PathBuf>,
+    pub client_certificate_path: Option<PathBuf>,
+    pub client_key_path: Option<PathBuf>,
     pub scope: StreamScope,
 }
 
 impl DsConnectionConfig {
     pub fn new(
         base_url: String,
-        ca_bundle_path: PathBuf,
-        client_certificate_path: PathBuf,
-        client_key_path: PathBuf,
+        ca_bundle_path: Option<PathBuf>,
+        client_certificate_path: Option<PathBuf>,
+        client_key_path: Option<PathBuf>,
         scope: StreamScope,
     ) -> Result<Self> {
         let url = url::Url::parse(&base_url).context("ELECTRIC_CIRCUITS_DS_URL must be an absolute URL")?;
-        if url.scheme() != "https" {
-            bail!("ELECTRIC_CIRCUITS_DS_URL must use https; HTTP is reserved for explicit in-process test stores");
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("ELECTRIC_CIRCUITS_DS_URL must use http or https");
         }
         if url.host_str().is_none()
             || !url.username().is_empty()
@@ -43,11 +45,19 @@ impl DsConnectionConfig {
             || url.query().is_some()
             || url.fragment().is_some()
         {
-            bail!("ELECTRIC_CIRCUITS_DS_URL must be an HTTPS origin without credentials, query, or fragment");
+            bail!("ELECTRIC_CIRCUITS_DS_URL must be an HTTP(S) origin without credentials, query, or fragment");
         }
         if url.path() != "/" && !url.path().is_empty() {
             bail!("ELECTRIC_CIRCUITS_DS_URL must not contain a path prefix");
         }
+        let (ca_bundle_path, client_certificate_path, client_key_path) = if url.scheme() == "http" {
+            (None, None, None)
+        } else {
+            if client_certificate_path.is_some() != client_key_path.is_some() {
+                bail!("ELECTRIC_CIRCUITS_DS_CLIENT_CERT and ELECTRIC_CIRCUITS_DS_CLIENT_KEY must be set together");
+            }
+            (ca_bundle_path, client_certificate_path, client_key_path)
+        };
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             ca_bundle_path,
@@ -679,36 +689,72 @@ struct HttpDurableStreamsStore {
 
 impl HttpDurableStreamsStore {
     fn new(config: &DsConnectionConfig) -> Result<Self> {
-        let ca = fs::read(&config.ca_bundle_path)
-            .with_context(|| format!("reading Durable Streams CA bundle {}", config.ca_bundle_path.display()))?;
-        let certificate = fs::read(&config.client_certificate_path).with_context(|| {
-            format!("reading Durable Streams client certificate {}", config.client_certificate_path.display())
-        })?;
-        let key = fs::read(&config.client_key_path)
-            .with_context(|| format!("reading Durable Streams client key {}", config.client_key_path.display()))?;
-        let ca = reqwest::Certificate::from_pem(&ca).context("parsing Durable Streams CA bundle")?;
-        let mut identity_pem = certificate;
-        if !identity_pem.ends_with(b"\n") {
-            identity_pem.push(b'\n');
-        }
-        identity_pem.extend(key);
-        let identity =
-            reqwest::Identity::from_pem(&identity_pem).context("parsing Durable Streams client certificate/key")?;
+        let tls = url::Url::parse(&config.base_url)?.scheme() == "https";
+        // HTTP never reads TLS files, even when a caller supplies stale paths directly.
+        let ca = if tls {
+            config
+                .ca_bundle_path
+                .as_ref()
+                .map(|path| -> Result<Vec<reqwest::Certificate>> {
+                    let pem = fs::read(path)
+                        .with_context(|| format!("reading Durable Streams CA bundle {}", path.display()))?;
+                    let certificates =
+                        reqwest::Certificate::from_pem_bundle(&pem).context("parsing Durable Streams CA bundle")?;
+                    if certificates.is_empty() {
+                        bail!("Durable Streams CA bundle contains no certificates");
+                    }
+                    Ok(certificates)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let identity = if tls {
+            match (&config.client_certificate_path, &config.client_key_path) {
+                (Some(certificate_path), Some(key_path)) => {
+                    let mut pem = fs::read(certificate_path).with_context(|| {
+                        format!("reading Durable Streams client certificate {}", certificate_path.display())
+                    })?;
+                    let key = fs::read(key_path)
+                        .with_context(|| format!("reading Durable Streams client key {}", key_path.display()))?;
+                    if !pem.ends_with(b"\n") {
+                        pem.push(b'\n');
+                    }
+                    pem.extend(key);
+                    Some(reqwest::Identity::from_pem(&pem).context("parsing Durable Streams client certificate/key")?)
+                }
+                (None, None) => None,
+                _ => bail!("ELECTRIC_CIRCUITS_DS_CLIENT_CERT and ELECTRIC_CIRCUITS_DS_CLIENT_KEY must be set together"),
+            }
+        } else {
+            None
+        };
         let timeouts = DsTimeouts::from_env();
-        let mtls = |read: std::time::Duration, request: std::time::Duration| {
-            reqwest::Client::builder()
-                .https_only(true)
+        let client = |read: std::time::Duration, request: std::time::Duration| {
+            let mut builder = reqwest::Client::builder()
+                .https_only(tls)
+                // Disable feature-unified bundled roots; only the selected trust source is used.
                 .tls_built_in_root_certs(false)
-                .add_root_certificate(ca.clone())
-                .identity(identity.clone())
+                .tls_built_in_native_certs(tls && ca.is_none())
                 .connect_timeout(timeouts.connect)
                 .read_timeout(read)
-                .timeout(request)
-                .build()
+                .timeout(request);
+            if !tls {
+                builder = builder.http1_only();
+            }
+            if let Some(certificates) = &ca {
+                for certificate in certificates {
+                    builder = builder.add_root_certificate(certificate.clone());
+                }
+            }
+            if let Some(identity) = &identity {
+                builder = builder.identity(identity.clone());
+            }
+            builder.build()
         };
-        let http = mtls(timeouts.read, timeouts.request).context("building Durable Streams mTLS client")?;
-        let live_http = mtls(timeouts.live_read, timeouts.live_request())
-            .context("building Durable Streams mTLS long-poll client")?;
+        let http = client(timeouts.read, timeouts.request).context("building Durable Streams HTTP client")?;
+        let live_http =
+            client(timeouts.live_read, timeouts.live_request()).context("building Durable Streams long-poll client")?;
         Ok(Self { base: config.base_url.clone(), http, live_http })
     }
 
@@ -862,8 +908,8 @@ pub struct DsClient {
 }
 
 impl DsClient {
-    /// Construct the production client. HTTPS, server verification, and a client certificate are
-    /// required; production code has no unscoped or HTTP fallback.
+    /// Construct the scoped production client over HTTP or verified HTTPS, optionally with mTLS.
+    /// Store readiness and identity verification are required for every transport.
     pub async fn connect(config: DsConnectionConfig) -> Result<Self> {
         let expected = config.scope.store.clone();
         let store = Arc::new(HttpDurableStreamsStore::new(&config)?);
@@ -887,8 +933,7 @@ impl DsClient {
     }
 
     /// An HTTP test double requires an explicit in-process test scope. This constructor is absent
-    /// from non-test builds so a deployment cannot accidentally use HTTP because an environment
-    /// happened to point at localhost.
+    /// from non-test builds so deployments cannot bypass store identity checks.
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_for_in_process_test(base: impl Into<String>) -> Self {
