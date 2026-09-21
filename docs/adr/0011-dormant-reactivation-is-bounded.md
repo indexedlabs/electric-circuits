@@ -54,10 +54,14 @@ settles.
 
 Replay memory is bounded by the response cap, parsed page, and scheduler permits rather than log
 size or shape count. The response cap is sized from the store's own readiness, not from a fixed
-number: a store that advertises a page gets 16 MiB (four of its pages, so the cap is never reached),
+number: a store that advertises a page gets 16 MiB (four of its pages, so a page never reaches it),
 and a store that advertises none gets 64 MiB, because it answers a read with the whole remainder of
 the stream and a cap below the backlog does not bound memory — the sequencer retries the identical
-read and it fails identically forever, so no data flows at all. A deployment that wants the tighter
+read and it fails identically forever, so no data flows at all. Neither derived cap is ever below
+the engine's own append budget (`ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`, 64 MiB): a JSON page cuts
+only on a value boundary, so the store frames one append whole on read, and an engine whose cap
+could not hold its own largest append would latch on its own change log and cycle under the health
+check on every restart. An explicit cap below the budget is refused at boot for the same reason. A deployment that wants the tighter
 bound guaranteed sets `ELECTRIC_CIRCUITS_REQUIRE_DS_CHUNK_CAP=1` and runs a store that pages. The
 verdict is not boot-only state: the sequencer re-attests readiness on the first failed read of a
 streak — the only reconnect signal the HTTP client offers — so a store upgraded to page, or rolled
@@ -66,17 +70,22 @@ live read nevertheless exceeds its cap, the sequencer records a typed cap failur
 `sequencer_read_cap_failures_total`; what happens next depends on what the store advertised, because
 the same symptom means two different things.
 
-Against a store that advertises a page and then answers with more than it promised, the store is
-broken in a way a bigger buffer does not fix: the engine logs an error, latches the
+A page is a target, not a bound. The store cuts a JSON page only on a value boundary, so a single
+value larger than the page is framed whole, and readiness advertises the largest value the store
+accepts (`max_value_bytes`) beside the page for exactly that reason. Against a store that advertised
+a page AND a value bound the cap already covered, and then answered with more than either, the store
+is broken in a way a bigger buffer does not fix: the engine logs an error, latches the
 `degraded`/not-ready status and halts further reads until a restart, rather than retrying a page
 that can never fit or hiding the regression behind a larger cap. An operator-named
 `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` latches for the same reason — that number is a decision, not a
 guess the engine may overrule.
 
-Against a store that advertises no page — which is every released durable-streams build today — an
-oversized read is not a fault at all. Such a store answers a read with the whole remainder of the
-stream, so a backlog larger than the client's guess is an ordinary operational state, and halting
-there costs more than the memory it saves: the fleet health check replaces the task, the restart
+Against a store that advertises no page — or a page beside a value bound the cap does not cover,
+which is the deployed durable-streams build (a 4 MiB page target beside a 1 GiB value bound) — an
+oversized read is not a fault at all. The uncapped store answers a read with the whole remainder of
+the stream, and the paged one is entitled to one value larger than its page, so a read larger than
+the client's guess is an ordinary operational state, and halting there costs more than the memory
+it saves: the fleet health check replaces the task, the restart
 reads from the same checkpoint, fails identically, and the task cycles until someone intervenes,
 where the pre-cap engine read the page whole and made progress. So the cap is doubled (WARN,
 `sequencer_read_cap_raised`) and the read retried, up to

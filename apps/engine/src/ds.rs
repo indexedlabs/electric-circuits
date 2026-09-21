@@ -409,9 +409,23 @@ pub(crate) enum BodyRead {
     Always,
 }
 
-/// The cap against a store that advertises a page: four of the 4 MiB pages the server serves, so it
-/// is pure defense in depth and is never reached in normal operation.
+/// The cap against a store that advertises a page: four of the 4 MiB pages the server serves, so a
+/// page never reaches it. It is a starting point, not the cap in force: a JSON page cuts only on a
+/// value boundary, so one value larger than the page is framed whole, and the cap this process
+/// installs is never below its own append budget ([`ds_read_cap_floor`]).
 const DEFAULT_DS_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The floor under every derived cap: the largest single message this engine appends
+/// (`ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`, one POST body). The store frames a value that large
+/// whole on read, so a cap below it would refuse a page this engine's own writes are entitled to
+/// produce — and an engine that latched on its own change log would cycle under the health check
+/// forever, re-reading the same value from the same checkpoint. An explicit
+/// `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` below this floor is refused at boot (`config.rs`).
+pub(crate) fn ds_read_cap_floor() -> u64 {
+    crate::txn_buffer::TxnBufferConfig::from_env()
+        .map(|cfg| cfg.append_bytes)
+        .unwrap_or_else(|_| crate::txn_buffer::TxnBufferConfig::default().append_bytes)
+}
 
 /// The cap against a store that advertises NO page. Such a store answers a read with the whole
 /// remainder of the stream, so the client cap is the only thing between a large backlog and a
@@ -548,15 +562,18 @@ fn ds_read_max_ceiling_bytes() -> u64 {
         .unwrap_or(DEFAULT_DS_READ_MAX_CEILING_BYTES)
 }
 
-/// Whether the store this process attested advertises a page size. It decides what an oversized
-/// read MEANS: against a store that promised a page it is the store breaking its promise, and
-/// against one that promised nothing it is an ordinary backlog the client guessed too small for.
+/// Whether the store this process attested advertises a page size. Together with the value bound it
+/// advertises beside it ([`ADVERTISED_MAX_VALUE_BYTES`]) it decides what an oversized read MEANS:
+/// a store that promised a page AND a value bound the cap already covers has broken its promise,
+/// while one that promised no page, or a value bound above the cap, has answered with a large
+/// value the protocol entitles it to frame whole.
 static STORE_ADVERTISES_PAGE_CAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What to do about a read that exceeded the body cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CapBreachOutcome {
-    /// Retry with this larger cap. Only an uncapped store, below the hard ceiling, with no operator-named cap.
+    /// Retry with this larger cap: below the hard ceiling, with no operator-named cap, against a
+    /// store that either advertises no page or advertises a value bound the cap does not cover.
     Raise { limit: u64 },
     /// Stop reading and withdraw readiness: nothing about a retry can make this read fit.
     Latch,
@@ -566,19 +583,23 @@ pub(crate) enum CapBreachOutcome {
 /// be exercised as the decision table it is.
 pub(crate) fn cap_after_breach(
     advertises_page: bool,
+    advertised_max_value: Option<u64>,
     configured: Option<u64>,
     current: u64,
     ceiling: u64,
 ) -> CapBreachOutcome {
-    // A store that advertises a page and then answers with more than it advertised is broken in a
-    // way a bigger buffer does not fix, and hiding it behind a raised cap would lose the only
-    // signal that says so.
-    if advertises_page {
-        return CapBreachOutcome::Latch;
-    }
     // An operator who named a cap has decided what this process may buffer. Raising it silently
     // would be the engine overruling that decision on its own.
     if configured.is_some() {
+        return CapBreachOutcome::Latch;
+    }
+    // A page is a target, not a bound: a JSON page cuts only on a value boundary, so a store that
+    // advertises a page is still entitled to answer with one value larger than it, up to the value
+    // bound it advertises beside the page. Only a store that promised a value bound the cap already
+    // covers, and then exceeded it, is broken in a way a bigger buffer does not fix — hiding that
+    // behind a raised cap would lose the only signal that says so. A store that names no value
+    // bound, or an unbounded one (`0`), has made no such promise.
+    if advertises_page && advertised_max_value.is_some_and(|bound| bound > 0 && bound <= current) {
         return CapBreachOutcome::Latch;
     }
     let raised = current.saturating_mul(2).min(ceiling);
@@ -590,6 +611,7 @@ pub(crate) fn cap_after_breach(
 pub(crate) fn raise_read_cap_after_breach() -> CapBreachOutcome {
     let outcome = cap_after_breach(
         STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
+        advertised_max_value_bytes(),
         configured_ds_read_max_bytes(),
         ds_read_max_bytes(),
         ds_read_max_ceiling_bytes(),
@@ -614,18 +636,35 @@ fn configured_ds_read_max_bytes() -> Option<u64> {
 
 pub(crate) fn ds_read_max_bytes() -> u64 {
     match EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => configured_ds_read_max_bytes().unwrap_or(DEFAULT_DS_READ_MAX_BYTES),
+        0 => configured_ds_read_max_bytes().unwrap_or_else(|| DEFAULT_DS_READ_MAX_BYTES.max(ds_read_cap_floor())),
         installed => installed,
     }
 }
 
+/// The largest single message the attested store said it accepts (`max_value_bytes`), or `None`
+/// when it advertised none or an unbounded `0`. The store is entitled to frame a value that large
+/// whole on read, whatever page it advertises beside it.
+fn advertised_max_value_bytes() -> Option<u64> {
+    match ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        value => Some(value),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn store_advertises_page_cap() -> bool {
+    STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// An explicit `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` is always obeyed: an operator who names a cap
-/// has decided what this process may buffer, including against an uncapped store.
-pub(crate) fn effective_read_max_bytes(verdict: PageCapVerdict, configured: Option<u64>) -> u64 {
+/// has decided what this process may buffer, including against an uncapped store. A derived cap is
+/// never below `floor`, the engine's own append budget: the store frames a value the engine wrote
+/// whole, so the engine must be able to read back anything it is allowed to write.
+pub(crate) fn effective_read_max_bytes(verdict: PageCapVerdict, configured: Option<u64>, floor: u64) -> u64 {
     match (configured, verdict) {
         (Some(explicit), _) => explicit,
-        (None, PageCapVerdict::Compatible { .. }) => DEFAULT_DS_READ_MAX_BYTES,
-        (None, PageCapVerdict::Unknown | PageCapVerdict::Exceeds { .. }) => UNCAPPED_STORE_READ_MAX_BYTES,
+        (None, PageCapVerdict::Compatible { .. }) => DEFAULT_DS_READ_MAX_BYTES.max(floor),
+        (None, PageCapVerdict::Unknown | PageCapVerdict::Exceeds { .. }) => UNCAPPED_STORE_READ_MAX_BYTES.max(floor),
     }
 }
 
@@ -1018,12 +1057,23 @@ impl DsClient {
     pub(crate) async fn refresh_readiness(&self, expected: &StoreIdentityV1) -> Result<PageCapVerdict> {
         let readiness = self.preflight_readiness(expected).await?;
         let configured = configured_ds_read_max_bytes();
-        let verdict = assess_page_cap(&readiness, configured.unwrap_or(DEFAULT_DS_READ_MAX_BYTES));
-        EFFECTIVE_READ_MAX_BYTES
-            .store(effective_read_max_bytes(verdict, configured), std::sync::atomic::Ordering::Relaxed);
+        let floor = ds_read_cap_floor();
+        let verdict = assess_page_cap(&readiness, configured.unwrap_or_else(|| DEFAULT_DS_READ_MAX_BYTES.max(floor)));
+        let cap = effective_read_max_bytes(verdict, configured, floor);
+        EFFECTIVE_READ_MAX_BYTES.store(cap, std::sync::atomic::Ordering::Relaxed);
         ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         STORE_ADVERTISES_PAGE_CAP
             .store(matches!(verdict, PageCapVerdict::Compatible { .. }), std::sync::atomic::Ordering::Relaxed);
+        // The cap in force is the number an operator needs when a read fails on size, so it is
+        // stated at every attestation rather than left to be inferred from the defaults.
+        tracing::info!(
+            cap,
+            floor,
+            explicit = configured.is_some(),
+            ?verdict,
+            max_value_bytes = readiness.max_value_bytes,
+            "durable-streams read cap in force"
+        );
         if let Some(advisory) = enforce_page_cap(verdict, ds_read_max_bytes(), require_ds_chunk_cap())? {
             warn_page_cap_once(&advisory);
         }
@@ -1810,16 +1860,18 @@ mod tests {
     }
 
     #[test]
-    fn read_body_cap_defaults_to_16_mib() {
-        // The default is a property of the sizing rule, not of whatever another test last attested.
+    fn read_body_cap_defaults_to_the_append_budget() {
+        // The default is a property of the sizing rule, not of whatever another test last attested:
+        // four pages, lifted to the append budget so the engine can read back what it writes.
+        let floor = ds_read_cap_floor();
         assert_eq!(
-            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None),
-            16 * 1024 * 1024
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None, floor),
+            (16 * 1024 * 1024).max(floor)
         );
         // And with nothing installed, that is what the read path uses.
         let _guard = read_cap_test_guard();
         EFFECTIVE_READ_MAX_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(ds_read_max_bytes(), 16 * 1024 * 1024);
+        assert_eq!(ds_read_max_bytes(), (16 * 1024 * 1024).max(floor));
     }
 
     #[derive(Default)]
@@ -2263,30 +2315,63 @@ mod tests {
     /// The decision table behind a body-cap breach, in one place: raise only where a bigger buffer
     /// is what the situation actually calls for.
     #[test]
-    fn a_cap_breach_raises_only_against_an_uncapped_store_below_the_ceiling() {
+    fn a_cap_breach_raises_unless_an_operator_named_the_cap_or_the_store_broke_its_value_bound() {
         let ceiling = 512 * 1024 * 1024;
+        let gib = 1024 * 1024 * 1024;
         assert_eq!(
-            cap_after_breach(false, None, 64 * 1024 * 1024, ceiling),
+            cap_after_breach(false, None, None, 64 * 1024 * 1024, ceiling),
             CapBreachOutcome::Raise { limit: 128 * 1024 * 1024 },
             "an uncapped store's backlog is not a fault; make progress on it"
         );
         assert_eq!(
-            cap_after_breach(true, None, 16 * 1024 * 1024, ceiling),
-            CapBreachOutcome::Latch,
-            "a store that broke a page it advertised must stay visible, not be papered over"
+            cap_after_breach(true, Some(gib), None, 64 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: 128 * 1024 * 1024 },
+            "the deployed store: a 4 MiB page target beside a 1 GiB value bound. A value larger than the \
+             page is framed whole by the protocol, so the read is a large value, not a broken store"
         );
         assert_eq!(
-            cap_after_breach(false, Some(16 * 1024 * 1024), 16 * 1024 * 1024, ceiling),
+            cap_after_breach(true, None, None, 64 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: 128 * 1024 * 1024 },
+            "a store that advertises a page but no value bound has promised nothing about value size"
+        );
+        assert_eq!(
+            cap_after_breach(true, Some(0), None, 64 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Raise { limit: 128 * 1024 * 1024 },
+            "a value bound of 0 is unbounded, which is the same absence of a promise"
+        );
+        assert_eq!(
+            cap_after_breach(true, Some(8 * 1024 * 1024), None, 16 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "a store whose advertised value bound the cap already covers, and that still answered with \
+             more, broke its contract; that must stay visible, not be papered over"
+        );
+        assert_eq!(
+            cap_after_breach(true, Some(16 * 1024 * 1024), None, 16 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "a value bound exactly at the cap is covered by it"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, Some(16 * 1024 * 1024), 16 * 1024 * 1024, ceiling),
             CapBreachOutcome::Latch,
             "an operator who named a cap decided what this process may buffer"
         );
         assert_eq!(
-            cap_after_breach(false, None, ceiling, ceiling),
+            cap_after_breach(true, Some(gib), Some(64 * 1024 * 1024), 64 * 1024 * 1024, ceiling),
+            CapBreachOutcome::Latch,
+            "and that decision holds against a store whose value bound exceeds it"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, None, ceiling, ceiling),
             CapBreachOutcome::Latch,
             "past the hard ceiling a single read really is unserviceable"
         );
         assert_eq!(
-            cap_after_breach(false, None, 400 * 1024 * 1024, ceiling),
+            cap_after_breach(true, Some(gib), None, ceiling, ceiling),
+            CapBreachOutcome::Latch,
+            "the ceiling binds a large value against a paged store exactly as it binds a backlog"
+        );
+        assert_eq!(
+            cap_after_breach(false, None, None, 400 * 1024 * 1024, ceiling),
             CapBreachOutcome::Raise { limit: ceiling },
             "the last raise stops at the ceiling rather than overshooting it"
         );
@@ -2323,9 +2408,10 @@ mod tests {
             client.refresh_readiness(&identity).await.unwrap(),
             PageCapVerdict::Compatible { observed: 4194304 }
         );
+        // A page above the floored default (64 MiB, the append budget), so the verdict flips.
         *store.readiness_body.lock().unwrap() =
-            Some(readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":33554432,\"reserve\":{"));
-        assert_eq!(client.refresh_readiness(&identity).await.unwrap(), PageCapVerdict::Exceeds { observed: 33554432 });
+            Some(readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":134217728,\"reserve\":{"));
+        assert_eq!(client.refresh_readiness(&identity).await.unwrap(), PageCapVerdict::Exceeds { observed: 134217728 });
     }
 
     #[tokio::test]
@@ -2448,18 +2534,20 @@ mod tests {
     /// not for a number.
     #[test]
     fn an_uncapped_store_raises_the_read_ceiling_unless_an_operator_named_one() {
+        // A floor below every default, so the verdicts are what these assertions see.
+        let small_floor = 4 * 1024 * 1024;
         assert_eq!(
-            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None),
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None, small_floor),
             16 * 1024 * 1024,
             "a store that pages needs only defense in depth"
         );
         assert_eq!(
-            effective_read_max_bytes(PageCapVerdict::Unknown, None),
+            effective_read_max_bytes(PageCapVerdict::Unknown, None, small_floor),
             64 * 1024 * 1024,
             "a store that does not page must not be able to stall the live loop at 16 MiB"
         );
         assert_eq!(
-            effective_read_max_bytes(PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }, None),
+            effective_read_max_bytes(PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 }, None, small_floor),
             64 * 1024 * 1024,
             "a store whose page exceeds the client cap is the same hazard"
         );
@@ -2469,11 +2557,44 @@ mod tests {
             PageCapVerdict::Exceeds { observed: 32 * 1024 * 1024 },
         ] {
             assert_eq!(
-                effective_read_max_bytes(verdict, Some(8 * 1024 * 1024)),
+                effective_read_max_bytes(verdict, Some(8 * 1024 * 1024), small_floor),
                 8 * 1024 * 1024,
                 "an operator who names a cap has decided what this process may buffer"
             );
         }
+    }
+
+    /// The engine writes one POST body of up to its append budget, and the store frames that value
+    /// whole on read. A derived cap below the budget would refuse the engine's own change log — the
+    /// production incident: a 16 MiB cap against a 64 MiB append budget latched degraded on a value
+    /// this engine had itself appended, and the task cycled under the health check on every restart.
+    #[test]
+    fn a_derived_read_cap_is_never_below_the_append_budget() {
+        let budget = 64 * 1024 * 1024;
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 }, None, budget),
+            budget,
+            "four pages is not enough to read back one of this engine's own appends"
+        );
+        assert_eq!(
+            effective_read_max_bytes(PageCapVerdict::Unknown, None, 96 * 1024 * 1024),
+            96 * 1024 * 1024,
+            "a larger append budget lifts the uncapped-store cap with it"
+        );
+        assert_eq!(
+            effective_read_max_bytes(
+                PageCapVerdict::Compatible { observed: 4 * 1024 * 1024 },
+                Some(8 * 1024 * 1024),
+                budget
+            ),
+            8 * 1024 * 1024,
+            "an explicit cap is obeyed here; a contradictory one is refused at boot, not corrected in flight"
+        );
+        assert_eq!(
+            ds_read_cap_floor(),
+            crate::txn_buffer::TxnBufferConfig::default().append_bytes,
+            "the floor is the append budget, which defaults to 64 MiB"
+        );
     }
 
     #[test]

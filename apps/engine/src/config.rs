@@ -519,6 +519,25 @@ impl Config {
         // budget that was meant to be applied and silently was not is the worst of both worlds.
         let txn = TxnBufferConfig::resolve(g).context("large-transaction configuration")?;
 
+        // The Durable Streams read cap must cover this engine's own largest append. A JSON page
+        // cuts only on a value boundary, so a value the engine appended is read back whole; a cap
+        // below the append budget would refuse a page this process is entitled to produce, and an
+        // engine that latched on its own change log would cycle under the health check forever.
+        // A derived cap is floored at the budget (`ds::ds_read_cap_floor`); an explicit one that
+        // contradicts it is refused here, like every other contradictory memory knob.
+        if let Some(cap) = g("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|cap| *cap > 0)
+            && cap < txn.append_bytes
+        {
+            bail!(
+                "ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES is {cap}, below ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES \
+                 ({}); the store frames one append whole on read, so this engine could not read back its \
+                 own change log",
+                txn.append_bytes
+            );
+        }
+
         // Streamed backfills. Same stance as the large-transaction knobs: a budget that was meant
         // to be applied and silently was not is worse than a refused boot.
         let d = crate::pg::BackfillConfig::default();
@@ -1052,6 +1071,27 @@ mod tests {
         let url = "postgresql://postgres:password@proxy:5433/postgres?sslmode=disable";
         let c = cfg(&[("DATABASE_URL", url)]);
         assert_eq!(c.pg_url.as_deref(), Some(url));
+    }
+
+    /// The read cap must cover the append budget: the engine reads its own appends back whole.
+    #[test]
+    fn a_read_cap_below_the_append_budget_is_refused_at_boot() {
+        let resolve = |entries: &[(&str, &str)]| {
+            Config::resolve(|key| entries.iter().find_map(|(name, value)| (*name == key).then(|| (*value).to_string())))
+        };
+        let below = resolve(&[("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES", "16777216")])
+            .expect_err("a 16 MiB read cap cannot read back a 64 MiB append");
+        assert!(format!("{below:#}").contains("ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES"), "{below:#}");
+
+        resolve(&[("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES", "67108864")])
+            .expect("a read cap equal to the append budget covers every append");
+        resolve(&[
+            ("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES", "16777216"),
+            ("ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES", "8388608"),
+        ])
+        .expect("a smaller append budget makes the same read cap sufficient");
+        resolve(&[("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES", "not-a-number")])
+            .expect("an unparseable cap is ignored by the read path, so it is not a contradiction here");
     }
 
     #[test]
