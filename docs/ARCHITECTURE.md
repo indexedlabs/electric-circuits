@@ -472,6 +472,19 @@ refcount back for a join) and is typed `CreateRaced`, which the create **redoes*
 the definition is still valid, only the attempt lost a race, and every client would otherwise have
 to implement that loop. Exhausting the retries answers 503.
 
+**Subquery initialization is serialized within one engine.** A new subquery create acquires one
+async admission permit after ensuring its stream, before phase A. It releases the permit after
+phase C installs every seed; same-signature joiners use their existing readiness wait, and ordinary
+creates, replication and existing streams do not acquire this permit. A queued create remains
+cancellable and wakes on shutdown. The create-start log reports `admission_wait_ms` so restart and
+deployment handoff queues can be checked against caller deadlines.
+
+On failure or cancellation before installation, `CreateGuard` transfers its rollback and permit to
+one cleanup task before awaiting anything. Explicit failure waits for that task; cancelling that
+wait leaves the same cleanup running. The permit stays held through registry rollback, circuit
+retractions and stream deletion, preventing the next create from observing abandoned seed state.
+There is no timed retry or temporary conflict response for normal overlapping initialization.
+
 ### 5.5 Reliability: appends never drop silently
 
 A lost shape-stream append is a permanent divergence for every subscriber, so live-path appends use
