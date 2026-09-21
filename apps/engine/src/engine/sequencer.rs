@@ -1113,20 +1113,25 @@ pub(crate) async fn sequencer_loop(
                 Err(e) => {
                     if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
                         metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
-                        // Against a store that advertises no page — every released durable-streams
-                        // build — a read bigger than the cap is an ordinary backlog, not a broken
-                        // store: the whole remainder of the stream comes back in one response.
-                        // Halting there costs more than the memory it saves. The health check
-                        // replaces the task, the restart re-reads from the same checkpoint, and the
-                        // task cycles until an operator intervenes, where the previous engine read
-                        // the page whole and made progress. So the ceiling is raised, the read
-                        // retried, and the latch kept for a store that broke a page it advertised
-                        // or a backlog past the hard ceiling.
+                        // A read bigger than the cap is ordinarily a large value, not a broken
+                        // store: against a store that advertises no page the whole remainder of
+                        // the stream comes back in one response, and against one that pages a
+                        // single value larger than the page is framed whole, up to the value bound
+                        // the store advertises. Halting there costs more than the memory it saves.
+                        // The health check replaces the task, the restart re-reads from the same
+                        // checkpoint, and the task cycles until an operator intervenes. So the
+                        // ceiling is raised, the read retried, and the latch kept for an
+                        // operator-named cap, a store that broke a value bound it advertised, or a
+                        // value past the hard ceiling.
                         match crate::ds::raise_read_cap_after_breach() {
                             crate::ds::CapBreachOutcome::Raise { limit } => {
                                 metrics().sequencer_read_cap_raised.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(path = %cap.path, observed = cap.observed, was = cap.limit, now = limit,
-                                    "a Durable Streams read exceeded the client body cap against a store that                                      advertises no page; raising the cap and retrying. Deploy a store that pages,                                      or name a cap this process should not exceed");
+                                    max_value_bytes = cap.max_value_bytes,
+                                    "a Durable Streams read exceeded the client body cap: the store either advertises \
+                                     no page or is entitled to frame one value larger than its page; raising the cap \
+                                     and retrying. Bound the values written to this stream, or name a cap this \
+                                     process should not exceed");
                                 back_off(&shutdown, std::time::Duration::from_millis(200)).await;
                             }
                             crate::ds::CapBreachOutcome::Latch => {
