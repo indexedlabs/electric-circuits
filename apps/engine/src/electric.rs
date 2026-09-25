@@ -59,7 +59,7 @@ use tokio::sync::watch;
 use crate::ds::{Envelope, ReadResult};
 use crate::engine::Engine;
 use crate::heap_size::HeapSize;
-use crate::schema::{ColumnType, TableSchema};
+use crate::schema::{ColumnType, PK_SEP, TableSchema, unescape_key_component};
 use crate::table_ref::TableRef;
 
 #[derive(Debug, Deserialize)]
@@ -106,7 +106,7 @@ struct HandleEntry {
     /// sees it: the handle is its name for the same thing.
     subscription: String,
     table: TableRef,
-    pk_name: String,
+    pk_cols: Vec<String>,
     /// When this handle was last touched by a request — drives idle-TTL eviction.
     last_access: std::sync::Mutex<Instant>,
     state: tokio::sync::Mutex<HandleState>,
@@ -144,7 +144,7 @@ fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
 /// `bytes_electric_adapter` term. `HandleEntry`/`HandleState` hold sync/async primitives
 /// (`Mutex`, `watch::Receiver`), so this is a hand-rolled walk rather than a `HeapSize` impl:
 /// the registry map's own key strings + each entry's owned strings (`stream_path`, `shape_id`,
-/// `table`, `pk_name`) + its cursor state (`keys`/`offset`) + the in-flight live-poll map's key
+/// `table`, `pk_cols`) + its cursor state (`keys`/`offset`) + the in-flight live-poll map's key
 /// strings (the `watch::Receiver` values are shared channel handles, not uniquely owned, so
 /// only their keys are counted).
 ///
@@ -162,7 +162,7 @@ pub(crate) async fn ttl_registry_heap_bytes() -> usize {
             + entry.stream_path.heap_bytes()
             + entry.shape_id.heap_bytes()
             + entry.table.heap_bytes()
-            + entry.pk_name.heap_bytes();
+            + entry.pk_cols.heap_bytes();
         if let Ok(st) = entry.state.try_lock() {
             total += st.keys.heap_bytes() + st.offset.heap_bytes();
         }
@@ -594,18 +594,33 @@ async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result
     Ok(fold.rows.into_keys().collect())
 }
 
+/// Reconstruct a delete's key columns as Electric text values, matching [`encode_value`].
+fn delete_key_value(pk_cols: &[String], key: &str) -> serde_json::Value {
+    let mut value = serde_json::Map::new();
+    // Escaped components contain no bare PK_SEP, so every separator here is a tuple boundary.
+    if pk_cols.len() > 1 && key.split(PK_SEP).count() == pk_cols.len() {
+        for (column, part) in pk_cols.iter().zip(key.split(PK_SEP)) {
+            value.insert(column.clone(), serde_json::Value::String(unescape_key_component(part)));
+        }
+    } else if let Some(column) = pk_cols.first() {
+        // Single-column keys are never escaped. Malformed composite keys retain the old fallback.
+        value.insert(column.clone(), serde_json::Value::String(key.to_string()));
+    }
+    serde_json::Value::Object(value)
+}
+
 /// Classify the engine's absolute `upsert`/`delete` envelopes into Electric `insert`/`update`/`delete`
 /// change messages against the client's key set (mutating it as it goes).
-fn apply_changes(keys: &mut HashSet<String>, pk_name: &str, envelopes: Vec<Envelope>) -> Vec<serde_json::Value> {
+fn apply_changes(keys: &mut HashSet<String>, pk_cols: &[String], envelopes: Vec<Envelope>) -> Vec<serde_json::Value> {
     let mut messages = Vec::new();
     for env in envelopes {
         match env.headers.operation.as_str() {
             "delete" => {
                 if keys.remove(&env.key) {
                     // Electric's client requires a `value` on every change message (its parser matches
-                    // on `"value"`). For a delete we carry the row's old value if present, else the key.
+                    // on `"value"`). For a delete we carry the row's old value if present, else all key columns.
                     let value =
-                        env.value.as_ref().map(encode_value).unwrap_or_else(|| serde_json::json!({ pk_name: env.key }));
+                        env.value.as_ref().map(encode_value).unwrap_or_else(|| delete_key_value(pk_cols, &env.key));
                     messages.push(change_msg("delete", &env.key, Some(value), env.headers.txid.as_deref()));
                 }
             }
@@ -829,7 +844,7 @@ async fn positioned_read(
         });
     }
 
-    let mut messages = apply_changes(&mut st.keys, &entry.pk_name, r.envelopes);
+    let mut messages = apply_changes(&mut st.keys, &entry.pk_cols, r.envelopes);
     if r.up_to_date {
         messages.push(control_msg("up-to-date"));
     }
@@ -1015,7 +1030,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
                 shape_id: rec.id.clone(),
                 subscription: subscription.clone(),
                 table: p.table.clone(),
-                pk_name: ts.pk_name.clone(),
+                pk_cols: ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect(),
                 last_access: std::sync::Mutex::new(Instant::now()),
                 state: tokio::sync::Mutex::new(HandleState { keys, offset: tail.clone() }),
                 live_inflight: std::sync::Mutex::new(HashMap::new()),
@@ -1354,7 +1369,7 @@ mod tests {
         // ...then replay everything after it.
         let replay: Vec<Envelope> =
             all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
-        let msgs = apply_changes(&mut keys, "id", replay);
+        let msgs = apply_changes(&mut keys, &["id".into()], replay);
         assert_eq!(msgs.len(), 1);
         assert_eq!(op_and_key(&msgs[0]), ("delete".into(), "k2".into()));
         assert!(!keys.contains("k2"));
@@ -1373,7 +1388,7 @@ mod tests {
 
         let replay: Vec<Envelope> =
             all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
-        let msgs = apply_changes(&mut keys, "id", replay);
+        let msgs = apply_changes(&mut keys, &["id".into()], replay);
         assert_eq!(msgs.len(), 1);
         assert_eq!(op_and_key(&msgs[0]), ("insert".into(), "k1".into()));
     }
@@ -1383,13 +1398,88 @@ mod tests {
         let mut keys: HashSet<String> = ["k1".to_string()].into_iter().collect();
         let msgs = apply_changes(
             &mut keys,
-            "id",
+            &["id".into()],
             vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k9", "03")],
         );
         assert_eq!(op_and_key(&msgs[0]), ("update".into(), "k1".into()));
         assert_eq!(op_and_key(&msgs[1]), ("insert".into(), "k2".into()));
         // delete of a key the client never had is suppressed
         assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn apply_changes_composite_delete_carries_every_key_column() {
+        let pk_cols = ["message_id".to_string(), "principal".to_string()];
+        let key = crate::schema::join_key_components(["message-1", "principal-2"]);
+        let mut keys = HashSet::from([key.clone()]);
+
+        let messages = apply_changes(&mut keys, &pk_cols, vec![env("delete", &key, "01")]);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(op_and_key(&messages[0]), ("delete".into(), key));
+        assert_eq!(messages[0]["value"], serde_json::json!({"message_id": "message-1", "principal": "principal-2"}));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn apply_changes_composite_delete_unescapes_key_components() {
+        let pk_cols = ["message_id".to_string(), "principal".to_string()];
+        for (message_id, principal) in [
+            ("message\u{1f}1", r"principal\2"),
+            (r"message\x1f1", "principal\\\u{1f}2"),
+            ("", "雪\\"),
+            ("message-1", ""),
+        ] {
+            let key = crate::schema::join_key_components([message_id, principal]);
+            let mut keys = HashSet::from([key.clone()]);
+
+            let messages = apply_changes(&mut keys, &pk_cols, vec![env("delete", &key, "01")]);
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["value"], serde_json::json!({"message_id": message_id, "principal": principal}));
+        }
+    }
+
+    #[test]
+    fn apply_changes_single_column_delete_preserves_the_bare_key() {
+        for key in ["message-1", "message\u{1f}1", r"message\x1f1", ""] {
+            let mut keys = HashSet::from([key.to_string()]);
+
+            let messages = apply_changes(&mut keys, &["id".into()], vec![env("delete", key, "01")]);
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["value"], serde_json::json!({"id": key}));
+        }
+    }
+
+    #[test]
+    fn apply_changes_malformed_composite_delete_falls_back_to_the_first_key_column() {
+        let pk_cols = ["message_id".to_string(), "principal".to_string()];
+        for key in ["message-1", "message-1\u{1f}principal-2\u{1f}extra"] {
+            let mut keys = HashSet::from([key.to_string()]);
+
+            let messages = apply_changes(&mut keys, &pk_cols, vec![env("delete", key, "01")]);
+
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["value"], serde_json::json!({"message_id": key}));
+        }
+    }
+
+    #[test]
+    fn apply_changes_delete_preserves_a_supplied_value() {
+        let pk_cols = ["message_id".to_string(), "principal".to_string()];
+        let key = crate::schema::join_key_components(["message-1", "principal-2"]);
+        let mut keys = HashSet::from([key.clone()]);
+        let mut delete = env("delete", &key, "01");
+        delete.value = Some(serde_json::json!({"message_id": "message-1", "principal": "principal-2", "count": 7}));
+
+        let messages = apply_changes(&mut keys, &pk_cols, vec![delete]);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["value"],
+            serde_json::json!({"message_id": "message-1", "principal": "principal-2", "count": "7"})
+        );
     }
 
     #[test]
@@ -1402,7 +1492,7 @@ mod tests {
         delete.headers.txid = Some("3261".into());
         let mut keys: HashSet<String> = ["k1".into(), "k3".into()].into_iter().collect();
 
-        let messages = apply_changes(&mut keys, "id", vec![update, insert, delete]);
+        let messages = apply_changes(&mut keys, &["id".into()], vec![update, insert, delete]);
 
         assert_eq!(messages[0]["headers"]["txid"], "3259");
         assert_eq!(messages[0]["headers"]["txids"], serde_json::json!([3259]));
@@ -1418,7 +1508,7 @@ mod tests {
         change.headers.txid = Some("library-write".into());
         let mut keys = HashSet::new();
 
-        let messages = apply_changes(&mut keys, "id", vec![change]);
+        let messages = apply_changes(&mut keys, &["id".into()], vec![change]);
 
         assert_eq!(messages[0]["headers"]["txid"], "library-write");
         assert!(messages[0]["headers"].get("txids").is_none());
@@ -1443,7 +1533,7 @@ mod tests {
             shape_id: "s1".into(),
             subscription: "~test-1".into(),
             table: "t".into(),
-            pk_name: "id".into(),
+            pk_cols: vec!["id".into()],
             last_access: std::sync::Mutex::new(Instant::now()),
             state: tokio::sync::Mutex::new(HandleState { keys: HashSet::new(), offset: "-1".into() }),
             live_inflight: std::sync::Mutex::new(HashMap::new()),

@@ -262,6 +262,30 @@ pub fn escape_key_component(part: &str) -> String {
     out
 }
 
+/// Reverse [`escape_key_component`] for one composite-key component. Decode in one pass so an
+/// escaped backslash followed by literal `x1f` stays distinct from an escaped separator.
+/// Unrecognized escape sequences are preserved verbatim.
+pub(crate) fn unescape_key_component(part: &str) -> String {
+    let mut out = String::with_capacity(part.len());
+    let mut chars = part.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(rest) = chars.as_str().strip_prefix('\\') {
+                out.push('\\');
+                chars = rest.chars();
+                continue;
+            }
+            if let Some(rest) = chars.as_str().strip_prefix("x1f") {
+                out.push(PK_SEP);
+                chars = rest.chars();
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Join already-stringified key components into the composite key string (escaping each). The one
 /// implementation, shared by [`TableSchema::key_string`] and the replication decoder's
 /// `key_from_obj`, so the backfill and the live path spell an identical key for the same row.
@@ -594,6 +618,17 @@ mod tests {
     fn the_replication_decoder_agrees_with_key_string() {
         assert_eq!(join_key_components(["x", "y\u{1f}z"]), "x\u{1f}y\\x1fz");
         assert_eq!(join_key_components(["x\u{1f}y", "z"]), "x\\x1fy\u{1f}z");
+    }
+
+    #[test]
+    fn key_component_escape_round_trips() {
+        let parts = ["", "plain", "\\", "\u{1f}", r"\x1f", "雪"];
+        for left in parts {
+            for right in parts {
+                let original = format!("{left}{right}");
+                assert_eq!(unescape_key_component(&escape_key_component(&original)), original);
+            }
+        }
     }
 
     /// The durable audit record spells the identity as Postgres does.
