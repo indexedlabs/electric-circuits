@@ -570,7 +570,16 @@ impl Config {
                 )
             })?,
         };
-        let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms };
+        let settle_timeout_ms = match g("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS") {
+            None => d.settle_timeout_ms,
+            Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS must be a whole number of milliseconds, got '{}'",
+                    raw.trim()
+                )
+            })?,
+        };
+        let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms, settle_timeout_ms };
 
         let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
         let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;

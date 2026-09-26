@@ -421,6 +421,18 @@ impl DegradeState {
     }
 }
 
+/// One subset page (see [`Engine::query_subset`]): the projected rows and the fences of the settled
+/// snapshot they were read in.
+pub struct SubsetPage {
+    pub rows: Vec<serde_json::Value>,
+    /// `pg_current_wal_lsn()` at the snapshot.
+    pub lsn: String,
+    /// `pg_current_snapshot()::text` of the snapshot (full xid8 values).
+    pub snapshot: String,
+    /// `pg_current_wal_insert_lsn()` at the snapshot.
+    pub horizon: String,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     ds: DsClient,
@@ -1892,6 +1904,7 @@ impl Engine {
                 self.restore_reads_paused.clone(),
                 self.read_cap_failed.clone(),
                 self.retention.pending_buffer_max_bytes,
+                self.pg_url.as_deref().map(|url| crate::pg::pool_for(url).sequenced()),
                 self.shutdown.clone(),
             ));
         }
@@ -2296,7 +2309,7 @@ impl Engine {
         order_by: Option<(String, bool)>,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<(Vec<serde_json::Value>, String)> {
+    ) -> Result<SubsetPage> {
         let (ts, schemas) = {
             let st = self.state.lock().await;
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
@@ -2326,7 +2339,7 @@ impl Engine {
         let sq = crate::pg::query_subset_where(&client, &ts, where_sql, order, limit, offset).await?;
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
-        Ok((rows, sq.lsn))
+        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
     }
 
     /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the

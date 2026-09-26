@@ -56,9 +56,11 @@ await shape.close()
 ## `subset(def)` / `query(def)` — ordered pages, shared live tail
 
 `query()` is one-shot: the engine runs a single `SELECT … ORDER BY … LIMIT/OFFSET` against
-Postgres and returns `{ rows, lsn }` — nothing is stored server-side. `subset()` builds on it:
-first page + a **changes-only** live tail on the base predicate, merged client-side by per-pk LSN
-watermarks (a stale page can never resurrect a deleted row).
+Postgres and returns `{ rows, lsn, snapshot, horizon }` — nothing is stored server-side. `subset()`
+builds on it: first page + a **changes-only** live tail on the base predicate, merged client-side by
+per-pk versions — a live change is dropped only if the page's snapshot already contained its
+transaction (not merely because it committed below the page LSN), and a stale page can never
+resurrect a deleted row.
 
 ```ts
 const page = await client.subset({

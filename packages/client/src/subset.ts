@@ -286,13 +286,115 @@ export function lsnToU64(lsn: string | undefined | null): bigint | null {
   return (BigInt(hi) << 32n) | BigInt(lo)
 }
 
-/** The loaded subset window's membership + per-row LSN watermark (the merge state). */
+/**
+ * What a subset page's snapshot contains, from the engine's query-back (`snapshot`, `horizon`).
+ *
+ * A commit's WAL record is written, flushed and replicated BEFORE the transaction becomes visible to
+ * new snapshots, so "commit LSN < the page's LSN" does not mean "already in the page": a transaction
+ * can commit below the page LSN and still be missing from it. Transaction visibility decides it
+ * exactly — a live change is already in the page iff its transaction was visible to the page's
+ * snapshot (`docs/ARCHITECTURE.md` §7).
+ *
+ * xids are 32-bit (the envelope `txid` is pgoutput's 32-bit xid; the snapshot's xid8 values are
+ * masked to match) and compared modulo 2^32 like PostgreSQL's `TransactionIdPrecedes`. `horizon`
+ * (`pg_current_wal_insert_lsn()` in the snapshot's own statement) bounds the snapshot: no change at
+ * or past it can be in the page, whatever its 32-bit xid compares as — which is also what lets the
+ * client stop consulting the snapshot once its tail has passed the horizon.
+ */
+export interface PageSnapshot {
+  /** `pg_current_wal_lsn()` at the snapshot — the fallback for a change with no parseable txid. */
+  lsn: bigint
+  horizon: bigint
+  xmin: number
+  xmax: number
+  xip: Set<number>
+  /** Set once the live tail delivered a change at/past `horizon`: every later change is newer. */
+  passed?: boolean
+}
+
+const U32 = 0xffffffffn
+
+function xid32(text: string): number | null {
+  if (!/^\d+$/.test(text)) return null
+  return Number(BigInt(text) & U32)
+}
+
+/** PostgreSQL's `TransactionIdPrecedes`: the 32-bit difference read as signed. */
+function xidPrecedes(a: number, b: number): boolean {
+  return ((a - b) | 0) < 0
+}
+
+/**
+ * Parse the engine's `snapshot` (`pg_current_snapshot()::text`, `xmin:xmax:xip,…`) and `horizon`.
+ * `null` when either is missing or malformed — an engine that predates them — and the caller falls
+ * back to LSN positioning.
+ */
+export function parsePageSnapshot(lsn: string | undefined, snapshot: unknown, horizon: unknown): PageSnapshot | null {
+  if (typeof snapshot !== 'string' || typeof horizon !== 'string') return null
+  const [xminText, xmaxText, xipText = ''] = snapshot.split(':')
+  const xmin = xid32(xminText ?? '')
+  const xmax = xid32(xmaxText ?? '')
+  const h = lsnToU64(horizon)
+  const l = lsnToU64(lsn)
+  if (xmin === null || xmax === null || h === null || l === null) return null
+  const xip = new Set<number>()
+  for (const x of xipText.split(',')) {
+    if (!x) continue
+    const v = xid32(x)
+    if (v === null) return null
+    xip.add(v)
+  }
+  return { lsn: l, horizon: h, xmin, xmax, xip }
+}
+
+/**
+ * Is the change (commit LSN `lsn`, transaction `txid`) already reflected in a page read at `snap`?
+ * A change with no LSN is never "already in" anything (library mode applies idempotently by pk).
+ */
+export function pageIncludes(snap: PageSnapshot, lsn: bigint | null, txid: string | undefined): boolean {
+  if (lsn === null) return false
+  if (snap.passed || lsn >= snap.horizon) return false
+  const x = txid === undefined ? null : xid32(txid)
+  if (x === null) return lsn < snap.lsn
+  if (xidPrecedes(x, snap.xmin)) return true
+  if (!xidPrecedes(x, snap.xmax)) return false
+  return !snap.xip.has(x)
+}
+
+/**
+ * What a row's current value in the view already reflects: a page snapshot it was read at, or the
+ * commit LSN of the last live change applied to it (a bigint — also a delete's tombstone).
+ */
+export type RowVersion = bigint | PageSnapshot
+
+/** The loaded subset window's membership + per-row versions (the merge state). */
 export interface SubsetView {
+  /** The current page's LSN: the floor for rows not in the page when there is no `snapshot`. */
   snapshotLsn: bigint
+  /** The current page's snapshot (a newer engine); preferred over `snapshotLsn` when present. */
+  snapshot?: PageSnapshot | null
   present: Set<string>
-  applied: Map<string, bigint>
+  applied: Map<string, RowVersion>
+  /** The transaction behind each bigint entry of `applied`, when the change carried one. */
+  appliedTxid?: Map<string, string>
   /** Is the row within the currently-loaded keyset window? */
   inView: (row: Row) => boolean
+}
+
+/** Does version `v` already include the change (`lsn`, `txid`)? */
+function versionIncludes(v: RowVersion, lsn: bigint | null, txid: string | undefined): boolean {
+  if (typeof v === 'bigint') return lsn !== null && lsn < v
+  return pageIncludes(v, lsn, txid)
+}
+
+/**
+ * May a page read at `page` replace a row whose current version is `w`? Only if the page already
+ * includes the change that produced `w` — otherwise the page is older than what the view holds.
+ */
+export function pageSupersedes(page: RowVersion, w: RowVersion, wTxid: string | undefined): boolean {
+  if (typeof w !== 'bigint') return true // two pages: the later request read the later snapshot
+  if (typeof page === 'bigint') return page >= w
+  return pageIncludes(page, w, wTxid)
 }
 
 /** A collection write to emit, or `null` to drop the delta. */
@@ -311,11 +413,30 @@ export type MergeAction =
 export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeAction {
   const key = env.key
   const deltaLsn = lsnToU64(env.headers.lsn)
+  const txid = env.headers.txid
+  // The page snapshot is consulted only below its horizon; once the tail has passed it, every
+  // change is newer than the page (the feed is in commit-LSN order).
+  if (view.snapshot && deltaLsn !== null && deltaLsn >= view.snapshot.horizon && !view.snapshot.passed) {
+    view.snapshot.passed = true
+    view.snapshot.xip.clear()
+  }
   // A null LSN (library/no-Postgres mode) always applies — the old idempotent-by-pk behaviour.
+  // Otherwise the change is fresh unless the row's version (or, for a row the view does not hold,
+  // the page it was absent from) already includes it.
   const fresh = (): boolean => {
     if (deltaLsn === null) return true
-    const w = view.applied.get(key)
-    return w === undefined ? deltaLsn >= view.snapshotLsn : deltaLsn >= w
+    const w = view.applied.get(key) ?? view.snapshot ?? view.snapshotLsn
+    return !versionIncludes(w, deltaLsn, txid)
+  }
+  const record = (): void => {
+    if (deltaLsn !== null) {
+      view.applied.set(key, deltaLsn)
+      if (txid !== undefined) view.appliedTxid?.set(key, txid)
+      else view.appliedTxid?.delete(key)
+    } else {
+      view.applied.delete(key)
+      view.appliedTxid?.delete(key)
+    }
   }
   if (env.headers.operation === 'delete') {
     if (!fresh()) return null
@@ -325,8 +446,7 @@ export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeActi
     // "deleted at ≥ w", so an in-flight loadMore page snapshotted before the delete (pageLsn < w)
     // is skipped by the loadMore guard rather than resurrecting the row. Recorded even for a
     // never-seen pk — otherwise a stale page could insert a ghost row the feed already deleted.
-    if (deltaLsn !== null) view.applied.set(key, deltaLsn)
-    else view.applied.delete(key)
+    record()
     return wasPresent ? { type: 'delete', key } : null
   }
   const value = env.value
@@ -334,15 +454,14 @@ export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeActi
   if (view.inView(value)) {
     const type = view.present.has(key) ? 'update' : 'insert'
     view.present.add(key)
-    if (deltaLsn !== null) view.applied.set(key, deltaLsn)
+    if (deltaLsn !== null) record()
     return { type, value }
   }
   if (view.present.has(key)) {
     // Moved out of the loaded window (e.g. its sort key dropped below the boundary). Same tombstone
     // treatment as a delete: a stale in-flight page must not re-insert the pre-move version.
     view.present.delete(key)
-    if (deltaLsn !== null) view.applied.set(key, deltaLsn)
-    else view.applied.delete(key)
+    record()
     return { type: 'delete', key }
   }
   return null
@@ -357,6 +476,15 @@ interface SyncCtl {
   begin: (options?: { immediate?: boolean }) => void
   write: (m: ChangeMessageOrDeleteKeyMessage<Row, string>) => void
   commit: () => void
+}
+
+/**
+ * The page snapshot a query-back answered with (`snapshot` + `horizon`), or `null` from an engine that
+ * predates them. The fields are additive on the wire, so `SubsetResult` does not name them.
+ */
+function pageSnapshotOf(page: SubsetResult): PageSnapshot | null {
+  const extra = page as SubsetResult & { snapshot?: unknown; horizon?: unknown }
+  return parsePageSnapshot(page.lsn, extra.snapshot, extra.horizon)
 }
 
 export async function createSubset<T extends Row = Row>(
@@ -402,9 +530,12 @@ export async function createSubset<T extends Row = Row>(
     //
     //     The offset comes first because reading the live tail from there (rather than the stream
     //     origin) means a joiner to a SHARED, long-lived feed does not replay the whole backlog — it
-    //     starts at "≈now". Everything at/before this offset committed before the page's snapshot LSN
-    //     and is already in the page; the `< snapshotLsn` drop covers the small [thisOffset,
-    //     snapshot] overlap. Falls back to the stream origin if HEAD is unavailable.
+    //     starts at "≈now". Everything at/before this offset is in the page: the engine settles the
+    //     page snapshot against what it has already fanned out (a snapshot that still excludes a
+    //     transaction the feed already carries is retaken once that transaction is visible). The
+    //     [thisOffset, snapshot] overlap is then dropped by the page snapshot's transaction
+    //     visibility (`pageIncludes`), not by LSN: a commit below the page LSN can still be missing
+    //     from the page. Falls back to the stream origin if HEAD is unavailable.
     //
     //     `offset` applies to THIS page only: it is where the caller's window starts, and every
     //     later page is reached by moving the keyset cursor past the boundary — re-applying the
@@ -450,12 +581,14 @@ export async function createSubset<T extends Row = Row>(
     // promising a next page that could never arrive.
     let ended = false
     const present = new Set<string>()
-    // LSN positioning: `view.snapshotLsn` is the CURRENT page's read point in the engine's replication
-    // timeline. `applied` is a per-present-row watermark — the snapshot LSN the row's current value was
-    // read at (page or loadMore), bumped to a feed delta's LSN when applied. A feed delta is accepted
-    // only if its commit LSN is at/after the relevant watermark, so deltas already reflected in the page
-    // (commit LSN < snapshotLsn) are dropped — exactly-once after the snapshot, no double-count.
-    const applied = new Map<string, bigint>()
+    // Positioning: `view.snapshot` is the CURRENT page's snapshot (`view.snapshotLsn` its LSN, the
+    // fallback against an engine that returns no snapshot). `applied` is each row's version — the
+    // page snapshot its value was read at (page or loadMore), replaced by a feed delta's commit LSN
+    // when one is applied. A feed delta is accepted only if the row's version does not already
+    // include it: for a page version that is transaction visibility, not LSN order, because a commit
+    // below the page LSN can still be missing from the page. Exactly-once after the snapshot.
+    const applied = new Map<string, RowVersion>()
+    const appliedTxid = new Map<string, string>()
     const inView = (row: Row): boolean => {
       // The lower bound holds even once `ended`: "fully loaded" means the pages ran out, not that
       // the rows below the offset joined the window.
@@ -466,7 +599,7 @@ export async function createSubset<T extends Row = Row>(
     let ctl: SyncCtl | null = null
     let loadsInFlight = 0
 
-    const view: SubsetView = { snapshotLsn: 0n, present, applied, inView }
+    const view: SubsetView = { snapshotLsn: 0n, snapshot: null, present, applied, appliedTxid, inView }
     // Bumped by every `seedPage`. A `loadMore` page that was requested against the PREVIOUS window
     // is meaningless once the window has been re-derived from a fresh page, so it is dropped rather
     // than merged into rows it no longer describes.
@@ -483,6 +616,7 @@ export async function createSubset<T extends Row = Row>(
     const seedPage = (w: SyncCtl, page: SubsetResult): void => {
       const rows = page.rows
       const pageLsn = lsnToU64(page.lsn) ?? 0n
+      const snap = pageSnapshotOf(page)
       const keys = new Set(rows.map((r) => String(r[pk])))
       w.begin()
       for (const k of present) if (!keys.has(k)) w.write({ type: 'delete', key: k })
@@ -490,14 +624,16 @@ export async function createSubset<T extends Row = Row>(
       w.commit()
       present.clear()
       applied.clear()
+      appliedTxid.clear()
       for (const k of keys) {
         present.add(k)
-        applied.set(k, pageLsn)
+        applied.set(k, snap ?? pageLsn)
       }
       boundary = rows.length ? rows[rows.length - 1]! : null
       lower = def.offset && rows.length ? rows[0]! : null
       ended = limit === 0 || rows.length < limit
       view.snapshotLsn = pageLsn
+      view.snapshot = snap
       windowGeneration += 1
     }
     const applyEnvelope = (env: StreamEnvelope): void => {
@@ -610,14 +746,16 @@ export async function createSubset<T extends Row = Row>(
             // Tombstoned rows (watermark without membership) are skipped the same way — a page older than
             // the delete must not resurrect the row.
             const pageLsn = lsnToU64(page.lsn) ?? view.snapshotLsn
+            const pageVersion: RowVersion = pageSnapshotOf(page) ?? pageLsn
             ctl.begin()
             for (const r of page.rows) {
               const k = String(r[pk])
               const w = applied.get(k)
-              if (w !== undefined && pageLsn < w) continue
+              if (w !== undefined && !pageSupersedes(pageVersion, w, appliedTxid.get(k))) continue
               ctl.write({ type: present.has(k) ? 'update' : 'insert', value: r })
               present.add(k)
-              applied.set(k, pageLsn)
+              applied.set(k, pageVersion)
+              appliedTxid.delete(k)
             }
             ctl.commit()
             boundary = page.rows[page.rows.length - 1]!
@@ -629,7 +767,12 @@ export async function createSubset<T extends Row = Row>(
           // Tombstone watermarks only exist to guard in-flight loadMore pages; once none are in
           // flight, prune them so delete churn doesn't grow `applied` unboundedly.
           if (loadsInFlight === 0) {
-            for (const k of applied.keys()) if (!present.has(k)) applied.delete(k)
+            for (const k of applied.keys()) {
+              if (!present.has(k)) {
+                applied.delete(k)
+                appliedTxid.delete(k)
+              }
+            }
           }
         }
       },

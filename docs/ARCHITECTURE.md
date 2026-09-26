@@ -339,10 +339,19 @@ text-mode tuples
 prints — rather than `to_jsonb`'s (which would make the same timestamp compare unequal between a
 backfilled row and its first live update).
 
-*Known residual:* the **client-side subset seam** (§7) still positions by LSN watermarks; the same
-visibility window theoretically applies to a subset page's snapshot vs its live tail and would need
-the page query-back to also return the snapshot's xid list. Engine-maintained state is fully fenced.
-
+**Snapshots are settled against what is already sequenced.** The gate decides what to *skip*; it
+cannot recover a transaction that was *never delivered*. A commit T that the sequencer has already
+fanned out while T is still invisible (its commit record is flushed and decoded, but its backend has
+not left the ProcArray — microseconds normally, as long as a synchronous standby takes with
+synchronous replication) sits behind a shape's `BeginShape` point or a subset client's HEAD offset
+and outside any snapshot taken in that window. So every backfill and query-back snapshot is opened
+through `pg::begin_settled_snapshot`: the sequencer notes each transaction's xid in
+`pg::SequencedXids` before fanning it out, and a snapshot that excludes a noted xid is rolled back,
+the engine waits until those xids are visible (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS`; past it a
+subset query answers a retryable 503 and a create fails and is rolled back), and one more snapshot is taken — which needs no second check, because everything
+paired with it was noted before the first. `pg_xact_status()` cannot detect this window (it reports
+such a transaction as `in progress`). The gate's 32-bit xids are compared modulo 2^32, and a change at
+or past the snapshot's `pg_current_wal_insert_lsn()` horizon is never skipped.
 ---
 
 ## 5. The engine: fan-out, sharing, lifecycle
@@ -713,13 +722,19 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 *only* here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
-The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk LSN
-watermarks**: the page's snapshot LSN, and each applied delta's commit LSN. Engine output envelopes
-carry their commit LSN for exactly this. Key invariants (all regression-tested):
+The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk
+versions**: a row read from a page carries that page's snapshot (`snapshot` = `pg_current_snapshot()`
+and `horizon` = `pg_current_wal_insert_lsn()`, returned with every page), and an applied delta
+replaces it with the delta's commit LSN. Engine output envelopes carry their commit LSN and 32-bit
+`txid` for exactly this. Key invariants (all regression-tested):
 
 - The feed is created and its head offset captured **before** the page snapshot, so no delta can fall
-  in the gap; overlap reconciles idempotently by pk (`delta lsn ≥ snapshot lsn` applies; the engine's
-  backfill-visible side is strictly below).
+  in the gap. The engine settles the page snapshot against what it has already fanned out (§4), so
+  everything before the head offset is in the page. The overlap after it is reconciled by
+  **transaction visibility**: a delta is dropped iff its commit LSN is below the page's horizon and
+  its transaction was visible to the page's snapshot. Commit LSN below the page LSN is NOT enough — a
+  transaction can commit below it and still be missing from the page. Against an engine that returns
+  no snapshot, the client falls back to `delta lsn ≥ snapshot lsn`.
 - **Deletes leave tombstone watermarks** (including for pks never seen): a `loadMore` page whose
   snapshot predates a delete must not resurrect the row / insert a ghost. Tombstones prune when no
   page is in flight.
@@ -808,7 +823,7 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
 | subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
 | catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
-| subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
+| subset page ↔ live tail | settled page snapshot (§4) + per-pk versions (page snapshot visibility, then delta commit LSN) + delete tombstones | no double-count, no lost commit, no resurrections/ghosts across the seam |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
 | client-facing mutation → catalog | **durable-before-ack** = every record a CLIENT is told about: `Created`, the `Joined` of a NEW claim, and the `Left`/`Dropped` of a native `DELETE` — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`; a retry of an idempotent removal waits on the same barrier via `CatalogWriter::wait_durable`). **Queued-never-dropped** = what the engine does to itself: a *renewal's* `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the epoch reset, retention and the `/v1/shape` adapter. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream — and an acknowledged release or purge is in it too, so neither comes back. That matters most under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, a supported setting that disables lease expiry: there is no lease repair to fall back on. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. The cost is availability: a create, a release or a purge while storage is down **waits** rather than lying. A client that times out and gives up loses only its answer — the record still lands, and the teardown a purge promised is finished by a spawned task, not by the dropped request future |
 | shape ids → streams | the boot resumes `next_shape_id` past the maximum id of every `Created` in the log, dropped ones included (`CatalogFold::max_shape_id`) | an id is never re-minted while the `shape/*` stream it named still exists: a new shape can never inherit a dead one\'s stream (and its rows), and a pending retirement can never delete a live shape\'s stream |
@@ -965,6 +980,6 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
 | `apps/api/src/core.ts` | extended API core (writes, shape/subset/aggregate forwarding) |
 | `packages/client/src/index.ts` | client: shapes/aggregations, tracked lifecycles, `awaitTxId` |
-| `packages/client/src/subset.ts` | subset queries: page merge, LSN watermarks, tombstones, feed lifecycle |
+| `packages/client/src/subset.ts` | subset queries: page merge, snapshot-visibility positioning, tombstones, feed lifecycle |
 | `docker/` | containerized stack (engine, durable-streams, API, Postgres) |
 | `apps/pipeline-viz` | live pipeline explorer over `GET /graph` + `/state` + `/trace` |

@@ -552,17 +552,27 @@ struct PoolInner {
     url: String,
     idle: std::sync::Mutex<Vec<Client>>,
     sem: Arc<tokio::sync::Semaphore>,
+    /// What the sequencer reading this database's changes has fanned out without a snapshot having
+    /// been seen to contain it — the settle set every snapshot on this pool is checked against.
+    sequenced: Arc<SequencedXids>,
 }
 
 impl Pool {
     pub fn new(url: String, size: usize) -> Pool {
         Pool {
             inner: Arc::new(PoolInner {
+                sequenced: Arc::new(SequencedXids::for_url(url.clone())),
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
             }),
         }
+    }
+
+    /// The settle set for snapshots taken on this pool (see [`SequencedXids`]). The sequencer that
+    /// consumes this database's change log notes into it.
+    pub fn sequenced(&self) -> Arc<SequencedXids> {
+        self.inner.sequenced.clone()
     }
 
     /// Check out a connection; waits if all `size` are in use. The checkout is returned to the
@@ -1135,9 +1145,18 @@ pub struct BackfillFences {
 /// the slot is committed, so visibility reduces to: `xid < xmin`, or `xmin <= xid < xmax` and not
 /// in-progress at snapshot time.)
 ///
-/// The stored xids are `pg_current_snapshot()`'s xid8 values masked to 32 bits so they compare
-/// against test_decoding's 32-bit xids; the fence spans seconds around a backfill, so epoch
-/// wraparound (a ~4-billion-transaction horizon) cannot straddle it in practice.
+/// The stored xids are `pg_current_snapshot()`'s xid8 values masked to 32 bits, because the
+/// replication stream (pgoutput `Begin`) carries 32-bit xids. They are compared the way PostgreSQL
+/// compares `TransactionId`s — modulo 2^32, relative to each other (`xid_precedes`) — so a snapshot
+/// taken just before a 2^32 epoch boundary still orders a transaction from just after it as later.
+/// That is sound while every compared xid lies within 2^31 of the snapshot, which PostgreSQL's own
+/// wraparound protection guarantees for any transaction that can still be committing.
+///
+/// `horizon` is `pg_current_wal_insert_lsn()` in the same statement. A transaction visible to the
+/// snapshot had inserted its commit record before the snapshot was taken, so its commit LSN is below
+/// the horizon; a change at or past the horizon is never skipped, whatever its (possibly wrapped)
+/// 32-bit xid claims. A gate from before this field existed deserializes with `horizon = 0`, which
+/// disables that guard and keeps the old xid-only rule.
 ///
 /// When a change carries no parseable xid (library mode / non-PG sources), the gate falls back to
 /// the LSN comparison, and with neither it never skips.
@@ -1148,6 +1167,9 @@ pub struct SnapshotGate {
     xmin: u64,
     xmax: u64,
     xip: std::collections::HashSet<u64>,
+    /// `pg_current_wal_insert_lsn()` at the snapshot (numeric); `0` = unknown (see the type docs).
+    #[serde(default)]
+    horizon: u64,
 }
 
 impl HeapSize for SnapshotGate {
@@ -1155,6 +1177,12 @@ impl HeapSize for SnapshotGate {
     fn heap_bytes(&self) -> usize {
         self.xip.heap_bytes()
     }
+}
+
+/// Does 32-bit transaction id `a` logically precede `b`? PostgreSQL's `TransactionIdPrecedes` for
+/// normal xids: the difference taken modulo 2^32 and read as signed.
+fn xid_precedes(a: u64, b: u64) -> bool {
+    ((a as u32).wrapping_sub(b as u32) as i32) < 0
 }
 
 impl SnapshotGate {
@@ -1174,19 +1202,34 @@ impl SnapshotGate {
             .next()
             .map(|s| s.split(',').filter_map(|x| x.trim().parse::<u64>().ok()).map(mask).collect())
             .unwrap_or_default();
-        SnapshotGate { lsn: lsn_to_u64(lsn), xmin, xmax, xip }
+        SnapshotGate { lsn: lsn_to_u64(lsn), xmin, xmax, xip, horizon: 0 }
+    }
+
+    /// [`parse`](Self::parse), plus the `pg_current_wal_insert_lsn()` horizon read in the same
+    /// statement.
+    pub fn parse_with_horizon(snapshot: &str, lsn: &str, horizon: &str) -> Self {
+        SnapshotGate { horizon: lsn_to_u64(horizon), ..Self::parse(snapshot, lsn) }
+    }
+
+    /// Is this a real snapshot (not [`passthrough`](Self::passthrough))?
+    fn is_snapshot(&self) -> bool {
+        // xmax is never 0 for a real snapshot: the first normal xid is 3, and a masked xmax of 0
+        // would need an xmax of exactly k·2^32, which PostgreSQL never assigns (it skips the
+        // special xids 0..2 at every wrap). So 0 stays the passthrough marker.
+        self.xmax != 0
     }
 
     /// Was committed transaction `xid` visible to this snapshot (i.e. already reflected in the
     /// backfill rows)?
-    fn visible(&self, xid: u64) -> bool {
-        if self.xmax == 0 {
+    pub fn visible(&self, xid: u64) -> bool {
+        if !self.is_snapshot() {
             return false; // passthrough gate: nothing is "already seeded"
         }
-        if xid < self.xmin {
+        let xid = xid & 0xFFFF_FFFF;
+        if xid_precedes(xid, self.xmin) {
             return true;
         }
-        if xid >= self.xmax {
+        if !xid_precedes(xid, self.xmax) {
             return false;
         }
         !self.xip.contains(&xid)
@@ -1196,9 +1239,370 @@ impl SnapshotGate {
     /// snapshot already reflects it?
     pub fn should_skip(&self, commit_lsn: u64, xid: Option<u64>) -> bool {
         match xid {
+            // At or past the horizon the commit record did not exist yet when the snapshot was
+            // taken, so the transaction cannot be in it — whatever its 32-bit xid compares as.
+            Some(_) if self.horizon != 0 && commit_lsn != 0 && commit_lsn >= self.horizon => false,
             Some(x) => self.visible(x),
             None => commit_lsn != 0 && self.lsn != 0 && commit_lsn < self.lsn,
         }
+    }
+}
+
+// ---- settled snapshots ---------------------------------------------------------------------------
+
+/// Transactions the sequencer has fanned out that no snapshot has yet been seen to contain.
+///
+/// PostgreSQL makes a transaction visible to new snapshots only when its backend leaves the
+/// ProcArray, AFTER the commit record is flushed — and with synchronous replication, after the
+/// standby acknowledged it, which can take arbitrarily long. Logical decoding reads the flushed record,
+/// so the engine can sequence a transaction T (and append it to every shape and subset feed) while T
+/// is still invisible. A snapshot taken in that window excludes T, and T's envelopes are already
+/// behind whatever position the snapshot is paired with — a backfill's `BeginShape` point or a subset
+/// client's HEAD offset — so T is in neither the snapshot nor the live tail after it. The xid gate
+/// cannot help: it decides what to skip, not what was never delivered.
+///
+/// So every snapshot a backfill or query-back reads is **settled** against this set
+/// ([`begin_settled_snapshot`]): if any transaction the sequencer has already sequenced is invisible
+/// to the snapshot, the snapshot is discarded, the engine waits until those transactions are visible,
+/// and takes a new one. (`pg_xact_status()` cannot detect the window: it reports such a transaction
+/// as `in progress`, because it consults the ProcArray before the clog.)
+///
+/// The sequencer notes each transaction's xid before it fans the transaction out
+/// ([`note`](Self::note)); every settle check removes the xids its snapshot sees, since visibility is
+/// permanent for a committed transaction, and so does a one-query prune the set schedules for itself
+/// every [`SEQUENCED_XIDS_PRUNE_AT`] new entries (so a steady write load with no snapshots does not
+/// grow it). Memory is bounded even when that prune cannot run (Postgres unreachable): past
+/// [`SEQUENCED_XIDS_CAP`] entries the set is dropped wholesale and only the newest dropped xid is
+/// remembered; a later snapshot is then settled only once its `xmin` has passed that xid (every
+/// transaction at or before it has ended).
+#[derive(Default)]
+pub struct SequencedXids {
+    inner: std::sync::Mutex<SequencedInner>,
+    /// The database the prune reads snapshots from (`None` for a set no pool owns — unit tests).
+    url: Option<String>,
+    /// A prune is in flight (at most one at a time).
+    pruning: AtomicBool,
+}
+
+#[derive(Default)]
+struct SequencedInner {
+    xids: std::collections::HashSet<u32>,
+    /// The last xid noted — a transaction is noted once, not once per envelope.
+    last: Option<u32>,
+    /// After an overflow: the newest xid that was dropped without being seen visible.
+    dropped_through: Option<u32>,
+}
+
+/// Entries [`SequencedXids`] holds before it drops them all (see its docs). Normally the set is a
+/// handful of transactions: every settle check and every scheduled prune shrinks it, and a committed
+/// transaction is visible microseconds after it is decoded unless synchronous replication is holding
+/// it.
+pub const SEQUENCED_XIDS_CAP: usize = 65_536;
+
+/// Every this many noted transactions the set prunes itself against a fresh snapshot.
+pub const SEQUENCED_XIDS_PRUNE_AT: usize = 1_024;
+
+/// Why a snapshot could not be settled: which transactions it still excludes.
+#[derive(Clone, Debug)]
+pub struct Unsettled {
+    /// Sequenced transactions (32-bit xids) the snapshot does not contain.
+    pub xids: Vec<u32>,
+    /// After an overflow: the snapshot's `xmin` has not yet passed this dropped xid.
+    pub dropped_through: Option<u32>,
+}
+
+impl SequencedXids {
+    /// A set whose scheduled prune reads snapshots from `url`.
+    fn for_url(url: String) -> Self {
+        SequencedXids { url: Some(url), ..Default::default() }
+    }
+
+    /// Record that transaction `xid` is being sequenced. Call BEFORE any of its envelopes can reach
+    /// a shape stream or a feed.
+    pub fn note(&self, xid: u64) {
+        if self.note_inner(xid)
+            && self.pruning.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        {
+            self.spawn_prune();
+        }
+    }
+
+    /// One fresh snapshot, and forget everything it shows visible. Detached on purpose: it is an
+    /// optimization of memory, never needed for correctness (a settle check prunes the same way), so
+    /// losing it at shutdown or to an error costs nothing but a larger set until the next one.
+    fn spawn_prune(&self) {
+        let (Some(url), Ok(rt)) = (self.url.clone(), tokio::runtime::Handle::try_current()) else {
+            self.pruning.store(false, Ordering::Release);
+            return;
+        };
+        rt.spawn(async move {
+            let pool = pool_for(&url);
+            let seen = pool.sequenced();
+            let result = async {
+                let client = pool.get().await?;
+                let text: String = client.query_one("select pg_current_snapshot()::text", &[]).await?.get(0);
+                anyhow::Ok(SnapshotGate::parse(&text, "0/0"))
+            }
+            .await;
+            match result {
+                Ok(gate) => {
+                    let _ = seen.unsettled(&gate);
+                }
+                Err(e) => tracing::debug!("sequenced-transaction prune skipped: {e:#}"),
+            }
+            seen.pruning.store(false, Ordering::Release);
+        });
+    }
+
+    /// Add `xid`; `true` when the set has grown enough to schedule a prune.
+    fn note_inner(&self, xid: u64) -> bool {
+        let xid = xid as u32;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.last == Some(xid) {
+            return false;
+        }
+        inner.last = Some(xid);
+        if inner.xids.len() >= SEQUENCED_XIDS_CAP {
+            let newest = inner
+                .xids
+                .iter()
+                .copied()
+                .chain(inner.dropped_through)
+                .fold(xid, |a, b| if xid_precedes(a as u64, b as u64) { b } else { a });
+            inner.xids.clear();
+            inner.dropped_through = Some(newest);
+            tracing::warn!(
+                cap = SEQUENCED_XIDS_CAP,
+                "sequenced-transaction set overflowed between snapshots; the next snapshot settles on xmin instead"
+            );
+            return false;
+        }
+        inner.xids.insert(xid);
+        inner.xids.len() % SEQUENCED_XIDS_PRUNE_AT == 0
+    }
+
+    /// Forget every sequenced transaction `gate` shows as visible, and report the rest.
+    pub fn unsettled(&self, gate: &SnapshotGate) -> Option<Unsettled> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.xids.retain(|&x| !gate.visible(u64::from(x)));
+        if inner.dropped_through.is_some_and(|d| xid_precedes(u64::from(d), gate.xmin)) {
+            inner.dropped_through = None;
+        }
+        if inner.xids.is_empty() && inner.dropped_through.is_none() {
+            return None;
+        }
+        let mut xids: Vec<u32> = inner.xids.iter().copied().collect();
+        xids.sort_unstable();
+        Some(Unsettled { xids, dropped_through: inner.dropped_through })
+    }
+
+    /// Forget transactions that can no longer be waited for (see [`wait_until_visible`]).
+    fn forget(&self, xids: &[u32]) {
+        let mut inner = self.inner.lock().unwrap();
+        for x in xids {
+            inner.xids.remove(x);
+        }
+    }
+
+    /// How many sequenced transactions are not yet known visible.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().xids.len()
+    }
+
+    /// Is every sequenced transaction known visible?
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A snapshot could not be settled within `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS`: a
+/// transaction the engine has already sequenced is still not visible to new snapshots (typically a
+/// synchronous standby that has not acknowledged it). Retryable — the HTTP layer answers 503.
+#[derive(Debug)]
+pub struct SnapshotUnsettled {
+    pub waited: std::time::Duration,
+    pub pending: Vec<u32>,
+}
+
+impl std::fmt::Display for SnapshotUnsettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "snapshot not settled after {:?}: {} committed transaction(s) the engine already sequenced are not yet \
+             visible to new snapshots (first xids {:?}); a synchronous standby may be holding them. Retry.",
+            self.waited,
+            self.pending.len(),
+            &self.pending[..self.pending.len().min(8)]
+        )
+    }
+}
+
+impl std::error::Error for SnapshotUnsettled {}
+
+/// Snapshots currently waiting for sequenced transactions to become visible (process-wide). A
+/// diagnostic, surfaced on `GET /replication/lsn` as `visibilityWaits`.
+static SETTLE_WAITS_ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`SETTLE_WAITS_ACTIVE`].
+pub fn settle_waits_active() -> u64 {
+    SETTLE_WAITS_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// The fences of a settled snapshot (see [`begin_settled_snapshot`]).
+pub struct SnapshotFences {
+    /// `pg_current_wal_lsn()` in the snapshot's first statement.
+    pub seed_lsn: String,
+    /// `pg_current_wal_insert_lsn()` in the same statement.
+    pub horizon_lsn: String,
+    /// `pg_current_snapshot()::text` — full xid8 values, as PostgreSQL prints them.
+    pub snapshot: String,
+    pub gate: SnapshotGate,
+}
+
+/// Open the `REPEATABLE READ READ ONLY` transaction a backfill or query-back reads, and return its
+/// fences with the transaction still open. The snapshot is **settled** against what the sequencer
+/// has already fanned out ([`SequencedXids`]): if it excludes a transaction that was already
+/// sequenced, the transaction is rolled back, the call waits until everything it excluded is visible,
+/// and opens one more snapshot, which is then settled by construction:
+///
+/// Anything the caller has already paired with this snapshot — the `BeginShape` point of a backfill,
+/// the feed offset a subset client HEADed before asking for its page — was produced from what the
+/// sequencer had sequenced by then, and all of that was noted before the first check. A transaction
+/// the second snapshot excludes was excluded by the first as well (visibility only grows), so it was
+/// in the first check's set, and the call waited until it was visible. The second snapshot is
+/// therefore not re-checked: re-checking would chase transactions sequenced after the pairing point,
+/// which the live tail carries anyway, and under synchronous replication it could chase for ever.
+///
+/// On success the caller owns the open transaction (it must `COMMIT`/`ROLLBACK` and call
+/// `transaction_finished`).
+async fn begin_settled_snapshot(
+    client: &PooledClient,
+    statement_timeout_ms: u64,
+    what: &str,
+) -> Result<SnapshotFences> {
+    let started = std::time::Instant::now();
+    let mut waited = false;
+    loop {
+        client.transaction_started();
+        let opened = open_snapshot(client, statement_timeout_ms, what).await;
+        let fences = match opened {
+            Ok(f) => f,
+            Err(error) => {
+                if client.batch_execute("ROLLBACK").await.is_ok() {
+                    client.transaction_finished();
+                }
+                return Err(error);
+            }
+        };
+        if waited {
+            return Ok(fences);
+        }
+        let Some(unsettled) = client.inner.sequenced.unsettled(&fences.gate) else {
+            return Ok(fences);
+        };
+        if client.batch_execute("ROLLBACK").await.is_ok() {
+            client.transaction_finished();
+        } else {
+            bail!("{what}: rolling back an unsettled snapshot failed");
+        }
+        {
+            // Counted while waiting, and uncounted however the wait ends — a dropped request future
+            // included.
+            struct Waiting;
+            impl Drop for Waiting {
+                fn drop(&mut self) {
+                    SETTLE_WAITS_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            SETTLE_WAITS_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            let _waiting = Waiting;
+            wait_until_visible(client, unsettled.clone(), started).await?;
+        }
+        tracing::debug!(
+            what,
+            xids = ?unsettled.xids,
+            dropped_through = ?unsettled.dropped_through,
+            waited_ms = started.elapsed().as_millis() as u64,
+            "snapshot excluded already-sequenced transactions; retaking it after they became visible"
+        );
+        waited = true;
+    }
+}
+
+/// `BEGIN … REPEATABLE READ READ ONLY`, the optional statement timeout, and the fence statement that
+/// establishes the snapshot.
+async fn open_snapshot(client: &PooledClient, statement_timeout_ms: u64, what: &str) -> Result<SnapshotFences> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .with_context(|| format!("begin {what} snapshot"))?;
+    // Slow-backfill guard, off by default. `LOCAL` scopes it to this transaction, so the pooled
+    // connection carries nothing back to the next borrower. A timeout fails THIS create with a
+    // clear, retryable error; nothing is retired and nothing is purged.
+    if statement_timeout_ms > 0 {
+        client
+            .batch_execute(&format!("SET LOCAL statement_timeout = {statement_timeout_ms}"))
+            .await
+            .context("setting the backfill statement timeout")?;
+    }
+    // One statement establishes the snapshot AND captures every fence atomically with it.
+    let fence = client
+        .query_one(
+            "select pg_current_wal_lsn()::text, pg_current_snapshot()::text, pg_current_wal_insert_lsn()::text",
+            &[],
+        )
+        .await
+        .with_context(|| format!("{what} snapshot fences"))?;
+    let seed_lsn: String = fence.get(0);
+    let snapshot: String = fence.get(1);
+    let horizon_lsn: String = fence.get(2);
+    let gate = SnapshotGate::parse_with_horizon(&snapshot, &seed_lsn, &horizon_lsn);
+    Ok(SnapshotFences { seed_lsn, horizon_lsn, snapshot, gate })
+}
+
+/// Poll fresh snapshots (outside any transaction) until every transaction `pending` names is
+/// visible, bounded by `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS` from `started`.
+///
+/// A pending xid at or past a fresh snapshot's `xmax` is visible only once it ends, so it must still
+/// be in the ProcArray. One that is not was never a transaction of THIS cluster (the change log held
+/// it from before an epoch reset or a restore), or it ended between the snapshot and the ProcArray
+/// read — and then it is visible now. Either way waiting for it is pointless, so it is forgotten.
+async fn wait_until_visible(client: &PooledClient, mut pending: Unsettled, started: std::time::Instant) -> Result<()> {
+    let limit = std::time::Duration::from_millis(backfill_config().settle_timeout_ms);
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        let text: String = client.query_one("select pg_current_snapshot()::text", &[]).await?.get(0);
+        let now = SnapshotGate::parse(&text, "0/0");
+        pending.xids.retain(|&x| !now.visible(u64::from(x)));
+        if pending.xids.iter().any(|&x| !xid_precedes(u64::from(x), now.xmax)) {
+            let running: std::collections::HashSet<u32> = client
+                .query("select backend_xid::text::bigint from pg_stat_activity where backend_xid is not null", &[])
+                .await?
+                .iter()
+                .map(|r| r.get::<_, i64>(0) as u32)
+                .collect();
+            let (ahead, rest): (Vec<u32>, Vec<u32>) =
+                pending.xids.iter().partition(|&&x| !xid_precedes(u64::from(x), now.xmax) && !running.contains(&x));
+            if !ahead.is_empty() {
+                tracing::warn!(
+                    xids = ?ahead,
+                    "sequenced transaction(s) are past the snapshot horizon but not running; forgetting them"
+                );
+                client.inner.sequenced.forget(&ahead);
+                pending.xids = rest;
+            }
+        }
+        if pending.dropped_through.is_some_and(|d| xid_precedes(u64::from(d), now.xmin)) {
+            pending.dropped_through = None;
+        }
+        if pending.xids.is_empty() && pending.dropped_through.is_none() {
+            return Ok(());
+        }
+        if started.elapsed() >= limit {
+            return Err(anyhow::Error::new(SnapshotUnsettled { waited: started.elapsed(), pending: pending.xids }));
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(std::time::Duration::from_millis(50));
     }
 }
 
@@ -1216,11 +1620,15 @@ pub struct BackfillConfig {
     /// `SET LOCAL statement_timeout` inside the backfill transaction, in milliseconds. `0` = off
     /// (the default): a backfill takes as long as it takes.
     pub statement_timeout_ms: u64,
+    /// How long a backfill or subset snapshot may wait for already-sequenced transactions to become
+    /// visible before the request fails as retryable (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS`,
+    /// see [`SequencedXids`]).
+    pub settle_timeout_ms: u64,
 }
 
 impl Default for BackfillConfig {
     fn default() -> Self {
-        BackfillConfig { append_bytes: 16 * 1024 * 1024, statement_timeout_ms: 0 }
+        BackfillConfig { append_bytes: 16 * 1024 * 1024, statement_timeout_ms: 0, settle_timeout_ms: 10_000 }
     }
 }
 
@@ -1433,9 +1841,9 @@ pub async fn backfill_where_reader<'a>(
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
 ) -> Result<BackfillReader<'a>> {
-    client.transaction_started();
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin backfill snapshot")?;
-    match backfill_open_in_txn(client, ts, where_sql).await {
+    let cfg = backfill_config();
+    let fences = begin_settled_snapshot(client, cfg.statement_timeout_ms, "backfill").await?;
+    match backfill_open_in_txn(client, ts, where_sql, fences).await {
         Ok(reader) => Ok(reader),
         Err(error) => {
             if client.batch_execute("ROLLBACK").await.is_ok() {
@@ -1450,23 +1858,10 @@ async fn backfill_open_in_txn<'a>(
     client: &'a PooledClient,
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
+    fences: SnapshotFences,
 ) -> Result<BackfillReader<'a>> {
     let cfg = backfill_config();
-    // Slow-backfill guard, off by default. `LOCAL` scopes it to this transaction, so the pooled
-    // connection carries nothing back to the next borrower. A timeout fails THIS create with a
-    // clear, retryable error; nothing is retired and nothing is purged.
-    if cfg.statement_timeout_ms > 0 {
-        client
-            .batch_execute(&format!("SET LOCAL statement_timeout = {}", cfg.statement_timeout_ms))
-            .await
-            .context("setting the backfill statement timeout")?;
-    }
-    // One statement establishes the snapshot AND captures both fences (LSN + xid snapshot)
-    // atomically with it.
-    let fence = client.query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[]).await?;
-    let seed_lsn: String = fence.get(0);
-    let snap: String = fence.get(1);
-    let gate = SnapshotGate::parse(&snap, &seed_lsn);
+    let SnapshotFences { seed_lsn, gate, .. } = fences;
     let where_present = where_sql.is_some();
     let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
@@ -1502,27 +1897,15 @@ pub async fn backfill_group_counts(
     ts: &TableSchema,
     group_cols: &[usize],
 ) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
-    client.transaction_started();
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .context("begin counts seed snapshot")?;
-    let result = group_counts_in_txn(client, ts, group_cols).await;
+    let fences = begin_settled_snapshot(client, 0, "counts seed").await?;
+    let result = group_counts_in_txn(client, ts, group_cols).await.map(|rows| (rows, fences.gate));
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
     result
 }
 
-async fn group_counts_in_txn(
-    client: &Client,
-    ts: &TableSchema,
-    group_cols: &[usize],
-) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
-    let fence = client.query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[]).await?;
-    let seed_lsn: String = fence.get(0);
-    let snap: String = fence.get(1);
-    let gate = SnapshotGate::parse(&snap, &seed_lsn);
+async fn group_counts_in_txn(client: &Client, ts: &TableSchema, group_cols: &[usize]) -> Result<Vec<(Row, i64)>> {
     let mut args = Vec::new();
     let mut by = Vec::new();
     for &i in group_cols {
@@ -1549,7 +1932,7 @@ async fn group_counts_in_txn(
         // Missing (non-group) columns default to Null — the pipeline projects only group cols.
         out.push((ts.row_from_json(obj)?, r.get::<_, i64>(1)));
     }
-    Ok((out, gate))
+    Ok(out)
 }
 
 /// The per-row JSON projection used by backfill and subset query-backs. Text-mapped columns are cast
@@ -1578,10 +1961,18 @@ fn row_json_expr(ts: &TableSchema) -> String {
     objs.join(" || ")
 }
 
-/// Result of a one-shot subset query: the page rows + the snapshot LSN they were read at.
+/// Result of a one-shot subset query: the page rows + the fences of the settled snapshot they were
+/// read in.
 pub struct SubsetQuery {
     pub rows: Vec<Row>,
+    /// `pg_current_wal_lsn()` at the snapshot — the page's LSN positioning point (older clients).
     pub lsn: String,
+    /// `pg_current_snapshot()::text` of the page's snapshot, full xid8 values: a client skips a live
+    /// change only if its transaction was visible to this snapshot.
+    pub snapshot: String,
+    /// `pg_current_wal_insert_lsn()` at the snapshot: no change at or past it can be in the page, so
+    /// a client may drop the snapshot once its tail passes this LSN.
+    pub horizon: String,
 }
 
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
@@ -1611,13 +2002,13 @@ pub async fn query_subset_where(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
-    client.transaction_started();
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin subset snapshot")?;
+    let fences = begin_settled_snapshot(client, 0, "subset").await?;
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
-    result
+    let rows = result?;
+    Ok(SubsetQuery { rows, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
 }
 
 /// One `ORDER BY` term for a subset page.
@@ -1641,8 +2032,7 @@ async fn query_subset_in_txn(
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<SubsetQuery> {
-    let lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
+) -> Result<Vec<Row>> {
     let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
@@ -1681,7 +2071,7 @@ async fn query_subset_in_txn(
         let obj = j.as_object().context("subset row expr did not return an object")?;
         out.push(ts.row_from_json(obj)?);
     }
-    Ok(SubsetQuery { rows: out, lsn })
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1715,6 +2105,89 @@ mod tests {
         let p = SnapshotGate::passthrough();
         assert!(!p.should_skip(0x50, Some(99)));
         assert!(!p.should_skip(0x50, None));
+    }
+
+    /// The gate compares 32-bit xids the way PostgreSQL does (modulo 2^32), so a snapshot taken just
+    /// before an xid epoch boundary still treats a transaction from just after it as LATER. Masking
+    /// and comparing with plain `<` made such a transaction (masked xid 5 < masked xmin 0xFFFF_FFFA)
+    /// look committed-before-the-snapshot, and every one of its changes was skipped.
+    #[test]
+    fn snapshot_gate_is_wraparound_safe() {
+        // xid8 values straddling 2^32: xmin 2^32-6, xmax 2^32+4, in progress {2^32-1, 2^32+3}.
+        let g = SnapshotGate::parse("4294967290:4294967300:4294967295,4294967299", "0/100");
+        assert!(g.should_skip(0, Some(4_294_967_288)), "before xmin: in the snapshot");
+        assert!(g.should_skip(0, Some(4_294_967_294)), "between xmin and xmax, not in progress: in the snapshot");
+        assert!(g.should_skip(0, Some(2)), "2^32+2 masked: between xmin and xmax across the boundary");
+        assert!(!g.should_skip(0, Some(4_294_967_295)), "in progress before the boundary: not in the snapshot");
+        assert!(!g.should_skip(0, Some(3)), "in progress after the boundary: not in the snapshot");
+        assert!(!g.should_skip(0, Some(4)), "at xmax: not in the snapshot");
+        assert!(!g.should_skip(0, Some(5)), "the next epoch's xid 5 is after the snapshot, not before xmin");
+    }
+
+    /// A change whose commit LSN is at or past the snapshot's insert horizon cannot be in the
+    /// snapshot, whatever its xid compares as; a gate persisted before the horizon existed keeps the
+    /// xid-only rule.
+    #[test]
+    fn snapshot_gate_horizon_bounds_the_skip() {
+        let g = SnapshotGate::parse_with_horizon("100:110:103", "0/100", "0/180");
+        assert!(g.should_skip(0x170, Some(99)), "visible and below the horizon: skip");
+        assert!(!g.should_skip(0x180, Some(99)), "at the horizon: newer than the snapshot");
+        assert!(!g.should_skip(0x170, Some(103)), "in progress: never skipped");
+        assert!(g.should_skip(0, Some(99)), "unknown commit LSN: the xid decides");
+        let legacy: SnapshotGate =
+            serde_json::from_str(r#"{"lsn":256,"xmin":100,"xmax":110,"xip":[103]}"#).expect("old catalog gate");
+        assert!(legacy.should_skip(0x200, Some(99)), "no horizon recorded: xid-only, as before");
+    }
+
+    /// The settle set reports exactly the sequenced transactions a snapshot excludes, forgets the
+    /// ones it includes (visibility is permanent), and notes a transaction once however many
+    /// envelopes it has.
+    #[test]
+    fn sequenced_xids_report_what_a_snapshot_excludes() {
+        let seen = SequencedXids::default();
+        seen.note(100);
+        seen.note(100);
+        seen.note(101);
+        seen.note(4_294_967_396); // 2^32 + 100: the same 32-bit xid as the first — one entry
+        assert_eq!(seen.len(), 2);
+        // 100 still in progress (a commit held after its WAL was flushed); 101 visible.
+        let u = seen.unsettled(&SnapshotGate::parse("100:102:100", "0/1")).expect("100 is excluded");
+        assert_eq!(u.xids, vec![100]);
+        assert_eq!(seen.len(), 1, "101 was seen visible and forgotten");
+        // At xmax (e.g. the highest xid, still in SyncRep): excluded too.
+        seen.note(102);
+        let u = seen.unsettled(&SnapshotGate::parse("100:102:100", "0/1")).expect("excluded");
+        assert_eq!(u.xids, vec![100, 102]);
+        assert!(seen.unsettled(&SnapshotGate::parse("103:103:", "0/1")).is_none(), "both visible now");
+        assert!(seen.is_empty());
+    }
+
+    /// The set asks for a prune every `SEQUENCED_XIDS_PRUNE_AT` new entries (a repeated xid is not
+    /// a new entry), so a steady write load with no snapshots does not grow it toward the cap.
+    #[test]
+    fn sequenced_xids_schedule_a_prune_as_they_grow() {
+        let seen = SequencedXids::default();
+        let due: Vec<u64> = (1..=2 * SEQUENCED_XIDS_PRUNE_AT as u64).filter(|&x| seen.note_inner(x)).collect();
+        assert_eq!(due, vec![SEQUENCED_XIDS_PRUNE_AT as u64, 2 * SEQUENCED_XIDS_PRUNE_AT as u64]);
+        assert!(!seen.note_inner(2 * SEQUENCED_XIDS_PRUNE_AT as u64), "the same transaction again");
+    }
+
+    /// Past the cap the set is dropped and only the newest dropped xid is kept: a snapshot settles
+    /// again once its xmin has passed it.
+    #[test]
+    fn sequenced_xids_overflow_settles_on_xmin() {
+        let seen = SequencedXids::default();
+        for x in 1_000..1_000 + SEQUENCED_XIDS_CAP as u64 {
+            seen.note(x);
+        }
+        let newest = 1_000 + SEQUENCED_XIDS_CAP as u64;
+        seen.note(newest); // overflows: everything so far is dropped
+        assert_eq!(seen.len(), 0);
+        let before = SnapshotGate::parse(&format!("{newest}:{}:", newest + 1), "0/1");
+        let u = seen.unsettled(&before).expect("xmin has not passed the dropped xids");
+        assert_eq!(u.dropped_through, Some(newest as u32));
+        let after = SnapshotGate::parse(&format!("{}:{}:", newest + 1, newest + 1), "0/1");
+        assert!(seen.unsettled(&after).is_none());
     }
 
     /// The boot taxonomy IS the contract: a fatal class must never be retried into an invisible

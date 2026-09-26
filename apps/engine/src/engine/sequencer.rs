@@ -156,6 +156,9 @@ pub(crate) fn spawn_sequencer(
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     // Per-shape ceiling for the pending-creation buffer (see `buffer_pending`).
     pending_buffer_max_bytes: u64,
+    // Postgres mode: where each transaction's xid is noted before it is fanned out, so a backfill or
+    // subset snapshot that still excludes it can be retaken (`pg::SequencedXids`).
+    sequenced: Option<Arc<crate::pg::SequencedXids>>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -188,6 +191,7 @@ pub(crate) fn spawn_sequencer(
         pause_gate,
         read_cap_latch,
         pending_buffer_max_bytes,
+        sequenced,
         shutdown,
         party,
     ));
@@ -455,6 +459,7 @@ pub(crate) async fn sequencer_loop(
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     pending_buffer_max_bytes: u64,
+    sequenced: Option<Arc<crate::pg::SequencedXids>>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -830,6 +835,13 @@ pub(crate) async fn sequencer_loop(
                         let mut j = i + 1;
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
+                        }
+                        // Before any of this transaction reaches a shape stream or a feed: a
+                        // snapshot taken from here on that still excludes it must be retaken, or
+                        // whatever it is paired with (a BeginShape point, a subset client's HEAD)
+                        // would sit past a transaction that is in neither (`pg::SequencedXids`).
+                        if let (Some(seen), Some(xid)) = (&sequenced, txid.as_deref().and_then(|t| t.parse::<u64>().ok())) {
+                            seen.note(xid);
                         }
                         // Feed this transaction into the dbsp counts pipelines and step the
                         // circuit BEFORE fanning it out, so circuit-served aggregates emit

@@ -12,6 +12,9 @@ import {
   lsnToU64,
   makeCmp,
   mergeFeedDelta,
+  pageIncludes,
+  pageSupersedes,
+  parsePageSnapshot,
   startLeaseRenewal,
   type SubsetDeps,
   type SubsetView,
@@ -152,13 +155,13 @@ describe('mergeFeedDelta — LSN positioning', () => {
     expect(view.present.has('1')).toBe(false)
     // The watermark survives as a tombstone: absent + watermark w = "deleted at ≥ w".
     expect(view.applied.get('1')).toBe(D)
-    // The loadMore guard (`pageLsn < w` → skip) then drops a page snapshotted before the delete…
+    // The loadMore guard (`pageSupersedes`) then drops a page snapshotted before the delete…
     const stalePageLsn = lsnToU64('0/120')!
-    const w = view.applied.get('1')
-    expect(w !== undefined && stalePageLsn < w).toBe(true) // row stays deleted
+    const w = view.applied.get('1')!
+    expect(pageSupersedes(stalePageLsn, w, undefined)).toBe(false) // row stays deleted
     // …while a page at/after the delete (row genuinely re-created) is admitted.
     const freshPageLsn = lsnToU64('0/160')!
-    expect(w !== undefined && freshPageLsn < w).toBe(false)
+    expect(pageSupersedes(freshPageLsn, w, undefined)).toBe(true)
   })
 
   it('records a tombstone for a delete of a never-seen pk (no write, but no ghost from a stale page)', () => {
@@ -185,6 +188,98 @@ describe('mergeFeedDelta — LSN positioning', () => {
     expect(mergeFeedDelta(view, upsert(1, undefined, { t: 'x' }))).toEqual({ type: 'update', value: { id: 1, t: 'x' } })
     expect(mergeFeedDelta(view, upsert(2, undefined))).toEqual({ type: 'insert', value: { id: 2 } })
     expect(mergeFeedDelta(view, del(2, undefined))).toEqual({ type: 'delete', key: '2' })
+  })
+})
+
+function txn(env: Env, txid: string): Env {
+  return { ...env, headers: { ...env.headers, txid } }
+}
+
+/**
+ * A view seeded from a page whose snapshot is `snapshot` (`xmin:xmax:xip`), read at LSN 0/100 with
+ * insert horizon 0/180 — the fields a newer engine returns with every page.
+ */
+function viewWithSnapshot(pageIds: number[], snapshot: string): SubsetView {
+  const snap = parsePageSnapshot('0/100', snapshot, '0/180')!
+  const view: SubsetView = {
+    snapshotLsn: snap.lsn,
+    snapshot: snap,
+    present: new Set(pageIds.map(String)),
+    applied: new Map(pageIds.map((id) => [String(id), snap])),
+    appliedTxid: new Map(),
+    inView: () => true,
+  }
+  return view
+}
+
+describe('page snapshot positioning (transaction visibility, not LSN order)', () => {
+  // T (xid 105) committed at 0/90 — BELOW the page LSN 0/100 — but was still invisible when the
+  // page snapshot was taken (a commit is flushed and decoded before it becomes visible), so it is in
+  // the snapshot's xip and missing from the page.
+  const S = '100:110:105'
+
+  it('applies an insert whose commit LSN is below the page LSN when its transaction was not visible', () => {
+    const view = viewWithSnapshot([], S)
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/90'), '105'))).toEqual({ type: 'insert', value: { id: 1 } })
+  })
+
+  it('applies an update to a loaded row when its transaction was not visible to the page', () => {
+    const view = viewWithSnapshot([1], S)
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/90', { n: 10 }), '105'))).toEqual({
+      type: 'update',
+      value: { id: 1, n: 10 },
+    })
+    // …and its version is now that change, so a re-delivery of an older change stays dropped.
+    expect(view.applied.get('1')).toBe(lsnToU64('0/90'))
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/80', { n: 5 }), '104'))).toBeNull()
+  })
+
+  it('drops a change the page already reflects, whatever its LSN relative to the page LSN', () => {
+    const view = viewWithSnapshot([1], S)
+    // xid 104 was visible (in [xmin, xmax), not in xip) although it committed at 0/120 >= 0/100.
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/120'), '104'))).toBeNull()
+    expect(mergeFeedDelta(view, txn(upsert(2, '0/120'), '104'))).toBeNull()
+    // started after the snapshot
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/120', { n: 1 }), '110'))).toEqual({
+      type: 'update',
+      value: { id: 1, n: 1 },
+    })
+  })
+
+  it('never treats a change at or past the horizon as already in the page, and stops consulting it', () => {
+    const view = viewWithSnapshot([1], S)
+    expect(pageIncludes(view.snapshot!, lsnToU64('0/17F'), '99')).toBe(true)
+    expect(pageIncludes(view.snapshot!, lsnToU64('0/180'), '99')).toBe(false)
+    expect(mergeFeedDelta(view, txn(upsert(3, '0/180'), '99'))).toEqual({ type: 'insert', value: { id: 3 } })
+    expect(view.snapshot!.passed).toBe(true)
+  })
+
+  it('compares xids modulo 2^32 across an epoch boundary (xid8 values are masked like the envelope txid)', () => {
+    // xmin 2^32-6, xmax 2^32+4, in progress 2^32+3.
+    const snap = parsePageSnapshot('0/100', '4294967290:4294967300:4294967299', '0/180')!
+    expect(pageIncludes(snap, lsnToU64('0/90'), '4294967294')).toBe(true)
+    expect(pageIncludes(snap, lsnToU64('0/90'), '2')).toBe(true) // 2^32+2
+    expect(pageIncludes(snap, lsnToU64('0/90'), '3')).toBe(false) // in progress
+    expect(pageIncludes(snap, lsnToU64('0/90'), '5')).toBe(false) // after the snapshot, not "before xmin"
+  })
+
+  it('falls back to LSN positioning for an engine without snapshot fields, and for a change without a txid', () => {
+    expect(parsePageSnapshot('0/100', undefined, undefined)).toBeNull()
+    expect(parsePageSnapshot('0/100', '1:2:', 'garbage')).toBeNull()
+    const snap = parsePageSnapshot('0/100', S, '0/180')!
+    expect(pageIncludes(snap, lsnToU64('0/90'), undefined)).toBe(true)
+    expect(pageIncludes(snap, lsnToU64('0/110'), undefined)).toBe(false)
+  })
+
+  it('lets a loadMore page replace a live change only if the page includes that change', () => {
+    const view = viewWithSnapshot([], S)
+    mergeFeedDelta(view, txn(upsert(1, '0/90', { n: 10 }), '105'))
+    const w = view.applied.get('1')!
+    const txid = view.appliedTxid!.get('1')
+    // A page whose snapshot still had 105 in progress is older than the view's row.
+    expect(pageSupersedes(parsePageSnapshot('0/200', '100:120:105', '0/210')!, w, txid)).toBe(false)
+    // One that saw 105 committed may replace it.
+    expect(pageSupersedes(parsePageSnapshot('0/200', '106:120:', '0/210')!, w, txid)).toBe(true)
   })
 })
 
