@@ -1665,6 +1665,10 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // Backfill/subset snapshots currently waiting for transactions the sequencer already fanned
         // out to become visible to new snapshots (see `pg::SequencedXids`). Diagnostic only.
         "visibilityWaits": crate::pg::settle_waits_active(),
+        // The settle record (size, peak, bytes, transactions dropped at its bound) and counters
+        // (poller ticks/failures, checks, retakes, timeouts, admission rejections) plus the settle
+        // wait-duration distribution. Diagnostic only.
+        "settle": crate::pg::settle_stats_json(),
         // Flip batches abandoned after exhausting their retries; non-zero means the engine is
         // degraded (its membership-bearing routes answer 503) and must be restarted.
         "flipFailures": engine.flip_failures(),

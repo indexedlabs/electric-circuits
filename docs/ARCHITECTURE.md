@@ -345,13 +345,33 @@ fanned out while T is still invisible (its commit record is flushed and decoded,
 not left the ProcArray — microseconds normally, as long as a synchronous standby takes with
 synchronous replication) sits behind a shape's `BeginShape` point or a subset client's HEAD offset
 and outside any snapshot taken in that window. So every backfill and query-back snapshot is opened
-through `pg::begin_settled_snapshot`: the sequencer notes each transaction's xid in
-`pg::SequencedXids` before fanning it out, and a snapshot that excludes a noted xid is rolled back,
-the engine waits until those xids are visible (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS`; past it a
-subset query answers a retryable 503 and a create fails and is rolled back), and one more snapshot is taken — which needs no second check, because everything
-paired with it was noted before the first. `pg_xact_status()` cannot detect this window (it reports
-such a transaction as `in progress`). The gate's 32-bit xids are compared modulo 2^32, and a change at
-or past the snapshot's `pg_current_wal_insert_lsn()` horizon is never skipped.
+through `pg::begin_settled_snapshot` (`apps/engine/src/pg/settle.rs`):
+
+- The sequencer notes each transaction's xid, **per table it touched**, in `pg::SequencedXids`
+  before fanning it out: per-table sparse bitmaps of 1024-xid chunks, xids unwrapped modulo 2^32
+  (PostgreSQL's `TransactionIdPrecedes`), so a transaction from just after an xid epoch boundary
+  orders after one from just before it.
+- A snapshot is checked only against the tables its read depends on (the table, plus the inner
+  tables of a subquery predicate) and only where a sequenced transaction can hide from it: the
+  snapshot's `xip` list and `[xmax, highest sequenced]`. A transaction the engine never sequenced —
+  a long-open writer pinning `xmin` — is never consulted, so it can never block a settle.
+- A snapshot that excludes one is rolled back, its pooled connection is **released**, and the
+  request waits (no connection held) for the one **visibility poller** per database — its own
+  dedicated connection, never a pooled one — to see those transactions visible; then it takes a
+  connection again and one more snapshot, which needs no second check, because everything paired
+  with it was noted before the first. The whole wait, the retake's pool wait included, is bounded by
+  `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS`; past it, or past the waiter cap
+  (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS`), a subset query or shape create answers a
+  retryable 503 with `Retry-After` (typed through the create and share paths) and a create is
+  rolled back. A poller that cannot run only makes waits time out.
+- The poller forgets what a fresh snapshot shows visible every tick, so the record is normally a
+  chunk or two. It is bounded (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`, ~2 MiB by default); at
+  the bound the **oldest** recorded transactions are given up — their settle is no longer
+  guaranteed, counted and logged — rather than failing or stalling every snapshot.
+
+`pg_xact_status()` cannot detect the window by itself (it reports such a transaction as
+`in progress`). The gate's 32-bit xids are compared modulo 2^32, and a change at or past the
+snapshot's `pg_current_wal_insert_lsn()` horizon is never skipped.
 ---
 
 ## 5. The engine: fan-out, sharing, lifecycle

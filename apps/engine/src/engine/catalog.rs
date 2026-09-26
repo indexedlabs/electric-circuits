@@ -1526,7 +1526,6 @@ impl Engine {
         )
         .await
         .map(|_| ())
-        .map_err(|e| anyhow::anyhow!(e))
     }
 }
 
