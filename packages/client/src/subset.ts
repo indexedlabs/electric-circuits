@@ -308,15 +308,39 @@ export interface PageSnapshot {
   xmin: number
   xmax: number
   xip: Set<number>
-  /** Set once the live tail delivered a change at/past `horizon`: every later change is newer. */
+  /**
+   * Set once the live tail delivered a change at/past `horizon`: every later change is newer, so the
+   * snapshot is never consulted again and its `xip` is cleared.
+   */
   passed?: boolean
 }
 
-const U32 = 0xffffffffn
+const TWO_32 = 4294967296
 
-function xid32(text: string): number | null {
-  if (!/^\d+$/.test(text)) return null
-  return Number(BigInt(text) & U32)
+/**
+ * A decimal transaction id modulo 2^32 (pgoutput's 32-bit xid, or a snapshot's xid8 masked to match),
+ * or `null` if `text` is not all digits. No regex and no BigInt: this runs for every live change.
+ * Exact in doubles — up to 15 digits accumulate below 2^53 and are reduced once; longer text is
+ * reduced digit by digit, where `v * 10 + d` stays below 2^36.
+ */
+export function xid32(text: string): number | null {
+  const n = text.length
+  if (n === 0) return null
+  let v = 0
+  if (n <= 15) {
+    for (let i = 0; i < n; i++) {
+      const d = text.charCodeAt(i) - 48
+      if (d < 0 || d > 9) return null
+      v = v * 10 + d
+    }
+    return v < TWO_32 ? v : v % TWO_32
+  }
+  for (let i = 0; i < n; i++) {
+    const d = text.charCodeAt(i) - 48
+    if (d < 0 || d > 9) return null
+    v = (v * 10 + d) % TWO_32
+  }
+  return v
 }
 
 /** PostgreSQL's `TransactionIdPrecedes`: the 32-bit difference read as signed. */
@@ -350,15 +374,26 @@ export function parsePageSnapshot(lsn: string | undefined, snapshot: unknown, ho
 /**
  * Is the change (commit LSN `lsn`, transaction `txid`) already reflected in a page read at `snap`?
  * A change with no LSN is never "already in" anything (library mode applies idempotently by pk).
+ * `txid` is the envelope's decimal text or an already-parsed 32-bit xid.
  */
-export function pageIncludes(snap: PageSnapshot, lsn: bigint | null, txid: string | undefined): boolean {
+export function pageIncludes(snap: PageSnapshot, lsn: bigint | null, txid: string | number | undefined): boolean {
+  return includesXid(snap, lsn, typeof txid === 'string' ? xid32(txid) : (txid ?? null))
+}
+
+/** [`pageIncludes`] with the xid already parsed (`null` = the change carried none). */
+function includesXid(snap: PageSnapshot, lsn: bigint | null, x: number | null): boolean {
   if (lsn === null) return false
   if (snap.passed || lsn >= snap.horizon) return false
-  const x = txid === undefined ? null : xid32(txid)
   if (x === null) return lsn < snap.lsn
   if (xidPrecedes(x, snap.xmin)) return true
   if (!xidPrecedes(x, snap.xmax)) return false
   return !snap.xip.has(x)
+}
+
+/** Mark `snap` passed: the tail is at/after its horizon, so nothing later can be in its page. */
+function markPassed(snap: PageSnapshot): void {
+  snap.passed = true
+  snap.xip.clear()
 }
 
 /**
@@ -375,23 +410,31 @@ export interface SubsetView {
   snapshot?: PageSnapshot | null
   present: Set<string>
   applied: Map<string, RowVersion>
-  /** The transaction behind each bigint entry of `applied`, when the change carried one. */
-  appliedTxid?: Map<string, string>
+  /** The transaction (32-bit xid) behind each bigint entry of `applied`, when the change carried one. */
+  appliedTxid?: Map<string, number>
+  /**
+   * `loadMore` page snapshots rows may still be versioned by and the tail has not yet passed (see
+   * [`trackPageSnapshot`]). Each is marked passed — its `xip` cleared — once a change at/past its
+   * horizon arrives, exactly like `snapshot`.
+   */
+  pending?: PageSnapshot[]
   /** Is the row within the currently-loaded keyset window? */
   inView: (row: Row) => boolean
 }
 
-/** Does version `v` already include the change (`lsn`, `txid`)? */
-function versionIncludes(v: RowVersion, lsn: bigint | null, txid: string | undefined): boolean {
-  if (typeof v === 'bigint') return lsn !== null && lsn < v
-  return pageIncludes(v, lsn, txid)
+/** Register a `loadMore` page's snapshot so the tail marks it passed once it reaches its horizon. */
+export function trackPageSnapshot(view: SubsetView, snap: PageSnapshot): void {
+  if (snap.passed) return
+  if (view.pending) view.pending.push(snap)
+  else view.pending = [snap]
 }
 
 /**
  * May a page read at `page` replace a row whose current version is `w`? Only if the page already
- * includes the change that produced `w` — otherwise the page is older than what the view holds.
+ * includes the change that produced `w` (transaction `wTxid`) — otherwise the page is older than
+ * what the view holds.
  */
-export function pageSupersedes(page: RowVersion, w: RowVersion, wTxid: string | undefined): boolean {
+export function pageSupersedes(page: RowVersion, w: RowVersion, wTxid: string | number | undefined): boolean {
   if (typeof w !== 'bigint') return true // two pages: the later request read the later snapshot
   if (typeof page === 'bigint') return page >= w
   return pageIncludes(page, w, wTxid)
@@ -414,57 +457,79 @@ export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeActi
   const key = env.key
   const deltaLsn = lsnToU64(env.headers.lsn)
   const txid = env.headers.txid
-  // The page snapshot is consulted only below its horizon; once the tail has passed it, every
-  // change is newer than the page (the feed is in commit-LSN order).
-  if (view.snapshot && deltaLsn !== null && deltaLsn >= view.snapshot.horizon && !view.snapshot.passed) {
-    view.snapshot.passed = true
-    view.snapshot.xip.clear()
-  }
+  // A page snapshot is consulted only below its horizon; once the tail has passed it, every change
+  // is newer than that page (the feed is in commit-LSN order), so it is marked passed for good.
+  if (deltaLsn !== null) passHorizons(view, deltaLsn)
   // A null LSN (library/no-Postgres mode) always applies — the old idempotent-by-pk behaviour.
   // Otherwise the change is fresh unless the row's version (or, for a row the view does not hold,
-  // the page it was absent from) already includes it.
-  const fresh = (): boolean => {
-    if (deltaLsn === null) return true
-    const w = view.applied.get(key) ?? view.snapshot ?? view.snapshotLsn
-    return !versionIncludes(w, deltaLsn, txid)
-  }
-  const record = (): void => {
-    if (deltaLsn !== null) {
-      view.applied.set(key, deltaLsn)
-      if (txid !== undefined) view.appliedTxid?.set(key, txid)
-      else view.appliedTxid?.delete(key)
-    } else {
-      view.applied.delete(key)
-      view.appliedTxid?.delete(key)
-    }
-  }
+  // the page it was absent from) already includes it. (No per-call closures: this runs for every
+  // live change.)
+  const fresh = deltaLsn === null || isFresh(view, key, deltaLsn, txid)
   if (env.headers.operation === 'delete') {
-    if (!fresh()) return null
+    if (!fresh) return null
     const wasPresent = view.present.has(key)
     view.present.delete(key)
     // Keep a tombstone watermark instead of clearing it: absence from `present` + watermark w means
     // "deleted at ≥ w", so an in-flight loadMore page snapshotted before the delete (pageLsn < w)
     // is skipped by the loadMore guard rather than resurrecting the row. Recorded even for a
     // never-seen pk — otherwise a stale page could insert a ghost row the feed already deleted.
-    record()
+    recordVersion(view, key, deltaLsn, txid)
     return wasPresent ? { type: 'delete', key } : null
   }
   const value = env.value
-  if (!value || !fresh()) return null
+  if (!value || !fresh) return null
   if (view.inView(value)) {
     const type = view.present.has(key) ? 'update' : 'insert'
     view.present.add(key)
-    if (deltaLsn !== null) record()
+    if (deltaLsn !== null) recordVersion(view, key, deltaLsn, txid)
     return { type, value }
   }
   if (view.present.has(key)) {
     // Moved out of the loaded window (e.g. its sort key dropped below the boundary). Same tombstone
     // treatment as a delete: a stale in-flight page must not re-insert the pre-move version.
     view.present.delete(key)
-    record()
+    recordVersion(view, key, deltaLsn, txid)
     return { type: 'delete', key }
   }
   return null
+}
+
+/** Mark every page snapshot the tail at `lsn` has reached passed (see [`mergeFeedDelta`]). */
+function passHorizons(view: SubsetView, lsn: bigint): void {
+  const snap = view.snapshot
+  if (snap && !snap.passed && lsn >= snap.horizon) markPassed(snap)
+  const pending = view.pending
+  if (pending === undefined || pending.length === 0) return
+  for (let i = pending.length - 1; i >= 0; i--) {
+    const p = pending[i]!
+    if (p.passed || lsn >= p.horizon) {
+      markPassed(p)
+      pending.splice(i, 1)
+    }
+  }
+}
+
+/** Is the change (`lsn`, `txid`) to `key` newer than what the view holds for it? */
+function isFresh(view: SubsetView, key: string, lsn: bigint, txid: string | undefined): boolean {
+  const w = view.applied.get(key) ?? view.snapshot ?? view.snapshotLsn
+  if (typeof w === 'bigint') return lsn >= w
+  return !includesXid(w, lsn, txid === undefined ? null : xid32(txid))
+}
+
+/** The row's version is now this change (or, without an LSN, nothing: it applies idempotently). */
+function recordVersion(view: SubsetView, key: string, lsn: bigint | null, txid: string | undefined): void {
+  const txids = view.appliedTxid
+  if (lsn !== null) {
+    view.applied.set(key, lsn)
+    if (txids !== undefined) {
+      const x = txid === undefined ? null : xid32(txid)
+      if (x !== null) txids.set(key, x)
+      else txids.delete(key)
+    }
+  } else {
+    view.applied.delete(key)
+    txids?.delete(key)
+  }
 }
 
 /**
@@ -588,7 +653,7 @@ export async function createSubset<T extends Row = Row>(
     // include it: for a page version that is transaction visibility, not LSN order, because a commit
     // below the page LSN can still be missing from the page. Exactly-once after the snapshot.
     const applied = new Map<string, RowVersion>()
-    const appliedTxid = new Map<string, string>()
+    const appliedTxid = new Map<string, number>()
     const inView = (row: Row): boolean => {
       // The lower bound holds even once `ended`: "fully loaded" means the pages ran out, not that
       // the rows below the offset joined the window.
@@ -599,7 +664,7 @@ export async function createSubset<T extends Row = Row>(
     let ctl: SyncCtl | null = null
     let loadsInFlight = 0
 
-    const view: SubsetView = { snapshotLsn: 0n, snapshot: null, present, applied, appliedTxid, inView }
+    const view: SubsetView = { snapshotLsn: 0n, snapshot: null, present, applied, appliedTxid, pending: [], inView }
     // Bumped by every `seedPage`. A `loadMore` page that was requested against the PREVIOUS window
     // is meaningless once the window has been re-derived from a fresh page, so it is dropped rather
     // than merged into rows it no longer describes.
@@ -634,6 +699,8 @@ export async function createSubset<T extends Row = Row>(
       ended = limit === 0 || rows.length < limit
       view.snapshotLsn = pageLsn
       view.snapshot = snap
+      // Every row now carries this page's snapshot: earlier loadMore snapshots are unreferenced.
+      view.pending = []
       windowGeneration += 1
     }
     const applyEnvelope = (env: StreamEnvelope): void => {
@@ -746,7 +813,9 @@ export async function createSubset<T extends Row = Row>(
             // Tombstoned rows (watermark without membership) are skipped the same way — a page older than
             // the delete must not resurrect the row.
             const pageLsn = lsnToU64(page.lsn) ?? view.snapshotLsn
-            const pageVersion: RowVersion = pageSnapshotOf(page) ?? pageLsn
+            const pageSnap = pageSnapshotOf(page)
+            const pageVersion: RowVersion = pageSnap ?? pageLsn
+            let versioned = false
             ctl.begin()
             for (const r of page.rows) {
               const k = String(r[pk])
@@ -756,8 +825,12 @@ export async function createSubset<T extends Row = Row>(
               present.add(k)
               applied.set(k, pageVersion)
               appliedTxid.delete(k)
+              versioned = true
             }
             ctl.commit()
+            // Rows now carry this page's snapshot as their version: let the tail retire it (mark it
+            // passed, drop its xip) once it reaches the page's horizon, as it does the first page's.
+            if (pageSnap && versioned) trackPageSnapshot(view, pageSnap)
             boundary = page.rows[page.rows.length - 1]!
           }
           if (page.rows.length < pageSize) ended = true
