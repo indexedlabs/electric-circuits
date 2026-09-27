@@ -15,8 +15,10 @@
 //!
 //! * The sequencer notes each transaction's xid, per table it touched, BEFORE it fans the
 //!   transaction out ([`SequencedXids::note`]).
-//! * A snapshot is checked only against the tables its read depends on ([`SettleScope`]), and
-//!   only at the places a sequenced transaction can hide from it: the snapshot's `xip` list and
+//! * A snapshot is checked only against the tables its read depends on ([`SettleScope`]), as their
+//!   record stood just BEFORE the snapshot was opened (the poller may prune a transaction that
+//!   became visible after the snapshot was taken, before it is checked), and only at the places a
+//!   sequenced transaction can hide from it: the snapshot's `xip` list and
 //!   `[xmax, highest sequenced]`. A sequenced transaction below `xmin`, or between `xmin` and `xmax`
 //!   and not in `xip`, is visible by definition. A transaction the engine never sequenced — an
 //!   open writer pinning `xmin`, however old — is never looked at, so it can never block a settle.
@@ -128,7 +130,7 @@ impl Chunk {
 }
 
 /// One table's sequenced-but-not-yet-seen-visible xids: chunks sorted by key.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct TableXids {
     chunks: VecDeque<Chunk>,
     len: u64,
@@ -267,31 +269,74 @@ struct Record {
     dropped_since_log: u64,
 }
 
-impl Record {
-    /// A 32-bit xid, placed in the 64-bit space of everything recorded: the value within 2^31 of the
-    /// anchor that has these low 32 bits. That is exactly PostgreSQL's modulo-2^32 comparison
-    /// (`TransactionIdPrecedes`), so a transaction from just after an epoch boundary lands above one
-    /// from just before it. Sound while every live xid is within 2^31 of the newest, which
-    /// PostgreSQL's wraparound protection guarantees for anything that can still be committing.
-    fn unwrap(&self, xid: u32) -> u64 {
-        match self.anchor {
-            // First xid ever: park it one epoch up, so older xids unwrap without going below 0.
-            None => (1u64 << 32) | u64::from(xid),
-            Some(a) => {
-                let d = i64::from(xid.wrapping_sub(a as u32) as i32);
-                (a as i64 + d) as u64
-            }
+/// A 32-bit xid, placed in the 64-bit space of everything recorded: the value within 2^31 of
+/// `anchor` (the newest xid noted) that has these low 32 bits. That is exactly PostgreSQL's
+/// modulo-2^32 comparison (`TransactionIdPrecedes`), so a transaction from just after an epoch
+/// boundary lands above one from just before it. Sound while every live xid is within 2^31 of the
+/// newest, which PostgreSQL's wraparound protection guarantees for anything that can still be
+/// committing.
+fn unwrap_xid(anchor: Option<u64>, xid: u32) -> u64 {
+    match anchor {
+        // First xid ever: park it one epoch up, so older xids unwrap without going below 0.
+        None => (1u64 << 32) | u64::from(xid),
+        Some(a) => {
+            let d = i64::from(xid.wrapping_sub(a as u32) as i32);
+            (a as i64 + d) as u64
         }
+    }
+}
+
+/// `gate`'s fences, unwrapped against `anchor` (see [`unwrap_xid`]).
+fn fences_at(anchor: Option<u64>, gate: &SnapshotGate) -> Fences {
+    let mut xip: Vec<u64> = gate.xip.iter().map(|&x| unwrap_xid(anchor, x as u32)).collect();
+    xip.sort_unstable();
+    Fences { xmax: unwrap_xid(anchor, gate.xmax as u32), xip }
+}
+
+impl Record {
+    /// See [`unwrap_xid`].
+    fn unwrap(&self, xid: u32) -> u64 {
+        unwrap_xid(self.anchor, xid)
     }
 
     fn fences(&self, gate: &SnapshotGate) -> Fences {
-        let mut xip: Vec<u64> = gate.xip.iter().map(|&x| self.unwrap(x as u32)).collect();
-        xip.sort_unstable();
-        Fences { xmax: self.unwrap(gate.xmax as u32), xip }
+        fences_at(self.anchor, gate)
     }
 
     fn contains(&self, table: &str, v: u64) -> bool {
         self.tables.get(table).is_some_and(|t| t.contains(v))
+    }
+}
+
+/// What a scope's tables had recorded when a snapshot was about to be opened (see
+/// [`SequencedXids::capture`]).
+struct Captured {
+    anchor: Option<u64>,
+    tables: Vec<TableXids>,
+}
+
+impl Captured {
+    /// Captured transactions that `gate` does not see (unwrapped, sorted), or `None` if it sees them
+    /// all. Looks only at `gate`'s `xip` and at `[xmax, highest recorded]`.
+    ///
+    /// Everything the request paired with the snapshot was sequenced, hence noted, before the
+    /// capture. A transaction that was recorded then but pruned before the capture was already
+    /// visible, so a snapshot opened after the capture sees it.
+    fn unsettled(&self, gate: &SnapshotGate) -> Option<Vec<u64>> {
+        if self.tables.is_empty() {
+            return None;
+        }
+        let f = fences_at(self.anchor, gate);
+        let mut out = Vec::new();
+        for t in &self.tables {
+            t.unsettled(f.xmax, &f.xip, &mut out);
+        }
+        if out.is_empty() {
+            return None;
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
     }
 }
 
@@ -596,26 +641,23 @@ impl SequencedXids {
         }
     }
 
-    /// Recorded transactions on `scope`'s tables that `gate` does not see (unwrapped, sorted), or
-    /// `None` if it sees them all. Looks only at `gate`'s `xip` and at `[xmax, highest recorded]`.
-    fn unsettled(&self, scope: &SettleScope, gate: &SnapshotGate) -> Option<Vec<u64>> {
+    /// A copy of what is recorded on `scope`'s tables, taken BEFORE a snapshot is opened and checked
+    /// against afterwards ([`Captured::unsettled`]). Checking the live record instead would lose a
+    /// transaction the poller prunes between the snapshot and the check: it became visible after the
+    /// snapshot was taken, so the snapshot still excludes it, yet it would no longer be recorded.
+    ///
+    /// Normally the record is empty (nothing is copied) or a chunk or two per table.
+    fn capture(&self, scope: &SettleScope) -> Captured {
         let r = self.record.lock().unwrap();
-        if r.len == 0 {
-            return None;
-        }
-        let f = r.fences(gate);
-        let mut out = Vec::new();
-        for table in &scope.tables {
-            if let Some(t) = r.tables.get(table.as_str()) {
-                t.unsettled(f.xmax, &f.xip, &mut out);
+        let mut tables = Vec::new();
+        if r.len > 0 {
+            for table in &scope.tables {
+                if let Some(t) = r.tables.get(table.as_str()) {
+                    tables.push(t.clone());
+                }
             }
         }
-        if out.is_empty() {
-            return None;
-        }
-        out.sort_unstable();
-        out.dedup();
-        Some(out)
+        Captured { anchor: r.anchor, tables }
     }
 
     /// Forget everything `gate` shows visible, on every table (the poller's prune).
@@ -970,6 +1012,48 @@ async fn open_tracked(client: &PooledClient, statement_timeout_ms: u64, what: &s
     }
 }
 
+/// The outcome of checking a snapshot against the record of sequenced transactions.
+#[derive(Debug, PartialEq, Eq)]
+enum Check {
+    /// The snapshot contains every sequenced transaction its read depends on.
+    Settled,
+    /// Sequenced transactions (unwrapped, sorted) the snapshot excludes.
+    Pending(Vec<u64>),
+}
+
+/// What a snapshot is checked by: its visibility fences.
+trait HasGate {
+    fn gate(&self) -> &SnapshotGate;
+}
+
+impl HasGate for SnapshotFences {
+    fn gate(&self) -> &SnapshotGate {
+        &self.gate
+    }
+}
+
+impl HasGate for SnapshotGate {
+    fn gate(&self) -> &SnapshotGate {
+        self
+    }
+}
+
+/// Open a snapshot with `open` and check it against the sequenced transactions on `scope`'s tables
+/// as they were recorded BEFORE it was opened (see [`SequencedXids::capture`]).
+async fn open_checked<T: HasGate, Fut: std::future::Future<Output = Result<T>>>(
+    seen: &SequencedXids,
+    scope: &SettleScope,
+    open: impl FnOnce() -> Fut,
+) -> Result<(T, Check)> {
+    let captured = seen.capture(scope);
+    let opened = open().await?;
+    let check = match captured.unsettled(opened.gate()) {
+        None => Check::Settled,
+        Some(pending) => Check::Pending(pending),
+    };
+    Ok((opened, check))
+}
+
 /// Open the `REPEATABLE READ READ ONLY` transaction a backfill or query-back reads, and return its
 /// fences with the transaction still open. The snapshot is **settled** against what the sequencer
 /// has already fanned out on `scope`'s tables ([`SequencedXids`]): if it excludes such a
@@ -979,7 +1063,9 @@ async fn open_tracked(client: &PooledClient, statement_timeout_ms: u64, what: &s
 ///
 /// Anything the caller has already paired with this snapshot — the `BeginShape` point of a backfill,
 /// the feed offset a subset client HEADed before asking for its page — was produced from what the
-/// sequencer had sequenced by then, and all of that was noted before the first check. A transaction
+/// sequencer had sequenced by then, and all of that was noted before the record was captured for
+/// the first check (the capture is taken before the snapshot is opened, so the poller pruning a
+/// transaction in between cannot hide it from the check). A transaction
 /// the second snapshot excludes was excluded by the first as well (visibility only grows), so it was
 /// in the first check's set, and the call waited until it was visible. The second snapshot is
 /// therefore not re-checked: re-checking would chase transactions sequenced after the pairing point,
@@ -998,11 +1084,12 @@ pub(super) async fn begin_settled_snapshot(
     what: &str,
 ) -> Result<SnapshotFences> {
     let started = Instant::now();
-    let fences = open_tracked(client, statement_timeout_ms, what).await?;
-    METRICS.checks.fetch_add(1, Ordering::Relaxed);
     let seen = client.inner.sequenced.clone();
-    let Some(pending) = seen.unsettled(scope, &fences.gate) else {
-        return Ok(fences);
+    let (fences, check) = open_checked(&seen, scope, || open_tracked(client, statement_timeout_ms, what)).await?;
+    METRICS.checks.fetch_add(1, Ordering::Relaxed);
+    let pending = match check {
+        Check::Settled => return Ok(fences),
+        Check::Pending(pending) => pending,
     };
     if client.batch_execute("ROLLBACK").await.is_ok() {
         client.transaction_finished();
@@ -1075,6 +1162,13 @@ mod tests {
 
     fn gate(s: &str) -> SnapshotGate {
         SnapshotGate::parse(s, "0/1")
+    }
+
+    impl SequencedXids {
+        /// Capture and check at once (no snapshot is opened in between).
+        fn unsettled(&self, scope: &SettleScope, gate: &SnapshotGate) -> Option<Vec<u64>> {
+            self.capture(scope).unsettled(gate)
+        }
     }
 
     /// The check reports exactly the recorded transactions a snapshot excludes — those in its xip,
@@ -1160,6 +1254,25 @@ mod tests {
         let done = SnapshotGate::parse("4294967304:4294967304:", "0/1");
         seen.prune(&done);
         assert!(seen.is_empty());
+    }
+
+    /// T is sequenced (noted) before the request's pairing point, and the request's snapshot S is
+    /// taken while T is still invisible. If T becomes visible and the poller prunes it between S being
+    /// opened and S being checked, the check must still see that S excludes T: it is made against
+    /// the record as it stood BEFORE S was opened, not the live one.
+    #[tokio::test]
+    async fn a_prune_between_opening_and_checking_a_snapshot_does_not_settle_it() {
+        let seen = Arc::new(SequencedXids::default());
+        seen.note(600, ["public.items"]);
+        let (_, check) = open_checked(&seen, &items(), || async {
+            let s = gate("600:601:600"); // S: T (600) still in progress
+            seen.prune(&gate("601:601:")); // T visible now; the poller forgets it
+            Ok(s)
+        })
+        .await
+        .unwrap();
+        let Check::Pending(pending) = check else { panic!("S excludes T but was accepted as settled") };
+        assert_eq!(pending.iter().map(|&v| v as u32).collect::<Vec<_>>(), vec![600]);
     }
 
     /// Past its bound the record gives up its OLDEST transactions rather than failing snapshots:
