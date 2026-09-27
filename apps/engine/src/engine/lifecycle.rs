@@ -538,7 +538,7 @@ impl Engine {
                     }
                     // Registration failed: wake any joiners with the failure, then undo everything
                     // this create registered so later identical creates don't join a dead stream.
-                    let _ = ready_tx.send(ShareOutcome::Failed);
+                    let _ = ready_tx.send(ShareOutcome::failed_by(&e));
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -611,7 +611,7 @@ impl Engine {
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
-            Err(e) => Err(format!("creating shape stream: {e:#}")),
+            Err(e) => Err(e.context("creating shape stream")),
             Ok(()) => {
                 backfill_and_activate(
                     &self.ds,
@@ -686,10 +686,11 @@ impl Engine {
                     return Err(raced);
                 }
                 // Backfill/registration failed: wake any joiners, then undo the whole registration
-                // (no zombie shape a later identical create would join) and surface the error.
-                let _ = share_tx.send(ShareOutcome::Failed);
+                // (no zombie shape a later identical create would join) and surface the error —
+                // TYPED, so a snapshot that could not settle answers 503, not 500.
+                let _ = share_tx.send(ShareOutcome::failed_by(&e));
                 creating.rollback().await;
-                bail!("shape '{id}' creation failed: {e}")
+                Err(e.context(format!("shape '{id}' creation failed")))
             }
         }
     }
@@ -1040,9 +1041,9 @@ impl Engine {
                     creating.rollback().await;
                     return Err(raced);
                 }
-                let _ = share_tx.send(ShareOutcome::Failed);
+                let _ = share_tx.send(ShareOutcome::failed_by(&e));
                 creating.rollback().await;
-                bail!("aggregate '{id}' creation failed: {e}")
+                Err(e.context(format!("aggregate '{id}' creation failed")))
             }
         }
     }
@@ -2223,9 +2224,13 @@ impl Engine {
                     .with_context(|| format!("seed: unknown inner table '{inner_table}'"))?;
                 let wsql =
                     inner_where.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &begin.schemas, inner_table));
-                let client = crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
-                    .get()
-                    .await?;
+                let mut client =
+                    crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
+                        .get()
+                        .await?;
+                // Settled against the inner table and whatever ITS predicate's subqueries read.
+                let scope = crate::pg::SettleScope::request(inner_table)
+                    .with(inner_where.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
                 // `collect`: an inner-set node's seed IS engine state — the set it will maintain
                 // — so there is nothing to stream it to. It is read through the same streamed
                 // reader as every other backfill, so the transport (and the fences) are identical.
@@ -2238,7 +2243,8 @@ impl Engine {
                     inner_where_present = inner_where.is_some(),
                     "subquery inner seed started"
                 );
-                let (rows, fences) = crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
+                let (rows, fences) =
+                    crate::pg::backfill_where_reader(&mut client, &ts, wsql, &scope).await?.collect().await?;
                 tracing::info!(
                     target: "electric_circuits_engine::shape_create",
                     shape_id = id,
@@ -2256,14 +2262,19 @@ impl Engine {
                 (crate::pg::SnapshotGate::passthrough(), 0u64, HashSet::new())
             } else {
                 let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
-                let client = crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
-                    .get()
-                    .await?;
+                let mut client =
+                    crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
+                        .get()
+                        .await?;
+                // Settled against the outer table and every table its subqueries read.
+                let scope =
+                    crate::pg::SettleScope::request(table).with(crate::subquery::referenced_tables(where_json).iter());
                 // The OUTER shape's backfill is streamed: each chunk is appended to the (not yet
                 // installed) shape stream and dropped, so a wide subquery shape costs one chunk of
                 // memory, not a table's worth. Only the pk SET is kept — it is what
                 // `finish_create`'s gated replay is fenced against, and keys are small.
-                let mut reader = crate::pg::backfill_where_reader(&client, &outer_ts, Some((wsql, params))).await?;
+                let mut reader =
+                    crate::pg::backfill_where_reader(&mut client, &outer_ts, Some((wsql, params)), &scope).await?;
                 let mut seeded_pks: HashSet<String> = HashSet::new();
                 let mut seeded = 0u64;
                 let mut appends = 0u64;

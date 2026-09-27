@@ -12,7 +12,14 @@ import {
   lsnToU64,
   makeCmp,
   mergeFeedDelta,
+  pageIncludes,
+  pageSupersedes,
+  parsePageSnapshot,
   startLeaseRenewal,
+  trackPageSnapshot,
+  xid32,
+  type PageSnapshot,
+  type RowVersion,
   type SubsetDeps,
   type SubsetView,
 } from './subset.js'
@@ -152,13 +159,13 @@ describe('mergeFeedDelta — LSN positioning', () => {
     expect(view.present.has('1')).toBe(false)
     // The watermark survives as a tombstone: absent + watermark w = "deleted at ≥ w".
     expect(view.applied.get('1')).toBe(D)
-    // The loadMore guard (`pageLsn < w` → skip) then drops a page snapshotted before the delete…
+    // The loadMore guard (`pageSupersedes`) then drops a page snapshotted before the delete…
     const stalePageLsn = lsnToU64('0/120')!
-    const w = view.applied.get('1')
-    expect(w !== undefined && stalePageLsn < w).toBe(true) // row stays deleted
+    const w = view.applied.get('1')!
+    expect(pageSupersedes(stalePageLsn, w, undefined)).toBe(false) // row stays deleted
     // …while a page at/after the delete (row genuinely re-created) is admitted.
     const freshPageLsn = lsnToU64('0/160')!
-    expect(w !== undefined && freshPageLsn < w).toBe(false)
+    expect(pageSupersedes(freshPageLsn, w, undefined)).toBe(true)
   })
 
   it('records a tombstone for a delete of a never-seen pk (no write, but no ghost from a stale page)', () => {
@@ -185,6 +192,296 @@ describe('mergeFeedDelta — LSN positioning', () => {
     expect(mergeFeedDelta(view, upsert(1, undefined, { t: 'x' }))).toEqual({ type: 'update', value: { id: 1, t: 'x' } })
     expect(mergeFeedDelta(view, upsert(2, undefined))).toEqual({ type: 'insert', value: { id: 2 } })
     expect(mergeFeedDelta(view, del(2, undefined))).toEqual({ type: 'delete', key: '2' })
+  })
+})
+
+function txn(env: Env, txid: string): Env {
+  return { ...env, headers: { ...env.headers, txid } }
+}
+
+/**
+ * A view seeded from a page whose snapshot is `snapshot` (`xmin:xmax:xip`), read at LSN 0/100 with
+ * insert horizon 0/180 — the fields a newer engine returns with every page.
+ */
+function viewWithSnapshot(pageIds: number[], snapshot: string): SubsetView {
+  const snap = parsePageSnapshot('0/100', snapshot, '0/180')!
+  const view: SubsetView = {
+    snapshotLsn: snap.lsn,
+    snapshot: snap,
+    present: new Set(pageIds.map(String)),
+    applied: new Map(pageIds.map((id) => [String(id), snap])),
+    appliedTxid: new Map(),
+    inView: () => true,
+  }
+  return view
+}
+
+describe('page snapshot positioning (transaction visibility, not LSN order)', () => {
+  // T (xid 105) committed at 0/90 — BELOW the page LSN 0/100 — but was still invisible when the
+  // page snapshot was taken (a commit is flushed and decoded before it becomes visible), so it is in
+  // the snapshot's xip and missing from the page.
+  const S = '100:110:105'
+
+  it('applies an insert whose commit LSN is below the page LSN when its transaction was not visible', () => {
+    const view = viewWithSnapshot([], S)
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/90'), '105'))).toEqual({ type: 'insert', value: { id: 1 } })
+  })
+
+  it('applies an update to a loaded row when its transaction was not visible to the page', () => {
+    const view = viewWithSnapshot([1], S)
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/90', { n: 10 }), '105'))).toEqual({
+      type: 'update',
+      value: { id: 1, n: 10 },
+    })
+    // …and its version is now that change, so a re-delivery of an older change stays dropped.
+    expect(view.applied.get('1')).toBe(lsnToU64('0/90'))
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/80', { n: 5 }), '104'))).toBeNull()
+  })
+
+  it('drops a change the page already reflects, whatever its LSN relative to the page LSN', () => {
+    const view = viewWithSnapshot([1], S)
+    // xid 104 was visible (in [xmin, xmax), not in xip) although it committed at 0/120 >= 0/100.
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/120'), '104'))).toBeNull()
+    expect(mergeFeedDelta(view, txn(upsert(2, '0/120'), '104'))).toBeNull()
+    // started after the snapshot
+    expect(mergeFeedDelta(view, txn(upsert(1, '0/120', { n: 1 }), '110'))).toEqual({
+      type: 'update',
+      value: { id: 1, n: 1 },
+    })
+  })
+
+  it('never treats a change at or past the horizon as already in the page, and stops consulting it', () => {
+    const view = viewWithSnapshot([1], S)
+    expect(pageIncludes(view.snapshot!, lsnToU64('0/17F'), '99')).toBe(true)
+    expect(pageIncludes(view.snapshot!, lsnToU64('0/180'), '99')).toBe(false)
+    expect(mergeFeedDelta(view, txn(upsert(3, '0/180'), '99'))).toEqual({ type: 'insert', value: { id: 3 } })
+    expect(view.snapshot!.passed).toBe(true)
+  })
+
+  it('compares xids modulo 2^32 across an epoch boundary (xid8 values are masked like the envelope txid)', () => {
+    // xmin 2^32-6, xmax 2^32+4, in progress 2^32+3.
+    const snap = parsePageSnapshot('0/100', '4294967290:4294967300:4294967299', '0/180')!
+    expect(pageIncludes(snap, lsnToU64('0/90'), '4294967294')).toBe(true)
+    expect(pageIncludes(snap, lsnToU64('0/90'), '2')).toBe(true) // 2^32+2
+    expect(pageIncludes(snap, lsnToU64('0/90'), '3')).toBe(false) // in progress
+    expect(pageIncludes(snap, lsnToU64('0/90'), '5')).toBe(false) // after the snapshot, not "before xmin"
+  })
+
+  it('falls back to LSN positioning for an engine without snapshot fields, and for a change without a txid', () => {
+    expect(parsePageSnapshot('0/100', undefined, undefined)).toBeNull()
+    expect(parsePageSnapshot('0/100', '1:2:', 'garbage')).toBeNull()
+    const snap = parsePageSnapshot('0/100', S, '0/180')!
+    expect(pageIncludes(snap, lsnToU64('0/90'), undefined)).toBe(true)
+    expect(pageIncludes(snap, lsnToU64('0/110'), undefined)).toBe(false)
+  })
+
+  it('lets a loadMore page replace a live change only if the page includes that change', () => {
+    const view = viewWithSnapshot([], S)
+    mergeFeedDelta(view, txn(upsert(1, '0/90', { n: 10 }), '105'))
+    const w = view.applied.get('1')!
+    const txid = view.appliedTxid!.get('1')
+    // A page whose snapshot still had 105 in progress is older than the view's row.
+    expect(pageSupersedes(parsePageSnapshot('0/200', '100:120:105', '0/210')!, w, txid)).toBe(false)
+    // One that saw 105 committed may replace it.
+    expect(pageSupersedes(parsePageSnapshot('0/200', '106:120:', '0/210')!, w, txid)).toBe(true)
+  })
+})
+
+describe('xid parsing and per-change bookkeeping', () => {
+  it('parses decimal xids modulo 2^32 without regex or BigInt, exactly as the masked xid8 compare did', () => {
+    expect(xid32('0')).toBe(0)
+    expect(xid32('105')).toBe(105)
+    expect(xid32('4294967295')).toBe(4294967295)
+    expect(xid32('4294967296')).toBe(0)
+    expect(xid32('4294967300')).toBe(4)
+    // xid8 values of any epoch, up to the 20-digit maximum, reduce like `BigInt(text) & 0xffffffffn`.
+    for (const text of ['123456789012345', '1234567890123456', '98765432109876543', '18446744073709551615']) {
+      expect(xid32(text)).toBe(Number(BigInt(text) & 0xffffffffn))
+    }
+    for (const bad of ['', ' 1', '1 ', '+1', '-1', '1e3', '0x10', '12a']) expect(xid32(bad)).toBeNull()
+  })
+
+  it("records a live change's transaction as a number", () => {
+    const view = viewWithSnapshot([], '100:110:105')
+    mergeFeedDelta(view, txn(upsert(1, '0/190'), '4294967401'))
+    expect(view.appliedTxid!.get('1')).toBe(105)
+    mergeFeedDelta(view, upsert(1, '0/1A0'))
+    expect(view.appliedTxid!.has('1'), 'a change without a txid leaves none behind').toBe(false)
+  })
+
+  it('marks a loadMore page snapshot passed, and drops its xip, once the tail reaches its horizon', () => {
+    const view = viewWithSnapshot([1], '100:110:105')
+    view.pending = []
+    // A loadMore page read later, with its own snapshot and a later horizon.
+    const later = parsePageSnapshot('0/200', '106:120:107,108,109', '0/280')!
+    view.applied.set('2', later)
+    view.present.add('2')
+    trackPageSnapshot(view, later)
+    // Below the loadMore horizon: consulted (107 was in progress for that page, so it applies).
+    expect(mergeFeedDelta(view, txn(upsert(2, '0/220', { n: 1 }), '107'))).toEqual({ type: 'update', value: { id: 2, n: 1 } })
+    expect(later.passed).toBeUndefined()
+    expect(view.snapshot!.passed, 'the first page was passed on the way').toBe(true)
+    // At its horizon: retired for good.
+    mergeFeedDelta(view, txn(upsert(9, '0/280'), '130'))
+    expect(later.passed).toBe(true)
+    expect(later.xip.size).toBe(0)
+    expect(view.pending).toEqual([])
+  })
+})
+
+// --- a1817ad's merge, verbatim, as the oracle for the rewritten hot path ---------------------------
+
+interface RefView {
+  snapshotLsn: bigint
+  snapshot?: PageSnapshot | null
+  present: Set<string>
+  applied: Map<string, RowVersion>
+  appliedTxid?: Map<string, string>
+  inView: (row: Row) => boolean
+}
+function refXid32(text: string): number | null {
+  if (!/^\d+$/.test(text)) return null
+  return Number(BigInt(text) & 0xffffffffn)
+}
+function refPageIncludes(snap: PageSnapshot, lsn: bigint | null, txid: string | undefined): boolean {
+  if (lsn === null) return false
+  if (snap.passed || lsn >= snap.horizon) return false
+  const x = txid === undefined ? null : refXid32(txid)
+  if (x === null) return lsn < snap.lsn
+  if (((x - snap.xmin) | 0) < 0) return true
+  if (!(((x - snap.xmax) | 0) < 0)) return false
+  return !snap.xip.has(x)
+}
+function refSupersedes(page: RowVersion, w: RowVersion, wTxid: string | undefined): boolean {
+  if (typeof w !== 'bigint') return true
+  if (typeof page === 'bigint') return page >= w
+  return refPageIncludes(page, w, wTxid)
+}
+function refMerge(view: RefView, env: Env): ReturnType<typeof mergeFeedDelta> {
+  const key = env.key
+  const deltaLsn = lsnToU64(env.headers.lsn)
+  const txid = env.headers.txid
+  if (view.snapshot && deltaLsn !== null && deltaLsn >= view.snapshot.horizon && !view.snapshot.passed) {
+    view.snapshot.passed = true
+    view.snapshot.xip.clear()
+  }
+  const fresh = (): boolean => {
+    if (deltaLsn === null) return true
+    const w = view.applied.get(key) ?? view.snapshot ?? view.snapshotLsn
+    return typeof w === 'bigint' ? !(deltaLsn < w) : !refPageIncludes(w, deltaLsn, txid)
+  }
+  const record = (): void => {
+    if (deltaLsn !== null) {
+      view.applied.set(key, deltaLsn)
+      if (txid !== undefined) view.appliedTxid?.set(key, txid)
+      else view.appliedTxid?.delete(key)
+    } else {
+      view.applied.delete(key)
+      view.appliedTxid?.delete(key)
+    }
+  }
+  if (env.headers.operation === 'delete') {
+    if (!fresh()) return null
+    const wasPresent = view.present.has(key)
+    view.present.delete(key)
+    record()
+    return wasPresent ? { type: 'delete', key } : null
+  }
+  const value = env.value
+  if (!value || !fresh()) return null
+  if (view.inView(value)) {
+    const type = view.present.has(key) ? 'update' : 'insert'
+    view.present.add(key)
+    if (deltaLsn !== null) record()
+    return { type, value }
+  }
+  if (view.present.has(key)) {
+    view.present.delete(key)
+    record()
+    return { type: 'delete', key }
+  }
+  return null
+}
+
+describe('the rewritten merge decides exactly as a1817ad did', () => {
+  it('agrees on every live change and every loadMore replacement over randomized commit-ordered feeds', () => {
+    let seed = 7
+    const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
+    const pick = <T,>(xs: T[]): T => xs[Math.floor(rnd() * xs.length)]!
+    const lsnText = (n: bigint) => `${(n >> 32n).toString(16).toUpperCase()}/${(n & 0xffffffffn).toString(16).toUpperCase()}`
+    for (let round = 0; round < 300; round++) {
+      // Snapshots near an xid epoch boundary half the time; xid8 text of any epoch.
+      const epoch = BigInt(Math.floor(rnd() * 3))
+      const base = rnd() < 0.5 ? 4294967296n * epoch + 4294967200n : 4294967296n * epoch + 1000n
+      const snapText = (lo: bigint) => {
+        const xmin = lo
+        const xmax = lo + BigInt(5 + Math.floor(rnd() * 40))
+        const xip = [...new Set(Array.from({ length: Math.floor(rnd() * 6) }, () => xmin + BigInt(Math.floor(rnd() * Number(xmax - xmin)))))]
+        return `${xmin}:${xmax}:${xip.join(',')}`
+      }
+      let lsn = 0x100n
+      const text0 = snapText(base)
+      const h0 = 0x100n + BigInt(Math.floor(rnd() * 400))
+      const pageIds = Array.from({ length: 6 }, () => Math.floor(rnd() * 12))
+      const mk = <V extends RefView | SubsetView>(extra: object): V => {
+        const snap = parsePageSnapshot(lsnText(0x100n), text0, lsnText(h0))!
+        return {
+          snapshotLsn: snap.lsn,
+          snapshot: snap,
+          present: new Set(pageIds.map(String)),
+          applied: new Map<string, RowVersion>(pageIds.map((id) => [String(id), snap])),
+          inView: (r: Row) => Number(r.n ?? 0) < 8,
+          ...extra,
+        } as V
+      }
+      const ref = mk<RefView>({ appliedTxid: new Map<string, string>() })
+      const now = mk<SubsetView>({ appliedTxid: new Map<string, number>(), pending: [] })
+      for (let step = 0; step < 80; step++) {
+        if (rnd() < 0.1) {
+          // A loadMore page arrives with a later snapshot and horizon.
+          const text = snapText(base + BigInt(Math.floor(rnd() * 60)))
+          const at = lsn + BigInt(Math.floor(rnd() * 50))
+          const horizon = at + BigInt(Math.floor(rnd() * 300))
+          const refSnap = parsePageSnapshot(lsnText(at), text, lsnText(horizon))!
+          const nowSnap = parsePageSnapshot(lsnText(at), text, lsnText(horizon))!
+          let versioned = false
+          for (const id of Array.from({ length: 4 }, () => String(Math.floor(rnd() * 12)))) {
+            const rw = ref.applied.get(id)
+            const nw = now.applied.get(id)
+            const refOk = rw === undefined || refSupersedes(refSnap, rw, ref.appliedTxid!.get(id))
+            const nowOk = nw === undefined || pageSupersedes(nowSnap, nw, now.appliedTxid!.get(id))
+            expect(nowOk, `round ${round} step ${step}: loadMore replacement of ${id}`).toBe(refOk)
+            if (refOk) {
+              ref.present.add(id)
+              ref.applied.set(id, refSnap)
+              ref.appliedTxid!.delete(id)
+              now.present.add(id)
+              now.applied.set(id, nowSnap)
+              now.appliedTxid!.delete(id)
+              versioned = true
+            }
+          }
+          if (versioned) trackPageSnapshot(now, nowSnap)
+          continue
+        }
+        lsn += BigInt(1 + Math.floor(rnd() * 40)) // commit-LSN order, never backwards
+        const id = Math.floor(rnd() * 12)
+        const xid = base + BigInt(Math.floor(rnd() * 80)) - 10n
+        const txid = rnd() < 0.1 ? undefined : pick([String(xid), String(xid & 0xffffffffn)])
+        const env: Env =
+          rnd() < 0.2
+            ? { type: 'issues', key: String(id), headers: { operation: 'delete', lsn: lsnText(lsn) } }
+            : { type: 'issues', key: String(id), value: { id, n: Math.floor(rnd() * 10) } as Row, headers: { operation: 'upsert', lsn: lsnText(lsn) } }
+        if (txid !== undefined) env.headers.txid = txid
+        const a = refMerge(ref, env)
+        const b = mergeFeedDelta(now, env)
+        expect(b, `round ${round} step ${step}`).toEqual(a)
+      }
+      expect([...now.present].sort()).toEqual([...ref.present].sort())
+      expect(new Map([...now.appliedTxid!].map(([k, v]) => [k, v]))).toEqual(
+        new Map([...ref.appliedTxid!].map(([k, v]) => [k, refXid32(v)])),
+      )
+    }
   })
 })
 
@@ -239,6 +536,83 @@ describe('createSubset lifecycle', () => {
     const { deps, deleted } = fakeDeps({ queryError: new Error('boom') })
     await expect(createSubset(deps, { table: 'issues' })).rejects.toThrow('boom')
     expect(deleted).toEqual(['feed-1'])
+  })
+})
+
+describe('loadMore', () => {
+  it('overlapping calls whose responses return in reverse order never regress a row to the older page', async () => {
+    // Rows 1..4. Row 3 reads 'old' in a snapshot taken before transaction 101 and 'new' in one after.
+    type State = { snapshot: string; title3: string }
+    const before: State = { snapshot: '101:101:', title3: 'old' }
+    const after: State = { snapshot: '102:102:', title3: 'new' }
+    const page = (st: State, past: number, limit: number) => ({
+      rows: [1, 2, 3, 4].filter((id) => id > past).slice(0, limit).map((id) => ({ id, title: id === 3 ? st.title3 : `t${id}` })),
+      lsn: '0/100',
+      snapshot: st.snapshot,
+      horizon: '0/200',
+    })
+    // Every loadMore request is held until the test answers it with a snapshot of its choosing.
+    const requests: Array<{ past: number; answered: boolean; answer: (st: State) => void }> = []
+    let first = true
+    const trpc = {
+      subset: {
+        live: {
+          mutate: async () => ({ shapeId: 'feed-1', streamPath: 'streams/feed-1', streamUrl: 'http://127.0.0.1:9/streams/feed-1' }),
+        },
+        query: {
+          query: (input: { where?: { col?: string; op?: string; value?: unknown }; limit: number }) => {
+            if (first) {
+              first = false
+              return Promise.resolve(page(before, 0, input.limit))
+            }
+            const past = Number(input.where?.value) // the keyset cursor: `id > boundary`
+            return new Promise((resolve) => {
+              const request = { past, answered: false, answer: (st: State) => ((request.answered = true), resolve(page(st, past, input.limit))) }
+              requests.push(request)
+            })
+          },
+        },
+      },
+      shapes: { delete: { mutate: async () => ({ ok: true as const }) } },
+    }
+    const deps: SubsetDeps = { trpc: trpc as unknown as SubsetDeps['trpc'], schema: testSchema, resolveStreamUrl: (h) => h.streamUrl }
+    const sub = await createSubset(deps, { table: 'issues', limit: 2 })
+    const flush = async () => {
+      for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0))
+    }
+    const title3 = () => (sub.collection.toArray as unknown as Row[]).find((r) => Number(r.id) === 3)?.title
+    const shown: unknown[] = []
+
+    const a = sub.loadMore()
+    const b = sub.loadMore()
+    await flush()
+    // Reversed: every request after the first is answered (newest first) from the later snapshot,
+    // before the first is answered from the earlier one; anything issued after that sees the later.
+    for (let i = requests.length - 1; i >= 1; i--) {
+      requests[i]!.answer(after)
+      await flush()
+      shown.push(title3())
+    }
+    requests[0]!.answer(before)
+    await flush()
+    shown.push(title3())
+    for (let i = 1; i < requests.length; i++) {
+      if (requests[i]!.answered) continue
+      requests[i]!.answer(after)
+      await flush()
+      shown.push(title3())
+    }
+    await Promise.all([a, b])
+
+    // Once the view has shown a row from a later snapshot, an earlier page never replaces it.
+    const firstNew = shown.indexOf('new')
+    expect(firstNew === -1 ? [] : shown.slice(firstNew), `row 3 as the view showed it: ${shown.join(' → ')}`).toEqual(
+      firstNew === -1 ? [] : shown.slice(firstNew).map(() => 'new'),
+    )
+    // The calls ran one after the other: the second asked for the page after the first's.
+    expect(requests.map((r) => r.past)).toEqual([2, 4])
+    expect((sub.collection.toArray as unknown as Row[]).map((r) => Number(r.id)).sort()).toEqual([1, 2, 3, 4])
+    await sub.close()
   })
 })
 

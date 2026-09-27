@@ -552,12 +552,17 @@ struct PoolInner {
     url: String,
     idle: std::sync::Mutex<Vec<Client>>,
     sem: Arc<tokio::sync::Semaphore>,
+    /// What the sequencer reading this database's changes has fanned out without a snapshot having
+    /// been seen to contain it — the settle record every snapshot on this pool is checked against,
+    /// with its own visibility poller (a dedicated connection, outside this pool's `size`).
+    sequenced: Arc<SequencedXids>,
 }
 
 impl Pool {
     pub fn new(url: String, size: usize) -> Pool {
         Pool {
             inner: Arc::new(PoolInner {
+                sequenced: Arc::new(SequencedXids::new(Some(url.clone()), backfill_config().settle, size.max(1))),
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
@@ -565,22 +570,35 @@ impl Pool {
         }
     }
 
+    /// The settle set for snapshots taken on this pool (see [`SequencedXids`]). The sequencer that
+    /// consumes this database's change log notes into it.
+    pub fn sequenced(&self) -> Arc<SequencedXids> {
+        self.inner.sequenced.clone()
+    }
+
     /// Check out a connection; waits if all `size` are in use. The checkout is returned to the
     /// pool (or discarded, if broken) when the guard drops.
     pub async fn get(&self) -> Result<PooledClient> {
-        let permit = self.inner.sem.clone().acquire_owned().await.context("pg pool closed")?;
-        // Reuse an idle connection if it is still healthy; otherwise dial a new one.
-        let reused = self.inner.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
-        let client = match reused {
-            Some(c) => c,
-            None => connect(&self.inner.url).await?,
-        };
+        let (client, permit) = self.inner.checkout().await?;
         Ok(PooledClient {
             client: Some(client),
             inner: self.inner.clone(),
             permit: Some(permit),
             transaction_open: AtomicBool::new(false),
         })
+    }
+}
+
+impl PoolInner {
+    /// A permit plus a healthy connection: an idle one if there is one, otherwise a new dial.
+    async fn checkout(&self) -> Result<(Client, tokio::sync::OwnedSemaphorePermit)> {
+        let permit = self.sem.clone().acquire_owned().await.context("pg pool closed")?;
+        let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
+        let client = match reused {
+            Some(c) => c,
+            None => connect(&self.url).await?,
+        };
+        Ok((client, permit))
     }
 }
 
@@ -610,6 +628,30 @@ impl PooledClient {
 
     fn transaction_finished(&self) {
         self.transaction_open.store(false, Ordering::SeqCst);
+    }
+
+    /// Give the connection (and its pool slot) back while keeping this checkout, so a caller that
+    /// must wait on something other than Postgres — a snapshot settle — pins nothing. No transaction
+    /// may be open. [`Self::reacquire`] takes a connection again; until then the checkout must not be
+    /// used (its `Deref` panics).
+    fn release(&mut self) {
+        debug_assert!(!self.transaction_open.load(Ordering::SeqCst), "released with a transaction open");
+        if let Some(client) = self.client.take()
+            && !client.is_closed()
+        {
+            self.inner.idle.lock().unwrap().push(client);
+        }
+        self.permit = None;
+    }
+
+    /// Take a connection again after [`Self::release`] — waiting for a pool slot like
+    /// [`Pool::get`].
+    async fn reacquire(&mut self) -> Result<()> {
+        let (client, permit) = self.inner.checkout().await?;
+        self.client = Some(client);
+        self.permit = Some(permit);
+        self.transaction_open.store(false, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -1135,9 +1177,18 @@ pub struct BackfillFences {
 /// the slot is committed, so visibility reduces to: `xid < xmin`, or `xmin <= xid < xmax` and not
 /// in-progress at snapshot time.)
 ///
-/// The stored xids are `pg_current_snapshot()`'s xid8 values masked to 32 bits so they compare
-/// against test_decoding's 32-bit xids; the fence spans seconds around a backfill, so epoch
-/// wraparound (a ~4-billion-transaction horizon) cannot straddle it in practice.
+/// The stored xids are `pg_current_snapshot()`'s xid8 values masked to 32 bits, because the
+/// replication stream (pgoutput `Begin`) carries 32-bit xids. They are compared the way PostgreSQL
+/// compares `TransactionId`s — modulo 2^32, relative to each other (`xid_precedes`) — so a snapshot
+/// taken just before a 2^32 epoch boundary still orders a transaction from just after it as later.
+/// That is sound while every compared xid lies within 2^31 of the snapshot, which PostgreSQL's own
+/// wraparound protection guarantees for any transaction that can still be committing.
+///
+/// `horizon` is `pg_current_wal_insert_lsn()` in the same statement. A transaction visible to the
+/// snapshot had inserted its commit record before the snapshot was taken, so its commit LSN is below
+/// the horizon; a change at or past the horizon is never skipped, whatever its (possibly wrapped)
+/// 32-bit xid claims. A gate from before this field existed deserializes with `horizon = 0`, which
+/// disables that guard and keeps the old xid-only rule.
 ///
 /// When a change carries no parseable xid (library mode / non-PG sources), the gate falls back to
 /// the LSN comparison, and with neither it never skips.
@@ -1148,6 +1199,9 @@ pub struct SnapshotGate {
     xmin: u64,
     xmax: u64,
     xip: std::collections::HashSet<u64>,
+    /// `pg_current_wal_insert_lsn()` at the snapshot (numeric); `0` = unknown (see the type docs).
+    #[serde(default)]
+    horizon: u64,
 }
 
 impl HeapSize for SnapshotGate {
@@ -1155,6 +1209,12 @@ impl HeapSize for SnapshotGate {
     fn heap_bytes(&self) -> usize {
         self.xip.heap_bytes()
     }
+}
+
+/// Does 32-bit transaction id `a` logically precede `b`? PostgreSQL's `TransactionIdPrecedes` for
+/// normal xids: the difference taken modulo 2^32 and read as signed.
+fn xid_precedes(a: u64, b: u64) -> bool {
+    ((a as u32).wrapping_sub(b as u32) as i32) < 0
 }
 
 impl SnapshotGate {
@@ -1174,19 +1234,34 @@ impl SnapshotGate {
             .next()
             .map(|s| s.split(',').filter_map(|x| x.trim().parse::<u64>().ok()).map(mask).collect())
             .unwrap_or_default();
-        SnapshotGate { lsn: lsn_to_u64(lsn), xmin, xmax, xip }
+        SnapshotGate { lsn: lsn_to_u64(lsn), xmin, xmax, xip, horizon: 0 }
+    }
+
+    /// [`parse`](Self::parse), plus the `pg_current_wal_insert_lsn()` horizon read in the same
+    /// statement.
+    pub fn parse_with_horizon(snapshot: &str, lsn: &str, horizon: &str) -> Self {
+        SnapshotGate { horizon: lsn_to_u64(horizon), ..Self::parse(snapshot, lsn) }
+    }
+
+    /// Is this a real snapshot (not [`passthrough`](Self::passthrough))?
+    fn is_snapshot(&self) -> bool {
+        // xmax is never 0 for a real snapshot: the first normal xid is 3, and a masked xmax of 0
+        // would need an xmax of exactly k·2^32, which PostgreSQL never assigns (it skips the
+        // special xids 0..2 at every wrap). So 0 stays the passthrough marker.
+        self.xmax != 0
     }
 
     /// Was committed transaction `xid` visible to this snapshot (i.e. already reflected in the
     /// backfill rows)?
-    fn visible(&self, xid: u64) -> bool {
-        if self.xmax == 0 {
+    pub fn visible(&self, xid: u64) -> bool {
+        if !self.is_snapshot() {
             return false; // passthrough gate: nothing is "already seeded"
         }
-        if xid < self.xmin {
+        let xid = xid & 0xFFFF_FFFF;
+        if xid_precedes(xid, self.xmin) {
             return true;
         }
-        if xid >= self.xmax {
+        if !xid_precedes(xid, self.xmax) {
             return false;
         }
         !self.xip.contains(&xid)
@@ -1196,10 +1271,75 @@ impl SnapshotGate {
     /// snapshot already reflects it?
     pub fn should_skip(&self, commit_lsn: u64, xid: Option<u64>) -> bool {
         match xid {
+            // At or past the horizon the commit record did not exist yet when the snapshot was
+            // taken, so the transaction cannot be in it — whatever its 32-bit xid compares as.
+            Some(_) if self.horizon != 0 && commit_lsn != 0 && commit_lsn >= self.horizon => false,
             Some(x) => self.visible(x),
             None => commit_lsn != 0 && self.lsn != 0 && commit_lsn < self.lsn,
         }
     }
+}
+
+// ---- settled snapshots ---------------------------------------------------------------------------
+
+// The record of what the sequencer has fanned out, its visibility poller, and the bounded settle
+// wait every backfill/query-back snapshot goes through (see the module docs).
+mod settle;
+
+use settle::begin_settled_snapshot;
+pub use settle::{
+    DEFAULT_SETTLE_MAX_XIDS, MAX_SETTLE_MAX_XIDS, MIN_SETTLE_MAX_XIDS, SequencedXids, SettleConfig, SettleScope,
+    SnapshotUnsettled, UnsettledCause, settle_waits_active,
+};
+
+/// The `settle` object of `GET /replication/lsn`: the settle record's size across every pool, and
+/// the process-wide settle counters (checks, retakes, timeouts, rejections, poller ticks/failures,
+/// transactions dropped at the bound) and wait-duration distribution.
+pub fn settle_stats_json() -> serde_json::Value {
+    let pools = POOLS.get_or_init(Default::default).lock().unwrap();
+    settle::stats_json(pools.values().map(|p| &*p.inner.sequenced))
+}
+
+/// The fences of a settled snapshot (see [`begin_settled_snapshot`]).
+pub struct SnapshotFences {
+    /// `pg_current_wal_lsn()` in the snapshot's first statement.
+    pub seed_lsn: String,
+    /// `pg_current_wal_insert_lsn()` in the same statement.
+    pub horizon_lsn: String,
+    /// `pg_current_snapshot()::text` — full xid8 values, as PostgreSQL prints them.
+    pub snapshot: String,
+    pub gate: SnapshotGate,
+}
+
+/// `BEGIN … REPEATABLE READ READ ONLY`, the optional statement timeout, and the fence statement that
+/// establishes the snapshot.
+async fn open_snapshot(client: &PooledClient, statement_timeout_ms: u64, what: &str) -> Result<SnapshotFences> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await
+        .with_context(|| format!("begin {what} snapshot"))?;
+    // Slow-backfill guard, off by default. `LOCAL` scopes it to this transaction, so the pooled
+    // connection carries nothing back to the next borrower. A timeout fails THIS create with a
+    // clear, retryable error; nothing is retired and nothing is purged.
+    if statement_timeout_ms > 0 {
+        client
+            .batch_execute(&format!("SET LOCAL statement_timeout = {statement_timeout_ms}"))
+            .await
+            .context("setting the backfill statement timeout")?;
+    }
+    // One statement establishes the snapshot AND captures every fence atomically with it.
+    let fence = client
+        .query_one(
+            "select pg_current_wal_lsn()::text, pg_current_snapshot()::text, pg_current_wal_insert_lsn()::text",
+            &[],
+        )
+        .await
+        .with_context(|| format!("{what} snapshot fences"))?;
+    let seed_lsn: String = fence.get(0);
+    let snapshot: String = fence.get(1);
+    let horizon_lsn: String = fence.get(2);
+    let gate = SnapshotGate::parse_with_horizon(&snapshot, &seed_lsn, &horizon_lsn);
+    Ok(SnapshotFences { seed_lsn, horizon_lsn, snapshot, gate })
 }
 
 // ---- streamed backfill (issue #13) -------------------------------------------------------------
@@ -1216,11 +1356,14 @@ pub struct BackfillConfig {
     /// `SET LOCAL statement_timeout` inside the backfill transaction, in milliseconds. `0` = off
     /// (the default): a backfill takes as long as it takes.
     pub statement_timeout_ms: u64,
+    /// How backfill and subset snapshots are settled against what the sequencer already fanned out
+    /// (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_*`, see [`SequencedXids`]).
+    pub settle: SettleConfig,
 }
 
 impl Default for BackfillConfig {
     fn default() -> Self {
-        BackfillConfig { append_bytes: 16 * 1024 * 1024, statement_timeout_ms: 0 }
+        BackfillConfig { append_bytes: 16 * 1024 * 1024, statement_timeout_ms: 0, settle: SettleConfig::default() }
     }
 }
 
@@ -1414,12 +1557,13 @@ impl<'a> BackfillReader<'a> {
 /// Text literals are bound parameters; numeric/bool/null are inlined (see [`crate::sql`]). The
 /// engine still applies `matches()` afterwards, so the SQL only has to be a sound superset filter.
 pub async fn backfill_reader<'a>(
-    client: &'a PooledClient,
+    client: &'a mut PooledClient,
     ts: &'a TableSchema,
     filter: Option<&CompiledPredicate>,
+    scope: &SettleScope,
 ) -> Result<BackfillReader<'a>> {
     let where_sql = filter.and_then(|p| crate::sql::predicate_to_sql(p, ts));
-    backfill_where_reader(client, ts, where_sql).await
+    backfill_where_reader(client, ts, where_sql, scope).await
 }
 
 /// Open a streamed backfill with a **prebuilt** `WHERE` fragment + params (from the JSON SQL
@@ -1428,14 +1572,20 @@ pub async fn backfill_reader<'a>(
 ///
 /// The `REPEATABLE READ READ ONLY` bracket and the fence capture are byte-for-byte what the
 /// materialising version did; only the row transport changed (`query` → `query_raw`).
+///
+/// `scope` names every table the read depends on (`ts`, plus the inner tables of a subquery in
+/// `where_sql`) and whether its settle wait is admission-capped (see [`SettleScope`]). The
+/// checkout's connection is released while a settle waits, so it is `&mut`.
 pub async fn backfill_where_reader<'a>(
-    client: &'a PooledClient,
+    client: &'a mut PooledClient,
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
+    scope: &SettleScope,
 ) -> Result<BackfillReader<'a>> {
-    client.transaction_started();
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin backfill snapshot")?;
-    match backfill_open_in_txn(client, ts, where_sql).await {
+    let cfg = backfill_config();
+    let fences = begin_settled_snapshot(client, scope, cfg.statement_timeout_ms, "backfill").await?;
+    let client: &'a PooledClient = client;
+    match backfill_open_in_txn(client, ts, where_sql, fences).await {
         Ok(reader) => Ok(reader),
         Err(error) => {
             if client.batch_execute("ROLLBACK").await.is_ok() {
@@ -1450,23 +1600,10 @@ async fn backfill_open_in_txn<'a>(
     client: &'a PooledClient,
     ts: &'a TableSchema,
     where_sql: Option<(String, Vec<String>)>,
+    fences: SnapshotFences,
 ) -> Result<BackfillReader<'a>> {
     let cfg = backfill_config();
-    // Slow-backfill guard, off by default. `LOCAL` scopes it to this transaction, so the pooled
-    // connection carries nothing back to the next borrower. A timeout fails THIS create with a
-    // clear, retryable error; nothing is retired and nothing is purged.
-    if cfg.statement_timeout_ms > 0 {
-        client
-            .batch_execute(&format!("SET LOCAL statement_timeout = {}", cfg.statement_timeout_ms))
-            .await
-            .context("setting the backfill statement timeout")?;
-    }
-    // One statement establishes the snapshot AND captures both fences (LSN + xid snapshot)
-    // atomically with it.
-    let fence = client.query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[]).await?;
-    let seed_lsn: String = fence.get(0);
-    let snap: String = fence.get(1);
-    let gate = SnapshotGate::parse(&snap, &seed_lsn);
+    let SnapshotFences { seed_lsn, gate, .. } = fences;
     let where_present = where_sql.is_some();
     let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
@@ -1498,31 +1635,19 @@ async fn backfill_open_in_txn<'a>(
 /// columns populated (the counts pipeline projects exactly those positions); text-mapped
 /// columns are cast `::text` for live-path byte identity.
 pub async fn backfill_group_counts(
-    client: &PooledClient,
+    client: &mut PooledClient,
     ts: &TableSchema,
     group_cols: &[usize],
 ) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
-    client.transaction_started();
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        .await
-        .context("begin counts seed snapshot")?;
-    let result = group_counts_in_txn(client, ts, group_cols).await;
+    let fences = begin_settled_snapshot(client, &SettleScope::internal(&ts.table), 0, "counts seed").await?;
+    let result = group_counts_in_txn(client, ts, group_cols).await.map(|rows| (rows, fences.gate));
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
     result
 }
 
-async fn group_counts_in_txn(
-    client: &Client,
-    ts: &TableSchema,
-    group_cols: &[usize],
-) -> Result<(Vec<(Row, i64)>, SnapshotGate)> {
-    let fence = client.query_one("select pg_current_wal_lsn()::text, pg_current_snapshot()::text", &[]).await?;
-    let seed_lsn: String = fence.get(0);
-    let snap: String = fence.get(1);
-    let gate = SnapshotGate::parse(&snap, &seed_lsn);
+async fn group_counts_in_txn(client: &Client, ts: &TableSchema, group_cols: &[usize]) -> Result<Vec<(Row, i64)>> {
     let mut args = Vec::new();
     let mut by = Vec::new();
     for &i in group_cols {
@@ -1549,7 +1674,7 @@ async fn group_counts_in_txn(
         // Missing (non-group) columns default to Null — the pipeline projects only group cols.
         out.push((ts.row_from_json(obj)?, r.get::<_, i64>(1)));
     }
-    Ok((out, gate))
+    Ok(out)
 }
 
 /// The per-row JSON projection used by backfill and subset query-backs. Text-mapped columns are cast
@@ -1578,10 +1703,18 @@ fn row_json_expr(ts: &TableSchema) -> String {
     objs.join(" || ")
 }
 
-/// Result of a one-shot subset query: the page rows + the snapshot LSN they were read at.
+/// Result of a one-shot subset query: the page rows + the fences of the settled snapshot they were
+/// read in.
 pub struct SubsetQuery {
     pub rows: Vec<Row>,
+    /// `pg_current_wal_lsn()` at the snapshot — the page's LSN positioning point (older clients).
     pub lsn: String,
+    /// `pg_current_snapshot()::text` of the page's snapshot, full xid8 values: a client skips a live
+    /// change only if its transaction was visible to this snapshot.
+    pub snapshot: String,
+    /// `pg_current_wal_insert_lsn()` at the snapshot: no change at or past it can be in the page, so
+    /// a client may drop the snapshot once its tail passes this LSN.
+    pub horizon: String,
 }
 
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
@@ -1590,34 +1723,38 @@ pub struct SubsetQuery {
 /// subset/pagination view uses (the live tail is followed separately). `order` is `(column index,
 /// descending?)`; the pk is appended as a tiebreaker so the window is total/stable.
 pub async fn query_subset(
-    client: &PooledClient,
+    client: &mut PooledClient,
     ts: &TableSchema,
     filter: Option<&CompiledPredicate>,
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
-    query_subset_where(client, ts, filter.and_then(|p| crate::sql::predicate_to_sql(p, ts)), order, limit, offset).await
+    let where_sql = filter.and_then(|p| crate::sql::predicate_to_sql(p, ts));
+    query_subset_where(client, ts, where_sql, &SettleScope::request(&ts.table), order, limit, offset).await
 }
 
 /// Like [`query_subset`], but with a **prebuilt** `WHERE` fragment + params — used when the predicate
 /// contains an `IN (SELECT …)` subquery (the JSON SQL emitter builds it; Postgres evaluates it natively,
 /// so paginated subquery lists work without engine-side subquery state).
+///
+/// `scope` must name the inner tables of any subquery in `where_sql` (see [`SettleScope`]).
 pub async fn query_subset_where(
-    client: &PooledClient,
+    client: &mut PooledClient,
     ts: &TableSchema,
     where_sql: Option<(String, Vec<String>)>,
+    scope: &SettleScope,
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
-    client.transaction_started();
-    client.batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await.context("begin subset snapshot")?;
+    let fences = begin_settled_snapshot(client, scope, 0, "subset").await?;
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
-    result
+    let rows = result?;
+    Ok(SubsetQuery { rows, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
 }
 
 /// One `ORDER BY` term for a subset page.
@@ -1641,8 +1778,7 @@ async fn query_subset_in_txn(
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
-) -> Result<SubsetQuery> {
-    let lsn: String = client.query_one("select pg_current_wal_lsn()::text", &[]).await?.get(0);
+) -> Result<Vec<Row>> {
     let (where_clause, params) = match where_sql {
         Some((w, ps)) => (format!(" where {w}"), ps),
         None => (String::new(), Vec::new()),
@@ -1681,7 +1817,7 @@ async fn query_subset_in_txn(
         let obj = j.as_object().context("subset row expr did not return an object")?;
         out.push(ts.row_from_json(obj)?);
     }
-    Ok(SubsetQuery { rows: out, lsn })
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1715,6 +1851,38 @@ mod tests {
         let p = SnapshotGate::passthrough();
         assert!(!p.should_skip(0x50, Some(99)));
         assert!(!p.should_skip(0x50, None));
+    }
+
+    /// The gate compares 32-bit xids the way PostgreSQL does (modulo 2^32), so a snapshot taken just
+    /// before an xid epoch boundary still treats a transaction from just after it as LATER. Masking
+    /// and comparing with plain `<` made such a transaction (masked xid 5 < masked xmin 0xFFFF_FFFA)
+    /// look committed-before-the-snapshot, and every one of its changes was skipped.
+    #[test]
+    fn snapshot_gate_is_wraparound_safe() {
+        // xid8 values straddling 2^32: xmin 2^32-6, xmax 2^32+4, in progress {2^32-1, 2^32+3}.
+        let g = SnapshotGate::parse("4294967290:4294967300:4294967295,4294967299", "0/100");
+        assert!(g.should_skip(0, Some(4_294_967_288)), "before xmin: in the snapshot");
+        assert!(g.should_skip(0, Some(4_294_967_294)), "between xmin and xmax, not in progress: in the snapshot");
+        assert!(g.should_skip(0, Some(2)), "2^32+2 masked: between xmin and xmax across the boundary");
+        assert!(!g.should_skip(0, Some(4_294_967_295)), "in progress before the boundary: not in the snapshot");
+        assert!(!g.should_skip(0, Some(3)), "in progress after the boundary: not in the snapshot");
+        assert!(!g.should_skip(0, Some(4)), "at xmax: not in the snapshot");
+        assert!(!g.should_skip(0, Some(5)), "the next epoch's xid 5 is after the snapshot, not before xmin");
+    }
+
+    /// A change whose commit LSN is at or past the snapshot's insert horizon cannot be in the
+    /// snapshot, whatever its xid compares as; a gate persisted before the horizon existed keeps the
+    /// xid-only rule.
+    #[test]
+    fn snapshot_gate_horizon_bounds_the_skip() {
+        let g = SnapshotGate::parse_with_horizon("100:110:103", "0/100", "0/180");
+        assert!(g.should_skip(0x170, Some(99)), "visible and below the horizon: skip");
+        assert!(!g.should_skip(0x180, Some(99)), "at the horizon: newer than the snapshot");
+        assert!(!g.should_skip(0x170, Some(103)), "in progress: never skipped");
+        assert!(g.should_skip(0, Some(99)), "unknown commit LSN: the xid decides");
+        let legacy: SnapshotGate =
+            serde_json::from_str(r#"{"lsn":256,"xmin":100,"xmax":110,"xip":[103]}"#).expect("old catalog gate");
+        assert!(legacy.should_skip(0x200, Some(99)), "no horizon recorded: xid-only, as before");
     }
 
     /// The boot taxonomy IS the contract: a fatal class must never be retried into an invisible

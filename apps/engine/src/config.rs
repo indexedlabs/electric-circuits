@@ -180,6 +180,36 @@ const HANDLED: &[&str] = &[
     "ELECTRIC_DB_POOL_SIZE",
 ];
 
+/// The snapshot-settle knobs (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_*`, see `pg::SequencedXids`). Like
+/// the backfill budgets, an unusable value refuses the boot rather than silently not applying.
+fn resolve_settle(g: &impl Fn(&str) -> Option<String>, d: crate::pg::SettleConfig) -> Result<crate::pg::SettleConfig> {
+    let whole = |name: &str, default: u64, what: &str| -> Result<u64> {
+        match g(name) {
+            None => Ok(default),
+            Some(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("{name} must be a whole number of {what}, got '{}'", raw.trim())),
+        }
+    };
+    let timeout_ms = whole("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS", d.timeout_ms, "milliseconds")?;
+    let max_waiters = whole("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS", d.max_waiters as u64, "waiters")?;
+    let max_xids = whole("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS", d.max_xids, "transactions")?;
+    if !(crate::pg::MIN_SETTLE_MAX_XIDS..=crate::pg::MAX_SETTLE_MAX_XIDS).contains(&max_xids) {
+        bail!(
+            "ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS is {max_xids}; it must be between {} and {} \
+             (it bounds the record of sequenced transactions awaiting visibility, ~1 bit each)",
+            crate::pg::MIN_SETTLE_MAX_XIDS,
+            crate::pg::MAX_SETTLE_MAX_XIDS
+        );
+    }
+    let poll_ms = whole("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS", d.poll_ms, "milliseconds")?;
+    if poll_ms == 0 {
+        bail!("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS must be at least 1 millisecond");
+    }
+    Ok(crate::pg::SettleConfig { timeout_ms, max_waiters: max_waiters as usize, max_xids, poll_ms })
+}
+
 fn nonempty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
 }
@@ -570,7 +600,8 @@ impl Config {
                 )
             })?,
         };
-        let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms };
+        let settle = resolve_settle(&g, d.settle)?;
+        let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms, settle };
 
         let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
         let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;
@@ -814,6 +845,35 @@ mod tests {
     fn try_cfg(pairs: &[(&str, &str)]) -> Result<Config> {
         let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Config::resolve(move |k| map.get(k).cloned())
+    }
+
+    /// The settle knobs: defaults, explicit values, and refusals of values that would silently not
+    /// apply (a bound below 2^20 — overflowing must take a pathological poller outage — or above
+    /// what the record can compare modulo 2^32, a zero poll interval).
+    #[test]
+    fn settle_knobs_resolve_or_refuse() {
+        assert_eq!(cfg(&[]).backfill.settle, crate::pg::SettleConfig::default());
+        let c = cfg(&[
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS", "2500"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS", "3"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS", "1048576"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS", "20"),
+        ]);
+        assert_eq!(
+            c.backfill.settle,
+            crate::pg::SettleConfig { timeout_ms: 2500, max_waiters: 3, max_xids: 1_048_576, poll_ms: 20 }
+        );
+        for (name, bad) in [
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS", "soon"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS", "-1"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS", "1023"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS", "1048575"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS", "2147483648"),
+            ("ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS", "0"),
+        ] {
+            let e = try_cfg(&[(name, bad)]).expect_err("refused");
+            assert!(format!("{e:#}").contains(name), "names the knob: {e:#}");
+        }
     }
 
     fn pilot_ds_config() -> Vec<(&'static str, &'static str)> {

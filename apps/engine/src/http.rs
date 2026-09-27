@@ -139,7 +139,14 @@ struct SubsetQuery {
 #[derive(Serialize, Deserialize, ToSchema)]
 struct SubsetResponse {
     rows: Vec<serde_json::Value>,
+    /// `pg_current_wal_lsn()` at the page snapshot (LSN positioning for older clients).
     lsn: String,
+    /// `pg_current_snapshot()::text` of the page snapshot (`xmin:xmax:xip,…`, full xid8 values). A
+    /// live change is already in the page iff its transaction was visible to this snapshot.
+    snapshot: String,
+    /// `pg_current_wal_insert_lsn()` at the page snapshot: every change at or past it is newer than
+    /// the page.
+    horizon: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -996,13 +1003,15 @@ struct QueryReq {
 struct QueryResp {
     rows: Vec<serde_json::Value>,
     lsn: String,
+    snapshot: String,
+    horizon: String,
 }
 
 async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -> Result<Json<QueryResp>, AppError> {
     engine.ensure_not_degraded()?;
     let order_by = req.order_by.map(|o| (o.col, o.desc));
-    let (rows, lsn) = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
-    Ok(Json(QueryResp { rows, lsn }))
+    let page = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
+    Ok(Json(QueryResp { rows: page.rows, lsn: page.lsn, snapshot: page.snapshot, horizon: page.horizon }))
 }
 
 /// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized
@@ -1653,6 +1662,13 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // + per-table offsets at tail + pendingFlips == 0. An abandoned batch never decrements, so
         // pendingFlips can only reach 0 when every computed effect really did land.
         "pendingFlips": engine.pending_flips(),
+        // Backfill/subset snapshots currently waiting for transactions the sequencer already fanned
+        // out to become visible to new snapshots (see `pg::SequencedXids`). Diagnostic only.
+        "visibilityWaits": crate::pg::settle_waits_active(),
+        // The settle record (size, peak, bytes, transactions dropped at its bound) and counters
+        // (poller ticks/failures, checks, retakes, timeouts, admission rejections) plus the settle
+        // wait-duration distribution. Diagnostic only.
+        "settle": crate::pg::settle_stats_json(),
         // Flip batches abandoned after exhausting their retries; non-zero means the engine is
         // degraded (its membership-bearing routes answer 503) and must be restarted.
         "flipFailures": engine.flip_failures(),
@@ -1739,6 +1755,9 @@ impl From<anyhow::Error> for AppError {
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
         let retry_after = e.downcast_ref::<crate::engine::CreateRaced>().is_some()
+            // A snapshot that could not settle is waiting on Postgres (a synchronous standby), not
+            // broken: the same request succeeds once the held commit is visible.
+            || e.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some()
             // A deferred reactivation is the caller's to retry, not evidence of a broken engine:
             // the shape is still there, parked back as dormant, and the next touch replays it.
             || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()

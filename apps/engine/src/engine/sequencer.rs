@@ -156,6 +156,9 @@ pub(crate) fn spawn_sequencer(
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     // Per-shape ceiling for the pending-creation buffer (see `buffer_pending`).
     pending_buffer_max_bytes: u64,
+    // Postgres mode: where each transaction's xid is noted before it is fanned out, so a backfill or
+    // subset snapshot that still excludes it can be retaken (`pg::SequencedXids`).
+    sequenced: Option<Arc<crate::pg::SequencedXids>>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -188,6 +191,7 @@ pub(crate) fn spawn_sequencer(
         pause_gate,
         read_cap_latch,
         pending_buffer_max_bytes,
+        sequenced,
         shutdown,
         party,
     ));
@@ -455,6 +459,7 @@ pub(crate) async fn sequencer_loop(
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     pending_buffer_max_bytes: u64,
+    sequenced: Option<Arc<crate::pg::SequencedXids>>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -830,6 +835,17 @@ pub(crate) async fn sequencer_loop(
                         let mut j = i + 1;
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
+                        }
+                        // Before any of this transaction reaches a shape stream or a feed: a
+                        // snapshot of a table it touched, taken from here on, that still excludes
+                        // it must be retaken, or whatever it is paired with (a BeginShape point, a
+                        // subset client's HEAD) would sit past a transaction that is in neither
+                        // (`pg::SequencedXids`). Engine control envelopes name no table.
+                        if let (Some(seen), Some(xid)) = (&sequenced, txid.as_deref().and_then(|t| t.parse::<u64>().ok())) {
+                            seen.note(
+                                xid,
+                                envs[i..j].iter().map(|e| e.type_.as_str()).filter(|t| !t.starts_with("__circuits.")),
+                            );
                         }
                         // Feed this transaction into the dbsp counts pipelines and step the
                         // circuit BEFORE fanning it out, so circuit-served aggregates emit
@@ -1634,12 +1650,12 @@ pub(crate) async fn backfill_and_activate(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     ack_rx: tokio::sync::oneshot::Receiver<LogPosition>,
-) -> std::result::Result<BackfillStats, String> {
+) -> anyhow::Result<BackfillStats> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape { table: table.clone(), shape_id: shape_id.to_string() });
     };
     if ack_rx.await.is_err() {
-        return Err("sequencer dropped the begin-shape ack".to_string());
+        anyhow::bail!("sequencer dropped the begin-shape ack");
     }
     // Backfill: current matching rows from a REPEATABLE READ snapshot, predicate pushed into the
     // SELECT; `matches()` is the final authority (a safety net if the SQL is ever a looser
@@ -1669,12 +1685,12 @@ pub(crate) async fn backfill_and_activate(
         })
         .is_err()
     {
-        return Err("sequencer is gone".to_string());
+        anyhow::bail!("sequencer is gone");
     }
     ready_rx
         .await
         .unwrap_or_else(|_| Err(ActivateFailure::Failed("sequencer dropped the ready channel".to_string())))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     Ok(stats)
 }
 
@@ -1705,7 +1721,7 @@ async fn stream_backfill(
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
     t0: std::time::Instant,
-) -> std::result::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64, BackfillStats), String> {
+) -> anyhow::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64, BackfillStats)> {
     // Library/no-source mode: the shape simply starts empty (and an aggregate starts at its
     // empty-set value), exactly as the materialising version did.
     let Some(url) = pg_url.as_deref() else {
@@ -1716,9 +1732,11 @@ async fn stream_backfill(
             BackfillStats::default(),
         ));
     };
-    let client = crate::pg::pool_for(url).get().await.map_err(|e| format!("{e:#}"))?;
-    let mut reader =
-        crate::pg::backfill_reader(&client, ts, Some(pred.as_ref())).await.map_err(|e| format!("{e:#}"))?;
+    // Typed errors all the way out: a snapshot that could not settle (`pg::SnapshotUnsettled`) must
+    // reach the HTTP layer as itself — a retryable 503 — not as a string it can only answer 500 to.
+    let mut client = crate::pg::pool_for(url).get().await?;
+    let scope = crate::pg::SettleScope::request(&ts.table);
+    let mut reader = crate::pg::backfill_reader(&mut client, ts, Some(pred.as_ref()), &scope).await?;
 
     let mut agg_seed = aggregate.map(|_| AggSeed::default());
     let mut rows_total = 0u64;
@@ -1731,13 +1749,9 @@ async fn stream_backfill(
         // un-raced connect. Aborting costs nothing: the shape is still PENDING, so the caller's
         // rollback removes the partly-appended stream and the client simply creates it again.
         if shutdown.is_shutting_down() {
-            return Err(SHUTTING_DOWN.to_string());
+            anyhow::bail!(SHUTTING_DOWN);
         }
-        let chunk = match reader.next_chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(e) => return Err(format!("{e:#}")),
-        };
+        let Some(chunk) = reader.next_chunk().await? else { break };
         rows_total += chunk.len() as u64;
         match (&mut agg_seed, aggregate) {
             // The sequencer no longer receives rows for an aggregate: the fold happens here, one
@@ -1753,9 +1767,7 @@ async fn stream_backfill(
                     snapshot_bytes += envs_bytes(&envs);
                 }
                 emitted_seed += envs.len() as u64;
-                if let Err(e) = ds.append(stream_path, &envs).await {
-                    return Err(format!("append snapshot: {e:#}"));
-                }
+                ds.append(stream_path, &envs).await.context("append snapshot")?;
                 appends += 1;
             }
         }
