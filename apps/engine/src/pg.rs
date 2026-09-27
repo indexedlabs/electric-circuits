@@ -1288,8 +1288,8 @@ mod settle;
 
 use settle::begin_settled_snapshot;
 pub use settle::{
-    DEFAULT_SETTLE_MAX_XIDS, MAX_SETTLE_MAX_XIDS, SequencedXids, SettleConfig, SettleScope, SnapshotUnsettled,
-    UnsettledCause, settle_waits_active,
+    DEFAULT_SETTLE_MAX_XIDS, MAX_SETTLE_MAX_XIDS, MIN_SETTLE_MAX_XIDS, SequencedXids, SettleConfig, SettleScope,
+    SnapshotUnsettled, UnsettledCause, settle_waits_active,
 };
 
 /// The `settle` object of `GET /replication/lsn`: the settle record's size across every pool, and

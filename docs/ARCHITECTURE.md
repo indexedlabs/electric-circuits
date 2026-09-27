@@ -352,7 +352,9 @@ through `pg::begin_settled_snapshot` (`apps/engine/src/pg/settle.rs`):
   (PostgreSQL's `TransactionIdPrecedes`), so a transaction from just after an xid epoch boundary
   orders after one from just before it.
 - A snapshot is checked only against the tables its read depends on (the table, plus the inner
-  tables of a subquery predicate) and only where a sequenced transaction can hide from it: the
+  tables of a subquery predicate), as their record stood just before the snapshot was opened (so the
+  poller pruning a transaction that became visible in between cannot hide it from the check), and
+  only where a sequenced transaction can hide from it: the
   snapshot's `xip` list and `[xmax, highest sequenced]`. A transaction the engine never sequenced —
   a long-open writer pinning `xmin` — is never consulted, so it can never block a settle.
 - A snapshot that excludes one is rolled back, its pooled connection is **released**, and the
@@ -365,9 +367,14 @@ through `pg::begin_settled_snapshot` (`apps/engine/src/pg/settle.rs`):
   retryable 503 with `Retry-After` (typed through the create and share paths) and a create is
   rolled back. A poller that cannot run only makes waits time out.
 - The poller forgets what a fresh snapshot shows visible every tick, so the record is normally a
-  chunk or two. It is bounded (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`, ~2 MiB by default); at
-  the bound the **oldest** recorded transactions are given up — their settle is no longer
-  guaranteed, counted and logged — rather than failing or stalling every snapshot.
+  chunk or two. It is bounded (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`, ≥ 2^20 transactions,
+  ~2 MiB by default), so only a long poller outage reaches the bound. There the **oldest** recorded
+  transactions are given up (counted and logged) and each affected table gets an **overflow
+  fence** — the highest xid given up. While a table is fenced, a snapshot that reads it is served
+  only if its `xmin` is past the fence (it provably sees every given-up transaction); otherwise the
+  request answers a retryable 503. The poller clears the fence once it sees `xmin` pass it, and a
+  given-up transaction never satisfies a waiter. The degrade costs availability on the affected
+  tables only, never a silently lost change, and never stalls unaffected tables.
 
 `pg_xact_status()` cannot detect the window by itself (it reports such a transaction as
 `in progress`). The gate's 32-bit xids are compared modulo 2^32, and a change at or past the

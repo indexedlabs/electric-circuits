@@ -8,9 +8,11 @@
 //  * a held transaction on one table never delays reads of another table;
 //  * past the waiter cap, excess requests are refused at once, and the admitted one still succeeds
 //    once T becomes visible;
-//  * a long-open transaction the engine never sequenced (pinning `xmin`) never blocks settling, even
-//    when the settle record has overflowed its bound;
-//  * at its bound the record gives up its oldest transactions instead of failing snapshots.
+//  * a long-open transaction the engine never sequenced (pinning `xmin`) never blocks settling of a
+//    table the settle record still covers, even once the record has overflowed its bound;
+//  * at its bound the record gives up its oldest transactions, and fences the tables it gave them up
+//    on: a snapshot of such a table either provably includes them (its xmin is past the fence) or
+//    answers a retryable 503 — never a silent success that is missing a transaction.
 //
 // T is held exactly as in the seam test: the cluster names a synchronous standby that never connects
 // (`phantom_standby`), T commits with `synchronous_commit = on` and parks in `SyncRepWaitForLSN` after
@@ -22,7 +24,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import pg from 'pg'
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
 import { postgres18Tools } from '../../../scripts/postgres18.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
@@ -80,8 +82,8 @@ afterEach(async () => {
   h = undefined
 })
 
-async function boot(engineEnv: Record<string, string>): Promise<void> {
-  h = await bootHarness(schema, { engineEnv })
+async function boot(engineEnv: Record<string, string>, tables: Schema = schema): Promise<void> {
+  h = await bootHarness(tables, { engineEnv })
   await drainEngine(h)
 }
 
@@ -144,6 +146,44 @@ async function post(path: string, body: unknown): Promise<Answer> {
   return { status: res.status, ms: performance.now() - t0, retryAfter: res.headers.get('retry-after'), body: json }
 }
 const query = (table: string) => post('/v1/subsets/query', { table, orderBy: { col: 'id' }, limit: 100 })
+
+/** Resend a request while it answers the retryable 503 (honouring its `Retry-After` contract). */
+async function untilAccepted(send: () => Promise<Answer>, what: string): Promise<Answer> {
+  const deadline = Date.now() + 20000
+  for (;;) {
+    const answer = await send()
+    if (answer.status !== 503) return answer
+    expect(answer.retryAfter).toBe('1')
+    if (Date.now() > deadline) throw new Error(`${what} still answered 503 at the deadline: ${JSON.stringify(answer.body)}`)
+    await new Promise((r) => setTimeout(r, 50))
+  }
+}
+
+/** A shape stream's rows, folded, after a causal fence row on the same table has been applied. */
+async function shapeRows(streamUrl: string, fenceId: number): Promise<Array<{ id: number; n: number }>> {
+  await sql('INSERT INTO items VALUES ($1, 0)', [fenceId])
+  await drainEngine(h!)
+  const folded = new Map<string, Row>()
+  let offset = '-1'
+  for (let page = 0; ; page++) {
+    if (page === 100) throw new Error('shape stream exceeded 100 catch-up pages')
+    const res = await fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}`)
+    if (res.status === 204) break
+    expect(res.ok).toBe(true)
+    const text = (await res.text()).trim()
+    for (const e of (text ? JSON.parse(text) : []) as StreamEnvelope[]) {
+      if (e.headers.operation === 'delete') folded.delete(e.key)
+      else if (e.value) folded.set(e.key, e.value)
+    }
+    offset = res.headers.get('stream-next-offset')!
+    if (res.headers.has('stream-up-to-date') || !text) break
+  }
+  expect(folded.has(String(fenceId)), 'the shape applied the fence row').toBe(true)
+  return rowsOf(folded.values())
+}
+const rowsOf = (rows: Iterable<Row>) =>
+  [...rows].map((r) => ({ id: Number(r.id), n: Number(r.n) })).sort((a, b) => a.id - b.id)
+const truth = async () => rowsOf(await sql('SELECT id, n FROM items ORDER BY id'))
 async function replicationStatus(): Promise<{ visibilityWaits?: number; settle?: Record<string, any> }> {
   return (await (await fetch(`${h!.engineUrl}/replication/lsn`)).json()) as { visibilityWaits?: number; settle?: Record<string, any> }
 }
@@ -216,37 +256,86 @@ describe('settling snapshots never turns into an outage', () => {
     expect((admitted.body as { rows: Row[] }).rows.map((r) => Number(r.id))).toEqual([1])
   })
 
-  it('a long-open unsequenced writer never blocks settling, and at its bound the record degrades without 503s', async () => {
-    // A poller that effectively never ticks on its own and the smallest bound: the record only grows,
-    // so it must hit the bound — the exact condition under which waiting on xmin failed everything.
-    await boot({ ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS: '1024', ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS: '600000' })
+  it('at its bound the record fences what it gave up: T is in the shape once visible, or the create answers 503', async () => {
+    // A poller that effectively never ticks on its own and the smallest bound the engine accepts
+    // (2^20 xids = 1024 chunks of 1024): the record only grows, so it must hit the bound. It is
+    // bounded in chunks, one per table per 1024-xid window, so FILLERS tables written once per
+    // window for WINDOWS windows overflow it without committing a million transactions.
+    const FILLERS = 64
+    const WINDOWS = 17 // 64 × 17 = 1088 chunks > 1024
+    const wide: Schema = { tables: { ...schema.tables } }
+    for (let f = 0; f < FILLERS; f++) wide.tables[`f${f}`] = schema.tables.items!
+    await boot(
+      { ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS: '1048576', ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS: '600000' },
+      wide,
+    )
     pin = new pg.Client({ connectionString: h!.pgUrl })
     await pin.connect()
     await pin.query('BEGIN')
-    await pin.query('INSERT INTO other VALUES (1000, 0)') // holds an xid (and xmin) until the test ends
+    await pin.query('INSERT INTO other VALUES (1000, 0)') // holds an xid (and xmin) until it ends
     const [{ x: pinXid }] = await pin.query('SELECT pg_current_xact_id()::text AS x').then((r) => r.rows)
 
-    // T, held and sequenced, is the OLDEST entry; then enough commits to push the record past 1024.
+    // T, held and sequenced, is the OLDEST entry on `items`; then every filler table is written
+    // once in each of WINDOWS later 1024-xid windows (the xids in between are burnt by empty
+    // transactions, which the engine never sequences).
     await holdCommit('INSERT INTO items VALUES (1, 10)')
     const writer = new pg.Client({ connectionString: h!.pgUrl })
     await writer.connect()
-    for (let i = 0; i < 2100; i++) await writer.query('INSERT INTO items VALUES ($1, 0)', [100 + i])
+    await writer.query('SET synchronous_commit = off')
+    const burn = 'BEGIN; SELECT pg_current_xact_id(); COMMIT;'.repeat(1024)
+    for (let w = 0; w < WINDOWS; w++) {
+      await writer.query(burn)
+      const inserts = Array.from({ length: FILLERS }, (_, f) => `INSERT INTO f${f} VALUES (${w}, 0);`).join(' ')
+      await writer.query(`BEGIN; ${inserts} COMMIT;`)
+    }
     await writer.end()
     await drainEngine(h!, 60000)
 
     const stats = await settleStats()
     console.log('settle after overflow', { pinXid, ...stats, waitMs: undefined })
     expect(stats.xidsDropped, 'the bound was hit and counted').toBeGreaterThan(0)
-    expect(stats.sequencedXids).toBeLessThanOrEqual(2048)
+    expect(stats.sequencedXids).toBeLessThanOrEqual(1024 * 1024)
     const [snap] = await sql('SELECT pg_current_snapshot()::text AS s')
     expect(String(snap!.s).startsWith(`${pinXid}:`), 'xmin is pinned by the open writer').toBe(true)
 
-    // Every query succeeds promptly: the pin was never sequenced, and T — dropped at the bound — is
-    // no longer waited for.
-    const answers = await Promise.all(Array.from({ length: 20 }, () => query('items')))
+    // A shape create on T's table while T is still held. T was given up at the bound, and xmin is
+    // pinned below it, so no snapshot can be proved to include it: the create either answers the
+    // retryable 503, or — accepted — its shape must hold T once T is visible. A success whose
+    // shape is missing T is the lost change.
+    const whileHeld = await post('/v1/shapes', { table: 'items' })
+    console.log('create on the fenced table while T is held', whileHeld.status, whileHeld.body)
+    await release()
+    if (whileHeld.status === 200) {
+      const shape = whileHeld.body as { streamUrl: string }
+      expect(await shapeRows(shape.streamUrl, 98), 'the accepted shape holds T').toEqual(await truth())
+    } else {
+      expect(whileHeld.status).toBe(503)
+      expect(whileHeld.retryAfter).toBe('1')
+    }
+    // T is visible now; with xmin still pinned below the fence a query either includes T or is refused.
+    const afterRelease = await query('items')
+    if (afterRelease.status === 200) {
+      const ids = (afterRelease.body as { rows: Row[] }).rows.map((r) => Number(r.id))
+      expect(ids, 'a subset page on the fenced table includes T').toContain(1)
+    } else {
+      expect(afterRelease.status).toBe(503)
+      expect(afterRelease.retryAfter).toBe('1')
+    }
+
+    // A table the record still covers keeps working, and the unsequenced pin never blocks it.
+    const answers = await Promise.all(Array.from({ length: 20 }, () => query('other')))
     expect(answers.map((a) => a.status)).toEqual(Array(20).fill(200))
     expect(Math.max(...answers.map((a) => a.ms))).toBeLessThan(2000)
-    const create = await post('/v1/shapes', { table: 'items', where: { col: 'n', op: 'eq', value: 0 } })
-    expect(create.status).toBe(200)
+    expect((await post('/v1/shapes', { table: 'other' })).status).toBe(200)
+
+    // Once the pin ends, xmin moves past the fence: T's table is served again, and a new shape holds T.
+    await pin.query('ROLLBACK')
+    await pin.end()
+    pin = undefined
+    const created = await untilAccepted(() => post('/v1/shapes', { table: 'items', where: { col: 'n', op: 'gte', value: 0 } }), 'create')
+    expect(created.status, JSON.stringify(created.body)).toBe(200)
+    const rows = await shapeRows((created.body as { streamUrl: string }).streamUrl, 99)
+    expect(rows.map((r) => r.id)).toContain(1)
+    expect(rows).toEqual(await truth())
   })
 })

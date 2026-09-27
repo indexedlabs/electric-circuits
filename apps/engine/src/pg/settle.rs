@@ -29,6 +29,10 @@
 //!   by construction (see [`begin_settled_snapshot`]).
 //! * Waiters are admitted up to `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS`; a request past that
 //!   fails at once with a retryable [`SnapshotUnsettled`] (HTTP 503 + `Retry-After`).
+//! * The record is bounded (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`). Past the bound it gives up
+//!   its oldest chunks and leaves a per-table **overflow fence** (the highest xid given up): until the
+//!   poller sees `xmin` pass the fence, a snapshot of that table is served only if its own `xmin` is
+//!   past it, and answers a retryable 503 otherwise (see [`SequencedXids::enforce_bound`]).
 //!
 //! `pg_xact_status()` cannot detect the window by itself: it reports such a transaction as
 //! `in progress`, because it consults the ProcArray before the clog.
@@ -57,6 +61,12 @@ const CHUNK_BYTES: u64 = (CHUNK_WORDS as u64) * 8 + 16;
 
 /// Default for `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`: 16M transactions, ~2 MiB when dense.
 pub const DEFAULT_SETTLE_MAX_XIDS: u64 = 16 * 1024 * 1024;
+
+/// The smallest accepted `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`: 2^20 transactions (1024
+/// chunks, ~144 KiB). The poller forgets what it sees visible every tick, so only a poller outage
+/// long enough for a million transactions (or a thousand tables' worth of 1024-xid windows) can
+/// reach the bound — and past it the affected tables answer 503 until it recovers.
+pub const MIN_SETTLE_MAX_XIDS: u64 = 1 << 20;
 
 /// The largest accepted `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`. Every recorded xid is
 /// compared modulo 2^32 against the newest one, which is sound only while they span less than 2^31;
@@ -106,6 +116,12 @@ impl Chunk {
         *w &= !m;
         self.len -= 1;
         true
+    }
+
+    /// The highest set xid (unwrapped), if any.
+    fn max(&self) -> Option<u64> {
+        let (i, &w) = self.bits.iter().enumerate().rev().find(|(_, w)| **w != 0)?;
+        Some(self.start() + i as u64 * 64 + 63 - u64::from(w.leading_zeros()))
     }
 
     /// Every set xid (unwrapped) at or after `from`.
@@ -248,6 +264,7 @@ impl TableXids {
 
 /// A snapshot's visibility fences, unwrapped into the record's 64-bit xid space.
 struct Fences {
+    xmin: u64,
     xmax: u64,
     /// Sorted.
     xip: Vec<u64>,
@@ -263,6 +280,9 @@ struct Record {
     len: u64,
     /// Chunks, all tables — what the bound is enforced on.
     chunks: usize,
+    /// Overflow fences: per table, the highest xid the bound gave up (unwrapped). A snapshot of the
+    /// table is served only if its `xmin` is past it; the poller clears it once a snapshot's is.
+    fences: HashMap<Box<str>, u64>,
     peak_len: u64,
     /// When the last bound drop was logged (the warning is rate-limited).
     last_drop_log: Option<Instant>,
@@ -290,7 +310,7 @@ fn unwrap_xid(anchor: Option<u64>, xid: u32) -> u64 {
 fn fences_at(anchor: Option<u64>, gate: &SnapshotGate) -> Fences {
     let mut xip: Vec<u64> = gate.xip.iter().map(|&x| unwrap_xid(anchor, x as u32)).collect();
     xip.sort_unstable();
-    Fences { xmax: unwrap_xid(anchor, gate.xmax as u32), xip }
+    Fences { xmin: unwrap_xid(anchor, gate.xmin as u32), xmax: unwrap_xid(anchor, gate.xmax as u32), xip }
 }
 
 impl Record {
@@ -306,6 +326,11 @@ impl Record {
     fn contains(&self, table: &str, v: u64) -> bool {
         self.tables.get(table).is_some_and(|t| t.contains(v))
     }
+
+    /// Is `v` still unresolved on `table`: recorded, or possibly given up under its overflow fence?
+    fn unresolved(&self, table: &str, v: u64) -> bool {
+        self.contains(table, v) || self.fences.get(table).is_some_and(|&f| v <= f)
+    }
 }
 
 /// What a scope's tables had recorded when a snapshot was about to be opened (see
@@ -313,9 +338,25 @@ impl Record {
 struct Captured {
     anchor: Option<u64>,
     tables: Vec<TableXids>,
+    /// The highest overflow fence on the scope's tables, if any is set.
+    fence: Option<u64>,
 }
 
 impl Captured {
+    /// Check `gate`: fenced (an overflow gave up transactions on a scope table, and `gate`'s `xmin`
+    /// is not past them), else the captured transactions it excludes, else settled.
+    fn check(&self, gate: &SnapshotGate) -> Check {
+        if let Some(fence) = self.fence
+            && unwrap_xid(self.anchor, gate.xmin as u32) <= fence
+        {
+            return Check::Fenced(fence);
+        }
+        match self.unsettled(gate) {
+            None => Check::Settled,
+            Some(pending) => Check::Pending(pending),
+        }
+    }
+
     /// Captured transactions that `gate` does not see (unwrapped, sorted), or `None` if it sees them
     /// all. Looks only at `gate`'s `xip` and at `[xmax, highest recorded]`.
     ///
@@ -392,6 +433,8 @@ struct SettleMetrics {
     dropped: AtomicU64,
     /// Times the bound was hit.
     bound_hits: AtomicU64,
+    /// Snapshots refused because a table they read was fenced by an overflow (xmin not past it).
+    overflow_refusals: AtomicU64,
     /// Settle-duration histogram of every wait (whatever its outcome).
     hist: [AtomicU64; HIST_BOUNDS_MS.len() + 1],
     hist_sum_us: AtomicU64,
@@ -412,6 +455,7 @@ static METRICS: SettleMetrics = SettleMetrics {
     forgotten: ZERO,
     dropped: ZERO,
     bound_hits: ZERO,
+    overflow_refusals: ZERO,
     hist: [ZERO; HIST_BOUNDS_MS.len() + 1],
     hist_sum_us: ZERO,
     hist_max_us: ZERO,
@@ -435,13 +479,14 @@ pub fn settle_waits_active() -> u64 {
 /// The `settle` object of `GET /replication/lsn`: the record's size across `sets`, and the
 /// process-wide counters and wait-duration distribution.
 pub(super) fn stats_json<'a>(sets: impl Iterator<Item = &'a SequencedXids>) -> serde_json::Value {
-    let (mut len, mut peak, mut chunks, mut tables) = (0u64, 0u64, 0usize, 0usize);
+    let (mut len, mut peak, mut chunks, mut tables, mut fenced) = (0u64, 0u64, 0usize, 0usize, 0usize);
     for s in sets {
         let r = s.record.lock().unwrap();
         len += r.len;
         peak += r.peak_len;
         chunks += r.chunks;
         tables += r.tables.len();
+        fenced += r.fences.len();
     }
     let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
     let counts: Vec<u64> = METRICS.hist.iter().map(l).collect();
@@ -473,6 +518,8 @@ pub(super) fn stats_json<'a>(sets: impl Iterator<Item = &'a SequencedXids>) -> s
         "recordBytes": chunks as u64 * CHUNK_BYTES,
         "xidsDropped": l(&METRICS.dropped),
         "boundHits": l(&METRICS.bound_hits),
+        "fencedTables": fenced,
+        "overflowRefusals": l(&METRICS.overflow_refusals),
         "forgotten": l(&METRICS.forgotten),
         "pollerTicks": l(&METRICS.poller_ticks),
         "pollerFailures": l(&METRICS.poller_failures),
@@ -502,7 +549,7 @@ pub(super) fn stats_json<'a>(sets: impl Iterator<Item = &'a SequencedXids>) -> s
 /// `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS` (in chunks: ≈ that many transactions of dense
 /// backlog, ≈ that / 8 bytes). Normally the record is a chunk or two — the poller forgets everything
 /// a fresh snapshot shows visible every tick — so the bound only matters when the poller cannot run
-/// for a long time (see [`Record`] overflow handling in [`SequencedXids::note`]).
+/// for a long time (see [`SequencedXids::enforce_bound`]).
 ///
 /// **Poller.** A single task per pool on its own dedicated connection (never a pooled one, so a
 /// starved pool cannot starve it): while the record is non-empty it takes a fresh
@@ -591,17 +638,25 @@ impl SequencedXids {
         }
     }
 
-    /// The record has hit its bound: give up the OLDEST chunks (across tables) until it fits.
+    /// The record has hit its bound: give up the OLDEST chunks (across tables) until it fits, and
+    /// leave an overflow fence on each table a chunk was taken from: the highest xid given up.
     ///
-    /// Degrading means those transactions' settle is no longer guaranteed: a snapshot that excludes
-    /// one of them is accepted as settled. The alternatives are worse. Refusing or stalling every
-    /// snapshot (what waiting on `xmin` past the dropped range amounted to) turns a memory bound into
-    /// a total outage for every subset query and shape create — triggered by nothing more than an
-    /// unrelated long-open transaction. Dropping the NEWEST would give up exactly the transactions
-    /// that are racing a snapshot right now (the microsecond window the guarantee exists for), while
-    /// the oldest have been invisible for as long as the bound can hold — a stalled synchronous
-    /// standby or a poller that has not run for that long — and are the ones most likely never to be
-    /// asked about. So the oldest go, each drop is counted (`xidsDropped`), and it is logged.
+    /// A given-up transaction can no longer be checked for, so a snapshot of its table cannot be
+    /// shown to include it — unless the snapshot's `xmin` is past the fence, which proves every xid
+    /// up to the fence has ended (and a sequenced one committed, so it is visible). So while a table
+    /// is fenced, a snapshot that reads it is served only if its `xmin` is past the fence, and is
+    /// otherwise refused with a retryable 503 at once; the poller clears the fence once one of its
+    /// snapshots has `xmin` past it. A waiter's transactions under a fence stay unresolved, so the
+    /// bound never satisfies a wait either.
+    ///
+    /// The degrade is therefore availability, never correctness, and only for the affected tables:
+    /// accepting such a snapshot would silently lose a transaction that is already behind the
+    /// request's pairing point (the lost-change bug the record exists to prevent); waiting on `xmin`
+    /// for every table would let one long-open transaction stall every snapshot. The oldest chunks
+    /// go because the newest are the transactions racing a snapshot right now, while the oldest have
+    /// been invisible for as long as the bound can hold. Reaching the bound takes a poller outage
+    /// spanning at least `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS` (≥ 2^20) transactions; each
+    /// drop is counted (`xidsDropped`), fenced tables are reported (`fencedTables`), and it is logged.
     fn enforce_bound(&self, r: &mut Record) {
         let mut dropped = 0u64;
         while r.chunks > self.cap_chunks {
@@ -620,6 +675,10 @@ impl SequencedXids {
             if t.len == 0 {
                 r.tables.remove(&oldest);
             }
+            if let Some(high) = chunk.max() {
+                let fence = r.fences.entry(oldest).or_insert(high);
+                *fence = (*fence).max(high);
+            }
             r.chunks -= 1;
             r.len -= u64::from(chunk.len);
             dropped += u64::from(chunk.len);
@@ -632,9 +691,10 @@ impl SequencedXids {
             tracing::warn!(
                 dropped = r.dropped_since_log,
                 cap_xids = self.cap_chunks as u64 * CHUNK_BITS,
+                fenced_tables = r.fences.len(),
                 "settle record hit its bound (ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS): the oldest \
-                 sequenced transactions are no longer guaranteed to be visible to backfill and subset \
-                 snapshots; is the visibility poller failing, or a synchronous standby stalled?"
+                 sequenced transactions were given up, and snapshots of their tables answer 503 until \
+                 xmin passes them; is the visibility poller failing, or a synchronous standby stalled?"
             );
             r.last_drop_log = Some(Instant::now());
             r.dropped_since_log = 0;
@@ -647,6 +707,9 @@ impl SequencedXids {
     /// snapshot was taken, so the snapshot still excludes it, yet it would no longer be recorded.
     ///
     /// Normally the record is empty (nothing is copied) or a chunk or two per table.
+    ///
+    /// The overflow fences are captured with it: a fence the poller clears after the snapshot was
+    /// opened says nothing about that snapshot.
     fn capture(&self, scope: &SettleScope) -> Captured {
         let r = self.record.lock().unwrap();
         let mut tables = Vec::new();
@@ -657,16 +720,28 @@ impl SequencedXids {
                 }
             }
         }
-        Captured { anchor: r.anchor, tables }
+        let mut fence = None;
+        if !r.fences.is_empty() {
+            for table in &scope.tables {
+                if let Some(&f) = r.fences.get(table.as_str()) {
+                    fence = Some(fence.map_or(f, |g: u64| g.max(f)));
+                }
+            }
+        }
+        Captured { anchor: r.anchor, tables, fence }
     }
 
-    /// Forget everything `gate` shows visible, on every table (the poller's prune).
+    /// Forget everything `gate` shows visible, on every table (the poller's prune), and clear every
+    /// overflow fence its `xmin` is past.
     fn prune(&self, gate: &SnapshotGate) {
         let mut r = self.record.lock().unwrap();
-        if r.len == 0 {
+        if r.len == 0 && r.fences.is_empty() {
             return;
         }
         let f = r.fences(gate);
+        if !r.fences.is_empty() {
+            r.fences.retain(|_, fence| f.xmin <= *fence);
+        }
         let (mut forgotten, mut removed) = (0u64, 0usize);
         r.tables.retain(|_, t| {
             let (n, c) = t.prune(f.xmax, &f.xip);
@@ -717,6 +792,20 @@ impl SequencedXids {
         self.len() == 0
     }
 
+    /// Nothing for the poller to learn: every sequenced transaction is known visible and no table is
+    /// fenced by an overflow.
+    fn is_quiet(&self) -> bool {
+        let r = self.record.lock().unwrap();
+        r.len == 0 && r.fences.is_empty()
+    }
+
+    /// Start the poller if needed and make it tick now (a fenced table's fence is cleared only by a
+    /// poll that sees `xmin` past it).
+    fn kick(self: &Arc<Self>) {
+        self.ensure_poller();
+        self.wake.notify_one();
+    }
+
     /// Start the poller if it is not running (never started, or its runtime went away). A set with
     /// no URL, or a caller outside a Tokio runtime, has none.
     fn ensure_poller(self: &Arc<Self>) {
@@ -730,7 +819,9 @@ impl SequencedXids {
     }
 
     /// Wait until none of `pending` (unwrapped) is recorded on `scope`'s tables any more — the
-    /// poller saw it visible, forgot it as foreign, or the bound gave it up — or until `deadline`.
+    /// poller saw it visible or forgot it as foreign — or until `deadline`. A transaction the bound
+    /// gave up is not resolved by that: it stays pending while an overflow fence covers it, until the
+    /// poller sees `xmin` past the fence.
     /// Never touches a pooled connection. A poller that cannot run does not wedge this: the deadline
     /// does.
     async fn wait_until_settled(
@@ -755,7 +846,7 @@ impl SequencedXids {
         loop {
             {
                 let r = self.record.lock().unwrap();
-                pending.retain(|&v| scope.tables.iter().any(|t| r.contains(t, v)));
+                pending.retain(|&v| scope.tables.iter().any(|t| r.unresolved(t, v)));
             }
             if pending.is_empty() {
                 return Ok(());
@@ -788,7 +879,7 @@ async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
     let mut prev_ahead: HashSet<u64> = HashSet::new();
     loop {
         let idle = set.waiters.load(Ordering::Acquire) == 0;
-        if idle && set.is_empty() {
+        if idle && set.is_quiet() {
             // Nothing to learn: park until a first note or a waiter.
             set.wake.notified().await;
             fast = FAST_START;
@@ -942,6 +1033,9 @@ pub enum UnsettledCause {
     Rejected,
     /// A shared shape's creator failed this way; a joiner reports the same.
     Shared,
+    /// The settle record overflowed its bound and gave up sequenced transactions on a table the read
+    /// depends on; the snapshot's `xmin` is not past them, so it cannot be shown to include them.
+    Overflowed,
 }
 
 /// A snapshot could not be settled: a transaction the engine has already sequenced is still not
@@ -971,6 +1065,13 @@ impl std::fmt::Display for SnapshotUnsettled {
                  to new snapshots (first xids {first:?}) and too many requests are already waiting for them \
                  (ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS). Retry.",
                 self.pending.len()
+            ),
+            UnsettledCause::Overflowed => write!(
+                f,
+                "snapshot not settled: the settle record overflowed ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS and gave \
+                 up committed transaction(s) on a table this read depends on (up to xid {first:?}); the table is \
+                 served again once no transaction up to there is still running. Is the visibility poller failing, \
+                 or a synchronous standby stalled? Retry."
             ),
             UnsettledCause::Shared => f.write_str(
                 "the shared shape's creator could not settle its snapshot (a committed transaction is not yet \
@@ -1019,6 +1120,9 @@ enum Check {
     Settled,
     /// Sequenced transactions (unwrapped, sorted) the snapshot excludes.
     Pending(Vec<u64>),
+    /// The bound gave up transactions on a table the read depends on, up to this xid (unwrapped),
+    /// and the snapshot's `xmin` is not past it: it cannot be shown to include them.
+    Fenced(u64),
 }
 
 /// What a snapshot is checked by: its visibility fences.
@@ -1047,10 +1151,7 @@ async fn open_checked<T: HasGate, Fut: std::future::Future<Output = Result<T>>>(
 ) -> Result<(T, Check)> {
     let captured = seen.capture(scope);
     let opened = open().await?;
-    let check = match captured.unsettled(opened.gate()) {
-        None => Check::Settled,
-        Some(pending) => Check::Pending(pending),
-    };
+    let check = captured.check(opened.gate());
     Ok((opened, check))
 }
 
@@ -1090,6 +1191,20 @@ pub(super) async fn begin_settled_snapshot(
     let pending = match check {
         Check::Settled => return Ok(fences),
         Check::Pending(pending) => pending,
+        Check::Fenced(fence) => {
+            if client.batch_execute("ROLLBACK").await.is_ok() {
+                client.transaction_finished();
+            } else {
+                bail!("{what}: rolling back a fenced snapshot failed");
+            }
+            METRICS.overflow_refusals.fetch_add(1, Ordering::Relaxed);
+            // Let the poller clear the fence as soon as `xmin` has passed it, for the retry.
+            seen.kick();
+            return Err(anyhow::Error::new(SnapshotUnsettled {
+                cause: UnsettledCause::Overflowed,
+                pending: vec![fence as u32],
+            }));
+        }
     };
     if client.batch_execute("ROLLBACK").await.is_ok() {
         client.transaction_finished();
@@ -1275,11 +1390,12 @@ mod tests {
         assert_eq!(pending.iter().map(|&v| v as u32).collect::<Vec<_>>(), vec![600]);
     }
 
-    /// Past its bound the record gives up its OLDEST transactions rather than failing snapshots:
-    /// they stop being reported (a snapshot excluding them settles), each is counted as dropped, and
-    /// memory stays at the bound however long the poller cannot run.
+    /// Past its bound the record gives up its OLDEST transactions, and fences their table: a
+    /// snapshot of it that excludes one — or cannot be shown not to (its xmin is not past the fence)
+    /// — is refused, never accepted as settled. Memory stays at the bound however long the poller
+    /// cannot run, and a table nothing was given up on is unaffected.
     #[test]
-    fn the_bound_degrades_by_dropping_the_oldest_not_by_failing_snapshots() {
+    fn the_bound_fences_the_tables_it_gave_up_transactions_on() {
         let seen = set_with(SettleConfig { max_xids: 2 * CHUNK_BITS, ..SettleConfig::default() });
         let dropped_before = METRICS.dropped.load(Ordering::Relaxed);
         // A held transaction, then three chunks' worth of transactions no poller ever prunes.
@@ -1287,15 +1403,72 @@ mod tests {
         for x in 10_001..10_001 + 3 * CHUNK_BITS {
             seen.note(x, ["public.items"]);
         }
+        let last = 10_001 + 3 * CHUNK_BITS;
+        seen.note(last, ["public.other"]); // newest: the bound takes items' chunks, never this one
         let r = seen.record.lock().unwrap();
         assert!(r.chunks <= 2, "held at the bound: {} chunks", r.chunks);
+        assert!(r.fences.contains_key("public.items"));
         drop(r);
         assert!(METRICS.dropped.load(Ordering::Relaxed) > dropped_before, "the drop is counted");
-        // The held xid (the oldest) is no longer guaranteed: a snapshot that excludes it settles.
-        let g = SnapshotGate::parse("10000:10000:", "0/1");
-        let u = seen.unsettled(&items(), &g).unwrap();
-        assert!(!u.contains(&(u64::from(10_000u32) | (1 << 32))), "the oldest was given up");
-        assert!(u.iter().all(|&v| (v as u32) >= 10_000 + CHUNK_BITS as u32), "only recent transactions remain");
+        let v = |x: u64| seen.record.lock().unwrap().unwrap(x as u32);
+        // A snapshot that excludes the given-up 10_000 (xmin at it) is fenced, not settled.
+        let fenced = seen.capture(&items()).check(&gate("10000:10000:"));
+        assert!(matches!(fenced, Check::Fenced(f) if f >= v(10_000)), "{fenced:?}");
+        // So is one whose xmin sits anywhere at or below the fence, whatever else it sees.
+        let fence = seen.record.lock().unwrap().fences["public.items"];
+        let below = gate(&format!("{0}:{0}:", fence as u32));
+        assert!(matches!(seen.capture(&items()).check(&below), Check::Fenced(_)));
+        // A snapshot whose xmin is past the fence has seen every given-up xid end: only what is still
+        // recorded is checked.
+        let past = gate(&format!("{0}:{0}:", fence as u32 + 1));
+        assert!(!matches!(seen.capture(&items()).check(&past), Check::Fenced(_)));
+        // A table the bound took nothing from — and a subquery scope reading it — is served as before.
+        let other = SettleScope::request(&TableRef::parse("public.other").unwrap());
+        assert!(!r_fenced(&seen, "public.other"));
+        assert_eq!(seen.capture(&other).check(&gate("10000:10000:")), Check::Pending(vec![v(last)]));
+        let after = gate(&format!("{0}:{0}:", last + 1));
+        assert_eq!(seen.capture(&other).check(&after), Check::Settled);
+        let joined = other.with([&TableRef::parse("public.items").unwrap()]);
+        assert!(matches!(seen.capture(&joined).check(&gate("10000:10000:")), Check::Fenced(_)));
+        // The poller clears the fence once a snapshot's xmin is past it — not before.
+        seen.prune(&below);
+        assert!(seen.record.lock().unwrap().fences.contains_key("public.items"), "xmin not past the fence");
+        seen.prune(&past);
+        assert!(seen.record.lock().unwrap().fences.is_empty(), "cleared once xmin passed it");
+        assert!(!matches!(seen.capture(&items()).check(&gate("10000:10000:")), Check::Fenced(_)));
+    }
+
+    fn r_fenced(seen: &SequencedXids, table: &str) -> bool {
+        seen.record.lock().unwrap().fences.contains_key(table)
+    }
+
+    /// A transaction a waiter is waiting for that the bound then gives up does NOT satisfy the wait:
+    /// it stays pending under the overflow fence until the poller sees xmin past the fence.
+    #[tokio::test]
+    async fn eviction_never_satisfies_a_waiter() {
+        let seen = set_with(SettleConfig { max_xids: 2 * CHUNK_BITS, ..SettleConfig::default() });
+        seen.note(20_000, ["public.items"]);
+        let pending = seen.unsettled(&items(), &gate("20000:20001:20000")).unwrap();
+        let s = seen.clone();
+        let evictor = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for x in 20_001..20_001 + 3 * CHUNK_BITS {
+                s.note(x, ["public.items"]); // overflows: 20_000's chunk is given up
+            }
+            s.generation.send_modify(|g| *g += 1);
+        });
+        let started = Instant::now();
+        let err = seen
+            .wait_until_settled(&items(), pending.clone(), started + Duration::from_millis(300))
+            .await
+            .expect_err("a given-up transaction is not a visible one");
+        assert_eq!(err.cause, UnsettledCause::TimedOut);
+        evictor.await.unwrap();
+        assert!(!seen.record.lock().unwrap().contains("public.items", pending[0]), "it was evicted");
+        // Once the poller sees xmin past the fence, the same wait settles.
+        let fence = seen.record.lock().unwrap().fences["public.items"];
+        seen.prune(&gate(&format!("{0}:{0}:", fence as u32 + 1)));
+        seen.wait_until_settled(&items(), pending, Instant::now() + Duration::from_secs(5)).await.expect("settles");
     }
 
     /// A sparse backlog — a few held transactions among millions that became visible — costs a chunk
