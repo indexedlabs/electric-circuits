@@ -539,6 +539,83 @@ describe('createSubset lifecycle', () => {
   })
 })
 
+describe('loadMore', () => {
+  it('overlapping calls whose responses return in reverse order never regress a row to the older page', async () => {
+    // Rows 1..4. Row 3 reads 'old' in a snapshot taken before transaction 101 and 'new' in one after.
+    type State = { snapshot: string; title3: string }
+    const before: State = { snapshot: '101:101:', title3: 'old' }
+    const after: State = { snapshot: '102:102:', title3: 'new' }
+    const page = (st: State, past: number, limit: number) => ({
+      rows: [1, 2, 3, 4].filter((id) => id > past).slice(0, limit).map((id) => ({ id, title: id === 3 ? st.title3 : `t${id}` })),
+      lsn: '0/100',
+      snapshot: st.snapshot,
+      horizon: '0/200',
+    })
+    // Every loadMore request is held until the test answers it with a snapshot of its choosing.
+    const requests: Array<{ past: number; answered: boolean; answer: (st: State) => void }> = []
+    let first = true
+    const trpc = {
+      subset: {
+        live: {
+          mutate: async () => ({ shapeId: 'feed-1', streamPath: 'streams/feed-1', streamUrl: 'http://127.0.0.1:9/streams/feed-1' }),
+        },
+        query: {
+          query: (input: { where?: { col?: string; op?: string; value?: unknown }; limit: number }) => {
+            if (first) {
+              first = false
+              return Promise.resolve(page(before, 0, input.limit))
+            }
+            const past = Number(input.where?.value) // the keyset cursor: `id > boundary`
+            return new Promise((resolve) => {
+              const request = { past, answered: false, answer: (st: State) => ((request.answered = true), resolve(page(st, past, input.limit))) }
+              requests.push(request)
+            })
+          },
+        },
+      },
+      shapes: { delete: { mutate: async () => ({ ok: true as const }) } },
+    }
+    const deps: SubsetDeps = { trpc: trpc as unknown as SubsetDeps['trpc'], schema: testSchema, resolveStreamUrl: (h) => h.streamUrl }
+    const sub = await createSubset(deps, { table: 'issues', limit: 2 })
+    const flush = async () => {
+      for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0))
+    }
+    const title3 = () => (sub.collection.toArray as unknown as Row[]).find((r) => Number(r.id) === 3)?.title
+    const shown: unknown[] = []
+
+    const a = sub.loadMore()
+    const b = sub.loadMore()
+    await flush()
+    // Reversed: every request after the first is answered (newest first) from the later snapshot,
+    // before the first is answered from the earlier one; anything issued after that sees the later.
+    for (let i = requests.length - 1; i >= 1; i--) {
+      requests[i]!.answer(after)
+      await flush()
+      shown.push(title3())
+    }
+    requests[0]!.answer(before)
+    await flush()
+    shown.push(title3())
+    for (let i = 1; i < requests.length; i++) {
+      if (requests[i]!.answered) continue
+      requests[i]!.answer(after)
+      await flush()
+      shown.push(title3())
+    }
+    await Promise.all([a, b])
+
+    // Once the view has shown a row from a later snapshot, an earlier page never replaces it.
+    const firstNew = shown.indexOf('new')
+    expect(firstNew === -1 ? [] : shown.slice(firstNew), `row 3 as the view showed it: ${shown.join(' → ')}`).toEqual(
+      firstNew === -1 ? [] : shown.slice(firstNew).map(() => 'new'),
+    )
+    // The calls ran one after the other: the second asked for the page after the first's.
+    expect(requests.map((r) => r.past)).toEqual([2, 4])
+    expect((sub.collection.toArray as unknown as Row[]).map((r) => Number(r.id)).sort()).toEqual([1, 2, 3, 4])
+    await sub.close()
+  })
+})
+
 describe('deleteShapeWithRetry', () => {
   it('treats "not found" as success (shape already dropped) without retrying', async () => {
     let calls = 0

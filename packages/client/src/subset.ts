@@ -663,6 +663,11 @@ export async function createSubset<T extends Row = Row>(
 
     let ctl: SyncCtl | null = null
     let loadsInFlight = 0
+    // `loadMore` calls run one at a time, request AND merge: a page snapshot must never land after a
+    // newer one. Two overlapping calls whose responses came back in reverse order would otherwise let
+    // the older page replace rows the newer one wrote (`pageSupersedes` accepts any page over a
+    // page-versioned row, because page versions are only ever installed in request order).
+    let loadChain: Promise<unknown> = Promise.resolve()
 
     const view: SubsetView = { snapshotLsn: 0n, snapshot: null, present, applied, appliedTxid, pending: [], inView }
     // Bumped by every `seedPage`. A `loadMore` page that was requested against the PREVIOUS window
@@ -779,6 +784,70 @@ export async function createSubset<T extends Row = Row>(
     // handles, and those exist only once the collection has run its sync callback.
     lease = startLeaseRenewal(feed.leaseSeconds, renew)
 
+    /** One `loadMore`, run only through `loadChain`: request the page after `boundary` and merge it. */
+    const loadNext = async (pageSize: number): Promise<number> => {
+      // `pageSize <= 0` asks for nothing: answer 0 without a round-trip, and without concluding
+      // the set is exhausted (a zero-row answer to a zero-row request proves nothing about it).
+      if (closed || ended || pageSize <= 0 || !boundary || !ctl) return 0
+      const where = andPredicate(def.where, cursorPredicate(pk, def.orderBy, boundary))
+      const generation = windowGeneration
+      loadsInFlight++
+      try {
+        const page = (await deps.trpc.subset.query.query({
+          table: def.table,
+          where: where as never,
+          columns: cols,
+          orderBy: def.orderBy,
+          limit: pageSize,
+        })) as SubsetResult
+        // A replacement feed re-derived the whole window from a fresh page while this one was in
+        // flight: it describes a window that no longer exists, and merging it would resurrect rows
+        // the new page does not contain. Report nothing loaded, and leave `ended` to the new page.
+        if (generation !== windowGeneration) return 0
+        if (page.rows.length) {
+          // This page is a fresh Postgres snapshot at `pageLsn`; its rows are the authoritative state as
+          // of that LSN. Don't let a stale page regress a row already advanced past `pageLsn` by the live
+          // feed (the loadMore-vs-feed race), and set each row's watermark so older feed deltas drop.
+          // Tombstoned rows (watermark without membership) are skipped the same way — a page older than
+          // the delete must not resurrect the row.
+          const pageLsn = lsnToU64(page.lsn) ?? view.snapshotLsn
+          const pageSnap = pageSnapshotOf(page)
+          const pageVersion: RowVersion = pageSnap ?? pageLsn
+          let versioned = false
+          ctl.begin()
+          for (const r of page.rows) {
+            const k = String(r[pk])
+            const w = applied.get(k)
+            if (w !== undefined && !pageSupersedes(pageVersion, w, appliedTxid.get(k))) continue
+            ctl.write({ type: present.has(k) ? 'update' : 'insert', value: r })
+            present.add(k)
+            applied.set(k, pageVersion)
+            appliedTxid.delete(k)
+            versioned = true
+          }
+          ctl.commit()
+          // Rows now carry this page's snapshot as their version: let the tail retire it (mark it
+          // passed, drop its xip) once it reaches the page's horizon, as it does the first page's.
+          if (pageSnap && versioned) trackPageSnapshot(view, pageSnap)
+          boundary = page.rows[page.rows.length - 1]!
+        }
+        if (page.rows.length < pageSize) ended = true
+        return page.rows.length
+      } finally {
+        loadsInFlight--
+        // Tombstone watermarks only exist to guard in-flight loadMore pages; once none are in
+        // flight, prune them so delete churn doesn't grow `applied` unboundedly.
+        if (loadsInFlight === 0) {
+          for (const k of applied.keys()) {
+            if (!present.has(k)) {
+              applied.delete(k)
+              appliedTxid.delete(k)
+            }
+          }
+        }
+      }
+    }
+
     return {
       // The one place the caller's `T` is applied. `T` is an unverified claim about the wire row
       // shape (nothing validates it), and the collection is genuinely built over `Row`, so this is
@@ -787,67 +856,12 @@ export async function createSubset<T extends Row = Row>(
       collection: collection as unknown as Collection<T, string>,
       hasMore: () => !ended,
 
-      async loadMore(pageSize = limit) {
-        // `pageSize <= 0` asks for nothing: answer 0 without a round-trip, and without concluding
-        // the set is exhausted (a zero-row answer to a zero-row request proves nothing about it).
-        if (closed || ended || pageSize <= 0 || !boundary || !ctl) return 0
-        const where = andPredicate(def.where, cursorPredicate(pk, def.orderBy, boundary))
-        const generation = windowGeneration
-        loadsInFlight++
-        try {
-          const page = (await deps.trpc.subset.query.query({
-            table: def.table,
-            where: where as never,
-            columns: cols,
-            orderBy: def.orderBy,
-            limit: pageSize,
-          })) as SubsetResult
-          // A replacement feed re-derived the whole window from a fresh page while this one was in
-          // flight: it describes a window that no longer exists, and merging it would resurrect rows
-          // the new page does not contain. Report nothing loaded, and leave `ended` to the new page.
-          if (generation !== windowGeneration) return 0
-          if (page.rows.length) {
-            // This page is a fresh Postgres snapshot at `pageLsn`; its rows are the authoritative state as
-            // of that LSN. Don't let a stale page regress a row already advanced past `pageLsn` by the live
-            // feed (the loadMore-vs-feed race), and set each row's watermark so older feed deltas drop.
-            // Tombstoned rows (watermark without membership) are skipped the same way — a page older than
-            // the delete must not resurrect the row.
-            const pageLsn = lsnToU64(page.lsn) ?? view.snapshotLsn
-            const pageSnap = pageSnapshotOf(page)
-            const pageVersion: RowVersion = pageSnap ?? pageLsn
-            let versioned = false
-            ctl.begin()
-            for (const r of page.rows) {
-              const k = String(r[pk])
-              const w = applied.get(k)
-              if (w !== undefined && !pageSupersedes(pageVersion, w, appliedTxid.get(k))) continue
-              ctl.write({ type: present.has(k) ? 'update' : 'insert', value: r })
-              present.add(k)
-              applied.set(k, pageVersion)
-              appliedTxid.delete(k)
-              versioned = true
-            }
-            ctl.commit()
-            // Rows now carry this page's snapshot as their version: let the tail retire it (mark it
-            // passed, drop its xip) once it reaches the page's horizon, as it does the first page's.
-            if (pageSnap && versioned) trackPageSnapshot(view, pageSnap)
-            boundary = page.rows[page.rows.length - 1]!
-          }
-          if (page.rows.length < pageSize) ended = true
-          return page.rows.length
-        } finally {
-          loadsInFlight--
-          // Tombstone watermarks only exist to guard in-flight loadMore pages; once none are in
-          // flight, prune them so delete churn doesn't grow `applied` unboundedly.
-          if (loadsInFlight === 0) {
-            for (const k of applied.keys()) {
-              if (!present.has(k)) {
-                applied.delete(k)
-                appliedTxid.delete(k)
-              }
-            }
-          }
-        }
+      loadMore(pageSize = limit) {
+        // Serialized per view (see `loadChain`): a later call starts only once the earlier one has
+        // merged, so it also asks for the page AFTER that one's rows rather than the same page again.
+        const run = loadChain.then(() => loadNext(pageSize))
+        loadChain = run.catch(() => {}) // a failed call does not stop the next one
+        return run
       },
 
       async renew() {

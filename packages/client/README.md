@@ -81,8 +81,9 @@ a row below the first loaded row does not pull it into the page the offset skipp
 keys page correctly in both directions, following
 Postgres's `ORDER BY` defaults — ascending puts NULLs last, descending first; `hasMore()` turns
 false once a page comes back **shorter than requested**, so exhausting a set takes one final
-`loadMore()` that returns 0; and `limit: 0` is ended from the start (a zero-size page can never be
-short, and never moves the cursor).
+`loadMore()` that returns 0; `limit: 0` is ended from the start (a zero-size page can never be
+short, and never moves the cursor); and overlapping `loadMore()` calls run one after the other (the
+second requests the page after the first's), so an older page can never land over a newer one.
 
 **Text ordering in a subset is CODE-POINT order, not your database's collation.** Membership in the
 loaded window is decided here, in the client, from the values it received — it cannot reproduce an
