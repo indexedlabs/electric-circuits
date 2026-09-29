@@ -476,6 +476,9 @@ pub(crate) async fn sequencer_loop(
     // does not, or a store that is down would be HEADed at the backoff frequency for as long as it
     // stays down.
     let mut reattested_since_read = false;
+    // A task started before restore may hold a stale initial cursor. Until an unpaused read
+    // succeeds it has no progress to checkpoint, especially when the first segment is gone.
+    let mut completed_read = false;
     let mut pos = start;
     // Offset checkpointing: persist the processed position (the restart replay start) at most
     // every ~2s of change — and ALWAYS the moment a segment boundary is crossed, so a restart
@@ -680,7 +683,7 @@ pub(crate) async fn sequencer_loop(
             // nothing: `pos` is only advanced inside the branch body, so the next boot re-reads
             // from the checkpoint written just below.
             _ = shutdown.wait() => {
-                tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
+                tracing::info!("sequencer: shutdown requested at {}", published(&pos, &held_from));
                 break;
             }
             res = ds.read(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
@@ -691,6 +694,7 @@ pub(crate) async fn sequencer_loop(
                     if pause_gate.load(std::sync::atomic::Ordering::Acquire) {
                         continue;
                     }
+                    completed_read = true;
                     reattested_since_read = false;
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
@@ -1188,12 +1192,14 @@ pub(crate) async fn sequencer_loop(
     // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
-    if !paused {
+    if !paused && completed_read {
         let ckpt = published(&pos, &held_from);
         catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
         tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
-    } else {
+    } else if paused {
         tracing::info!("sequencer: stopped while replay was paused; no checkpoint published");
+    } else {
+        tracing::info!("sequencer: stopped before completing a read; no checkpoint published");
     }
 }
 
