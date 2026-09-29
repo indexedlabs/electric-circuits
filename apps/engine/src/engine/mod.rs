@@ -83,13 +83,13 @@ struct ManagedDeploymentState {
     ownership: Option<crate::deployment::Ownership>,
 }
 
-/// Public data is fenced while a managed process has not proved its exact active generation.
+/// Public data is fenced until boot completes and any managed ownership is proved.
 #[derive(Debug)]
 pub struct DeploymentNotReady;
 
 impl std::fmt::Display for DeploymentNotReady {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("managed deployment is not the active ready writer; retry")
+        formatter.write_str("engine is not the active ready writer; retry")
     }
 }
 
@@ -1828,6 +1828,13 @@ impl Engine {
         if self.degraded() {
             return Err(anyhow::Error::new(Degraded));
         }
+        // Schemas become visible before arrangement seeding and catalog restore finish. A
+        // request admitted in that window could spawn the one-shot sequencer at changes/0,
+        // before restore installs its saved cursor. ACTIVE is published only after restore and
+        // sequencer setup succeed; library mode has no Postgres boot to wait for.
+        if self.pg_url.is_some() && self.health.load(Ordering::Acquire) != HEALTH_ACTIVE {
+            return Err(anyhow::Error::new(DeploymentNotReady));
+        }
         if !self.managed_public_ready() {
             return Err(anyhow::Error::new(DeploymentNotReady));
         }
@@ -2172,7 +2179,7 @@ impl Engine {
         // Spawn the ingestor at most once, even if setup_postgres is called again.
         if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
-            self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
+            self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Release);
             return Ok(());
         }
         // The ingestor reads the LIVE schema view (not a boot-time copy) and reports schema drift
@@ -2204,8 +2211,9 @@ impl Engine {
         // sweep is what deletes the segments nothing can resume inside (ADR-0006), so it must run
         // whether or not anyone has ever created a shape.
         self.ensure_retention_sweeper();
-        // Introspection + slot + ingest loop are up: report `active` (200 on `/v1/health`).
-        self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
+        // Restore + sequencer + ingest are up: publish boot completion to membership admission
+        // and report `active` (200 on `/v1/health`).
+        self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

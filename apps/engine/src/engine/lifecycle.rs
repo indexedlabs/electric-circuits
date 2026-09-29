@@ -1327,6 +1327,7 @@ impl Engine {
     /// Concurrent touches coalesce onto one replay; a touch during deactivation waits for the
     /// transition to settle first. Also refreshes `last_read`.
     pub async fn ensure_active(&self, id: &str) -> Result<()> {
+        self.ensure_not_degraded()?;
         loop {
             enum Step {
                 Done,
@@ -1567,6 +1568,7 @@ impl Engine {
     ) -> Result<()> {
         let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
+            self.ensure_not_degraded()?;
             let rec =
                 st.shapes.get(id).cloned().with_context(|| format!("shape '{id}' vanished during reactivation"))?;
             self.ensure_schema_resolved(&st, std::slice::from_ref(&rec.table))?;
