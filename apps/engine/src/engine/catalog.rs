@@ -2015,6 +2015,77 @@ mod tests {
         assert_eq!(read, LogPosition::start());
     }
 
+    #[tokio::test]
+    async fn otto_5492_schema_route_during_pg_boot_cannot_start_sequencer() {
+        use tower::ServiceExt;
+
+        let server = FakeDs::start().await;
+        let mut reads = server.hold_change_reads();
+        let engine = Engine::new_pg_for_in_process_test(
+            DsClient::new_for_in_process_test(server.url()),
+            "postgres://postgres@127.0.0.1:55532/postgres".into(),
+        );
+        let fold = otto_5492_saved_catalog(&engine).await;
+        let saved = fold.start_pos();
+        engine.health.store(HEALTH_STARTING, Ordering::Release);
+        // The server is listening, but setup has not installed the restored replay cursor.
+        let response = tokio::time::timeout(
+            OTTO_5492_DEADLINE,
+            crate::http::router(engine.clone()).oneshot(
+                axum::http::Request::post("/schema")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"schema":{"tables":{"users":{"columns":{"id":{"type":"int"}},"primaryKey":"id"}}}}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("schema request must finish without waiting for boot")
+        .unwrap();
+        let premature = engine.state.lock().await.sequencer.is_some();
+        let installed_tables = engine.table_count().await;
+        tokio::time::timeout(OTTO_5492_DEADLINE, engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume))
+            .await
+            .expect("catalog restore must finish")
+            .unwrap();
+        let read = otto_5492_read(&mut reads).await;
+        otto_5492_stop(&engine).await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST, "POST /schema is library-mode only");
+        assert!(!response.headers().contains_key("retry-after"), "wrong-mode requests cannot succeed on retry");
+        assert!(!premature, "POST /schema must not start the PostgreSQL sequencer before restore");
+        assert_eq!(installed_tables, 0, "POST /schema must not install caller-supplied PostgreSQL schemas");
+        assert_eq!(read, saved, "boot must read from its restored checkpoint");
+    }
+
+    #[tokio::test]
+    async fn otto_5492_define_schema_rejects_active_pg_at_engine_boundary() {
+        let server = FakeDs::start().await;
+        let _reads = server.hold_change_reads();
+        let engine = Engine::new_pg_for_in_process_test(
+            DsClient::new_for_in_process_test(server.url()),
+            "postgres://postgres@127.0.0.1:55532/postgres".into(),
+        );
+        // This API is never supported in PostgreSQL mode, including after the boot gate opens.
+        engine.health.store(HEALTH_ACTIVE, Ordering::Release);
+        let schema = serde_json::from_value(serde_json::json!({
+            "tables": { "users": { "columns": { "id": { "type": "int" } }, "primaryKey": "id" } }
+        }))
+        .unwrap();
+        let result = tokio::time::timeout(OTTO_5492_DEADLINE, engine.define_schema(&schema))
+            .await
+            .expect("direct schema definition must return promptly");
+        let spawned = engine.state.lock().await.sequencer.is_some();
+        let installed_tables = engine.table_count().await;
+        otto_5492_stop(&engine).await;
+
+        assert!(result.is_err(), "define_schema must reject PostgreSQL mode even when ACTIVE");
+        assert!(!spawned, "rejection must precede sequencer spawn");
+        assert_eq!(installed_tables, 0, "rejection must precede schema installation");
+        assert!(engine.tables_shared.read().unwrap().is_empty(), "the shared schema view must remain untouched");
+    }
+
     fn expected_store_bound() -> crate::store_identity::StoreBound {
         crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope())
     }

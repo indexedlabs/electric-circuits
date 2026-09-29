@@ -95,6 +95,11 @@ impl std::fmt::Display for DeploymentNotReady {
 
 impl std::error::Error for DeploymentNotReady {}
 
+/// PostgreSQL owns its schemas; caller-defined schemas are a library-mode API only.
+#[derive(Debug, thiserror::Error)]
+#[error("define_schema is only supported in library mode; PostgreSQL schemas are introspected")]
+pub(crate) struct SchemaDefinitionUnsupported;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum BootEpochAction {
     Restore,
@@ -2301,7 +2306,13 @@ impl Engine {
         self.ds.stream_url(path)
     }
 
+    /// Define a library-mode schema. PostgreSQL mode configures schemas through introspection.
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
+        // Reject at the engine boundary, before any storage/schema mutation or sequencer spawn.
+        // This must hold after boot too: callers must never replace PostgreSQL's schema view.
+        if self.pg_url.is_some() {
+            return Err(anyhow::Error::new(SchemaDefinitionUnsupported));
+        }
         let compiled = compile_schema(schema)?;
         if compiled.contains_key(crate::runtime_authority::marker_table()) {
             bail!("runtime authority marker is private and cannot be an application table");
