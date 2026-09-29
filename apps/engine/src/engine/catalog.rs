@@ -1590,6 +1590,9 @@ pub(crate) mod testing {
         missing_heads: Mutex<HashSet<String>>,
         closed_heads: Mutex<HashSet<String>>,
         events: Mutex<Vec<serde_json::Value>>,
+        /// Opt-in read cut: report the requested cursor, then hold the response forever.
+        /// The engine can cancel the read, but no page can complete before shutdown.
+        held_change_reads: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::changelog::LogPosition>>>,
     }
 
     pub(crate) struct FakeDs {
@@ -1606,6 +1609,33 @@ pub(crate) mod testing {
                 .route(
                     "/{*path}",
                     axum::routing::put(|| async { axum::http::StatusCode::OK })
+                        .get(
+                            |State(st): State<Arc<FakeDsState>>,
+                             axum::extract::Path(path): axum::extract::Path<String>,
+                             axum::extract::Query(query): axum::extract::Query<
+                                std::collections::HashMap<String, String>,
+                            >| async move {
+                                let logical = logical_path(&path);
+                                if logical == "meta/catalog" {
+                                    return (
+                                        [("stream-next-offset", "catalog-tail"), ("stream-up-to-date", "true")],
+                                        axum::Json(st.events.lock().unwrap().clone()),
+                                    )
+                                        .into_response();
+                                }
+                                let observer = st.held_change_reads.lock().unwrap().clone();
+                                if let Some(observer) = observer
+                                    && let Some(segment) = logical.strip_prefix("changes/")
+                                {
+                                    let _ = observer.send(crate::changelog::LogPosition {
+                                        segment: segment.parse().unwrap(),
+                                        offset: query.get("offset").expect("read must specify a cursor").clone(),
+                                    });
+                                    return std::future::pending::<axum::response::Response>().await;
+                                }
+                                axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
+                            },
+                        )
                         .head(
                             |State(st): State<Arc<FakeDsState>>,
                              axum::extract::Path(path): axum::extract::Path<String>| async move {
@@ -1720,6 +1750,12 @@ pub(crate) mod testing {
             &self.url
         }
 
+        pub(crate) fn hold_change_reads(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::changelog::LogPosition> {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            *self.state.held_change_reads.lock().unwrap() = Some(tx);
+            rx
+        }
+
         /// Answer the next `n` catalog appends with 503.
         pub(crate) fn fail_appends(&self, n: u32) {
             self.state.fail_appends.store(n, Ordering::SeqCst);
@@ -1812,6 +1848,172 @@ pub(crate) mod testing {
 mod tests {
     use super::*;
     use testing::FakeDs;
+
+    const OTTO_5492_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn otto_5492_read(reads: &mut tokio::sync::mpsc::UnboundedReceiver<LogPosition>) -> LogPosition {
+        tokio::time::timeout(OTTO_5492_DEADLINE, reads.recv())
+            .await
+            .expect("sequencer must issue a change-log read")
+            .expect("storage read observer must remain open")
+    }
+
+    async fn otto_5492_stop(engine: &Engine) {
+        engine.shutdown.begin();
+        assert!(engine.shutdown.wait_for_parties(OTTO_5492_DEADLINE).await, "sequencer must stop");
+        assert!(engine.catalog_tx.drain(OTTO_5492_DEADLINE).await, "final catalog writes must land");
+    }
+
+    /// Persist a dormant shape and the incident's checkpoint through the actual catalog writer.
+    /// The dormant record keeps this test independent of snapshot SQL and boot replay backfills.
+    async fn otto_5492_saved_catalog(engine: &Engine) -> CatalogFold {
+        let saved = pos(270, "0000000000000000_0000000529873332");
+        let mut created = created_event("public.users");
+        // Leave s1 available to the racing request, so an ID collision cannot hide the cursor bug.
+        created["rec"]["id"] = serde_json::json!("s99");
+        created["rec"]["stream_path"] = serde_json::json!("shape/s99");
+        for event in [
+            serde_json::from_value::<CatalogEvent>(created).unwrap(),
+            CatalogEvent::Dormant {
+                id: "s99".into(),
+                resume: saved.clone(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+            CatalogEvent::ChangesRotated { segment: 270, at: crate::changelog::now_secs() },
+            CatalogEvent::Offset { pos: saved.clone(), highwater: Some((0x10, 2)) },
+        ] {
+            engine.catalog_tx.send_durable(event).await.unwrap();
+        }
+        let fold = engine.fold_catalog().await.expect("read the saved catalog through storage");
+        assert_eq!(fold.start_pos(), saved, "fixture must contain the incident's saved checkpoint");
+        engine
+            .init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos())
+            .await
+            .expect("the saved segment exists at boot");
+        fold
+    }
+
+    async fn otto_5492_create(engine: &Engine) -> axum::response::Response {
+        use tower::ServiceExt;
+        tokio::time::timeout(
+            OTTO_5492_DEADLINE,
+            crate::http::router(engine.clone()).oneshot(
+                axum::http::Request::post("/v1/shapes")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"table":"public.users","changesOnly":true}"#))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("create must complete or refuse retryably during boot")
+        .unwrap()
+    }
+
+    async fn otto_5492_boot_with_request(race_request: bool) {
+        let server = FakeDs::start().await;
+        let mut reads = server.hold_change_reads();
+        let engine = Engine::new_pg_for_in_process_test(
+            DsClient::new_for_in_process_test(server.url()),
+            // No SQL is needed: changesOnly skips snapshots. Never contact another lane's PG.
+            "postgres://postgres@127.0.0.1:55532/postgres".into(),
+        );
+        let fold = otto_5492_saved_catalog(&engine).await;
+        let saved = fold.start_pos();
+        let def = serde_json::from_value(serde_json::json!({
+            "columns": { "id": { "type": "int" } }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let table = TableRef::parse("public.users").unwrap();
+        let compiled = HashMap::from([(table.clone(), TableSchema::from_def(&table, &def).unwrap())]);
+
+        // Deterministically stop setup at its schema-installed / pre-arrangement-seed boundary.
+        // The rest of boot runs only after the request returns; no timing window or sleep.
+        engine.health.store(HEALTH_STARTING, Ordering::Relaxed);
+        *engine.tables_shared.write().unwrap() = compiled.clone();
+        engine.state.lock().await.tables = compiled.clone();
+        engine.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
+        if race_request {
+            let response = otto_5492_create(&engine).await;
+            assert!(
+                response.status().is_success() || response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "boot admission must succeed safely or refuse retryably: {}",
+                response.status()
+            );
+            if response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+                assert!(response.headers().contains_key("retry-after"), "boot refusal must be retryable");
+            }
+        }
+        let premature = engine.state.lock().await.sequencer.is_some();
+        tokio::time::timeout(OTTO_5492_DEADLINE, engine.apply_catalog(fold, &compiled, RestoreMode::Resume))
+            .await
+            .expect("catalog restore must complete")
+            .unwrap();
+        engine.ensure_sequencer(&mut *engine.state.lock().await);
+        let read = otto_5492_read(&mut reads).await;
+        otto_5492_stop(&engine).await;
+
+        assert_eq!(
+            (premature, read),
+            (false, saved),
+            "a pre-restore request must not start replay; the live reader must use the restored checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn otto_5492_create_before_restore_reads_from_saved_position() {
+        otto_5492_boot_with_request(true).await;
+    }
+
+    #[tokio::test]
+    async fn otto_5492_restore_without_request_reads_from_saved_position() {
+        otto_5492_boot_with_request(false).await;
+    }
+
+    #[tokio::test]
+    async fn otto_5492_unread_sequencer_shutdown_preserves_catalog_position() {
+        let server = FakeDs::start().await;
+        let mut reads = server.hold_change_reads();
+        // Inject the already-stale task below admission, independently of the boot-latch fix.
+        // Library construction allows this even if Postgres spawning is later boot-gated.
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let fold = otto_5492_saved_catalog(&engine).await;
+        let saved = fold.start_pos();
+        engine.ensure_sequencer(&mut *engine.state.lock().await);
+        assert_eq!(otto_5492_read(&mut reads).await, LogPosition::start(), "inject a stale live cursor");
+
+        tokio::time::timeout(OTTO_5492_DEADLINE, engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume))
+            .await
+            .expect("restore must complete while the read is held")
+            .unwrap();
+        assert_eq!(*engine.seq_start.lock().unwrap(), saved, "restore installed its newer checkpoint");
+        // The HTTP handler never completes a page. Stop only after the resumed read has arrived.
+        otto_5492_read(&mut reads).await;
+        otto_5492_stop(&engine).await;
+        let next_boot = engine.fold_catalog().await.expect("fold the persisted catalog after shutdown");
+        assert_eq!(
+            next_boot.start_pos(),
+            saved,
+            "shutdown without a completed read must not overwrite the restored restart checkpoint"
+        );
+        assert_eq!(next_boot.start_highwater, Some((0x10, 2)), "preserve the matching de-duplication frontier");
+    }
+
+    #[tokio::test]
+    async fn otto_5492_library_define_schema_still_starts_and_creates() {
+        let server = FakeDs::start().await;
+        let mut reads = server.hold_change_reads();
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let schema = serde_json::from_value(serde_json::json!({
+            "tables": { "users": { "columns": { "id": { "type": "int" } }, "primaryKey": "id" } }
+        }))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let response = otto_5492_create(&engine).await;
+        let read = otto_5492_read(&mut reads).await;
+        otto_5492_stop(&engine).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "library mode needs no Postgres boot latch");
+        assert_eq!(read, LogPosition::start());
+    }
 
     fn expected_store_bound() -> crate::store_identity::StoreBound {
         crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope())
