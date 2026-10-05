@@ -199,13 +199,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Memory probes via OpenTelemetry: register the meter provider + Prometheus/optional OTLP
-    // exporters, publish an initial sample, and start the background samplers. `_otel` is held for
-    // the process lifetime so the provider (and its exporters) stay alive. Exposed at
-    // GET /metrics/prometheus and GET /memory; structured snapshots go to stderr/CloudWatch.
-    let _otel = electric_circuits_engine::mem::init_otel();
-    electric_circuits_engine::mem::publish(&engine.mem_cardinalities().await);
-    electric_circuits_engine::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
+    // The Engine owns its meter provider, registry and cardinality sampler.
     let shutdown = engine.shutdown_token();
     electric_circuits_engine::mem::spawn_memory_logger(
         engine.clone(),
@@ -216,6 +210,7 @@ async fn main() -> Result<()> {
 
     // StatsD periodic samplers (no-ops when StatsD is off): system metrics + storage size.
     statsd::spawn_system_sampler(config.metrics_period);
+    engine.spawn_statsd_shape_sampler(config.metrics_period);
     statsd::spawn_storage_sampler(config.storage_dir.clone());
 
     // Kept past the router so the Postgres setup and the shutdown path still have a handle.

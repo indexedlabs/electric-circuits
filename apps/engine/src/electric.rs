@@ -942,7 +942,7 @@ pub async fn shape(
     } else if let Err(e) = engine.ensure_not_degraded() {
         degraded(&e)
     } else {
-        match shape_inner(engine, p, &raw_pairs).await {
+        match shape_inner(engine.clone(), p, &raw_pairs).await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("/v1/shape error ({}): {}", e.status, e.message);
@@ -953,7 +953,7 @@ pub async fn shape(
 
     let status = resp.status().as_u16();
     let bytes = resp.extensions().get::<BodyLen>().map(|b| b.0).unwrap_or(0);
-    crate::statsd::serve_shape(&root_table, live, status, start.elapsed(), bytes);
+    engine.metrics.emitter().serve_shape(&root_table, live, status, start.elapsed(), bytes);
     resp
 }
 

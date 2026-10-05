@@ -320,6 +320,10 @@ pub struct ChangeLogWriter {
 }
 
 impl ChangeLogWriter {
+    pub(crate) fn metrics(&self) -> &Arc<crate::metrics::Metrics> {
+        self.ds.metrics()
+    }
+
     pub fn new(
         ds: DsClient,
         state: Arc<ChangesState>,
@@ -452,7 +456,7 @@ impl ChangeLogWriter {
         let at = now_secs();
         self.state.began(to, at);
         (self.rotated)(to, at);
-        crate::metrics::metrics().changes_rotations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ds.metrics().changes_rotations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("change log: rotated {from_path} -> {to_path}");
         Ok(())
     }

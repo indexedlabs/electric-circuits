@@ -1664,11 +1664,11 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         "pendingFlips": engine.pending_flips(),
         // Backfill/subset snapshots currently waiting for transactions the sequencer already fanned
         // out to become visible to new snapshots (see `pg::SequencedXids`). Diagnostic only.
-        "visibilityWaits": crate::pg::settle_waits_active(),
+        "visibilityWaits": engine.settle_waits_active(),
         // The settle record (size, peak, bytes, transactions dropped at its bound) and counters
         // (poller ticks/failures, checks, retakes, timeouts, admission rejections) plus the settle
         // wait-duration distribution. Diagnostic only.
-        "settle": crate::pg::settle_stats_json(),
+        "settle": engine.settle_stats_json(),
         // Flip batches abandoned after exhausting their retries; non-zero means the engine is
         // degraded (its membership-bearing routes answer 503) and must be restarted.
         "flipFailures": engine.flip_failures(),
@@ -1707,12 +1707,12 @@ async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Va
     Ok(Json(serde_json::json!({ "ok": true, "epoch": engine.epoch_json() })))
 }
 
-async fn get_metrics() -> Json<serde_json::Value> {
-    Json(crate::metrics::metrics().snapshot())
+async fn get_metrics(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    Json(engine.metrics.snapshot())
 }
 
-async fn reset_metrics() -> Json<serde_json::Value> {
-    crate::metrics::metrics().reset();
+async fn reset_metrics(State(engine): State<Engine>) -> Json<serde_json::Value> {
+    engine.metrics.reset();
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -1726,8 +1726,8 @@ async fn reset_metrics() -> Json<serde_json::Value> {
 /// comments).
 async fn get_memory(State(engine): State<Engine>) -> Json<serde_json::Value> {
     let card = engine.mem_cardinalities().await.with_bytes(engine.mem_bytes().await);
-    crate::mem::publish(&card);
-    Json(crate::mem::snapshot_json(&card))
+    crate::mem::publish(&engine.memory_gauges, &card);
+    Json(crate::mem::snapshot_json(&engine.memory_gauges, &card))
 }
 
 /// Diagnostic: dbsp profiler dump for every dbsp circuit the engine runs (see
@@ -1738,8 +1738,8 @@ async fn get_dbsp_profile(State(engine): State<Engine>) -> Json<serde_json::Valu
 
 /// OpenTelemetry metrics in Prometheus exposition format (what an OTel collector's prometheus receiver
 /// scrapes). Reflects the last published sample (refreshed by the background sampler + every `/memory`).
-async fn get_prometheus() -> Response {
-    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], crate::mem::prometheus_text()).into_response()
+async fn get_prometheus(State(engine): State<Engine>) -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], engine.prometheus_text()).into_response()
 }
 
 pub(crate) struct AppError {

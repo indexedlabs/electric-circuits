@@ -1002,7 +1002,7 @@ async fn ensure_active_burst_coalesces_more_than_two_same_table_shapes() {
         engine.ensure_active("s4")
     );
     assert!(a.is_ok() && b.is_ok() && c.is_ok() && d.is_ok());
-    assert!(crate::metrics::metrics().reactivations_coalesced.load(std::sync::atomic::Ordering::Relaxed) >= 4);
+    assert!(engine.metrics.reactivations_coalesced.load(std::sync::atomic::Ordering::Relaxed) >= 4);
     drop(tx);
 }
 
@@ -1040,7 +1040,7 @@ async fn replay_stops_at_admission_tail_when_the_log_grows() {
         library_mode: true,
         until: Some(LogPosition { segment: 0, offset: "0000000000000000_0000000000000100".into() }),
     };
-    crate::metrics::metrics().reactivation_bytes_scanned.store(0, std::sync::atomic::Ordering::Relaxed);
+    ds.metrics().reactivation_bytes_scanned.store(0, std::sync::atomic::Ordering::Relaxed);
     let result =
         crate::engine::sequencer::replay_changes_for_targets(&ds, vec![target], &crate::shutdown::ShutdownToken::new())
             .await;
@@ -1050,7 +1050,7 @@ async fn replay_stops_at_admission_tail_when_the_log_grows() {
         1,
         "growth after admission belongs to live ingestion"
     );
-    assert_eq!(crate::metrics::metrics().reactivation_bytes_scanned.load(std::sync::atomic::Ordering::Relaxed), 100);
+    assert_eq!(ds.metrics().reactivation_bytes_scanned.load(std::sync::atomic::Ordering::Relaxed), 100);
     let body = &store.appended.lock().unwrap()[0].2;
     let envelopes: Vec<Envelope> = serde_json::from_slice(body).unwrap();
     assert_eq!(envelopes.iter().map(|env| env.key.as_str()).collect::<Vec<_>>(), vec!["1"]);
@@ -1435,6 +1435,7 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
     ) -> HashMap<String, Vec<Envelope>> {
         let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
         process_envelope(
+            &crate::metrics::Metrics::default(),
             ts,
             shapes,
             shape_index,
@@ -1490,6 +1491,7 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
     //    old behaviour (an old-less delete produces nothing at all).
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
     process_envelope(
+        &crate::metrics::Metrics::default(),
         &ts,
         &shapes,
         &shape_index,
@@ -1584,6 +1586,7 @@ async fn trace_family_route_and_filter_drop() {
 
     // Insert routed to key 'a' -> family hop routed with the key, shape s7 reached, filter s9 drops.
     process_envelope(
+        &crate::metrics::Metrics::default(),
         &ts,
         &shapes,
         &shape_index,
@@ -1614,6 +1617,7 @@ async fn trace_family_route_and_filter_drop() {
 
     // Insert whose key matches no routed shape -> family hop dropped, no shapes reached.
     process_envelope(
+        &crate::metrics::Metrics::default(),
         &ts,
         &shapes,
         &shape_index,
@@ -1639,6 +1643,7 @@ async fn trace_family_route_and_filter_drop() {
     // Nobody subscribed -> nothing is built or sent (receiver dropped).
     drop(trace_rx);
     process_envelope(
+        &crate::metrics::Metrics::default(),
         &ts,
         &shapes,
         &shape_index,
@@ -1672,6 +1677,7 @@ async fn trace_aggregate_fold() {
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
 
     process_envelope(
+        &crate::metrics::Metrics::default(),
         &ts,
         &shapes,
         &shape_index,
@@ -1692,6 +1698,7 @@ async fn trace_aggregate_fold() {
     assert_eq!(ev["shapes"].as_array().unwrap(), &vec![serde_json::json!("s4")]);
 
     process_envelope(
+        &crate::metrics::Metrics::default(),
         &ts,
         &shapes,
         &shape_index,
@@ -2638,7 +2645,7 @@ async fn an_overflowed_pending_buffer_refuses_activation() {
 
     // Let the scripted write burst run past the cap.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while crate::metrics::metrics().pending_buffer_overflows.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    while engine.metrics.pending_buffer_overflows.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         assert!(std::time::Instant::now() < deadline, "the buffer never overflowed");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

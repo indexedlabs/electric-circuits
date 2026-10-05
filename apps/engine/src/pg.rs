@@ -508,7 +508,6 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
 static POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
 // Non-owning inventory preserves the existing process-wide settle statistics until PR B.
-static LIVE_POOLS: std::sync::Mutex<Vec<std::sync::Weak<PoolInner>>> = std::sync::Mutex::new(Vec::new());
 
 /// Host-wide capacity; each Engine gets its own pool at this capacity.
 pub fn set_pool_size(size: usize) {
@@ -573,9 +572,6 @@ impl Pool {
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
             }),
         };
-        let mut pools = LIVE_POOLS.lock().unwrap();
-        pools.retain(|pool| pool.strong_count() != 0);
-        pools.push(Arc::downgrade(&pool.inner));
         pool
     }
 
@@ -583,11 +579,6 @@ impl Pool {
         self.inner.shutdown.begin();
         self.inner.sem.close();
         self.inner.idle.lock().unwrap().clear();
-        let mut pools = LIVE_POOLS.lock().unwrap();
-        pools.retain(|pool| pool.strong_count() != 0 && !pool.ptr_eq(&Arc::downgrade(&self.inner)));
-        if pools.is_empty() {
-            pools.shrink_to_fit();
-        }
     }
 
     /// The settle set for snapshots taken on this pool (see [`SequencedXids`]). The sequencer that
@@ -1322,16 +1313,8 @@ mod settle;
 use settle::begin_settled_snapshot;
 pub use settle::{
     DEFAULT_SETTLE_MAX_XIDS, MAX_SETTLE_MAX_XIDS, MIN_SETTLE_MAX_XIDS, SequencedXids, SettleConfig, SettleScope,
-    SnapshotUnsettled, UnsettledCause, settle_waits_active,
+    SnapshotUnsettled, UnsettledCause,
 };
-
-/// The `settle` object of `GET /replication/lsn`: the settle record's size across every pool, and
-/// the process-wide settle counters (checks, retakes, timeouts, rejections, poller ticks/failures,
-/// transactions dropped at the bound) and wait-duration distribution.
-pub fn settle_stats_json() -> serde_json::Value {
-    let pools: Vec<_> = LIVE_POOLS.lock().unwrap().iter().filter_map(std::sync::Weak::upgrade).collect();
-    settle::stats_json(pools.iter().map(|p| &*p.sequenced))
-}
 
 /// The fences of a settled snapshot (see [`begin_settled_snapshot`]).
 pub struct SnapshotFences {

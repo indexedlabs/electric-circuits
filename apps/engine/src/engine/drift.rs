@@ -415,7 +415,7 @@ impl Engine {
             // reconciling it and API callers get the specific "unresolved" refusal.
             self.tables_shared.write().unwrap().remove(table);
         }
-        crate::metrics::metrics().schema_unresolved.fetch_add(1, Ordering::Relaxed);
+        self.metrics.schema_unresolved.fetch_add(1, Ordering::Relaxed);
         // Check-and-claim in ONE critical section, so two concurrent parkings cannot both decide
         // they are the one to start the task (or both decide they are not).
         let claimed = self.retrying.lock().unwrap().insert(table.clone());
@@ -497,7 +497,7 @@ impl Engine {
     async fn retire_dependents(&self, table: &TableRef, why: &str) {
         // Every trigger funnels through here exactly once, so this is the whole `schema_drift_total`
         // count: tables whose dependents were retired, whatever noticed.
-        crate::metrics::metrics().schema_drift.fetch_add(1, Ordering::Relaxed);
+        self.metrics.schema_drift.fetch_add(1, Ordering::Relaxed);
         let ids: Vec<String> = {
             let mut st = self.state.lock().await;
             let ids = st

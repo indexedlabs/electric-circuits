@@ -917,8 +917,7 @@ than the mechanism.
   gauges (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the
   replication-slot trio below) + log-bucket latency histograms (`process_envelope`, `family_step`,
   `append`) with p50/p99/p999/max.
-- **Replication-slot gauges**, engine-owned and sampled every ~10 s on a *pooled* connection (never a
-  dedicated one): `replication_slot_retained_wal_bytes`
+- **Replication-slot gauges**, engine-owned and sampled every ~10 s on a fresh connection: `replication_slot_retained_wal_bytes`
   (`pg_current_wal_lsn() - restart_lsn` — the WAL the source database holds on disk for this engine),
   `replication_confirmed_flush_lag_bytes` (`… - confirmed_flush_lsn` — ingest lag) and
   `replication_slot_active`. The same sample feeds StatsD, so the numbers exist with or without it.
@@ -926,6 +925,13 @@ than the mechanism.
   `engine_family_circuits`, …) — the cardinalities that drive RSS. `GET /metrics/prometheus` exports
   those **and** every counter/gauge above (it used to carry only the memory/cardinality half), so it
   is a complete scrape target.
+- **Source ownership:** each Engine has its own counters, gauges, histograms, memory cardinalities,
+  pool settle metrics and meter provider. Its metrics/reset and memory routes affect only that
+  Engine; RSS and allocator figures remain process measurements. In sources mode Prometheus
+  observations and optional OTLP resources carry `source_id`, and StatsD uses that source's
+  `stack_id` over the shared UDP transport. Each Engine owns its cardinality/slot samplers.
+  Close flushes and shuts down its provider, then drops its registry, callbacks and cumulative
+  series; a replacement starts fresh. Standalone metric names and route shapes stay the same.
 - **Probes:** `GET /health` is liveness (`ok` while the process runs, and never more than that);
   `GET /ready` is readiness (200 `active`, else 503 `waiting` / `starting` / `degraded` /
   `shutting_down`); `GET /v1/health` is unchanged Electric-fleet parity. The HTTP surface comes up

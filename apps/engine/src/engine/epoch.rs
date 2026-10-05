@@ -315,7 +315,7 @@ impl Engine {
         *broken = Some(reason);
         self.runtime_receipts.lock().unwrap().invalidate();
         drop(broken);
-        crate::metrics::metrics().epoch_breaks.fetch_add(1, Ordering::Relaxed);
+        self.metrics.epoch_breaks.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             "EPOCH BREAK on slot '{slot}' ({reason}): the slot the engine bound to is not the slot \
              postgres has, so every shape is missing an unknown span of changes and no amount of \
@@ -500,7 +500,7 @@ impl Engine {
         drop(client);
         // Counted here, not on entry: `epoch_resets_total` is "new epochs bound", so an attempt that
         // aborted at the drain barrier and was retried must not show up as two.
-        crate::metrics::metrics().epoch_resets.fetch_add(1, Ordering::Relaxed);
+        self.metrics.epoch_resets.fetch_add(1, Ordering::Relaxed);
 
         // 4. The new epoch must be durable before anything acts on it.
         let drained = self.catalog_tx.drain(CATALOG_DRAIN_TIMEOUT).await;

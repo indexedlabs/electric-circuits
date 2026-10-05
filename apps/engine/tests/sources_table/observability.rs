@@ -134,25 +134,36 @@ async fn scrape(app: &Router, source: &str) -> Result<String> {
 }
 
 async fn prometheus(f: &Fixture) -> Result<()> {
-    // The production composition root initializes the process provider before sources start.
-    let _provider = electric_circuits_engine::mem::init_otel();
     let host = f.host().await?;
     let app = host.router();
     let result = async {
         f.snapshot(&app, "/sources/alpha", false).await?;
-        read(&app, "alpha", "memory").await?;
-        read(&app, "beta", "memory").await?;
+        let memory_a = read(&app, "alpha", "memory").await?;
+        let memory_b = read(&app, "beta", "memory").await?;
+        ensure!(memory_a["cardinalities"]["shapes"] == 1, "alpha snapshot must own one shape: {memory_a}");
+        ensure!(memory_b["cardinalities"]["shapes"] == 0, "beta inherited alpha's shapes: {memory_b}");
         let initial = scrape(&app, "alpha").await?;
         ensure!(
             initial.contains("source_id=\"alpha\""),
             "source Prometheus must contain alpha series with source_id: {initial}"
         );
         ensure!(!initial.contains("source_id=\"beta\""), "alpha scrape includes beta");
+        let shape_line = initial.lines().find(|line| line.starts_with("engine_shapes{"));
+        ensure!(
+            shape_line.is_some_and(|line| line.ends_with(" 1")),
+            "beta memory read overwrote alpha's published shape count: {shape_line:?}"
+        );
         let baseline = initial.lines().filter(|line| line.starts_with("engine_")).count();
         let mut old_states = Vec::new();
+        let mut old_providers = Vec::new();
         for revision in 2..=51 {
-            old_states.push(host.engine_for_test("alpha").await.context("alpha missing")?.state_alive_probe_for_test());
+            let previous = host.engine_for_test("alpha").await.context("alpha missing")?;
+            old_providers.push(previous.provider_alive_probe_for_test());
+            old_states.push(previous.state_alive_probe_for_test());
             f.restart(&host, revision).await?;
+            ensure!(old_providers.iter().all(|probe| !probe()), "restart {} retained an old provider", revision - 1);
+            ensure!(previous.prometheus_text().is_empty(), "closed Engine still exposes a registry");
+            drop(previous);
             let current = scrape(&app, "alpha").await?;
             ensure!(
                 current.lines().filter(|line| line.starts_with("engine_")).count() == baseline,
@@ -164,7 +175,9 @@ async fn prometheus(f: &Fixture) -> Result<()> {
         f.client.execute(&format!("DELETE FROM {} WHERE source_id = 'alpha'", f.sources_table), &[]).await?;
         set_revision(&f.client, &f.version_table, 52).await?;
         host.refresh().await?;
-        let all = electric_circuits_engine::mem::prometheus_text();
+        let all = scrape(&app, "beta").await?;
+        let other = scrape(&app, "gamma").await?;
+        ensure!(!other.contains("source_id=\"alpha\""), "stopped source remains in gamma registry");
         ensure!(!all.contains("source_id=\"alpha\""), "stopped source series remain");
         ensure!(all.contains("source_id=\"beta\""), "stopping alpha removed beta series");
         Ok(())

@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use crate::changelog::{ChangeLogWriter, ChangesState, LogPosition, segment_path};
 use crate::ds::{DsClient, Envelope, EnvelopeHeaders};
 use crate::heap_size::HeapSize;
-use crate::metrics::{Timer, metrics};
+use crate::metrics::Timer;
 use crate::predicate::{CompiledPredicate, PredicateJson};
 use crate::retention::{EvictReason, Evicted, LifeState, RetentionConfig, ShapeLife, SweepShape};
 use crate::runtime_authority::{AuthorityMarker, RuntimeDrainReceipt, RuntimeReceipts};
@@ -23,6 +23,7 @@ use crate::schema::{Schema, SharedTables, TableSchema, compile_schema};
 use crate::subquery::{SubqueryRegistry, predicate_has_subquery, referenced_tables};
 use crate::table_ref::{TableRef, TableSelector};
 use crate::value::{Row, Value};
+use std::time::Duration;
 
 mod catalog;
 mod circuit_serving;
@@ -440,6 +441,9 @@ pub struct SubsetPage {
 
 #[derive(Clone)]
 pub struct Engine {
+    pub(crate) metrics: Arc<crate::metrics::Metrics>,
+    pub(crate) memory_gauges: Arc<crate::mem::Gauges>,
+    pub(crate) telemetry: Arc<std::sync::Mutex<Option<Arc<crate::mem::Telemetry>>>>,
     pg_pool: Option<crate::pg::Pool>,
     publish_generated: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) electric_handles: Arc<crate::electric::HandleRegistry>,
@@ -985,9 +989,9 @@ impl EngineState {
     /// Publish the live-subscription gauge. A gauge and not a counter: it describes how many claims
     /// are pinning shapes right now, which is the number an operator watching a shape that will not
     /// go dormant needs.
-    fn publish_subscription_gauge(&self) {
+    fn publish_subscription_gauge(&self, metrics: &crate::metrics::Metrics) {
         let live: usize = self.feed_shares.values().map(FeedShare::refcount).sum();
-        crate::metrics::metrics().subscriptions_live.store(live as u64, std::sync::atomic::Ordering::Relaxed);
+        metrics.subscriptions_live.store(live as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Every subscription whose lease has not been renewed within `window`, as
@@ -1311,7 +1315,13 @@ impl Engine {
         if let Some(binding) = binding {
             store_bound.set(binding).expect("fresh store binding proof");
         }
-        let shutdown = crate::shutdown::ShutdownToken::with_supervisor(restart_notify);
+        let metrics = Arc::new(crate::metrics::Metrics::new(
+            config.map_or_else(|| crate::config::stack_id().to_owned(), |c| c.stack_id.clone()),
+        ));
+        let memory_gauges = Arc::new(crate::mem::Gauges::default());
+        let source_id = restart_notify.as_ref().map(|_| metrics.stack_id.clone());
+        let telemetry = crate::mem::init_otel(metrics.clone(), memory_gauges.clone(), source_id.as_deref());
+        let shutdown = crate::shutdown::ShutdownToken::with_metrics(restart_notify, metrics.clone());
         let ds = ds.with_shutdown(shutdown.clone());
         let pg_pool = pg_url.as_ref().map(|url| {
             crate::pg::Pool::owned(
@@ -1369,6 +1379,9 @@ impl Engine {
             },
         );
         let engine = Engine {
+            metrics,
+            memory_gauges,
+            telemetry: Arc::new(std::sync::Mutex::new(Some(Arc::new(telemetry)))),
             pg_pool,
             publish_generated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             electric_handles: Arc::new(crate::electric::HandleRegistry::default()),
@@ -1450,7 +1463,44 @@ impl Engine {
         engine.install_gone_reconciler();
         engine.ensure_degrade_reaper();
         crate::electric::ensure_evictor(&engine);
+        crate::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
         engine
+    }
+
+    /// Emit this Engine's shape counts over the shared StatsD transport.
+    pub fn spawn_statsd_shape_sampler(&self, period: Duration) {
+        if !crate::statsd::enabled() {
+            return;
+        }
+        let engine = self.clone();
+        self.shutdown.spawn_background(async move {
+            loop {
+                let (total, indexed, unindexed) = crate::mem::published_shape_counts(&engine.memory_gauges);
+                engine.metrics.emitter().shape_gauges(total, indexed, unindexed);
+                tokio::select! { _ = engine.shutdown.wait() => break, _ = tokio::time::sleep(period) => {} }
+            }
+        });
+    }
+
+    pub(crate) fn settle_waits_active(&self) -> u64 {
+        self.pg_pool.as_ref().map_or(0, |pool| pool.sequenced().settle_waits_active())
+    }
+    pub(crate) fn settle_stats_json(&self) -> serde_json::Value {
+        self.pg_pool
+            .as_ref()
+            .map_or_else(|| crate::pg::SequencedXids::default().stats_json(), |pool| pool.sequenced().stats_json())
+    }
+
+    /// This Engine's Prometheus series; an already closed Engine has no registry.
+    pub fn prometheus_text(&self) -> String {
+        self.telemetry.lock().unwrap().as_ref().map_or_else(String::new, |telemetry| telemetry.prometheus_text())
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn provider_alive_probe_for_test(&self) -> impl Fn() -> bool + Send + Sync + use<> {
+        let weak = self.telemetry.lock().unwrap().as_ref().map(Arc::downgrade);
+        move || weak.as_ref().is_some_and(|weak| weak.strong_count() != 0)
     }
 
     /// This Engine's shutdown token — close or the standalone signal handler flips it, and every
@@ -1496,6 +1546,13 @@ impl Engine {
             barrier.complete();
         }
         self.ds.clear_gone_reconciler();
+        let telemetry = self.telemetry.lock().unwrap().take();
+        if let Some(telemetry) = telemetry {
+            if let Err(error) = tokio::task::spawn_blocking(move || telemetry.shutdown()).await {
+                tracing::warn!(%error, "Engine telemetry shutdown task failed");
+                outcome = ShutdownOutcome::Forced;
+            }
+        }
         *result = Some(outcome);
         outcome
     }
@@ -2437,7 +2494,7 @@ impl Engine {
             self.ds.head(&segment_path(resolved)).await.ok().flatten().and_then(|h| h.next_offset)
         };
         self.changes.state().adopt(resolved, starts, tail);
-        crate::metrics::metrics().changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
+        self.metrics.changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
         tracing::info!("change log: current segment is {}", segment_path(resolved));
         Ok(())
     }

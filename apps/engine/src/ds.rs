@@ -947,6 +947,7 @@ impl DurableStreamStore for HttpDurableStreamsStore {
 #[derive(Clone)]
 pub struct DsClient {
     shutdown: Option<crate::shutdown::ShutdownToken>,
+    metrics: Arc<crate::metrics::Metrics>,
     caps: Arc<ReadCaps>,
     base: String,
     scope: StreamScope,
@@ -962,7 +963,12 @@ pub struct DsClient {
 }
 
 impl DsClient {
+    pub(crate) fn metrics(&self) -> &Arc<crate::metrics::Metrics> {
+        &self.metrics
+    }
+
     pub(crate) fn with_shutdown(mut self, shutdown: crate::shutdown::ShutdownToken) -> Self {
+        self.metrics = shutdown.metrics().clone();
         self.shutdown = Some(shutdown);
         self
     }
@@ -995,6 +1001,7 @@ impl DsClient {
     fn with_store(base: String, scope: StreamScope, store: Arc<dyn DurableStreamStore>) -> Self {
         DsClient {
             shutdown: None,
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             base,
             scope,
             caps: store.read_caps(),

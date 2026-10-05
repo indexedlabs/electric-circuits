@@ -118,14 +118,27 @@ I/O and reconciliation short-circuit and no new source is started.
 Both hosting modes use `Engine::close`: begin shutdown, wait for registered parties, drop the
 Electric handle registry and drain the catalog, stop and join the membership/counts circuits,
 close the Postgres pool, end and join remaining Engine tasks, fail unfinished retirement completions,
-and clear the DS reconciler callback. Source workers also close an Engine whose boot fails or is
+clear the DS reconciler callback, then flush, shut down and drop the Engine's meter provider. Source workers also close an Engine whose boot fails or is
 cancelled before dropping their runtime. The standalone binary uses the same lifecycle on shutdown.
 
 Each Engine owns its Postgres pool, settle record and poller, publication-generated-column setting,
 DS read-cap state, Electric handle registry and evictor, and background tasks. This includes work
 started by an HTTP handler on the host runtime. Pools are distinct even when source URLs match.
-The existing process-wide metrics and settle statistics remain aggregated; per-source observability
-is separate work. The statistics collector keeps only weak references to pools.
+Counters, gauges, latency histograms, memory cardinalities and settle statistics also belong to
+that Engine. `/sources/{id}/metrics/reset` resets only that source's counters and histograms;
+stopping a source does not set another source's shutdown gauge. RSS and allocator figures still
+describe the shared process.
+
+Each Engine owns its Prometheus registry and meter provider. Its `/metrics/prometheus` route
+exports only its own series, carrying `source_id`. Close drops the provider, callbacks and cumulative
+series, even while another caller still holds an Engine handle. A replacement creates fresh metric
+state and a fresh provider. There is no host aggregate Prometheus route. An optional OTLP reader
+belongs to the same provider and carries `source_id` as a resource attribute; close flushes it and
+ends it before the source runtime drops.
+
+The 500 ms cardinality sampler and replication-slot gauge sampler run in each Engine's task set.
+They end on that Engine's shutdown. StatsD keeps one process UDP transport, and source emissions
+use the source id as their `stack_id` tag.
 
 Electric handles belong to the Engine that minted them. A foreign or pre-restart handle receives
 `409 must-refetch`. Idle eviction releases the handle's own subscription on its own Engine. Plain
