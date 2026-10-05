@@ -1213,7 +1213,7 @@ fn sid_of_path(stream_path: &str) -> &str {
 impl Engine {
     /// Construct a production engine only from storage admission completed before engine setup.
     pub fn new(admission: StoreAdmission) -> Self {
-        Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None)
+        Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None)
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
@@ -1226,7 +1226,7 @@ impl Engine {
     /// `setup_postgres` validates the exact existing publication and replica
     /// identity rather than trying to broaden the Engine's database grants.
     pub fn new_pg_with_setup(admission: StoreAdmission, pg_url: String, setup: PostgresSetup) -> Self {
-        let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup, None);
+        let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup, None, None);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
@@ -1234,7 +1234,7 @@ impl Engine {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_in_process_test(ds: DsClient) -> Self {
-        Self::new_inner(ds, None, None, PostgresSetup::EngineManaged, None)
+        Self::new_inner(ds, None, None, PostgresSetup::EngineManaged, None, None)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1246,9 +1246,21 @@ impl Engine {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_pg_for_in_process_test_with_setup(ds: DsClient, pg_url: String, setup: PostgresSetup) -> Self {
-        let e = Self::new_inner(ds, Some(pg_url), None, setup, None);
+        let e = Self::new_inner(ds, Some(pg_url), None, setup, None, None);
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_supervised_for_test(notify: Arc<tokio::sync::Notify>) -> Self {
+        Self::new_inner(
+            DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+            None,
+            None,
+            PostgresSetup::EngineManaged,
+            None,
+            Some(notify),
+        )
     }
 
     /// Construct using the resolved per-Engine storage and pool settings.
@@ -1258,8 +1270,29 @@ impl Engine {
         setup: PostgresSetup,
         config: &crate::config::Config,
     ) -> Self {
+        Self::new_configured(admission, pg_url, setup, config, None)
+    }
+
+    pub(crate) fn new_supervised(
+        admission: StoreAdmission,
+        pg_url: Option<String>,
+        setup: PostgresSetup,
+        config: &crate::config::Config,
+        restart_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self::new_configured(admission, pg_url, setup, config, Some(restart_notify))
+    }
+
+    fn new_configured(
+        admission: StoreAdmission,
+        pg_url: Option<String>,
+        setup: PostgresSetup,
+        config: &crate::config::Config,
+        restart_notify: Option<Arc<tokio::sync::Notify>>,
+    ) -> Self {
         let postgres = pg_url.is_some();
-        let engine = Self::new_inner(admission.ds, pg_url, Some(admission.binding), setup, Some(config));
+        let engine =
+            Self::new_inner(admission.ds, pg_url, Some(admission.binding), setup, Some(config), restart_notify);
         if postgres {
             engine.health.store(HEALTH_WAITING, Ordering::Relaxed);
         }
@@ -1272,12 +1305,13 @@ impl Engine {
         binding: Option<crate::store_identity::StoreBound>,
         postgres_setup: PostgresSetup,
         config: Option<&crate::config::Config>,
+        restart_notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
         let store_bound = Arc::new(std::sync::OnceLock::new());
         if let Some(binding) = binding {
             store_bound.set(binding).expect("fresh store binding proof");
         }
-        let shutdown = crate::shutdown::ShutdownToken::new();
+        let shutdown = crate::shutdown::ShutdownToken::with_supervisor(restart_notify);
         let ds = ds.with_shutdown(shutdown.clone());
         let pg_pool = pg_url.as_ref().map(|url| {
             crate::pg::Pool::owned(
@@ -1441,10 +1475,8 @@ impl Engine {
             tracing::warn!(parties = ?self.shutdown.outstanding(), "Engine close exceeded graceful drain");
             ShutdownOutcome::Forced
         };
-        // Handles are volatile; their catalog subscriptions must not survive a clean restart.
-        if tokio::time::timeout(remaining(), crate::electric::close_handles(self)).await.is_err() {
-            outcome = ShutdownOutcome::Forced;
-        }
+        // Handles are volatile; durable subscriptions lapse by lease after restart.
+        crate::electric::close_handles(self);
         if !self.drain_catalog(remaining().min(crate::shutdown::CATALOG_DRAIN)).await
             && outcome == ShutdownOutcome::Complete
         {
@@ -1879,17 +1911,30 @@ impl Engine {
         // not O(rows); row data stays in Postgres. State is in-memory only, so this runs on
         // every boot; the seed's SnapshotGate fences change-log replay exactly like a shape
         // backfill.
-        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
-        let mut gates = HashMap::new();
-        for spec in &counts {
-            let ts = schemas.get(&spec.table).expect("resolved above");
-            let (groups, gate) = crate::pg::backfill_group_counts(&mut client, ts, &spec.group_cols).await?;
-            let total = groups.len();
-            arr.seed_groups(&spec.table, groups).await?;
-            gates.insert(spec.table.clone(), gate);
-            arr.finish_seed(&spec.table);
-            tracing::info!("arrangements: seeded counts for '{}' ({total} groups)", spec.table);
+        let seeded = async {
+            let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+            let mut gates = HashMap::new();
+            for spec in &counts {
+                let ts = schemas.get(&spec.table).expect("resolved above");
+                let (groups, gate) = crate::pg::backfill_group_counts(&mut client, ts, &spec.group_cols).await?;
+                let total = groups.len();
+                arr.seed_groups(&spec.table, groups).await?;
+                gates.insert(spec.table.clone(), gate);
+                arr.finish_seed(&spec.table);
+                tracing::info!("arrangements: seeded counts for '{}' ({total} groups)", spec.table);
+            }
+            Ok::<_, anyhow::Error>(gates)
         }
+        .await;
+        let gates = match seeded {
+            Ok(gates) => gates,
+            Err(error) => {
+                self.arrangements.lock().unwrap().take();
+                self.arr_gates.write().unwrap().clear();
+                arr.shutdown().await;
+                return Err(error);
+            }
+        };
         *self.arr_gates.write().unwrap() = gates;
         *self.arrangements.lock().unwrap() = Some(arr);
         Ok(())

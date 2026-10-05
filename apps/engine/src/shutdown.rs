@@ -88,7 +88,7 @@ struct Inner {
     /// server finally stopped, so the readiness-drain window comes out of the same budget.
     began_at: std::sync::Mutex<Option<std::time::Instant>>,
     tasks: std::sync::Mutex<Option<tokio::task::JoinSet<()>>>,
-    restart_notify: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    restart_notify: Option<Arc<tokio::sync::Notify>>,
     restart_reason: std::sync::atomic::AtomicI32,
 }
 
@@ -106,33 +106,32 @@ impl Default for ShutdownToken {
 
 impl ShutdownToken {
     pub fn new() -> Self {
+        Self::with_supervisor(None)
+    }
+
+    pub(crate) fn with_supervisor(restart_notify: Option<Arc<tokio::sync::Notify>>) -> Self {
         ShutdownToken {
             inner: Arc::new(Inner {
                 tx: tokio::sync::watch::channel(false).0,
                 outstanding: std::sync::Mutex::new(BTreeSet::new()),
                 began_at: std::sync::Mutex::new(None),
                 tasks: std::sync::Mutex::new(Some(tokio::task::JoinSet::new())),
-                restart_notify: std::sync::Mutex::new(None),
+                restart_notify,
                 restart_reason: std::sync::atomic::AtomicI32::new(0),
             }),
         }
     }
 
-    pub(crate) fn supervise_restarts(&self, notify: Arc<tokio::sync::Notify>) {
-        *self.inner.restart_notify.lock().unwrap() = Some(notify);
-    }
-
+    #[cfg(test)]
     pub(crate) fn restart_requested(&self) -> bool {
         self.inner.restart_reason.load(std::sync::atomic::Ordering::Acquire) != 0
     }
 
     /// Fatal Engine conditions restart one supervised source; the standalone binary keeps its exit code.
     pub(crate) fn restart_or_exit(&self, code: i32) {
-        let notify = self.inner.restart_notify.lock().unwrap().clone();
-        if let Some(notify) = notify {
+        if self.inner.restart_notify.is_some() {
             self.inner.restart_reason.store(code, std::sync::atomic::Ordering::Release);
             self.begin();
-            notify.notify_one();
         } else {
             std::process::exit(code);
         }
@@ -198,6 +197,9 @@ impl ShutdownToken {
             // on demand inside `wait`). `send_replace` always stores, then wakes whoever is there.
             *self.inner.began_at.lock().unwrap() = Some(std::time::Instant::now());
             self.inner.tx.send_replace(true);
+            if let Some(notify) = &self.inner.restart_notify {
+                notify.notify_one();
+            }
             crate::metrics::metrics().shutdown_in_progress.store(1, std::sync::atomic::Ordering::Relaxed);
         }
         first
@@ -479,10 +481,9 @@ mod ownership_tests {
 
     #[tokio::test]
     async fn supervised_failure_signals_only_the_source_owner() {
-        let failed = ShutdownToken::new();
         let healthy = ShutdownToken::new();
         let notify = Arc::new(tokio::sync::Notify::new());
-        failed.supervise_restarts(notify.clone());
+        let failed = ShutdownToken::with_supervisor(Some(notify.clone()));
         failed.restart_or_exit(74);
         notify.notified().await;
         assert!(failed.is_shutting_down());

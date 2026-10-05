@@ -1,5 +1,5 @@
 //! OTTO-6003 lifecycle contracts. Each ignored test uses a fresh process because the current
-//! adapter caches its TTL and evictor in process statics. No production lifecycle is changed here.
+//! adapter caches its TTL in process statics. The parent serializes children and owns fixture cleanup.
 
 use super::*;
 use std::collections::BTreeSet;
@@ -14,36 +14,34 @@ use tokio::sync::watch;
 
 const SOURCES: [&str; 3] = ["alpha", "beta", "gamma"];
 const RESTARTS: i64 = 50;
-const CHILD_ENV: &str = "OTTO_6003_TEST_CHILD";
-
 // Re-exec the test binary, not Cargo: the parent's herdr-heavy lock covers the entire run.
-// The child sets process settings before any runtime or Engine exists; no unsafe env mutation.
 fn isolated(name: &str, case: Case) -> Result<()> {
-    if std::env::var(CHILD_ENV).as_deref() != Ok(name) {
-        let run_root = std::env::temp_dir().join(format!("otto-6003-run-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&run_root)?;
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([name, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
-            .env(CHILD_ENV, name)
-            .env("TMPDIR", &run_root)
+    if isolated_contract(name, |command| {
+        command
             .env("ELECTRIC_HANDLE_TTL", "1")
             .env("ELECTRIC_CIRCUITS_SUBQ_STORAGE", "1")
             .env_remove("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR")
             .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "0")
-            .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0")
-            .output()?;
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        // The child has exited, so even leaked circuit threads can no longer use these files.
-        // Never sweep another test's or another process's spill directory.
-        std::fs::remove_dir_all(run_root)?;
-        ensure!(output.status.success(), "isolated contract {name} failed: {}", output.status);
+            .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0");
+    })? {
         return Ok(());
     }
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?.block_on(async {
         let fixture = Fixture::new().await?;
         let result = match case {
-            Case::FailedRetry => failed_source_retry(&fixture).await,
+            Case::FailedRetry => {
+                let mut errors = Vec::new();
+                for result in [
+                    failed_source_retry(&fixture).await,
+                    self_stopped_sources_recover_without_starving_rows(&fixture).await,
+                    changed_version_fetch_failure_does_not_retry_cached_rows(&fixture).await,
+                ] {
+                    if let Err(error) = result {
+                        errors.push(format!("{error:#}"));
+                    }
+                }
+                if errors.is_empty() { Ok(()) } else { anyhow::bail!("{}", errors.join("\n")) }
+            }
             Case::Restarts => repeated_restarts(&fixture).await,
             Case::StaleHandle => stale_handle(&fixture).await,
             Case::ForeignHandle => foreign_handle(&fixture).await,
@@ -166,6 +164,12 @@ impl Fixture {
         std::fs::create_dir(&root)?;
         let secret = root.join("database-url");
         std::fs::write(&secret, &pg_url)?;
+        FixtureObjects {
+            slots: SOURCES.iter().map(|source| format!("otto_{source}_{suffix}")).collect(),
+            publications: SOURCES.iter().map(|source| format!("otto_{source}_{suffix}_pub")).collect(),
+            tables: vec![sources_table.clone(), version_table.clone(), outer.clone(), inner.clone()],
+        }
+        .record()?;
         client
             .batch_execute(&format!(
                 "CREATE TABLE {sources_table} (
@@ -335,17 +339,7 @@ impl Fixture {
     async fn cleanup(self) -> Result<()> {
         let _ = self.ds_stop.send(());
         self.ds_task.await?;
-        for slot in &self.slots {
-            self.client.batch_execute(&format!("DROP PUBLICATION {slot}_pub")).await?;
-            self.client.query_one("SELECT pg_drop_replication_slot($1)", &[slot]).await?;
-        }
-        self.client
-            .batch_execute(&format!(
-                "DROP TABLE {}, {}, {}, {}",
-                self.sources_table, self.version_table, self.outer, self.inner
-            ))
-            .await?;
-        std::fs::remove_dir_all(self.root)?;
+        // The parent cleans all recorded objects after process exit, including partial setup.
         Ok(())
     }
 }
@@ -361,7 +355,12 @@ fn spill_folders(f: &Fixture) -> Result<BTreeSet<PathBuf>> {
     for source in SOURCES {
         let path = f.root.join("sources").join(source).join("subq");
         if path.exists() {
-            folders.insert(path);
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.path().is_dir() {
+                    folders.insert(entry.path());
+                }
+            }
         }
     }
     if !root.exists() {
@@ -495,7 +494,16 @@ async fn reader_snapshots(f: &Fixture) -> Result<()> {
         ensure!(baseline == (0, 0), "fresh Engine registry must be empty: {baseline:?}");
         drop(initial);
         let mut stopped = Vec::new();
+        let mut inherited_subscriptions = 0;
         for revision in 1..=3 {
+            if revision == 3 {
+                // Close preserves durable leases. With leases disabled in this fixture, measure
+                // the restored baseline separately from handles minted by this live Engine.
+                let live = host.engine_for_test("alpha").await.context("alpha missing")?;
+                for shape in live.graph().await.shapes {
+                    inherited_subscriptions += live.subscription_count(&shape.id).await;
+                }
+            }
             for _ in 0..16 {
                 // The reader uses only the snapshot body and never resumes the returned handle.
                 f.snapshot(&app, "/sources/alpha", false).await?;
@@ -510,7 +518,7 @@ async fn reader_snapshots(f: &Fixture) -> Result<()> {
         let live = host.engine_for_test("alpha").await.context("alpha replacement missing")?;
         let graph = live.graph().await;
         ensure!(graph.shapes.len() == 1, "reader snapshots should share one plain shape");
-        let eviction = await_idle_release(f, &app, &[("/sources/alpha".into(), graph.shapes[0].id.clone())]).await;
+        let eviction = await_subscription_count(f, &app, &[("/sources/alpha".into(), graph.shapes[0].id.clone())], inherited_subscriptions).await;
         let usage = electric_circuits_engine::electric::registry_usage_for_test(&live).await;
         let alive = stopped.iter().filter(|probe| probe()).count();
         println!("reader snapshots: registry count/heap={usage:?}, baseline={baseline:?}, stopped Engines alive={alive}");
@@ -519,13 +527,36 @@ async fn reader_snapshots(f: &Fixture) -> Result<()> {
         eviction?;
         Ok(())
     }.await;
+    let close_check = async {
+        result?;
+        for _ in 0..8 {
+            f.snapshot(&app, "/sources/alpha", false).await?;
+        }
+        let lefts = || async {
+            f.ds.store.streams.lock().await.values().flatten().filter(|event| event["t"] == "left").count()
+        };
+        let before = lefts().await;
+        stop(&host).await;
+        ensure!(lefts().await == before, "Engine close appended Left for live snapshot handles");
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
     stop(&host).await;
-    result
+    close_check
 }
 
 // Observe catalog writes to wait for releases without touching/renewing an idle Electric handle.
 // The deadline diagnoses a missing eviction; event notification, not a sleep, drives observation.
 async fn await_idle_release(f: &Fixture, app: &Router, shapes: &[(String, String)]) -> Result<()> {
+    await_subscription_count(f, app, shapes, 0).await
+}
+
+async fn await_subscription_count(
+    f: &Fixture,
+    app: &Router,
+    shapes: &[(String, String)],
+    expected: usize,
+) -> Result<()> {
     let mut changes = f.ds.changed.subscribe();
     let outcome = tokio::time::timeout(Duration::from_secs(75), async {
         loop {
@@ -534,7 +565,7 @@ async fn await_idle_release(f: &Fixture, app: &Router, shapes: &[(String, String
             for (prefix, id) in shapes {
                 let (code, shape) = json(app, Method::GET, &format!("{prefix}/shapes/{id}"), Body::empty()).await?;
                 ensure!(code == StatusCode::OK, "idle shape unexpectedly disappeared: {code} {shape}");
-                if shape["subscriptions"] != 0 {
+                if shape["subscriptions"] != expected {
                     pending.push((prefix.clone(), shape["subscriptions"].clone()));
                 }
             }
@@ -551,7 +582,7 @@ async fn await_idle_release(f: &Fixture, app: &Router, shapes: &[(String, String
     let mut remaining = Vec::new();
     for (prefix, id) in shapes {
         let (_, shape) = json(app, Method::GET, &format!("{prefix}/shapes/{id}"), Body::empty()).await?;
-        if shape["subscriptions"] != 0 {
+        if shape["subscriptions"] != expected {
             remaining.push(format!("{prefix}: subscriptions={}", shape["subscriptions"]));
         }
     }
@@ -641,8 +672,10 @@ async fn single_engine_controls(f: &Fixture) -> Result<()> {
         Ok(())
     }
     .await;
-    engine.shutdown_token().begin();
-    ensure!(engine.shutdown_token().wait_for_parties(Duration::from_secs(25)).await, "single Engine did not drain");
+    ensure!(
+        engine.close(Duration::from_secs(25)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+        "single Engine did not close cleanly"
+    );
     result
 }
 
@@ -687,5 +720,67 @@ async fn failed_source_retry(f: &Fixture) -> Result<()> {
         Ok(())
     }.await;
     stop(&host).await;
+    result
+}
+
+async fn self_stopped_sources_recover_without_starving_rows(f: &Fixture) -> Result<()> {
+    let host = f.host().await?;
+    let mut completed = host.poll_completed_for_test();
+    host.spawn_poll();
+    let result = async {
+        for revision in 2..=4 {
+            let old = host.engine_for_test("alpha").await.context("alpha missing")?;
+            let old_alive = old.state_alive_probe_for_test();
+            old.shutdown_token().begin();
+            drop(old);
+            f.client
+                .execute(&format!("UPDATE {} SET revision=$1 WHERE source_id='beta'", f.sources_table), &[&revision])
+                .await?;
+            set_revision(&f.client, &f.version_table, revision).await?;
+            tokio::time::timeout(Duration::from_secs(6), completed.changed()).await??;
+            f.ready(&host.router(), "beta", revision).await?;
+            f.ready(&host.router(), "alpha", 1).await?;
+            ensure!(!old_alive(), "an Engine-initiated stop remained in running after the next poll");
+            f.snapshot(&host.router(), "/sources/alpha", false).await?;
+            f.snapshot(&host.router(), "/sources/gamma", false).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    stop(&host).await;
+    // Restore the fixture revisions for the next independent scenario.
+    f.client.execute(&format!("UPDATE {} SET revision=1", f.sources_table), &[]).await?;
+    set_revision(&f.client, &f.version_table, 1).await?;
+    result
+}
+
+async fn changed_version_fetch_failure_does_not_retry_cached_rows(f: &Fixture) -> Result<()> {
+    let secret = f.root.join("fetch-failure-secret");
+    f.client
+        .execute(
+            &format!("UPDATE {} SET database_secret=$1 WHERE source_id='alpha'", f.sources_table),
+            &[&format!("file:{}", secret.display())],
+        )
+        .await?;
+    let host = SourcesSupervisor::new(f.config.clone())?;
+    host.refresh().await?;
+    let mut completed = host.poll_completed_for_test();
+    let unavailable = format!("{}_held", f.sources_table);
+    f.client.batch_execute(&format!("ALTER TABLE {} RENAME TO {unavailable}", f.sources_table)).await?;
+    set_revision(&f.client, &f.version_table, 2).await?;
+    std::fs::write(&secret, &f.pg_url)?;
+    host.spawn_poll();
+    let result = async {
+        tokio::time::timeout(Duration::from_secs(6), completed.changed()).await??;
+        ensure!(
+            host.engine_for_test("alpha").await.is_none(),
+            "changed version with failed fetch started a stale cached row"
+        );
+        f.snapshot(&host.router(), "/sources/beta", false).await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    stop(&host).await;
+    f.client.batch_execute(&format!("ALTER TABLE {unavailable} RENAME TO {}", f.sources_table)).await?;
     result
 }

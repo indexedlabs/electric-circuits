@@ -115,8 +115,8 @@ I/O and reconciliation short-circuit and no new source is started.
 
 ## Engine ownership and stop
 
-Both hosting modes use `Engine::close`: begin shutdown, wait for registered parties, release
-Electric handle subscriptions and drain the catalog, stop and join the membership/counts circuits,
+Both hosting modes use `Engine::close`: begin shutdown, wait for registered parties, drop the
+Electric handle registry and drain the catalog, stop and join the membership/counts circuits,
 close the Postgres pool, end and join remaining Engine tasks, fail unfinished retirement completions,
 and clear the DS reconciler callback. Source workers also close an Engine whose boot fails or is
 cancelled before dropping their runtime. The standalone binary uses the same lifecycle on shutdown.
@@ -130,18 +130,25 @@ is separate work. The statistics collector keeps only weak references to pools.
 Electric handles belong to the Engine that minted them. A foreign or pre-restart handle receives
 `409 must-refetch`. Idle eviction releases the handle's own subscription on its own Engine. Plain
 `offset=-1` recovery snapshots also create handles; clients that never resume them are cleaned up by
-the same TTL. `ttl_registry_heap_bytes` measures only the serving Engine's registry.
+the same TTL. Close drops the registry without writing one catalog `Left` per handle; durable
+subscriptions retain their existing lease and lapse after restart. `ttl_registry_heap_bytes`
+measures only the serving Engine's registry.
 
-Membership spill settings are resolved through `Config`. Sources use `<source_root>/subq`, overriding
-any host-wide explicit membership directory; the circuit cache is removed when its joined thread
-exits. The configured standalone membership directory is likewise an Engine-owned disposable cache.
+Membership spill settings are resolved through `Config`. Each source Engine owns a unique child
+`<source_root>/subq/<pid>-<seq>`, overriding any host-wide explicit membership directory. Close removes
+only that child after its circuit thread joins, and boot sweeps children left by dead processes.
+The default temporary directory follows the same lifecycle. An explicit standalone membership
+directory is operator-managed and kept on shutdown; the Engine never removes that directory.
 The source storage root, including retained storage, stays on disk across stops and row deletion;
 removing an obsolete root remains an operator action.
 
 Catalog refusal (standalone exit 74) and counts-circuit rebuild (standalone exit 75) notify the
-supervisor to stop and restart only the affected source, without a source-row revision change.
-The supervisor serializes this with discovery reconciliation. If that start fails, the same
-failed-source poll retry policy applies. The standalone binary retains its process exit codes.
+supervisor to stop only the affected source, without a source-row revision change. Any Engine-initiated
+shutdown, including catalog or sequencer fail-closed stops, moves the source to `failed`. Notifications
+never reboot immediately: the next poll reconciles row changes and retries desired failed sources,
+so a repeatedly stopping source cannot starve discovery. The notifier belongs to the Engine from
+construction. If a table version moved but fetching its rows fails, that tick does not retry cached
+rows. The standalone binary retains its process exit codes.
 
 Authentication secrets, environment-derived TTL/deadline knobs, pool capacity policy, backfill
 settings, and the StatsD transport remain host-wide. Source database URLs, slots, publications,

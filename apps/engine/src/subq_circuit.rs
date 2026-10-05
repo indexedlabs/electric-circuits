@@ -95,11 +95,12 @@ impl Assertions {
     }
 }
 
-/// Resolved membership cache settings. Each Engine owns its directory exclusively.
+/// Resolved membership cache settings; explicit standalone directories remain operator-owned.
 #[derive(Clone, Debug)]
 pub struct StorageSettings {
     enabled: bool,
     dir: Option<String>,
+    owned_root: Option<std::path::PathBuf>,
     min_storage_bytes: usize,
     cache_mib: usize,
 }
@@ -109,6 +110,7 @@ impl StorageSettings {
         Self {
             enabled: g("ELECTRIC_CIRCUITS_SUBQ_STORAGE").as_deref() != Some("0"),
             dir: g("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR").filter(|s| !s.is_empty()),
+            owned_root: None,
             min_storage_bytes: g("ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB")
                 .and_then(|s| s.parse::<usize>().ok())
                 .unwrap_or(128)
@@ -117,12 +119,19 @@ impl StorageSettings {
         }
     }
 
+    pub(crate) fn own_children_in(&mut self, root: std::path::PathBuf) {
+        self.owned_root = Some(root);
+    }
+
     fn spill(&self) -> Option<SpillConfig> {
         self.enabled.then(|| SpillConfig {
-            dir: self.dir.clone().unwrap_or_else(default_spill_dir),
+            dir: match &self.owned_root {
+                Some(root) => owned_spill_dir(root),
+                None => self.dir.clone().unwrap_or_else(default_spill_dir),
+            },
             min_storage_bytes: self.min_storage_bytes,
             cache_mib: self.cache_mib,
-            auto: true,
+            auto: self.owned_root.is_some() || self.dir.is_none(),
         })
     }
 }
@@ -169,7 +178,7 @@ fn storage_cache_mib(raw: Option<&str>) -> usize {
 /// on shutdown; stale dirs from dead processes are swept best-effort at start).
 ///
 /// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE=0` — disable (fully in-memory relations).
-/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=<path>` — exclusive cache location (removed on close).
+/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=<path>` — operator-managed location (kept on close).
 /// - `ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB` (default 128).
 /// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` (default 64, TOTAL across all workers/thread-types —
 ///   see [`storage_cache_mib`]; dbsp's own unset-default would be 512 MiB for this circuit).
@@ -181,10 +190,13 @@ fn spill_config_from_env() -> Result<Option<SpillConfig>> {
 /// dirs whose owning process is gone (best-effort — a crash leaves the dir behind, and the
 /// next boot on the machine reclaims it).
 fn default_spill_dir() -> String {
+    owned_spill_dir(&std::env::temp_dir().join("electric-circuits-subq"))
+}
+
+fn owned_spill_dir(base: &std::path::Path) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir().join("electric-circuits-subq");
-    if let Ok(entries) = std::fs::read_dir(&base) {
+    if let Ok(entries) = std::fs::read_dir(base) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             let Some(pid) = name.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {

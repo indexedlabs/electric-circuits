@@ -141,11 +141,9 @@ pub(crate) struct HandleRegistry {
     started: OnceLock<()>,
 }
 
-pub(crate) async fn close_handles(engine: &Engine) {
-    let entries = std::mem::take(&mut *engine.electric_handles.entries.lock().unwrap());
-    for entry in entries.into_values() {
-        engine.release_subscription(&entry.shape_id, Some(&entry.subscription)).await;
-    }
+pub(crate) fn close_handles(engine: &Engine) {
+    // Durable subscriptions retain their existing lease; shutdown adds no per-handle catalog work.
+    drop(std::mem::take(&mut *engine.electric_handles.entries.lock().unwrap()));
 }
 
 /// Observe the serving Engine's registry without creating or renewing a handle.

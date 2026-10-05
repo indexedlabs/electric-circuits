@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
             tracing::info!("postgres mode: {tables} table(s), slot '{}', streaming pgoutput", config.slot);
             statsd::consumers_ready(tables as u64);
             // Replication-slot gauges (engine-owned: `/metrics`, `/metrics/prometheus` AND StatsD
-            // read the same ~10 s sample, taken on a POOLED connection).
+            // read the same ~10 s sample, taken on a fresh connection).
             electric_circuits_engine::metrics::spawn_replication_slot_sampler(
                 url,
                 config.slot.clone(),

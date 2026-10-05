@@ -269,9 +269,6 @@ impl SourcesSupervisor {
                 tokio::select! {
                     biased;
                     _ = supervisor.inner.shutdown.wait() => break,
-                    _ = supervisor.inner.restart_notify.notified() => {
-                        supervisor.restart_failed_engines().await;
-                    }
                     _ = interval.tick() => {
                         if supervisor.inner.shutdown.is_shutting_down() {
                             break;
@@ -282,8 +279,13 @@ impl SourcesSupervisor {
                             }
                             tracing::warn!(error = %error, "sources poll failed");
                         }
+                        // A slow failed boot must not consume overdue ticks in a reboot burst.
+                        interval.reset();
                         #[cfg(feature = "test-support")]
                         supervisor.inner.poll_completed.send_replace(());
+                    }
+                    _ = supervisor.inner.restart_notify.notified() => {
+                        supervisor.restart_failed_engines().await;
                     }
                 }
             }
@@ -296,6 +298,11 @@ impl SourcesSupervisor {
 
     async fn restart_failed_engines(&self) {
         let _guard = self.inner.reconcile.lock().await;
+        self.collect_stopped_engines().await;
+    }
+
+    // Caller owns reconciliation. A notification only stops/queues; poll ticks own retries.
+    async fn collect_stopped_engines(&self) {
         if self.inner.shutdown.is_shutting_down() {
             return;
         }
@@ -306,7 +313,7 @@ impl SourcesSupervisor {
             .await
             .running
             .iter()
-            .filter(|(_, runtime)| runtime.engine.shutdown_token().restart_requested())
+            .filter(|(_, runtime)| runtime.engine.shutdown_token().is_shutting_down())
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -321,7 +328,6 @@ impl SourcesSupervisor {
                     tracing::warn!(source_id = %id, %error, "failed Engine worker did not join");
                 }
                 drop(runtime);
-                self.start_or_record(row).await;
             }
         }
     }
@@ -354,6 +360,8 @@ impl SourcesSupervisor {
         // Discovery and retries share the refresh/restart lock: the cached failed rows are still
         // desired by the latest applied snapshot, and a concurrent refresh cannot replace them.
         let _guard = self.inner.reconcile.lock().await;
+        self.collect_stopped_engines().await;
+        let mut changed_table_snapshot = false;
         let refreshed = async {
             let changed = match self.inner.sources.mode {
                 SourcesMode::File => true,
@@ -363,6 +371,7 @@ impl SourcesSupervisor {
                 }
             };
             if changed {
+                changed_table_snapshot = matches!(self.inner.sources.mode, SourcesMode::Table);
                 let snapshot = self.fetch_snapshot().await?;
                 // apply_snapshot already attempts each desired failed row once.
                 self.apply_snapshot(snapshot).await?;
@@ -370,7 +379,7 @@ impl SourcesSupervisor {
             Ok::<_, anyhow::Error>(changed)
         }
         .await;
-        if !matches!(refreshed, Ok(true)) {
+        if !matches!(refreshed, Ok(true)) && !changed_table_snapshot {
             let rows: Vec<_> = self.inner.state.lock().await.failed.values().map(|failed| failed.row.clone()).collect();
             for row in rows {
                 self.start_or_record(row).await;
@@ -647,8 +656,8 @@ async fn boot_source(
         _ = host_shutdown.wait() => bail!("source start interrupted by shutdown"),
         prepared = prepare => prepared?,
     };
-    let engine = Engine::new_with_config(admission, Some(database_url), PostgresSetup::ExternallyManaged, &child);
-    engine.shutdown_token().supervise_restarts(restart_notify);
+    let engine =
+        Engine::new_supervised(admission, Some(database_url), PostgresSetup::ExternallyManaged, &child, restart_notify);
     engine.set_dbsp_config(child.dbsp.clone());
     engine.set_txn_config(child.txn.clone());
     let activated = tokio::select! {
@@ -694,6 +703,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
         _ => std::env::var(name).ok(),
     })?;
     child.sources = None;
+    child.subq_storage.own_children_in(source_root.join("subq"));
     child.dbsp = base.dbsp.clone();
     child.dbsp.dir = source_root.join("dbsp");
     child.txn = base.txn.clone();
@@ -1338,5 +1348,62 @@ mod tests {
             .await
             .expect("shutdown must join the poll task");
         let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn review_r1_fatal_stop_queues_without_an_immediate_boot_attempt() {
+        let supervisor = SourcesSupervisor::new(file_mode_config("/unused")).unwrap();
+        let row = valid_row("alpha", 1, "file:/missing-otto-r1-secret");
+        let engine = Engine::new_supervised_for_test(supervisor.inner.restart_notify.clone());
+        engine.shutdown_token().restart_or_exit(75);
+        supervisor
+            .inner
+            .state
+            .lock()
+            .await
+            .running
+            .insert("alpha".into(), SourceRuntime { row, engine: engine.clone(), router: Router::new(), worker: None });
+        supervisor.restart_failed_engines().await;
+        let error = supervisor.inner.state.lock().await.failed["alpha"].error.clone();
+        engine.close(std::time::Duration::from_secs(1)).await;
+        assert!(!error.contains("resolve failed"), "restart notification attempted boot before a poll tick: {error}");
+    }
+
+    #[tokio::test]
+    async fn review_r1_source_spill_children_are_unique() -> Result<()> {
+        let mut base = file_mode_config("/unused");
+        let root = std::env::temp_dir().join(format!("otto-r1-source-spill-{}", uuid::Uuid::new_v4()));
+        base.sources.as_mut().unwrap().storage_dir = root.clone();
+        let row = valid_row("alpha", 1, "file:/unused");
+        let child = source_engine_config(&base, &row, "postgres://localhost/unused")?;
+        let mut dead = std::process::Command::new("true").spawn()?;
+        let dead_pid = dead.id();
+        dead.wait()?;
+        let stale = root.join(format!("alpha/subq/{dead_pid}-0"));
+        std::fs::create_dir_all(&stale)?;
+        std::fs::write(stale.join("stale-cache"), "old")?;
+        let first = crate::subq_circuit::MembershipCircuit::start_config(&child.subq_storage)?;
+        let second = crate::subq_circuit::MembershipCircuit::start_config(&child.subq_storage);
+        let count =
+            std::fs::read_dir(root.join("alpha/subq"))?.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count();
+        let stale_removed = !stale.exists();
+        first.shutdown().await;
+        let remaining = std::fs::read_dir(root.join("alpha/subq"))
+            .map(|entries| entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count())
+            .unwrap_or(0);
+        if let Ok(second) = &second {
+            second.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(root);
+        anyhow::ensure!(
+            stale_removed && remaining == 1,
+            "spill sweep must remove dead children, and closing one circuit must preserve the other's child"
+        );
+        anyhow::ensure!(
+            second.is_ok() && count == 2,
+            "two source Engines must own distinct spill children, got {count} children; second circuit started={}",
+            second.is_ok()
+        );
+        Ok(())
     }
 }
