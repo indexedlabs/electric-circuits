@@ -452,7 +452,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                         }
                         AppendVerdict::Retry => {
                             attempt += 1;
-                            crate::metrics::metrics().catalog_append_retries.fetch_add(1, Ordering::Relaxed);
+                            shutdown.metrics().catalog_append_retries.fetch_add(1, Ordering::Relaxed);
                             // Once per outage, not once per attempt: an unreachable storage server
                             // must not turn one event into a log flood.
                             if attempt == 1 {
@@ -1296,8 +1296,8 @@ impl Engine {
                     "catalog restore: retiring shape whose stream storage is gone"
                 );
                 self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
-                crate::metrics::metrics().catalog_restore_retired.fetch_add(1, Ordering::Relaxed);
-                crate::statsd::catalog_restore_retired(reason);
+                self.metrics.catalog_restore_retired.fetch_add(1, Ordering::Relaxed);
+                self.metrics.emitter().catalog_restore_retired(reason);
                 dead_streams.push((id, rec.stream_path));
             }
         }

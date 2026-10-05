@@ -673,6 +673,12 @@ async fn boot_source(
         engine.close(child.shutdown_grace).await;
         bail!("source {} did not become active", row.source_id);
     }
+    crate::metrics::spawn_replication_slot_sampler(
+        child.pg_url.clone().expect("source database configured"),
+        row.slot.clone(),
+        engine.shutdown_token(),
+    );
+    engine.spawn_statsd_shape_sampler(child.metrics_period);
     Ok((engine.clone(), crate::http::router_with_introspection(engine, child.trace)))
 }
 

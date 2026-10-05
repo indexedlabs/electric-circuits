@@ -95,6 +95,7 @@ impl RetirementCompletion {
 }
 
 fn abandon_retirements(
+    metrics: &crate::metrics::Metrics,
     current: Option<Retirement>,
     queue: &mut std::collections::VecDeque<Retirement>,
     receiver: &mut mpsc::UnboundedReceiver<Retirement>,
@@ -114,13 +115,14 @@ fn abandon_retirements(
         }
     }
     pending.fetch_sub(abandoned, Ordering::SeqCst);
-    crate::metrics::metrics().retirements_pending.store(pending.load(Ordering::SeqCst), Ordering::Relaxed);
+    metrics.retirements_pending.store(pending.load(Ordering::SeqCst), Ordering::Relaxed);
 }
 
 /// The engine's background retirement queue (see the module docs). Cheap to clone: a sender plus the
 /// gauge.
 #[derive(Clone)]
 pub(crate) struct RetirementQueue {
+    metrics: Arc<crate::metrics::Metrics>,
     tx: mpsc::UnboundedSender<Retirement>,
     pending: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -140,7 +142,7 @@ impl RetirementQueue {
         completion: Option<Arc<RetirementCompletion>>,
     ) {
         self.pending.fetch_add(1, Ordering::SeqCst);
-        crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
+        self.metrics.retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
         let item = Retirement {
             stream_path: stream_path.to_string(),
             shape_id: shape_id.map(str::to_string),
@@ -151,7 +153,7 @@ impl RetirementQueue {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             // Republish: the gauge is written from the counter, so an un-mirrored decrement would
             // leave it reading one retirement too many for the rest of the process.
-            crate::metrics::metrics().retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
+            self.metrics.retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
         }
     }
 
@@ -174,6 +176,7 @@ pub(crate) fn spawn_retirement_queue(
     let (tx, mut rx) = mpsc::unbounded_channel::<Retirement>();
     let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter = pending.clone();
+    let metrics = shutdown.metrics().clone();
     shutdown.clone().spawn(async move {
         let mut queue: std::collections::VecDeque<Retirement> = std::collections::VecDeque::new();
         loop {
@@ -181,7 +184,7 @@ pub(crate) fn spawn_retirement_queue(
                 tokio::select! {
                     biased;
                     _ = shutdown.wait() => {
-                        abandon_retirements(None, &mut queue, &mut rx, &counter);
+                        abandon_retirements(shutdown.metrics(), None, &mut queue, &mut rx, &counter);
                         return;
                     }
                     item = rx.recv() => match item {
@@ -202,7 +205,7 @@ pub(crate) fn spawn_retirement_queue(
                      `Dropped` records are durable)",
                     queue.len()
                 );
-                abandon_retirements(None, &mut queue, &mut rx, &counter);
+                abandon_retirements(shutdown.metrics(), None, &mut queue, &mut rx, &counter);
                 return;
             }
             let mut item = queue.pop_front().expect("non-empty above");
@@ -215,7 +218,7 @@ pub(crate) fn spawn_retirement_queue(
                         if item.completion.as_ref().is_some_and(|completion| completion.durable) {
                             if let Err(error) = catalog_tx.send_durable(retired).await {
                                 tracing::error!(error = %error, "retirement completion could not reach the catalog");
-                                abandon_retirements(Some(item), &mut queue, &mut rx, &counter);
+                                abandon_retirements(shutdown.metrics(), Some(item), &mut queue, &mut rx, &counter);
                                 return;
                             }
                         } else {
@@ -226,7 +229,7 @@ pub(crate) fn spawn_retirement_queue(
                         tracing::info!("retired stream {} after {} retr(ies)", item.stream_path, item.attempt);
                     }
                     counter.fetch_sub(1, Ordering::SeqCst);
-                    crate::metrics::metrics()
+                    shutdown.metrics()
                         .retirements_pending
                         .store(counter.load(Ordering::SeqCst), Ordering::Relaxed);
                     if let Some(completion) = item.completion.take() {
@@ -235,7 +238,7 @@ pub(crate) fn spawn_retirement_queue(
                 }
                 Err(e) => {
                     item.attempt += 1;
-                    crate::metrics::metrics().retirement_retries.fetch_add(1, Ordering::Relaxed);
+                    shutdown.metrics().retirement_retries.fetch_add(1, Ordering::Relaxed);
                     let base = retire_backoff(item.attempt);
                     // Once per entry per outage escalation, not once per attempt: the ceiling is
                     // reached in a few seconds and the loop can then run for hours.
@@ -255,7 +258,7 @@ pub(crate) fn spawn_retirement_queue(
             }
         }
     });
-    RetirementQueue { tx, pending }
+    RetirementQueue { tx, pending, metrics }
 }
 
 impl Engine {

@@ -227,6 +227,7 @@ const SPILL_WRITE_BUFFER: usize = 1024 * 1024;
 /// stamped chunks. Dropping the buffer removes its spill file, so an aborted transaction, a replaced
 /// `Begin` and a torn-down connection all clean up on the ordinary path.
 pub struct TxnBuffer {
+    metrics: std::sync::Arc<crate::metrics::Metrics>,
     xid: u32,
     cfg: TxnBufferConfig,
     /// Envelopes still in memory, in transaction order, UNSERIALIZED. Emptied when the buffer
@@ -248,7 +249,16 @@ pub struct TxnBuffer {
 
 impl TxnBuffer {
     pub fn new(xid: u32, cfg: TxnBufferConfig) -> TxnBuffer {
+        Self::with_metrics(xid, cfg, std::sync::Arc::new(crate::metrics::Metrics::default()))
+    }
+
+    pub(crate) fn with_metrics(
+        xid: u32,
+        cfg: TxnBufferConfig,
+        metrics: std::sync::Arc<crate::metrics::Metrics>,
+    ) -> TxnBuffer {
         TxnBuffer {
+            metrics,
             xid,
             cfg,
             mem: Vec::new(),
@@ -362,7 +372,7 @@ impl TxnBuffer {
             self.write_spilled(&line)?;
         }
         drop(buffered);
-        crate::metrics::metrics().txn_spills.fetch_add(1, Ordering::Relaxed);
+        self.metrics.txn_spills.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             xid = self.xid,
             bytes = self.buffered_bytes,
@@ -411,7 +421,7 @@ impl TxnBuffer {
 impl Drop for TxnBuffer {
     fn drop(&mut self) {
         let Some(spill) = self.spill.take() else { return };
-        crate::metrics::metrics().txn_spill_bytes.fetch_add(spill.bytes, Ordering::Relaxed);
+        self.metrics.txn_spill_bytes.fetch_add(spill.bytes, Ordering::Relaxed);
         drop(spill.writer);
         if let Err(e) = std::fs::remove_file(&spill.path)
             && e.kind() != std::io::ErrorKind::NotFound

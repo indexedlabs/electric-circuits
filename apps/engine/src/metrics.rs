@@ -2,7 +2,6 @@
 //! via `GET /metrics`. Used by the benchmark harness to attribute bottlenecks (per-envelope
 //! fan-out, family-step, and shape-append latencies) under sustained load.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const NB: usize = 40; // buckets cover [2^0, 2^40) microseconds (~12 days) — plenty of headroom.
@@ -97,6 +96,8 @@ impl Drop for Timer<'_> {
 }
 
 pub struct Metrics {
+    pub(crate) stack_id: String,
+    source_mode: bool,
     pub envelopes: AtomicU64,          // table change events processed
     pub shape_appends: AtomicU64,      // appends to shape streams
     pub family_steps: AtomicU64,       // family circuit transactions (write path)
@@ -138,7 +139,7 @@ pub struct Metrics {
     /// climbing value with a flat `shapes_*` means creates are waiting on storage.
     pub catalog_append_retries: AtomicU64,
     /// Shape records retired during catalog restore because their durable stream was missing or
-    /// already closed. The reason-tagged StatsD event is emitted alongside this process counter.
+    /// already closed. The reason-tagged StatsD event is emitted alongside this Engine counter.
     pub catalog_restore_retired: AtomicU64,
     /// ADR-0007: retirement attempts that failed and were re-queued.
     pub retirement_retries: AtomicU64,
@@ -180,7 +181,7 @@ pub struct Metrics {
     pub retirements_pending: AtomicU64,
     /// GAUGE: `pg_current_wal_lsn() - restart_lsn` for the engine's slot — the WAL Postgres is
     /// holding on disk **for this engine**. The number that fills the source database's disk when
-    /// the engine falls behind or stops. Sampled ~every 10 s on a pooled connection.
+    /// the engine falls behind or stops. Sampled ~every 10 s on a fresh connection.
     pub replication_slot_retained_wal_bytes: AtomicU64,
     /// GAUGE: `pg_current_wal_lsn() - confirmed_flush_lsn` — how far behind the engine's
     /// acknowledged position is. Ingest lag, in bytes of WAL.
@@ -193,61 +194,73 @@ pub struct Metrics {
     pub append: Hist,           // one shape-stream append (durable-streams round-trip)
 }
 
-static METRICS: OnceLock<Metrics> = OnceLock::new();
-
-pub fn metrics() -> &'static Metrics {
-    METRICS.get_or_init(|| Metrics {
-        envelopes: AtomicU64::new(0),
-        shape_appends: AtomicU64::new(0),
-        family_steps: AtomicU64::new(0),
-        shapes_dormanted: AtomicU64::new(0),
-        shapes_reactivated: AtomicU64::new(0),
-        reactivations_started: AtomicU64::new(0),
-        reactivations_coalesced: AtomicU64::new(0),
-        reactivation_scans_coalesced: AtomicU64::new(0),
-        reactivations_replayed: AtomicU64::new(0),
-        reactivations_recreated: AtomicU64::new(0),
-        pending_buffer_overflows: AtomicU64::new(0),
-        sequencer_read_cap_raised: AtomicU64::new(0),
-        reactivations_evicted_unresumable: AtomicU64::new(0),
-        reactivations_completed: AtomicU64::new(0),
-        reactivations_failed: AtomicU64::new(0),
-        reactivation_joins_timed_out: AtomicU64::new(0),
-        reactivation_bytes_scanned: AtomicU64::new(0),
-        reactivation_spans: AtomicU64::new(0),
-        shapes_evicted: AtomicU64::new(0),
-        retention_pressure: AtomicU64::new(0),
-        subscriptions_lapsed: AtomicU64::new(0),
-        subscriptions_live: AtomicU64::new(0),
-        schema_drift: AtomicU64::new(0),
-        schema_unresolved: AtomicU64::new(0),
-        epoch_breaks: AtomicU64::new(0),
-        epoch_resets: AtomicU64::new(0),
-        changes_rotations: AtomicU64::new(0),
-        changes_segments_deleted: AtomicU64::new(0),
-        changes_segments_retained: AtomicU64::new(0),
-        catalog_append_retries: AtomicU64::new(0),
-        catalog_restore_retired: AtomicU64::new(0),
-        retirement_retries: AtomicU64::new(0),
-        retirements_pending: AtomicU64::new(0),
-        backfill_chunked_appends: AtomicU64::new(0),
-        sequencer_orphan_fragments: AtomicU64::new(0),
-        sequencer_held_run: AtomicU64::new(0),
-        sequencer_read_cap_failures: AtomicU64::new(0),
-        shutdown_in_progress: AtomicU64::new(0),
-        replication_slot_retained_wal_bytes: AtomicU64::new(0),
-        replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
-        replication_slot_active: AtomicU64::new(0),
-        txn_spills: AtomicU64::new(0),
-        txn_spill_bytes: AtomicU64::new(0),
-        txn_chunked_appends: AtomicU64::new(0),
-        process_envelope: Hist::new(),
-        family_step: Hist::new(),
-        append: Hist::new(),
-    })
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new(crate::config::stack_id().to_owned(), false)
+    }
 }
 
 impl Metrics {
+    pub(crate) fn new(stack_id: String, source_mode: bool) -> Self {
+        Self {
+            stack_id,
+            source_mode,
+            envelopes: AtomicU64::new(0),
+            shape_appends: AtomicU64::new(0),
+            family_steps: AtomicU64::new(0),
+            shapes_dormanted: AtomicU64::new(0),
+            shapes_reactivated: AtomicU64::new(0),
+            reactivations_started: AtomicU64::new(0),
+            reactivations_coalesced: AtomicU64::new(0),
+            reactivation_scans_coalesced: AtomicU64::new(0),
+            reactivations_replayed: AtomicU64::new(0),
+            reactivations_recreated: AtomicU64::new(0),
+            pending_buffer_overflows: AtomicU64::new(0),
+            sequencer_read_cap_raised: AtomicU64::new(0),
+            reactivations_evicted_unresumable: AtomicU64::new(0),
+            reactivations_completed: AtomicU64::new(0),
+            reactivations_failed: AtomicU64::new(0),
+            reactivation_joins_timed_out: AtomicU64::new(0),
+            reactivation_bytes_scanned: AtomicU64::new(0),
+            reactivation_spans: AtomicU64::new(0),
+            shapes_evicted: AtomicU64::new(0),
+            retention_pressure: AtomicU64::new(0),
+            subscriptions_lapsed: AtomicU64::new(0),
+            subscriptions_live: AtomicU64::new(0),
+            schema_drift: AtomicU64::new(0),
+            schema_unresolved: AtomicU64::new(0),
+            epoch_breaks: AtomicU64::new(0),
+            epoch_resets: AtomicU64::new(0),
+            changes_rotations: AtomicU64::new(0),
+            changes_segments_deleted: AtomicU64::new(0),
+            changes_segments_retained: AtomicU64::new(0),
+            catalog_append_retries: AtomicU64::new(0),
+            catalog_restore_retired: AtomicU64::new(0),
+            retirement_retries: AtomicU64::new(0),
+            retirements_pending: AtomicU64::new(0),
+            backfill_chunked_appends: AtomicU64::new(0),
+            sequencer_orphan_fragments: AtomicU64::new(0),
+            sequencer_held_run: AtomicU64::new(0),
+            sequencer_read_cap_failures: AtomicU64::new(0),
+            shutdown_in_progress: AtomicU64::new(0),
+            replication_slot_retained_wal_bytes: AtomicU64::new(0),
+            replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
+            replication_slot_active: AtomicU64::new(0),
+            txn_spills: AtomicU64::new(0),
+            txn_spill_bytes: AtomicU64::new(0),
+            txn_chunked_appends: AtomicU64::new(0),
+            process_envelope: Hist::new(),
+            family_step: Hist::new(),
+            append: Hist::new(),
+        }
+    }
+}
+
+impl Metrics {
+    pub(crate) fn emitter(&self) -> crate::statsd::Emitter<'_> {
+        crate::statsd::Emitter::new(&self.stack_id, self.source_mode)
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "counters": {
@@ -364,9 +377,9 @@ const SLOT_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1
 /// `GET /metrics/prometheus` and StatsD all read the same sample, so an operator without StatsD can
 /// still see the number that fills the source database's disk (`replication_slot_retained_wal_bytes`)
 /// and how far behind ingest is (`replication_confirmed_flush_lag_bytes`). It stops when the
-/// process begins shutting down.
+/// Engine begins shutting down.
 pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: crate::shutdown::ShutdownToken) {
-    tokio::spawn(async move {
+    shutdown.clone().spawn_background(async move {
         let mut logged_err = false;
         // Sample FIRST, then sleep. Sleeping first left the three gauges reading 0 for the first
         // ten seconds of every process — and 0 retained WAL / 0 lag / an inactive slot is not
@@ -380,7 +393,7 @@ pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: cr
                 }
             }
             first = false;
-            match sample_replication_slot(&pg_url, &slot).await {
+            match sample_replication_slot(&pg_url, &slot, shutdown.metrics()).await {
                 Ok(()) => logged_err = false,
                 Err(e) => {
                     // Once per outage, not once per tick: a Postgres blip must not become a log flood.
@@ -400,28 +413,27 @@ pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: cr
 /// A slot that is not there at all leaves `replication_slot_active` at 0 and the two byte gauges
 /// **untouched** — their last real value, never a fabricated zero (a zero would read as "no lag",
 /// which is the opposite of what a missing slot means).
-async fn sample_replication_slot(pg_url: &str, slot: &str) -> anyhow::Result<()> {
+async fn sample_replication_slot(pg_url: &str, slot: &str, metrics: &Metrics) -> anyhow::Result<()> {
     let client = crate::pg::connect(pg_url).await?;
     let q = "select pg_current_wal_lsn()::text, restart_lsn::text, confirmed_flush_lsn::text, active \
              from pg_replication_slots where slot_name = $1";
     let Some(row) = client.query_opt(q, &[&slot]).await? else {
-        metrics().replication_slot_active.store(0, Ordering::Relaxed);
+        metrics.replication_slot_active.store(0, Ordering::Relaxed);
         return Ok(());
     };
     let wal: String = row.get(0);
     let restart: Option<String> = row.get(1);
     let confirmed: Option<String> = row.get(2);
     let active: bool = row.get(3);
-    publish_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref(), active);
-    crate::statsd::replication_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref());
+    publish_slot_gauges(metrics, &wal, restart.as_deref(), confirmed.as_deref(), active);
+    metrics.emitter().replication_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref());
     Ok(())
 }
 
 /// Publish one slot sample into the engine gauges (split out so it is unit-testable without a
 /// database). A `None` LSN — a freshly created slot has no `restart_lsn` yet — leaves that gauge at
 /// its last real value rather than storing a fabricated zero, which would read as "no lag".
-pub fn publish_slot_gauges(wal: &str, restart: Option<&str>, confirmed: Option<&str>, active: bool) {
-    let m = metrics();
+pub fn publish_slot_gauges(m: &Metrics, wal: &str, restart: Option<&str>, confirmed: Option<&str>, active: bool) {
     let wal_u = crate::pg::lsn_to_u64(wal);
     if let Some(r) = restart {
         let retained = wal_u.saturating_sub(crate::pg::lsn_to_u64(r));
@@ -439,18 +451,18 @@ mod tests {
     use super::*;
 
     /// The gauge arithmetic (and the deliberate "leave it alone" on a NULL LSN). The metrics
-    /// singleton is process-global, so this test owns the three slot gauges.
+    /// state is owned by this test, independent of any Engine or other test.
     #[test]
     fn slot_gauges_are_deltas_from_the_wal_head() {
-        publish_slot_gauges("0/1000", Some("0/0400"), Some("0/0C00"), true);
-        let m = metrics();
+        let m = Metrics::default();
+        publish_slot_gauges(&m, "0/1000", Some("0/0400"), Some("0/0C00"), true);
         assert_eq!(m.replication_slot_retained_wal_bytes.load(Ordering::Relaxed), 0x1000 - 0x400);
         assert_eq!(m.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed), 0x1000 - 0xC00);
         assert_eq!(m.replication_slot_active.load(Ordering::Relaxed), 1);
 
         // A slot with no restart_lsn yet (freshly created): the byte gauge keeps its last real
         // value rather than reporting a fake zero; `active` still tracks reality.
-        publish_slot_gauges("0/2000", None, None, false);
+        publish_slot_gauges(&m, "0/2000", None, None, false);
         assert_eq!(m.replication_slot_retained_wal_bytes.load(Ordering::Relaxed), 0x1000 - 0x400);
         assert_eq!(m.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed), 0x1000 - 0xC00);
         assert_eq!(m.replication_slot_active.load(Ordering::Relaxed), 0);

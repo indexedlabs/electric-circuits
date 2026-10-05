@@ -206,97 +206,170 @@ pub fn enabled() -> bool {
 /// is the response body size. `root_table` is the table's canonical `schema.name` (ADR-0002), so two
 /// same-named tables in different schemas are two series rather than one.
 pub fn serve_shape(root_table: &str, live: bool, status: u16, elapsed: Duration, body_bytes: u64) {
-    let Some(s) = statsd() else { return };
-    let ms = elapsed.as_secs_f64() * 1000.0;
-    let status_s = status.to_string();
-    let live_s = if live { "true" } else { "false" };
-    // 4xx (incl. 409) are client/known errors; 5xx are unknown/internal.
-    let known_s = if (400..500).contains(&status) { "true" } else { "false" };
+    Emitter::new(crate::config::stack_id(), false).serve_shape(root_table, live, status, elapsed, body_bytes);
+}
+pub fn replication_txn(ops: u64, bytes: u64, receive_lag_ms: f64) {
+    Emitter::new(crate::config::stack_id(), false).replication_txn(ops, bytes, receive_lag_ms);
+}
+pub fn storage_txn(ops: u64, bytes: u64, affected_shapes: u64) {
+    Emitter::new(crate::config::stack_id(), false).storage_txn(ops, bytes, affected_shapes);
+}
+pub fn snapshot_stored(rows: u64, bytes: u64, make_new_ms: f64) {
+    Emitter::new(crate::config::stack_id(), false).snapshot_stored(rows, bytes, make_new_ms);
+}
+pub fn create_snapshot_task(elapsed: Duration) {
+    Emitter::new(crate::config::stack_id(), false).create_snapshot_task(elapsed);
+}
+pub fn consumers_ready(tables: u64) {
+    Emitter::new(crate::config::stack_id(), false).consumers_ready(tables);
+}
+pub fn storage_used(bytes: u64, measurement: Duration) {
+    Emitter::new(crate::config::stack_id(), false).storage_used(bytes, measurement);
+}
+pub fn shape_gauges(total: u64, indexed: u64, unindexed: u64) {
+    Emitter::new(crate::config::stack_id(), false).shape_gauges(total, indexed, unindexed);
+}
+pub fn catalog_restore_retired(reason: &str) {
+    Emitter::new(crate::config::stack_id(), false).catalog_restore_retired(reason);
+}
 
-    s.dist("plug.router_dispatch.stop.duration", ms, &[("route", "/v1/shape"), ("status", status_s.as_str())]);
-    s.incr(
-        "electric.plug.serve_shape.requests.count",
-        &[("status", status_s.as_str()), ("known_error", known_s), ("live", live_s)],
-    );
-    s.dist(
-        "electric.shape.response_size.bytes",
-        body_bytes as f64,
-        &[("root_table", root_table), ("is_live", live_s), ("stack_id", crate::config::stack_id())],
-    );
-    if !live {
-        s.dist("electric.plug.serve_shape.duration", ms, &[]);
-        s.incr("electric.plug.serve_shape.count", &[]);
-        s.count("electric.plug.serve_shape.bytes", body_bytes, &[]);
+/// Source context sharing the process UDP transport.
+pub(crate) struct Emitter<'a> {
+    stack_id: &'a str,
+    source_mode: bool,
+}
+struct Tagged<'a> {
+    client: &'a Statsd,
+    stack_id: Option<&'a str>,
+}
+impl Tagged<'_> {
+    fn tags<'a>(&'a self, tags: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut tags = tags.to_vec();
+        if let Some(stack_id) = self.stack_id {
+            tags.push(("stack_id", stack_id));
+        }
+        tags
+    }
+    fn incr(&self, name: &str, tags: &[(&str, &str)]) {
+        self.client.incr(name, &self.tags(tags));
+    }
+    fn count(&self, name: &str, value: u64, tags: &[(&str, &str)]) {
+        self.client.count(name, value, &self.tags(tags));
+    }
+    fn gauge(&self, name: &str, value: f64, tags: &[(&str, &str)]) {
+        self.client.gauge(name, value, &self.tags(tags));
+    }
+    fn dist(&self, name: &str, value: f64, tags: &[(&str, &str)]) {
+        self.client.dist(name, value, &self.tags(tags));
     }
 }
+impl<'a> Emitter<'a> {
+    pub(crate) fn new(stack_id: &'a str, source_mode: bool) -> Self {
+        Self { stack_id, source_mode }
+    }
+    pub fn serve_shape(&self, root_table: &str, live: bool, status: u16, elapsed: Duration, body_bytes: u64) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        let status_s = status.to_string();
+        let live_s = if live { "true" } else { "false" };
+        // 4xx (incl. 409) are client/known errors; 5xx are unknown/internal.
+        let known_s = if (400..500).contains(&status) { "true" } else { "false" };
 
-/// Per committed replicated transaction (see conformance §4b). `receive_lag_ms` is ingest-side latency
-/// (see the call site in `replication.rs` for exactly what it measures).
-pub fn replication_txn(ops: u64, bytes: u64, receive_lag_ms: f64) {
-    let Some(s) = statsd() else { return };
-    s.incr("electric.postgres.replication.transaction_received.count", &[]);
-    s.count("electric.postgres.replication.transaction_received.bytes", bytes, &[]);
-    s.dist("electric.postgres.replication.transaction_received.operations", ops as f64, &[]);
-    s.dist("electric.postgres.replication.transaction_received.receive_lag", receive_lag_ms, &[]);
-}
+        s.dist("plug.router_dispatch.stop.duration", ms, &[("route", "/v1/shape"), ("status", status_s.as_str())]);
+        s.incr(
+            "electric.plug.serve_shape.requests.count",
+            &[("status", status_s.as_str()), ("known_error", known_s), ("live", live_s)],
+        );
+        // This metric carries stack_id in both modes; send directly to avoid a duplicate tag.
+        client.dist(
+            "electric.shape.response_size.bytes",
+            body_bytes as f64,
+            &[("root_table", root_table), ("is_live", live_s), ("stack_id", self.stack_id)],
+        );
+        if !live {
+            s.dist("electric.plug.serve_shape.duration", ms, &[]);
+            s.incr("electric.plug.serve_shape.count", &[]);
+            s.count("electric.plug.serve_shape.bytes", body_bytes, &[]);
+        }
+    }
 
-/// Per source transaction whose changes were appended to shape streams (see conformance §4b).
-pub fn storage_txn(ops: u64, bytes: u64, affected_shapes: u64) {
-    let Some(s) = statsd() else { return };
-    s.incr("electric.storage.transaction_stored.count", &[]);
-    s.count("electric.storage.transaction_stored.bytes", bytes, &[]);
-    s.count("electric.storage.transaction_stored.operations", ops, &[]);
-    s.dist("electric.shape_log_collector.transaction.affected_shape_count", affected_shapes as f64, &[]);
-}
+    /// Per committed replicated transaction (see conformance §4b). `receive_lag_ms` is ingest-side latency
+    /// (see the call site in `replication.rs` for exactly what it measures).
+    pub fn replication_txn(&self, ops: u64, bytes: u64, receive_lag_ms: f64) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.incr("electric.postgres.replication.transaction_received.count", &[]);
+        s.count("electric.postgres.replication.transaction_received.bytes", bytes, &[]);
+        s.dist("electric.postgres.replication.transaction_received.operations", ops as f64, &[]);
+        s.dist("electric.postgres.replication.transaction_received.receive_lag", receive_lag_ms, &[]);
+    }
 
-/// Per completed shape backfill/snapshot (see conformance §4b). `make_new_ms` is the backfill query time.
-pub fn snapshot_stored(rows: u64, bytes: u64, make_new_ms: f64) {
-    let Some(s) = statsd() else { return };
-    s.incr("electric.storage.snapshot_stored.count", &[]);
-    s.count("electric.storage.snapshot_stored.bytes", bytes, &[]);
-    s.count("electric.storage.snapshot_stored.operations", rows, &[]);
-    s.dist("electric.storage.make_new_snapshot.stop.duration", make_new_ms, &[]);
-}
+    /// Per source transaction whose changes were appended to shape streams (see conformance §4b).
+    pub fn storage_txn(&self, ops: u64, bytes: u64, affected_shapes: u64) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.incr("electric.storage.transaction_stored.count", &[]);
+        s.count("electric.storage.transaction_stored.bytes", bytes, &[]);
+        s.count("electric.storage.transaction_stored.operations", ops, &[]);
+        s.dist("electric.shape_log_collector.transaction.affected_shape_count", affected_shapes as f64, &[]);
+    }
 
-/// The whole shape-creation task duration (backfill + registration), emitted by the creator only.
-pub fn create_snapshot_task(elapsed: Duration) {
-    let Some(s) = statsd() else { return };
-    s.dist("electric.shape_snapshot.create_snapshot_task.stop.duration", elapsed.as_secs_f64() * 1000.0, &[]);
-}
+    /// Per completed shape backfill/snapshot (see conformance §4b). `make_new_ms` is the backfill query time.
+    pub fn snapshot_stored(&self, rows: u64, bytes: u64, make_new_ms: f64) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.incr("electric.storage.snapshot_stored.count", &[]);
+        s.count("electric.storage.snapshot_stored.bytes", bytes, &[]);
+        s.count("electric.storage.snapshot_stored.operations", rows, &[]);
+        s.dist("electric.storage.make_new_snapshot.stop.duration", make_new_ms, &[]);
+    }
 
-/// Boot-to-ready, emitted once when the engine becomes active.
-pub fn consumers_ready(tables: u64) {
-    let Some(s) = statsd() else { return };
-    s.gauge("electric.connection.consumers_ready.duration", since_start().as_secs_f64() * 1000.0, &[]);
-    s.gauge("electric.connection.consumers_ready.total", tables as f64, &[]);
-}
+    /// The whole shape-creation task duration (backfill + registration), emitted by the creator only.
+    pub fn create_snapshot_task(&self, elapsed: Duration) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.dist("electric.shape_snapshot.create_snapshot_task.stop.duration", elapsed.as_secs_f64() * 1000.0, &[]);
+    }
 
-/// Current durable-streams storage size (file mode; `du` of `ELECTRIC_STORAGE_DIR`) plus how long the
-/// `du` took (matches Electric emitting `used.bytes` + `used.measurement_duration` together).
-pub fn storage_used(bytes: u64, measurement: Duration) {
-    let Some(s) = statsd() else { return };
-    s.gauge("electric.storage.used.bytes", bytes as f64, &[]);
-    s.dist("electric.storage.used.measurement_duration", measurement.as_secs_f64() * 1000.0, &[]);
-}
+    /// Boot-to-ready, emitted once when the engine becomes active.
+    pub fn consumers_ready(&self, tables: u64) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.gauge("electric.connection.consumers_ready.duration", since_start().as_secs_f64() * 1000.0, &[]);
+        s.gauge("electric.connection.consumers_ready.total", tables as f64, &[]);
+    }
 
-/// Shape-count gauges (conformance §5 / baseline dashboard headline metrics), emitted every poll tick.
-/// `indexed`/`unindexed` map to our shared-family vs standalone evaluation split — the honest analog of
-/// Electric's indexed-where-clause distinction. Every registered shape is actively maintained in our
-/// engine, so `active_shapes == total_shapes` (a true statement about this engine, not a copy of total).
-pub fn shape_gauges(total: u64, indexed: u64, unindexed: u64) {
-    let Some(s) = statsd() else { return };
-    s.gauge("electric.shapes.total_shapes.count", total as f64, &[]);
-    s.gauge("electric.shapes.active_shapes.count", total as f64, &[]);
-    s.gauge("electric.shapes.total_shapes.count_indexed", indexed as f64, &[]);
-    s.gauge("electric.shapes.total_shapes.count_unindexed", unindexed as f64, &[]);
-}
+    /// Current durable-streams storage size (file mode; `du` of `ELECTRIC_STORAGE_DIR`) plus how long the
+    /// `du` took (matches Electric emitting `used.bytes` + `used.measurement_duration` together).
+    pub fn storage_used(&self, bytes: u64, measurement: Duration) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.gauge("electric.storage.used.bytes", bytes as f64, &[]);
+        s.dist("electric.storage.used.measurement_duration", measurement.as_secs_f64() * 1000.0, &[]);
+    }
 
-/// A shape retired during catalog restore because durable-streams definitively reported its
-/// stream missing or closed. The reason is a bounded value from the HEAD response and is retained
-/// as a StatsD tag for operators distinguishing orphan cleanup from terminal-stream cleanup.
-pub fn catalog_restore_retired(reason: &str) {
-    let Some(s) = statsd() else { return };
-    s.incr("electric.catalog.restore.retired.count", &[("reason", reason)]);
+    /// Shape-count gauges (conformance §5 / baseline dashboard headline metrics), emitted every poll tick.
+    /// `indexed`/`unindexed` map to our shared-family vs standalone evaluation split — the honest analog of
+    /// Electric's indexed-where-clause distinction. Every registered shape is actively maintained in our
+    /// engine, so `active_shapes == total_shapes` (a true statement about this engine, not a copy of total).
+    pub fn shape_gauges(&self, total: u64, indexed: u64, unindexed: u64) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.gauge("electric.shapes.total_shapes.count", total as f64, &[]);
+        s.gauge("electric.shapes.active_shapes.count", total as f64, &[]);
+        s.gauge("electric.shapes.total_shapes.count_indexed", indexed as f64, &[]);
+        s.gauge("electric.shapes.total_shapes.count_unindexed", unindexed as f64, &[]);
+    }
+
+    /// A shape retired during catalog restore because durable-streams definitively reported its
+    /// stream missing or closed. The reason is a bounded value from the HEAD response and is retained
+    /// as a StatsD tag for operators distinguishing orphan cleanup from terminal-stream cleanup.
+    pub fn catalog_restore_retired(&self, reason: &str) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        s.incr("electric.catalog.restore.retired.count", &[("reason", reason)]);
+    }
 }
 
 /// Compute the replication-slot WAL gauges from raw LSN strings (pure, unit-tested). `restart` and
@@ -323,9 +396,15 @@ pub fn slot_gauge_values(wal: &str, restart: Option<&str>, confirmed: Option<&st
 /// ([`crate::metrics::spawn_replication_slot_sampler`]), which publishes the same numbers as engine
 /// gauges so `GET /metrics` and `GET /metrics/prometheus` see them with or without StatsD.
 pub fn replication_slot_gauges(wal: &str, restart: Option<&str>, confirmed: Option<&str>) {
-    let Some(s) = statsd() else { return };
-    for (name, v) in slot_gauge_values(wal, restart, confirmed) {
-        s.gauge(name, v, &[]);
+    Emitter::new(crate::config::stack_id(), false).replication_slot_gauges(wal, restart, confirmed);
+}
+impl Emitter<'_> {
+    pub(crate) fn replication_slot_gauges(&self, wal: &str, restart: Option<&str>, confirmed: Option<&str>) {
+        let Some(client) = statsd() else { return };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
+        for (name, value) in slot_gauge_values(wal, restart, confirmed) {
+            s.gauge(name, value, &[]);
+        }
     }
 }
 
@@ -419,10 +498,6 @@ async fn system_sampler(period: Duration) {
         if let Some(threads) = os_thread_count() {
             s.gauge("vm.system_counts.process_count", threads as f64, &[]);
         }
-
-        // Shape-count gauges from the engine's cardinality snapshot (published by the mem sampler).
-        let (total, indexed, unindexed) = crate::mem::published_shape_counts();
-        shape_gauges(total, indexed, unindexed);
 
         tokio::time::sleep(period).await;
     }

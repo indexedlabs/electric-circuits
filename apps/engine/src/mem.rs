@@ -26,7 +26,7 @@
 //! `engine::Engine::mem_cardinalities` / `mem_bytes` for the split and `http::get_memory` for the
 //! endpoint that combines both layers.
 
-use std::sync::OnceLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -142,7 +142,7 @@ impl Cardinalities {
 
 /// Lock-free snapshot the OTel gauge callbacks and `/memory` read. Updated by the sampler and on demand.
 #[derive(Default)]
-struct Gauges {
+pub(crate) struct Gauges {
     rss_bytes: AtomicU64,
     virtual_bytes: AtomicU64,
     shapes: AtomicU64,
@@ -159,13 +159,6 @@ struct Gauges {
     subquery_edges: AtomicU64,
     subquery_feed_entries: AtomicU64,
     samples: AtomicU64,
-}
-
-static GAUGES: OnceLock<Gauges> = OnceLock::new();
-static PROM_REGISTRY: OnceLock<Registry> = OnceLock::new();
-
-fn gauges() -> &'static Gauges {
-    GAUGES.get_or_init(Gauges::default)
 }
 
 /// Current process resident + virtual memory in bytes (0 if unavailable on this platform).
@@ -419,8 +412,7 @@ pub fn spawn_memory_logger(
 
 /// Refresh the published gauges from a freshly-measured process memory + engine cardinalities. Called by
 /// the background sampler and by `/memory` so the JSON read and the OTel scrape agree.
-pub fn publish(card: &Cardinalities) {
-    let g = gauges();
+pub(crate) fn publish(g: &Gauges, card: &Cardinalities) {
     let (rss, virt) = process_memory();
     g.rss_bytes.store(rss, Ordering::Relaxed);
     g.virtual_bytes.store(virt, Ordering::Relaxed);
@@ -445,8 +437,7 @@ pub fn publish(card: &Cardinalities) {
 /// The `bytes_*` fields are read directly from `card` (the just-computed snapshot), not from
 /// [`Gauges`] — they are JSON-only (no OTel gauge), so there is nothing published to read back;
 /// every other field mirrors the last [`publish`] call, same as before.
-pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
-    let g = gauges();
+pub(crate) fn snapshot_json(g: &Gauges, card: &Cardinalities) -> serde_json::Value {
     let (rss, virt) = process_memory();
     let (allocator_allocated, allocator_resident, allocator_retained) = allocator_memory();
     let allocator_config = allocator_config();
@@ -494,30 +485,40 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
 /// Shape counts from the last published cardinality snapshot (refreshed by the background sampler):
 /// `(total, family_shapes, standalone)`. Used by the StatsD periodic sampler for the
 /// `electric.shapes.*` gauges without re-locking engine state on the poll path.
-pub fn published_shape_counts() -> (u64, u64, u64) {
-    let g = gauges();
+pub(crate) fn published_shape_counts(g: &Gauges) -> (u64, u64, u64) {
     (g.shapes.load(Ordering::Relaxed), g.family_shapes.load(Ordering::Relaxed), g.standalone.load(Ordering::Relaxed))
 }
 
-/// Render the OTel/Prometheus exposition text for `GET /metrics/prometheus`.
-pub fn prometheus_text() -> String {
-    let Some(reg) = PROM_REGISTRY.get() else { return String::new() };
-    let mut buf = String::new();
-    let _ = TextEncoder::new().encode_utf8(&reg.gather(), &mut buf);
-    buf
+/// One Engine's exporters, observations and cumulative series.
+pub(crate) struct Telemetry {
+    pub(crate) provider: SdkMeterProvider,
+    registry: Registry,
+}
+impl Telemetry {
+    pub(crate) fn prometheus_text(&self) -> String {
+        let mut text = String::new();
+        let _ = TextEncoder::new().encode_utf8(&self.registry.gather(), &mut text);
+        text
+    }
+    pub(crate) fn shutdown(&self) {
+        // Shutdown performs the final export before releasing the readers.
+        if let Err(error) = self.provider.shutdown() {
+            tracing::warn!(%error, "Engine telemetry shutdown failed");
+        }
+    }
 }
 
-/// Initialize the OpenTelemetry meter provider with a Prometheus exporter, an optional OTLP
-/// exporter, and register the memory + cardinality observable gauges. Idempotent; returns the
-/// provider so the caller keeps it alive.
-pub fn init_otel() -> SdkMeterProvider {
+/// Build a provider for this Engine. Captures only metric state, never the Engine.
+pub(crate) fn init_otel(
+    metrics: Arc<crate::metrics::Metrics>,
+    gauges: Arc<Gauges>,
+    source_id: Option<&str>,
+) -> Telemetry {
     let registry = Registry::new();
     let exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry.clone())
         .build()
         .expect("build prometheus exporter");
-    let _ = PROM_REGISTRY.set(registry);
-
     let mut provider_builder = SdkMeterProvider::builder().with_reader(exporter);
     if std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
         .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT"))
@@ -548,6 +549,13 @@ pub fn init_otel() -> SdkMeterProvider {
         }
     }
 
+    if let Some(source) = source_id {
+        provider_builder = provider_builder.with_resource(opentelemetry_sdk::Resource::new_with_defaults([
+            opentelemetry::KeyValue::new("source_id", source.to_owned()),
+        ]));
+    }
+    let attributes: Vec<_> =
+        source_id.into_iter().map(|source| opentelemetry::KeyValue::new("source_id", source.to_owned())).collect();
     let provider = provider_builder.build();
     let meter = provider.meter("electric_circuits_engine");
 
@@ -556,7 +564,9 @@ pub fn init_otel() -> SdkMeterProvider {
         ($name:expr, $desc:expr, $field:ident, $unit:expr) => {{
             let b = meter.u64_observable_gauge($name).with_description($desc);
             let b = if $unit.is_empty() { b } else { b.with_unit($unit) };
-            b.with_callback(|obs| obs.observe(gauges().$field.load(Ordering::Relaxed), &[])).build();
+            let gauges = gauges.clone();
+            let attributes = attributes.clone();
+            b.with_callback(move |obs| obs.observe(gauges.$field.load(Ordering::Relaxed), &attributes)).build();
         }};
     }
     gauge!("engine_process_resident_memory", "Resident set size of the engine process", rss_bytes, "By");
@@ -587,7 +597,7 @@ pub fn init_otel() -> SdkMeterProvider {
 
     // The engine's own counters and gauges (`crate::metrics`, served as JSON at `GET /metrics`) are
     // exported here too, so `/metrics/prometheus` is a complete scrape target rather than the
-    // memory/cardinality half of one. Counters are observable COUNTERS (monotonic within a process;
+    // memory/cardinality half of one. Counters are observable COUNTERS (monotonic within an Engine;
     // `POST /metrics/reset` is a benchmark affordance and shows up as a reset, which is exactly what
     // it is); the gauges below describe the world right now.
     //
@@ -601,14 +611,18 @@ pub fn init_otel() -> SdkMeterProvider {
         ($name:expr, $desc:expr, $field:ident, $unit:expr) => {{
             let b = meter.u64_observable_counter($name).with_description($desc);
             let b = if $unit.is_empty() { b } else { b.with_unit($unit) };
-            b.with_callback(|obs| obs.observe(crate::metrics::metrics().$field.load(Ordering::Relaxed), &[])).build();
+            let metrics = metrics.clone();
+            let attributes = attributes.clone();
+            b.with_callback(move |obs| obs.observe(metrics.$field.load(Ordering::Relaxed), &attributes)).build();
         }};
     }
     macro_rules! engine_gauge {
         ($name:expr, $desc:expr, $field:ident, $unit:expr) => {{
             let b = meter.u64_observable_gauge($name).with_description($desc);
             let b = if $unit.is_empty() { b } else { b.with_unit($unit) };
-            b.with_callback(|obs| obs.observe(crate::metrics::metrics().$field.load(Ordering::Relaxed), &[])).build();
+            let metrics = metrics.clone();
+            let attributes = attributes.clone();
+            b.with_callback(move |obs| obs.observe(metrics.$field.load(Ordering::Relaxed), &attributes)).build();
         }};
     }
     engine_counter!("engine_envelopes_processed", "Table change events fanned out", envelopes, "");
@@ -692,7 +706,7 @@ pub fn init_otel() -> SdkMeterProvider {
     );
     engine_gauge!("engine_replication_slot_active", "1 while a walsender holds the slot", replication_slot_active, "");
 
-    provider
+    Telemetry { provider, registry }
 }
 
 /// Spawn the background sampler: every `interval`, recompute engine cardinalities and republish the
@@ -703,11 +717,12 @@ pub fn init_otel() -> SdkMeterProvider {
 /// that does): that byte-level walk is reserved for `GET /memory` and the slower diagnostic logger
 /// (see the module doc comment above and `Engine::mem_bytes`'s doc comment for why).
 pub fn spawn_sampler(engine: crate::engine::Engine, interval: Duration) {
-    tokio::spawn(async move {
+    let shutdown = engine.shutdown_token();
+    shutdown.clone().spawn_background(async move {
         loop {
             let card = engine.mem_cardinalities().await;
-            publish(&card);
-            tokio::time::sleep(interval).await;
+            publish(&engine.memory_gauges, &card);
+            tokio::select! { _ = shutdown.wait() => break, _ = tokio::time::sleep(interval) => {} }
         }
     });
 }
@@ -715,6 +730,90 @@ pub fn spawn_sampler(engine: crate::engine::Engine, interval: Duration) {
 #[cfg(test)]
 mod tests {
     use super::parse_cgroup_event;
+
+    #[test]
+    fn source_memory_publication_and_registries_are_independent() {
+        use super::*;
+        let alpha = Arc::new(Gauges::default());
+        let beta = Arc::new(Gauges::default());
+        let alpha_provider = init_otel(Arc::new(crate::metrics::Metrics::default()), alpha.clone(), Some("alpha"));
+        let beta_provider = init_otel(Arc::new(crate::metrics::Metrics::default()), beta.clone(), Some("beta"));
+        let card_a = Cardinalities { shapes: 7, ..Default::default() };
+        let card_b = Cardinalities { shapes: 2, ..Default::default() };
+        publish(&alpha, &card_a);
+        publish(&beta, &card_b);
+        assert_eq!(snapshot_json(&alpha, &card_a)["cardinalities"]["shapes"], 7);
+        assert_eq!(snapshot_json(&beta, &card_b)["cardinalities"]["shapes"], 2);
+        let a = alpha_provider.prometheus_text();
+        let b = beta_provider.prometheus_text();
+        assert!(a.contains("source_id=\"alpha\""));
+        assert!(!a.contains("source_id=\"beta\""));
+        assert!(b.contains("source_id=\"beta\""));
+        assert!(!b.contains("source_id=\"alpha\""));
+        alpha_provider.shutdown();
+        drop(alpha_provider);
+        assert_eq!(beta_provider.prometheus_text(), b);
+        beta_provider.shutdown();
+    }
+
+    #[test]
+    fn source_resource_keeps_sdk_defaults() {
+        use super::*;
+        let telemetry =
+            init_otel(Arc::new(crate::metrics::Metrics::default()), Arc::new(Gauges::default()), Some("alpha"));
+        let scrape = telemetry.prometheus_text();
+        telemetry.shutdown();
+        let resource = scrape.lines().find(|line| line.starts_with("target_info{")).expect("resource series");
+        assert!(resource.contains("source_id=\"alpha\""), "source identity missing: {resource}");
+        assert!(resource.contains("service_name="), "SDK service.name missing: {resource}");
+        assert!(resource.contains("telemetry_sdk_name="), "SDK telemetry attributes missing: {resource}");
+    }
+
+    #[tokio::test]
+    async fn telemetry_close_exports_once() {
+        use super::*;
+        use opentelemetry_otlp::WithExportConfig;
+
+        let requests = Arc::new(AtomicU64::new(0));
+        let received = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/metrics",
+            axum::routing::post(move || {
+                let received = received.clone();
+                async move {
+                    received.fetch_add(1, Ordering::Relaxed);
+                    ([("content-type", "application/x-protobuf")], Vec::<u8>::new())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let exporter =
+            opentelemetry_otlp::MetricExporter::builder().with_http().with_endpoint(endpoint).build().unwrap();
+        let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let counter = provider.meter("close-test").u64_counter("close_test").build();
+        counter.add(1, &[]);
+        let telemetry = Telemetry { provider, registry: Registry::new() };
+        tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || telemetry.shutdown()))
+            .await
+            .expect("telemetry shutdown deadline")
+            .unwrap();
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 1, "close must send exactly one final OTLP export");
+    }
 
     #[test]
     fn cgroup_event_parser_accepts_only_the_named_counter() {

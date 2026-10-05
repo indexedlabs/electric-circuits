@@ -748,12 +748,12 @@ pub(crate) async fn sequencer_loop(
                                 key,
                                 run_key_owned(&envs[0]),
                             );
-                            metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
+                            ds.metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
                             held.clear();
                             held_from = None;
                             held_since = None;
                             held_warnings = 0;
-                            metrics().sequencer_held_run.store(0, Ordering::Relaxed);
+                            ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
                         } else {
                             // Only the leading run is filtered; everything after the first envelope
                             // of a different transaction passes through untouched.
@@ -787,7 +787,7 @@ pub(crate) async fn sequencer_loop(
                                 held_warnings = 0;
                             }
                             held = envs.split_off(cut);
-                            metrics().sequencer_held_run.store(1, Ordering::Relaxed);
+                            ds.metrics().sequencer_held_run.store(1, Ordering::Relaxed);
                             let since = *held_since.get_or_insert_with(std::time::Instant::now);
                             // A hold longer than a minute is no longer "the next chunk is coming":
                             // ingest has stalled mid-transaction, and everything downstream of
@@ -814,7 +814,7 @@ pub(crate) async fn sequencer_loop(
                             held_from = None;
                             held_since = None;
                             held_warnings = 0;
-                            metrics().sequencer_held_run.store(0, Ordering::Relaxed);
+                            ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
                         }
                     }
                     // Split the read batch into transactions (runs of equal (txid, lsn) — the
@@ -924,7 +924,7 @@ pub(crate) async fn sequencer_loop(
                             for (pending_id, pending) in exec.pending.iter_mut() {
                                 let was_overflowed = pending.overflowed;
                                 if !buffer_pending(pending, &envs[k], pending_buffer_max_bytes) && !was_overflowed {
-                                    metrics().pending_buffer_overflows.fetch_add(1, Ordering::Relaxed);
+                                    ds.metrics().pending_buffer_overflows.fetch_add(1, Ordering::Relaxed);
                                     tracing::error!(
                                         shape_id = pending_id,
                                         cap_bytes = pending_buffer_max_bytes,
@@ -935,7 +935,7 @@ pub(crate) async fn sequencer_loop(
                                 }
                             }
                             if let Err(e) = process_envelope(
-                                &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
+                                ds.metrics(), &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
                                 &mut exec.aggregates, &exec.agg_index, envs[k].clone(), &mut txn_pending,
                                 &subq, &trace_tx, library_mode,
                             )
@@ -971,7 +971,7 @@ pub(crate) async fn sequencer_loop(
                                 &trace_tx,
                             );
                         }
-                        emit_storage_txn_metrics(&txn_pending);
+                        emit_storage_txn_metrics(ds.metrics(), &txn_pending);
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
                         }
@@ -1137,7 +1137,7 @@ pub(crate) async fn sequencer_loop(
                 }
                 Err(e) => {
                     if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
-                        metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
+                        ds.metrics().sequencer_read_cap_failures.fetch_add(1, Ordering::Relaxed);
                         // A read bigger than the cap is ordinarily a large value, not a broken
                         // store: against a store that advertises no page the whole remainder of
                         // the stream comes back in one response, and against one that pages a
@@ -1150,7 +1150,7 @@ pub(crate) async fn sequencer_loop(
                         // value past the hard ceiling.
                         match ds.raise_read_cap_after_breach() {
                             crate::ds::CapBreachOutcome::Raise { limit } => {
-                                metrics().sequencer_read_cap_raised.fetch_add(1, Ordering::Relaxed);
+                                ds.metrics().sequencer_read_cap_raised.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(path = %cap.path, observed = cap.observed, was = cap.limit, now = limit,
                                     max_value_bytes = cap.max_value_bytes,
                                     "a Durable Streams read exceeded the client body cap: the store either advertises \
@@ -1600,7 +1600,7 @@ pub(crate) async fn replay_changes_for_targets(
         if let (Some(start), Some(end)) =
             (page_start, rr.next_offset.as_deref().and_then(crate::changelog::offset_bytes))
         {
-            metrics().reactivation_bytes_scanned.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
+            ds.metrics().reactivation_bytes_scanned.fetch_add(end.saturating_sub(start), Ordering::Relaxed);
         }
         if let Some(n) = rr.next_offset {
             pos.offset = n;
@@ -1787,7 +1787,7 @@ async fn stream_backfill(
     }
     // A backfill that fit in one append contributes 0, same accounting as a chunked commit's.
     if appends > 1 {
-        metrics().backfill_chunked_appends.fetch_add(appends, Ordering::Relaxed);
+        ds.metrics().backfill_chunked_appends.fetch_add(appends, Ordering::Relaxed);
         tracing::info!(
             table = %ts.table,
             rows = rows_total,
@@ -1799,13 +1799,14 @@ async fn stream_backfill(
     let estimated_bytes = reader.estimated_bytes_read();
     let fences = reader.finish().await;
     if agg_seed.is_none() {
-        crate::statsd::snapshot_stored(rows_total, snapshot_bytes, t0.elapsed().as_secs_f64() * 1000.0);
+        ds.metrics().emitter().snapshot_stored(rows_total, snapshot_bytes, t0.elapsed().as_secs_f64() * 1000.0);
     }
     Ok((fences.gate, agg_seed, emitted_seed, BackfillStats { rows: rows_total, estimated_bytes }))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_envelope(
+    metrics: &crate::metrics::Metrics,
     ts: &TableSchema,
     shapes: &HashMap<String, StandaloneShape>,
     shape_index: &StandaloneIndex,
@@ -1840,8 +1841,8 @@ pub(crate) async fn process_envelope(
     // not LSN order, is the sound backfill↔replication reconciliation.
     let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
-    metrics().envelopes.fetch_add(1, Ordering::Relaxed);
-    let _t = Timer::new(&metrics().process_envelope);
+    metrics.envelopes.fetch_add(1, Ordering::Relaxed);
+    let _t = Timer::new(&metrics.process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
     // Skip changes already visible to the shape's backfill snapshot (xid-visibility gate, LSN
     // fallback for changes without a parseable xid). On the untraced hot path only the index's
@@ -1884,7 +1885,7 @@ pub(crate) async fn process_envelope(
                 pending.entry(shape.stream_path.clone()).or_default().push(e);
             }
         }
-        let _s = Timer::new(&metrics().family_step);
+        let _s = Timer::new(&metrics.family_step);
         for router in families.values() {
             // A routed shape's membership IS the key match, so the row belongs to exactly the one
             // key group its CURRENT value names; every other group must drop it.
@@ -1949,7 +1950,7 @@ pub(crate) async fn process_envelope(
     // No table copy, no join state — membership is the key match (an equality-template predicate matches a
     // row iff its key equals the shape's constants). Each shape's own snapshot gate is applied, so
     // changes already in that shape's backfill are skipped.
-    let _s = Timer::new(&metrics().family_step);
+    let _s = Timer::new(&metrics.family_step);
     for router in families.values().filter(|_| !absolute) {
         type ShapeOut<'a> = (&'a str, Option<&'a [usize]>, Vec<(Row, ZWeight)>);
         let mut by_shape: HashMap<u64, ShapeOut> = HashMap::new();
@@ -1997,7 +1998,7 @@ pub(crate) async fn process_envelope(
         if by_shape.is_empty() {
             continue;
         }
-        metrics().family_steps.fetch_add(1, Ordering::Relaxed);
+        metrics.family_steps.fetch_add(1, Ordering::Relaxed);
         for (_sid, (stream_path, out_cols, rows)) in by_shape {
             let envs = translate_output(ts, rows, txid.clone(), lsn.clone(), out_cols);
             if !envs.is_empty() {
@@ -2125,14 +2126,17 @@ pub(crate) fn envs_bytes(envs: &[Envelope]) -> u64 {
 /// `affected_shape_count` = distinct shape streams the txn touched; `operations`/`bytes` = output
 /// envelopes appended + their serialized size. (Subquery-registry appends go out synchronously inside
 /// `process_envelope` and are not reflected here.) No-op when the txn produced no appends.
-pub(crate) fn emit_storage_txn_metrics(txn_pending: &HashMap<String, Vec<Envelope>>) {
+pub(crate) fn emit_storage_txn_metrics(
+    metrics: &crate::metrics::Metrics,
+    txn_pending: &HashMap<String, Vec<Envelope>>,
+) {
     let ops: u64 = txn_pending.values().map(|v| v.len() as u64).sum();
     if ops == 0 {
         return;
     }
     let bytes: u64 =
         txn_pending.values().flatten().map(|e| serde_json::to_string(e).map(|s| s.len() as u64).unwrap_or(0)).sum();
-    crate::statsd::storage_txn(ops, bytes, txn_pending.len() as u64);
+    metrics.emitter().storage_txn(ops, bytes, txn_pending.len() as u64);
 }
 
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so
@@ -2153,9 +2157,9 @@ pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<En
         for (path, envs) in batch {
             let ds = ds.clone();
             set.spawn(async move {
-                let _t = Timer::new(&metrics().append);
+                let _t = Timer::new(&ds.metrics().append);
                 ds.append_reliable(&path, &envs).await?;
-                metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
+                ds.metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, anyhow::Error>(())
             });
         }

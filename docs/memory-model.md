@@ -70,7 +70,9 @@ The Electric `/v1/shape` adapter keeps a key set per handle in an Engine-owned r
 Its evictor releases idle subscriptions on that Engine, including snapshot-only readers. Empty
 registries release their map capacity. Close drops the stopped Engine's registry and joins its tasks
 and circuit threads; source replacements cannot use predecessor or foreign handles. The adapter's
-heap estimate is per Engine. Other metrics remain process-wide until the observability follow-up.
+heap estimate, cardinality gauges, engine metrics and pool settle statistics are per Engine.
+RSS and allocator figures remain process-wide. Each Engine owns its meter provider and registry;
+close drops their callbacks and cumulative series, and ends the Engine's telemetry samplers.
 
 ### Across subquery shapes — the outer-shape conjunct index
 

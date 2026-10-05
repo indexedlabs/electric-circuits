@@ -527,7 +527,7 @@ impl Engine {
                         &self.trace_tx,
                         crate::trace::GraphLifecycle::ShapeAdded { shape: id, table: table.clone() },
                     );
-                    crate::statsd::create_snapshot_task(created_at.elapsed());
+                    self.metrics.emitter().create_snapshot_task(created_at.elapsed());
                     return Ok(rec);
                 }
                 Err(e) => {
@@ -676,7 +676,7 @@ impl Engine {
                     &self.trace_tx,
                     crate::trace::GraphLifecycle::ShapeAdded { shape: rec.id.clone(), table: rec.table.clone() },
                 );
-                crate::statsd::create_snapshot_task(created_at.elapsed());
+                self.metrics.emitter().create_snapshot_task(created_at.elapsed());
                 Ok(rec)
             }
             Err(e) => {
@@ -1346,8 +1346,8 @@ impl Engine {
                             LifeState::Active => Step::Done,
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
                             LifeState::Reactivating { done, .. } => {
-                                metrics().reactivations_coalesced.fetch_add(1, Ordering::Relaxed);
-                                metrics().reactivation_scans_coalesced.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.reactivations_coalesced.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.reactivation_scans_coalesced.fetch_add(1, Ordering::Relaxed);
                                 Step::WaitReactivate(done.clone())
                             }
                             LifeState::Dormant { resume, gate, .. } => {
@@ -1364,7 +1364,7 @@ impl Engine {
                                 life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
                                 let engine = self.clone();
                                 let id = id.to_string();
-                                metrics().reactivations_started.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.reactivations_started.fetch_add(1, Ordering::Relaxed);
                                 self.shutdown.spawn(async move {
                                     let _control = control;
                                     let admission = engine.reactivation_admission(&id, &resume).await;
@@ -1378,7 +1378,7 @@ impl Engine {
                                                     gate: gate.clone(),
                                                 };
                                             }
-                                            metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
+                                            engine.metrics.reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                             let _ = tx.send(Some(false));
                                             return;
                                         }
@@ -1397,14 +1397,17 @@ impl Engine {
                                             };
                                         }
                                         let _ = engine.evict_shape(&id, reason).await;
-                                        metrics().reactivations_recreated.fetch_add(1, Ordering::Relaxed);
+                                        engine.metrics.reactivations_recreated.fetch_add(1, Ordering::Relaxed);
                                         if admission.is_err() {
-                                            metrics().reactivations_evicted_unresumable.fetch_add(1, Ordering::Relaxed);
+                                            engine
+                                                .metrics
+                                                .reactivations_evicted_unresumable
+                                                .fetch_add(1, Ordering::Relaxed);
                                         }
                                         let _ = tx.send(Some(false));
                                         return;
                                     }
-                                    metrics().reactivations_replayed.fetch_add(1, Ordering::Relaxed);
+                                    engine.metrics.reactivations_replayed.fetch_add(1, Ordering::Relaxed);
                                     let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
                                     let err = match res {
                                         Ok(()) => {
@@ -1414,7 +1417,7 @@ impl Engine {
                                                 life.last_read = std::time::Instant::now();
                                             }
                                             drop(lives);
-                                            metrics().reactivations_completed.fetch_add(1, Ordering::Relaxed);
+                                            engine.metrics.reactivations_completed.fetch_add(1, Ordering::Relaxed);
                                             let _ = tx.send(Some(true));
                                             return;
                                         }
@@ -1443,7 +1446,7 @@ impl Engine {
                                         if let Err(e) = engine.evict_shape(&id, EvictReason::ReplayBudget).await {
                                             tracing::warn!("retiring overflowed shape {id} failed: {e:#}");
                                         }
-                                        metrics().reactivations_recreated.fetch_add(1, Ordering::Relaxed);
+                                        engine.metrics.reactivations_recreated.fetch_add(1, Ordering::Relaxed);
                                         let _ = tx.send(Some(false));
                                         return;
                                     }
@@ -1466,7 +1469,7 @@ impl Engine {
                                             tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
                                         }
                                         let _ = tx.send(Some(false));
-                                        metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
+                                        engine.metrics.reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                         return;
                                     }
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
@@ -1475,7 +1478,7 @@ impl Engine {
                                         life.state =
                                             LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
                                     }
-                                    metrics().reactivations_failed.fetch_add(1, Ordering::Relaxed);
+                                    engine.metrics.reactivations_failed.fetch_add(1, Ordering::Relaxed);
                                     let _ = tx.send(Some(false));
                                 });
                                 Step::WaitReactivate(rx)
@@ -1525,7 +1528,7 @@ impl Engine {
                                 match changed {
                                     Ok(Some(())) => {}
                                     Ok(None) => {
-                                        metrics().reactivation_joins_timed_out.fetch_add(1, Ordering::Relaxed);
+                                        self.metrics.reactivation_joins_timed_out.fetch_add(1, Ordering::Relaxed);
                                         tracing::warn!(
                                             shape_id = id,
                                             timeout_secs = self.retention.reactivation_join_timeout.as_secs(),
@@ -1653,7 +1656,7 @@ impl Engine {
             return Err(e.context(format!("shape '{id}' reactivation")));
         }
         self.catalog_tx.send(CatalogEvent::Reactivated { id: id.to_string() });
-        metrics().shapes_reactivated.fetch_add(1, Ordering::Relaxed);
+        self.metrics.shapes_reactivated.fetch_add(1, Ordering::Relaxed);
         trace_lifecycle(
             &self.trace_tx,
             crate::trace::GraphLifecycle::ShapeReactivated { shape: id.to_string(), table: rec.table.clone() },
@@ -1683,7 +1686,7 @@ impl Engine {
         let batch = {
             let mut batches = self.reactivation_batches.lock().unwrap();
             if let Some(existing) = batches.get(&key) {
-                metrics().reactivation_scans_coalesced.fetch_add(1, Ordering::Relaxed);
+                self.metrics.reactivation_scans_coalesced.fetch_add(1, Ordering::Relaxed);
                 existing.clone()
             } else {
                 let batch = Arc::new(std::sync::Mutex::new(ReplayBatch { targets: Vec::new() }));
@@ -1787,7 +1790,7 @@ impl Engine {
                     LifeState::Dormant { since: std::time::Instant::now(), resume: resume.clone(), gate: gate.clone() };
                 drop(lives);
                 self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume, gate });
-                metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);
+                self.metrics.shapes_dormanted.fetch_add(1, Ordering::Relaxed);
                 trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDormant { shape: id.to_string() });
                 tracing::debug!("shape {id} went dormant (idle)");
             }
@@ -1875,7 +1878,7 @@ impl Engine {
             // deleted — a client still tailing it is released at once with `stream-closed` — and the
             // completion recorded. A storage failure is queued, never forgotten.
             self.retire_shape_stream(id, &rec.stream_path).await;
-            metrics().shapes_evicted.fetch_add(1, Ordering::Relaxed);
+            self.metrics.shapes_evicted.fetch_add(1, Ordering::Relaxed);
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("evicted shape {id} ({})", reason.as_str());
         }
@@ -1943,7 +1946,7 @@ impl Engine {
         }
         let plan = crate::retention::plan_sweep(&cfg, &snapshot);
         if plan.over_capacity {
-            metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
+            self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
                  every shape is actively subscribed or recently read; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
@@ -1952,7 +1955,7 @@ impl Engine {
             );
         }
         if plan.over_budget {
-            metrics().retention_pressure.fetch_add(1, Ordering::Relaxed);
+            self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 "retention: shape streams exceed the disk budget ({} bytes) but nothing dormant is left to evict — \
                  raise ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB or lower the idle timeout",
@@ -1993,7 +1996,7 @@ impl Engine {
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }
-            st.publish_subscription_gauge();
+            st.publish_subscription_gauge(&self.metrics);
             expired
         };
         for (shape, subscription) in lapsed {
@@ -2002,7 +2005,7 @@ impl Engine {
                 cfg.subscription_lease_timeout
             );
             self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
-            metrics().subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
+            self.metrics.subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2116,14 +2119,14 @@ impl Engine {
                     Ok(()) => {
                         self.changes.state().forget(*segment);
                         self.catalog_tx.send(CatalogEvent::ChangesSegmentDeleted { segment: *segment });
-                        metrics().changes_segments_deleted.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.changes_segments_deleted.fetch_add(1, Ordering::Relaxed);
                         tracing::info!("change log: deleted {path} (behind the durable checkpoint, unpinned)");
                     }
                     Err(e) => tracing::warn!("change log: deleting {path} failed: {e:#}"),
                 }
             }
         }
-        metrics().changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
+        self.metrics.changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
     }
 
     /// Every shape currently holding a change-log segment against deletion (ADR-0006).
@@ -2293,7 +2296,7 @@ impl Engine {
                     appends += 1;
                 }
                 if appends > 1 {
-                    metrics().backfill_chunked_appends.fetch_add(appends, Ordering::Relaxed);
+                    self.metrics.backfill_chunked_appends.fetch_add(appends, Ordering::Relaxed);
                 }
                 (reader.finish().await.gate, seeded, seeded_pks)
             };

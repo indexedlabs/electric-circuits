@@ -412,6 +412,7 @@ impl Default for SettleConfig {
 const HIST_BOUNDS_MS: [u64; 14] = [1, 2, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000];
 
 /// Process-wide settle counters (every pool), surfaced on `GET /replication/lsn` as `settle`.
+#[derive(Default)]
 struct SettleMetrics {
     /// Snapshots checked.
     checks: AtomicU64,
@@ -441,105 +442,78 @@ struct SettleMetrics {
     hist_max_us: AtomicU64,
 }
 
-#[allow(clippy::declare_interior_mutable_const)]
-const ZERO: AtomicU64 = AtomicU64::new(0);
-
-static METRICS: SettleMetrics = SettleMetrics {
-    checks: ZERO,
-    retakes: ZERO,
-    timeouts: ZERO,
-    rejections: ZERO,
-    waiting: ZERO,
-    poller_ticks: ZERO,
-    poller_failures: ZERO,
-    forgotten: ZERO,
-    dropped: ZERO,
-    bound_hits: ZERO,
-    overflow_refusals: ZERO,
-    hist: [ZERO; HIST_BOUNDS_MS.len() + 1],
-    hist_sum_us: ZERO,
-    hist_max_us: ZERO,
-};
-
-fn record_wait(d: Duration) {
+fn record_wait(metrics: &SettleMetrics, d: Duration) {
     let ms = d.as_millis() as u64;
     let i = HIST_BOUNDS_MS.iter().position(|&b| ms <= b).unwrap_or(HIST_BOUNDS_MS.len());
-    METRICS.hist[i].fetch_add(1, Ordering::Relaxed);
+    metrics.hist[i].fetch_add(1, Ordering::Relaxed);
     let us = d.as_micros() as u64;
-    METRICS.hist_sum_us.fetch_add(us, Ordering::Relaxed);
-    METRICS.hist_max_us.fetch_max(us, Ordering::Relaxed);
+    metrics.hist_sum_us.fetch_add(us, Ordering::Relaxed);
+    metrics.hist_max_us.fetch_max(us, Ordering::Relaxed);
 }
 
-/// Snapshots currently waiting for sequenced transactions to become visible (process-wide) —
-/// `visibilityWaits` on `GET /replication/lsn`.
-pub fn settle_waits_active() -> u64 {
-    METRICS.waiting.load(Ordering::Relaxed)
-}
-
-/// The `settle` object of `GET /replication/lsn`: the record's size across `sets`, and the
-/// process-wide counters and wait-duration distribution.
-pub(super) fn stats_json<'a>(sets: impl Iterator<Item = &'a SequencedXids>) -> serde_json::Value {
-    let (mut len, mut peak, mut chunks, mut tables, mut fenced) = (0u64, 0u64, 0usize, 0usize, 0usize);
-    for s in sets {
-        let r = s.record.lock().unwrap();
-        len += r.len;
-        peak += r.peak_len;
-        chunks += r.chunks;
-        tables += r.tables.len();
-        fenced += r.fences.len();
+/// Diagnostics for this Engine's pool only.
+impl SequencedXids {
+    pub fn settle_waits_active(&self) -> u64 {
+        self.metrics.waiting.load(Ordering::Relaxed)
     }
-    let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
-    let counts: Vec<u64> = METRICS.hist.iter().map(l).collect();
-    let n: u64 = counts.iter().sum();
-    let quantile = |q: f64| -> Option<u64> {
-        if n == 0 {
-            return None;
-        }
-        let rank = ((q * n as f64).ceil() as u64).max(1);
-        let mut acc = 0;
-        for (i, c) in counts.iter().enumerate() {
-            acc += c;
-            if acc >= rank {
-                // A bucket's upper bound; the open-ended last bucket reports the observed max.
-                return Some(HIST_BOUNDS_MS.get(i).copied().unwrap_or(l(&METRICS.hist_max_us) / 1000));
+    pub fn stats_json(&self) -> serde_json::Value {
+        let metrics = &self.metrics;
+        let (len, peak, chunks, tables, fenced) = {
+            let record = self.record.lock().unwrap();
+            (record.len, record.peak_len, record.chunks, record.tables.len(), record.fences.len())
+        };
+        let l = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let counts: Vec<u64> = metrics.hist.iter().map(l).collect();
+        let n: u64 = counts.iter().sum();
+        let quantile = |q: f64| -> Option<u64> {
+            if n == 0 {
+                return None;
             }
+            let rank = ((q * n as f64).ceil() as u64).max(1);
+            let mut acc = 0;
+            for (i, c) in counts.iter().enumerate() {
+                acc += c;
+                if acc >= rank {
+                    // A bucket's upper bound; the open-ended last bucket reports the observed max.
+                    return Some(HIST_BOUNDS_MS.get(i).copied().unwrap_or(l(&metrics.hist_max_us) / 1000));
+                }
+            }
+            None
+        };
+        let mut buckets = serde_json::Map::new();
+        for (i, c) in counts.iter().enumerate() {
+            let name = HIST_BOUNDS_MS.get(i).map_or("inf".to_string(), |b| b.to_string());
+            buckets.insert(format!("le_{name}ms"), (*c).into());
         }
-        None
-    };
-    let mut buckets = serde_json::Map::new();
-    for (i, c) in counts.iter().enumerate() {
-        let name = HIST_BOUNDS_MS.get(i).map_or("inf".to_string(), |b| b.to_string());
-        buckets.insert(format!("le_{name}ms"), (*c).into());
+        serde_json::json!({
+            "sequencedXids": len,
+            "sequencedXidsPeak": peak,
+            "tables": tables,
+            "recordBytes": chunks as u64 * CHUNK_BYTES,
+            "xidsDropped": l(&metrics.dropped),
+            "boundHits": l(&metrics.bound_hits),
+            "fencedTables": fenced,
+            "overflowRefusals": l(&metrics.overflow_refusals),
+            "forgotten": l(&metrics.forgotten),
+            "pollerTicks": l(&metrics.poller_ticks),
+            "pollerFailures": l(&metrics.poller_failures),
+            "checks": l(&metrics.checks),
+            "retakes": l(&metrics.retakes),
+            "timeouts": l(&metrics.timeouts),
+            "rejections": l(&metrics.rejections),
+            "waiting": l(&metrics.waiting),
+            "waitMs": {
+                "count": n,
+                "sumMs": l(&metrics.hist_sum_us) / 1000,
+                "maxMs": l(&metrics.hist_max_us) / 1000,
+                "p50Ms": quantile(0.50),
+                "p90Ms": quantile(0.90),
+                "p99Ms": quantile(0.99),
+                "buckets": buckets,
+            },
+        })
     }
-    serde_json::json!({
-        "sequencedXids": len,
-        "sequencedXidsPeak": peak,
-        "tables": tables,
-        "recordBytes": chunks as u64 * CHUNK_BYTES,
-        "xidsDropped": l(&METRICS.dropped),
-        "boundHits": l(&METRICS.bound_hits),
-        "fencedTables": fenced,
-        "overflowRefusals": l(&METRICS.overflow_refusals),
-        "forgotten": l(&METRICS.forgotten),
-        "pollerTicks": l(&METRICS.poller_ticks),
-        "pollerFailures": l(&METRICS.poller_failures),
-        "checks": l(&METRICS.checks),
-        "retakes": l(&METRICS.retakes),
-        "timeouts": l(&METRICS.timeouts),
-        "rejections": l(&METRICS.rejections),
-        "waiting": l(&METRICS.waiting),
-        "waitMs": {
-            "count": n,
-            "sumMs": l(&METRICS.hist_sum_us) / 1000,
-            "maxMs": l(&METRICS.hist_max_us) / 1000,
-            "p50Ms": quantile(0.50),
-            "p90Ms": quantile(0.90),
-            "p99Ms": quantile(0.99),
-            "buckets": buckets,
-        },
-    })
 }
-
 // ---- the settle set + its poller ----------------------------------------------------------------
 
 /// Transactions the sequencer has fanned out that no snapshot has yet been seen to contain, per
@@ -559,6 +533,7 @@ pub(super) fn stats_json<'a>(sets: impl Iterator<Item = &'a SequencedXids>) -> s
 /// retryable 503), and the record grows until the bound. It is started on demand and restarted on
 /// demand if it has ended (a runtime that went away).
 pub struct SequencedXids {
+    metrics: SettleMetrics,
     record: Mutex<Record>,
     /// The database the poller reads snapshots from (`None` for a set no pool owns — unit tests,
     /// where nothing ever polls and waiters time out).
@@ -599,6 +574,7 @@ impl SequencedXids {
     ) -> Self {
         let max_waiters = if cfg.max_waiters == 0 { (pool_size / 4).max(1) } else { cfg.max_waiters };
         SequencedXids {
+            metrics: SettleMetrics::default(),
             record: Mutex::new(Record::default()),
             url,
             cap_chunks: (cfg.max_xids.clamp(CHUNK_BITS, MAX_SETTLE_MAX_XIDS) / CHUNK_BITS) as usize,
@@ -694,8 +670,8 @@ impl SequencedXids {
             r.len -= u64::from(chunk.len);
             dropped += u64::from(chunk.len);
         }
-        METRICS.dropped.fetch_add(dropped, Ordering::Relaxed);
-        METRICS.bound_hits.fetch_add(1, Ordering::Relaxed);
+        self.metrics.dropped.fetch_add(dropped, Ordering::Relaxed);
+        self.metrics.bound_hits.fetch_add(1, Ordering::Relaxed);
         r.dropped_since_log += dropped;
         let due = r.last_drop_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(10));
         if due {
@@ -917,11 +893,11 @@ async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
             match tokio::time::timeout(QUERY_TIMEOUT, super::connect_owned(&url, &set.shutdown)).await {
                 Ok(Ok(c)) => client = Some(c),
                 Ok(Err(e)) => {
-                    poller_failed(&format!("{e:#}"), &mut backoff, BACKOFF_MAX).await;
+                    poller_failed(&set.metrics, &format!("{e:#}"), &mut backoff, BACKOFF_MAX).await;
                     continue;
                 }
                 Err(_) => {
-                    poller_failed("connect timed out", &mut backoff, BACKOFF_MAX).await;
+                    poller_failed(&set.metrics, "connect timed out", &mut backoff, BACKOFF_MAX).await;
                     continue;
                 }
             }
@@ -931,7 +907,7 @@ async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
             Ok(text) => text,
             Err(error) => {
                 client = None;
-                poller_failed(&error, &mut backoff, BACKOFF_MAX).await;
+                poller_failed(&set.metrics, &error, &mut backoff, BACKOFF_MAX).await;
                 continue;
             }
         };
@@ -939,7 +915,7 @@ async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
         backoff = Duration::from_millis(50);
         let gate = SnapshotGate::parse(&text, "0/0");
         set.prune(&gate);
-        METRICS.poller_ticks.fetch_add(1, Ordering::Relaxed);
+        set.metrics.poller_ticks.fetch_add(1, Ordering::Relaxed);
         // A recorded xid past this snapshot's xmax on two ticks running is either still in the
         // ProcArray (held — keep waiting for it) or not a transaction of this cluster at all (the
         // change log carried it from before an epoch reset or a restore), which would otherwise be
@@ -979,7 +955,7 @@ async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
                         xids = ?gone.iter().map(|&v| v as u32).collect::<Vec<_>>(),
                         "sequenced transaction(s) past the snapshot horizon are not in progress; forgetting them"
                     );
-                    METRICS.forgotten.fetch_add(gone.len() as u64, Ordering::Relaxed);
+                    set.metrics.forgotten.fetch_add(gone.len() as u64, Ordering::Relaxed);
                     set.forget(&gone);
                     prev_ahead.retain(|v| !gone.contains(v));
                 }
@@ -998,8 +974,8 @@ async fn snapshot_text(c: &tokio_postgres::Client, limit: Duration) -> std::resu
     }
 }
 
-async fn poller_failed(error: &str, backoff: &mut Duration, max: Duration) {
-    METRICS.poller_failures.fetch_add(1, Ordering::Relaxed);
+async fn poller_failed(metrics: &SettleMetrics, error: &str, backoff: &mut Duration, max: Duration) {
+    metrics.poller_failures.fetch_add(1, Ordering::Relaxed);
     tracing::debug!("settle visibility poller: {error}; retrying in {backoff:?}");
     tokio::time::sleep(*backoff).await;
     *backoff = (*backoff * 2).min(max);
@@ -1104,18 +1080,18 @@ impl std::fmt::Display for SnapshotUnsettled {
 impl std::error::Error for SnapshotUnsettled {}
 
 /// Counted in `visibilityWaits` for exactly as long as it lives — a dropped request future included.
-struct Waiting;
+struct Waiting<'a>(&'a SettleMetrics);
 
-impl Waiting {
-    fn start() -> Self {
-        METRICS.waiting.fetch_add(1, Ordering::Relaxed);
-        Waiting
+impl<'a> Waiting<'a> {
+    fn start(metrics: &'a SettleMetrics) -> Self {
+        metrics.waiting.fetch_add(1, Ordering::Relaxed);
+        Waiting(metrics)
     }
 }
 
-impl Drop for Waiting {
+impl Drop for Waiting<'_> {
     fn drop(&mut self) {
-        METRICS.waiting.fetch_sub(1, Ordering::Relaxed);
+        self.0.waiting.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1207,7 +1183,7 @@ pub(super) async fn begin_settled_snapshot(
     let started = Instant::now();
     let seen = client.inner.sequenced.clone();
     let (fences, check) = open_checked(&seen, scope, || open_tracked(client, statement_timeout_ms, what)).await?;
-    METRICS.checks.fetch_add(1, Ordering::Relaxed);
+    seen.metrics.checks.fetch_add(1, Ordering::Relaxed);
     let pending = match check {
         Check::Settled => return Ok(fences),
         Check::Pending(pending) => pending,
@@ -1217,7 +1193,7 @@ pub(super) async fn begin_settled_snapshot(
             } else {
                 bail!("{what}: rolling back a fenced snapshot failed");
             }
-            METRICS.overflow_refusals.fetch_add(1, Ordering::Relaxed);
+            seen.metrics.overflow_refusals.fetch_add(1, Ordering::Relaxed);
             // Let the poller clear the fence as soon as `xmin` has passed it, for the retry.
             seen.kick();
             return Err(anyhow::Error::new(SnapshotUnsettled {
@@ -1235,7 +1211,7 @@ pub(super) async fn begin_settled_snapshot(
         match seen.admission.try_acquire() {
             Ok(permit) => Some(permit),
             Err(_) => {
-                METRICS.rejections.fetch_add(1, Ordering::Relaxed);
+                seen.metrics.rejections.fetch_add(1, Ordering::Relaxed);
                 return Err(anyhow::Error::new(SnapshotUnsettled {
                     cause: UnsettledCause::Rejected,
                     pending: pending.iter().map(|&v| v as u32).collect(),
@@ -1245,26 +1221,26 @@ pub(super) async fn begin_settled_snapshot(
     } else {
         None
     };
-    let _waiting = Waiting::start();
+    let _waiting = Waiting::start(&seen.metrics);
     let deadline = started + Duration::from_millis(seen.cfg.timeout_ms);
     // Give the connection back while waiting: a stalled standby must not pin the pool.
     client.release();
     let waited = seen.wait_until_settled(scope, pending.clone(), deadline).await;
     if let Err(unsettled) = waited {
-        METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
-        record_wait(started.elapsed());
+        seen.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+        record_wait(&seen.metrics, started.elapsed());
         return Err(anyhow::Error::new(unsettled));
     }
     // The retake's pool wait counts against the same budget.
     match tokio::time::timeout_at(deadline.into(), client.reacquire()).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            record_wait(started.elapsed());
+            record_wait(&seen.metrics, started.elapsed());
             return Err(e);
         }
         Err(_) => {
-            METRICS.timeouts.fetch_add(1, Ordering::Relaxed);
-            record_wait(started.elapsed());
+            seen.metrics.timeouts.fetch_add(1, Ordering::Relaxed);
+            record_wait(&seen.metrics, started.elapsed());
             return Err(anyhow::Error::new(SnapshotUnsettled {
                 cause: UnsettledCause::TimedOut,
                 pending: pending.iter().map(|&v| v as u32).collect(),
@@ -1272,8 +1248,8 @@ pub(super) async fn begin_settled_snapshot(
         }
     }
     let fences = open_tracked(client, statement_timeout_ms, what).await?;
-    METRICS.retakes.fetch_add(1, Ordering::Relaxed);
-    record_wait(started.elapsed());
+    seen.metrics.retakes.fetch_add(1, Ordering::Relaxed);
+    record_wait(&seen.metrics, started.elapsed());
     tracing::debug!(
         what,
         xids = ?pending.iter().map(|&v| v as u32).collect::<Vec<_>>(),
@@ -1286,6 +1262,22 @@ pub(super) async fn begin_settled_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_waits_and_histograms_belong_to_their_set() {
+        let alpha = SequencedXids::default();
+        let beta = SequencedXids::default();
+        let waiting = Waiting::start(&alpha.metrics);
+        record_wait(&alpha.metrics, Duration::from_millis(7));
+        assert_eq!(alpha.settle_waits_active(), 1);
+        assert_eq!(beta.settle_waits_active(), 0);
+        assert_eq!(alpha.stats_json()["waitMs"]["count"], 1);
+        assert_eq!(alpha.stats_json()["waitMs"]["sumMs"], 7);
+        assert_eq!(beta.stats_json()["waitMs"]["count"], 0);
+        drop(waiting);
+        assert_eq!(alpha.settle_waits_active(), 0);
+        assert_eq!(beta.stats_json()["waitMs"]["sumMs"], 0);
+    }
 
     fn items() -> SettleScope {
         SettleScope::request(&TableRef::parse("public.items").unwrap())
@@ -1417,7 +1409,7 @@ mod tests {
     #[test]
     fn the_bound_fences_the_tables_it_gave_up_transactions_on() {
         let seen = set_with(SettleConfig { max_xids: 2 * CHUNK_BITS, ..SettleConfig::default() });
-        let dropped_before = METRICS.dropped.load(Ordering::Relaxed);
+        let dropped_before = seen.metrics.dropped.load(Ordering::Relaxed);
         // A held transaction, then three chunks' worth of transactions no poller ever prunes.
         seen.note(10_000, ["public.items"]);
         for x in 10_001..10_001 + 3 * CHUNK_BITS {
@@ -1429,7 +1421,7 @@ mod tests {
         assert!(r.chunks <= 2, "held at the bound: {} chunks", r.chunks);
         assert!(r.fences.contains_key("public.items"));
         drop(r);
-        assert!(METRICS.dropped.load(Ordering::Relaxed) > dropped_before, "the drop is counted");
+        assert!(seen.metrics.dropped.load(Ordering::Relaxed) > dropped_before, "the drop is counted");
         let v = |x: u64| seen.record.lock().unwrap().unwrap(x as u32);
         // A snapshot that excludes the given-up 10_000 (xmin at it) is fenced, not settled.
         let fenced = seen.capture(&items()).check(&gate("10000:10000:"));
@@ -1526,7 +1518,7 @@ mod tests {
             .expect_err("nothing ever sees 300 visible");
         assert_eq!(err.cause, UnsettledCause::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2), "bounded by the deadline: {:?}", started.elapsed());
-        assert!(METRICS.poller_failures.load(Ordering::Relaxed) > 0, "the poller ran and failed");
+        assert!(seen.metrics.poller_failures.load(Ordering::Relaxed) > 0, "the poller ran and failed");
         assert_eq!(seen.waiters.load(Ordering::Acquire), 0, "the waiter is uncounted on the way out");
     }
 

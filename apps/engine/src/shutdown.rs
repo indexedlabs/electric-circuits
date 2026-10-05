@@ -80,6 +80,7 @@ pub const CATALOG_DRAIN: Duration = Duration::from_secs(10);
 pub const DEFAULT_READY_DRAIN: Duration = Duration::from_secs(2);
 
 struct Inner {
+    metrics: Arc<crate::metrics::Metrics>,
     tx: tokio::sync::watch::Sender<bool>,
     /// Parties registered and not yet finished, by name — so a shutdown that runs out of grace can
     /// say **who** it was waiting for.
@@ -105,13 +106,25 @@ impl Default for ShutdownToken {
 }
 
 impl ShutdownToken {
+    pub(crate) fn metrics(&self) -> &Arc<crate::metrics::Metrics> {
+        &self.inner.metrics
+    }
+
     pub fn new() -> Self {
         Self::with_supervisor(None)
     }
 
     pub(crate) fn with_supervisor(restart_notify: Option<Arc<tokio::sync::Notify>>) -> Self {
+        Self::with_metrics(restart_notify, Arc::new(crate::metrics::Metrics::default()))
+    }
+
+    pub(crate) fn with_metrics(
+        restart_notify: Option<Arc<tokio::sync::Notify>>,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
         ShutdownToken {
             inner: Arc::new(Inner {
+                metrics,
                 tx: tokio::sync::watch::channel(false).0,
                 outstanding: std::sync::Mutex::new(BTreeSet::new()),
                 began_at: std::sync::Mutex::new(None),
@@ -200,7 +213,7 @@ impl ShutdownToken {
             if let Some(notify) = &self.inner.restart_notify {
                 notify.notify_one();
             }
-            crate::metrics::metrics().shutdown_in_progress.store(1, std::sync::atomic::Ordering::Relaxed);
+            self.metrics().shutdown_in_progress.store(1, std::sync::atomic::Ordering::Relaxed);
         }
         first
     }

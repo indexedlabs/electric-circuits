@@ -489,7 +489,7 @@ async fn stream_loop(
         }
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
-                txn = Some(TxnBuffer::new(xid, txn_cfg.clone()));
+                txn = Some(TxnBuffer::with_metrics(xid, txn_cfg.clone(), shutdown.metrics().clone()));
             }
             ReplicationEvent::XLogData { data, .. } => {
                 let msg = pgoutput::decode(&data)?;
@@ -541,7 +541,7 @@ async fn stream_loop(
                 // (commit frame received → appended), not source-commit→receipt lag.
                 if ops > 0 && crate::statsd::enabled() {
                     let lag_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    crate::statsd::replication_txn(ops, raw_bytes, lag_ms);
+                    shutdown.metrics().emitter().replication_txn(ops, raw_bytes, lag_ms);
                 }
                 // Rotation is a TRANSACTION-BOUNDARY decision, taken after the commit is on the log
                 // and acknowledged: a segment never splits a transaction — chunking does not change
@@ -598,7 +598,7 @@ pub async fn append_commit_chunked(
         chunks += 1;
     }
     if chunks > 1 {
-        crate::metrics::metrics().txn_chunked_appends.fetch_add(chunks, Ordering::Relaxed);
+        log.metrics().txn_chunked_appends.fetch_add(chunks, Ordering::Relaxed);
     }
     if spilled || chunks > 1 {
         tracing::info!(

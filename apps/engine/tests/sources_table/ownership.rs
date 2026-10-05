@@ -12,6 +12,9 @@ use electric_circuits_engine::engine::{Engine, PostgresSetup};
 use electric_circuits_engine::table_ref::TableSelector;
 use tokio::sync::watch;
 
+#[path = "observability.rs"]
+mod observability;
+
 const SOURCES: [&str; 3] = ["alpha", "beta", "gamma"];
 const RESTARTS: i64 = 50;
 // Re-exec the test binary, not Cargo: the parent's herdr-heavy lock covers the entire run.
