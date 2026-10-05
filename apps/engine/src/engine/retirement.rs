@@ -38,6 +38,14 @@ struct Retirement {
     completion: Option<Arc<RetirementCompletion>>,
 }
 
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.fail();
+        }
+    }
+}
+
 pub(crate) struct RetirementCompletion {
     done: std::sync::atomic::AtomicBool,
     failed: std::sync::atomic::AtomicBool,
@@ -100,8 +108,8 @@ fn abandon_retirements(
         queue.push_back(item);
     }
     let abandoned = u64::try_from(queue.len()).unwrap_or(u64::MAX);
-    for item in queue.drain(..) {
-        if let Some(completion) = item.completion {
+    for mut item in queue.drain(..) {
+        if let Some(completion) = item.completion.take() {
             completion.fail();
         }
     }
@@ -166,13 +174,20 @@ pub(crate) fn spawn_retirement_queue(
     let (tx, mut rx) = mpsc::unbounded_channel::<Retirement>();
     let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let counter = pending.clone();
-    tokio::spawn(async move {
+    shutdown.clone().spawn(async move {
         let mut queue: std::collections::VecDeque<Retirement> = std::collections::VecDeque::new();
         loop {
             if queue.is_empty() {
-                match rx.recv().await {
-                    Some(item) => queue.push_back(item),
-                    None => return, // engine gone
+                tokio::select! {
+                    biased;
+                    _ = shutdown.wait() => {
+                        abandon_retirements(None, &mut queue, &mut rx, &counter);
+                        return;
+                    }
+                    item = rx.recv() => match item {
+                        Some(item) => queue.push_back(item),
+                        None => return,
+                    }
                 }
             }
             while let Ok(item) = rx.try_recv() {
@@ -214,7 +229,7 @@ pub(crate) fn spawn_retirement_queue(
                     crate::metrics::metrics()
                         .retirements_pending
                         .store(counter.load(Ordering::SeqCst), Ordering::Relaxed);
-                    if let Some(completion) = item.completion {
+                    if let Some(completion) = item.completion.take() {
                         completion.complete();
                     }
                 }

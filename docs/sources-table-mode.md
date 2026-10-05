@@ -100,10 +100,12 @@ Reconciliation is idempotent:
 - a changed row revision stops and restarts it;
 - an unchanged healthy row does nothing.
 
-A failed start is retained as a not-ready source with its classified error and is retried when a
-later revision or an explicit refresh touches it, including when the row revision is unchanged.
-Unchanged healthy rows remain no-ops. Polling does not retry a failed source while the version row
-is unchanged, so failure is not a tight loop. One source's failure does not stop other sources.
+A failed start is retained as a not-ready source with its classified error and retried on every poll
+tick in both modes. The poll interval is the retry interval. When the table version is unchanged,
+retries use the desired row already held in memory without fetching the sources table again. A
+changed discovery snapshot is reconciled before retries, so deleted rows are not restarted. Manual
+refresh still retries immediately. Unchanged healthy rows remain no-ops; one failure does not stop
+other sources.
 Stopping leaves that source's storage directory in place, so a restart can restore its shape catalog.
 
 Each source runs on its own operating-system thread with a current-thread Tokio runtime. The
@@ -111,13 +113,48 @@ control plane uses one serialized reconcile lock, so concurrent refresh calls ca
 plans. The poll task is owned and joined on shutdown. Once the host shutdown token is set, control
 I/O and reconciliation short-circuit and no new source is started.
 
-## Process-global caveats
+## Engine ownership and stop
 
-The existing DB pool, backfill, shutdown, and related `OnceLock` settings remain process-global.
-They therefore apply uniformly to every source in a host. Source-specific Postgres URLs, slots,
-tables, storage roots, DBSP directories, and transaction-spill directories are per-source. The
-engine uses `PostgresSetup::ExternallyManaged`: the consumer's migration/bootstrap step owns
-publications, slots, replica identity, and grants; the engine only verifies them.
+Both hosting modes use `Engine::close`: begin shutdown, wait for registered parties, drop the
+Electric handle registry and drain the catalog, stop and join the membership/counts circuits,
+close the Postgres pool, end and join remaining Engine tasks, fail unfinished retirement completions,
+and clear the DS reconciler callback. Source workers also close an Engine whose boot fails or is
+cancelled before dropping their runtime. The standalone binary uses the same lifecycle on shutdown.
+
+Each Engine owns its Postgres pool, settle record and poller, publication-generated-column setting,
+DS read-cap state, Electric handle registry and evictor, and background tasks. This includes work
+started by an HTTP handler on the host runtime. Pools are distinct even when source URLs match.
+The existing process-wide metrics and settle statistics remain aggregated; per-source observability
+is separate work. The statistics collector keeps only weak references to pools.
+
+Electric handles belong to the Engine that minted them. A foreign or pre-restart handle receives
+`409 must-refetch`. Idle eviction releases the handle's own subscription on its own Engine. Plain
+`offset=-1` recovery snapshots also create handles; clients that never resume them are cleaned up by
+the same TTL. Close drops the registry without writing one catalog `Left` per handle; durable
+subscriptions retain their existing lease and lapse after restart. `ttl_registry_heap_bytes`
+measures only the serving Engine's registry.
+
+Membership spill settings are resolved through `Config`. Each source Engine owns a unique child
+`<source_root>/subq/<pid>-<seq>`, overriding any host-wide explicit membership directory. Close removes
+only that child after its circuit thread joins, and boot sweeps children left by dead processes.
+The default temporary directory follows the same lifecycle. An explicit standalone membership
+directory is operator-managed and kept on shutdown; the Engine never removes that directory.
+The source storage root, including retained storage, stays on disk across stops and row deletion;
+removing an obsolete root remains an operator action.
+
+Catalog refusal (standalone exit 74) and counts-circuit rebuild (standalone exit 75) notify the
+supervisor to stop only the affected source, without a source-row revision change. Any Engine-initiated
+shutdown, including catalog or sequencer fail-closed stops, moves the source to `failed`. Notifications
+never reboot immediately: the next poll reconciles row changes and retries desired failed sources,
+so a repeatedly stopping source cannot starve discovery. The notifier belongs to the Engine from
+construction. If a table version moved but fetching its rows fails, that tick does not retry cached
+rows. The standalone binary retains its process exit codes.
+
+Authentication secrets, environment-derived TTL/deadline knobs, pool capacity policy, backfill
+settings, and the StatsD transport remain host-wide. Source database URLs, slots, publications,
+tables, and storage paths remain source-specific. `PostgresSetup::ExternallyManaged` means the
+consumer's migration/bootstrap step owns publications, slots, replica identity, and grants; the
+Engine verifies them.
 
 ## Shape gateway authentication
 

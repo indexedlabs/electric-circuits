@@ -401,7 +401,7 @@ pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: cr
 /// **untouched** — their last real value, never a fabricated zero (a zero would read as "no lag",
 /// which is the opposite of what a missing slot means).
 async fn sample_replication_slot(pg_url: &str, slot: &str) -> anyhow::Result<()> {
-    let client = crate::pg::pool_for(pg_url).get().await?;
+    let client = crate::pg::connect(pg_url).await?;
     let q = "select pg_current_wal_lsn()::text, restart_lsn::text, confirmed_flush_lsn::text, active \
              from pg_replication_slots where slot_name = $1";
     let Some(row) = client.query_opt(q, &[&slot]).await? else {

@@ -66,8 +66,11 @@ Task 2.2 moved it back to the host as a bitmap — which re-provides the structu
 delete exists iff `remove()` returns true, same lock scope) while being far lighter and needing
 no spill. §3–§4 below.
 
-(The Electric `/v1/shape` adapter additionally keeps a TTL-evicted per-handle key set in
-`electric.rs` for protocol filtering — same order, handle-scoped, dropped on idle.)
+The Electric `/v1/shape` adapter keeps a key set per handle in an Engine-owned registry.
+Its evictor releases idle subscriptions on that Engine, including snapshot-only readers. Empty
+registries release their map capacity. Close drops the stopped Engine's registry and joins its tasks
+and circuit threads; source replacements cannot use predecessor or foreign handles. The adapter's
+heap estimate is per Engine. Other metrics remain process-wide until the observability follow-up.
 
 ### Across subquery shapes — the outer-shape conjunct index
 

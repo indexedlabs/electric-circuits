@@ -159,11 +159,11 @@ impl PgConnectionConfig {
         Self::resolve(url, ca_bundle.as_deref(), server_name.as_deref())
     }
 
-    async fn connect(&self) -> Result<Client> {
+    async fn connect(&self, owner: Option<&crate::shutdown::ShutdownToken>) -> Result<Client> {
         match &self.tls {
             PgTlsPolicy::Disabled => {
                 let (client, connection) = self.query.connect(NoTls).await.context("connect postgres")?;
-                tokio::spawn(async move {
+                spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
                         tracing::error!("postgres connection error: {error}");
                     }
@@ -174,7 +174,7 @@ impl PgConnectionConfig {
                 let connector = MakeRustlsConnect::new(rustls_client_config(ca_bundle)?);
                 let (client, connection) =
                     self.query.connect(connector).await.context("connect postgres with verified TLS")?;
-                tokio::spawn(async move {
+                spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
                         tracing::error!("postgres TLS connection error: {error}");
                     }
@@ -294,14 +294,14 @@ fn percent_decode(value: &str) -> String {
 }
 
 /// Connect and drive the connection on a background task. Returns the query `Client`.
-/// For per-request work (backfills, query-backs, subset queries) prefer [`pool_for`] — a fresh
+/// For per-request work (backfills, query-backs, subset queries) prefer an Engine-owned [`Pool`] — a fresh
 /// TCP+auth handshake per shape creation is the fleet benchmark's p99 driver, and thousands of
 /// concurrent creations exhaust ephemeral ports.
 ///
 /// The pool dials through here too, so the boot connection and every pooled one share one config
 /// path — including the connect timeout.
 pub async fn connect(url: &str) -> Result<Client> {
-    PgConnectionConfig::from_process_env(url)?.connect().await
+    PgConnectionConfig::from_process_env(url)?.connect(None).await
 }
 
 // ---- boot-time error taxonomy (issue #13) ------------------------------------------------------
@@ -507,37 +507,31 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
 /// Maximum connections per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_SIZE` (default 20).
 static POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
-/// One shared pool per distinct URL for the process lifetime.
-static POOLS: OnceLock<std::sync::Mutex<HashMap<String, Pool>>> = OnceLock::new();
+// Non-owning inventory preserves the existing process-wide settle statistics until PR B.
+static LIVE_POOLS: std::sync::Mutex<Vec<std::sync::Weak<PoolInner>>> = std::sync::Mutex::new(Vec::new());
 
-/// Whether the publication publishes stored generated columns (PG18 `pg_publication.pubgencols`),
-/// resolved once at boot by [`inspect_publication`]. Default `false` — every server before 18, and
-/// PG18's own default.
-static PUBLISH_GENERATED: OnceLock<bool> = OnceLock::new();
-
-/// Record what the publication does with stored generated columns. Call once at boot, before the
-/// first [`fingerprints`].
-pub fn set_publish_generated(v: bool) {
-    let _ = PUBLISH_GENERATED.set(v);
-}
-
-/// Does the publication deliver stored generated columns? Decides whether the schema fingerprint
-/// includes them, so that the catalog's view and the wire's `Relation` message agree by
-/// construction (ADR-0005).
-pub fn publish_generated() -> bool {
-    *PUBLISH_GENERATED.get_or_init(|| false)
-}
-
-/// Set the per-URL pool capacity. Call once at boot, before the first [`pool_for`].
+/// Host-wide capacity; each Engine gets its own pool at this capacity.
 pub fn set_pool_size(size: usize) {
     let _ = POOL_SIZE.set(size.max(1));
 }
 
-/// The shared connection pool for `url` (created on first use).
-pub fn pool_for(url: &str) -> Pool {
-    let pools = POOLS.get_or_init(Default::default);
-    let mut pools = pools.lock().unwrap();
-    pools.entry(url.to_string()).or_insert_with(|| Pool::new(url.to_string(), *POOL_SIZE.get_or_init(|| 20))).clone()
+pub(crate) fn configured_pool_size() -> usize {
+    *POOL_SIZE.get_or_init(|| 20)
+}
+
+fn spawn_connection(
+    owner: Option<&crate::shutdown::ShutdownToken>,
+    future: impl std::future::Future<Output = ()> + Send + 'static,
+) {
+    if let Some(owner) = owner {
+        owner.spawn(future);
+    } else {
+        tokio::spawn(future);
+    }
+}
+
+pub(crate) async fn connect_owned(url: &str, owner: &crate::shutdown::ShutdownToken) -> Result<Client> {
+    PgConnectionConfig::from_process_env(url)?.connect(Some(owner)).await
 }
 
 /// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
@@ -549,6 +543,7 @@ pub struct Pool {
 }
 
 struct PoolInner {
+    shutdown: crate::shutdown::ShutdownToken,
     url: String,
     idle: std::sync::Mutex<Vec<Client>>,
     sem: Arc<tokio::sync::Semaphore>,
@@ -560,13 +555,38 @@ struct PoolInner {
 
 impl Pool {
     pub fn new(url: String, size: usize) -> Pool {
-        Pool {
+        Self::owned(url, size, crate::shutdown::ShutdownToken::new())
+    }
+
+    pub(crate) fn owned(url: String, size: usize, shutdown: crate::shutdown::ShutdownToken) -> Pool {
+        let pool = Pool {
             inner: Arc::new(PoolInner {
-                sequenced: Arc::new(SequencedXids::new(Some(url.clone()), backfill_config().settle, size.max(1))),
+                sequenced: Arc::new(SequencedXids::owned(
+                    Some(url.clone()),
+                    backfill_config().settle,
+                    size.max(1),
+                    shutdown.clone(),
+                )),
+                shutdown,
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
             }),
+        };
+        let mut pools = LIVE_POOLS.lock().unwrap();
+        pools.retain(|pool| pool.strong_count() != 0);
+        pools.push(Arc::downgrade(&pool.inner));
+        pool
+    }
+
+    pub(crate) fn close(&self) {
+        self.inner.shutdown.begin();
+        self.inner.sem.close();
+        self.inner.idle.lock().unwrap().clear();
+        let mut pools = LIVE_POOLS.lock().unwrap();
+        pools.retain(|pool| pool.strong_count() != 0 && !pool.ptr_eq(&Arc::downgrade(&self.inner)));
+        if pools.is_empty() {
+            pools.shrink_to_fit();
         }
     }
 
@@ -589,6 +609,12 @@ impl Pool {
     }
 }
 
+impl Drop for PoolInner {
+    fn drop(&mut self) {
+        self.shutdown.begin();
+    }
+}
+
 impl PoolInner {
     /// A permit plus a healthy connection: an idle one if there is one, otherwise a new dial.
     async fn checkout(&self) -> Result<(Client, tokio::sync::OwnedSemaphorePermit)> {
@@ -596,7 +622,7 @@ impl PoolInner {
         let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
         let client = match reused {
             Some(c) => c,
-            None => connect(&self.url).await?,
+            None => connect_owned(&self.url, &self.shutdown).await?,
         };
         Ok((client, permit))
     }
@@ -638,6 +664,7 @@ impl PooledClient {
         debug_assert!(!self.transaction_open.load(Ordering::SeqCst), "released with a transaction open");
         if let Some(client) = self.client.take()
             && !client.is_closed()
+            && !self.inner.sem.is_closed()
         {
             self.inner.idle.lock().unwrap().push(client);
         }
@@ -659,7 +686,7 @@ impl Drop for PooledClient {
     fn drop(&mut self) {
         let Some(client) = self.client.take() else { return };
         let permit = self.permit.take();
-        if client.is_closed() {
+        if client.is_closed() || self.inner.sem.is_closed() {
             return; // permit drops here, freeing the slot
         }
         if !self.transaction_open.load(Ordering::SeqCst) {
@@ -672,8 +699,8 @@ impl Drop for PooledClient {
         // `there is no transaction in progress` warning. A failed BEGIN or a COMMIT whose response
         // was lost can conservatively reach this path after PostgreSQL already ended the transaction,
         // so a rare warning is preferable to reusing a connection whose state is uncertain.
-        tokio::spawn(async move {
-            if client.batch_execute("ROLLBACK").await.is_ok() {
+        self.inner.shutdown.spawn(async move {
+            if client.batch_execute("ROLLBACK").await.is_ok() && !inner.sem.is_closed() {
                 inner.idle.lock().unwrap().push(client);
             }
             drop(permit);
@@ -740,7 +767,11 @@ pub async fn list_tables(client: &Client, schema: &str) -> Result<Vec<TableRef>>
 /// DROPped table is detected, by the reconciler and by the drift handler alike. The wanted set is
 /// two bound `text[]` params joined through `unnest`, so neither an odd schema name nor a large
 /// table set turns into interpolated SQL.
-pub async fn fingerprints(client: &Client, tables: &[TableRef]) -> Result<HashMap<TableRef, SchemaFingerprint>> {
+pub async fn fingerprints(
+    client: &Client,
+    tables: &[TableRef],
+    with_generated: bool,
+) -> Result<HashMap<TableRef, SchemaFingerprint>> {
     if tables.is_empty() {
         return Ok(HashMap::new());
     }
@@ -749,7 +780,6 @@ pub async fn fingerprints(client: &Client, tables: &[TableRef]) -> Result<HashMa
     // Stored generated columns are included **iff the publication publishes them** ($3): pgoutput
     // omits them unless `pubgencols = 's'`, and a fingerprint that disagrees with the wire on this
     // would report drift on every single `Relation` message, forever (ADR-0005).
-    let with_generated = publish_generated();
     let rows = client
         .query(
             "select n.nspname, c.relname, c.relreplident::text, \
@@ -815,16 +845,19 @@ pub async fn fingerprints(client: &Client, tables: &[TableRef]) -> Result<HashMa
 /// table_name)` / the quoted qualified `to_regclass`, so same-named tables in different schemas
 /// never cross. Errors when the table does not exist — see [`introspect_opt`] for the caller that
 /// treats "gone" as an outcome rather than a failure.
-pub async fn introspect(client: &Client, table: &TableRef) -> Result<TableDef> {
-    introspect_opt(client, table).await?.with_context(|| format!("table '{table}' not found in postgres"))
+pub async fn introspect(client: &Client, table: &TableRef, with_generated: bool) -> Result<TableDef> {
+    introspect_opt(client, table, with_generated)
+        .await?
+        .with_context(|| format!("table '{table}' not found in postgres"))
 }
 
 /// [`introspect`], but a table Postgres no longer has yields `Ok(None)` instead of an error: the
 /// schema-drift handler must tell "this table was ALTERed" from "this table was DROPped", and
 /// re-introspecting is where it finds out (ADR-0005).
-pub async fn introspect_opt(client: &Client, table: &TableRef) -> Result<Option<TableDef>> {
+pub async fn introspect_opt(client: &Client, table: &TableRef, with_generated: bool) -> Result<Option<TableDef>> {
     let (schema, name) = (table.schema(), table.name());
-    let Some(fingerprint) = fingerprints(client, std::slice::from_ref(table)).await?.remove(table) else {
+    let Some(fingerprint) = fingerprints(client, std::slice::from_ref(table), with_generated).await?.remove(table)
+    else {
         return Ok(None);
     };
     let col_rows = client
@@ -1296,8 +1329,8 @@ pub use settle::{
 /// the process-wide settle counters (checks, retakes, timeouts, rejections, poller ticks/failures,
 /// transactions dropped at the bound) and wait-duration distribution.
 pub fn settle_stats_json() -> serde_json::Value {
-    let pools = POOLS.get_or_init(Default::default).lock().unwrap();
-    settle::stats_json(pools.values().map(|p| &*p.inner.sequenced))
+    let pools: Vec<_> = LIVE_POOLS.lock().unwrap().iter().filter_map(std::sync::Weak::upgrade).collect();
+    settle::stats_json(pools.iter().map(|p| &*p.sequenced))
 }
 
 /// The fences of a settled snapshot (see [`begin_settled_snapshot`]).
@@ -2086,5 +2119,24 @@ pub fn lsn_to_u64(lsn: &str) -> u64 {
             (hi << 32) | lo
         }
         None => 0,
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn same_url_pools_have_independent_settle_records() {
+        let a = Pool::new("postgres://unused/test".into(), 2);
+        let b = Pool::new("postgres://unused/test".into(), 2);
+        assert!(!Arc::ptr_eq(&a.inner, &b.inner));
+        a.sequenced().note(42, ["public.items"]);
+        assert_eq!(a.sequenced().len(), 1);
+        assert_eq!(b.sequenced().len(), 0);
+        a.close();
+        assert!(a.inner.sem.is_closed());
+        assert!(!b.inner.sem.is_closed());
+        b.close();
     }
 }

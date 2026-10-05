@@ -566,7 +566,8 @@ pub struct SequencedXids {
     cfg: SettleConfig,
     /// Bound on the record, in chunks.
     cap_chunks: usize,
-    poller: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    poller: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    shutdown: crate::shutdown::ShutdownToken,
     /// Kicks the poller: a first note into an empty record, or a new waiter.
     wake: tokio::sync::Notify,
     /// Bumped by the poller after every prune; waiters re-check on each bump.
@@ -587,6 +588,15 @@ impl SequencedXids {
     /// A set whose poller reads snapshots from `url` (`None`: never polled). `pool_size` sizes the
     /// default waiter cap.
     pub(super) fn new(url: Option<String>, cfg: SettleConfig, pool_size: usize) -> Self {
+        Self::owned(url, cfg, pool_size, crate::shutdown::ShutdownToken::new())
+    }
+
+    pub(super) fn owned(
+        url: Option<String>,
+        cfg: SettleConfig,
+        pool_size: usize,
+        shutdown: crate::shutdown::ShutdownToken,
+    ) -> Self {
         let max_waiters = if cfg.max_waiters == 0 { (pool_size / 4).max(1) } else { cfg.max_waiters };
         SequencedXids {
             record: Mutex::new(Record::default()),
@@ -594,6 +604,7 @@ impl SequencedXids {
             cap_chunks: (cfg.max_xids.clamp(CHUNK_BITS, MAX_SETTLE_MAX_XIDS) / CHUNK_BITS) as usize,
             cfg,
             poller: Mutex::new(None),
+            shutdown,
             wake: tokio::sync::Notify::new(),
             generation: tokio::sync::watch::channel(0).0,
             waiters: AtomicUsize::new(0),
@@ -809,13 +820,22 @@ impl SequencedXids {
     /// Start the poller if it is not running (never started, or its runtime went away). A set with
     /// no URL, or a caller outside a Tokio runtime, has none.
     fn ensure_poller(self: &Arc<Self>) {
-        let Some(url) = self.url.clone() else { return };
-        let mut slot = self.poller.lock().unwrap();
-        if slot.as_ref().is_some_and(|h| !h.is_finished()) {
+        if self.shutdown.is_shutting_down() {
             return;
         }
-        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
-        *slot = Some(rt.spawn(poll_visibility(self.clone(), url)));
+        let Some(url) = self.url.clone() else { return };
+        let mut slot = self.poller.lock().unwrap();
+        if let Some(handle) = slot.as_mut() {
+            if matches!(handle.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)) {
+                return;
+            }
+        }
+        let Ok(_rt) = tokio::runtime::Handle::try_current() else { return };
+        let set = self.clone();
+        let shutdown = self.shutdown.clone();
+        *slot = Some(self.shutdown.spawn(async move {
+            tokio::select! { _ = shutdown.wait() => {}, _ = poll_visibility(set, url) => {} }
+        }));
     }
 
     /// Wait until none of `pending` (unwrapped) is recorded on `scope`'s tables any more — the
@@ -865,8 +885,8 @@ impl SequencedXids {
     }
 }
 
-/// The poller loop (see [`SequencedXids`]). Runs for the life of its runtime; every set it serves is
-/// a pool's, which lives as long as the process.
+/// The poller loop (see [`SequencedXids`]). Owned by one Engine's pool and task set;
+/// its enclosing shutdown select ends it even when a host request started it.
 async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
     const FAST_START: Duration = Duration::from_millis(1);
     const FAST_MAX: Duration = Duration::from_millis(32);
@@ -894,7 +914,7 @@ async fn poll_visibility(set: Arc<SequencedXids>, url: String) {
             fast = (fast * 2).min(FAST_MAX);
         }
         if client.as_ref().is_none_or(|c| c.is_closed()) {
-            match tokio::time::timeout(QUERY_TIMEOUT, super::connect(&url)).await {
+            match tokio::time::timeout(QUERY_TIMEOUT, super::connect_owned(&url, &set.shutdown)).await {
                 Ok(Ok(c)) => client = Some(c),
                 Ok(Err(e)) => {
                     poller_failed(&format!("{e:#}"), &mut backoff, BACKOFF_MAX).await;

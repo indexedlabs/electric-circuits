@@ -101,6 +101,7 @@ enum Cmd {
 /// Handle to the counts layer. Cheap to clone; readers and the feeder share it.
 #[derive(Clone)]
 pub struct Arrangements {
+    thread: Arc<tokio::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     tx: mpsc::Sender<Cmd>,
     /// Counts pipelines: per table, the group columns and the published count snapshot.
     counts: Arc<HashMap<TableRef, (Vec<usize>, CountSlot)>>,
@@ -149,12 +150,12 @@ impl Arrangements {
         .map_err(|e| anyhow::anyhow!("arrangements: init_circuit: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<Cmd>(256);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("dbsp-arrangements".into())
             .spawn(move || circuit_thread(dbsp, inputs, count_outputs, rx))
             .map_err(|e| anyhow::anyhow!("spawning dbsp-arrangements thread: {e}"))?;
 
-        Ok(Arrangements { tx, counts: count_slots, seeded })
+        Ok(Arrangements { tx, counts: count_slots, seeded, thread: Arc::new(tokio::sync::Mutex::new(Some(thread))) })
     }
 
     /// Feed one change-log batch and wait for the circuit to step. Returns the step's
@@ -248,11 +249,17 @@ impl Arrangements {
         rx.await.unwrap_or((0, 0, String::new()))
     }
 
-    /// Stop the circuit thread. State is in-memory only; there is nothing to persist.
+    /// Stop and join the circuit thread. Counts are reseeded at the next boot.
     pub async fn shutdown(&self) {
+        let mut thread = self.thread.lock().await;
+        let Some(worker) = thread.take() else { return };
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Cmd::Shutdown { resp: tx }).await.is_ok() {
             let _ = rx.await;
+        }
+        match tokio::task::spawn_blocking(move || worker.join()).await {
+            Ok(Ok(())) => {}
+            result => tracing::error!(?result, "circuit thread did not join cleanly"),
         }
     }
 }

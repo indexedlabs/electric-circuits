@@ -160,6 +160,10 @@ column added after readiness, a stored column added while `pubgencols=none`, or 
 `publish_generated_columns` change while the engine is down. A boot-only fix or fingerprint-only fix
 can still reinstall a half-schema during drift recovery.
 
+**OTTO-6003 ownership update.** Publication-generated-column state is now held by each Engine and
+passed explicitly into fingerprinting and re-introspection. This removes the first-source-wins
+problem described above; it does not complete the broader PG18 column-admission requirements below.
+
 **Required correction.** Amend `PG18-001` so the single column-admission function is mandatory on
 every boot, create/join/reactivation, live drift re-introspection, reconciler retry, and catalog restore;
 make the effective publication manifest an input rather than process-global mutable state. Add cases

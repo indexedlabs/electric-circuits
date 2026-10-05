@@ -20,6 +20,91 @@ use electric_circuits_engine::sources::{SourceRow, SourcesSupervisor};
 use tokio::sync::{Mutex, oneshot};
 use tower::ServiceExt;
 
+#[cfg(feature = "test-support")]
+#[path = "sources_table/ownership.rs"]
+mod ownership;
+
+// Every contract owns the server's slot budget until its child exits and cleanup finishes.
+// This lock is only taken by synchronous parent tests, never by an async worker or child.
+static CONTRACT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const CHILD_ENV: &str = "SOURCES_TABLE_TEST_CHILD";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FixtureObjects {
+    slots: Vec<String>,
+    publications: Vec<String>,
+    tables: Vec<String>,
+}
+
+impl FixtureObjects {
+    fn record(&self) -> Result<()> {
+        // Publish the complete ownership list before the first DDL, including partial setup.
+        std::fs::write(std::env::temp_dir().join("fixtures.json"), serde_json::to_vec(self)?)?;
+        Ok(())
+    }
+
+    async fn cleanup(&self) -> Result<()> {
+        let client = pg::connect(&std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL")?).await?;
+        let mut errors = Vec::new();
+        for slot in &self.slots {
+            let result = async {
+                // The child has exited. Wait for any remaining backend on this fixture's slot.
+                client.query("SELECT pg_terminate_backend(active_pid, 5000) FROM pg_replication_slots WHERE slot_name = $1 AND active", &[slot]).await?;
+                client.query("SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1", &[slot]).await?;
+                Ok::<(), anyhow::Error>(())
+            }.await;
+            if let Err(error) = result {
+                errors.push(format!("slot {slot}: {error:#}"));
+            }
+        }
+        for (kind, names) in [("PUBLICATION", &self.publications), ("TABLE", &self.tables)] {
+            for name in names {
+                if let Err(error) = client.batch_execute(&format!("DROP {kind} IF EXISTS {}", quote_ident(name))).await
+                {
+                    errors.push(format!("{kind} {name}: {error:#}"));
+                }
+            }
+        }
+        anyhow::ensure!(errors.is_empty(), "fixture cleanup failed: {}", errors.join("; "));
+        Ok(())
+    }
+}
+
+// Return false only inside the exact child. Parent cleanup also covers errors and panics in setup.
+fn isolated_contract(name: &str, configure: impl FnOnce(&mut std::process::Command)) -> Result<bool> {
+    if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+        return Ok(false);
+    }
+    let _guard = CONTRACT_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let run_root = std::env::temp_dir().join(format!("otto-6003-run-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&run_root)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .args([name, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env(CHILD_ENV, name)
+        .env("TMPDIR", &run_root);
+    configure(&mut command);
+    let output = command.output();
+    let cleanup = (|| -> Result<()> {
+        let manifest = run_root.join("fixtures.json");
+        if manifest.exists() {
+            let objects: FixtureObjects = serde_json::from_slice(&std::fs::read(manifest)?)?;
+            tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(objects.cleanup())?;
+        }
+        std::fs::remove_dir_all(&run_root)?;
+        Ok(())
+    })();
+    if let Err(error) = &cleanup {
+        eprintln!("contract {name}: {error:#}; fixture files: {}", run_root.display());
+    }
+    let output = output?;
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    anyhow::ensure!(output.status.success(), "isolated contract {name} failed: {}", output.status);
+    cleanup?;
+    Ok(true)
+}
+
 #[derive(Clone, Default)]
 struct FeedDs {
     streams: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
@@ -157,9 +242,16 @@ async fn set_revision(client: &tokio_postgres::Client, version_table: &str, revi
     Ok(())
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "requires an isolated real PostgreSQL instance via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Result<()> {
+fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Result<()> {
+    if isolated_contract("sources_table_discovers_restarts_stops_degrades_and_refreshes", |_| {})? {
+        return Ok(());
+    }
+    tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(sources_lifecycle())
+}
+
+async fn sources_lifecycle() -> Result<()> {
     let control_url = std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL").context(
         "ELECTRIC_CIRCUITS_TEST_PG_URL is required for this ignored lifecycle test; a missing value must fail, not skip",
     )?;
@@ -175,6 +267,12 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
     let version_table_sql = quote_ident(&version_table);
     let publication_sql = quote_ident(&publication);
 
+    FixtureObjects {
+        slots: vec![slot.clone()],
+        publications: vec![publication.clone()],
+        tables: vec![sources_table.clone(), version_table.clone(), source_table.clone()],
+    }
+    .record()?;
     client
         .batch_execute(&format!(
             "CREATE TABLE public.{sources_table_sql} (
@@ -349,16 +447,6 @@ async fn sources_table_discovers_restarts_stops_degrades_and_refreshes() -> Resu
     .await;
 
     let _ = ds_stop.send(());
-    let _ = client.execute(&format!("DROP PUBLICATION IF EXISTS {publication_sql}"), &[]).await;
-    let _ = client.execute("SELECT pg_drop_replication_slot($1)", &[&slot]).await;
-    let _ = client
-        .batch_execute(&format!(
-            "DROP TABLE IF EXISTS public.{sources_table_sql};
-             DROP TABLE IF EXISTS public.{version_table_sql};
-             DROP TABLE IF EXISTS public.{source_table_sql};"
-        ))
-        .await;
-    let _ = std::fs::remove_file(secret_file);
-    let _ = std::fs::remove_dir_all(storage_dir);
+    // The parent removes PostgreSQL objects and files after this child exits.
     result
 }

@@ -20,6 +20,9 @@
 //! | `75` | a counts pipeline must be rebuilt (schema drift or an epoch reset on a circuit-served table); restart to re-seed it |
 //! | `78` | **boot refused** (`EX_CONFIG`): a misconfiguration retrying cannot fix — a setting the config resolver rejected (an unparseable `ELECTRIC_CIRCUITS_PG_URL`, an unusable `ELECTRIC_CIRCUITS_PG_TABLES`, an out-of-range byte budget, a missing `ELECTRIC_CIRCUITS_DS_URL`, an unwritable spill directory), or a fatal Postgres condition — bad credentials, a missing privilege, an unknown database, `wal_level` ≠ `logical`, a publication with a column list, an unreadable durable catalog |
 //!
+//! In sources mode, catalog refusal and circuit rebuild restart only the affected source.
+//! Failed source starts retry on the existing poll interval without a row revision change.
+//!
 //! A **retryable** Postgres condition — connection refused, DNS, a timeout, "the database system is
 //! starting up" — is not an exit at all: the boot backs off (1 s → 30 s, jittered) and tries again
 //! forever, answering `GET /ready` with `503 {"status":"waiting"}` throughout. Kubernetes gates
@@ -151,7 +154,7 @@ async fn main() -> Result<()> {
         tracing::warn!("ELECTRIC_CIRCUITS_FAULT active: {:?}", electric_circuits_engine::fault::active());
     }
 
-    // Size the shared Postgres pool (backfills, query-backs, subset queries) and publish the
+    // Set the capacity policy for each Engine Postgres pool (backfills, query-backs, subset queries) and publish the
     // backfill streaming budget before first use.
     electric_circuits_engine::pg::set_pool_size(config.db_pool_size);
     electric_circuits_engine::pg::set_backfill_config(config.backfill);
@@ -160,7 +163,12 @@ async fn main() -> Result<()> {
     // backfill. Enabled by a resolved pg_url (ELECTRIC_CIRCUITS_PG_URL or DATABASE_URL).
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
-            let engine = Engine::new_pg(admission, url.clone());
+            let engine = Engine::new_with_config(
+                admission,
+                Some(url.clone()),
+                electric_circuits_engine::engine::PostgresSetup::EngineManaged,
+                &config,
+            );
             // The dbsp arrangement circuit is mandatory infrastructure — always configured.
             tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
             engine.set_dbsp_config(config.dbsp.clone());
@@ -172,7 +180,12 @@ async fn main() -> Result<()> {
         _ => {
             // Library mode: no Postgres source; the engine is `active` from construction. Shutdown
             // and readiness still apply — there is simply nothing Postgres-shaped to wait for.
-            let engine = Engine::new(admission);
+            let engine = Engine::new_with_config(
+                admission,
+                None,
+                electric_circuits_engine::engine::PostgresSetup::EngineManaged,
+                &config,
+            );
             statsd::consumers_ready(engine.table_count().await as u64);
             engine
         }
@@ -240,7 +253,7 @@ async fn main() -> Result<()> {
             tracing::info!("postgres mode: {tables} table(s), slot '{}', streaming pgoutput", config.slot);
             statsd::consumers_ready(tables as u64);
             // Replication-slot gauges (engine-owned: `/metrics`, `/metrics/prometheus` AND StatsD
-            // read the same ~10 s sample, taken on a POOLED connection).
+            // read the same ~10 s sample, taken on a fresh connection).
             electric_circuits_engine::metrics::spawn_replication_slot_sampler(
                 url,
                 config.slot.clone(),
@@ -413,32 +426,8 @@ async fn await_signal_and_begin(engine: Engine, shutdown: ShutdownToken, ready_d
 /// The whole thing is bounded by `grace`. Running out of it is not silent: the parties still
 /// outstanding are named and the process exits [`shutdown::EXIT_SHUTDOWN_FORCED`], because "exited
 /// 0" must mean "everything got to a clean point".
-async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Duration) -> shutdown::ShutdownOutcome {
-    let started = std::time::Instant::now();
-    // Measured from the SIGNAL, not from here: the readiness-drain window already spent part of it.
-    let left = grace.saturating_sub(shutdown.elapsed().unwrap_or_default());
-    if !shutdown.wait_for_parties(left).await {
-        tracing::error!(
-            "shutdown grace of {grace:?} elapsed with {:?} still running; exiting {}. \
-             Raise ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS if a commit of this size needs longer.",
-            shutdown.outstanding(),
-            shutdown::EXIT_SHUTDOWN_FORCED
-        );
-        return shutdown::ShutdownOutcome::Forced;
-    }
-    // The sequencer's final `Offset` is queued, not written: draining is what makes the checkpoint
-    // durable, and with it the restart point the next boot resumes from.
-    let catalog_budget = grace.saturating_sub(shutdown.elapsed().unwrap_or_default()).min(shutdown::CATALOG_DRAIN);
-    if !engine.drain_catalog(catalog_budget).await {
-        tracing::error!(
-            "the durable catalog writer did not drain within {catalog_budget:?}; the final checkpoint may be \
-             missing and the next boot will replay from the previous one; exiting {}",
-            shutdown::EXIT_SHUTDOWN_INCOMPLETE
-        );
-        return shutdown::ShutdownOutcome::CatalogIncomplete;
-    }
-    tracing::info!("shutdown complete in {:?}", started.elapsed());
-    shutdown::ShutdownOutcome::Complete
+async fn finish_shutdown(engine: &Engine, _shutdown: &ShutdownToken, grace: Duration) -> shutdown::ShutdownOutcome {
+    engine.close(grace).await
 }
 
 /// Refuse the boot: name the class of failure, print the whole error chain, exit [`pg::EXIT_CONFIG`].

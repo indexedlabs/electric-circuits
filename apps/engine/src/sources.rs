@@ -95,6 +95,9 @@ pub struct SourcesSupervisor {
 }
 
 struct SupervisorInner {
+    #[cfg(feature = "test-support")]
+    poll_completed: tokio::sync::watch::Sender<()>,
+    restart_notify: Arc<tokio::sync::Notify>,
     config: Config,
     sources: SourcesConfig,
     state: Mutex<SupervisorState>,
@@ -144,6 +147,9 @@ impl SourcesSupervisor {
         }
         Ok(Self {
             inner: Arc::new(SupervisorInner {
+                #[cfg(feature = "test-support")]
+                poll_completed: tokio::sync::watch::channel(()).0,
+                restart_notify: Arc::new(tokio::sync::Notify::new()),
                 config,
                 sources,
                 state: Mutex::new(SupervisorState {
@@ -176,6 +182,13 @@ impl SourcesSupervisor {
 
     pub fn shutdown_token(&self) -> ShutdownToken {
         self.inner.shutdown.clone()
+    }
+
+    /// Borrow a source Engine for lifecycle observations; callers must drop the clone before stop.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn engine_for_test(&self, source_id: &str) -> Option<Engine> {
+        self.inner.state.lock().await.running.get(source_id).map(|runtime| runtime.engine.clone())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -240,6 +253,13 @@ impl SourcesSupervisor {
         self.apply_snapshot(snapshot).await
     }
 
+    /// Observe completed real poll ticks without requesting a refresh or driving reconciliation.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn poll_completed_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.inner.poll_completed.subscribe()
+    }
+
     pub fn spawn_poll(&self) {
         let supervisor = self.clone();
         let handle = tokio::spawn(async move {
@@ -259,6 +279,13 @@ impl SourcesSupervisor {
                             }
                             tracing::warn!(error = %error, "sources poll failed");
                         }
+                        // A slow failed boot must not consume overdue ticks in a reboot burst.
+                        interval.reset();
+                        #[cfg(feature = "test-support")]
+                        supervisor.inner.poll_completed.send_replace(());
+                    }
+                    _ = supervisor.inner.restart_notify.notified() => {
+                        supervisor.restart_failed_engines().await;
                     }
                 }
             }
@@ -266,6 +293,42 @@ impl SourcesSupervisor {
         let previous = self.inner.poll_task.lock().unwrap().replace(handle);
         if let Some(previous) = previous {
             previous.abort();
+        }
+    }
+
+    async fn restart_failed_engines(&self) {
+        let _guard = self.inner.reconcile.lock().await;
+        self.collect_stopped_engines().await;
+    }
+
+    // Caller owns reconciliation. A notification only stops/queues; poll ticks own retries.
+    async fn collect_stopped_engines(&self) {
+        if self.inner.shutdown.is_shutting_down() {
+            return;
+        }
+        let ids: Vec<_> = self
+            .inner
+            .state
+            .lock()
+            .await
+            .running
+            .iter()
+            .filter(|(_, runtime)| runtime.engine.shutdown_token().is_shutting_down())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let runtime = self.inner.state.lock().await.running.remove(&id);
+            if let Some(mut runtime) = runtime {
+                let row = runtime.row.clone();
+                self.inner.state.lock().await.failed.insert(
+                    id.clone(),
+                    FailedSource { row: row.clone(), error: "source restarting after Engine failure".into() },
+                );
+                if let Err(error) = stop_runtime(&mut runtime).await {
+                    tracing::warn!(source_id = %id, %error, "failed Engine worker did not join");
+                }
+                drop(runtime);
+            }
         }
     }
 
@@ -294,22 +357,35 @@ impl SourcesSupervisor {
         if self.inner.shutdown.is_shutting_down() {
             return Ok(());
         }
-        match self.inner.sources.mode {
-            SourcesMode::File => {
-                self.refresh().await?;
+        // Discovery and retries share the refresh/restart lock: the cached failed rows are still
+        // desired by the latest applied snapshot, and a concurrent refresh cannot replace them.
+        let _guard = self.inner.reconcile.lock().await;
+        self.collect_stopped_engines().await;
+        let mut changed_table_snapshot = false;
+        let refreshed = async {
+            let changed = match self.inner.sources.mode {
+                SourcesMode::File => true,
+                SourcesMode::Table => {
+                    let revision = self.read_control_revision().await?;
+                    self.inner.state.lock().await.last_revision != Some(revision)
+                }
+            };
+            if changed {
+                changed_table_snapshot = matches!(self.inner.sources.mode, SourcesMode::Table);
+                let snapshot = self.fetch_snapshot().await?;
+                // apply_snapshot already attempts each desired failed row once.
+                self.apply_snapshot(snapshot).await?;
             }
-            SourcesMode::Table => {
-                let revision = self.read_control_revision().await?;
-                if self.inner.shutdown.is_shutting_down() {
-                    return Ok(());
-                }
-                let unchanged = self.inner.state.lock().await.last_revision == Some(revision);
-                if !unchanged {
-                    self.refresh().await?;
-                }
+            Ok::<_, anyhow::Error>(changed)
+        }
+        .await;
+        if !matches!(refreshed, Ok(true)) && !changed_table_snapshot {
+            let rows: Vec<_> = self.inner.state.lock().await.failed.values().map(|failed| failed.row.clone()).collect();
+            for row in rows {
+                self.start_or_record(row).await;
             }
         }
-        Ok(())
+        refreshed.map(|_| ())
     }
 
     async fn run_unless_shutdown<T, E, F>(&self, fut: F) -> Result<T>
@@ -464,6 +540,7 @@ impl SourcesSupervisor {
         let config = self.inner.config.clone();
         let grace = config.shutdown_grace;
         let host_shutdown = self.inner.shutdown.clone();
+        let restart_notify = self.inner.restart_notify.clone();
         let source_id = row.source_id.clone();
         let row_for_thread = row.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -478,23 +555,18 @@ impl SourcesSupervisor {
                         return;
                     }
                 };
-                let booted = runtime.block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = host_shutdown.wait() => Err(anyhow::anyhow!("source start interrupted by shutdown")),
-                        result = boot_source(config, row_for_thread) => result,
-                    }
-                });
+                let booted = runtime.block_on(boot_source(config, row_for_thread, host_shutdown, restart_notify));
                 match booted {
                     Ok((engine, router)) => {
                         let shutdown = engine.shutdown_token();
-                        if ready_tx.send(Ok((engine, router))).is_err() {
+                        if ready_tx.send(Ok((engine.clone(), router))).is_err() {
                             shutdown.begin();
                         }
                         runtime.block_on(async move {
                             shutdown.wait().await;
-                            if !shutdown.wait_for_parties(grace).await {
-                                tracing::warn!("source shutdown grace elapsed with work still in flight");
+                            let outcome = engine.close(grace).await;
+                            if outcome != crate::shutdown::ShutdownOutcome::Complete {
+                                tracing::warn!(?outcome, "source close requires replay");
                             }
                         });
                     }
@@ -565,20 +637,40 @@ async fn stop_runtime(runtime: &mut SourceRuntime) -> Result<()> {
     Ok(())
 }
 
-async fn boot_source(config: Config, row: SourceRow) -> Result<(Engine, Router)> {
-    let database_url = resolve_database_secret(&row.database_secret).await?;
-    let child = source_engine_config(&config, &row, &database_url)?;
-    child.txn.probe().context("probe source transaction spill directory")?;
-    let (ds, scope) = source_ds(&config, &row.source_id).await?;
-    let admission = Engine::admit_store(ds, StoreBound::coupled_v1(&scope), config.initialize_namespace).await?;
-    let engine = Engine::new_pg_with_setup(admission, database_url, PostgresSetup::ExternallyManaged);
+async fn boot_source(
+    config: Config,
+    row: SourceRow,
+    host_shutdown: ShutdownToken,
+    restart_notify: Arc<tokio::sync::Notify>,
+) -> Result<(Engine, Router)> {
+    let prepare = async {
+        let database_url = resolve_database_secret(&row.database_secret).await?;
+        let child = source_engine_config(&config, &row, &database_url)?;
+        child.txn.probe().context("probe source transaction spill directory")?;
+        let (ds, scope) = source_ds(&config, &row.source_id).await?;
+        let admission = Engine::admit_store(ds, StoreBound::coupled_v1(&scope), config.initialize_namespace).await?;
+        Ok::<_, anyhow::Error>((database_url, child, admission))
+    };
+    let (database_url, child, admission) = tokio::select! {
+        biased;
+        _ = host_shutdown.wait() => bail!("source start interrupted by shutdown"),
+        prepared = prepare => prepared?,
+    };
+    let engine =
+        Engine::new_supervised(admission, Some(database_url), PostgresSetup::ExternallyManaged, &child, restart_notify);
     engine.set_dbsp_config(child.dbsp.clone());
     engine.set_txn_config(child.txn.clone());
-    engine
-        .setup_postgres(&child.tables, &row.slot)
-        .await
-        .with_context(|| format!("activate source {}", row.source_id))?;
+    let activated = tokio::select! {
+        biased;
+        _ = host_shutdown.wait() => Err(anyhow::anyhow!("source start interrupted by shutdown")),
+        result = engine.setup_postgres(&child.tables, &row.slot) => result.with_context(|| format!("activate source {}", row.source_id)),
+    };
+    if let Err(error) = activated {
+        engine.close(child.shutdown_grace).await;
+        return Err(error);
+    }
     if engine.readiness_status() != "active" {
+        engine.close(child.shutdown_grace).await;
         bail!("source {} did not become active", row.source_id);
     }
     Ok((engine.clone(), crate::http::router_with_introspection(engine, child.trace)))
@@ -603,6 +695,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
         "ELECTRIC_CIRCUITS_PG_TABLES" => Some(tables.clone()),
         "ELECTRIC_STORAGE_DIR" => Some(source_root.to_string_lossy().into_owned()),
         "ELECTRIC_CIRCUITS_DBSP_DIR" => Some(source_root.join("dbsp").to_string_lossy().into_owned()),
+        "ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR" => Some(source_root.join("subq").to_string_lossy().into_owned()),
         "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some(source_root.join("txn-spill").to_string_lossy().into_owned()),
         "ELECTRIC_CIRCUITS_DS_URL" => base.ds_url.clone(),
         "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST" => base.ds_in_process_test_url.as_ref().map(|_| "1".to_string()),
@@ -610,6 +703,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
         _ => std::env::var(name).ok(),
     })?;
     child.sources = None;
+    child.subq_storage.own_children_in(source_root.join("subq"));
     child.dbsp = base.dbsp.clone();
     child.dbsp.dir = source_root.join("dbsp");
     child.txn = base.txn.clone();
@@ -1254,5 +1348,62 @@ mod tests {
             .await
             .expect("shutdown must join the poll task");
         let _ = std::fs::remove_file(file);
+    }
+
+    #[tokio::test]
+    async fn review_r1_fatal_stop_queues_without_an_immediate_boot_attempt() {
+        let supervisor = SourcesSupervisor::new(file_mode_config("/unused")).unwrap();
+        let row = valid_row("alpha", 1, "file:/missing-otto-r1-secret");
+        let engine = Engine::new_supervised_for_test(supervisor.inner.restart_notify.clone());
+        engine.shutdown_token().restart_or_exit(75);
+        supervisor
+            .inner
+            .state
+            .lock()
+            .await
+            .running
+            .insert("alpha".into(), SourceRuntime { row, engine: engine.clone(), router: Router::new(), worker: None });
+        supervisor.restart_failed_engines().await;
+        let error = supervisor.inner.state.lock().await.failed["alpha"].error.clone();
+        engine.close(std::time::Duration::from_secs(1)).await;
+        assert!(!error.contains("resolve failed"), "restart notification attempted boot before a poll tick: {error}");
+    }
+
+    #[tokio::test]
+    async fn review_r1_source_spill_children_are_unique() -> Result<()> {
+        let mut base = file_mode_config("/unused");
+        let root = std::env::temp_dir().join(format!("otto-r1-source-spill-{}", uuid::Uuid::new_v4()));
+        base.sources.as_mut().unwrap().storage_dir = root.clone();
+        let row = valid_row("alpha", 1, "file:/unused");
+        let child = source_engine_config(&base, &row, "postgres://localhost/unused")?;
+        let mut dead = std::process::Command::new("true").spawn()?;
+        let dead_pid = dead.id();
+        dead.wait()?;
+        let stale = root.join(format!("alpha/subq/{dead_pid}-0"));
+        std::fs::create_dir_all(&stale)?;
+        std::fs::write(stale.join("stale-cache"), "old")?;
+        let first = crate::subq_circuit::MembershipCircuit::start_config(&child.subq_storage)?;
+        let second = crate::subq_circuit::MembershipCircuit::start_config(&child.subq_storage);
+        let count =
+            std::fs::read_dir(root.join("alpha/subq"))?.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count();
+        let stale_removed = !stale.exists();
+        first.shutdown().await;
+        let remaining = std::fs::read_dir(root.join("alpha/subq"))
+            .map(|entries| entries.filter_map(|e| e.ok()).filter(|e| e.path().is_dir()).count())
+            .unwrap_or(0);
+        if let Ok(second) = &second {
+            second.shutdown().await;
+        }
+        let _ = std::fs::remove_dir_all(root);
+        anyhow::ensure!(
+            stale_removed && remaining == 1,
+            "spill sweep must remove dead children, and closing one circuit must preserve the other's child"
+        );
+        anyhow::ensure!(
+            second.is_ok() && count == 2,
+            "two source Engines must own distinct spill children, got {count} children; second circuit started={}",
+            second.is_ok()
+        );
+        Ok(())
     }
 }

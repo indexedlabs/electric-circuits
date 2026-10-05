@@ -135,9 +135,23 @@ struct HandleState {
     offset: String,
 }
 
-fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
-    static H: OnceLock<std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>> = OnceLock::new();
-    H.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+#[derive(Default)]
+pub(crate) struct HandleRegistry {
+    entries: std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>,
+    started: OnceLock<()>,
+}
+
+pub(crate) fn close_handles(engine: &Engine) {
+    // Durable subscriptions retain their existing lease; shutdown adds no per-handle catalog work.
+    drop(std::mem::take(&mut *engine.electric_handles.entries.lock().unwrap()));
+}
+
+/// Observe the serving Engine's registry without creating or renewing a handle.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub async fn registry_usage_for_test(engine: &Engine) -> (usize, usize) {
+    let count = engine.electric_handles.entries.lock().unwrap().len();
+    (count, ttl_registry_heap_bytes(engine).await)
 }
 
 /// Owned-heap estimate of the `/v1/shape` handle registry — the memory probe's
@@ -153,8 +167,8 @@ fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
 /// reads each handle's cursor state with `try_lock` instead of awaiting the async `Mutex` — this
 /// is a best-effort byte estimate, not a request path, so a handle mid-request (lock momentarily
 /// held) is simply skipped for its `keys`/`offset` term rather than blocked on.
-pub(crate) async fn ttl_registry_heap_bytes() -> usize {
-    let map = handles().lock().unwrap();
+pub(crate) async fn ttl_registry_heap_bytes(engine: &Engine) -> usize {
+    let map = engine.electric_handles.entries.lock().unwrap();
     let cap = map.capacity();
     let mut total = (cap * (std::mem::size_of::<(String, Arc<HandleEntry>)>() + 1) * 11) / 10;
     for (id, entry) in map.iter() {
@@ -196,22 +210,23 @@ fn handle_ttl() -> Duration {
     })
 }
 
-/// Spawn (once) the background evictor that cleans up handles idle longer than [`handle_ttl`]:
-/// the per-handle cursor state is dropped and the shape's subscription released (`release_shape`)
+/// Start this Engine's shutdown-aware background evictor once that cleans up handles idle longer than [`handle_ttl`]:
+/// the per-handle cursor state is dropped and the shape's subscription released (`release_subscription`)
 /// — the shape itself is retained and ages through the retention lifecycle. A request arriving
 /// with an evicted handle gets the standard `409 must-refetch` and re-snapshots (rejoining the
 /// retained shape).
-fn ensure_evictor(engine: &Engine) {
-    static STARTED: OnceLock<()> = OnceLock::new();
-    STARTED.get_or_init(|| {
+pub(crate) fn ensure_evictor(engine: &Engine) {
+    engine.electric_handles.started.get_or_init(|| {
         let engine = engine.clone();
-        tokio::spawn(async move {
+        engine.shutdown_token().spawn_background(async move {
             let ttl = handle_ttl();
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let idle: Vec<(String, Arc<HandleEntry>)> = handles()
+                let idle: Vec<(String, Arc<HandleEntry>)> = engine
+                    .electric_handles
+                    .entries
                     .lock()
                     .unwrap()
                     .iter()
@@ -230,7 +245,13 @@ fn ensure_evictor(engine: &Engine) {
                     let Ok(_control) = engine.admit_control() else {
                         continue; // deployment handoff: keep the handle and its subscription intact
                     };
-                    handles().lock().unwrap().remove(&id);
+                    {
+                        let mut entries = engine.electric_handles.entries.lock().unwrap();
+                        entries.remove(&id);
+                        if entries.is_empty() {
+                            entries.shrink_to_fit();
+                        }
+                    }
                     drop(guard);
                     engine.release_subscription(&entry.shape_id, Some(&entry.subscription)).await;
                     tracing::debug!("evicted idle electric handle {id} (shape retained)");
@@ -1023,7 +1044,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         // The suffix keeps handle ids disjoint from shape ids. Each handle holds the one shape
         // subscription its create/join took; the idle evictor releases it with the handle.
         let handle_id = format!("{}h{}", rec.id, next_cursor());
-        handles().lock().unwrap().insert(
+        engine.electric_handles.entries.lock().unwrap().insert(
             handle_id.clone(),
             Arc::new(HandleEntry {
                 stream_path: rec.stream_path.clone(),
@@ -1050,7 +1071,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
     let handle = p.handle.clone().unwrap();
     let entry = {
         // Registry lock held only for the lookup; never across I/O or the per-handle lock.
-        let map = handles().lock().unwrap();
+        let map = engine.electric_handles.entries.lock().unwrap();
         match map.get(&handle) {
             Some(e) => e.clone(),
             None => return Ok(must_refetch()),
