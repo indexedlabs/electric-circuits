@@ -499,7 +499,7 @@ pub struct SubqueryRegistry {
     shape_index: crate::subq_index::SubqueryShapeIndex,
     /// The membership circuit: every node's value set as one dbsp relation; flip detection is
     /// the circuit's incremental distinct (see `crate::subq_circuit`).
-    circuit: crate::subq_circuit::MembershipCircuit,
+    pub(crate) circuit: crate::subq_circuit::MembershipCircuit,
     /// The global pk dictionary shared by the circuit tier: every contributor / feed key is
     /// `(id, pk_id)` where `pk_id = pk_dict.get_or_insert(pk)`. Ids are minted here (when building
     /// assertions) and resolved back to pk strings here (at the emission seam), so the circuit and
@@ -535,6 +535,7 @@ pub struct SubqueryRegistry {
     collect_log: Vec<SubquerySig>,
     ds: DsClient,
     pg_url: Option<String>,
+    pg_pool: Option<crate::pg::Pool>,
     schemas: SchemaMap,
     /// Ordered emission lanes (see `engine::emission`): membership envelopes are enqueued
     /// under this registry's lock — per-stream enqueue order = eval order — and land on their
@@ -572,13 +573,28 @@ impl HeapSize for SubqueryRegistry {
 
 impl SubqueryRegistry {
     pub fn new(ds: DsClient, pg_url: Option<String>) -> Self {
+        let pool = pg_url.as_ref().map(|url| crate::pg::Pool::new(url.clone(), crate::pg::configured_pool_size()));
+        Self::with_pool(
+            ds,
+            pg_url,
+            pool,
+            crate::subq_circuit::MembershipCircuit::start().expect("membership circuit failed to start"),
+        )
+    }
+
+    pub(crate) fn with_pool(
+        ds: DsClient,
+        pg_url: Option<String>,
+        pg_pool: Option<crate::pg::Pool>,
+        circuit: crate::subq_circuit::MembershipCircuit,
+    ) -> Self {
         SubqueryRegistry {
             nodes: HashMap::new(),
             edges: HashMap::new(),
             staged_edges: Vec::new(),
             shapes: HashMap::new(),
             shape_index: crate::subq_index::SubqueryShapeIndex::default(),
-            circuit: crate::subq_circuit::MembershipCircuit::start().expect("membership circuit failed to start"),
+            circuit,
             pk_dict: Arc::new(PkDict::new()),
             next_node_id: 1,
             node_by_id: HashMap::new(),
@@ -591,6 +607,7 @@ impl SubqueryRegistry {
             collect_log: Vec::new(),
             ds,
             pg_url,
+            pg_pool,
             schemas: Arc::new(HashMap::new()),
             lanes: None,
         }
@@ -688,13 +705,14 @@ impl SubqueryRegistry {
     /// stream's emission lane while the caller holds this registry's lock (per-stream FIFO ⇒
     /// append order = eval order — the "data in the right place" invariant). Without lanes
     /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
-    async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>) {
+    async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>) -> Result<()> {
         match &self.lanes {
             Some(l) => l.enqueue(stream_path, envs),
             None => {
-                self.ds.append_reliable(stream_path, &envs).await;
+                self.ds.append_reliable(stream_path, &envs).await?;
             }
         }
+        Ok(())
     }
 
     pub fn set_schemas(&mut self, schemas: SchemaMap) {
@@ -1894,7 +1912,7 @@ impl SubqueryRegistry {
             }
             shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let path = shape.stream_path.clone();
-            self.deliver(&path, envs).await;
+            self.deliver(&path, envs).await?;
             results.push((shape_id, true, net));
         }
         Ok(results)
@@ -2235,7 +2253,7 @@ async fn move_shape_for_value(
             return Ok(None);
         }
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_url.clone());
+        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_pool.clone());
         // In flight from here until the evaluation below: live decisions taken in that window are
         // stamped on the shape and beat whatever this read returns.
         reg.begin_queryback(shape_id);
@@ -2296,7 +2314,7 @@ async fn requery_and_reconcile_parent(
             return Ok(None);
         }
         let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
-        let snapshot = (reg.snapshot_for_table(&n.inner_table)?, reg.pg_url.clone());
+        let snapshot = (reg.snapshot_for_table(&n.inner_table)?, reg.pg_pool.clone());
         // In flight from here until the reconcile below: live contribution decisions taken in that
         // window are stamped on the node and beat whatever this read returns.
         reg.begin_node_queryback(parent_sig);
@@ -2365,7 +2383,7 @@ async fn rederive_shape(
             return Ok(());
         }
         let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
-        let snapshot = (reg.snapshot_for_table(&s.outer_table)?, reg.pg_url.clone());
+        let snapshot = (reg.snapshot_for_table(&s.outer_table)?, reg.pg_pool.clone());
         reg.begin_queryback(shape_id);
         snapshot
     };

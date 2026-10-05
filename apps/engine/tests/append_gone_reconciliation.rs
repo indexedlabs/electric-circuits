@@ -120,7 +120,7 @@ async fn a_false_404_on_a_live_shape_retries_until_the_batch_lands() {
     let (engine, client, ds) = engine_with_one_shape().await;
 
     ds.false_404.store(true, Ordering::SeqCst);
-    let landed = client.append_reliable("shape/s1", &[envelope()]).await;
+    let landed = client.append_reliable("shape/s1", &[envelope()]).await.expect("append while Engine is active");
 
     assert!(landed, "a false 404 must not be reported as a retired stream");
     assert_eq!(ds.shape_appends.load(Ordering::SeqCst), 1, "the batch must reach the stream");
@@ -171,7 +171,7 @@ async fn a_real_404_retires_the_shape_instead_of_leaving_it_stale() {
     let (engine, client, ds) = engine_with_one_shape().await;
 
     ds.stream_lost.store(true, Ordering::SeqCst);
-    let landed = client.append_reliable("shape/s1", &[envelope()]).await;
+    let landed = client.append_reliable("shape/s1", &[envelope()]).await.expect("append while Engine is active");
 
     assert!(!landed, "a stream storage does not have cannot be appended to");
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

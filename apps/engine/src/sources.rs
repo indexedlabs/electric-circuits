@@ -97,6 +97,7 @@ pub struct SourcesSupervisor {
 struct SupervisorInner {
     #[cfg(feature = "test-support")]
     poll_completed: tokio::sync::watch::Sender<()>,
+    restart_notify: Arc<tokio::sync::Notify>,
     config: Config,
     sources: SourcesConfig,
     state: Mutex<SupervisorState>,
@@ -148,6 +149,7 @@ impl SourcesSupervisor {
             inner: Arc::new(SupervisorInner {
                 #[cfg(feature = "test-support")]
                 poll_completed: tokio::sync::watch::channel(()).0,
+                restart_notify: Arc::new(tokio::sync::Notify::new()),
                 config,
                 sources,
                 state: Mutex::new(SupervisorState {
@@ -180,6 +182,13 @@ impl SourcesSupervisor {
 
     pub fn shutdown_token(&self) -> ShutdownToken {
         self.inner.shutdown.clone()
+    }
+
+    /// Borrow a source Engine for lifecycle observations; callers must drop the clone before stop.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn engine_for_test(&self, source_id: &str) -> Option<Engine> {
+        self.inner.state.lock().await.running.get(source_id).map(|runtime| runtime.engine.clone())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -244,12 +253,6 @@ impl SourcesSupervisor {
         self.apply_snapshot(snapshot).await
     }
 
-    #[cfg(feature = "test-support")]
-    #[doc(hidden)]
-    pub async fn engine_for_test(&self, source_id: &str) -> Option<Engine> {
-        self.inner.state.lock().await.running.get(source_id).map(|runtime| runtime.engine.clone())
-    }
-
     /// Observe completed real poll ticks without requesting a refresh or driving reconciliation.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]
@@ -266,6 +269,9 @@ impl SourcesSupervisor {
                 tokio::select! {
                     biased;
                     _ = supervisor.inner.shutdown.wait() => break,
+                    _ = supervisor.inner.restart_notify.notified() => {
+                        supervisor.restart_failed_engines().await;
+                    }
                     _ = interval.tick() => {
                         if supervisor.inner.shutdown.is_shutting_down() {
                             break;
@@ -285,6 +291,38 @@ impl SourcesSupervisor {
         let previous = self.inner.poll_task.lock().unwrap().replace(handle);
         if let Some(previous) = previous {
             previous.abort();
+        }
+    }
+
+    async fn restart_failed_engines(&self) {
+        let _guard = self.inner.reconcile.lock().await;
+        if self.inner.shutdown.is_shutting_down() {
+            return;
+        }
+        let ids: Vec<_> = self
+            .inner
+            .state
+            .lock()
+            .await
+            .running
+            .iter()
+            .filter(|(_, runtime)| runtime.engine.shutdown_token().restart_requested())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            let runtime = self.inner.state.lock().await.running.remove(&id);
+            if let Some(mut runtime) = runtime {
+                let row = runtime.row.clone();
+                self.inner.state.lock().await.failed.insert(
+                    id.clone(),
+                    FailedSource { row: row.clone(), error: "source restarting after Engine failure".into() },
+                );
+                if let Err(error) = stop_runtime(&mut runtime).await {
+                    tracing::warn!(source_id = %id, %error, "failed Engine worker did not join");
+                }
+                drop(runtime);
+                self.start_or_record(row).await;
+            }
         }
     }
 
@@ -313,22 +351,32 @@ impl SourcesSupervisor {
         if self.inner.shutdown.is_shutting_down() {
             return Ok(());
         }
-        match self.inner.sources.mode {
-            SourcesMode::File => {
-                self.refresh().await?;
+        // Discovery and retries share the refresh/restart lock: the cached failed rows are still
+        // desired by the latest applied snapshot, and a concurrent refresh cannot replace them.
+        let _guard = self.inner.reconcile.lock().await;
+        let refreshed = async {
+            let changed = match self.inner.sources.mode {
+                SourcesMode::File => true,
+                SourcesMode::Table => {
+                    let revision = self.read_control_revision().await?;
+                    self.inner.state.lock().await.last_revision != Some(revision)
+                }
+            };
+            if changed {
+                let snapshot = self.fetch_snapshot().await?;
+                // apply_snapshot already attempts each desired failed row once.
+                self.apply_snapshot(snapshot).await?;
             }
-            SourcesMode::Table => {
-                let revision = self.read_control_revision().await?;
-                if self.inner.shutdown.is_shutting_down() {
-                    return Ok(());
-                }
-                let unchanged = self.inner.state.lock().await.last_revision == Some(revision);
-                if !unchanged {
-                    self.refresh().await?;
-                }
+            Ok::<_, anyhow::Error>(changed)
+        }
+        .await;
+        if !matches!(refreshed, Ok(true)) {
+            let rows: Vec<_> = self.inner.state.lock().await.failed.values().map(|failed| failed.row.clone()).collect();
+            for row in rows {
+                self.start_or_record(row).await;
             }
         }
-        Ok(())
+        refreshed.map(|_| ())
     }
 
     async fn run_unless_shutdown<T, E, F>(&self, fut: F) -> Result<T>
@@ -483,6 +531,7 @@ impl SourcesSupervisor {
         let config = self.inner.config.clone();
         let grace = config.shutdown_grace;
         let host_shutdown = self.inner.shutdown.clone();
+        let restart_notify = self.inner.restart_notify.clone();
         let source_id = row.source_id.clone();
         let row_for_thread = row.clone();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -497,23 +546,18 @@ impl SourcesSupervisor {
                         return;
                     }
                 };
-                let booted = runtime.block_on(async {
-                    tokio::select! {
-                        biased;
-                        _ = host_shutdown.wait() => Err(anyhow::anyhow!("source start interrupted by shutdown")),
-                        result = boot_source(config, row_for_thread) => result,
-                    }
-                });
+                let booted = runtime.block_on(boot_source(config, row_for_thread, host_shutdown, restart_notify));
                 match booted {
                     Ok((engine, router)) => {
                         let shutdown = engine.shutdown_token();
-                        if ready_tx.send(Ok((engine, router))).is_err() {
+                        if ready_tx.send(Ok((engine.clone(), router))).is_err() {
                             shutdown.begin();
                         }
                         runtime.block_on(async move {
                             shutdown.wait().await;
-                            if !shutdown.wait_for_parties(grace).await {
-                                tracing::warn!("source shutdown grace elapsed with work still in flight");
+                            let outcome = engine.close(grace).await;
+                            if outcome != crate::shutdown::ShutdownOutcome::Complete {
+                                tracing::warn!(?outcome, "source close requires replay");
                             }
                         });
                     }
@@ -584,20 +628,40 @@ async fn stop_runtime(runtime: &mut SourceRuntime) -> Result<()> {
     Ok(())
 }
 
-async fn boot_source(config: Config, row: SourceRow) -> Result<(Engine, Router)> {
-    let database_url = resolve_database_secret(&row.database_secret).await?;
-    let child = source_engine_config(&config, &row, &database_url)?;
-    child.txn.probe().context("probe source transaction spill directory")?;
-    let (ds, scope) = source_ds(&config, &row.source_id).await?;
-    let admission = Engine::admit_store(ds, StoreBound::coupled_v1(&scope), config.initialize_namespace).await?;
-    let engine = Engine::new_pg_with_setup(admission, database_url, PostgresSetup::ExternallyManaged);
+async fn boot_source(
+    config: Config,
+    row: SourceRow,
+    host_shutdown: ShutdownToken,
+    restart_notify: Arc<tokio::sync::Notify>,
+) -> Result<(Engine, Router)> {
+    let prepare = async {
+        let database_url = resolve_database_secret(&row.database_secret).await?;
+        let child = source_engine_config(&config, &row, &database_url)?;
+        child.txn.probe().context("probe source transaction spill directory")?;
+        let (ds, scope) = source_ds(&config, &row.source_id).await?;
+        let admission = Engine::admit_store(ds, StoreBound::coupled_v1(&scope), config.initialize_namespace).await?;
+        Ok::<_, anyhow::Error>((database_url, child, admission))
+    };
+    let (database_url, child, admission) = tokio::select! {
+        biased;
+        _ = host_shutdown.wait() => bail!("source start interrupted by shutdown"),
+        prepared = prepare => prepared?,
+    };
+    let engine = Engine::new_with_config(admission, Some(database_url), PostgresSetup::ExternallyManaged, &child);
+    engine.shutdown_token().supervise_restarts(restart_notify);
     engine.set_dbsp_config(child.dbsp.clone());
     engine.set_txn_config(child.txn.clone());
-    engine
-        .setup_postgres(&child.tables, &row.slot)
-        .await
-        .with_context(|| format!("activate source {}", row.source_id))?;
+    let activated = tokio::select! {
+        biased;
+        _ = host_shutdown.wait() => Err(anyhow::anyhow!("source start interrupted by shutdown")),
+        result = engine.setup_postgres(&child.tables, &row.slot) => result.with_context(|| format!("activate source {}", row.source_id)),
+    };
+    if let Err(error) = activated {
+        engine.close(child.shutdown_grace).await;
+        return Err(error);
+    }
     if engine.readiness_status() != "active" {
+        engine.close(child.shutdown_grace).await;
         bail!("source {} did not become active", row.source_id);
     }
     Ok((engine.clone(), crate::http::router_with_introspection(engine, child.trace)))
@@ -622,6 +686,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
         "ELECTRIC_CIRCUITS_PG_TABLES" => Some(tables.clone()),
         "ELECTRIC_STORAGE_DIR" => Some(source_root.to_string_lossy().into_owned()),
         "ELECTRIC_CIRCUITS_DBSP_DIR" => Some(source_root.join("dbsp").to_string_lossy().into_owned()),
+        "ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR" => Some(source_root.join("subq").to_string_lossy().into_owned()),
         "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some(source_root.join("txn-spill").to_string_lossy().into_owned()),
         "ELECTRIC_CIRCUITS_DS_URL" => base.ds_url.clone(),
         "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST" => base.ds_in_process_test_url.as_ref().map(|_| "1".to_string()),

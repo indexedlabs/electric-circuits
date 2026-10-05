@@ -229,11 +229,11 @@ pub(crate) struct CatalogWriter {
     tx: mpsc::UnboundedSender<CatalogSend>,
     shutdown: crate::shutdown::ShutdownToken,
     in_flight: Arc<std::sync::atomic::AtomicI64>,
-    /// This process's half of every `eid` it mints: a boot nonce, so two engines writing to the
+    /// This Engine instance's half of every `eid` it mints: a boot nonce, so two engines writing to the
     /// same catalog (a restart, or the same storage adopted by another process) can never mint the
     /// same id for different events. The other half is [`Self::next_eid`].
     eid_nonce: String,
-    /// Monotonic within the process. Together with `eid_nonce` this is the whole identity of an
+    /// Monotonic within the Engine instance. Together with `eid_nonce` this is the whole identity of an
     /// append attempt — no clock, no hashing of the payload (two identical `Left`s ARE two
     /// different events; only a retry of the same one must be de-duplicated).
     next_eid: Arc<std::sync::atomic::AtomicU64>,
@@ -252,7 +252,7 @@ pub(crate) struct CatalogWriter {
 }
 
 impl CatalogWriter {
-    /// Enqueue an event. Infallible by design: a dead writer means the process is going away, and
+    /// Enqueue an event. Infallible by design: a dead writer means this Engine is stopping, and
     /// no caller has a better answer than continuing (the previous code spelled this `let _ =`).
     ///
     /// For an event a CLIENT is being told about — a create, a join, a release, an explicit purge —
@@ -375,7 +375,7 @@ impl CatalogWriter {
 ///
 /// **The writer never drops an event.** A transient failure (transport, timeout, 5xx) retries THAT
 /// event in place, forever, so the log keeps its order and a restart cannot under-restore; a
-/// definite refusal exits [`EXIT_CATALOG_REFUSED`], because an engine whose memory and durable
+/// definite refusal requests a source restart (standalone: [`EXIT_CATALOG_REFUSED`]), because memory and the durable
 /// record disagree has no honest way to continue. The retry loop is bounded in practice by the
 /// shutdown grace: while it is retrying the writer registers a `catalog writer` shutdown party, so
 /// a `SIGTERM` during an outage exits 70 NAMING it rather than looking like a mystery hang.
@@ -390,7 +390,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     let landed_notify = Arc::new(tokio::sync::Notify::new());
     let writer_landed_notify = landed_notify.clone();
     let writer_shutdown = shutdown.clone();
-    tokio::spawn(async move {
+    shutdown.clone().spawn(async move {
         let mut ensured = false;
         // Latches the "catalog stream create failed" line to once per outage (see
         // `ensure_catalog_logged`); it outlives one event because the retry loop below runs per
@@ -411,13 +411,20 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                     map.insert("eid".to_string(), serde_json::Value::String(eid.clone()));
                     serde_json::Value::Object(map)
                 }
-                Ok(other) => refuse(
-                    &ev,
-                    &anyhow::anyhow!("catalog event serialized to a non-object ({other}); it cannot carry an eid"),
-                ),
+                Ok(other) => {
+                    refuse(
+                        &shutdown,
+                        &ev,
+                        &anyhow::anyhow!("catalog event serialized to a non-object ({other}); it cannot carry an eid"),
+                    );
+                    return;
+                }
                 // Not a storage problem and not one waiting fixes: the engine has state it cannot
                 // describe. Same verdict as a refusal, for the same reason.
-                Err(e) => refuse(&ev, &anyhow::Error::new(e).context("catalog event could not be serialized")),
+                Err(e) => {
+                    refuse(&shutdown, &ev, &anyhow::Error::new(e).context("catalog event could not be serialized"));
+                    return;
+                }
             };
             // Held only while an outage is in progress, so the ordinary case leaves
             // `wait_for_parties` untouched (a permanently-registered party would never let a
@@ -439,7 +446,10 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                 match ds.append_json(CATALOG_STREAM, std::slice::from_ref(&json)).await {
                     Ok(()) => break,
                     Err(e) => match if ensured { classify_append(&e) } else { AppendVerdict::Retry } {
-                        AppendVerdict::Refused => refuse(&ev, &e),
+                        AppendVerdict::Refused => {
+                            refuse(&shutdown, &ev, &e);
+                            return;
+                        }
                         AppendVerdict::Retry => {
                             attempt += 1;
                             crate::metrics::metrics().catalog_append_retries.fetch_add(1, Ordering::Relaxed);
@@ -492,9 +502,9 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     }
 }
 
-/// A short, per-process nonce — the namespace half of both the catalog's event ids and the
+/// A short nonce per Engine instance — the namespace half of both the catalog's event ids and the
 /// subscription ids the engine mints (ADR-0008). Not cryptographic and not required to be: it only
-/// has to differ between processes writing to the same catalog, and the pair (start time, address of
+/// has to differ between Engine instances writing to the same catalog, and the pair (start time, address of
 /// a fresh allocation) does that on every platform the engine runs on.
 pub(crate) fn process_nonce() -> String {
     let secs =
@@ -505,17 +515,17 @@ pub(crate) fn process_nonce() -> String {
 }
 
 /// The refusal half of [`spawn_catalog_writer`]: name the event and what storage answered, then
-/// exit. Split out (and `-> !`) so the loop above reads as "retry or die" with no third branch.
-fn refuse(ev: &CatalogEvent, e: &anyhow::Error) -> ! {
+/// stop this Engine. A supervised source requests its own restart; standalone mode exits.
+fn refuse(shutdown: &crate::shutdown::ShutdownToken, ev: &CatalogEvent, e: &anyhow::Error) {
     tracing::error!(
         "durable catalog REFUSED a {} event: {e:#}. Storage answered, and the answer will not change \
          — the engine is now serving state its durable record does not describe, which no restart of \
-         the request and no amount of waiting can reconcile. Exiting {EXIT_CATALOG_REFUSED}: a boot \
+         the request and no amount of waiting can reconcile. Requesting restart ({EXIT_CATALOG_REFUSED} in standalone mode): a boot \
          re-folds the catalog, which is the only way memory becomes consistent with storage again.",
         event_kind(ev)
     );
     std::io::Write::flush(&mut std::io::stderr()).ok();
-    std::process::exit(EXIT_CATALOG_REFUSED)
+    shutdown.restart_or_exit(EXIT_CATALOG_REFUSED)
 }
 
 /// The event's variant name, for the refusal message (`serde` tags it, but only on the way out).
@@ -1511,7 +1521,7 @@ impl Engine {
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
         backfill_and_activate(
             &self.ds,
-            &self.pg_url,
+            &self.pg_pool,
             cmd_tx,
             ts,
             &rec.table,

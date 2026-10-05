@@ -40,19 +40,26 @@ pub(crate) struct EmissionLanes {
 impl EmissionLanes {
     /// Spawn `n` writer tasks. `pending` is the engine's convergence-barrier counter
     /// (`pendingFlips`): incremented per enqueued batch, decremented after its append lands.
-    pub(crate) fn spawn(ds: DsClient, n: usize, pending: Arc<AtomicI64>) -> EmissionLanes {
+    pub(crate) fn spawn(
+        ds: DsClient,
+        n: usize,
+        pending: Arc<AtomicI64>,
+        shutdown: crate::shutdown::ShutdownToken,
+    ) -> EmissionLanes {
         let n = n.max(1);
         let mut lanes = Vec::with_capacity(n);
         for _ in 0..n {
             let (tx, mut rx) = mpsc::unbounded_channel::<Batch>();
             let ds = ds.clone();
             let pending = pending.clone();
-            tokio::spawn(async move {
+            shutdown.spawn_background(async move {
                 while let Some(b) = rx.recv().await {
                     // Reliable: a dropped subquery envelope is permanent divergence for the
                     // shape's subscribers. A retired stream (shape dropped/evicted mid-flight)
                     // discards, correctly.
-                    ds.append_reliable(&b.stream_path, &b.envs).await;
+                    if ds.append_reliable(&b.stream_path, &b.envs).await.is_err() {
+                        return;
+                    }
                     pending.fetch_sub(1, Ordering::SeqCst);
                 }
             });

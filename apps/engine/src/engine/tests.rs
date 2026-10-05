@@ -308,7 +308,14 @@ fn test_subq() -> SubqueryHandle {
     let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
-    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), degrade.clone(), trace_tx);
+    spawn_flip_propagator(
+        registry.clone(),
+        flip_rx,
+        pending_flips.clone(),
+        degrade.clone(),
+        trace_tx,
+        crate::shutdown::ShutdownToken::new(),
+    );
     SubqueryHandle { registry, flip_tx, pending_flips, degrade }
 }
 
@@ -2126,7 +2133,7 @@ async fn emission_lanes_order_and_barrier() {
 
     let ds = crate::ds::DsClient::new_for_in_process_test(&format!("http://{addr}"));
     let pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone());
+    let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone(), crate::shutdown::ShutdownToken::new());
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
     assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));
@@ -2478,7 +2485,6 @@ async fn a_wake_replays_up_to_where_the_pending_buffer_starts() {
 /// it. Every reconnect must re-attest, and the re-derived verdict must be the one in force.
 #[tokio::test]
 async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
-    let _cap = crate::ds::read_cap_test_guard();
     let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
     let paging =
         crate::ds::readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{");
@@ -2492,9 +2498,9 @@ async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
     });
     let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
     ds.refresh_readiness(&identity).await.expect("the boot attestation");
-    assert!(crate::ds::store_advertises_page_cap(), "the boot attestation saw a store that pages");
+    assert!(ds.store_advertises_page_cap(), "the boot attestation saw a store that pages");
     assert_eq!(
-        crate::ds::ds_read_max_bytes(),
+        ds.read_max_bytes(),
         64 * 1024 * 1024,
         "four pages lifted to the append budget, so the engine can read back its own appends"
     );
@@ -2502,7 +2508,7 @@ async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
     // The store is replaced by one that advertises no page while the engine is running.
     *store.readiness_body.lock().unwrap() = Some(crate::ds::readiness_json(&identity));
 
-    let engine = Engine::new_for_in_process_test(ds);
+    let engine = Engine::new_for_in_process_test(ds.clone());
     {
         let mut st = engine.state.lock().await;
         engine.ensure_sequencer(&mut st);
@@ -2516,10 +2522,10 @@ async fn a_reconnect_re_attests_readiness_and_rederives_the_read_cap() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(
-        !crate::ds::store_advertises_page_cap(),
+        !ds.store_advertises_page_cap(),
         "the verdict re-derived on reconnect must be the one the breach policy uses"
     );
-    assert_eq!(crate::ds::ds_read_max_bytes(), 64 * 1024 * 1024, "an uncapped store starts at the uncapped ceiling");
+    assert_eq!(ds.read_max_bytes(), 64 * 1024 * 1024, "an uncapped store starts at the uncapped ceiling");
 }
 
 /// A join that times out purges the shape, but the coalesced scan replaying for it keeps a
@@ -2663,7 +2669,6 @@ async fn an_overflowed_pending_buffer_refuses_activation() {
 /// engine read the page whole and made progress. The cap is raised and the read retried instead.
 #[tokio::test]
 async fn an_uncapped_store_raises_the_read_ceiling_rather_than_latching_degraded() {
-    let _cap = crate::ds::read_cap_test_guard();
     let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
         // No `max_chunk_bytes`: the verdict is Unknown, which is every released store today.
@@ -2674,23 +2679,23 @@ async fn an_uncapped_store_raises_the_read_ceiling_rather_than_latching_degraded
     });
     let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
     ds.refresh_readiness(&identity).await.expect("the boot attestation");
-    let boot_cap = crate::ds::ds_read_max_bytes();
+    let boot_cap = ds.read_max_bytes();
     assert_eq!(boot_cap, 64 * 1024 * 1024, "an uncapped store starts at the uncapped ceiling");
 
-    let engine = Engine::new_for_in_process_test(ds);
+    let engine = Engine::new_for_in_process_test(ds.clone());
     {
         let mut st = engine.state.lock().await;
         engine.ensure_sequencer(&mut st);
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while crate::ds::ds_read_max_bytes() == boot_cap {
+    while ds.read_max_bytes() == boot_cap {
         assert!(
             std::time::Instant::now() < deadline,
             "an oversized read against an uncapped store must raise the ceiling and retry, not halt the engine"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert!(crate::ds::ds_read_max_bytes() > boot_cap);
+    assert!(ds.read_max_bytes() > boot_cap);
     assert_eq!(
         engine.readiness_status(),
         "active",
@@ -2704,7 +2709,6 @@ async fn an_uncapped_store_raises_the_read_ceiling_rather_than_latching_degraded
 /// log in production, and the task cycled under the health check on every restart.
 #[tokio::test]
 async fn a_paged_store_with_a_larger_value_bound_raises_the_cap_rather_than_latching() {
-    let _cap = crate::ds::read_cap_test_guard();
     let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
     let paging = crate::ds::readiness_json(&identity)
         .replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"max_value_bytes\":1073741824,\"reserve\":{");
@@ -2716,23 +2720,23 @@ async fn a_paged_store_with_a_larger_value_bound_raises_the_cap_rather_than_latc
     });
     let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
     ds.refresh_readiness(&identity).await.expect("the boot attestation");
-    let boot_cap = crate::ds::ds_read_max_bytes();
-    assert!(crate::ds::store_advertises_page_cap());
+    let boot_cap = ds.read_max_bytes();
+    assert!(ds.store_advertises_page_cap());
 
-    let engine = Engine::new_for_in_process_test(ds);
+    let engine = Engine::new_for_in_process_test(ds.clone());
     {
         let mut st = engine.state.lock().await;
         engine.ensure_sequencer(&mut st);
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while crate::ds::ds_read_max_bytes() == boot_cap {
+    while ds.read_max_bytes() == boot_cap {
         assert!(
             std::time::Instant::now() < deadline,
             "a value larger than the page is one the store may frame whole; raise the cap and retry, not halt"
         );
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert!(crate::ds::ds_read_max_bytes() > boot_cap);
+    assert!(ds.read_max_bytes() > boot_cap);
     assert_eq!(engine.readiness_status(), "active", "a raised cap is a WARN, not a degraded engine the fleet replaces");
 }
 
@@ -2741,7 +2745,6 @@ async fn a_paged_store_with_a_larger_value_bound_raises_the_cap_rather_than_latc
 /// latch stays.
 #[tokio::test]
 async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it() {
-    let _cap = crate::ds::read_cap_test_guard();
     let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
     let paging = crate::ds::readiness_json(&identity)
         .replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"max_value_bytes\":4194304,\"reserve\":{");
@@ -2753,7 +2756,7 @@ async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it(
     });
     let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
     ds.refresh_readiness(&identity).await.expect("the boot attestation");
-    let engine = Engine::new_for_in_process_test(ds);
+    let engine = Engine::new_for_in_process_test(ds.clone());
     {
         let mut st = engine.state.lock().await;
         engine.ensure_sequencer(&mut st);
@@ -2778,4 +2781,16 @@ async fn private_runtime_marker_is_rejected_before_library_schema_work() {
     assert!(engine.define_schema(&schema).await.unwrap_err().to_string().contains("private"));
     assert!(engine.tracked_tables().await.is_empty());
     assert!(engine.state.lock().await.sequencer.is_none());
+}
+
+#[tokio::test]
+async fn shutdown_append_cannot_be_reported_as_a_completed_flush() {
+    let shutdown = crate::shutdown::ShutdownToken::new();
+    let store = Arc::new(crate::ds::ScriptedStore::default());
+    let ds = DsClient::with_test_store("scripted://cancel".into(), store.clone()).with_shutdown(shutdown.clone());
+    shutdown.begin();
+    let mut pending = HashMap::new();
+    pending.insert("shape/s1".into(), Vec::new());
+    assert!(super::sequencer::flush_pending(&ds, pending).await.is_err());
+    assert!(store.appended.lock().unwrap().is_empty());
 }

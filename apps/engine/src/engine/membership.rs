@@ -58,13 +58,13 @@ pub(crate) fn fold_refcount_flips(
 /// `subquery::EmissionSource::QueryBack`). Discarding it — as this used to — is what let an
 /// older read become a shape stream's last word.
 pub(crate) async fn query_rows_by_col(
-    pg_url: &Option<String>,
+    pg_pool: &Option<crate::pg::Pool>,
     ts: &TableSchema,
     col: usize,
     value: &Value,
 ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
-    let url = pg_url.as_deref().context("membership query-back requires postgres")?;
-    let mut client = crate::pg::pool_for(url).get().await?;
+    let pool = pg_pool.as_ref().context("membership query-back requires postgres")?;
+    let mut client = pool.get().await?;
     let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
     // `collect`, deliberately: a query-back's RESULT is the candidate set — there is no stream to
     // append it to, and it is one key's worth of rows, not a table's. An engine-internal read: never
@@ -78,11 +78,11 @@ pub(crate) async fn query_rows_by_col(
 /// Query all rows of `ts` (full re-derive) from Postgres on a pooled connection, with the read's
 /// snapshot gate (see [`query_rows_by_col`]).
 pub(crate) async fn query_rows_all(
-    pg_url: &Option<String>,
+    pg_pool: &Option<crate::pg::Pool>,
     ts: &TableSchema,
 ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
-    let url = pg_url.as_deref().context("membership query-back requires postgres")?;
-    let mut client = crate::pg::pool_for(url).get().await?;
+    let pool = pg_pool.as_ref().context("membership query-back requires postgres")?;
+    let mut client = pool.get().await?;
     // `collect`: a full re-derive's result IS the in-memory candidate set (see `query_rows_by_col`).
     let scope = crate::pg::SettleScope::internal(&ts.table);
     let (rows, fences) = crate::pg::backfill_where_reader(&mut client, ts, None, &scope).await?.collect().await?;

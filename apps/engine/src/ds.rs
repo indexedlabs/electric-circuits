@@ -562,12 +562,13 @@ fn ds_read_max_ceiling_bytes() -> u64 {
         .unwrap_or(DEFAULT_DS_READ_MAX_CEILING_BYTES)
 }
 
-/// Whether the store this process attested advertises a page size. Together with the value bound it
-/// advertises beside it ([`ADVERTISED_MAX_VALUE_BYTES`]) it decides what an oversized read MEANS:
-/// a store that promised a page AND a value bound the cap already covers has broken its promise,
-/// while one that promised no page, or a value bound above the cap, has answered with a large
-/// value the protocol entitles it to frame whole.
-static STORE_ADVERTISES_PAGE_CAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Capabilities attested for this Engine's store, shared with its HTTP read port.
+#[derive(Default)]
+pub(crate) struct ReadCaps {
+    advertises_page: std::sync::atomic::AtomicBool,
+    effective: std::sync::atomic::AtomicU64,
+    max_value: std::sync::atomic::AtomicU64,
+}
 
 /// What to do about a read that exceeded the body cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,7 +580,7 @@ pub(crate) enum CapBreachOutcome {
     Latch,
 }
 
-/// The policy behind [`raise_read_cap_after_breach`], separated from the process statics so it can
+/// The policy behind [`raise_read_cap_after_breach`], separated from mutable capability state so it can
 /// be exercised as the decision table it is.
 pub(crate) fn cap_after_breach(
     advertises_page: bool,
@@ -606,54 +607,51 @@ pub(crate) fn cap_after_breach(
     if raised <= current { CapBreachOutcome::Latch } else { CapBreachOutcome::Raise { limit: raised } }
 }
 
-/// Decide what an oversized live read means for THIS process, and install the raised cap when the
-/// answer is to retry.
-pub(crate) fn raise_read_cap_after_breach() -> CapBreachOutcome {
-    let outcome = cap_after_breach(
-        STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
-        advertised_max_value_bytes(),
-        configured_ds_read_max_bytes(),
-        ds_read_max_bytes(),
-        ds_read_max_ceiling_bytes(),
-    );
-    if let CapBreachOutcome::Raise { limit } = outcome {
-        EFFECTIVE_READ_MAX_BYTES.store(limit, std::sync::atomic::Ordering::Relaxed);
+impl ReadCaps {
+    /// Decide what an oversized live read means for this Engine, and install the raised cap when the
+    /// answer is to retry.
+    pub(crate) fn raise_read_cap_after_breach(&self) -> CapBreachOutcome {
+        let outcome = cap_after_breach(
+            self.advertises_page.load(std::sync::atomic::Ordering::Relaxed),
+            self.advertised_max_value_bytes(),
+            configured_ds_read_max_bytes(),
+            self.ds_read_max_bytes(),
+            ds_read_max_ceiling_bytes(),
+        );
+        if let CapBreachOutcome::Raise { limit } = outcome {
+            self.effective.store(limit, std::sync::atomic::Ordering::Relaxed);
+        }
+        outcome
     }
-    outcome
-}
 
-/// The cap in force for this process, chosen at boot from the store's readiness. Zero means boot has
-/// not resolved it yet, in which case the configured or default value applies.
-static EFFECTIVE_READ_MAX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static ADVERTISED_MAX_VALUE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub(crate) fn ds_read_max_bytes(&self) -> u64 {
+        match self.effective.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => configured_ds_read_max_bytes().unwrap_or_else(|| DEFAULT_DS_READ_MAX_BYTES.max(ds_read_cap_floor())),
+            installed => installed,
+        }
+    }
+
+    /// The largest single message the attested store said it accepts (`max_value_bytes`), or `None`
+    /// when it advertised none or an unbounded `0`. The store is entitled to frame a value that large
+    /// whole on read, whatever page it advertises beside it.
+    fn advertised_max_value_bytes(&self) -> Option<u64> {
+        match self.max_value.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            value => Some(value),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_advertises_page_cap(&self) -> bool {
+        self.advertises_page.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 fn configured_ds_read_max_bytes() -> Option<u64> {
     std::env::var("ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
-}
-
-pub(crate) fn ds_read_max_bytes() -> u64 {
-    match EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => configured_ds_read_max_bytes().unwrap_or_else(|| DEFAULT_DS_READ_MAX_BYTES.max(ds_read_cap_floor())),
-        installed => installed,
-    }
-}
-
-/// The largest single message the attested store said it accepts (`max_value_bytes`), or `None`
-/// when it advertised none or an unbounded `0`. The store is entitled to frame a value that large
-/// whole on read, whatever page it advertises beside it.
-fn advertised_max_value_bytes() -> Option<u64> {
-    match ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        value => Some(value),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn store_advertises_page_cap() -> bool {
-    STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// An explicit `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` is always obeyed: an operator who names a cap
@@ -668,16 +666,17 @@ pub(crate) fn effective_read_max_bytes(verdict: PageCapVerdict, configured: Opti
     }
 }
 
-async fn read_body_bounded(mut response: reqwest::Response, limit: u64, path: &str) -> Result<String> {
+async fn read_body_bounded(
+    mut response: reqwest::Response,
+    limit: u64,
+    path: &str,
+    max_value_bytes: Option<u64>,
+) -> Result<String> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(anyhow::Error::new)? {
         let size = body.len() as u64 + chunk.len() as u64;
         if size > limit {
             tracing::error!(path, size, limit, "durable-streams response exceeded client body limit");
-            let max_value_bytes = match ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
-                0 => None,
-                value => Some(value),
-            };
             return Err(anyhow::Error::new(ReadCapExceeded {
                 path: path.to_string(),
                 observed: size,
@@ -699,6 +698,7 @@ type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send
 /// invariants and remain on [`DsClient`].  It is private because no external crate is entitled to
 /// rely on this first compatibility-shaped outcome representation.
 pub(crate) trait DurableStreamStore: Send + Sync {
+    fn read_caps(&self) -> Arc<ReadCaps>;
     fn ready<'a>(&'a self) -> StoreFuture<'a>;
     fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a>;
     fn append<'a>(
@@ -717,6 +717,7 @@ pub(crate) trait DurableStreamStore: Send + Sync {
 /// The currently pinned pgxsinkit/durable-streams-rust wire adapter.  It performs exactly one
 /// HTTP request per port call; `DsClient` owns the interpretation and retry policy above it.
 struct HttpDurableStreamsStore {
+    caps: Arc<ReadCaps>,
     base: String,
     http: reqwest::Client,
     /// The long-poll client. Identical to `http` except for its deadlines: reqwest's read timeout
@@ -794,12 +795,12 @@ impl HttpDurableStreamsStore {
         let http = client(timeouts.read, timeouts.request).context("building Durable Streams HTTP client")?;
         let live_http =
             client(timeouts.live_read, timeouts.live_request()).context("building Durable Streams long-poll client")?;
-        Ok(Self { base: config.base_url.clone(), http, live_http })
+        Ok(Self { base: config.base_url.clone(), http, live_http, caps: Arc::default() })
     }
 
     #[cfg(any(test, feature = "test-support"))]
     fn new_in_process(base: String) -> Self {
-        Self { base, http: reqwest::Client::new(), live_http: reqwest::Client::new() }
+        Self { base, http: reqwest::Client::new(), live_http: reqwest::Client::new(), caps: Arc::default() }
     }
 
     /// Test seam: the same client production builds, from explicit deadlines instead of the
@@ -815,6 +816,7 @@ impl HttpDurableStreamsStore {
                 .expect("in-process client")
         };
         Self {
+            caps: Arc::default(),
             base,
             http: client(timeouts.read, timeouts.request),
             live_http: client(timeouts.live_read, timeouts.live_request()),
@@ -842,7 +844,15 @@ impl HttpDurableStreamsStore {
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
         let body = if should_read {
-            Some(read_body_bounded(res, ds_read_max_bytes(), path.unwrap_or("<unknown>")).await)
+            Some(
+                read_body_bounded(
+                    res,
+                    self.caps.ds_read_max_bytes(),
+                    path.unwrap_or("<unknown>"),
+                    self.caps.advertised_max_value_bytes(),
+                )
+                .await,
+            )
         } else {
             None
         };
@@ -851,6 +861,9 @@ impl HttpDurableStreamsStore {
 }
 
 impl DurableStreamStore for HttpDurableStreamsStore {
+    fn read_caps(&self) -> Arc<ReadCaps> {
+        self.caps.clone()
+    }
     fn ready<'a>(&'a self) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.get(format!("{}/_admin/ready", self.base)).send().await.context("GET /_admin/ready")?;
@@ -933,13 +946,15 @@ impl DurableStreamStore for HttpDurableStreamsStore {
 
 #[derive(Clone)]
 pub struct DsClient {
+    shutdown: Option<crate::shutdown::ShutdownToken>,
+    caps: Arc<ReadCaps>,
     base: String,
     scope: StreamScope,
     store: Arc<dyn DurableStreamStore>,
     /// Shared across clones (installed after the engine exists, seen by every copy of the client
     /// from then on). See [`Self::set_gone_reconciler`].
-    reconcile: std::sync::Arc<std::sync::OnceLock<GoneReconciler>>,
-    /// Bytes appended per stream path since this process started (serialized request bodies).
+    reconcile: std::sync::Arc<std::sync::Mutex<Option<GoneReconciler>>>,
+    /// Bytes appended per stream path since this client was created (serialized request bodies).
     /// The durable-streams server exposes no per-stream sizes, so this engine-side accounting is
     /// what the retention disk-budget layer works from. It undercounts streams that already
     /// existed before the process started (restart persistence is the catalog work, GH #8).
@@ -947,6 +962,22 @@ pub struct DsClient {
 }
 
 impl DsClient {
+    pub(crate) fn with_shutdown(mut self, shutdown: crate::shutdown::ShutdownToken) -> Self {
+        self.shutdown = Some(shutdown);
+        self
+    }
+
+    pub(crate) fn read_max_bytes(&self) -> u64 {
+        self.caps.ds_read_max_bytes()
+    }
+    pub(crate) fn raise_read_cap_after_breach(&self) -> CapBreachOutcome {
+        self.caps.raise_read_cap_after_breach()
+    }
+    #[cfg(test)]
+    pub(crate) fn store_advertises_page_cap(&self) -> bool {
+        self.caps.store_advertises_page_cap()
+    }
+
     /// Construct the scoped production client over HTTP or verified HTTPS, optionally with mTLS.
     /// Store readiness and identity verification are required for every transport.
     pub async fn connect(config: DsConnectionConfig) -> Result<Self> {
@@ -963,10 +994,12 @@ impl DsClient {
     /// status behavior; deterministic stores belong in `ds.rs` unit tests.
     fn with_store(base: String, scope: StreamScope, store: Arc<dyn DurableStreamStore>) -> Self {
         DsClient {
+            shutdown: None,
             base,
             scope,
+            caps: store.read_caps(),
             store,
-            reconcile: std::sync::Arc::new(std::sync::OnceLock::new()),
+            reconcile: std::sync::Arc::new(std::sync::Mutex::new(None)),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -994,9 +1027,14 @@ impl DsClient {
     /// Install the reconciler [`Self::append_reliable`] consults before believing a terminal
     /// append answer (see [`GoneVerdict`]). Shared by every clone of this client, including the ones
     /// already handed to the sequencer, the emission lanes and the subquery registry — which is why
-    /// it can be installed after construction. Idempotent: a second install is ignored.
+    /// it can be installed after construction. A second install is ignored while installed; Engine close clears the slot.
     pub fn set_gone_reconciler(&self, reconciler: GoneReconciler) {
-        let _ = self.reconcile.set(reconciler);
+        self.reconcile.lock().unwrap().get_or_insert(reconciler);
+    }
+
+    /// Only Engine close clears the installed callback, after its workers have ended.
+    pub(crate) fn clear_gone_reconciler(&self) {
+        self.reconcile.lock().unwrap().take();
     }
 
     /// Tracked bytes appended to `path` since process start (0 if never appended).
@@ -1060,9 +1098,10 @@ impl DsClient {
         let floor = ds_read_cap_floor();
         let verdict = assess_page_cap(&readiness, configured.unwrap_or_else(|| DEFAULT_DS_READ_MAX_BYTES.max(floor)));
         let cap = effective_read_max_bytes(verdict, configured, floor);
-        EFFECTIVE_READ_MAX_BYTES.store(cap, std::sync::atomic::Ordering::Relaxed);
-        ADVERTISED_MAX_VALUE_BYTES.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
-        STORE_ADVERTISES_PAGE_CAP
+        self.caps.effective.store(cap, std::sync::atomic::Ordering::Relaxed);
+        self.caps.max_value.store(readiness.max_value_bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        self.caps
+            .advertises_page
             .store(matches!(verdict, PageCapVerdict::Compatible { .. }), std::sync::atomic::Ordering::Relaxed);
         // The cap in force is the number an operator needs when a read fails on size, so it is
         // stated at every attestation rather than left to be inferred from the defaults.
@@ -1074,7 +1113,7 @@ impl DsClient {
             max_value_bytes = readiness.max_value_bytes,
             "durable-streams read cap in force"
         );
-        if let Some(advisory) = enforce_page_cap(verdict, ds_read_max_bytes(), require_ds_chunk_cap())? {
+        if let Some(advisory) = enforce_page_cap(verdict, self.read_max_bytes(), require_ds_chunk_cap())? {
             warn_page_cap_once(&advisory);
         }
         Ok(verdict)
@@ -1281,7 +1320,8 @@ impl DsClient {
     /// because the stream was retired (the shape was dropped/evicted mid-flush), which is a clean
     /// no-op. Envelopes are absolute per-pk (`upsert`/`delete` by key), so an at-least-once retry
     /// that double-appends after an ambiguous network failure is idempotent for readers.
-    /// Returns `false` iff the stream is retired (404, 410, or closed).
+    /// Returns `Ok(false)` iff the stream is retired (404, 410, or closed). Shutdown returns an
+    /// error: the sequencer preserves the replay boundary instead of checkpointing the batch.
     ///
     /// Treating a **closed** stream as terminal is sound only for shape streams: their envelopes are
     /// absolute per-pk and the stream is about to be deleted, so the discarded batch has no reader
@@ -1297,14 +1337,27 @@ impl DsClient {
     /// and [`GoneVerdict::Discard`] means the engine has confirmed the stream is gone and has retired
     /// the shape, so the batch has no reader left. Either way the shape's batch is never silently
     /// abandoned while the shape stays registered and stale.
-    pub async fn append_reliable(&self, path: &str, envelopes: &[Envelope]) -> bool {
+    pub async fn append_reliable(&self, path: &str, envelopes: &[Envelope]) -> Result<bool> {
+        if let Some(shutdown) = &self.shutdown {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => bail!("Engine shutdown interrupted a reliable append"),
+                landed = self.append_reliable_inner(path, envelopes) => Ok(landed),
+            }
+        } else {
+            Ok(self.append_reliable_inner(path, envelopes).await)
+        }
+    }
+
+    async fn append_reliable_inner(&self, path: &str, envelopes: &[Envelope]) -> bool {
         let mut attempt = 0u32;
         let mut false_gone = 0u32;
         loop {
             match self.append_once(path, envelopes).await {
                 Ok(_) => return true,
                 Err(AppendError::Gone(status)) => {
-                    let verdict = match self.reconcile.get() {
+                    let reconciler = self.reconcile.lock().unwrap().clone();
+                    let verdict = match reconciler {
                         Some(reconcile) => reconcile(path.to_string()).await,
                         None => GoneVerdict::Discard,
                     };
@@ -1820,43 +1873,60 @@ impl<'de> Deserialize<'de> for StrictJson {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{ScriptedStore, read_cap_test_guard, readiness_json};
+pub(crate) use tests::{ScriptedStore, readiness_json};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The effective read cap is process-wide state that `refresh_readiness` installs, so any test
-    /// that attests a store moves it under every other test in the same binary. Tests that read or
-    /// write it hold this guard: it serialises them and restores the previous values on drop, which
-    /// is what makes their assertions independent of scheduling order.
-    static READ_CAP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    pub(crate) struct ReadCapTestGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        cap: u64,
-        max_value: u64,
-        advertises_page: bool,
+    #[tokio::test]
+    async fn reconciler_slot_is_first_wins_until_close_releases_it() {
+        let client = DsClient::with_test_store("scripted://ownership".into(), Arc::new(ScriptedStore::default()));
+        let owner = Arc::new(());
+        let weak = Arc::downgrade(&owner);
+        client.set_gone_reconciler(Arc::new(move |_| {
+            let owner = owner.clone();
+            Box::pin(async move {
+                drop(owner);
+                GoneVerdict::Retry
+            })
+        }));
+        client.set_gone_reconciler(Arc::new(|_| Box::pin(async { GoneVerdict::Discard })));
+        let callback = client.reconcile.lock().unwrap().clone().expect("installed");
+        assert_eq!(callback("shape/s1".into()).await, GoneVerdict::Retry);
+        drop(callback);
+        assert!(weak.upgrade().is_some());
+        client.clear_gone_reconciler();
+        assert!(weak.upgrade().is_none());
+        client.clear_gone_reconciler();
+        client.set_gone_reconciler(Arc::new(|_| Box::pin(async { GoneVerdict::Discard })));
+        let callback = client.reconcile.lock().unwrap().clone().expect("reinstalled");
+        assert_eq!(callback("shape/s1".into()).await, GoneVerdict::Discard);
     }
 
-    impl Drop for ReadCapTestGuard {
-        fn drop(&mut self) {
-            EFFECTIVE_READ_MAX_BYTES.store(self.cap, std::sync::atomic::Ordering::Relaxed);
-            ADVERTISED_MAX_VALUE_BYTES.store(self.max_value, std::sync::atomic::Ordering::Relaxed);
-            STORE_ADVERTISES_PAGE_CAP.store(self.advertises_page, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn read_cap_test_guard() -> ReadCapTestGuard {
-        // A panicking test must not make every later one fail on a poisoned lock; the guard's whole
-        // job is restoring the statics, which the drop below does either way.
-        let lock = READ_CAP_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        ReadCapTestGuard {
-            _lock: lock,
-            cap: EFFECTIVE_READ_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-            max_value: ADVERTISED_MAX_VALUE_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-            advertises_page: STORE_ADVERTISES_PAGE_CAP.load(std::sync::atomic::Ordering::Relaxed),
-        }
+    #[tokio::test]
+    async fn attestation_and_cap_growth_are_isolated_between_clients() {
+        let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+        let paging = readiness_json(&identity).replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"reserve\":{");
+        let a = DsClient::with_test_store(
+            "scripted://a".into(),
+            Arc::new(ScriptedStore { readiness_body: std::sync::Mutex::new(Some(paging)), ..Default::default() }),
+        );
+        let b = DsClient::with_test_store(
+            "scripted://b".into(),
+            Arc::new(ScriptedStore {
+                readiness_body: std::sync::Mutex::new(Some(readiness_json(&identity))),
+                ..Default::default()
+            }),
+        );
+        a.refresh_readiness(&identity).await.unwrap();
+        b.refresh_readiness(&identity).await.unwrap();
+        assert!(a.store_advertises_page_cap());
+        assert!(!b.store_advertises_page_cap());
+        let before = b.read_max_bytes();
+        assert!(matches!(a.raise_read_cap_after_breach(), CapBreachOutcome::Raise { .. }));
+        assert!(a.read_max_bytes() > before);
+        assert_eq!(b.read_max_bytes(), before);
     }
 
     #[test]
@@ -1869,13 +1939,12 @@ mod tests {
             (16 * 1024 * 1024).max(floor)
         );
         // And with nothing installed, that is what the read path uses.
-        let _guard = read_cap_test_guard();
-        EFFECTIVE_READ_MAX_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(ds_read_max_bytes(), (16 * 1024 * 1024).max(floor));
+        assert_eq!(ReadCaps::default().ds_read_max_bytes(), (16 * 1024 * 1024).max(floor));
     }
 
     #[derive(Default)]
     pub(crate) struct ScriptedStore {
+        pub(crate) caps: Arc<ReadCaps>,
         pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_read_body: bool,
@@ -1926,6 +1995,9 @@ mod tests {
     }
 
     impl DurableStreamStore for ScriptedStore {
+        fn read_caps(&self) -> Arc<ReadCaps> {
+            self.caps.clone()
+        }
         fn ready<'a>(&'a self) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push("ready".to_string());
@@ -1968,7 +2040,7 @@ mod tests {
                         })
                         .is_ok()
                 {
-                    let limit = ds_read_max_bytes();
+                    let limit = self.caps.ds_read_max_bytes();
                     let mut res = response(200);
                     res.body = Some(Err(anyhow::Error::new(ReadCapExceeded {
                         path: path.to_string(),
@@ -2397,7 +2469,6 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_is_reread_and_verdict_rederived_after_reconnect() {
-        let _guard = read_cap_test_guard();
         let identity = StoreIdentityV1::in_process_test_identity();
         let store = Arc::new(ScriptedStore { readiness_body: std::sync::Mutex::new(None), ..Default::default() });
         // Replace the helper's decoded value with a wire body for the first and second connections.

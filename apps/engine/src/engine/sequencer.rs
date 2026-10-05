@@ -168,7 +168,7 @@ pub(crate) fn spawn_sequencer(
     // Registered before the spawn: the shutdown wait must never see "no parties" in the window
     // between deciding to run a sequencer and the task existing.
     let party = shutdown.party("sequencer");
-    tokio::spawn(sequencer_loop(
+    shutdown.clone().spawn(sequencer_loop(
         ds,
         tables,
         start,
@@ -977,7 +977,12 @@ pub(crate) async fn sequencer_loop(
                         }
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
-                        flush_pending(&ds, txn_pending).await;
+                        if let Err(error) = flush_pending(&ds, txn_pending).await {
+                            tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
+                            highwater = txn_highwater;
+                            processing_failed = true;
+                            break;
+                        }
                         if source_fence.is_some() || !runtime_fences.is_empty() {
                             if !wait_for_source_effects(&subq, &shutdown).await {
                                 tracing::error!(
@@ -1143,7 +1148,7 @@ pub(crate) async fn sequencer_loop(
                         // ceiling is raised, the read retried, and the latch kept for an
                         // operator-named cap, a store that broke a value bound it advertised, or a
                         // value past the hard ceiling.
-                        match crate::ds::raise_read_cap_after_breach() {
+                        match ds.raise_read_cap_after_breach() {
                             crate::ds::CapBreachOutcome::Raise { limit } => {
                                 metrics().sequencer_read_cap_raised.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(path = %cap.path, observed = cap.observed, was = cap.limit, now = limit,
@@ -1187,8 +1192,8 @@ pub(crate) async fn sequencer_loop(
         }
     }
     // The loop is only left on shutdown (or on the command channel closing, i.e. the engine going
-    // away). Either way the batch it was in the middle of is fully fanned out and flushed — the
-    // select only chooses at the TOP of the loop — so one last `Offset` makes the position (and the
+    // away). A completed batch is fully flushed; a processing/append failure rewinds to its replay
+    // boundary above. One last `Offset` makes that safe position (and the
     // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
@@ -1373,7 +1378,9 @@ pub(crate) async fn activate_shape(
             }
             if !outs.is_empty() {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
-                ds.append_reliable(&p.stream_path, &outs).await;
+                ds.append_reliable(&p.stream_path, &outs)
+                    .await
+                    .map_err(|error| ActivateFailure::Failed(error.to_string()))?;
             }
         }
         CreateKind::Aggregate { func, col } => {
@@ -1642,7 +1649,7 @@ pub(crate) async fn replay_changes_for_targets(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn backfill_and_activate(
     ds: &DsClient,
-    pg_url: &Option<String>,
+    pg_url: &Option<crate::pg::Pool>,
     cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
     ts: &TableSchema,
     table: &TableRef,
@@ -1719,7 +1726,7 @@ pub(crate) const SHUTTING_DOWN: &str = "engine is shutting down; retry the creat
 #[allow(clippy::too_many_arguments)]
 async fn stream_backfill(
     ds: &DsClient,
-    pg_url: &Option<String>,
+    pg_url: &Option<crate::pg::Pool>,
     ts: &TableSchema,
     pred: &Arc<CompiledPredicate>,
     out_cols: Option<&Arc<Vec<usize>>>,
@@ -1730,7 +1737,7 @@ async fn stream_backfill(
 ) -> anyhow::Result<(crate::pg::SnapshotGate, Option<AggSeed>, u64, BackfillStats)> {
     // Library/no-source mode: the shape simply starts empty (and an aggregate starts at its
     // empty-set value), exactly as the materialising version did.
-    let Some(url) = pg_url.as_deref() else {
+    let Some(pool) = pg_url.as_ref() else {
         return Ok((
             crate::pg::SnapshotGate::passthrough(),
             aggregate.map(|_| AggSeed::default()),
@@ -1740,7 +1747,7 @@ async fn stream_backfill(
     };
     // Typed errors all the way out: a snapshot that could not settle (`pg::SnapshotUnsettled`) must
     // reach the HTTP layer as itself — a retryable 503 — not as a string it can only answer 500 to.
-    let mut client = crate::pg::pool_for(url).get().await?;
+    let mut client = pool.get().await?;
     let scope = crate::pg::SettleScope::request(&ts.table);
     let mut reader = crate::pg::backfill_reader(&mut client, ts, Some(pred.as_ref()), &scope).await?;
 
@@ -2136,7 +2143,7 @@ pub(crate) fn emit_storage_txn_metrics(txn_pending: &HashMap<String, Vec<Envelop
 /// the tailer's processed-offset barrier (published after this returns) must mean "every subscriber
 /// stream reflects the batch". The only non-retried case is a retired stream (404/410/closed — the
 /// shape was dropped or evicted mid-flush), which discards cleanly.
-pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) {
+pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<Envelope>>) -> Result<()> {
     const CAP: usize = 32; // bound in-flight appends so we don't swamp the storage server
     let mut items: Vec<(String, Vec<Envelope>)> = pending.into_iter().collect();
     while !items.is_empty() {
@@ -2147,12 +2154,16 @@ pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<En
             let ds = ds.clone();
             set.spawn(async move {
                 let _t = Timer::new(&metrics().append);
-                ds.append_reliable(&path, &envs).await;
+                ds.append_reliable(&path, &envs).await?;
                 metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, anyhow::Error>(())
             });
         }
-        while set.join_next().await.is_some() {}
+        while let Some(result) = set.join_next().await {
+            result??;
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

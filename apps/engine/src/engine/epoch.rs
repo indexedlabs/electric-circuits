@@ -490,7 +490,8 @@ impl Engine {
         //    of the same name someone else made, a slot whose WAL is gone) is not ours, so it is
         //    dropped rather than adopted. A dedicated connection, never the shared pool: the pool is
         //    where the post-reset backfill storm queues, and the reset must not wait behind it.
-        let client = crate::pg::connect(&url).await.context("epoch reset: connect to postgres")?;
+        let client =
+            crate::pg::connect_owned(&url, &self.shutdown).await.context("epoch reset: connect to postgres")?;
         crate::pg::recreate_slot(&client, &slot).await?;
         // From here until `bind_epoch` succeeds the slot exists but nothing records it. The break is
         // still latched, so a failure here leaves the engine refusing (and, under the auto policy,
@@ -513,7 +514,7 @@ impl Engine {
 
         // The counts pipelines were seeded from a snapshot on the far side of the gap and have no
         // runtime rebuild, so — exactly as for schema drift on a circuit-served table (ADR-0005) —
-        // the process restarts and boot re-seeds them. Only reachable after boot: at boot the reset
+        // the Engine restarts and boot re-seeds them. Only reachable after boot: at boot the reset
         // runs before the circuit is built. Never with a drain outstanding: exiting then would
         // destroy the very records that make the new epoch restorable.
         if self.arrangements.lock().unwrap().is_some() {
@@ -528,10 +529,10 @@ impl Engine {
             tracing::error!(
                 "epoch reset with counts pipelines running: the circuit was seeded before the gap and \
                  has no runtime rebuild, so its counts no longer describe the tables. Restarting the \
-                 process (exit {}): boot re-seeds the circuit in the new epoch.",
+                 Engine (exit {} in standalone mode): boot re-seeds the circuit in the new epoch.",
                 super::drift::EXIT_CIRCUIT_REBUILD
             );
-            std::process::exit(super::drift::EXIT_CIRCUIT_REBUILD);
+            self.shutdown.restart_or_exit(super::drift::EXIT_CIRCUIT_REBUILD);
         }
         Ok(())
     }
@@ -615,7 +616,7 @@ impl Engine {
         }
         // A dedicated connection, not the shared pool: the pool is where shape backfills queue,
         // and the one check that decides whether ingest may resume must never wait behind them.
-        let client = match crate::pg::connect(&url).await {
+        let client = match crate::pg::connect_owned(&url, &self.shutdown).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("epoch check: postgres unreachable ({e:#})");

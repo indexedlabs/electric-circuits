@@ -119,6 +119,8 @@ pub struct Config {
     /// Large-transaction handling on the ingest path (ADR-0003): the per-transaction memory cap
     /// before the buffer spills to disk, the spill directory, and the byte budget for one append.
     pub txn: TxnBufferConfig,
+    /// Per-Engine membership spill cache settings.
+    pub subq_storage: crate::subq_circuit::StorageSettings,
     /// Backfill streaming: the byte budget for one backfill append and the off-by-default
     /// slow-backfill `statement_timeout`.
     pub backfill: crate::pg::BackfillConfig,
@@ -682,6 +684,7 @@ impl Config {
             memory_bytes_log_period,
             dbsp,
             txn,
+            subq_storage: crate::subq_circuit::StorageSettings::resolve(g),
             backfill,
             shutdown_grace,
             shutdown_ready_drain,
@@ -785,7 +788,7 @@ fn redact_url(url: &str) -> String {
     }
 }
 
-// ---- process-global accessors set once at boot (read from request handlers) --------------------
+// ---- host-wide authentication/config accessors set once at boot (metrics stack tags remain host-wide) --------------------
 
 use std::sync::OnceLock;
 

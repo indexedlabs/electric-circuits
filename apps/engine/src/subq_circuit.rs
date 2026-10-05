@@ -95,6 +95,38 @@ impl Assertions {
     }
 }
 
+/// Resolved membership cache settings. Each Engine owns its directory exclusively.
+#[derive(Clone, Debug)]
+pub struct StorageSettings {
+    enabled: bool,
+    dir: Option<String>,
+    min_storage_bytes: usize,
+    cache_mib: usize,
+}
+
+impl StorageSettings {
+    pub(crate) fn resolve(g: impl Fn(&str) -> Option<String>) -> Self {
+        Self {
+            enabled: g("ELECTRIC_CIRCUITS_SUBQ_STORAGE").as_deref() != Some("0"),
+            dir: g("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR").filter(|s| !s.is_empty()),
+            min_storage_bytes: g("ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB")
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(128)
+                .saturating_mul(1024),
+            cache_mib: storage_cache_mib(g("ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB").as_deref()),
+        }
+    }
+
+    fn spill(&self) -> Option<SpillConfig> {
+        self.enabled.then(|| SpillConfig {
+            dir: self.dir.clone().unwrap_or_else(default_spill_dir),
+            min_storage_bytes: self.min_storage_bytes,
+            cache_mib: self.cache_mib,
+            auto: true,
+        })
+    }
+}
+
 /// Disk spilling for the membership circuit's relations (ON by default).
 struct SpillConfig {
     dir: String,
@@ -110,9 +142,8 @@ struct SpillConfig {
     /// 512 MiB, which is why we always pass an explicit value here (see
     /// [`spill_config_from_env`]/[`storage_cache_mib`]) instead of ever leaving this `None`.
     cache_mib: usize,
-    /// Engine-owned temp dir (removed at circuit shutdown — without checkpointing the
-    /// on-disk state is a cache, worthless across boots). `false` = user-specified dir,
-    /// never deleted.
+    /// Remove this exclusively owned cache directory after the circuit thread exits.
+    /// Tests can opt out when inspecting stored batches after shutdown.
     auto: bool,
 }
 
@@ -138,22 +169,12 @@ fn storage_cache_mib(raw: Option<&str>) -> usize {
 /// on shutdown; stale dirs from dead processes are swept best-effort at start).
 ///
 /// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE=0` — disable (fully in-memory relations).
-/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=<path>` — explicit location (kept on shutdown).
+/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=<path>` — exclusive cache location (removed on close).
 /// - `ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB` (default 128).
 /// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` (default 64, TOTAL across all workers/thread-types —
 ///   see [`storage_cache_mib`]; dbsp's own unset-default would be 512 MiB for this circuit).
 fn spill_config_from_env() -> Result<Option<SpillConfig>> {
-    if std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
-        return Ok(None);
-    }
-    let min_kb: usize =
-        std::env::var("ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
-    let cache_mib = storage_cache_mib(std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
-    let (dir, auto) = match std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR") {
-        Ok(d) if !d.is_empty() => (d, false),
-        _ => (default_spill_dir(), true),
-    };
-    Ok(Some(SpillConfig { dir, min_storage_bytes: min_kb * 1024, cache_mib, auto }))
+    Ok(StorageSettings::resolve(|name| std::env::var(name).ok()).spill())
 }
 
 /// A unique engine-owned spill dir: `<tmp>/electric-circuits-subq/<pid>-<seq>`. Sweeps sibling
@@ -242,6 +263,7 @@ impl CircuitBytes {
 /// Handle to the membership circuit. Cheap to clone; the registry and readers share it.
 #[derive(Clone)]
 pub struct MembershipCircuit {
+    thread: Arc<tokio::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     tx: mpsc::Sender<Cmd>,
     members: Slot<MemberSnapshot>,
     contributors: Slot<MapSnapshot>,
@@ -252,6 +274,10 @@ impl MembershipCircuit {
     /// Postgres on registration.
     pub fn start() -> Result<MembershipCircuit> {
         Self::start_full(spill_config_from_env()?)
+    }
+
+    pub(crate) fn start_config(settings: &StorageSettings) -> Result<MembershipCircuit> {
+        Self::start_full(settings.spill())
     }
 
     /// [`start`], with everything explicit (tests).
@@ -309,19 +335,19 @@ impl MembershipCircuit {
         .map_err(|e| anyhow::anyhow!("membership circuit: init_circuit: {e}"))?;
 
         let (tx, rx) = mpsc::channel::<Cmd>(256);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("dbsp-subq".into())
             .spawn(move || {
                 circuit_thread(dbsp, contrib_in, flips_out, rx);
-                // The default spill dir is a per-boot cache (no checkpointing yet): remove it
-                // once the circuit is gone. Explicit dirs are the user's to manage.
+                // Membership storage is a disposable per-Engine cache. The thread removes it
+                // after dbsp has stopped; shutdown joins this cleanup too.
                 if let Some(dir) = cleanup_dir {
                     let _ = std::fs::remove_dir_all(dir);
                 }
             })
             .map_err(|e| anyhow::anyhow!("spawning dbsp-subq thread: {e}"))?;
 
-        Ok(MembershipCircuit { tx, members, contributors })
+        Ok(MembershipCircuit { tx, members, contributors, thread: Arc::new(tokio::sync::Mutex::new(Some(thread))) })
     }
 
     /// Assert, step, and return the step's membership flips. After this returns, snapshot reads
@@ -404,11 +430,17 @@ impl MembershipCircuit {
         rx.await.unwrap_or((0, 0, String::new()))
     }
 
-    /// Stop the circuit thread. State is in-memory only; nothing to persist.
+    /// Stop and join the circuit thread and remove its disposable spill cache.
     pub async fn shutdown(&self) {
+        let mut thread = self.thread.lock().await;
+        let Some(worker) = thread.take() else { return };
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Cmd::Shutdown { resp: tx }).await.is_ok() {
             let _ = rx.await;
+        }
+        match tokio::task::spawn_blocking(move || worker.join()).await {
+            Ok(Ok(())) => {}
+            result => tracing::error!(?result, "circuit thread did not join cleanly"),
         }
     }
 }

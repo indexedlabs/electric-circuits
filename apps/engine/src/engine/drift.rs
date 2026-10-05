@@ -232,7 +232,7 @@ impl Engine {
 
     /// Handle drift on one table: re-introspect, retire every dependent, swap the compiled schema.
     pub(crate) async fn handle_schema_drift(&self, table: &TableRef, observed: DriftSource, txn: Option<TxnRef>) {
-        let Some(url) = self.pg_url.clone() else {
+        let Some(_url) = self.pg_url.clone() else {
             // Library mode: no fingerprints exist, so nothing can call this.
             return;
         };
@@ -246,15 +246,16 @@ impl Engine {
         };
 
         // Postgres is the authority on what the table is now.
-        let client = match crate::pg::pool_for(&url).get().await {
+        let client = match self.pg_pool.as_ref().expect("Postgres Engine pool").get().await {
             Ok(c) => c,
             Err(e) => return self.unresolved(table, &format!("postgres unreachable: {e:#}")).await,
         };
-        let mut def = match crate::pg::introspect_opt(&client, table).await {
-            Ok(Some(def)) => def,
-            Ok(None) => return self.handle_dropped_table(table).await,
-            Err(e) => return self.unresolved(table, &format!("re-introspection failed: {e:#}")).await,
-        };
+        let mut def =
+            match crate::pg::introspect_opt(&client, table, self.publish_generated.load(Ordering::Acquire)).await {
+                Ok(Some(def)) => def,
+                Ok(None) => return self.handle_dropped_table(table).await,
+                Err(e) => return self.unresolved(table, &format!("re-introspection failed: {e:#}")).await,
+            };
 
         // An identity that is no longer FULL is re-asserted before anything else: the engine cannot
         // retract a row without its full old image.
@@ -274,7 +275,7 @@ impl Engine {
             }
             tracing::warn!("restored REPLICA IDENTITY FULL on {table}");
             identity_restored = true;
-            match crate::pg::introspect_opt(&client, table).await {
+            match crate::pg::introspect_opt(&client, table, self.publish_generated.load(Ordering::Acquire)).await {
                 Ok(Some(fresh)) => def = fresh,
                 Ok(None) => return self.handle_dropped_table(table).await,
                 Err(e) => {
@@ -428,7 +429,7 @@ impl Engine {
     /// task, by the reconciler, by a `Relation` message, or by being dropped.
     fn spawn_unresolved_retry(&self, table: TableRef) {
         let engine = self.clone();
-        tokio::spawn(async move {
+        self.shutdown.spawn_background(async move {
             // Clears the slot however this task ends — including a panic — so a later parking of
             // the same table can always start a fresh one.
             let _slot = RetryGuard { retrying: engine.retrying.clone(), table: table.clone() };
@@ -572,13 +573,13 @@ impl Engine {
         tracing::error!(
             "{why} on {table}, which has a counts pipeline: the circuit is built and seeded once at boot \
              and has no runtime rebuild, so its counts no longer describe the table. Restarting the \
-             process (exit {EXIT_CIRCUIT_REBUILD}): boot re-introspects, re-seeds the circuit, and \
+             Engine (exit {EXIT_CIRCUIT_REBUILD} in standalone mode): boot re-introspects, re-seeds the circuit, and \
              restores every other table's shapes from the durable catalog."
         );
         if !self.catalog_tx.drain(std::time::Duration::from_secs(5)).await {
             tracing::error!("catalog writer did not drain before the restart; some drop records may be missing");
         }
-        std::process::exit(EXIT_CIRCUIT_REBUILD);
+        self.shutdown.restart_or_exit(EXIT_CIRCUIT_REBUILD);
     }
 
     /// Spawn (once) the background schema reconciler: DDL with **no following DML** produces no
@@ -589,7 +590,7 @@ impl Engine {
     /// Postgres mode only, and only while `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` is non-zero.
     /// (Unresolved tables are retried by their own task regardless — see [`Self::unresolved`].)
     pub(crate) fn ensure_schema_reconciler(&self) {
-        let Some(url) = self.pg_url.clone() else { return };
+        let Some(_url) = self.pg_url.clone() else { return };
         let interval = reconcile_interval();
         if interval.is_zero() {
             tracing::warn!(
@@ -603,19 +604,19 @@ impl Engine {
             return;
         }
         let engine = self.clone();
-        tokio::spawn(async move {
+        self.shutdown.spawn_background(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // the first tick fires immediately; skip it
             loop {
                 tick.tick().await;
-                engine.reconcile_schemas(&url).await;
+                engine.reconcile_schemas().await;
             }
         });
     }
 
     /// One reconciler pass: compare every tracked table's compiled fingerprint with Postgres's.
-    async fn reconcile_schemas(&self, url: &str) {
+    async fn reconcile_schemas(&self) {
         // Snapshot (table, compiled fingerprint) pairs. Tables without a fingerprint cannot drift.
         let wanted: Vec<(TableRef, SchemaFingerprint)> = {
             let st = self.state.lock().await;
@@ -625,14 +626,15 @@ impl Engine {
             return;
         }
         let tables: Vec<TableRef> = wanted.iter().map(|(t, _)| t.clone()).collect();
-        let client = match crate::pg::pool_for(url).get().await {
+        let client = match self.pg_pool.as_ref().expect("Postgres Engine pool").get().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("schema reconciler: postgres unavailable this tick: {e:#}");
                 return;
             }
         };
-        let live = match crate::pg::fingerprints(&client, &tables).await {
+        let live = match crate::pg::fingerprints(&client, &tables, self.publish_generated.load(Ordering::Acquire)).await
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("schema reconciler: fingerprint query failed: {e:#}");

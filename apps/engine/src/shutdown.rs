@@ -1,4 +1,4 @@
-//! Process shutdown: one token, flipped once, that every long-running part of the engine joins.
+//! Engine shutdown: one token and task set per Engine in both hosting modes.
 //!
 //! `SIGTERM`/`SIGINT` must not be a kill: the ingestor may be half-way through appending a commit,
 //! the sequencer may be half-way through fanning a transaction out, and the durable checkpoint that
@@ -25,8 +25,10 @@
 //!    second or so is re-delivered after the restart and dropped by the sequencer's `(lsn, seq)`
 //!    highwater. Stopping mid-transaction, before the commit, is the same story with nothing
 //!    appended at all. Either way the slot is never advanced BY the shutdown. The sequencer
-//!    completes the batch it is processing, flushes it, and writes a final checkpoint;
-//! 4. the catalog writer drains, and the process exits 0.
+//!    flushes a completed batch and writes a final checkpoint. An interrupted reliable append
+//!    preserves the earlier replay boundary; shutdown never checkpoints an undelivered batch;
+//! 4. Engine close drains the catalog, joins circuit threads and remaining tasks, and clears owned callbacks.
+//!    A source worker then drops its runtime; the standalone process reports the shutdown outcome.
 //!
 //! The whole thing is bounded (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`, default 25 s — under a
 //! typical Kubernetes `terminationGracePeriodSeconds: 30`), and a **second** signal during the grace
@@ -85,9 +87,12 @@ struct Inner {
     /// When the token flipped. The grace period is measured from HERE, not from when the HTTP
     /// server finally stopped, so the readiness-drain window comes out of the same budget.
     began_at: std::sync::Mutex<Option<std::time::Instant>>,
+    tasks: std::sync::Mutex<Option<tokio::task::JoinSet<()>>>,
+    restart_notify: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    restart_reason: std::sync::atomic::AtomicI32,
 }
 
-/// A cheap, cloneable handle to the process's shutdown state.
+/// A cheap, cloneable handle to one Engine's shutdown state.
 #[derive(Clone)]
 pub struct ShutdownToken {
     inner: Arc<Inner>,
@@ -106,7 +111,80 @@ impl ShutdownToken {
                 tx: tokio::sync::watch::channel(false).0,
                 outstanding: std::sync::Mutex::new(BTreeSet::new()),
                 began_at: std::sync::Mutex::new(None),
+                tasks: std::sync::Mutex::new(Some(tokio::task::JoinSet::new())),
+                restart_notify: std::sync::Mutex::new(None),
+                restart_reason: std::sync::atomic::AtomicI32::new(0),
             }),
+        }
+    }
+
+    pub(crate) fn supervise_restarts(&self, notify: Arc<tokio::sync::Notify>) {
+        *self.inner.restart_notify.lock().unwrap() = Some(notify);
+    }
+
+    pub(crate) fn restart_requested(&self) -> bool {
+        self.inner.restart_reason.load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// Fatal Engine conditions restart one supervised source; the standalone binary keeps its exit code.
+    pub(crate) fn restart_or_exit(&self, code: i32) {
+        let notify = self.inner.restart_notify.lock().unwrap().clone();
+        if let Some(notify) = notify {
+            self.inner.restart_reason.store(code, std::sync::atomic::Ordering::Release);
+            self.begin();
+            notify.notify_one();
+        } else {
+            std::process::exit(code);
+        }
+    }
+
+    /// Track work on the caller's runtime, including work started by host HTTP handlers.
+    /// Closing the task set rejects later spawns, then aborts and joins all remaining work.
+    pub(crate) fn spawn<F, T>(&self, future: F) -> tokio::sync::oneshot::Receiver<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut guard = self.inner.tasks.lock().unwrap();
+        if let Some(tasks) = guard.as_mut() {
+            while let Some(result) = tasks.try_join_next() {
+                if let Err(error) = result {
+                    tracing::error!(%error, "Engine task failed");
+                }
+            }
+            tasks.spawn(async move {
+                let _ = tx.send(future.await);
+            });
+        }
+        rx
+    }
+
+    pub(crate) fn spawn_background<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let shutdown = self.clone();
+        self.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => {},
+                _ = future => {},
+            }
+        });
+    }
+
+    pub(crate) async fn join_tasks(&self) {
+        let tasks = self.inner.tasks.lock().unwrap().take();
+        if let Some(mut tasks) = tasks {
+            tasks.abort_all();
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::error!(%error, "Engine task failed during close");
+                }
+            }
         }
     }
 
@@ -143,7 +221,7 @@ impl ShutdownToken {
         let _ = rx.wait_for(|flipped| *flipped).await;
     }
 
-    /// Register a component the process must wait for before exiting. The returned guard removes it
+    /// Register a component Engine close must wait for. The returned guard removes it
     /// on drop, so a party that returns — or panics — never wedges the shutdown.
     pub fn party(&self, name: &'static str) -> ShutdownParty {
         self.inner.outstanding.lock().unwrap().insert(name);
@@ -357,5 +435,59 @@ mod tests {
         assert!(t.elapsed().is_none());
         t.begin();
         assert!(t.elapsed().is_some());
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn close_joins_tasks_and_refuses_late_spawns() {
+        let token = ShutdownToken::new();
+        let owned = Arc::new(());
+        let weak = Arc::downgrade(&owned);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        token.spawn(async move {
+            let _owned = owned;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        token.begin();
+        token.join_tasks().await;
+        assert!(weak.upgrade().is_none());
+        let late = token.spawn(async { panic!("closed task set must never poll new work") });
+        assert!(late.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn background_work_ends_when_its_engine_stops() {
+        let token = ShutdownToken::new();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (held, released) = tokio::sync::oneshot::channel::<()>();
+        token.spawn_background(async move {
+            let _held = held;
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        token.begin();
+        assert!(released.await.is_err());
+        token.join_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn supervised_failure_signals_only_the_source_owner() {
+        let failed = ShutdownToken::new();
+        let healthy = ShutdownToken::new();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        failed.supervise_restarts(notify.clone());
+        failed.restart_or_exit(74);
+        notify.notified().await;
+        assert!(failed.is_shutting_down());
+        assert!(failed.restart_requested());
+        assert!(!healthy.is_shutting_down());
+        assert!(!healthy.restart_requested());
     }
 }

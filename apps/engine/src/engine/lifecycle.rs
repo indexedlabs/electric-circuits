@@ -615,7 +615,7 @@ impl Engine {
             Ok(()) => {
                 backfill_and_activate(
                     &self.ds,
-                    &self.pg_url,
+                    &self.pg_pool,
                     &cmd_tx,
                     &ts,
                     table,
@@ -986,7 +986,7 @@ impl Engine {
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
             &self.ds,
-            &self.pg_url,
+            &self.pg_pool,
             &cmd_tx,
             &ts,
             table,
@@ -1197,10 +1197,10 @@ impl Engine {
             // the writer owns it. Left inline, the retirement and the subquery-registry removal
             // would simply never run in this process: the stream would linger alive until the next
             // boot's GC and a subquery shape would stay registered and maintained as a zombie. So
-            // the work after the durability wait is owned by the PROCESS, not by the request.
+            // the work after the durability wait is owned by the Engine and ended by its close.
             let task_barrier = barrier.clone();
             let (engine, owned) = (self.clone(), id.to_string());
-            tokio::spawn(async move {
+            self.shutdown.spawn(async move {
                 // ADR-0007 order is preserved inside the task: `Dropped` durable, then close/delete.
                 if let Some(wait) = wait {
                     if let Err(error) = wait.await {
@@ -1213,7 +1213,7 @@ impl Engine {
                 }
                 task_barrier.mark_dropped_durable();
                 // A native purge promises a durable `Dropped` intent before it answers. Retirement
-                // itself remains process-owned and eventually retried by `RetirementQueue`; making
+                // itself remains Engine-owned and eventually retried by `RetirementQueue`; making
                 // the HTTP request wait for that external recovery turns a durable-stream outage
                 // into an unnecessary, unbounded acknowledgment delay.
                 let _ = engine.finish_purge(&owned, removed, false, None).await;
@@ -1233,7 +1233,7 @@ impl Engine {
                 } else {
                     let barriers = self.purge_barriers.clone();
                     let owned = id.to_string();
-                    tokio::spawn(async move {
+                    self.shutdown.spawn(async move {
                         let _ = barrier.wait().await;
                         barriers.lock().unwrap().remove(&owned);
                     });
@@ -1270,7 +1270,7 @@ impl Engine {
             } else if let Some(barrier) = completion_barrier {
                 let completion = crate::engine::retirement::RetirementCompletion::new_non_durable();
                 let completion_wait = completion.clone();
-                tokio::spawn(async move {
+                self.shutdown.spawn(async move {
                     if completion_wait.wait().await.is_err() {
                         barrier.mark_dropped_failed();
                     }
@@ -1365,7 +1365,7 @@ impl Engine {
                                 let engine = self.clone();
                                 let id = id.to_string();
                                 metrics().reactivations_started.fetch_add(1, Ordering::Relaxed);
-                                tokio::spawn(async move {
+                                self.shutdown.spawn(async move {
                                     let _control = control;
                                     let admission = engine.reactivation_admission(&id, &resume).await;
                                     if let Err(error) = &admission {
@@ -1690,7 +1690,7 @@ impl Engine {
                 batches.insert(key.clone(), batch.clone());
                 let engine = self.clone();
                 let batch_for_task = batch.clone();
-                tokio::spawn(async move {
+                self.shutdown.spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     engine.reactivation_batches.lock().unwrap().remove(&key);
                     let targets = std::mem::take(&mut batch_for_task.lock().unwrap().targets);
@@ -2172,7 +2172,7 @@ impl Engine {
             return;
         }
         let engine = self.clone();
-        tokio::spawn(async move {
+        self.shutdown.spawn_background(async move {
             let mut tick = tokio::time::interval(engine.retention.sweep_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // the first tick fires immediately; skip it
@@ -2226,10 +2226,7 @@ impl Engine {
                     .with_context(|| format!("seed: unknown inner table '{inner_table}'"))?;
                 let wsql =
                     inner_where.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &begin.schemas, inner_table));
-                let mut client =
-                    crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
-                        .get()
-                        .await?;
+                let mut client = self.pg_pool.as_ref().context("subquery work requires postgres")?.get().await?;
                 // Settled against the inner table and whatever ITS predicate's subqueries read.
                 let scope = crate::pg::SettleScope::request(inner_table)
                     .with(inner_where.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
@@ -2264,10 +2261,7 @@ impl Engine {
                 (crate::pg::SnapshotGate::passthrough(), 0u64, HashSet::new())
             } else {
                 let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
-                let mut client =
-                    crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
-                        .get()
-                        .await?;
+                let mut client = self.pg_pool.as_ref().context("subquery work requires postgres")?.get().await?;
                 // Settled against the outer table and every table its subqueries read.
                 let scope =
                     crate::pg::SettleScope::request(table).with(crate::subquery::referenced_tables(where_json).iter());
@@ -2437,7 +2431,7 @@ impl Drop for JoinGuard {
             self.subscription
         );
         let (engine, shape_id, subscription) = (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
-        tokio::spawn(async move {
+        self.engine.shutdown.spawn(async move {
             engine.release_subscription(&shape_id, Some(&subscription)).await;
         });
     }
@@ -2502,7 +2496,7 @@ impl CreateGuard {
 
     /// Transfer compensation and admission to one task BEFORE the first await. Cancelling an
     /// explicit rollback then detaches that same task instead of abandoning half a rollback.
-    fn start_cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+    fn start_cleanup(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
         if !std::mem::take(&mut self.armed) {
             return None;
         }
@@ -2514,7 +2508,7 @@ impl CreateGuard {
             self.registration,
             self.admission.take(),
         );
-        Some(tokio::spawn(async move {
+        Some(self.engine.shutdown.spawn(async move {
             engine.rollback_create(&shape_id, &table, &stream_path, registration).await;
             // Cleanup includes circuit retractions: release only once they have actually landed.
             drop(admission);
@@ -2692,7 +2686,7 @@ impl Engine {
                      retiring the shape so its subscribers re-subscribe"
                 );
                 let (engine, id) = (self.clone(), id.to_string());
-                tokio::spawn(async move {
+                self.shutdown.spawn(async move {
                     let _ = engine.purge_shape(&id).await;
                 });
                 GoneVerdict::Discard
@@ -2704,24 +2698,10 @@ impl Engine {
         }
     }
 
-    /// Wire [`Self::reconcile_gone_shape_stream`] into the streams client, once, at construction.
-    ///
-    /// This is deliberately a cycle (the client holds a closure holding the engine holding the
-    /// client): the engine is a process singleton whose background tasks own clones of it anyway, so
-    /// nothing is reclaimed earlier without it, and the alternative — threading a reconciler through
-    /// the sequencer, the emission lanes and the subquery registry by hand — would leave every
-    /// future append site to remember the rule on its own.
-    ///
-    /// Two consequences, both accepted rather than accidental:
-    ///
-    /// * the cycle means **one `Engine` is never dropped per `Engine::new`**. In the binary that is
-    ///   one engine for the process lifetime; in tests and tools that construct many, it is a bounded
-    ///   leak of engine state (no task, no socket — the background tasks end when their channels
-    ///   close), which is why it is not worth a `Weak` indirection on the hot append path.
-    /// * the slot is a `OnceLock`, so if the SAME `DsClient` is handed to two engines, the first
-    ///   one's reconciler serves both. That is a test-only shape (each engine owns its client in the
-    ///   binary), and the alternative — last-writer-wins — would silently repoint a live client's
-    ///   reconciliation at a different engine's state, which is worse.
+    /// Install this Engine's reconciler in its shared DS client slot. The first install wins
+    /// while installed. Engine close ends the workers and clears the callback, breaking the
+    /// Engine/client cycle without adding an indirection to each append. Different live Engines
+    /// must own different clients in both hosting modes.
     pub(crate) fn install_gone_reconciler(&self) {
         let engine = self.clone();
         self.ds.set_gone_reconciler(std::sync::Arc::new(move |path: String| {

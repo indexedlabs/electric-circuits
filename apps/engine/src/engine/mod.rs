@@ -440,6 +440,11 @@ pub struct SubsetPage {
 
 #[derive(Clone)]
 pub struct Engine {
+    pg_pool: Option<crate::pg::Pool>,
+    publish_generated: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) electric_handles: Arc<crate::electric::HandleRegistry>,
+    close_result: Arc<Mutex<Option<crate::shutdown::ShutdownOutcome>>>,
+    membership: crate::subq_circuit::MembershipCircuit,
     ds: DsClient,
     state: Arc<Mutex<EngineState>>,
     /// Postgres connection string when running in Postgres mode (logical replication + query-back
@@ -580,11 +585,11 @@ pub struct Engine {
     epoch: Arc<EpochState>,
     /// Expected event-zero storage binding, installed by the binary before Postgres setup.
     store_bound: Arc<std::sync::OnceLock<crate::store_identity::StoreBound>>,
-    /// The process's graceful-shutdown state (see [`crate::shutdown`]). Held here — not in a global
+    /// This Engine's graceful-shutdown state (see [`crate::shutdown`]). Held here — not in a global
     /// — because every part that must join it (the sequencer's select, the ingestor, the `/v1/shape`
     /// live poll, `GET /ready`) already has an `Engine`.
     shutdown: crate::shutdown::ShutdownToken,
-    /// Per-process nonce for the subscription ids the engine mints for creates that named none
+    /// Per-Engine-instance nonce for the subscription ids the engine mints for creates that named none
     /// (ADR-0008). The counter alone would not do: the catalog outlives the process, so a restart
     /// would re-mint ids a restored shape still holds.
     sub_nonce: Arc<str>,
@@ -731,10 +736,11 @@ fn spawn_flip_propagator(
     pending: Arc<std::sync::atomic::AtomicI64>,
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+    shutdown: crate::shutdown::ShutdownToken,
 ) {
     let workers: usize =
         std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
-    tokio::spawn(async move {
+    shutdown.clone().spawn_background(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(workers));
         while let Some(fw) = rx.recv().await {
             let permit = sem.clone().acquire_owned().await.expect("flip semaphore");
@@ -742,7 +748,7 @@ fn spawn_flip_propagator(
             let pending = pending.clone();
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
-            tokio::spawn(async move {
+            shutdown.spawn_background(async move {
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
                 // is treated exactly like a live one, because its effects are just as lost.
                 let failed = match fw {
@@ -843,7 +849,7 @@ struct EngineState {
     /// two shapes and be unable to release either without ambiguity.
     subs_by_id: HashMap<String, String>,
     /// Counter behind the ids the engine mints for creates that named no subscription. Combined
-    /// with a per-process nonce (see [`Engine::mint_subscription`]), so a minted id is unique
+    /// with a per-Engine-instance nonce (see [`Engine::mint_subscription`]), so a minted id is unique
     /// across restarts too — the catalog outlives the process that wrote it.
     next_minted_sub: u64,
 }
@@ -1207,7 +1213,7 @@ fn sid_of_path(stream_path: &str) -> &str {
 impl Engine {
     /// Construct a production engine only from storage admission completed before engine setup.
     pub fn new(admission: StoreAdmission) -> Self {
-        Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged)
+        Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None)
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
@@ -1220,7 +1226,7 @@ impl Engine {
     /// `setup_postgres` validates the exact existing publication and replica
     /// identity rather than trying to broaden the Engine's database grants.
     pub fn new_pg_with_setup(admission: StoreAdmission, pg_url: String, setup: PostgresSetup) -> Self {
-        let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup);
+        let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup, None);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
@@ -1228,7 +1234,7 @@ impl Engine {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn new_for_in_process_test(ds: DsClient) -> Self {
-        Self::new_inner(ds, None, None, PostgresSetup::EngineManaged)
+        Self::new_inner(ds, None, None, PostgresSetup::EngineManaged, None)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1240,9 +1246,24 @@ impl Engine {
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub fn new_pg_for_in_process_test_with_setup(ds: DsClient, pg_url: String, setup: PostgresSetup) -> Self {
-        let e = Self::new_inner(ds, Some(pg_url), None, setup);
+        let e = Self::new_inner(ds, Some(pg_url), None, setup, None);
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
+    }
+
+    /// Construct using the resolved per-Engine storage and pool settings.
+    pub fn new_with_config(
+        admission: StoreAdmission,
+        pg_url: Option<String>,
+        setup: PostgresSetup,
+        config: &crate::config::Config,
+    ) -> Self {
+        let postgres = pg_url.is_some();
+        let engine = Self::new_inner(admission.ds, pg_url, Some(admission.binding), setup, Some(config));
+        if postgres {
+            engine.health.store(HEALTH_WAITING, Ordering::Relaxed);
+        }
+        engine
     }
 
     fn new_inner(
@@ -1250,12 +1271,32 @@ impl Engine {
         pg_url: Option<String>,
         binding: Option<crate::store_identity::StoreBound>,
         postgres_setup: PostgresSetup,
+        config: Option<&crate::config::Config>,
     ) -> Self {
         let store_bound = Arc::new(std::sync::OnceLock::new());
         if let Some(binding) = binding {
             store_bound.set(binding).expect("fresh store binding proof");
         }
-        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let ds = ds.with_shutdown(shutdown.clone());
+        let pg_pool = pg_url.as_ref().map(|url| {
+            crate::pg::Pool::owned(
+                url.clone(),
+                config.map_or_else(crate::pg::configured_pool_size, |c| c.db_pool_size),
+                shutdown.clone(),
+            )
+        });
+        let membership = match config {
+            Some(config) => crate::subq_circuit::MembershipCircuit::start_config(&config.subq_storage),
+            None => crate::subq_circuit::MembershipCircuit::start(),
+        }
+        .expect("membership circuit failed to start");
+        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::with_pool(
+            ds.clone(),
+            pg_url.clone(),
+            pg_pool.clone(),
+            membership.clone(),
+        )));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -1266,13 +1307,20 @@ impl Engine {
             ds.clone(),
             std::env::var("ELECTRIC_CIRCUITS_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             pending_flips.clone(),
+            shutdown.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
         let degrade = DegradeState::new();
-        spawn_flip_propagator(subqueries.clone(), flip_rx, pending_flips.clone(), degrade.clone(), trace_tx.clone());
+        spawn_flip_propagator(
+            subqueries.clone(),
+            flip_rx,
+            pending_flips.clone(),
+            degrade.clone(),
+            trace_tx.clone(),
+            shutdown.clone(),
+        );
         // Created before the writer so the writer can register a shutdown party while it is
         // retrying an append (see `spawn_catalog_writer`).
-        let shutdown = crate::shutdown::ShutdownToken::new();
         let catalog_tx = spawn_catalog_writer(ds.clone(), shutdown.clone());
         let retirements = spawn_retirement_queue(ds.clone(), catalog_tx.clone(), shutdown.clone());
         // The change log's writer records every rotation in the durable catalog, so a restart knows
@@ -1287,6 +1335,11 @@ impl Engine {
             },
         );
         let engine = Engine {
+            pg_pool,
+            publish_generated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            electric_handles: Arc::new(crate::electric::HandleRegistry::default()),
+            close_result: Arc::new(Mutex::new(None)),
+            membership,
             ds,
             state: Arc::new(Mutex::new(EngineState {
                 tables: HashMap::new(),
@@ -1361,13 +1414,58 @@ impl Engine {
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
+        engine.ensure_degrade_reaper();
+        crate::electric::ensure_evictor(&engine);
         engine
     }
 
-    /// The process's shutdown token — the binary flips it on `SIGTERM`/`SIGINT` and every
+    /// This Engine's shutdown token — close or the standalone signal handler flips it, and every
     /// long-running part of the engine joins it (see [`crate::shutdown`]).
     pub fn shutdown_token(&self) -> crate::shutdown::ShutdownToken {
         self.shutdown.clone()
+    }
+
+    /// Stop this Engine in either hosting mode. Safe to call repeatedly; all clones share completion.
+    pub async fn close(&self, grace: std::time::Duration) -> crate::shutdown::ShutdownOutcome {
+        use crate::shutdown::ShutdownOutcome;
+        let mut result = self.close_result.lock().await;
+        if let Some(outcome) = *result {
+            return outcome;
+        }
+        self.shutdown.begin();
+        self.close_control_admission();
+        let remaining = || grace.saturating_sub(self.shutdown.elapsed().unwrap_or_default());
+        let mut outcome = if self.shutdown.wait_for_parties(remaining()).await {
+            ShutdownOutcome::Complete
+        } else {
+            tracing::warn!(parties = ?self.shutdown.outstanding(), "Engine close exceeded graceful drain");
+            ShutdownOutcome::Forced
+        };
+        // Handles are volatile; their catalog subscriptions must not survive a clean restart.
+        if tokio::time::timeout(remaining(), crate::electric::close_handles(self)).await.is_err() {
+            outcome = ShutdownOutcome::Forced;
+        }
+        if !self.drain_catalog(remaining().min(crate::shutdown::CATALOG_DRAIN)).await
+            && outcome == ShutdownOutcome::Complete
+        {
+            outcome = ShutdownOutcome::CatalogIncomplete;
+        }
+        self.membership.shutdown().await;
+        let arrangements = self.arrangements.lock().unwrap().take();
+        if let Some(arrangements) = arrangements {
+            arrangements.shutdown().await;
+        }
+        if let Some(pool) = &self.pg_pool {
+            pool.close();
+        }
+        self.shutdown.join_tasks().await;
+        for (_, barrier) in std::mem::take(&mut *self.purge_barriers.lock().unwrap()) {
+            barrier.mark_dropped_failed();
+            barrier.complete();
+        }
+        self.ds.clear_gone_reconciler();
+        *result = Some(outcome);
+        outcome
     }
 
     /// Observe state ownership without keeping the Engine alive.
@@ -1776,12 +1874,12 @@ impl Engine {
             return Ok(()); // nothing for the circuit to maintain
         }
         let arr = crate::arrangements::Arrangements::start(counts.clone())?;
+        *self.arrangements.lock().unwrap() = Some(arr.clone());
         // Seed each counts pipeline from ONE group-aggregated query per table — O(groups),
         // not O(rows); row data stays in Postgres. State is in-memory only, so this runs on
         // every boot; the seed's SnapshotGate fences change-log replay exactly like a shape
         // backfill.
-        let url = self.pg_url.clone().context("counts pipelines need a pg_url to seed")?;
-        let mut client = crate::pg::pool_for(&url).get().await?;
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
         let mut gates = HashMap::new();
         for spec in &counts {
             let ts = schemas.get(&spec.table).expect("resolved above");
@@ -1861,16 +1959,15 @@ impl Engine {
         self.degrade.mark();
     }
 
-    /// Start the stream reaper, once, for an engine that now has subquery shapes to reap. Lazy for
-    /// the same reason the retention sweeper is: an engine that never serves a subquery can never
-    /// lose a flip, so it never needs the task.
+    /// Start this Engine's reaper once at construction. It waits for degradation or shutdown;
+    /// request handlers may call this idempotently without starting work on an unowned runtime.
     pub(crate) fn ensure_degrade_reaper(&self) {
         if self.degrade.reaper_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let engine = self.clone();
         let mut wake = self.degrade.wake.subscribe();
-        tokio::spawn(async move {
+        self.shutdown.spawn_background(async move {
             while !engine.degraded() {
                 if wake.changed().await.is_err() {
                     return; // engine gone
@@ -1945,7 +2042,7 @@ impl Engine {
                 self.restore_reads_paused.clone(),
                 self.read_cap_failed.clone(),
                 self.retention.pending_buffer_max_bytes,
-                self.pg_url.as_deref().map(|url| crate::pg::pool_for(url).sequenced()),
+                self.pg_pool.as_ref().map(crate::pg::Pool::sequenced),
                 self.shutdown.clone(),
             ));
         }
@@ -2029,7 +2126,7 @@ impl Engine {
         // the phase is reset rather than left wherever the last attempt stopped: `/ready` must say
         // `waiting` while the engine is trying to reach Postgres, not `starting`.
         self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
-        let client = crate::pg::connect(&url).await?;
+        let client = crate::pg::connect_owned(&url, &self.shutdown).await?;
         // `wal_level` is checked explicitly, first, rather than left to surface as a slot-creation
         // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
         crate::pg::check_wal_level(&client).await?;
@@ -2142,7 +2239,7 @@ impl Engine {
             crate::pg::ensure_publication(&client, &publication).await?;
         }
         let pubinfo = crate::pg::inspect_publication(&client, &publication, &tables).await?;
-        crate::pg::set_publish_generated(pubinfo.publish_generated);
+        self.publish_generated.store(pubinfo.publish_generated, Ordering::Release);
         if pubinfo.publish_generated {
             tracing::info!("publication '{publication}' publishes stored generated columns");
         }
@@ -2155,7 +2252,7 @@ impl Engine {
             if self.postgres_setup == PostgresSetup::EngineManaged {
                 crate::pg::ensure_replica_identity_full(&client, t).await?;
             }
-            let def = crate::pg::introspect(&client, t).await?;
+            let def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
             if self.postgres_setup == PostgresSetup::ExternallyManaged
                 && def
                     .fingerprint
@@ -2203,7 +2300,7 @@ impl Engine {
         // Registered BEFORE the spawn so the shutdown wait can never observe "no parties" in the
         // window between deciding to start the ingestor and the task actually running.
         let party = self.shutdown.party("replication ingestor");
-        tokio::spawn(crate::replication::run(
+        self.shutdown.spawn(crate::replication::run(
             url,
             slot.to_string(),
             publication,
@@ -2386,8 +2483,7 @@ impl Engine {
         // the inner tables of any subquery in its predicate.
         let scope = crate::pg::SettleScope::request(table)
             .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
-        let url = self.pg_url.clone().context("query_subset requires postgres mode")?;
-        let mut client = crate::pg::pool_for(&url).get().await?;
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
         let sq = crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await?;
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
@@ -2472,8 +2568,7 @@ impl Engine {
             cols.join(", "),
             placeholders.join(", "),
         );
-        let url = self.pg_url.clone().context("insert_row requires postgres mode")?;
-        let client = crate::pg::pool_for(&url).get().await?;
+        let client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
         let n = client.execute(&sql, &param_refs).await.with_context(|| format!("insert into {table}"))?;
@@ -2537,8 +2632,7 @@ impl Engine {
             clauses.push(format!("({})", conj.join(" and ")));
         }
         let sql = format!("delete from {} where {}", table.quote_qualified(), clauses.join(" or "));
-        let url = self.pg_url.clone().context("delete_rows requires postgres mode")?;
-        let client = crate::pg::pool_for(&url).get().await?;
+        let client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
         let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
         let n = client.execute(&sql, &param_refs).await.with_context(|| format!("delete from {table}"))?;
@@ -2702,7 +2796,7 @@ impl Engine {
             (reg.circuit_bytes(), reg.feed_sets_bytes(), reg.heap_bytes(), reg.pk_dict_bytes())
         };
         let bytes_retention = self.lives.lock().unwrap().heap_bytes();
-        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
+        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes(self).await;
         crate::mem::HeapBytes {
             bytes_shape_records,
             bytes_executors,
