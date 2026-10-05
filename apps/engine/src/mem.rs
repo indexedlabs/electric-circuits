@@ -501,9 +501,7 @@ impl Telemetry {
         text
     }
     pub(crate) fn shutdown(&self) {
-        if let Err(error) = self.provider.force_flush() {
-            tracing::warn!(%error, "Engine telemetry flush failed");
-        }
+        // Shutdown performs the final export before releasing the readers.
         if let Err(error) = self.provider.shutdown() {
             tracing::warn!(%error, "Engine telemetry shutdown failed");
         }
@@ -552,11 +550,9 @@ pub(crate) fn init_otel(
     }
 
     if let Some(source) = source_id {
-        provider_builder =
-            provider_builder.with_resource(opentelemetry_sdk::Resource::new([opentelemetry::KeyValue::new(
-                "source_id",
-                source.to_owned(),
-            )]));
+        provider_builder = provider_builder.with_resource(opentelemetry_sdk::Resource::new_with_defaults([
+            opentelemetry::KeyValue::new("source_id", source.to_owned()),
+        ]));
     }
     let attributes: Vec<_> =
         source_id.into_iter().map(|source| opentelemetry::KeyValue::new("source_id", source.to_owned())).collect();
@@ -758,6 +754,65 @@ mod tests {
         drop(alpha_provider);
         assert_eq!(beta_provider.prometheus_text(), b);
         beta_provider.shutdown();
+    }
+
+    #[test]
+    fn source_resource_keeps_sdk_defaults() {
+        use super::*;
+        let telemetry =
+            init_otel(Arc::new(crate::metrics::Metrics::default()), Arc::new(Gauges::default()), Some("alpha"));
+        let scrape = telemetry.prometheus_text();
+        telemetry.shutdown();
+        let resource = scrape.lines().find(|line| line.starts_with("target_info{")).expect("resource series");
+        assert!(resource.contains("source_id=\"alpha\""), "source identity missing: {resource}");
+        assert!(resource.contains("service_name="), "SDK service.name missing: {resource}");
+        assert!(resource.contains("telemetry_sdk_name="), "SDK telemetry attributes missing: {resource}");
+    }
+
+    #[tokio::test]
+    async fn telemetry_close_exports_once() {
+        use super::*;
+        use opentelemetry_otlp::WithExportConfig;
+
+        let requests = Arc::new(AtomicU64::new(0));
+        let received = requests.clone();
+        let app = axum::Router::new().route(
+            "/v1/metrics",
+            axum::routing::post(move || {
+                let received = received.clone();
+                async move {
+                    received.fetch_add(1, Ordering::Relaxed);
+                    ([("content-type", "application/x-protobuf")], Vec::<u8>::new())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/metrics", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let exporter =
+            opentelemetry_otlp::MetricExporter::builder().with_http().with_endpoint(endpoint).build().unwrap();
+        let reader = PeriodicReader::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_interval(Duration::from_secs(3600))
+            .build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let counter = provider.meter("close-test").u64_counter("close_test").build();
+        counter.add(1, &[]);
+        let telemetry = Telemetry { provider, registry: Registry::new() };
+        tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || telemetry.shutdown()))
+            .await
+            .expect("telemetry shutdown deadline")
+            .unwrap();
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 1, "close must send exactly one final OTLP export");
     }
 
     #[test]

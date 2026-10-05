@@ -136,8 +136,28 @@ async fn instrumentation_emits_expected_metric_families() {
     statsd::storage_used(1_048_576, Duration::from_millis(4));
     statsd::replication_slot_gauges("0/20", Some("0/10"), Some("0/18"));
 
+    // Exercise the Engine-owned emitter too. This source deliberately has the same identifier as
+    // the standalone stack: hosting mode, not the identifier's spelling, determines the tag set.
+    #[cfg(feature = "test-support")]
+    let (standalone, source) = {
+        let engine = electric_circuits_engine::engine::Engine::new_supervised_for_test(std::sync::Arc::new(
+            tokio::sync::Notify::new(),
+        ));
+        let standalone = electric_circuits_engine::engine::Engine::new_for_in_process_test(
+            electric_circuits_engine::ds::DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+        );
+        standalone.spawn_statsd_shape_sampler(Duration::from_secs(60));
+        engine.spawn_statsd_shape_sampler(Duration::from_secs(60));
+        (standalone, engine)
+    };
+
     tokio::time::sleep(Duration::from_millis(200)).await;
     let datagrams = tokio::task::spawn_blocking(move || collect(sock, Duration::from_millis(800))).await.unwrap();
+    #[cfg(feature = "test-support")]
+    {
+        standalone.close(Duration::from_secs(5)).await;
+        source.close(Duration::from_secs(5)).await;
+    }
     let names = assert_fleet_parseable(&datagrams, id);
     let all = datagrams.join("\n");
 
@@ -174,6 +194,31 @@ async fn instrumentation_emits_expected_metric_families() {
     ] {
         assert!(names.iter().any(|n| n == expected), "missing metric {expected}");
     }
+
+    // Compare complete lines, so an extra or duplicated tag is a regression.
+    let lines: Vec<_> = all.lines().collect();
+    assert!(
+        lines.contains(&"electric.connection.consumers_ready.total:7|g|#instance_id:global-instance-03"),
+        "standalone consumers_ready must have only instance_id: {all}"
+    );
+    assert!(
+        lines.contains(&"electric.shapes.total_shapes.count:5|g|#instance_id:global-instance-03"),
+        "standalone shape count must have only instance_id: {all}"
+    );
+    #[cfg(feature = "test-support")]
+    assert!(
+        lines.contains(&"electric.shapes.total_shapes.count:0|g|#instance_id:global-instance-03"),
+        "standalone Engine shape count must have only instance_id: {all}"
+    );
+    #[cfg(feature = "test-support")]
+    assert!(
+        lines.contains(&"electric.shapes.total_shapes.count:0|g|#instance_id:global-instance-03,stack_id:bench-stream"),
+        "source shape count must have exactly instance_id and its source stack_id: {all}"
+    );
+    assert!(
+        lines.contains(&"electric.shape.response_size.bytes:1234|d|#instance_id:global-instance-03,root_table:issues,is_live:false,stack_id:bench-stream"),
+        "standalone response size retains its original tags: {all}"
+    );
 
     // active_shapes == total_shapes for our engine (every registered shape is actively maintained).
     assert!(all.contains("electric.shapes.total_shapes.count:5|g"));

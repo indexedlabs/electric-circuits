@@ -1255,8 +1255,9 @@ impl Engine {
         e
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_supervised_for_test(notify: Arc<tokio::sync::Notify>) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn new_supervised_for_test(notify: Arc<tokio::sync::Notify>) -> Self {
         Self::new_inner(
             DsClient::new_for_in_process_test("http://127.0.0.1:1"),
             None,
@@ -1317,6 +1318,7 @@ impl Engine {
         }
         let metrics = Arc::new(crate::metrics::Metrics::new(
             config.map_or_else(|| crate::config::stack_id().to_owned(), |c| c.stack_id.clone()),
+            restart_notify.is_some(),
         ));
         let memory_gauges = Arc::new(crate::mem::Gauges::default());
         let source_id = restart_notify.as_ref().map(|_| metrics.stack_id.clone());

@@ -97,6 +97,7 @@ impl Drop for Timer<'_> {
 
 pub struct Metrics {
     pub(crate) stack_id: String,
+    source_mode: bool,
     pub envelopes: AtomicU64,          // table change events processed
     pub shape_appends: AtomicU64,      // appends to shape streams
     pub family_steps: AtomicU64,       // family circuit transactions (write path)
@@ -195,14 +196,15 @@ pub struct Metrics {
 
 impl Default for Metrics {
     fn default() -> Self {
-        Self::new(crate::config::stack_id().to_owned())
+        Self::new(crate::config::stack_id().to_owned(), false)
     }
 }
 
 impl Metrics {
-    pub(crate) fn new(stack_id: String) -> Self {
+    pub(crate) fn new(stack_id: String, source_mode: bool) -> Self {
         Self {
             stack_id,
+            source_mode,
             envelopes: AtomicU64::new(0),
             shape_appends: AtomicU64::new(0),
             family_steps: AtomicU64::new(0),
@@ -256,7 +258,7 @@ impl Metrics {
 
 impl Metrics {
     pub(crate) fn emitter(&self) -> crate::statsd::Emitter<'_> {
-        crate::statsd::Emitter::new(&self.stack_id)
+        crate::statsd::Emitter::new(&self.stack_id, self.source_mode)
     }
 
     pub fn snapshot(&self) -> serde_json::Value {

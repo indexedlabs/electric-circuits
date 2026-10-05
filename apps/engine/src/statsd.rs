@@ -206,45 +206,48 @@ pub fn enabled() -> bool {
 /// is the response body size. `root_table` is the table's canonical `schema.name` (ADR-0002), so two
 /// same-named tables in different schemas are two series rather than one.
 pub fn serve_shape(root_table: &str, live: bool, status: u16, elapsed: Duration, body_bytes: u64) {
-    Emitter::new(crate::config::stack_id()).serve_shape(root_table, live, status, elapsed, body_bytes);
+    Emitter::new(crate::config::stack_id(), false).serve_shape(root_table, live, status, elapsed, body_bytes);
 }
 pub fn replication_txn(ops: u64, bytes: u64, receive_lag_ms: f64) {
-    Emitter::new(crate::config::stack_id()).replication_txn(ops, bytes, receive_lag_ms);
+    Emitter::new(crate::config::stack_id(), false).replication_txn(ops, bytes, receive_lag_ms);
 }
 pub fn storage_txn(ops: u64, bytes: u64, affected_shapes: u64) {
-    Emitter::new(crate::config::stack_id()).storage_txn(ops, bytes, affected_shapes);
+    Emitter::new(crate::config::stack_id(), false).storage_txn(ops, bytes, affected_shapes);
 }
 pub fn snapshot_stored(rows: u64, bytes: u64, make_new_ms: f64) {
-    Emitter::new(crate::config::stack_id()).snapshot_stored(rows, bytes, make_new_ms);
+    Emitter::new(crate::config::stack_id(), false).snapshot_stored(rows, bytes, make_new_ms);
 }
 pub fn create_snapshot_task(elapsed: Duration) {
-    Emitter::new(crate::config::stack_id()).create_snapshot_task(elapsed);
+    Emitter::new(crate::config::stack_id(), false).create_snapshot_task(elapsed);
 }
 pub fn consumers_ready(tables: u64) {
-    Emitter::new(crate::config::stack_id()).consumers_ready(tables);
+    Emitter::new(crate::config::stack_id(), false).consumers_ready(tables);
 }
 pub fn storage_used(bytes: u64, measurement: Duration) {
-    Emitter::new(crate::config::stack_id()).storage_used(bytes, measurement);
+    Emitter::new(crate::config::stack_id(), false).storage_used(bytes, measurement);
 }
 pub fn shape_gauges(total: u64, indexed: u64, unindexed: u64) {
-    Emitter::new(crate::config::stack_id()).shape_gauges(total, indexed, unindexed);
+    Emitter::new(crate::config::stack_id(), false).shape_gauges(total, indexed, unindexed);
 }
 pub fn catalog_restore_retired(reason: &str) {
-    Emitter::new(crate::config::stack_id()).catalog_restore_retired(reason);
+    Emitter::new(crate::config::stack_id(), false).catalog_restore_retired(reason);
 }
 
 /// Source context sharing the process UDP transport.
 pub(crate) struct Emitter<'a> {
     stack_id: &'a str,
+    source_mode: bool,
 }
 struct Tagged<'a> {
     client: &'a Statsd,
-    stack_id: &'a str,
+    stack_id: Option<&'a str>,
 }
 impl Tagged<'_> {
     fn tags<'a>(&'a self, tags: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
         let mut tags = tags.to_vec();
-        tags.push(("stack_id", self.stack_id));
+        if let Some(stack_id) = self.stack_id {
+            tags.push(("stack_id", stack_id));
+        }
         tags
     }
     fn incr(&self, name: &str, tags: &[(&str, &str)]) {
@@ -261,12 +264,12 @@ impl Tagged<'_> {
     }
 }
 impl<'a> Emitter<'a> {
-    pub(crate) fn new(stack_id: &'a str) -> Self {
-        Self { stack_id }
+    pub(crate) fn new(stack_id: &'a str, source_mode: bool) -> Self {
+        Self { stack_id, source_mode }
     }
     pub fn serve_shape(&self, root_table: &str, live: bool, status: u16, elapsed: Duration, body_bytes: u64) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         let ms = elapsed.as_secs_f64() * 1000.0;
         let status_s = status.to_string();
         let live_s = if live { "true" } else { "false" };
@@ -278,10 +281,11 @@ impl<'a> Emitter<'a> {
             "electric.plug.serve_shape.requests.count",
             &[("status", status_s.as_str()), ("known_error", known_s), ("live", live_s)],
         );
-        s.dist(
+        // This metric carries stack_id in both modes; send directly to avoid a duplicate tag.
+        client.dist(
             "electric.shape.response_size.bytes",
             body_bytes as f64,
-            &[("root_table", root_table), ("is_live", live_s)],
+            &[("root_table", root_table), ("is_live", live_s), ("stack_id", self.stack_id)],
         );
         if !live {
             s.dist("electric.plug.serve_shape.duration", ms, &[]);
@@ -294,7 +298,7 @@ impl<'a> Emitter<'a> {
     /// (see the call site in `replication.rs` for exactly what it measures).
     pub fn replication_txn(&self, ops: u64, bytes: u64, receive_lag_ms: f64) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.incr("electric.postgres.replication.transaction_received.count", &[]);
         s.count("electric.postgres.replication.transaction_received.bytes", bytes, &[]);
         s.dist("electric.postgres.replication.transaction_received.operations", ops as f64, &[]);
@@ -304,7 +308,7 @@ impl<'a> Emitter<'a> {
     /// Per source transaction whose changes were appended to shape streams (see conformance §4b).
     pub fn storage_txn(&self, ops: u64, bytes: u64, affected_shapes: u64) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.incr("electric.storage.transaction_stored.count", &[]);
         s.count("electric.storage.transaction_stored.bytes", bytes, &[]);
         s.count("electric.storage.transaction_stored.operations", ops, &[]);
@@ -314,7 +318,7 @@ impl<'a> Emitter<'a> {
     /// Per completed shape backfill/snapshot (see conformance §4b). `make_new_ms` is the backfill query time.
     pub fn snapshot_stored(&self, rows: u64, bytes: u64, make_new_ms: f64) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.incr("electric.storage.snapshot_stored.count", &[]);
         s.count("electric.storage.snapshot_stored.bytes", bytes, &[]);
         s.count("electric.storage.snapshot_stored.operations", rows, &[]);
@@ -324,14 +328,14 @@ impl<'a> Emitter<'a> {
     /// The whole shape-creation task duration (backfill + registration), emitted by the creator only.
     pub fn create_snapshot_task(&self, elapsed: Duration) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.dist("electric.shape_snapshot.create_snapshot_task.stop.duration", elapsed.as_secs_f64() * 1000.0, &[]);
     }
 
     /// Boot-to-ready, emitted once when the engine becomes active.
     pub fn consumers_ready(&self, tables: u64) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.gauge("electric.connection.consumers_ready.duration", since_start().as_secs_f64() * 1000.0, &[]);
         s.gauge("electric.connection.consumers_ready.total", tables as f64, &[]);
     }
@@ -340,7 +344,7 @@ impl<'a> Emitter<'a> {
     /// `du` took (matches Electric emitting `used.bytes` + `used.measurement_duration` together).
     pub fn storage_used(&self, bytes: u64, measurement: Duration) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.gauge("electric.storage.used.bytes", bytes as f64, &[]);
         s.dist("electric.storage.used.measurement_duration", measurement.as_secs_f64() * 1000.0, &[]);
     }
@@ -351,7 +355,7 @@ impl<'a> Emitter<'a> {
     /// engine, so `active_shapes == total_shapes` (a true statement about this engine, not a copy of total).
     pub fn shape_gauges(&self, total: u64, indexed: u64, unindexed: u64) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.gauge("electric.shapes.total_shapes.count", total as f64, &[]);
         s.gauge("electric.shapes.active_shapes.count", total as f64, &[]);
         s.gauge("electric.shapes.total_shapes.count_indexed", indexed as f64, &[]);
@@ -363,7 +367,7 @@ impl<'a> Emitter<'a> {
     /// as a StatsD tag for operators distinguishing orphan cleanup from terminal-stream cleanup.
     pub fn catalog_restore_retired(&self, reason: &str) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         s.incr("electric.catalog.restore.retired.count", &[("reason", reason)]);
     }
 }
@@ -392,12 +396,12 @@ pub fn slot_gauge_values(wal: &str, restart: Option<&str>, confirmed: Option<&st
 /// ([`crate::metrics::spawn_replication_slot_sampler`]), which publishes the same numbers as engine
 /// gauges so `GET /metrics` and `GET /metrics/prometheus` see them with or without StatsD.
 pub fn replication_slot_gauges(wal: &str, restart: Option<&str>, confirmed: Option<&str>) {
-    Emitter::new(crate::config::stack_id()).replication_slot_gauges(wal, restart, confirmed);
+    Emitter::new(crate::config::stack_id(), false).replication_slot_gauges(wal, restart, confirmed);
 }
 impl Emitter<'_> {
     pub(crate) fn replication_slot_gauges(&self, wal: &str, restart: Option<&str>, confirmed: Option<&str>) {
         let Some(client) = statsd() else { return };
-        let s = Tagged { client, stack_id: self.stack_id };
+        let s = Tagged { client, stack_id: self.source_mode.then_some(self.stack_id) };
         for (name, value) in slot_gauge_values(wal, restart, confirmed) {
             s.gauge(name, value, &[]);
         }

@@ -111,6 +111,12 @@ Do NOT emit BEAM-only internals we can't honestly measure: `vm.memory.atom*`, `v
 
 ### 4b. Event/stack metrics (from `StackTelemetry.metrics/1` + router dispatch)
 
+Every line carries the process `instance_id`. In single-engine mode, only
+`electric.shape.response_size.bytes` also carries `stack_id`; the other tags are listed below.
+In sources mode, every Engine metric line additionally carries `stack_id:<source_id>`, including
+shape-count and replication-slot gauges. Response-size metrics use that same source id, with one
+`stack_id` tag. Process metrics in §4a retain their process tags.
+
 | Electric StatsD name | Type | When we emit |
 |---|---|---|
 | `plug.router_dispatch.stop.duration` | d, **milliseconds** | every HTTP request; tags `route:/v1/shape,status:<code>` (fleet dashboards whitelist this name) |
