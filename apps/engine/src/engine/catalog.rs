@@ -569,16 +569,50 @@ pub struct StoreAdmission {
     pub(crate) binding: crate::store_identity::StoreBound,
 }
 
-async fn read_catalog_events_from(ds: &DsClient) -> Result<Vec<serde_json::Value>> {
-    let mut events = Vec::new();
+/// Consume each page before requesting the next; callers retain only their validation/fold state.
+async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json::Value>)) -> Result<()> {
     let mut off = "-1".to_string();
     loop {
         let (page, next, up_to_date) = ds.read_json(CATALOG_STREAM, &off).await?;
-        events.extend(page);
+        visit(page);
         match next {
             Some(next) if !up_to_date && next != off => off = next,
-            _ => return Ok(events),
+            _ => return Ok(()),
         }
+    }
+}
+
+/// Keep the first binding error until the read finishes, preserving read-before-binding errors.
+struct StoreBindingCheck<'a> {
+    expected: &'a crate::store_identity::StoreBound,
+    seen_first: bool,
+    result: Result<()>,
+}
+
+impl<'a> StoreBindingCheck<'a> {
+    fn new(expected: &'a crate::store_identity::StoreBound) -> Self {
+        Self { expected, seen_first: false, result: Ok(()) }
+    }
+
+    fn observe_page(&mut self, page: &[serde_json::Value]) {
+        for event in page {
+            if self.result.is_err() {
+                break;
+            }
+            if !self.seen_first {
+                self.seen_first = true;
+                self.result = validate_store_binding(std::slice::from_ref(event), self.expected);
+            } else if event.get("t").and_then(serde_json::Value::as_str) == Some("storeBound") {
+                self.result = Err(anyhow::Error::new(CatalogStoreBindingError::DuplicateOrReordered));
+            }
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        if !self.seen_first {
+            return Err(anyhow::Error::new(CatalogStoreBindingError::Missing));
+        }
+        self.result
     }
 }
 
@@ -1042,8 +1076,9 @@ impl Engine {
         expected: crate::store_identity::StoreBound,
         initialize_namespace: bool,
     ) -> Result<StoreAdmission> {
-        let events = read_catalog_events_from(&ds).await?;
-        if events.is_empty() {
+        let mut binding = StoreBindingCheck::new(&expected);
+        visit_catalog_pages(&ds, |page| binding.observe_page(&page)).await?;
+        if !binding.seen_first {
             if !initialize_namespace {
                 return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
             }
@@ -1054,10 +1089,9 @@ impl Engine {
                 .expect("catalog event serializes as object")
                 .insert("eid".to_string(), serde_json::Value::String("store-bound-init".to_string()));
             ds.append_json(CATALOG_STREAM, std::slice::from_ref(&event)).await?;
-            validate_store_binding(&read_catalog_events_from(&ds).await?, &expected)?;
-        } else {
-            validate_store_binding(&events, &expected)?;
+            visit_catalog_pages(&ds, |page| binding.observe_page(&page)).await?;
         }
+        binding.finish()?;
         Ok(StoreAdmission { ds, binding: expected })
     }
 
@@ -1087,8 +1121,11 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     async fn read_catalog_events(&self) -> Result<Vec<serde_json::Value>> {
-        read_catalog_events_from(&self.ds).await
+        let mut events = Vec::new();
+        visit_catalog_pages(&self.ds, |page| events.extend(page)).await?;
+        Ok(events)
     }
 
     /// Vouch for every stream that Resume would install before changing the registry, routing or
@@ -1125,38 +1162,56 @@ impl Engine {
     /// [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
         let mut fold = CatalogFold::default();
-        let events = self.read_catalog_events().await?;
-        if let Some(expected) = self.store_bound.get() {
-            validate_store_binding(&events, expected)?;
+        let mut binding = self.store_bound.get().map(StoreBindingCheck::new);
+        let mut fold_result = Ok(());
+        visit_catalog_pages(&self.ds, |page| {
+            if let Some(binding) = &mut binding {
+                binding.observe_page(&page);
+                if binding.result.is_err() {
+                    return;
+                }
+            }
+            if fold_result.is_err() {
+                return;
+            }
+            // Binding validation precedes fold errors even when the duplicate is on a later page.
+            fold_result = (|| -> Result<()> {
+                for ev in page {
+                    // The catalog is engine-written, so `rec.table` is ALWAYS the canonical
+                    // `schema.name` (`ShapeRecord`'s strict deserializer enforces it). A bare one can
+                    // only be a catalog written before ADR-0002: refuse the boot naming the record,
+                    // rather than let the strict deserializer turn it into a silently skipped event.
+                    if let Some(raw) = ev.pointer("/rec/table").and_then(serde_json::Value::as_str)
+                        && crate::table_ref::TableRef::parse(raw).is_ok_and(|t| t.as_str() != raw)
+                    {
+                        let id = ev.pointer("/rec/id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>");
+                        return Err(anyhow::Error::new(CatalogPredatesQualification {
+                            detail: format!("bare table name '{raw}' in shape {id}"),
+                        }));
+                    }
+                    // Same stance for a pre-segmentation change-log position (ADR-0006): refuse the
+                    // boot naming it, rather than let the strict deserializer turn it into a silently
+                    // skipped event.
+                    if let Some(detail) = predates_segmentation(&ev) {
+                        return Err(anyhow::Error::new(CatalogPredatesSegmentation { detail }));
+                    }
+                    // ...and for an event written before ADR-0008 (no `eid`, no `subscription`): the
+                    // fold cannot de-duplicate or rebuild the live set, and both failures are silent.
+                    if let Some(detail) = predates_subscriptions(&ev) {
+                        return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
+                    }
+                    let eid = ev["eid"].as_str().unwrap_or_default().to_string();
+                    let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
+                    fold.apply_once(&eid, ev);
+                }
+                Ok(())
+            })();
+        })
+        .await?;
+        if let Some(binding) = binding {
+            binding.finish()?;
         }
-        for ev in events {
-            // The catalog is engine-written, so `rec.table` is ALWAYS the canonical
-            // `schema.name` (`ShapeRecord`'s strict deserializer enforces it). A bare one can
-            // only be a catalog written before ADR-0002: refuse the boot naming the record,
-            // rather than let the strict deserializer turn it into a silently skipped event.
-            if let Some(raw) = ev.pointer("/rec/table").and_then(serde_json::Value::as_str)
-                && crate::table_ref::TableRef::parse(raw).is_ok_and(|t| t.as_str() != raw)
-            {
-                let id = ev.pointer("/rec/id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>");
-                return Err(anyhow::Error::new(CatalogPredatesQualification {
-                    detail: format!("bare table name '{raw}' in shape {id}"),
-                }));
-            }
-            // Same stance for a pre-segmentation change-log position (ADR-0006): refuse the
-            // boot naming it, rather than let the strict deserializer turn it into a silently
-            // skipped event.
-            if let Some(detail) = predates_segmentation(&ev) {
-                return Err(anyhow::Error::new(CatalogPredatesSegmentation { detail }));
-            }
-            // ...and for an event written before ADR-0008 (no `eid`, no `subscription`): the
-            // fold cannot de-duplicate or rebuild the live set, and both failures are silent.
-            if let Some(detail) = predates_subscriptions(&ev) {
-                return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
-            }
-            let eid = ev["eid"].as_str().unwrap_or_default().to_string();
-            let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
-            fold.apply_once(&eid, ev);
-        }
+        fold_result?;
         Ok(fold)
     }
 
@@ -2113,6 +2168,159 @@ mod tests {
         conflicting.query_generation = "other-query".to_string();
         let conflicting = serde_json::to_value(CatalogEvent::StoreBound(conflicting)).unwrap();
         assert!(validate_store_binding(&[conflicting], &expected).is_err());
+    }
+
+    fn paged_catalog(events: &[serde_json::Value], cap: usize) -> (DsClient, Arc<crate::ds::ScriptedStore>) {
+        let pages = events
+            .chunks(cap)
+            .enumerate()
+            .map(|(i, page)| {
+                let off = if i == 0 { "-1".to_string() } else { i.to_string() };
+                (off, ((i + 1).to_string(), (i + 1) * cap >= events.len(), serde_json::to_string(page).unwrap()))
+            })
+            .collect();
+        let store =
+            Arc::new(crate::ds::ScriptedStore { pages_by_offset: std::sync::Mutex::new(pages), ..Default::default() });
+        (DsClient::with_test_store("scripted://catalog-pages".into(), store.clone()), store)
+    }
+
+    fn catalog_event(eid: &str, event: CatalogEvent) -> serde_json::Value {
+        let mut value = serde_json::to_value(event).unwrap();
+        value["eid"] = serde_json::json!(eid);
+        value
+    }
+
+    fn paged_catalog_fixture() -> Vec<serde_json::Value> {
+        let mut created = created_event("public.users");
+        created["eid"] = serde_json::json!("created");
+        let joined =
+            catalog_event("joined", CatalogEvent::Joined { id: "s1".into(), subscription: "sub-b".into(), at: 101 });
+        vec![
+            catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound())),
+            created,
+            joined.clone(),
+            catalog_event("left", CatalogEvent::Left { id: "s1".into(), subscription: "sub-b".into(), lapsed: false }),
+            // Replaying a join after the leave must not resurrect the subscription.
+            joined,
+            serde_json::json!({"t": "future-event", "eid": "unknown"}),
+            catalog_event("rotation", CatalogEvent::ChangesRotated { segment: 3, at: 120 }),
+            catalog_event("pin", CatalogEvent::ConsumerPinned { id: "reader".into(), position: pos(2, "pin") }),
+            catalog_event("offset", CatalogEvent::Offset { pos: pos(3, "tail"), highwater: Some((42, 7)) }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn catalog_pages_are_handed_off_before_the_next_read() {
+        let events = paged_catalog_fixture();
+        let (ds, store) = paged_catalog(&events, 2);
+        let mut pages = 0;
+        let mut count = 0;
+        visit_catalog_pages(&ds, |page| {
+            assert!(page.len() <= 2, "catalog reader handed off {} events, exceeding the 2-event page", page.len());
+            pages += 1;
+            count += page.len();
+            assert_eq!(store.read_count.load(Ordering::SeqCst), pages, "process this page before reading the next");
+        })
+        .await
+        .unwrap();
+        assert_eq!(pages, 5);
+        assert_eq!(count, events.len());
+        assert_eq!(*store.read_offsets.lock().unwrap(), ["-1", "1", "2", "3", "4"]);
+    }
+
+    #[tokio::test]
+    async fn catalog_pages_admit_and_fold_preserve_state() {
+        let events = paged_catalog_fixture();
+        let (ds, store) = paged_catalog(&events, 2);
+        let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
+        assert_eq!(admission.binding, expected_store_bound());
+        assert_eq!(store.read_count.load(Ordering::SeqCst), 5, "admission is one pass");
+        let engine = Engine::new_for_in_process_test(admission.ds);
+        engine.store_bound.set(admission.binding).unwrap();
+        let fold = engine.fold_catalog().await.unwrap();
+        assert_eq!(store.read_count.load(Ordering::SeqCst), 10, "fold is one more pass");
+        assert_eq!(fold.start_pos(), pos(3, "tail"));
+        assert_eq!(fold.start_highwater, Some((42, 7)));
+        assert_eq!(fold.current_segment, 3);
+        assert_eq!(fold.segment_starts, std::collections::BTreeMap::from([(3, 120)]));
+        assert_eq!(fold.consumers, std::collections::BTreeMap::from([("reader".into(), pos(2, "pin"))]));
+        assert_eq!(fold.max_shape_id, Some(1));
+        assert_eq!(fold.recs.len(), 1);
+        assert_eq!(fold.recs["s1"].2, std::collections::BTreeMap::from([("sub-a".into(), 100)]));
+        assert!(fold.pending_retire.is_empty());
+        assert_eq!(fold.seen.len(), 7, "unknown and duplicate events are not applied");
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
+    async fn catalog_pages_binding_errors_match_the_collecting_validator() {
+        let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
+        let offset = catalog_event("offset", CatalogEvent::Offset { pos: pos(0, "tail"), highwater: None });
+        let mut mismatch = expected_store_bound();
+        mismatch.query_generation = "other-query".into();
+        let cases = [
+            vec![bound.clone(), offset.clone(), serde_json::json!({"t": "storeBound"})],
+            vec![catalog_event("bound", CatalogEvent::StoreBound(mismatch)), offset.clone()],
+            vec![offset, bound.clone()],
+            vec![serde_json::json!({"t": "storeBound"}), bound],
+        ];
+        for events in cases {
+            let expected = validate_store_binding(&events, &expected_store_bound()).unwrap_err();
+            let (ds, _) = paged_catalog(&events, 1);
+            let admission_error = match Engine::admit_store(ds.clone(), expected_store_bound(), false).await {
+                Ok(_) => panic!("invalid catalog must be refused"),
+                Err(error) => error,
+            };
+            assert_eq!(admission_error.to_string(), expected.to_string());
+            assert!(admission_error.downcast_ref::<CatalogStoreBindingError>().is_some());
+            let engine = Engine::new_for_in_process_test(ds);
+            engine.store_bound.set(expected_store_bound()).unwrap();
+            let error = engine.fold_catalog().await.err().expect("invalid binding must prevent folding");
+            assert_eq!(error.to_string(), expected.to_string());
+            assert!(error.downcast_ref::<CatalogStoreBindingError>().is_some());
+            engine.close(OTTO_5492_DEADLINE).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn catalog_pages_empty_namespace_requires_explicit_initialization() {
+        let server = FakeDs::start().await;
+        let ds = DsClient::new_for_in_process_test(server.url());
+        let error = match Engine::admit_store(ds.clone(), expected_store_bound(), false).await {
+            Ok(_) => panic!("empty namespace requires initialization"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.downcast_ref::<CatalogStoreBindingError>(),
+            Some(CatalogStoreBindingError::EmptyWithoutInitialization)
+        ));
+        let engine = Engine::new_for_in_process_test(ds.clone());
+        engine.store_bound.set(expected_store_bound()).unwrap();
+        let error = engine.fold_catalog().await.err().expect("empty catalog has no binding");
+        assert!(matches!(error.downcast_ref::<CatalogStoreBindingError>(), Some(CatalogStoreBindingError::Missing)));
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        assert_eq!(admission.binding, expected_store_bound());
+        assert_eq!(server.catalog_kinds(), ["storeBound"]);
+        engine.fold_catalog().await.unwrap();
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
+    async fn catalog_pages_binding_error_precedes_earlier_fold_error() {
+        let events = vec![
+            catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound())),
+            created_event("users"),
+            serde_json::json!({"t": "storeBound"}),
+        ];
+        let (ds, _) = paged_catalog(&events, 1);
+        let engine = Engine::new_for_in_process_test(ds);
+        engine.store_bound.set(expected_store_bound()).unwrap();
+        let error = engine.fold_catalog().await.err().expect("duplicate binding must be refused");
+        assert!(matches!(
+            error.downcast_ref::<CatalogStoreBindingError>(),
+            Some(CatalogStoreBindingError::DuplicateOrReordered)
+        ));
+        engine.close(OTTO_5492_DEADLINE).await;
     }
 
     fn created_event(table: &str) -> serde_json::Value {
