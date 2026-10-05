@@ -20,6 +20,10 @@ use electric_circuits_engine::sources::{SourceRow, SourcesSupervisor};
 use tokio::sync::{Mutex, oneshot};
 use tower::ServiceExt;
 
+#[cfg(feature = "test-support")]
+#[path = "sources_table/ownership.rs"]
+mod ownership;
+
 #[derive(Clone, Default)]
 struct FeedDs {
     streams: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,

@@ -1370,6 +1370,14 @@ impl Engine {
         self.shutdown.clone()
     }
 
+    /// Observe state ownership without keeping the Engine alive.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn state_alive_probe_for_test(&self) -> impl Fn() -> bool + Send + Sync + use<> {
+        let state = Arc::downgrade(&self.state);
+        move || state.upgrade().is_some()
+    }
+
     /// Install the managed ownership gate before the HTTP server is exposed or Postgres setup runs.
     pub fn configure_managed_deployment(
         &self,

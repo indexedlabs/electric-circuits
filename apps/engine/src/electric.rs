@@ -140,6 +140,14 @@ fn handles() -> &'static std::sync::Mutex<HashMap<String, Arc<HandleEntry>>> {
     H.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Observe the serving Engine's registry without creating or renewing a handle.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub async fn registry_usage_for_test(_engine: &Engine) -> (usize, usize) {
+    let count = handles().lock().unwrap().len();
+    (count, ttl_registry_heap_bytes().await)
+}
+
 /// Owned-heap estimate of the `/v1/shape` handle registry — the memory probe's
 /// `bytes_electric_adapter` term. `HandleEntry`/`HandleState` hold sync/async primitives
 /// (`Mutex`, `watch::Receiver`), so this is a hand-rolled walk rather than a `HeapSize` impl:

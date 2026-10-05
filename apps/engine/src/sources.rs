@@ -95,6 +95,8 @@ pub struct SourcesSupervisor {
 }
 
 struct SupervisorInner {
+    #[cfg(feature = "test-support")]
+    poll_completed: tokio::sync::watch::Sender<()>,
     config: Config,
     sources: SourcesConfig,
     state: Mutex<SupervisorState>,
@@ -144,6 +146,8 @@ impl SourcesSupervisor {
         }
         Ok(Self {
             inner: Arc::new(SupervisorInner {
+                #[cfg(feature = "test-support")]
+                poll_completed: tokio::sync::watch::channel(()).0,
                 config,
                 sources,
                 state: Mutex::new(SupervisorState {
@@ -240,6 +244,19 @@ impl SourcesSupervisor {
         self.apply_snapshot(snapshot).await
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn engine_for_test(&self, source_id: &str) -> Option<Engine> {
+        self.inner.state.lock().await.running.get(source_id).map(|runtime| runtime.engine.clone())
+    }
+
+    /// Observe completed real poll ticks without requesting a refresh or driving reconciliation.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn poll_completed_for_test(&self) -> tokio::sync::watch::Receiver<()> {
+        self.inner.poll_completed.subscribe()
+    }
+
     pub fn spawn_poll(&self) {
         let supervisor = self.clone();
         let handle = tokio::spawn(async move {
@@ -259,6 +276,8 @@ impl SourcesSupervisor {
                             }
                             tracing::warn!(error = %error, "sources poll failed");
                         }
+                        #[cfg(feature = "test-support")]
+                        supervisor.inner.poll_completed.send_replace(());
                     }
                 }
             }
