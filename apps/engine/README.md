@@ -482,6 +482,10 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   `eid` it has already applied — so the writer's retry-in-place (a response lost after the append
   committed) can never double-apply a join, a leave or anything else. A catalog written before this
   (no `eid`, no `subscription`) is boot-fatal, like the pre-ADR-0002 and pre-ADR-0006 formats.
+- **Store admission decodes only catalog event zero**, the expected `storeBound`, and stops there.
+  The transport still buffers its capped page body. The subsequent catalog fold reads every page
+  once and rejects duplicate or reordered bindings before event-id de-duplication, including a
+  repeated binding with the same `eid`. No shapes restore from an invalid catalog.
 
 ### Durability of a create, and of a retirement
 
@@ -609,6 +613,7 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `backfill_chunked_appends_total` | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0) |
 | `shutdown_in_progress` | gauge | `1` once a graceful shutdown has begun |
 | `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
+| `catalog_bytes` | gauge | response-body bytes read by the latest successful boot catalog fold, including JSON framing, whitespace, unknown events and duplicate events; excludes admission reads and HTTP headers. Exported as `engine_catalog_bytes` in Prometheus and logged once per successful fold as `catalog read complete` with `catalog_bytes`. This is a boot measurement, not a live size or heap estimate; metric reset preserves it |
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
 | `catalog_restore_retired_total` | counter | shape records retired at boot because storage answered their stream `HEAD` with 404/410 or `closed` (ADR-0011). StatsD emits the same as `electric.catalog.restore.retired.count` tagged `reason:missing` / `reason:closed`. Non-zero after a boot means a shape was orphaned by a crash (or storage lost a stream); a burst is worth a look |

@@ -49,6 +49,11 @@ phantom unrecoverable, the second lets any dead client pin a shape forever.
   retry-in-place (no event is ever dropped) can never double-apply anything — joins, leaves, drops,
   rotations, segment deletions alike. A catalog written before this ADR is boot-fatal, like the
   pre-ADR-0002 and pre-ADR-0006 formats (greenfield; nothing shipped).
+- Store admission now decodes only event zero. The full boot fold still checks the immutable
+  `storeBound` binding before `eid` de-duplication: a second binding, even with the same `eid`, is
+  fatal. The fold logs and exports its response-body bytes as `engine_catalog_bytes` (JSON
+  `catalog_bytes`), including repeated events and page framing; admission reads are excluded.
+  This measures append-only history without changing the catalog format or compacting it.
 - A join that is abandoned mid-wait (client disconnect while storage is unavailable) compensates with
   a `Left` for its own subscription id — idempotent, so it cannot steal anyone else's claim.
 - What this does not do: it does not observe reads. Liveness is the caller's renewal, full stop; a

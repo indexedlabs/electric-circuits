@@ -141,6 +141,9 @@ pub struct Metrics {
     /// Shape records retired during catalog restore because their durable stream was missing or
     /// already closed. The reason-tagged StatsD event is emitted alongside this Engine counter.
     pub catalog_restore_retired: AtomicU64,
+    /// GAUGE: response-body bytes read by the latest successful catalog fold (including framing
+    /// and duplicate events). Excludes admission reads; preserved by `reset()`.
+    pub(crate) catalog_bytes: AtomicU64,
     /// ADR-0007: retirement attempts that failed and were re-queued.
     pub retirement_retries: AtomicU64,
     pub txn_spills: AtomicU64, // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
@@ -236,6 +239,7 @@ impl Metrics {
             changes_segments_retained: AtomicU64::new(0),
             catalog_append_retries: AtomicU64::new(0),
             catalog_restore_retired: AtomicU64::new(0),
+            catalog_bytes: AtomicU64::new(0),
             retirement_retries: AtomicU64::new(0),
             retirements_pending: AtomicU64::new(0),
             backfill_chunked_appends: AtomicU64::new(0),
@@ -301,6 +305,7 @@ impl Metrics {
                 "sequencer_orphan_fragments_total": self.sequencer_orphan_fragments.load(Ordering::Relaxed),
             },
             "gauges": {
+                "catalog_bytes": self.catalog_bytes.load(Ordering::Relaxed),
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
                 "sequencer_read_cap_failures_total": self.sequencer_read_cap_failures.load(Ordering::Relaxed),
@@ -356,7 +361,7 @@ impl Metrics {
         self.backfill_chunked_appends.store(0, Ordering::Relaxed);
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
-        // (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`,
+        // (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`,
         // `retirements_pending`, and the three replication-slot gauges the sampler republishes).
         self.process_envelope.reset();
         self.family_step.reset();

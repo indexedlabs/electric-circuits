@@ -1169,10 +1169,23 @@ impl DsClient {
 
     /// Read raw JSON events (non-envelope streams). Returns `(events, next_offset, up_to_date)`.
     pub async fn read_json(&self, path: &str, offset: &str) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
+        let (body, next_offset, up_to_date) = self.read_json_body(path, offset).await?;
+        let events: Vec<serde_json::Value> = if body.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
+        };
+        Ok((events, next_offset, up_to_date))
+    }
+
+    /// One capped JSON page before decoding, for catalog event-zero admission and byte accounting.
+    /// Preserves `read_json`'s empty/missing-stream and fallible-body semantics. The returned body
+    /// is still page-sized; callers can decode a prefix without allocating every event in it.
+    pub(crate) async fn read_json_body(&self, path: &str, offset: &str) -> Result<(String, Option<String>, bool)> {
         let physical_path = self.physical_path(path)?;
         let res = self.store.read(&physical_path, offset, false).await?;
         if res.status == 204 || res.status == 404 {
-            return Ok((Vec::new(), res.next_offset, true));
+            return Ok((String::new(), res.next_offset, true));
         }
         if !(200..300).contains(&res.status) {
             return Err(status_error("GET", path, res.status, ""));
@@ -1180,12 +1193,7 @@ impl DsClient {
         let next_offset = res.next_offset.clone();
         let up_to_date = res.up_to_date;
         let body = res.required_body()?;
-        let events: Vec<serde_json::Value> = if body.trim().is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
-        };
-        Ok((events, next_offset, up_to_date))
+        Ok((body, next_offset, up_to_date))
     }
 
     /// Append envelopes. A retired stream (404/410/closed) is an error here; the live path uses

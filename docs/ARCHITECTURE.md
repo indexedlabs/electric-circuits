@@ -845,6 +845,15 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 
 ## 9. Consistency & durability model (summary)
 
+Store admission reads only the first catalog event to validate the immutable `storeBound` identity.
+It buffers that capped response body but decodes no later events. The subsequent fold reads the
+whole catalog page by page and checks bindings before `eid` de-duplication, so a duplicate or
+reordered `storeBound` still refuses boot before restore. After a successful fold, `catalog read
+complete` logs `catalog_bytes`: the sum of response-body lengths, including JSON framing and
+repeated events, excluding admission reads. The same boot measurement is the `catalog_bytes`
+JSON gauge and `engine_catalog_bytes` Prometheus gauge; it survives metric reset and does not track
+later appends or estimate heap usage. The catalog remains append-only and uncompacted.
+
 | seam | mechanism | guarantee |
 |---|---|---|
 | backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
@@ -914,7 +923,7 @@ than the mechanism.
 - `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
   `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions,
   `backfill_chunked_appends_total` for streamed backfills, `sequencer_orphan_fragments_total`) +
-  gauges (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the
+  gauges (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the
   replication-slot trio below) + log-bucket latency histograms (`process_envelope`, `family_step`,
   `append`) with p50/p99/p999/max.
 - **Replication-slot gauges**, engine-owned and sampled every ~10 s on a fresh connection: `replication_slot_retained_wal_bytes`

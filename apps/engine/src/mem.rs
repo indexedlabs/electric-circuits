@@ -659,6 +659,12 @@ pub(crate) fn init_otel(
         catalog_restore_retired,
         ""
     );
+    engine_gauge!(
+        "engine_catalog",
+        "Response-body bytes read by the latest successful catalog fold, excluding admission reads",
+        catalog_bytes,
+        "By"
+    );
     engine_counter!("engine_txn_spills", "Transactions whose buffer outgrew the memory cap (ADR-0003)", txn_spills, "");
     engine_counter!("engine_txn_spill", "Bytes ever written to transaction spill files", txn_spill_bytes, "By");
     engine_counter!(

@@ -470,7 +470,10 @@ deliberately NOT restored — their inner-node contributor state is not persiste
 fresh-seeded node cannot detect flips that happened while the engine was down (stale move-outs
 would persist forever) — so they are dropped loudly and clients recreate them. The catalog
 stream is never compacted (append-only); if event volume ever matters, snapshot+truncate or an
-embedded KV (redb/lmdb/sled) is the natural next step.
+embedded KV (redb/lmdb/sled) is the natural next step. Admission decodes only event zero; the fold
+still reads every page and validates later bindings. Its response-body byte total is logged at boot
+and exported as `engine_catalog_bytes` (JSON `catalog_bytes`), making catalog growth visible without
+a second full admission scan.
 
 In short: **the memory story is "keep nothing big resident"** — nothing the engine holds
 scales with table size; everything row-scale lives in Postgres.

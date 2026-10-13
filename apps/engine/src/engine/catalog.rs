@@ -570,14 +570,50 @@ pub struct StoreAdmission {
 }
 
 /// Consume each page before requesting the next; callers retain only their validation/fold state.
-async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json::Value>)) -> Result<()> {
+/// Returns response-body bytes, including JSON framing, whitespace and repeated events.
+async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json::Value>)) -> Result<u64> {
     let mut off = "-1".to_string();
+    let mut bytes = 0u64;
     loop {
-        let (page, next, up_to_date) = ds.read_json(CATALOG_STREAM, &off).await?;
+        let (body, next, up_to_date) = ds.read_json_body(CATALOG_STREAM, &off).await?;
+        bytes = bytes.saturating_add(body.len() as u64);
+        let page = if body.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&body).context("parsing catalog page")?
+        };
+        drop(body);
         visit(page);
         match next {
             Some(next) if !up_to_date && next != off => off = next,
-            _ => return Ok(()),
+            _ => return Ok(bytes),
+        }
+    }
+}
+
+/// Decode only event zero, then stop. The transport still buffers one capped page; the full fold
+/// owns validation of its remaining bytes/events and every later page, including duplicate bindings.
+async fn read_first_catalog_event(ds: &DsClient) -> Result<Option<serde_json::Value>> {
+    let mut off = "-1".to_string();
+    loop {
+        let (body, next, up_to_date) = ds.read_json_body(CATALOG_STREAM, &off).await?;
+        let body = body.trim();
+        if !body.is_empty() {
+            let rest = body.strip_prefix('[').context("catalog page must be a JSON array")?.trim_start();
+            if !rest.starts_with(']') {
+                let first = serde_json::Deserializer::from_str(rest)
+                    .into_iter::<serde_json::Value>()
+                    .next()
+                    .context("catalog page ended before event zero")?
+                    .context("parsing catalog event zero")?;
+                return Ok(Some(first));
+            }
+            // An empty page must still be well-formed before it can authorize initialization.
+            serde_json::from_str::<[serde_json::Value; 0]>(body).context("parsing empty catalog page")?;
+        }
+        match next {
+            Some(next) if !up_to_date && next != off => off = next,
+            _ => return Ok(None),
         }
     }
 }
@@ -1070,15 +1106,15 @@ pub(crate) enum RestoreMode {
 
 impl Engine {
     /// Admit a ready store namespace before an Engine can exist. The returned proof carries both
-    /// the admitted DS client and the immutable event-zero binding.
+    /// the admitted DS client and the immutable event-zero binding. Only event zero is decoded;
+    /// `fold_catalog` must validate the whole catalog before any restore, including later bindings.
     pub async fn admit_store(
         ds: DsClient,
         expected: crate::store_identity::StoreBound,
         initialize_namespace: bool,
     ) -> Result<StoreAdmission> {
-        let mut binding = StoreBindingCheck::new(&expected);
-        visit_catalog_pages(&ds, |page| binding.observe_page(&page)).await?;
-        if !binding.seen_first {
+        let mut first = read_first_catalog_event(&ds).await?;
+        if first.is_none() {
             if !initialize_namespace {
                 return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
             }
@@ -1089,9 +1125,9 @@ impl Engine {
                 .expect("catalog event serializes as object")
                 .insert("eid".to_string(), serde_json::Value::String("store-bound-init".to_string()));
             ds.append_json(CATALOG_STREAM, std::slice::from_ref(&event)).await?;
-            visit_catalog_pages(&ds, |page| binding.observe_page(&page)).await?;
+            first = read_first_catalog_event(&ds).await?;
         }
-        binding.finish()?;
+        validate_store_binding(first.as_slice(), &expected)?;
         Ok(StoreAdmission { ds, binding: expected })
     }
 
@@ -1158,13 +1194,13 @@ impl Engine {
         Ok(retire)
     }
 
-    /// Read the durable shape catalog and fold it. No engine state is touched — see
-    /// [`Self::apply_catalog`] for that half.
+    /// Read the durable shape catalog and fold it. Only the completed read's byte gauge is updated;
+    /// no restored state is installed — see [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
         let mut fold = CatalogFold::default();
         let mut binding = self.store_bound.get().map(StoreBindingCheck::new);
         let mut fold_result = Ok(());
-        visit_catalog_pages(&self.ds, |page| {
+        let bytes = visit_catalog_pages(&self.ds, |page| {
             if let Some(binding) = &mut binding {
                 binding.observe_page(&page);
                 if binding.result.is_err() {
@@ -1212,6 +1248,8 @@ impl Engine {
             binding.finish()?;
         }
         fold_result?;
+        self.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
+        tracing::info!(catalog_bytes = bytes, "catalog read complete");
         Ok(fold)
     }
 
@@ -2234,11 +2272,11 @@ mod tests {
         let (ds, store) = paged_catalog(&events, 2);
         let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
         assert_eq!(admission.binding, expected_store_bound());
-        assert_eq!(store.read_count.load(Ordering::SeqCst), 5, "admission is one pass");
+        assert_eq!(store.read_count.load(Ordering::SeqCst), 1, "admission stops after event zero");
         let engine = Engine::new_for_in_process_test(admission.ds);
         engine.store_bound.set(admission.binding).unwrap();
         let fold = engine.fold_catalog().await.unwrap();
-        assert_eq!(store.read_count.load(Ordering::SeqCst), 10, "fold is one more pass");
+        assert_eq!(store.read_count.load(Ordering::SeqCst), 6, "only the fold reads the whole catalog");
         assert_eq!(fold.start_pos(), pos(3, "tail"));
         assert_eq!(fold.start_highwater, Some((42, 7)));
         assert_eq!(fold.current_segment, 3);
@@ -2253,33 +2291,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_admission_leaves_the_rest_of_the_first_page_to_the_fold() {
+        let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
+        let store = Arc::new(crate::ds::ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![("tail".into(), true, format!("[{bound}, invalid JSON]"))]),
+            ..Default::default()
+        });
+        let ds = DsClient::with_test_store("scripted://catalog-event-zero".into(), store.clone());
+        assert!(
+            Engine::admit_store(ds.clone(), expected_store_bound(), false).await.is_ok(),
+            "admission must decode only event zero; the fold owns later validation"
+        );
+        store.read_pages.lock().unwrap().push(("tail".into(), true, format!("[{bound}, invalid JSON]")));
+        let engine = Engine::new_for_in_process_test(ds);
+        engine.store_bound.set(expected_store_bound()).unwrap();
+        assert!(engine.fold_catalog().await.is_err(), "malformed catalog tails must still prevent boot");
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
+    async fn catalog_fold_reports_body_bytes_without_counting_admission_or_deduplicating_bytes() {
+        let mut events = paged_catalog_fixture();
+        events.push(serde_json::json!({"t": "future-event", "eid": "utf8", "note": "雪"}));
+        let (ds, store) = paged_catalog(&events, 2);
+        // Non-canonical whitespace and UTF-8 distinguish wire bytes from reserialization/characters.
+        let expected_bytes: u64 = store
+            .pages_by_offset
+            .lock()
+            .unwrap()
+            .values_mut()
+            .map(|(_, _, body)| {
+                *body = format!(" \n{body}\n ");
+                body.len() as u64
+            })
+            .sum();
+        let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
+        let engine = Engine::new_for_in_process_test(admission.ds);
+        engine.store_bound.set(admission.binding).unwrap();
+        for _ in 0..2 {
+            engine.fold_catalog().await.unwrap();
+            assert_eq!(
+                engine.metrics.snapshot()["gauges"]["catalog_bytes"],
+                expected_bytes,
+                "catalog size is the bytes read by the latest successful fold"
+            );
+        }
+        engine.metrics.reset();
+        assert_eq!(engine.metrics.snapshot()["gauges"]["catalog_bytes"], expected_bytes, "a gauge survives reset");
+        let prometheus = engine.prometheus_text();
+        assert!(prometheus.contains("# TYPE engine_catalog_bytes gauge"), "{prometheus}");
+        let sample = prometheus.lines().find(|line| line.starts_with("engine_catalog_bytes")).unwrap();
+        assert_eq!(sample.split_whitespace().last().unwrap(), expected_bytes.to_string());
+        store.pages_by_offset.lock().unwrap().get_mut("1").unwrap().2 = "invalid JSON".into();
+        assert!(engine.fold_catalog().await.is_err());
+        assert_eq!(
+            engine.metrics.snapshot()["gauges"]["catalog_bytes"],
+            expected_bytes,
+            "a failed fold must not publish a partial size"
+        );
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
     async fn catalog_pages_binding_errors_match_the_collecting_validator() {
         let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
         let offset = catalog_event("offset", CatalogEvent::Offset { pos: pos(0, "tail"), highwater: None });
         let mut mismatch = expected_store_bound();
         mismatch.query_generation = "other-query".into();
         let cases = [
+            vec![bound.clone(), bound.clone()], // Even an identical eid must be refused before dedup.
+            vec![
+                bound.clone(),
+                offset.clone(),
+                catalog_event("other-bound", CatalogEvent::StoreBound(expected_store_bound())),
+            ],
             vec![bound.clone(), offset.clone(), serde_json::json!({"t": "storeBound"})],
             vec![catalog_event("bound", CatalogEvent::StoreBound(mismatch)), offset.clone()],
             vec![offset, bound.clone()],
             vec![serde_json::json!({"t": "storeBound"}), bound],
         ];
         for events in cases {
-            let expected = validate_store_binding(&events, &expected_store_bound()).unwrap_err();
-            let (ds, _) = paged_catalog(&events, 1);
-            let admission_error = match Engine::admit_store(ds.clone(), expected_store_bound(), false).await {
-                Ok(_) => panic!("invalid catalog must be refused"),
-                Err(error) => error,
-            };
-            assert_eq!(admission_error.to_string(), expected.to_string());
-            assert!(admission_error.downcast_ref::<CatalogStoreBindingError>().is_some());
-            let engine = Engine::new_for_in_process_test(ds);
-            engine.store_bound.set(expected_store_bound()).unwrap();
-            let error = engine.fold_catalog().await.err().expect("invalid binding must prevent folding");
-            assert_eq!(error.to_string(), expected.to_string());
-            assert!(error.downcast_ref::<CatalogStoreBindingError>().is_some());
-            engine.close(OTTO_5492_DEADLINE).await;
+            for cap in [1, events.len()] {
+                let expected = validate_store_binding(&events, &expected_store_bound()).unwrap_err();
+                let (ds, _) = paged_catalog(&events, cap);
+                let admission = Engine::admit_store(ds.clone(), expected_store_bound(), false).await;
+                if validate_store_binding(&events[..1], &expected_store_bound()).is_ok() {
+                    assert!(admission.is_ok(), "later binding errors belong to the fold");
+                } else {
+                    let error = admission.err().expect("invalid event zero must be refused at admission");
+                    assert_eq!(error.to_string(), expected.to_string());
+                    assert!(error.downcast_ref::<CatalogStoreBindingError>().is_some());
+                }
+                let engine = Engine::new_for_in_process_test(ds);
+                engine.store_bound.set(expected_store_bound()).unwrap();
+                let error = engine.fold_catalog().await.err().expect("invalid binding must prevent folding");
+                assert_eq!(error.to_string(), expected.to_string());
+                assert!(error.downcast_ref::<CatalogStoreBindingError>().is_some());
+                engine.close(OTTO_5492_DEADLINE).await;
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn catalog_admission_does_not_initialize_after_a_read_or_parse_failure() {
+        for body in ["[", "[}", "{}", "[] garbage"] {
+            let store = Arc::new(crate::ds::ScriptedStore {
+                read_pages: std::sync::Mutex::new(vec![("tail".into(), true, body.into())]),
+                ..Default::default()
+            });
+            let ds = DsClient::with_test_store("scripted://catalog-invalid".into(), store.clone());
+            assert!(Engine::admit_store(ds, expected_store_bound(), true).await.is_err(), "{body}");
+            assert!(store.appended.lock().unwrap().is_empty(), "malformed pages cannot authorize initialization");
+        }
+        let store = Arc::new(crate::ds::ScriptedStore { fail_read_body: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://catalog-unreadable".into(), store.clone());
+        let error = Engine::admit_store(ds, expected_store_bound(), true).await.err().unwrap();
+        assert!(error.to_string().contains("scripted stream body failure"));
+        assert!(store.appended.lock().unwrap().is_empty(), "an unreadable catalog is not an empty one");
+    }
+
+    #[tokio::test]
+    async fn catalog_admission_initialization_is_durable_and_rereads_event_zero() {
+        let bound = catalog_event("store-bound-init", CatalogEvent::StoreBound(expected_store_bound()));
+        let store = Arc::new(crate::ds::ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![
+                ("empty".into(), true, "[]".into()),
+                ("tail".into(), false, format!("[{bound}]")),
+            ]),
+            ..Default::default()
+        });
+        let ds = DsClient::with_test_store("scripted://catalog-initialize".into(), store.clone());
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        assert_eq!(admission.binding, expected_store_bound());
+        assert_eq!(*store.read_offsets.lock().unwrap(), ["-1", "-1"], "read back event zero, then stop");
+        let writes = store.appended.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].0.ends_with(CATALOG_STREAM));
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&writes[0].2).unwrap(), serde_json::json!([bound]));
     }
 
     #[tokio::test]
