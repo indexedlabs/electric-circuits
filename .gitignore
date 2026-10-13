@@ -22,3 +22,6 @@ memtest.txt
 /results/
 data/dbsp/
 packages/bench/data/
+
+# Mighty Next stores intent remotely; never recreate the retired mt store here.
+.mighty/
