@@ -19,13 +19,14 @@
 //! "`pendingFlips == 0`" still means every subquery effect is on its stream — queued batches
 //! included. Increment-before/at-enqueue happens while the emitter still holds its own
 //! accounting (a `FlipWork` token stays >0 until its batches are enqueued), so the counter
-//! never dips to zero with effects in flight.
+//! never dips to zero with effects in flight. Each batch retains its originating commit LSN;
+//! receipt barriers check only outstanding origins at or before their marker, while the metric
+//! remains the total across all origins. The origin is internal accounting, not a wire LSN.
 
 use super::*;
 
-use std::sync::atomic::AtomicI64;
-
 struct Batch {
+    commit_lsn: u64,
     stream_path: String,
     envs: Vec<Envelope>,
 }
@@ -34,7 +35,7 @@ struct Batch {
 #[derive(Clone)]
 pub(crate) struct EmissionLanes {
     lanes: Arc<Vec<mpsc::UnboundedSender<Batch>>>,
-    pending: Arc<AtomicI64>,
+    pending: Arc<PendingFlips>,
 }
 
 impl EmissionLanes {
@@ -43,7 +44,7 @@ impl EmissionLanes {
     pub(crate) fn spawn(
         ds: DsClient,
         n: usize,
-        pending: Arc<AtomicI64>,
+        pending: Arc<PendingFlips>,
         shutdown: crate::shutdown::ShutdownToken,
     ) -> EmissionLanes {
         let n = n.max(1);
@@ -60,7 +61,7 @@ impl EmissionLanes {
                     if ds.append_reliable(&b.stream_path, &b.envs).await.is_err() {
                         return;
                     }
-                    pending.fetch_sub(1, Ordering::SeqCst);
+                    pending.complete(b.commit_lsn);
                 }
             });
             lanes.push(tx);
@@ -79,15 +80,65 @@ impl EmissionLanes {
     /// Enqueue one batch for ordered delivery. Call while holding the registry lock so that
     /// per-stream enqueue order is evaluation order. Never blocks (unbounded lane queues —
     /// backpressure is the PG pool bounding how fast evals can produce batches).
-    pub(crate) fn enqueue(&self, stream_path: &str, envs: Vec<Envelope>) {
+    pub(crate) fn enqueue(&self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if envs.is_empty() {
             return;
         }
-        self.pending.fetch_add(1, Ordering::SeqCst);
+        self.pending.add(commit_lsn);
         let lane = self.lane_for(stream_path);
-        if self.lanes[lane].send(Batch { stream_path: stream_path.to_string(), envs }).is_err() {
+        if self.lanes[lane].send(Batch { commit_lsn, stream_path: stream_path.to_string(), envs }).is_err() {
             // Writer gone (engine teardown): don't leave the barrier stuck.
-            self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.pending.complete(commit_lsn);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_worker_hands_its_commit_to_every_append_before_completing() {
+        let pending = Arc::new(PendingFlips::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
+        let envelope: Envelope = serde_json::from_value(serde_json::json!({
+            "type": "test", "key": "1", "headers": {"operation": "upsert"}
+        }))
+        .unwrap();
+        pending.add(0x10); // The worker still owns the originating flip.
+        lanes.enqueue("shape/a", vec![envelope.clone()], 0x10);
+        lanes.enqueue("shape/b", vec![envelope.clone()], 0x10);
+        lanes.enqueue("shape/c", vec![envelope], 0x30);
+        pending.complete(0x10); // Worker has enqueued all of its effects.
+        assert_eq!(pending.count(), 3);
+        assert!(pending.has_at_or_before(0x20), "unlanded appends still hold this marker");
+        let first = rx.try_recv().unwrap();
+        let second = rx.try_recv().unwrap();
+        assert_eq!((first.commit_lsn, second.commit_lsn), (0x10, 0x10));
+        pending.complete(first.commit_lsn);
+        assert!(pending.has_at_or_before(0x20), "every append at the origin must land");
+        pending.complete(second.commit_lsn);
+        assert!(!pending.has_at_or_before(0x20), "a later append cannot hold this prefix");
+        assert_eq!(pending.count(), 1, "the aggregate metric still includes later work");
+        pending.complete(rx.try_recv().unwrap().commit_lsn);
+        assert_eq!(pending.count(), 0);
+        assert!(pending.state.lock().unwrap().1.is_empty(), "completed origins consume no index memory");
+    }
+
+    #[test]
+    fn a_closed_lane_undoes_only_its_own_origin() {
+        let pending = Arc::new(PendingFlips::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
+        pending.add(0x30);
+        let envelope = serde_json::from_value(serde_json::json!({
+            "type": "test", "key": "1", "headers": {"operation": "upsert"}
+        }))
+        .unwrap();
+        lanes.enqueue("shape/a", vec![envelope], 0x10);
+        assert_eq!(pending.count(), 1);
+        assert!(!pending.has_at_or_before(0x20));
     }
 }

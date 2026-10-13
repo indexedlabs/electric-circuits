@@ -188,7 +188,11 @@ configuration rejection). Valid receipts use `Cache-Control: no-store` and this 
 ```
 
 Unknown tuples return `drained:false, receipt:null`. Receipt publication follows the full source
-transaction boundary, its stream appends, and all preceding deferred membership/emission work.
+transaction boundary, its stream appends, and deferred membership/emission batches originating at
+or before the marker's commit LSN. Later pending work does not delay the receipt. Runtime and
+source/deployment markers share this commit-scoped barrier; unknown work origins hold every marker,
+and shutdown or degradation still prevents publication. `pendingFlips` remains an aggregate count
+of pending batches across all commit positions.
 Runtime markers do not write `SourceDrained` catalog events or advance deployment closure progress;
 the controller's separate source fence and receipt protocol above remain unchanged. A server
 receipt does not prove that a client has applied the subsequent stream tail.

@@ -305,7 +305,7 @@ fn test_subq() -> SubqueryHandle {
     let registry =
         Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new_for_in_process_test("http://127.0.0.1:1"), None)));
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
-    let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let pending_flips = Arc::new(PendingFlips::default());
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
     spawn_flip_propagator(
@@ -2139,7 +2139,7 @@ async fn emission_lanes_order_and_barrier() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let ds = crate::ds::DsClient::new_for_in_process_test(&format!("http://{addr}"));
-    let pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let pending = Arc::new(PendingFlips::default());
     let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone(), crate::shutdown::ShutdownToken::new());
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
@@ -2161,14 +2161,14 @@ async fn emission_lanes_order_and_barrier() {
     };
     // Interleave two streams; per-stream order must survive whatever lane assignment they get.
     for i in 0..50 {
-        lanes.enqueue("shape/a", vec![env(i)]);
-        lanes.enqueue("shape/b", vec![env(i)]);
+        lanes.enqueue("shape/a", vec![env(i)], 0);
+        lanes.enqueue("shape/b", vec![env(i)], 0);
     }
-    assert!(pending.load(Ordering::SeqCst) > 0, "barrier must cover queued batches");
+    assert!(pending.count() > 0, "barrier must cover queued batches");
 
     // Drain: the barrier is the only signal a caller has — poll it like the harness does.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while pending.load(Ordering::SeqCst) != 0 {
+    while pending.count() != 0 {
         assert!(std::time::Instant::now() < deadline, "lanes did not drain");
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
@@ -2317,8 +2317,8 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     };
     assert_eq!(work.len(), 1, "the delete flips gid 7 out of the inner set");
 
-    engine.pending_flips.fetch_add(1, Ordering::SeqCst);
-    engine.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: None }).expect("propagator alive");
+    engine.pending_flips.add(0x10);
+    engine.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: Some("0/10".into()) }).expect("propagator alive");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !engine.degraded() {
@@ -2326,6 +2326,8 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert_eq!(engine.flip_failures(), 1, "the abandoned batch is counted");
+    assert!(engine.pending_flips.has_at_or_before(0x10), "abandoned work retains its origin");
+    assert!(!engine.pending_flips.has_at_or_before(0x09));
     assert_eq!(
         engine.pending_flips(),
         1,

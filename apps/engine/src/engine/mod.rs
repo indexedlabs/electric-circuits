@@ -502,8 +502,9 @@ pub struct Engine {
     /// Flip batches enqueued but not yet fully propagated. Part of the convergence barrier:
     /// drained change log + `pending_flips == 0` ⇒ all subquery effects have landed. An abandoned
     /// batch keeps its count forever, so the barrier can never report "everything landed" over
-    /// effects that were lost — the engine degrades instead (see [`DegradeState`]).
-    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    /// effects that were lost — the engine degrades instead (see [`DegradeState`]). Each batch is
+    /// indexed by its originating commit LSN so receipt barriers can wait for just their prefix.
+    pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
     /// Latched when the live sequencer encounters an unrecoverable body-cap breach.
@@ -705,14 +706,67 @@ pub(crate) enum FlipWork {
     /// Work that reached a shape while it was still being created, run against that one shape now
     /// that it is installed (see `SubqueryRegistry::finish_create`). Its dependency walk already
     /// happened, so there is nothing left to walk.
-    Deferred { shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
+    Deferred { commit_lsn: u64, shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
     /// Work that reached a fresh parent NODE while a create was still seeding it, re-derived now
     /// that its set is installed (see `SubqueryRegistry::finish_create`). Unlike `Deferred`, this
     /// one DOES walk: reconciling the node produces flips, and the dependents below it — the
     /// create's own shape included — have not seen them.
     DeferredNode {
+        commit_lsn: u64,
         work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::DeferredNodeWork)>,
     },
+}
+
+impl FlipWork {
+    fn commit_lsn(&self) -> u64 {
+        match self {
+            Self::Walk { lsn, .. } => lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0),
+            Self::Deferred { commit_lsn, .. } | Self::DeferredNode { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+}
+
+/// Outstanding propagation and append batches, indexed by their originating commit LSN.
+/// Unknown origins use zero, so they hold every marker. Entries disappear after the last
+/// batch at that position lands; storage is O(distinct outstanding commit positions).
+/// The total and index share one short, non-async lock so receipts never see a partial update.
+#[derive(Default)]
+pub(crate) struct PendingFlips {
+    state: std::sync::Mutex<(i64, BTreeMap<u64, usize>)>,
+}
+
+impl PendingFlips {
+    fn add(&self, commit_lsn: u64) {
+        self.add_all(std::iter::once(commit_lsn));
+    }
+
+    /// Reserve an entire handoff before any worker can complete one of its batches. The
+    /// receipt check must not observe an empty prefix between two batches of the same create.
+    fn add_all(&self, origins: impl IntoIterator<Item = u64>) {
+        let mut state = self.state.lock().unwrap();
+        for commit_lsn in origins {
+            state.0 += 1;
+            *state.1.entry(commit_lsn).or_default() += 1;
+        }
+    }
+
+    fn complete(&self, commit_lsn: u64) {
+        let mut state = self.state.lock().unwrap();
+        let count = state.1.get_mut(&commit_lsn).expect("completed an untracked flip batch");
+        *count -= 1;
+        if *count == 0 {
+            state.1.remove(&commit_lsn);
+        }
+        state.0 -= 1;
+    }
+
+    fn count(&self) -> i64 {
+        self.state.lock().unwrap().0
+    }
+
+    fn has_at_or_before(&self, marker_lsn: u64) -> bool {
+        self.state.lock().unwrap().1.first_key_value().is_some_and(|(&lsn, _)| lsn <= marker_lsn)
+    }
 }
 
 /// Everything a tailer needs to route deltas through the subquery layer: the shared registry for
@@ -722,7 +776,7 @@ pub(crate) enum FlipWork {
 struct SubqueryHandle {
     registry: Arc<Mutex<SubqueryRegistry>>,
     flip_tx: mpsc::UnboundedSender<FlipWork>,
-    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    pending_flips: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
 }
 
@@ -737,7 +791,7 @@ struct SubqueryHandle {
 fn spawn_flip_propagator(
     registry: Arc<Mutex<SubqueryRegistry>>,
     mut rx: mpsc::UnboundedReceiver<FlipWork>,
-    pending: Arc<std::sync::atomic::AtomicI64>,
+    pending: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     shutdown: crate::shutdown::ShutdownToken,
@@ -753,6 +807,7 @@ fn spawn_flip_propagator(
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
             shutdown.spawn_background(async move {
+                let commit_lsn = fw.commit_lsn();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
                 // is treated exactly like a live one, because its effects are just as lost.
                 let failed = match fw {
@@ -762,21 +817,23 @@ fn spawn_flip_propagator(
                             .err()
                             .map(|e| (e, work.len()))
                     }
-                    FlipWork::Deferred { shape_id, mut work } => {
+                    FlipWork::Deferred { shape_id, mut work, .. } => {
                         crate::subquery::propagate_deferred_with_retry(&registry, &shape_id, &mut work)
                             .await
                             .err()
                             .map(|e| (e, work.len()))
                     }
-                    FlipWork::DeferredNode { mut work } => {
+                    FlipWork::DeferredNode { mut work, .. } => {
                         // The walk the re-derivations feed starts empty and is carried across the
                         // retries with them, so an exhausted batch reports both halves of what it
                         // never got through.
                         let mut walk = std::collections::VecDeque::new();
-                        crate::subquery::propagate_deferred_node_with_retry(&registry, &mut work, &mut walk, &trace_tx)
-                            .await
-                            .err()
-                            .map(|e| (e, work.len() + walk.len()))
+                        crate::subquery::propagate_deferred_node_with_retry(
+                            &registry, &mut work, &mut walk, commit_lsn, &trace_tx,
+                        )
+                        .await
+                        .err()
+                        .map(|e| (e, work.len() + walk.len()))
                     }
                 };
                 if let Some((e, unfinished)) = failed {
@@ -799,7 +856,7 @@ fn spawn_flip_propagator(
                 // Decremented only after propagation finished enqueueing every resulting
                 // batch — each batch carries its own pending increment until it lands, so
                 // the barrier never reads zero with effects in flight.
-                pending.fetch_sub(1, Ordering::SeqCst);
+                pending.complete(commit_lsn);
                 drop(permit);
             });
         }
@@ -1345,7 +1402,7 @@ impl Engine {
         )));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
-        let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let pending_flips = Arc::new(PendingFlips::default());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -2007,7 +2064,7 @@ impl Engine {
 
     /// Flip batches enqueued but not yet propagated (convergence-barrier term; see `flip_tx`).
     pub fn pending_flips(&self) -> i64 {
-        self.pending_flips.load(std::sync::atomic::Ordering::SeqCst)
+        self.pending_flips.count()
     }
 
     /// Flip batches abandoned after exhausting their retries — membership effects the engine

@@ -83,7 +83,8 @@ Three ideas carry the whole design:
 - **runtime authority drain** (`runtime_authority.rs`) — a private gateway receipt family, separate
   from deployment handoff. The source's `public.native_sync_authority_fence` INSERT/UPDATE becomes
   an ordered runtime envelope carrying its admitted ingress incarnation. The sequencer waits for
-  the complete transaction and deferred effects before publishing an exact user/generation/marker
+  the complete transaction and deferred effects originating at or before its commit LSN before
+  publishing an exact user/generation/marker
   receipt into a bounded, expiring memory cache. Reset invalidates queued and in-flight old
   incarnations; runtime traffic never advances deployment catalog/closure provenance. See the
   [runtime integration contract](../apps/engine/README.md#runtime-authority-drain) for publication,
@@ -595,7 +596,13 @@ sequencer feeds every table's deltas into:
   order alone is not freshness for a query-back, whose rows were read before it took the lock; the
   per-pk recency fence below closes that gap.) The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
-  undrained flips and enqueued-but-unlanded lane batches. A failed query-back is **retried**, and
+  undrained flips and enqueued-but-unlanded lane batches. Internally those batches retain the
+  originating commit LSN, including nested propagation, create replay and resulting lane appends.
+  Runtime and source/deployment receipts wait only for pending origins at or before their marker's
+  commit LSN; later work does not hold that barrier. Unknown origins conservatively hold every
+  marker. Create replay batches are separated by origin; coalesced re-derivations keep the earliest
+  covered origin. The index retains only outstanding origins, while `pendingFlips` remains the
+  total across all commits. Shutdown and degradation still refuse receipts. A failed query-back is **retried**, and
   the retry resumes the DAG walk where the failure stopped (the walk consumes transitions, so
   restarting it from the roots would derive nothing and silently lose the dependents' moves). If
   the retries are exhausted the batch's effects are gone for good — the node already moved — so

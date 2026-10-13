@@ -48,6 +48,13 @@ connection down unacknowledged, Postgres re-delivers the whole transaction, and 
 `(lsn, seq)` de-duplication discards the chunks that already landed. Rotation stays a
 transaction-boundary decision, so a segment never splits a commit by policy.
 
+Runtime and source/deployment drain receipts also wait for the complete transaction and its direct
+appends, then for pending subquery propagation and emission batches whose originating commit LSN is
+at or before the marker's LSN. A later commit's pending work does not delay an earlier receipt.
+Propagation passes its origin to nested work, create replay and ordered stream appends; an unknown
+origin conservatively holds every marker. This changes neither the ingest acknowledgement boundary
+nor the aggregate `pendingFlips` convergence metric. Shutdown and degradation still refuse receipts.
+
 **Chunking must not become visible as several transactions.** Durable-streams exposes each append
 atomically, so a reader long-polling the segment tail sees chunk 1 on its own; splitting a page into
 transactions by `(txid, lsn)` alone would fan that chunk out and flush it to the shape streams as if

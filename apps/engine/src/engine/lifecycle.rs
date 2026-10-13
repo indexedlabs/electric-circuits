@@ -2329,29 +2329,49 @@ impl Engine {
 /// failed send releases its count and refuses the create so its guard can roll back the install.
 fn enqueue_finished_create_work(
     flip_tx: &mpsc::UnboundedSender<FlipWork>,
-    pending_flips: &std::sync::atomic::AtomicI64,
+    pending_flips: &PendingFlips,
     id: &str,
     finished: crate::subquery::FinishedCreate,
 ) -> Result<()> {
     let crate::subquery::FinishedCreate { work, deferred, node_work } = finished;
-    if !node_work.is_empty() {
-        pending_flips.fetch_add(1, Ordering::SeqCst);
-        if flip_tx.send(FlipWork::DeferredNode { work: node_work }).is_err() {
-            pending_flips.fetch_sub(1, Ordering::SeqCst);
-            return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
-        }
+    // A create may replay multiple commits. Separate origins so finishing an early commit
+    // never waits for a later commit bundled into the same worker. Within an origin retain
+    // the original replay order. Coalesced re-derivations carry their earliest covered LSN.
+    let mut nodes = BTreeMap::<_, std::collections::VecDeque<_>>::new();
+    for (sig, item) in node_work {
+        nodes.entry(item.commit_lsn()).or_default().push_back((sig, item));
     }
-    if !work.is_empty() {
-        pending_flips.fetch_add(1, Ordering::SeqCst);
-        if flip_tx.send(FlipWork::Walk { work, txid: None, lsn: None }).is_err() {
-            pending_flips.fetch_sub(1, Ordering::SeqCst);
-            return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
-        }
+    let mut walks = BTreeMap::<_, std::collections::VecDeque<_>>::new();
+    for (commit_lsn, sig, flip) in work {
+        walks.entry(commit_lsn).or_default().push_back((sig, flip));
     }
-    if !deferred.is_empty() {
-        pending_flips.fetch_add(1, Ordering::SeqCst);
-        if flip_tx.send(FlipWork::Deferred { shape_id: id.to_string(), work: deferred }).is_err() {
-            pending_flips.fetch_sub(1, Ordering::SeqCst);
+    let mut shapes = BTreeMap::<_, std::collections::VecDeque<_>>::new();
+    for item in deferred {
+        shapes.entry(item.commit_lsn()).or_default().push_back(item);
+    }
+    let batches: Vec<_> = nodes
+        .into_iter()
+        .map(|(commit_lsn, work)| FlipWork::DeferredNode { commit_lsn, work })
+        .chain(walks.into_iter().map(|(commit_lsn, work)| FlipWork::Walk {
+            work,
+            txid: None,
+            lsn: Some(format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xffff_ffff)),
+        }))
+        .chain(shapes.into_iter().map(|(commit_lsn, work)| FlipWork::Deferred {
+            commit_lsn,
+            shape_id: id.to_string(),
+            work,
+        }))
+        .collect();
+    pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
+    let mut batches = batches.into_iter();
+    while let Some(batch) = batches.next() {
+        let commit_lsn = batch.commit_lsn();
+        if flip_tx.send(batch).is_err() {
+            pending_flips.complete(commit_lsn);
+            for unsent in batches {
+                pending_flips.complete(unsent.commit_lsn());
+            }
             return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
         }
     }
@@ -2869,6 +2889,41 @@ impl Engine {
 mod cancellation_tests {
     use super::*;
 
+    #[test]
+    fn create_replay_keeps_each_commit_separately_pending() {
+        use crate::subquery::{DeferredNodeWork, DeferredShapeWork, FinishedCreate, Flip, FlipDir};
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending = PendingFlips::default();
+        let finished = FinishedCreate {
+            work: [0x10, 0x30]
+                .into_iter()
+                .map(|lsn| (lsn, "inner".to_string(), Flip { value: Value::Int(7), dir: FlipDir::Enter }))
+                .collect(),
+            deferred: [0x10, 0x30]
+                .into_iter()
+                .map(|commit_lsn| DeferredShapeWork::Full { txid: None, commit_lsn })
+                .collect(),
+            node_work: [0x10, 0x30]
+                .into_iter()
+                .map(|commit_lsn| ("parent".to_string(), DeferredNodeWork::Full { commit_lsn }))
+                .collect(),
+        };
+        enqueue_finished_create_work(&tx, &pending, "s1", finished).unwrap();
+        assert_eq!(pending.count(), 6);
+        let mut earlier = 0;
+        while let Ok(batch) = rx.try_recv() {
+            if batch.commit_lsn() == 0x10 {
+                pending.complete(batch.commit_lsn());
+                earlier += 1;
+                assert_eq!(pending.has_at_or_before(0x20), earlier < 3);
+            } else {
+                assert_eq!(batch.commit_lsn(), 0x30);
+            }
+        }
+        assert_eq!(earlier, 3, "walks, shapes and parent nodes retain their cause");
+        assert_eq!(pending.count(), 3, "later workers remain outstanding");
+    }
+
     /// A create must not acknowledge after shutdown closes the flip propagator channel: the
     /// deferred effects returned by `finish_create` have nowhere to run, so the caller needs the
     /// normal shutdown error and rollback path.
@@ -2876,17 +2931,20 @@ mod cancellation_tests {
     fn closed_flip_channel_rejects_finished_create_handoff() {
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         drop(flip_rx);
-        let pending_flips = std::sync::atomic::AtomicI64::new(0);
+        let pending_flips = PendingFlips::default();
         let finished = crate::subquery::FinishedCreate {
             work: std::collections::VecDeque::new(),
-            deferred: std::collections::VecDeque::from([crate::subquery::DeferredShapeWork::Full { txid: None }]),
-            node_work: std::collections::VecDeque::new(),
+            deferred: [0x10, 0x30]
+                .into_iter()
+                .map(|commit_lsn| crate::subquery::DeferredShapeWork::Full { txid: None, commit_lsn })
+                .collect(),
+            node_work: [("parent".into(), crate::subquery::DeferredNodeWork::Full { commit_lsn: 0x20 })].into(),
         };
 
         let err = enqueue_finished_create_work(&flip_tx, &pending_flips, "s1", finished)
             .expect_err("a closed propagator cannot acknowledge deferred create work");
         assert_eq!(err.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
-        assert_eq!(pending_flips.load(Ordering::SeqCst), 0, "failed handoff must not hold the barrier");
+        assert_eq!(pending_flips.count(), 0, "failed handoff must not hold the barrier");
     }
 
     /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream

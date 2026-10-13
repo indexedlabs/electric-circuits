@@ -984,7 +984,7 @@ pub(crate) async fn sequencer_loop(
                             break;
                         }
                         if source_fence.is_some() || !runtime_fences.is_empty() {
-                            if !wait_for_source_effects(&subq, &shutdown).await {
+                            if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
                                 tracing::error!(
                                     "sequencer: drain fence could not reach a receipt before shutdown/degradation"
                                 );
@@ -1209,11 +1209,16 @@ pub(crate) async fn sequencer_loop(
 }
 
 /// A source receipt is stronger than "the sequencer task exited" or "the slot was released": it
-/// waits for every deferred propagation/emission batch to land and refuses to publish after the
-/// engine has degraded. Runtime and deployment markers share this effect barrier, while their
-/// receipts and admission remain separate. A short poll keeps the hot paths
-/// and emission lanes unchanged.
-async fn wait_for_source_effects(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken) -> bool {
+/// waits for deferred propagation/emission batches originating at or before the marker's commit
+/// LSN to land and refuses to publish after shutdown or degradation. Runtime and deployment markers
+/// share this effect barrier, while their receipts and admission remain separate. Later origins
+/// cannot delay this prefix; unknown origins (zero) hold every marker. The existing short poll
+/// services completion without adding wake-ups to the hot paths.
+async fn wait_for_source_effects(
+    subq: &SubqueryHandle,
+    shutdown: &crate::shutdown::ShutdownToken,
+    marker_lsn: u64,
+) -> bool {
     loop {
         if shutdown.is_shutting_down() {
             return false;
@@ -1221,7 +1226,7 @@ async fn wait_for_source_effects(subq: &SubqueryHandle, shutdown: &crate::shutdo
         if subq.degrade.degraded.load(Ordering::Acquire) {
             return false;
         }
-        if subq.pending_flips.load(Ordering::Acquire) == 0 {
+        if !subq.pending_flips.has_at_or_before(marker_lsn) {
             return true;
         }
         tokio::select! {
@@ -2042,10 +2047,10 @@ pub(crate) async fn process_envelope(
             }
         }
         if !work.is_empty() {
-            subq.pending_flips.fetch_add(1, Ordering::SeqCst);
+            subq.pending_flips.add(lsn_u64);
             if subq.flip_tx.send(FlipWork::Walk { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
-                subq.pending_flips.fetch_sub(1, Ordering::SeqCst);
+                subq.pending_flips.complete(lsn_u64);
             }
         }
     }
@@ -2257,15 +2262,226 @@ mod txn_boundary_tests {
 mod source_fence_tests {
     use super::*;
 
+    // Exercise the real barrier with named commit positions and deterministic completion.
+    fn commits_pending(positions: &[u64]) -> SubqueryHandle {
+        let subq = handle(0);
+        for &position in positions {
+            subq.pending_flips.add(position);
+        }
+        subq
+    }
+
+    async fn drain_through(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken, marker: u64) -> bool {
+        wait_for_source_effects(subq, shutdown, marker).await
+    }
+
+    fn complete_commit(subq: &SubqueryHandle, position: u64) {
+        subq.pending_flips.complete(position);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_later_flip_does_not_delay_an_earlier_marker() {
+        use std::future::Future;
+        let subquery = commits_pending(&[0x30]);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let drain = drain_through(&subquery, &shutdown, 0x20);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert_eq!(
+                drain.as_mut().poll(cx),
+                std::task::Poll::Ready(true),
+                "a marker at 0/20 must not wait for a pending flip at 0/30"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn earlier_and_same_commit_flips_hold_only_their_marker_prefix() {
+        use std::future::Future;
+        let subquery = commits_pending(&[0x10, 0x20, 0x30]);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let drain = drain_through(&subquery, &shutdown, 0x20);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert!(drain.as_mut().poll(cx).is_pending(), "earlier effects must hold the marker");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        complete_commit(&subquery, 0x10);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        std::future::poll_fn(|cx| {
+            assert!(drain.as_mut().poll(cx).is_pending(), "same-transaction effects must hold the marker");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        complete_commit(&subquery, 0x20);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        std::future::poll_fn(|cx| {
+            assert_eq!(
+                drain.as_mut().poll(cx),
+                std::task::Poll::Ready(true),
+                "the completed prefix must release its marker while the later flip stays pending"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_or_degradation_while_waiting_never_releases_a_receipt() {
+        use std::future::Future;
+        for degrade in [false, true] {
+            let subquery = commits_pending(&[0x10]);
+            let shutdown = crate::shutdown::ShutdownToken::new();
+            let drain = drain_through(&subquery, &shutdown, 0x20);
+            tokio::pin!(drain);
+            std::future::poll_fn(|cx| {
+                assert!(drain.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if degrade {
+                subquery.degrade.mark();
+            } else {
+                shutdown.begin();
+            }
+            complete_commit(&subquery, 0x10);
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+            assert!(!drain.await, "finished work must not bypass shutdown or degradation");
+        }
+    }
+
+    #[tokio::test]
+    async fn later_work_cannot_bypass_a_degraded_or_stopping_engine() {
+        for degrade in [false, true] {
+            let subquery = commits_pending(&[0x30]);
+            let shutdown = crate::shutdown::ShutdownToken::new();
+            if degrade {
+                subquery.degrade.mark();
+            } else {
+                shutdown.begin();
+            }
+            assert!(!drain_through(&subquery, &shutdown, 0x20).await);
+        }
+    }
+
+    #[test]
+    fn unknown_origins_are_conservative_and_commits_can_finish_out_of_order() {
+        let subquery = commits_pending(&[0, 0x10, 0x10, 0x30]);
+        complete_commit(&subquery, 0x30);
+        complete_commit(&subquery, 0x10);
+        assert!(subquery.pending_flips.has_at_or_before(0x20));
+        complete_commit(&subquery, 0x10);
+        assert!(subquery.pending_flips.has_at_or_before(0x01), "unknown work holds every prefix");
+        complete_commit(&subquery, 0);
+        assert!(!subquery.pending_flips.has_at_or_before(u64::MAX));
+        assert_eq!(subquery.pending_flips.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_and_source_receipts_publish_at_the_same_commit_prefix() {
+        use crate::runtime_authority::{AuthorityMarker, RuntimeFence};
+        use std::future::Future;
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://receipt-prefix".into(), store.clone());
+        let engine = Engine::new_for_in_process_test(ds);
+        let marker = AuthorityMarker::parse(
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f85",
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f81",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let mut runtime =
+            RuntimeFence { marker: marker.clone(), incarnation: engine.runtime_receipts.lock().unwrap().incarnation() }
+                .into_envelope();
+        runtime.headers.lsn = Some("0/20".into());
+        runtime.headers.txid = Some("2".into());
+        runtime.headers.seq = Some(0);
+        let mut source = runtime.clone();
+        source.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        source.key = "deployment-fence".into();
+        source.headers.seq = Some(1);
+        source.headers.last = Some(true);
+        let start = engine.seq_start.lock().unwrap().clone();
+        store.pages_by_offset.lock().unwrap().insert(
+            start.offset.clone(),
+            ("after-marker".into(), true, serde_json::to_string(&[runtime, source]).unwrap()),
+        );
+        engine.pending_flips.add(0x10);
+        engine.pending_flips.add(0x30);
+        let (_commands, rx) = mpsc::unbounded_channel();
+        let sequencer = sequencer_loop(
+            engine.ds.clone(),
+            engine.tables_shared.clone(),
+            start.clone(),
+            None,
+            engine.catalog_tx.clone(),
+            engine.source_receipts.clone(),
+            engine.last_source_receipt.clone(),
+            engine.source_receipt_progress.clone(),
+            engine.runtime_receipts.clone(),
+            rx,
+            Arc::new(std::sync::Mutex::new(start)),
+            Default::default(),
+            Default::default(),
+            engine.subquery_handle(),
+            engine.trace_tx.clone(),
+            None,
+            HashMap::new(),
+            true,
+            false,
+            engine.restore_reads_paused.clone(),
+            engine.read_cap_failed.clone(),
+            engine.retention.pending_buffer_max_bytes,
+            None,
+            engine.shutdown.clone(),
+            engine.shutdown.party("test sequencer"),
+        );
+        tokio::pin!(sequencer);
+        std::future::poll_fn(|cx| {
+            assert!(sequencer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(engine.runtime_drain_receipt(&marker).unwrap().is_none());
+        assert!(engine.source_drain_receipt("deployment-fence").is_none());
+        engine.pending_flips.complete(0x10);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        std::future::poll_fn(|cx| {
+            assert!(sequencer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(engine.runtime_drain_receipt(&marker).unwrap().unwrap().commit_lsn, "0/20");
+        // The sequencer queued SourceDrained, but its catalog writer has not been scheduled yet.
+        assert!(engine.source_drain_receipt("deployment-fence").is_none());
+        tokio::time::timeout(Duration::from_secs(1), engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
+        std::future::poll_fn(|cx| {
+            assert!(sequencer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(engine.source_drain_receipt("deployment-fence").unwrap().commit_lsn, "0/20");
+        assert_eq!(engine.pending_flips(), 1, "later work is still pending after both receipts");
+        engine.shutdown.begin();
+        sequencer.await;
+    }
+
     fn handle(pending: i64) -> SubqueryHandle {
         let (flip_tx, _flip_rx) = mpsc::unbounded_channel();
+        let pending_flips = Arc::new(PendingFlips::default());
+        for _ in 0..pending {
+            pending_flips.add(0);
+        }
         SubqueryHandle {
             registry: Arc::new(Mutex::new(SubqueryRegistry::new(
                 DsClient::new_for_in_process_test("http://127.0.0.1:1"),
                 None,
             ))),
             flip_tx,
-            pending_flips: Arc::new(std::sync::atomic::AtomicI64::new(pending)),
+            pending_flips,
             degrade: DegradeState::new(),
         }
     }
@@ -2275,7 +2491,7 @@ mod source_fence_tests {
         let subquery = handle(0);
         let shutdown = crate::shutdown::ShutdownToken::new();
         shutdown.begin();
-        assert!(!wait_for_source_effects(&subquery, &shutdown).await);
+        assert!(!wait_for_source_effects(&subquery, &shutdown, 0x10).await);
     }
 
     #[tokio::test]
@@ -2283,10 +2499,10 @@ mod source_fence_tests {
         let subquery = handle(1);
         let pending = subquery.pending_flips.clone();
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let wait = tokio::spawn(async move { wait_for_source_effects(&subquery, &shutdown).await });
+        let wait = tokio::spawn(async move { wait_for_source_effects(&subquery, &shutdown, 0x10).await });
         tokio::task::yield_now().await;
         assert!(!wait.is_finished(), "a pending deferred write must hold the receipt barrier");
-        pending.store(0, Ordering::Release);
+        pending.complete(0);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(1), wait).await.unwrap().unwrap());
     }
 
@@ -2304,7 +2520,7 @@ mod source_fence_tests {
         .unwrap();
         let subquery = handle(1);
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let drain = wait_for_source_effects(&subquery, &shutdown);
+        let drain = wait_for_source_effects(&subquery, &shutdown, 0x10);
         tokio::pin!(drain);
         std::future::poll_fn(|cx| {
             assert!(drain.as_mut().poll(cx).is_pending(), "the deferred effect has not landed");
@@ -2312,7 +2528,7 @@ mod source_fence_tests {
         })
         .await;
         receipts.invalidate();
-        subquery.pending_flips.store(0, Ordering::Release);
+        subquery.pending_flips.complete(0);
         assert!(drain.await);
         receipts.publish(
             incarnation,
@@ -2343,7 +2559,7 @@ mod source_fence_tests {
         .unwrap();
         let subquery = handle(1);
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let drain = wait_for_source_effects(&subquery, &shutdown);
+        let drain = wait_for_source_effects(&subquery, &shutdown, 0x10);
         tokio::pin!(drain);
         std::future::poll_fn(|cx| {
             assert!(drain.as_mut().poll(cx).is_pending());
@@ -2351,7 +2567,7 @@ mod source_fence_tests {
         })
         .await;
         assert!(engine.runtime_drain_receipt(&marker).unwrap().is_none());
-        subquery.pending_flips.store(0, Ordering::Release);
+        subquery.pending_flips.complete(0);
         assert!(drain.await);
         let mut receipts = engine.runtime_receipts.lock().unwrap();
         receipts.publish(
@@ -2374,7 +2590,7 @@ mod source_fence_tests {
     async fn degraded_effects_cannot_manufacture_a_source_receipt() {
         let subquery = handle(0);
         subquery.degrade.mark();
-        assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new()).await);
+        assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new(), 0x10).await);
     }
 }
 

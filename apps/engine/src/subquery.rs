@@ -321,8 +321,9 @@ pub(crate) enum EmissionSource<'a> {
     /// query-back can run immediately after install, so these decisions must be protected the
     /// same way — and kept a distinct variant because the two call sites are not interchangeable.
     Replay { lsn: u64, xid: Option<u64> },
-    /// Candidates read from Postgres by a query-back, under `gate`'s snapshot.
-    QueryBack { gate: &'a crate::pg::SnapshotGate },
+    /// Candidates read from Postgres by a query-back, under `gate`'s snapshot. `commit_lsn`
+    /// belongs to the triggering flip, not the snapshot: its resulting appends hold that receipt.
+    QueryBack { gate: &'a crate::pg::SnapshotGate, commit_lsn: u64 },
 }
 
 /// One table delta buffered by a mid-create shape (outer table) or a mid-seed node (inner table),
@@ -376,19 +377,34 @@ pub struct NodeStat {
 }
 
 /// Propagation work that reached a shape while it was still being created, deferred until it is
-/// installed (see [`PendingSubqueryShape::deferred`]).
+/// installed (see [`PendingSubqueryShape::deferred`]). Every item retains its originating
+/// commit LSN; coalescing keeps the earliest origin whose effects this re-derivation covers.
 pub enum DeferredShapeWork {
     /// An inner-set value flipped: re-derive the outer rows with `connecting_col = value`.
-    Value { connecting_col: usize, value: Value, txid: Option<String> },
+    Value { connecting_col: usize, value: Value, txid: Option<String>, commit_lsn: u64 },
     /// A NULL flip on a NULL-sensitive edge: re-derive every outer row.
-    Full { txid: Option<String> },
+    Full { txid: Option<String>, commit_lsn: u64 },
+}
+
+impl DeferredShapeWork {
+    pub(crate) fn commit_lsn(&self) -> u64 {
+        match self {
+            Self::Value { commit_lsn, .. } | Self::Full { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+
+    fn retain_earliest(&mut self, origin: u64) {
+        match self {
+            Self::Value { commit_lsn, .. } | Self::Full { commit_lsn, .. } => *commit_lsn = (*commit_lsn).min(origin),
+        }
+    }
 }
 
 impl HeapSize for DeferredShapeWork {
     fn heap_bytes(&self) -> usize {
         match self {
             DeferredShapeWork::Value { value, txid, .. } => value.heap_bytes() + txid.heap_bytes(),
-            DeferredShapeWork::Full { txid } => txid.heap_bytes(),
+            DeferredShapeWork::Full { txid, .. } => txid.heap_bytes(),
         }
     }
 }
@@ -398,19 +414,34 @@ impl HeapSize for DeferredShapeWork {
 ///
 /// The node analogue of [`DeferredShapeWork`], minus the `txid`: re-deriving a node reconciles an
 /// in-memory value set and emits nothing, so there is no envelope for a txid to travel on — the
-/// flips it produces carry the change onward to the dependents that do emit.
+/// flips it produces carry the change onward to the dependents that do emit. The originating
+/// commit LSN is retained for those descendants and their receipt barrier.
 pub enum DeferredNodeWork {
     /// A child value flipped: re-derive the parent's inner rows with `connecting_col = value`.
-    Value { connecting_col: usize, value: Value },
+    Value { connecting_col: usize, value: Value, commit_lsn: u64 },
     /// A NULL flip on a NULL-sensitive edge: re-derive every inner row of the parent.
-    Full,
+    Full { commit_lsn: u64 },
+}
+
+impl DeferredNodeWork {
+    pub(crate) fn commit_lsn(&self) -> u64 {
+        match self {
+            Self::Value { commit_lsn, .. } | Self::Full { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+
+    fn retain_earliest(&mut self, origin: u64) {
+        match self {
+            Self::Value { commit_lsn, .. } | Self::Full { commit_lsn, .. } => *commit_lsn = (*commit_lsn).min(origin),
+        }
+    }
 }
 
 impl HeapSize for DeferredNodeWork {
     fn heap_bytes(&self) -> usize {
         match self {
             DeferredNodeWork::Value { value, .. } => value.heap_bytes(),
-            DeferredNodeWork::Full => 0,
+            DeferredNodeWork::Full { .. } => 0,
         }
     }
 }
@@ -464,8 +495,9 @@ pub struct BeginCreate {
 /// three are effects the create computed but did not deliver, so all three are barrier-covered
 /// (`pendingFlips`) and fail closed exactly like a live flip batch.
 pub struct FinishedCreate {
-    /// Flips produced by replaying the fresh nodes' buffered inner deltas through their seed gates.
-    pub work: VecDeque<(SubquerySig, Flip)>,
+    /// Flips produced by replaying the fresh nodes' buffered inner deltas through their seed gates,
+    /// each with the buffered change's original commit LSN.
+    pub work: VecDeque<(u64, SubquerySig, Flip)>,
     /// Work that reached the SHAPE while it was pending (see [`PendingSubqueryShape::deferred`]),
     /// to run against the now-installed shape.
     pub deferred: VecDeque<DeferredShapeWork>,
@@ -705,9 +737,9 @@ impl SubqueryRegistry {
     /// stream's emission lane while the caller holds this registry's lock (per-stream FIFO ⇒
     /// append order = eval order — the "data in the right place" invariant). Without lanes
     /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
-    async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>) -> Result<()> {
+    async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
         match &self.lanes {
-            Some(l) => l.enqueue(stream_path, envs),
+            Some(l) => l.enqueue(stream_path, envs, commit_lsn),
             None => {
                 self.ds.append_reliable(stream_path, &envs).await?;
             }
@@ -989,24 +1021,30 @@ impl SubqueryRegistry {
     /// table can flip the same value repeatedly during one backfill: a re-derive is absolute, so
     /// running it once at install is running it enough. A full re-derive covers every value, so it
     /// subsumes — and is not added to — anything else in the queue.
-    fn queue_deferred(&mut self, shape_id: &str, work: DeferredShapeWork) -> bool {
+    fn queue_deferred(&mut self, shape_id: &str, mut work: DeferredShapeWork) -> bool {
         let Some(pending) = self.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id) else {
             return false;
         };
-        let has_full = pending.deferred.iter().any(|w| matches!(w, DeferredShapeWork::Full { .. }));
+        if let Some(full) = pending.deferred.iter_mut().find(|w| matches!(w, DeferredShapeWork::Full { .. })) {
+            full.retain_earliest(work.commit_lsn());
+            return true;
+        }
         match &work {
             DeferredShapeWork::Full { .. } => {
-                if !has_full {
-                    pending.deferred.clear();
-                    pending.deferred.push_back(work);
+                for previous in &pending.deferred {
+                    work.retain_earliest(previous.commit_lsn());
                 }
+                pending.deferred.clear();
+                pending.deferred.push_back(work);
             }
             DeferredShapeWork::Value { connecting_col, value, .. } => {
-                let dup = pending.deferred.iter().any(|w| {
+                let dup = pending.deferred.iter_mut().find(|w| {
                     matches!(w, DeferredShapeWork::Value { connecting_col: c, value: v, .. }
                         if c == connecting_col && v == value)
                 });
-                if !has_full && !dup {
+                if let Some(dup) = dup {
+                    dup.retain_earliest(work.commit_lsn());
+                } else {
                     pending.deferred.push_back(work);
                 }
             }
@@ -1031,25 +1069,31 @@ impl SubqueryRegistry {
     ///
     /// Deduped like the shape queue: the replay is absolute, so running a value's re-derive once is
     /// running it enough, and a `Full` re-derive covers every value, so it subsumes the rest.
-    fn queue_node_deferred(&mut self, sig: &SubquerySig, work: DeferredNodeWork) -> bool {
+    fn queue_node_deferred(&mut self, sig: &SubquerySig, mut work: DeferredNodeWork) -> bool {
         let Some(node) = self.nodes.get_mut(sig) else { return false };
         if node.seed_buffer.is_none() {
             return false;
         }
-        let has_full = node.deferred.iter().any(|w| matches!(w, DeferredNodeWork::Full));
+        if let Some(full) = node.deferred.iter_mut().find(|w| matches!(w, DeferredNodeWork::Full { .. })) {
+            full.retain_earliest(work.commit_lsn());
+            return true;
+        }
         match &work {
-            DeferredNodeWork::Full => {
-                if !has_full {
-                    node.deferred.clear();
-                    node.deferred.push_back(work);
+            DeferredNodeWork::Full { .. } => {
+                for previous in &node.deferred {
+                    work.retain_earliest(previous.commit_lsn());
                 }
+                node.deferred.clear();
+                node.deferred.push_back(work);
             }
-            DeferredNodeWork::Value { connecting_col, value } => {
-                let dup = node.deferred.iter().any(|w| {
-                    matches!(w, DeferredNodeWork::Value { connecting_col: c, value: v }
+            DeferredNodeWork::Value { connecting_col, value, .. } => {
+                let dup = node.deferred.iter_mut().find(|w| {
+                    matches!(w, DeferredNodeWork::Value { connecting_col: c, value: v, .. }
                         if c == connecting_col && v == value)
                 });
-                if !has_full && !dup {
+                if let Some(dup) = dup {
+                    dup.retain_earliest(work.commit_lsn());
+                } else {
                     node.deferred.push_back(work);
                 }
             }
@@ -1089,7 +1133,7 @@ impl SubqueryRegistry {
             self.pending_shapes.iter().any(|p| p.shape_id == shape_id),
             "finish_create: pending shape vanished"
         );
-        let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
+        let mut work: VecDeque<(u64, SubquerySig, Flip)> = VecDeque::new();
         let mut node_work: VecDeque<(SubquerySig, DeferredNodeWork)> = VecDeque::new();
         // 1. Install node seeds, then replay each node's buffered deltas through its gate.
         for (sig, rows, gate) in node_seeds {
@@ -1120,7 +1164,7 @@ impl SubqueryRegistry {
                 let evals = self.node_present_values(&sig, &ts, &b.delta);
                 self.record_node_recency(&sig, evals.iter().map(|(pk, _)| pk), b.lsn, b.xid);
                 for f in self.apply_node_evals(&sig, evals).await {
-                    work.push_back((sig.clone(), f));
+                    work.push_back((b.lsn, sig.clone(), f));
                 }
             }
             // The node is live from here (its seed and its raw deltas are both in), so a child
@@ -1805,6 +1849,12 @@ impl SubqueryRegistry {
         // wake-storm gate, PR #30). Upserts are delivered for every current member unconditionally.
         let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
         let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
+        // Receipt accounting follows the triggering commit even when candidates came from a
+        // later query-back snapshot. This is separate from the per-pk recency stamp below.
+        let commit_lsn = match &source {
+            EmissionSource::Live { lsn, .. } | EmissionSource::Replay { lsn, .. } => *lsn,
+            EmissionSource::QueryBack { commit_lsn, .. } => *commit_lsn,
+        };
         // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
         // query-back, which reads this map instead of writing it.
         let live_stamp: Option<(u64, Option<u64>)> = match &source {
@@ -1830,7 +1880,7 @@ impl SubqueryRegistry {
             let candidates: Vec<(Row, bool)> = match &source {
                 // `recent` empty (nothing decided live during this read) is the common case and
                 // costs nothing: no pk is recomputed for the whole candidate set.
-                EmissionSource::QueryBack { gate } if !shape.recent.is_empty() => {
+                EmissionSource::QueryBack { gate, .. } if !shape.recent.is_empty() => {
                     let recent = &shape.recent;
                     candidates
                         .into_iter()
@@ -1912,7 +1962,7 @@ impl SubqueryRegistry {
             }
             shape.emitted.fetch_add(envs.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let path = shape.stream_path.clone();
-            self.deliver(&path, envs).await?;
+            self.deliver(&path, envs, commit_lsn).await?;
             results.push((shape_id, true, net));
         }
         Ok(results)
@@ -2040,10 +2090,14 @@ pub async fn propagate_deferred_shape_work(
 ) -> Result<()> {
     while let Some(item) = work.pop_front() {
         let res = match &item {
-            DeferredShapeWork::Value { connecting_col, value, txid } => {
-                move_shape_for_value(registry, shape_id, *connecting_col, value, txid.clone()).await.map(|_| ())
+            DeferredShapeWork::Value { connecting_col, value, txid, commit_lsn } => {
+                move_shape_for_value(registry, shape_id, *connecting_col, value, txid.clone(), *commit_lsn)
+                    .await
+                    .map(|_| ())
             }
-            DeferredShapeWork::Full { txid } => rederive_shape(registry, shape_id, txid.clone()).await,
+            DeferredShapeWork::Full { txid, commit_lsn } => {
+                rederive_shape(registry, shape_id, txid.clone(), *commit_lsn).await
+            }
         };
         if let Err(e) = res {
             work.push_front(item);
@@ -2060,12 +2114,13 @@ pub async fn propagate_deferred_node_with_retry(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     work: &mut VecDeque<(SubquerySig, DeferredNodeWork)>,
     walk: &mut VecDeque<(SubquerySig, Flip)>,
+    commit_lsn: u64,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     let mut backoff = FLIP_BACKOFF_START;
     let mut attempt = 1u32;
     loop {
-        let e = match propagate_deferred_node_work(registry, work, walk, trace_tx).await {
+        let e = match propagate_deferred_node_work(registry, work, walk, commit_lsn, trace_tx).await {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
@@ -2097,14 +2152,15 @@ pub async fn propagate_deferred_node_work(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     work: &mut VecDeque<(SubquerySig, DeferredNodeWork)>,
     walk: &mut VecDeque<(SubquerySig, Flip)>,
+    commit_lsn: u64,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
 ) -> Result<()> {
     while let Some((sig, item)) = work.pop_front() {
         let filter = match &item {
-            DeferredNodeWork::Value { connecting_col, value } => Some((*connecting_col, value)),
-            DeferredNodeWork::Full => None,
+            DeferredNodeWork::Value { connecting_col, value, .. } => Some((*connecting_col, value)),
+            DeferredNodeWork::Full { .. } => None,
         };
-        match requery_and_reconcile_parent(registry, &sig, filter).await {
+        match requery_and_reconcile_parent(registry, &sig, filter, commit_lsn).await {
             Ok(Some((_inner, flips))) => {
                 for f in flips {
                     walk.push_back((sig.clone(), f));
@@ -2121,7 +2177,14 @@ pub async fn propagate_deferred_node_work(
     // No trace is emitted for the re-derivation itself, for the same reason the deferred shape
     // replay emits none: the walk that queued it already lit the source table → flipped node path.
     // The flips it produced light their own hops from this node down.
-    propagate_flips(registry, walk, None, None, trace_tx).await
+    propagate_flips(
+        registry,
+        walk,
+        None,
+        Some(format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xffff_ffff)),
+        trace_tx,
+    )
+    .await
 }
 
 /// Propagate a batch of inner-set flips up the dependency DAG (BFS), querying back affected rows.
@@ -2156,6 +2219,7 @@ async fn propagate_one(
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
 ) -> Result<()> {
+    let commit_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     // The flipped inner-set node's dependents, plus the table its change entered through: the
     // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
     // dependent). Fetched under one lock so a concurrent drop can't split them.
@@ -2171,13 +2235,15 @@ async fn propagate_one(
         // monotone over FALSE < UNKNOWN < TRUE), so skip.
         if matches!(flip.value, Value::Null) {
             if edge.null_sensitive {
-                rederive_dependent(registry, &edge, txid.clone(), work).await?;
+                rederive_dependent(registry, &edge, txid.clone(), work, commit_lsn).await?;
             }
             continue;
         }
         match &edge.dependent {
             Dependent::Shape(id) => {
-                let moved = move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone()).await?;
+                let moved =
+                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone(), commit_lsn)
+                        .await?;
                 // Light the whole path only when the shape actually moved rows: source
                 // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
                 if let (Some((outer, net)), Some(src)) = (moved, source_table.as_ref()) {
@@ -2198,9 +2264,13 @@ async fn propagate_one(
                 // `None` = the parent vanished, or it is a fresh node its own create is still
                 // seeding — in which case the re-derivation was queued on the node and runs when
                 // that create installs the seed (see `queue_node_deferred`).
-                let new_flips =
-                    requery_and_reconcile_parent(registry, parent_sig, Some((edge.connecting_col, &flip.value)))
-                        .await?;
+                let new_flips = requery_and_reconcile_parent(
+                    registry,
+                    parent_sig,
+                    Some((edge.connecting_col, &flip.value)),
+                    commit_lsn,
+                )
+                .await?;
                 if let Some((_inner, flips)) = new_flips {
                     // A nested `IN`: connect the flipped child `node:<sig>` to the parent
                     // `node:<parent_sig>` it re-derived, so the propagation reads through. The
@@ -2239,6 +2309,7 @@ async fn move_shape_for_value(
     connecting_col: usize,
     value: &Value,
     txid: Option<String>,
+    commit_lsn: u64,
 ) -> Result<Option<(TableRef, i64)>> {
     // Brief lock: snapshot what the query-back needs.
     let (ts, pg_url) = {
@@ -2248,7 +2319,7 @@ async fn move_shape_for_value(
         // to a `shapes` miss that would silently drop it.
         if reg.queue_deferred(
             shape_id,
-            DeferredShapeWork::Value { connecting_col, value: value.clone(), txid: txid.clone() },
+            DeferredShapeWork::Value { connecting_col, value: value.clone(), txid: txid.clone(), commit_lsn },
         ) {
             return Ok(None);
         }
@@ -2279,7 +2350,12 @@ async fn move_shape_for_value(
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
     let emitted = reg
-        .emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, EmissionSource::QueryBack { gate: &gate })
+        .emit_for_shapes(
+            &ts,
+            vec![(shape_id.to_string(), candidates)],
+            txid,
+            EmissionSource::QueryBack { gate: &gate, commit_lsn },
+        )
         .await;
     reg.end_queryback(shape_id);
     Ok(match emitted?.first() {
@@ -2297,6 +2373,7 @@ async fn requery_and_reconcile_parent(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     parent_sig: &SubquerySig,
     filter: Option<(usize, &Value)>,
+    commit_lsn: u64,
 ) -> Result<Option<(TableRef, Vec<Flip>)>> {
     let (ts, pg_url) = {
         let mut reg = registry.lock().await;
@@ -2307,8 +2384,8 @@ async fn requery_and_reconcile_parent(
         if reg.queue_node_deferred(
             parent_sig,
             match filter {
-                Some((col, value)) => DeferredNodeWork::Value { connecting_col: col, value: value.clone() },
-                None => DeferredNodeWork::Full,
+                Some((col, value)) => DeferredNodeWork::Value { connecting_col: col, value: value.clone(), commit_lsn },
+                None => DeferredNodeWork::Full { commit_lsn },
             },
         ) {
             return Ok(None);
@@ -2351,13 +2428,14 @@ async fn rederive_dependent(
     edge: &Edge,
     txid: Option<String>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
+    commit_lsn: u64,
 ) -> Result<()> {
     match &edge.dependent {
-        Dependent::Shape(id) => rederive_shape(registry, id, txid).await?,
+        Dependent::Shape(id) => rederive_shape(registry, id, txid, commit_lsn).await?,
         Dependent::Node(parent_sig) => {
             // Full re-derive of the parent: same eval+reconcile as a value flip, fetching
             // every row instead of one connecting value's candidates.
-            if let Some((_table, flips)) = requery_and_reconcile_parent(registry, parent_sig, None).await? {
+            if let Some((_table, flips)) = requery_and_reconcile_parent(registry, parent_sig, None, commit_lsn).await? {
                 for f in flips {
                     work.push_back((parent_sig.clone(), f));
                 }
@@ -2374,12 +2452,13 @@ async fn rederive_shape(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     shape_id: &str,
     txid: Option<String>,
+    commit_lsn: u64,
 ) -> Result<()> {
     let (ts, pg_url) = {
         let mut reg = registry.lock().await;
         // Same as `move_shape_for_value`: a shape still being created is queued, not dropped — its
         // edges are live but its `shapes` entry does not exist yet.
-        if reg.queue_deferred(shape_id, DeferredShapeWork::Full { txid: txid.clone() }) {
+        if reg.queue_deferred(shape_id, DeferredShapeWork::Full { txid: txid.clone(), commit_lsn }) {
             return Ok(());
         }
         let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
@@ -2400,7 +2479,12 @@ async fn rederive_shape(
     let mut reg = registry.lock().await;
     let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
     let emitted = reg
-        .emit_for_shapes(&ts, vec![(shape_id.to_string(), candidates)], txid, EmissionSource::QueryBack { gate: &gate })
+        .emit_for_shapes(
+            &ts,
+            vec![(shape_id.to_string(), candidates)],
+            txid,
+            EmissionSource::QueryBack { gate: &gate, commit_lsn },
+        )
         .await;
     reg.end_queryback(shape_id);
     emitted?;
@@ -2836,6 +2920,61 @@ mod tests {
         (reg, begin)
     }
 
+    #[tokio::test]
+    async fn deferred_rederivations_retain_the_earliest_coalesced_commit() {
+        let (reg, _) = registry_mid_create();
+        let registry = tokio::sync::Mutex::new(reg);
+        for lsn in [0x30, 0x10, 0x40] {
+            move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None, lsn).await.unwrap();
+        }
+        assert_eq!(registry.lock().await.pending_shapes[0].deferred[0].commit_lsn(), 0x10);
+        rederive_shape(&registry, "s1", None, 0x50).await.unwrap();
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(8), None, 0x08).await.unwrap();
+        {
+            let reg = registry.lock().await;
+            let queue = &reg.pending_shapes[0].deferred;
+            assert_eq!(queue.len(), 1);
+            assert!(matches!(queue[0], DeferredShapeWork::Full { commit_lsn: 0x08, .. }));
+        }
+
+        let (reg, _, mid) = registry_mid_nested_create();
+        let registry = tokio::sync::Mutex::new(reg);
+        for lsn in [0x30, 0x10, 0x40] {
+            requery_and_reconcile_parent(&registry, &mid, Some((0, &Value::Int(7))), lsn).await.unwrap();
+        }
+        assert_eq!(registry.lock().await.nodes[&mid].deferred[0].commit_lsn(), 0x10);
+        requery_and_reconcile_parent(&registry, &mid, None, 0x50).await.unwrap();
+        requery_and_reconcile_parent(&registry, &mid, Some((0, &Value::Int(8))), 0x08).await.unwrap();
+        let reg = registry.lock().await;
+        let queue = &reg.nodes[&mid].deferred;
+        assert_eq!(queue.len(), 1);
+        assert!(matches!(queue[0], DeferredNodeWork::Full { commit_lsn: 0x08 }));
+    }
+
+    #[tokio::test]
+    async fn node_seed_replay_retains_each_buffered_commits_origin() {
+        let (mut reg, begin) = registry_mid_create();
+        let inner = reg.schemas[&TableRef::parse("inner_t").unwrap()].clone();
+        for (lsn, gid) in [(0x10, 7), (0x30, 8)] {
+            let work = reg
+                .on_table_delta(&inner, &[Tup2(Row(vec![Value::Int(gid), Value::Int(gid)]), 1)], lsn, None, None, None)
+                .await
+                .unwrap();
+            assert!(work.is_empty(), "the node is still seeding");
+        }
+        let seeds = begin
+            .seeds
+            .into_iter()
+            .map(|(sig, _, _)| (sig, Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        let finished = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+        let origins: Vec<_> = finished.work.iter().map(|(lsn, _, _)| *lsn).collect();
+        assert_eq!(origins, vec![0x10, 0x30]);
+    }
+
     /// **A flip that arrives mid-create waits, it is not dropped.** Phase A commits the shape's
     /// edges, so a flip on a node the shape SHARES with a live sibling reaches this shape while
     /// phase B is still backfilling — and the backfill's snapshot may predate the inner change.
@@ -2847,11 +2986,11 @@ mod tests {
 
         // No `pg_url`: had the flip fallen through to its query-back instead of being queued, this
         // would be an error rather than "nothing moved".
-        let moved = move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
+        let moved = move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None, 0).await.unwrap();
         assert!(moved.is_none(), "nothing moves: the shape is not installed yet");
         // A hot inner table flips the same value repeatedly; the replay is absolute, so once is enough.
-        move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
-        move_shape_for_value(&registry, "s1", 0, &Value::Int(8), None).await.unwrap();
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None, 0).await.unwrap();
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(8), None, 0).await.unwrap();
         {
             let reg = registry.lock().await;
             assert!(reg.shapes.is_empty(), "the create has not installed anything");
@@ -2862,7 +3001,7 @@ mod tests {
         }
 
         // A NULL flip re-derives every row, so it subsumes anything queued before it.
-        rederive_shape(&registry, "s1", None).await.unwrap();
+        rederive_shape(&registry, "s1", None, 0).await.unwrap();
         let reg = registry.lock().await;
         let queued = &reg.pending_shapes[0].deferred;
         assert_eq!(queued.len(), 1, "the full re-derive replaced the per-value work");
@@ -2881,7 +3020,7 @@ mod tests {
             .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
             .collect();
         let registry = tokio::sync::Mutex::new(reg);
-        move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None, 0).await.unwrap();
 
         let mut reg = registry.into_inner();
         let finished = reg
@@ -2956,17 +3095,17 @@ mod tests {
             let reg = registry.lock().await;
             let queued = &reg.nodes[&mid].deferred;
             assert_eq!(queued.len(), 1, "queued once on the parent node; the repeat deduped");
-            assert!(matches!(queued[0], DeferredNodeWork::Value { connecting_col: 0, value: Value::Int(7) }));
+            assert!(matches!(queued[0], DeferredNodeWork::Value { connecting_col: 0, value: Value::Int(7), .. }));
             assert_eq!(reg.circuit_distinct(mid_id), 0, "the seeding node's set is untouched");
             assert!(reg.nodes[&mid].seed_buffer.is_some(), "and it is still seeding");
         }
 
         // A full re-derive covers every value, so it subsumes what was queued before it.
-        assert!(requery_and_reconcile_parent(&registry, &mid, None).await.unwrap().is_none());
+        assert!(requery_and_reconcile_parent(&registry, &mid, None, 0).await.unwrap().is_none());
         let reg = registry.lock().await;
         let queued = &reg.nodes[&mid].deferred;
         assert_eq!(queued.len(), 1, "the full re-derive replaced the per-value work");
-        assert!(matches!(queued[0], DeferredNodeWork::Full));
+        assert!(matches!(queued[0], DeferredNodeWork::Full { .. }));
     }
 
     /// `finish_create` hands the node's deferred work back once that node's seed and its buffered
@@ -3034,8 +3173,8 @@ mod tests {
         let registry = tokio::sync::Mutex::new(reg);
 
         let mut work: VecDeque<DeferredShapeWork> = [
-            DeferredShapeWork::Value { connecting_col: 1, value: Value::Int(100), txid: None },
-            DeferredShapeWork::Full { txid: None },
+            DeferredShapeWork::Value { connecting_col: 1, value: Value::Int(100), txid: None, commit_lsn: 0 },
+            DeferredShapeWork::Full { txid: None, commit_lsn: 0 },
         ]
         .into_iter()
         .collect();
@@ -3707,7 +3846,7 @@ mod tests {
             &ts,
             vec![("s1".to_string(), vec![(issue(1, 100), true)])],
             None,
-            EmissionSource::QueryBack { gate: &stale },
+            EmissionSource::QueryBack { gate: &stale, commit_lsn: 0 },
         )
         .await
         .unwrap();
@@ -3725,7 +3864,7 @@ mod tests {
             &ts,
             vec![("s1".to_string(), vec![(issue(1, 100), true)])],
             None,
-            EmissionSource::QueryBack { gate: &fresh },
+            EmissionSource::QueryBack { gate: &fresh, commit_lsn: 0 },
         )
         .await
         .unwrap();
@@ -3789,7 +3928,7 @@ mod tests {
             &ts,
             vec![("s1".to_string(), vec![(issue(1, 100), true)])],
             None,
-            EmissionSource::QueryBack { gate: &stale },
+            EmissionSource::QueryBack { gate: &stale, commit_lsn: 0 },
         )
         .await
         .unwrap();
