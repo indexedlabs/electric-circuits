@@ -17,7 +17,7 @@ stored generated columns absent from pgoutput. Boot rejects untracked tables, un
 never recorded in a witness, and lists missing any primary-key component before
 slot/publication/replica-identity mutations. Each supervised source receives entries for its own
 tracked tables; entries tracked by no source refuse startup. After startup, such entries are ignored
-with a warning so source removals and other reconciliation actions still apply. Schema preflight reads take a
+with one warning per table so source removals and other reconciliation actions still apply. Schema preflight reads take a
 backfill-sized budget permit per configured table. The compiled
 engine schema is projected while its physical `SchemaFingerprint` remains intact. Drift refreshes
 reapply the setting. Replication removes unlisted new/old cells before buffering; snapshot and
@@ -31,7 +31,7 @@ The additive catalog event is:
 ```
 
 Names are sorted and unique. The hash is lowercase hexadecimal SHA-256 of the compact UTF-8 JSON
-array of names (`["id","name"]`), without a trailing newline. Malformed records refuse boot;
+array of names (`["id","name"]`), without a trailing newline. Malformed records refuse Postgres boot;
 the normal catalog `eid` deduplication and last-event semantics apply. No record means all columns,
 so legacy catalogs need no migration. Existing fields and events keep their meanings, including
 `ShapeRecord.columns` (caller output projection) and audit-only `SchemaChanged`.
@@ -49,11 +49,13 @@ Legacy comparison uses the unprojected compiled schema, including unpublished st
 columns. Catalog validation precedes projection preflight: a missing configured column that appears
 in a prior witness was dropped by DDL, so compilation omits it and warns with its table and name.
 A missing name never witnessed remains a fatal typo. Historical names are derived from existing
-events; retained engine history is bounded by configured names. This distinction survives the next
-witness narrowing the effective set. Runtime drift writes any changed effective set after dependent
-retirements and before schema installation, including dropping listed columns; post-DDL shapes then
-retain their streams at restart. Drift whose effective columns are unchanged queues failed stream
-retirements without waiting for completion, preserving ingest progress on other tables (ADR-0007).
+events; retained names are bounded by configuration, with one entry per witnessed table even after
+its setting is removed. This distinction survives the next witness narrowing the effective set.
+Runtime drift writes a changed effective set only for a configured or previously witnessed table,
+after dependent retirements and before schema installation; post-DDL shapes then retain their streams
+at restart. Other drift, including ADD/DROP COLUMN with neither a setting nor a witness, queues failed
+stream retirements without waiting or writing a witness, preserving ingest progress on other tables
+(ADR-0007).
 No event format changes are needed.
 
 ## Consequences

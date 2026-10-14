@@ -108,8 +108,10 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | no | `67108864` | Per-shape ceiling for the deltas buffered while a shape is being created or woken. Past it the shape is retired and the client recreates it (`pending_buffer_overflows`). `0` = no ceiling. |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | no | `4` | Multiplier for replay admission against recorded backfill bytes. |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |
+| `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | no | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; incomplete input spills past this cap (`0` spills immediately). With the process budget enabled, held input spills before the next page regardless of this cap. Does not cap read pages or transaction output. |
+| `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | no | disabled | Opt-in transient byte admission shared across sources. A positive value enables it; unset or `0` disables it regardless of cgroup limits. Requests larger than the budget wait for an empty ledger. Retained results and arrangement state remain outside the ledger. |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | no | `67108864` | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot. |
-| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines. |
+| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Shared directory for ingest and sequencer held spill (created 0700, files 0600). One large commit can briefly need about twice its serialized change size. Must be writable at boot and must not be shared between engines. |
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
 | `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
@@ -313,13 +315,14 @@ perform the idempotent exact-generation promotion.
   `UPDATE`/`DELETE` under `REPLICA IDENTITY FULL` carries the old *and* new row for every change. Past
   `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (128 MiB of held changes) the buffer is written to one
   temporary file in `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` and memory is released, so peak **ingestor**
-  memory is that cap plus one append chunk whatever the transaction's size. That bound is the
-  ingestor's alone: downstream, the sequencer reads and applies the transaction as one unit, so its
-  read page and pending appends still scale with the transaction — size the pod for the largest
-  transaction you expect to sync, not just for this knob. **Size the spill directory for the largest
-  single transaction your database can produce** — the file holds that transaction's changes as JSON,
-  roughly the size of the rows involved (doubled for updates and deletes, which carry the prior row
-  too), and it exists only between that transaction's `BEGIN` and its commit. The directory defaults
+  memory is that cap plus one append chunk whatever the transaction's size. The sequencer's input
+  pages are bounded by the read cap; its incomplete held run spills past
+  `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (64 MiB by default). Read/held input no longer scales with
+  the whole transaction, but transaction output and pending appends still can — size the pod for
+  those as well. **Ingest and sequencer held spill share the directory: one large commit can briefly
+  require about twice its serialized change size**, because ingest spill remains until its last
+  append lands while the sequencer may already be spilling that input. Include old/new row images
+  when estimating change bytes, and allow headroom for concurrent sources. The directory defaults
   to a private `<temp dir>/circuits-txn-spill-<uid>` (0700, files 0600), is **probed at boot** — an
   unwritable one refuses the boot rather than failing every large commit — and must not be shared
   between engines (leftovers are identified by pid, which means nothing across containers): give each

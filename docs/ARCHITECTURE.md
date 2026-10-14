@@ -216,7 +216,7 @@ re-introspection reapplies the configured set. After reading catalog witnesses, 
 names and PK membership before entering the epoch or mutating slots/publications/identity; these schema preflight reads take one
 backfill-sized permit per configured table. Supervised sources receive only their tracked entries;
 an entry tracked by no source is a fatal startup configuration error. After startup, unused entries
-warn and are ignored, allowing removals and other plan actions to proceed. A trailing semicolon is
+warn once per table and are ignored, allowing removals and other plan actions to proceed. A trailing semicolon is
 accepted; library mode warns that the setting is ignored.
 
 The additive catalog event `ingestColumns { table, columns, hash }` records sorted effective names
@@ -228,8 +228,10 @@ even when it names every current column, without retiring shapes in that case. L
 uses the full compiled column set, including stored generated columns omitted from pgoutput. A
 listed column absent after DDL is omitted with a warning when an existing witness recorded it; an
 absent name never witnessed is a fatal typo. Historical names are derived from existing events and
-retained only for configured names. Runtime DDL refreshes any changed effective-width witness after
-dependent retirements and before installing the new schema, so post-DDL shapes survive restart. Clients recreate retired
+retained only for configured names, with one entry per witnessed table even after its setting is
+removed. Runtime DDL on a configured or previously witnessed table refreshes a changed effective-width
+witness after dependent retirements and before installing the new schema. With neither setting nor
+witness, ADD/DROP COLUMN queues retirement without waiting or writing a witness. Clients recreate retired
 streams and backfill newly included columns. Existing `SchemaChanged` and shape output lists keep
 their meanings. Catalog body reads use the shared page permits; projection reconciliation holds no
 permit while waiting for retirement. See [ADR-0012](adr/0012-static-ingest-columns.md).
@@ -930,8 +932,9 @@ Store admission reads only the first catalog event to validate the immutable `st
 It buffers that capped response body but decodes no later events. The subsequent fold reads the
 whole catalog page by page and checks bindings before `eid` de-duplication, so a duplicate or
 reordered `storeBound` still refuses boot before restore. Library-mode boot also completes this
-validation before publishing readiness, even though it restores no Postgres shapes. After a
-successful fold, `catalog read complete` logs `catalog_bytes`: the sum of response-body lengths, including JSON framing and
+binding validation before publishing readiness, without folding or retaining nonbinding catalog
+history. Its `catalog binding check complete` log and the Postgres fold's `catalog read complete`
+log report `catalog_bytes`: the sum of response-body lengths, including JSON framing and
 repeated events, excluding admission reads. The same boot measurement is the `catalog_bytes`
 JSON gauge and `engine_catalog_bytes` Prometheus gauge; it survives metric reset and does not track
 later appends or estimate heap usage. The catalog remains append-only and uncompacted.
@@ -959,8 +962,9 @@ later appends or estimate heap usage. The catalog remains append-only and uncomp
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
 
 Public library constructors `Engine::new` and `Engine::new_with_config` are async and return
-`Result<Engine>`. They validate the complete catalog before creating engine tasks or exposing
-readiness/control operations; `boot_library` delegates to the same path. A failed or cancelled
+`Result<Engine>`. They check store bindings across every catalog page before creating engine tasks
+or exposing readiness/control operations; `boot_library` delegates to the same path. They do not
+restore or validate nonbinding records. A failed or cancelled
 validation leaves no engine running. Postgres construction remains waiting for its boot validation.
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the

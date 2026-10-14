@@ -585,6 +585,7 @@ pub struct Engine {
     txn_cfg: Arc<std::sync::Mutex<crate::txn_buffer::TxnBufferConfig>>,
     /// Deployment projection, separate from physical schema fingerprints and shape SELECT lists.
     pg_columns: Arc<std::collections::BTreeMap<TableRef, Vec<String>>>,
+    /// Witnessed tables, with historical column names retained only when configured.
     pg_columns_seen: Arc<std::sync::RwLock<std::collections::BTreeMap<TableRef, HashSet<String>>>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
@@ -1278,11 +1279,11 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
-    /// Construct a library engine after validating its complete catalog. Fails before engine
-    /// tasks or control surfaces exist if storage is unreadable or the catalog is invalid.
+    /// Construct a library engine after checking store bindings across every catalog page.
+    /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
     pub async fn new(admission: StoreAdmission) -> Result<Self> {
-        let (_, bytes) = Self::read_catalog(&admission.ds, Some(&admission.binding)).await?;
+        let bytes = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
         let engine =
             Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None);
         engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
@@ -1343,8 +1344,8 @@ impl Engine {
         Self::new_with_config(admission, None, PostgresSetup::EngineManaged, config).await
     }
 
-    /// Construct using resolved storage/pool settings. Library mode validates the entire catalog
-    /// before construction; errors/cancellation start no engine work. Postgres mode remains
+    /// Construct using resolved storage/pool settings. Library mode checks bindings across all catalog
+    /// pages before construction; errors/cancellation start no engine work. Postgres mode remains
     /// waiting until `setup_postgres` validates the catalog and completes boot.
     pub async fn new_with_config(
         mut admission: StoreAdmission,
@@ -1354,7 +1355,7 @@ impl Engine {
     ) -> Result<Self> {
         let bytes = if pg_url.is_none() {
             admission.ds = admission.ds.with_memory_budget(config);
-            Some(Self::read_catalog(&admission.ds, Some(&admission.binding)).await?.1)
+            Some(Self::check_catalog_binding(&admission.ds, &admission.binding).await?)
         } else {
             None
         };
@@ -2350,14 +2351,15 @@ impl Engine {
         }
     }
 
+    fn tracks_ingest_columns(&self, table: &TableRef) -> bool {
+        self.pg_columns.contains_key(table) || self.pg_columns_seen.read().unwrap().contains_key(table)
+    }
+
     fn remember_ingest_columns(&self, table: &TableRef, columns: &[String]) {
+        let mut seen = self.pg_columns_seen.write().unwrap();
+        let names = seen.entry(table.clone()).or_default();
         if let Some(configured) = self.pg_columns.get(table) {
-            self.pg_columns_seen
-                .write()
-                .unwrap()
-                .entry(table.clone())
-                .or_default()
-                .extend(columns.iter().filter(|name| configured.contains(name)).cloned());
+            names.extend(columns.iter().filter(|name| configured.contains(name)).cloned());
         }
     }
 

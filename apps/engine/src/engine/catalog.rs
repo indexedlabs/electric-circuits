@@ -1227,14 +1227,15 @@ impl Engine {
     /// No shapes are installed — see [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
         let (fold, bytes) = Self::read_catalog(&self.ds, self.store_bound.get()).await?;
-        // Retained history is bounded by the configured names, not catalog length/DDL count.
-        let seen = self
-            .pg_columns
+        // One entry per witnessed table; retained names are bounded by configuration,
+        // not catalog length/DDL count. Empty entries remember witnesses after opt-out.
+        let seen = fold
+            .ingest_columns_seen
             .iter()
             .map(|(table, columns)| {
                 let names = columns
                     .iter()
-                    .filter(|name| fold.ingest_columns_seen.get(table).is_some_and(|seen| seen.contains(*name)))
+                    .filter(|name| self.pg_columns.get(table).is_some_and(|configured| configured.contains(*name)))
                     .cloned()
                     .collect();
                 (table.clone(), names)
@@ -1245,8 +1246,21 @@ impl Engine {
         Ok(fold)
     }
 
-    // Validate before constructing a library engine: no background task or control surface
-    // exists if this read fails or the constructor future is cancelled.
+    // Library mode never restores catalog state: retain only the binding check and byte count.
+    // No background task/control surface exists if this read fails or is cancelled.
+    pub(super) async fn check_catalog_binding(
+        ds: &DsClient,
+        expected: &crate::store_identity::StoreBound,
+    ) -> Result<u64> {
+        let mut binding = StoreBindingCheck::new(expected);
+        let bytes = visit_catalog_pages(ds, |page| binding.observe_page(&page))
+            .await
+            .context("reading catalog for store binding")?;
+        binding.finish().context("catalog store binding validation")?;
+        tracing::info!(catalog_bytes = bytes, "catalog binding check complete");
+        Ok(bytes)
+    }
+
     pub(super) async fn read_catalog(
         ds: &DsClient,
         expected: Option<&crate::store_identity::StoreBound>,
@@ -2525,6 +2539,38 @@ mod tests {
             "library mode must warn that its ingest setting is ignored: {logs}"
         );
         engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
+    async fn library_public_constructors_only_validate_bindings() {
+        let config = crate::config::Config::resolve(|_| None).unwrap();
+        let mut refused = Vec::new();
+        for configured in [false, true] {
+            for tail in [
+                serde_json::json!({"t":"created", "rec":{"id":"old-shape","table":"items"}}),
+                serde_json::json!({"t":"ingestColumns", "eid":"bad-projection", "table":"public.items"}),
+            ] {
+                let events = vec![catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound())), tail];
+                let (ds, store) = paged_catalog(&events, 1);
+                let expected_bytes: u64 =
+                    store.pages_by_offset.lock().unwrap().values().map(|(_, _, body)| body.len() as u64).sum();
+                let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
+                let result = if configured {
+                    Engine::new_with_config(admission, None, PostgresSetup::EngineManaged, &config).await
+                } else {
+                    Engine::new(admission).await
+                };
+                match result {
+                    Ok(engine) => {
+                        assert_eq!(engine.readiness_status(), "active");
+                        assert_eq!(engine.metrics.snapshot()["gauges"]["catalog_bytes"], expected_bytes);
+                        engine.close(OTTO_5492_DEADLINE).await;
+                    }
+                    Err(error) => refused.push((configured, format!("{error:#}"))),
+                }
+            }
+        }
+        assert!(refused.is_empty(), "library binding check must not fold nonbinding events: {refused:?}");
     }
 
     #[tokio::test]

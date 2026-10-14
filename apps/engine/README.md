@@ -87,7 +87,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |
 | `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | `67108864` (64 MiB) | Per-shape ceiling for the live deltas a shape buffers between `BeginShape` and `ActivateShape` (its Postgres backfill, or its change-log replay plus the wait for a reactivation permit). Past it the buffer is dropped, activation refuses with a typed outcome and the caller recreates from a fresh backfill — the same answer an over-budget replay gives. `0` = no ceiling |
-| `ELECTRIC_CIRCUITS_PG_COLUMNS` | all columns | Static per-table ingest lists: `schema.table:col,col;schema.table:col`. Must include every PK column. Unknown names never witnessed and missing keys refuse boot before slot/publication/identity writes; witnessed columns dropped by DDL are omitted with a warning. Sources receive their tracked entries (unused entries refuse startup, then warn/ignore on later polls); unavailable shape output/predicate columns return 400. Changed effective sets retire dependent shapes durably at restart; clients recreate/backfill. Missing entries keep all columns. A trailing `;` is accepted; library mode warns and ignores the setting |
+| `ELECTRIC_CIRCUITS_PG_COLUMNS` | all columns | Static per-table ingest lists: `schema.table:col,col;schema.table:col`. Must include every PK column. Unknown names never witnessed and missing keys refuse boot before slot/publication/identity writes; witnessed columns dropped by DDL are omitted with a warning. Sources receive their tracked entries (unused entries refuse startup, then warn once per table and ignore on later polls); unavailable shape output/predicate columns return 400. Changed effective sets retire dependent shapes durably at restart; clients recreate/backfill. Missing entries keep all columns. A trailing `;` is accepted; library mode warns and ignores the setting |
 | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in transient byte admission shared by all sources. A positive value enables it; unset or `0` disables it with one boot log, regardless of cgroup limits. Oversized requests wait for an empty budget |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk; budgeted workspace growth or schema callbacks may spill earlier. `0` = never spill (buffer the whole transaction in RAM) |
 | `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; strictly past this cap, incomplete input spills as NDJSON. `0` spills immediately. An enabled process budget spills held input before the next page regardless of this cap. Does not cap read pages or transaction output |
@@ -491,9 +491,10 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   (no `eid`, no `subscription`) is boot-fatal, like the pre-ADR-0002 and pre-ADR-0006 formats.
 - **Store admission decodes only catalog event zero**, the expected `storeBound`, and stops there.
   The transport still buffers its capped page body. Public library constructors `Engine::new` and
-  `Engine::new_with_config` are async and return `Result<Engine>`: the complete catalog must validate
-  before an engine or its background tasks exist. `boot_library` uses the same path; cancellation
-  during validation releases page credit and starts no engine work. The catalog fold reads every page
+  `Engine::new_with_config` are async and return `Result<Engine>`: store bindings must validate across
+  every page before an engine or its background tasks exist. Library mode does not fold, retain or
+  validate nonbinding history. `boot_library` uses the same path; cancellation releases page credit
+  and starts no engine work. The Postgres catalog fold reads every page
   once and rejects duplicate or reordered bindings before event-id de-duplication, including a
   repeated binding with the same `eid`. No shapes restore from an invalid catalog.
 

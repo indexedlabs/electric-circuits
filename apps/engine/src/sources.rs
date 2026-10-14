@@ -111,6 +111,8 @@ struct SupervisorState {
     failed: BTreeMap<String, FailedSource>,
     last_revision: Option<i64>,
     fetched: bool,
+    /// At most one entry per configured table; do not repeat warnings on every poll.
+    warned_unused_columns: std::collections::BTreeSet<crate::table_ref::TableRef>,
 }
 
 struct SourceRuntime {
@@ -162,6 +164,7 @@ impl SourcesSupervisor {
                     failed: BTreeMap::new(),
                     last_revision: None,
                     fetched: false,
+                    warned_unused_columns: Default::default(),
                 }),
                 reconcile: Mutex::new(()),
                 shutdown: ShutdownToken::new(),
@@ -458,7 +461,9 @@ impl SourcesSupervisor {
                 if !started {
                     return Err(UnknownProjectionTable(table.clone()).into());
                 }
-                tracing::warn!(%table, "ignoring ingest column setting: no current source tracks the table");
+                if self.inner.state.lock().await.warned_unused_columns.insert(table.clone()) {
+                    tracing::warn!(%table, "ignoring ingest column setting: no current source tracks the table");
+                }
             }
         }
         let (running, failed) = {
@@ -1428,6 +1433,51 @@ mod tests {
         let result = supervisor.apply_snapshot(SourceSnapshot { revision: 1, rows: vec![] }).await;
         assert!(result.is_err(), "a projection tracked by no source must be rejected before activation");
         assert!(!supervisor.inner.state.lock().await.fetched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_unused_table_warns_once_per_table() -> Result<()> {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Capture(Arc::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        let mut config = file_mode_config("/unused");
+        for table in ["public.items", "public.users"] {
+            config.pg_columns.insert(table.into(), vec!["id".into()]);
+        }
+        let supervisor = SourcesSupervisor::new(config)?;
+        // A previously accepted source snapshot has since removed both configured tables.
+        supervisor.inner.state.lock().await.fetched = true;
+        for revision in 1..=3 {
+            supervisor.apply_snapshot(SourceSnapshot { revision, rows: vec![] }).await?;
+        }
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        for table in ["public.items", "public.users"] {
+            assert_eq!(
+                logs.lines()
+                    .filter(|line| line.contains("no current source tracks the table") && line.contains(table))
+                    .count(),
+                1,
+                "one unused-setting warning per table: {logs}"
+            );
+        }
         Ok(())
     }
 
