@@ -1172,9 +1172,14 @@ mod tests {
             crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope());
         let mut event = serde_json::to_value(&binding).unwrap();
         event.as_object_mut().unwrap().insert("t".into(), "storeBound".into());
+        event.as_object_mut().unwrap().insert("eid".into(), "budget-binding".into());
         store.read_pages.lock().unwrap().push(("bound".into(), true, format!("[{event}]")));
         let ds = crate::ds::DsClient::with_test_store("scripted://budget-revision".into(), store.clone());
         let admission = Engine::admit_store(ds, binding, false).await.unwrap();
+        store.read_pages.lock().unwrap().push(("bound".into(), true, format!("[{event}]")));
+        let engine = Engine::new_with_config(admission, None, crate::engine::PostgresSetup::EngineManaged, config)
+            .await
+            .unwrap();
         let mut row = env("upsert", "one", "01");
         row.value = Some(serde_json::json!({"id":"one", "body":"x".repeat(1024)}));
         store
@@ -1182,7 +1187,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert("-1".into(), ("01".into(), true, serde_json::to_string(&vec![row]).unwrap()));
-        Engine::new_with_config(admission, None, crate::engine::PostgresSetup::EngineManaged, config)
+        engine
     }
 
     #[tokio::test]

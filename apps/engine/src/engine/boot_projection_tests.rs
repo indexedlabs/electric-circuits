@@ -108,7 +108,6 @@ async fn serve(mut io: DuplexStream) {
 
 #[tokio::test]
 async fn ingest_projection_invalid_columns_refuse_before_entering_the_epoch() {
-    let mut reads = Vec::new();
     for columns in ["id,typo", "name"] {
         let config = crate::config::Config::resolve(|key| match key {
             "ELECTRIC_CIRCUITS_PG_COLUMNS" => Some(format!("public.users:{columns}")),
@@ -116,8 +115,12 @@ async fn ingest_projection_invalid_columns_refuse_before_entering_the_epoch() {
             _ => None,
         })
         .unwrap();
-        // The epoch's catalog read is a named cut: if reached, fail there before any writes.
-        let store = Arc::new(crate::ds::ScriptedStore { fail_read_body: true, ..Default::default() });
+        // Projection now reads prior witnesses before deciding whether an absent column is a
+        // typo or DDL. The protocol fixture refuses epoch queries/writes: neither may happen.
+        let store = Arc::new(crate::ds::ScriptedStore {
+            read_pages: std::sync::Mutex::new(vec![("tail".into(), true, "[]".into())]),
+            ..Default::default()
+        });
         let engine = Engine::new_inner(
             DsClient::with_test_store("scripted://preflight".into(), store.clone()),
             Some("postgres://unused".into()),
@@ -138,14 +141,10 @@ async fn ingest_projection_invalid_columns_refuse_before_entering_the_epoch() {
         .await
         .unwrap()
         .unwrap_err();
-        reads.push(store.read_count.load(Ordering::Relaxed));
-        if reads.last() == Some(&0) {
-            assert!(format!("{error:#}").contains("ELECTRIC_CIRCUITS_PG_COLUMNS"), "{error:#}");
-        }
+        assert!(format!("{error:#}").contains("ELECTRIC_CIRCUITS_PG_COLUMNS"), "{error:#}");
         assert!(store.appended.lock().unwrap().is_empty());
         engine.close(std::time::Duration::from_secs(5)).await;
         driver.abort();
         server.abort();
     }
-    assert_eq!(reads, [0, 0], "invalid column names and omitted primary keys must refuse before epoch/catalog work");
 }

@@ -212,19 +212,25 @@ queries" (the per-feed key sets and the reconcile reverse index are host-side by
 ## 6. Transient operation budgets
 
 `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` shares transient byte admission across the process, including
-supervised sources. It defaults to 60% of a finite readable cgroup limit; unset without a limit logs
-once and disables admission. FIFO requests wait for capacity; oversized requests need an empty
-ledger. An explicit zero admits positive requests exclusively. Credits follow the working owner,
-including blocking spill I/O after cancellation. They are reservations/estimates, not allocator truth.
+supervised sources, only when set to a positive byte count. Unset or `0` disables admission with one
+boot log, regardless of cgroup limits. It accounts only transient input, so the default stays off
+until a profiled boot peak shows which stage needs bounding. Cgroup counters remain in memory
+snapshot logs. Held spill (its own default 64 MiB cap) and ingest spill apply independently of
+admission. When enabled, FIFO requests wait for capacity; oversized requests need an empty
+ledger. Credits follow the working owner, including blocking spill I/O after cancellation.
+They are reservations/estimates, not allocator truth.
 
-Backfills and Electric folds use ordinary FIFO frame/page permits, releasing each after consumption
+When admission is enabled, backfills and Electric folds use ordinary FIFO frame/page permits, releasing each after consumption
 and before requesting another. Only an individual oversized request requires an empty ledger.
 Retained fold maps, decoded rows and collected results remain outside the ledger, like arrangement
 state. The ingestor's `TXN_MEMORY_BYTES=0` escape hatch still never spills: only its input/drain
 workspace is admitted, with its unbounded retained rows unaccounted. Initial ingest reservations
 are capped at one quarter of the process budget (at least one byte).
-Drain workspace uses actual buffered bytes up to the append cap, plus one envelope. Capped ingestors
-may spill earlier before larger workspace or schema/pool waits. See
+Drain workspace uses actual buffered bytes up to the append cap, plus one envelope. Schema-message
+readmission restores the initial floor. Growth that fits immediately with no queued peer keeps
+an under-cap transaction in memory; otherwise capped ingestors spill before larger workspace or
+schema/pool waits. The sequencer keeps its read's FIFO position across ordinary commands. Live DS
+reads re-issue only if admission actually waits; an immediately admitted page uses one request. See
 [engine configuration](../apps/engine/README.md#process-byte-admission) for owner lifetimes and costs.
 
 `ELECTRIC_CIRCUITS_PG_COLUMNS` additionally reduces row width before transaction buffering and
@@ -232,7 +238,8 @@ spilling, for both new and old images. Backfill/query-back SQL uses that same pe
 wire frames and historical change-log segments can still contain omitted columns. Projection changes
 retire dependent streams at boot before clients backfill the new set ([ADR-0012](adr/0012-static-ingest-columns.md)).
 
-The following terms are intentionally separate from retained engine cardinalities:
+The following terms are intentionally separate from retained engine cardinalities. Reservations and
+byte credits apply only when process admission is enabled; local spill and read caps apply independently:
 
 | operation | bounded memory | accounting/observation |
 |---|---|---|

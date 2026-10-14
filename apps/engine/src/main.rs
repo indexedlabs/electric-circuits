@@ -169,7 +169,9 @@ async fn main() -> Result<()> {
                 Some(url.clone()),
                 electric_circuits_engine::engine::PostgresSetup::EngineManaged,
                 &config,
-            );
+            )
+            .await
+            .unwrap_or_else(|e| refuse_boot("catalog", &e));
             // The dbsp arrangement circuit is mandatory infrastructure — always configured.
             tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
             engine.set_dbsp_config(config.dbsp.clone());

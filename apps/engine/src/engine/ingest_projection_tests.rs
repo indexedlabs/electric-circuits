@@ -129,6 +129,86 @@ async fn ingest_projection_legacy_compares_full_compiled_columns() {
 }
 
 #[tokio::test]
+async fn ingest_projection_dropped_listed_column_uses_witness_but_typo_refuses() {
+    let mut after = definition();
+    after.columns.remove("payload");
+    after.fingerprint.as_mut().unwrap().columns.retain(|c| c.name != "payload");
+    let table = TableRef::parse("public.users").unwrap();
+    let setting = Some("public.users:id,name,payload");
+    let mut history = catalog(Some(&["id", "name", "payload"]));
+    for boot in 0..2 {
+        let (engine, store, _) = fixture(setting, &history);
+        let mut fold = engine.fold_catalog().await.unwrap();
+        let result = engine.compile_ingest_table(&table, &after);
+        assert!(result.is_ok(), "a previously witnessed column dropped by DDL must not abort boot {boot}: {result:?}");
+        let compiled = HashMap::from([(table.clone(), result.unwrap())]);
+        engine.reconcile_ingest_columns(&mut fold, &compiled).await.unwrap();
+        if boot == 0 {
+            assert!(fold.recs.is_empty(), "the changed projection must retire old shapes");
+            assert_eq!(
+                appended(&store).iter().map(|e| e["t"].as_str().unwrap()).collect::<Vec<_>>(),
+                ["dropped", "retired", "ingestColumns"]
+            );
+        } else {
+            assert!(fold.recs.contains_key("s2"), "post-DDL shape survives the next restart");
+            assert!(appended(&store).is_empty());
+        }
+        history.extend(appended(&store));
+        if boot == 0 {
+            let mut created = catalog(None).remove(0);
+            created["rec"]["id"] = json!("s2");
+            created["rec"]["stream_path"] = json!("shape/s2");
+            created["rec"]["fingerprint"] = json!(after.fingerprint);
+            history.push(event(created, 900));
+        }
+        engine.close(DEADLINE).await;
+    }
+    // The exact same absent name, without evidence that it ever existed, remains a typo.
+    let (engine, store, _) = fixture(setting, &catalog(Some(&["id", "name"])));
+    engine.fold_catalog().await.unwrap();
+    let error = engine.compile_ingest_table(&table, &after).unwrap_err();
+    assert!(format!("{error:#}").contains("payload"));
+    assert!(appended(&store).is_empty());
+    engine.close(DEADLINE).await;
+}
+
+#[tokio::test]
+async fn ingest_projection_legacy_all_columns_records_witness_for_add_column_restart() {
+    let setting = Some("public.users:id,name,payload");
+    let (engine, store, compiled) = fixture(setting, &catalog(None));
+    restore(&engine, &compiled).await;
+    let writes = appended(&store);
+    assert_eq!(
+        writes.iter().map(|e| e["t"].as_str().unwrap()).collect::<Vec<_>>(),
+        ["ingestColumns"],
+        "legacy explicit all must record provenance without retiring shapes"
+    );
+    assert!(engine.state.lock().await.shapes.contains_key("s1"));
+    engine.close(DEADLINE).await;
+
+    // Runtime ADD COLUMN: normal schema drift has retired the old shape; a newly created
+    // shape carries the post-DDL fingerprint and exactly the same projected set.
+    let mut after = definition();
+    after.columns.insert("added".into(), after.columns["name"].clone());
+    after.fingerprint.as_mut().unwrap().columns.push(FingerprintColumn {
+        name: "added".into(),
+        type_oid: 25,
+        typmod: -1,
+    });
+    let mut events = writes;
+    let mut post_ddl = catalog(None);
+    post_ddl[0]["rec"]["fingerprint"] = json!(after.fingerprint);
+    events.extend(post_ddl);
+    let (engine, store, _) = fixture(setting, &events);
+    let table = TableRef::parse("public.users").unwrap();
+    let compiled = HashMap::from([(table.clone(), engine.compile_ingest_table(&table, &after).unwrap())]);
+    restore(&engine, &compiled).await;
+    assert!(engine.state.lock().await.shapes.contains_key("s1"), "post-DDL shape must survive restart");
+    assert!(appended(&store).is_empty(), "the unchanged projection has no second transition");
+    engine.close(DEADLINE).await;
+}
+
+#[tokio::test]
 async fn ingest_projection_restart_matrix() {
     for (label, previous, setting, retire) in [
         ("unchanged", Some(&["id", "name"][..]), Some("public.users:name,id"), false),
@@ -158,6 +238,8 @@ async fn ingest_projection_restart_matrix() {
             assert!(
                 store.operations.lock().unwrap().iter().any(|op| op.starts_with("delete:") && op.ends_with("shape/s1"))
             );
+        } else if label == "legacy explicit all" {
+            assert_eq!(kinds, ["ingestColumns"], "explicit settings always establish a witness");
         } else {
             assert!(kinds.is_empty(), "unchanged columns must not append events: {label}");
         }
@@ -474,6 +556,22 @@ async fn ingest_projection_keeps_other_tables_and_deduplicates_witnesses() {
     engine.close(DEADLINE).await;
 }
 
+fn source_receipt_matches(event: &Json, commit: &str) -> bool {
+    event["t"] == "sourceDrained" && event["sourceCommitId"] == commit
+}
+
+#[test]
+fn ingest_projection_receipt_observer_matches_the_catalog_wire_contract() {
+    let commit = "018f5f4d-70c2-7d70-a4d5-5f7355078f85";
+    let receipt = json!({"t":"sourceDrained", "sourceCommitId":commit, "commitLsn":"0/16B6C50"});
+    assert!(
+        source_receipt_matches(&receipt, commit),
+        "the live-test fence must recognize the catalog's camelCase receipt"
+    );
+    assert!(!source_receipt_matches(&receipt, "another-commit"));
+    assert!(!source_receipt_matches(&json!({"t":"other", "sourceCommitId":commit}), commit));
+}
+
 /// Inherited real-PG regression: real pgoutput, snapshot/engine and public shape reads; the
 /// append/read log is an in-memory fixture, so this is not file-backed release qualification.
 #[tokio::test]
@@ -543,10 +641,7 @@ async fn ingest_projection_real_postgres_live_changes_match_sql() -> Result<()> 
                 let changed = store.appended_changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                if appended(&store)
-                    .iter()
-                    .any(|ev| ev["t"] == "sourceDrained" && ev["source_commit_id"] == commit.to_string())
-                {
+                if appended(&store).iter().any(|ev| source_receipt_matches(ev, &commit.to_string())) {
                     break;
                 }
                 changed.await;

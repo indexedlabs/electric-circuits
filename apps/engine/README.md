@@ -87,8 +87,8 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |
 | `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | `67108864` (64 MiB) | Per-shape ceiling for the live deltas a shape buffers between `BeginShape` and `ActivateShape` (its Postgres backfill, or its change-log replay plus the wait for a reactivation permit). Past it the buffer is dropped, activation refuses with a typed outcome and the caller recreates from a fresh backfill — the same answer an over-budget replay gives. `0` = no ceiling |
-| `ELECTRIC_CIRCUITS_PG_COLUMNS` | all columns | Static per-table ingest lists: `schema.table:col,col;schema.table:col`. Must include every PK column. Invalid names/keys refuse boot before slot/publication/identity writes; sources receive only their tracked entries (entries tracked by none refuse startup); unavailable shape output/predicate columns return 400. Changed effective sets retire dependent shapes durably at restart; clients recreate/backfill. Missing entries keep all columns |
-| `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | 60% of a finite readable cgroup memory limit | Process byte admission shared by all sources. Unset without a readable limit disables admission and logs once. `0` allows only exclusive positive requests; it does not disable admission. Oversized requests wait for an empty budget |
+| `ELECTRIC_CIRCUITS_PG_COLUMNS` | all columns | Static per-table ingest lists: `schema.table:col,col;schema.table:col`. Must include every PK column. Unknown names never witnessed and missing keys refuse boot before slot/publication/identity writes; witnessed columns dropped by DDL are omitted with a warning. Sources receive their tracked entries (unused entries refuse startup, then warn/ignore on later polls); unavailable shape output/predicate columns return 400. Changed effective sets retire dependent shapes durably at restart; clients recreate/backfill. Missing entries keep all columns. A trailing `;` is accepted; library mode warns and ignores the setting |
+| `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in transient byte admission shared by all sources. A positive value enables it; unset or `0` disables it with one boot log, regardless of cgroup limits. Oversized requests wait for an empty budget |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk; budgeted workspace growth or schema callbacks may spill earlier. `0` = never spill (buffer the whole transaction in RAM) |
 | `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; strictly past this cap, incomplete input spills as NDJSON. `0` spills immediately. An enabled process budget spills held input before the next page regardless of this cap. Does not cap read pages or transaction output |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
@@ -490,7 +490,10 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   committed) can never double-apply a join, a leave or anything else. A catalog written before this
   (no `eid`, no `subscription`) is boot-fatal, like the pre-ADR-0002 and pre-ADR-0006 formats.
 - **Store admission decodes only catalog event zero**, the expected `storeBound`, and stops there.
-  The transport still buffers its capped page body. Library mode validates the complete catalog before readiness too. The subsequent catalog fold reads every page
+  The transport still buffers its capped page body. Public library constructors `Engine::new` and
+  `Engine::new_with_config` are async and return `Result<Engine>`: the complete catalog must validate
+  before an engine or its background tasks exist. `boot_library` uses the same path; cancellation
+  during validation releases page credit and starts no engine work. The catalog fold reads every page
   once and rejects duplicate or reordered bindings before event-id de-duplication, including a
   repeated binding with the same `eid`. No shapes restore from an invalid catalog.
 
@@ -678,16 +681,22 @@ stream storage no longer has.
 
 ### Process byte admission
 
-`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` admits transient byte owners across all sources. The
-unset default is 60% of the readable finite cgroup limit (v1 unlimited sentinels are excluded).
-Without either an explicit setting or a limit, boot logs once that admission is disabled.
-Waiters are FIFO and cancellation removes the waiter; a request above the entire budget runs
-only when no other positive reservation is held. An explicit zero therefore serializes all
-positive requests. Reservations are capacity/byte estimates, not an RSS ceiling.
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` enables transient byte admission across all sources only
+when set to a positive byte count. Unset or `0` disables admission with one boot log, regardless
+of cgroup limits. The budget accounts only transient input, so the default stays off until a
+profiled boot peak shows which stage needs bounding. Memory snapshot logs still read cgroup
+counters. Held spill (its own default 64 MiB cap) and ingest spill remain independent of admission.
+When enabled, waiters are FIFO and cancellation removes the waiter; a request above the entire
+budget runs only when no other positive reservation is held. Reservations are capacity/byte
+estimates, not an RSS ceiling.
+
+The following reservation lifetimes apply when admission is enabled.
 
 Sequencer and catalog reads reserve their current response-body cap before accumulating a body;
 non-live HTTP reads acquire before send. Idle long-polls reserve nothing until data headers arrive,
-then discard/re-issue at the same offset after admission so the wait cannot expire the HTTP body. Catalog visits retain the permit through
+and use the first response when admission is immediate. Only an admission wait discards/re-issues
+at the same offset with a fresh deadline. Ordinary commands keep the sequencer read and its FIFO
+place alive; explicit pause/shutdown cancels it. Catalog visits retain the permit through
 decoding and folding. Sequencer input keeps its page owner until consumed or spilled. With admission
 enabled, incomplete input spills before the next page; a page containing a receipt or continuing a
 held transaction spills its remaining input before processing, so query-backs and spill readers can
@@ -696,8 +705,10 @@ credits through blocking I/O even when their async caller is cancelled.
 
 Ingest bounds its initial cap-plus-append reservation to one quarter of the process budget (at least
 one byte), leaving capacity for page readers under small budgets. Drain workspace uses buffered bytes
-up to the append cap, plus one envelope; larger input/drain requests reserve their actual workspace. A capped buffer spills before waiting for a larger reservation,
-and releases its credits before schema callbacks can wait for a backfill's pool slot.
+up to the append cap, plus one envelope. After schema callbacks, admission restores the initial
+floor. Larger requests grow in place only when immediately available with no queued peer; fitting
+under-cap commits do not spill. Otherwise a capped buffer spills before waiting for a larger
+reservation, and releases its credits before schema callbacks can wait for a backfill's pool slot.
 `TXN_MEMORY_BYTES=0` still never spills: its unbounded retained rows are outside the ledger, while
 input/drain workspace takes ordinary FIFO permits. Waiting cannot acknowledge PostgreSQL;
 acknowledgement still follows the last durable chunk.

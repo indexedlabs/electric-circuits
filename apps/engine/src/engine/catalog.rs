@@ -910,6 +910,9 @@ type Restored = (
 pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
     ingest_columns: std::collections::BTreeMap<TableRef, Vec<String>>,
+    // Historical names distinguish a dropped configured column from a typo even after a
+    // later witness records the narrower effective set. Derived from existing events only.
+    ingest_columns_seen: std::collections::BTreeMap<TableRef, HashSet<String>>,
     /// Shapes whose `Dropped` intent is in the log with no `Retired` completion after it: shape id →
     /// stream path. These are streams the engine promised to remove and did not — the boot hands
     /// them to the retirement queue (see [`Engine::apply_catalog`]).
@@ -961,6 +964,7 @@ impl Default for CatalogFold {
         CatalogFold {
             recs: HashMap::new(),
             ingest_columns: std::collections::BTreeMap::new(),
+            ingest_columns_seen: std::collections::BTreeMap::new(),
             pending_retire: HashMap::new(),
             max_shape_id: None,
             start_pos: LogPosition::start(),
@@ -1073,6 +1077,7 @@ impl CatalogFold {
             // and the boot's own introspection is the authority on the schema.
             CatalogEvent::SchemaChanged { .. } => {}
             CatalogEvent::IngestColumns { table, columns, .. } => {
+                self.ingest_columns_seen.entry(table.clone()).or_default().extend(columns.iter().cloned());
                 self.ingest_columns.insert(table, columns);
             }
             CatalogEvent::SourceDrained(receipt) => {
@@ -1218,13 +1223,38 @@ impl Engine {
         Ok(retire)
     }
 
-    /// Read the durable shape catalog and fold it. Only the completed read's byte gauge is updated;
-    /// no restored state is installed — see [`Self::apply_catalog`] for that half.
+    /// Read and fold the durable catalog, recording its byte count and projection history.
+    /// No shapes are installed — see [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
+        let (fold, bytes) = Self::read_catalog(&self.ds, self.store_bound.get()).await?;
+        // Retained history is bounded by the configured names, not catalog length/DDL count.
+        let seen = self
+            .pg_columns
+            .iter()
+            .map(|(table, columns)| {
+                let names = columns
+                    .iter()
+                    .filter(|name| fold.ingest_columns_seen.get(table).is_some_and(|seen| seen.contains(*name)))
+                    .cloned()
+                    .collect();
+                (table.clone(), names)
+            })
+            .collect();
+        *self.pg_columns_seen.write().unwrap() = seen;
+        self.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
+        Ok(fold)
+    }
+
+    // Validate before constructing a library engine: no background task or control surface
+    // exists if this read fails or the constructor future is cancelled.
+    pub(super) async fn read_catalog(
+        ds: &DsClient,
+        expected: Option<&crate::store_identity::StoreBound>,
+    ) -> Result<(CatalogFold, u64)> {
         let mut fold = CatalogFold::default();
-        let mut binding = self.store_bound.get().map(StoreBindingCheck::new);
+        let mut binding = expected.map(StoreBindingCheck::new);
         let mut fold_result = Ok(());
-        let bytes = visit_catalog_pages(&self.ds, |page| {
+        let bytes = visit_catalog_pages(ds, |page| {
             if let Some(binding) = &mut binding {
                 binding.observe_page(&page);
                 if binding.result.is_err() {
@@ -1293,9 +1323,8 @@ impl Engine {
             binding.finish()?;
         }
         fold_result?;
-        self.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
         tracing::info!(catalog_bytes = bytes, "catalog read complete");
-        Ok(fold)
+        Ok((fold, bytes))
     }
 
     /// Complete projection changes before any old shape can be installed or ingest can start.
@@ -1317,8 +1346,8 @@ impl Engine {
                 None if !self.pg_columns.contains_key(table) => false,
                 None => ts.ingest_full_columns != current,
             };
-            if differs {
-                changed.insert(table.clone(), current);
+            if differs || (self.pg_columns.contains_key(table) && !fold.ingest_columns.contains_key(table)) {
+                changed.insert(table.clone(), (current, differs));
             }
         }
         if changed.is_empty() {
@@ -1330,17 +1359,19 @@ impl Engine {
             self.retire_shape_stream_wait(&id, &path).await?;
             fold.pending_retire.remove(&id);
         }
-        for (table, columns) in changed {
+        for (table, (columns, differs)) in changed {
             let mut affected: Vec<_> = fold
                 .recs
                 .iter()
                 .filter(|(_, (rec, ..))| {
-                    rec.table == table || rec.where_json.as_ref().is_some_and(|w| referenced_tables(w).contains(&table))
+                    differs
+                        && (rec.table == table
+                            || rec.where_json.as_ref().is_some_and(|w| referenced_tables(w).contains(&table)))
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
             affected.sort();
-            tracing::info!(%table, shapes = affected.len(), columns = columns.len(), "ingest column set changed; retiring dependent streams");
+            tracing::info!(%table, shapes = affected.len(), columns = columns.len(), "recording ingest column set after dependent retirements");
             for id in affected {
                 let path = fold.recs[&id].0.stream_path.clone();
                 self.catalog_tx.send_durable(CatalogEvent::Dropped { id: id.clone() }).await?;
@@ -1351,6 +1382,7 @@ impl Engine {
             self.catalog_tx
                 .send_durable(CatalogEvent::IngestColumns { table: table.clone(), columns: columns.clone(), hash })
                 .await?;
+            self.remember_ingest_columns(&table, &columns);
             fold.ingest_columns.insert(table, columns);
         }
         Ok(())
@@ -2452,6 +2484,93 @@ mod tests {
             }
         }
         assert!(accepted.is_empty(), "library boot accepted invalid catalogs: {accepted:?}");
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_library_setting_warns_and_is_ignored() {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Capture(Arc::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
+        store.pages_by_offset.lock().unwrap().insert("-1".into(), ("tail".into(), true, format!("[{bound}]")));
+        let ds = DsClient::with_test_store("scripted://library-warning".into(), store);
+        let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
+        let config = crate::config::Config::resolve(|key| {
+            (key == "ELECTRIC_CIRCUITS_PG_COLUMNS").then(|| "public.users:id".into())
+        })
+        .unwrap();
+        let engine = Engine::new_with_config(admission, None, PostgresSetup::EngineManaged, &config).await.unwrap();
+        assert_eq!(engine.readiness_status(), "active", "valid catalog permits library readiness");
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("ELECTRIC_CIRCUITS_PG_COLUMNS") && logs.contains("ignored") && logs.contains("library"),
+            "library mode must warn that its ingest setting is ignored: {logs}"
+        );
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
+    async fn library_public_constructors_validate_the_entire_binding_history() {
+        let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
+        let mut other = expected_store_bound();
+        other.query_generation = "other-query".into();
+        let conflicting = catalog_event("conflict", CatalogEvent::StoreBound(other));
+        let config = crate::config::Config::resolve(|_| None).unwrap();
+        let mut accepted = Vec::new();
+        for configured in [false, true] {
+            for (name, tail) in [
+                ("duplicate eid", bound.to_string()),
+                ("conflicting binding", conflicting.to_string()),
+                ("malformed tail", "invalid JSON".into()),
+            ] {
+                let store = Arc::new(crate::ds::ScriptedStore::default());
+                store
+                    .pages_by_offset
+                    .lock()
+                    .unwrap()
+                    .insert("-1".into(), ("tail".into(), true, format!("[{bound}, {tail}]")));
+                let ds = DsClient::with_test_store("scripted://library-public".into(), store.clone());
+                let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
+                let result: Result<Engine> = if configured {
+                    Engine::new_with_config(admission, None, PostgresSetup::EngineManaged, &config).await
+                } else {
+                    Engine::new(admission).await
+                };
+                if let Ok(engine) = result {
+                    accepted.push((configured, name, engine.readiness_status()));
+                    engine.close(OTTO_5492_DEADLINE).await;
+                }
+                assert!(store.appended.lock().unwrap().is_empty(), "refusal must not append storage");
+                assert!(
+                    store
+                        .operations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|op| !op.starts_with("create:") && !op.starts_with("delete:")),
+                    "refusal must not mutate streams"
+                );
+            }
+        }
+        assert!(accepted.is_empty(), "public constructors exposed unvalidated libraries: {accepted:?}");
     }
 
     #[tokio::test]

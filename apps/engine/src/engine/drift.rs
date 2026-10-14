@@ -327,15 +327,14 @@ impl Engine {
 
             // Retire, THEN swap. Never the other way round.
             let retired = self.retire_dependents(table, "schema drift").await;
-            if !self.pg_columns.contains_key(table) {
-                // A new full-width witness must follow completion of this table's retirements.
-                for id in retired {
-                    let barrier = self.purge_barriers.lock().unwrap().get(&id).cloned();
-                    if let Some(barrier) = barrier
-                        && let Err(error) = barrier.wait().await
-                    {
-                        return self.unresolved(table, &format!("schema retirement failed: {error:#}")).await;
-                    }
+            // A changed effective projection (including a dropped listed column) must be
+            // witnessed only after completion, before any post-DDL shape can be admitted.
+            for id in retired {
+                let barrier = self.purge_barriers.lock().unwrap().get(&id).cloned();
+                if let Some(barrier) = barrier
+                    && let Err(error) = barrier.wait().await
+                {
+                    return self.unresolved(table, &format!("schema retirement failed: {error:#}")).await;
                 }
             }
         } else if was_unresolved {
@@ -551,13 +550,14 @@ impl Engine {
                 .tables
                 .get(table)
                 .is_some_and(|old| old.columns.iter().map(|(name, _)| name).ne(columns.iter()));
-            if changed && !self.pg_columns.contains_key(table) {
+            if changed {
                 // Drift completed dependent retirements before this install. Persist the
-                // full-width witness before admitting post-DDL creates.
+                // effective-width witness before admitting post-DDL creates.
                 let hash = super::catalog::ingest_columns_hash(&columns)?;
                 self.catalog_tx
-                    .send_durable(CatalogEvent::IngestColumns { table: table.clone(), columns, hash })
+                    .send_durable(CatalogEvent::IngestColumns { table: table.clone(), columns: columns.clone(), hash })
                     .await?;
+                self.remember_ingest_columns(table, &columns);
             }
         }
         let mut st = self.state.lock().await;
@@ -718,6 +718,44 @@ mod tests {
     /// catalog turned out to be unchanged. Without that, a table parked by a transient Postgres
     /// failure at a stale-`Relation` trigger could never come back: every retry would find the
     /// catalog equal to the compiled schema, change nothing, and leave it parked forever.
+    #[tokio::test]
+    async fn ingest_projection_configured_drop_records_runtime_witness() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let config = crate::config::Config::resolve(|key| {
+            (key == "ELECTRIC_CIRCUITS_PG_COLUMNS").then(|| "public.items:id,name".into())
+        })
+        .unwrap();
+        let engine = Engine::new_inner(
+            DsClient::with_test_store("scripted://configured-drift".into(), store.clone()),
+            None,
+            None,
+            PostgresSetup::EngineManaged,
+            Some(&config),
+            None,
+        );
+        let table: TableRef = "public.items".into();
+        let before = serde_json::from_value(serde_json::json!({
+            "columns":{"id":{"type":"int"},"name":{"type":"text"}},"primaryKey":"id"}))
+        .unwrap();
+        let after = serde_json::from_value(serde_json::json!({
+            "columns":{"id":{"type":"int"}},"primaryKey":"id"}))
+        .unwrap();
+        engine.state.lock().await.tables.insert(table.clone(), TableSchema::from_def(&table, &before).unwrap());
+        engine.swap_table_schema(&table, Some(TableSchema::from_def(&table, &after).unwrap())).await.unwrap();
+        let writes: Vec<serde_json::Value> = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+            .collect();
+        assert!(
+            writes.iter().any(|e| e["t"] == "ingestColumns" && e["columns"] == serde_json::json!(["id"])),
+            "a runtime drop must record its narrowed set before post-DDL shapes can be created"
+        );
+        engine.close(std::time::Duration::from_secs(5)).await;
+    }
+
     #[tokio::test]
     async fn ingest_projection_unconfigured_drift_refreshes_the_catalog_witness() {
         let store = Arc::new(crate::ds::ScriptedStore::default());

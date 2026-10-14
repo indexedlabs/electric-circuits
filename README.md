@@ -89,10 +89,16 @@ restart and retires dependent streams so clients recreate from fresh snapshots; 
 columns or predicates return 400. See [configuration](docs/deployment-postgres.md).
 
 Transient ingest, sequencing, catalog, backfill frames and Electric snapshot pages share process byte
-admission through `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` (default: 60% of a readable cgroup limit).
+admission when `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` is set to a positive byte count. Admission is
+off by default (unset or `0`), regardless of cgroup limits. It accounts only transient input, so the
+default stays off until a profiled boot peak shows which stage needs bounding. Cgroup counters remain
+in memory snapshot logs; held and ingest spill caps apply independently of admission.
 See [the transient memory budgets](docs/memory-model.md#6-transient-operation-budgets) for reservation
-lifetimes, spill behavior and the retained state outside this budget. Initial ingest reservations
+lifetimes, spill behavior and the retained state outside this budget. When enabled, initial ingest reservations
 are capped relative to that budget so small transactions can share capacity with page readers.
+An under-cap transaction grows its reservation without spilling when capacity is immediately
+available; it releases credit before any admission wait. Sequencer reads retain their FIFO place
+across commands, and immediately admitted live pages need only one request.
 
 ## The system
 

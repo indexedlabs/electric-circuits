@@ -12,7 +12,7 @@
 //!
 //! | Setting | Default | Meaning |
 //! | --- | --- | --- |
-//! | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | 60% of a finite readable cgroup limit | Shared process byte admission; unset with no limit disables it and logs once. `0` admits positive requests exclusively. |
+//! | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in shared transient byte admission: a positive value enables it; unset or `0` disables it and logs once, regardless of cgroup limits. |
 //!
 //! Configuration clones share one lazily initialized budget, including supervised sources.
 //! Reservations cover transient inputs, not retained fold maps, decoded backfill rows, allocator
@@ -89,9 +89,10 @@ pub struct Config {
     /// are dropped with a warning rather than crashing the boot.
     pub tables: Vec<TableSelector>,
     /// Static per-table ingest projection (`ELECTRIC_CIRCUITS_PG_COLUMNS`):
-    /// `schema.table:col,col;schema.table:col`. Missing tables keep all columns. Lists are sorted
-    /// and deduplicated; boot introspection rejects untracked tables, unknown columns and missing
-    /// primary-key columns. A changed set retires dependent shapes before ingest starts.
+    /// `schema.table:col,col;schema.table:col` (optional trailing `;`). Missing tables keep all
+    /// columns; library mode warns and ignores this setting. Lists are sorted and deduplicated.
+    /// Boot rejects untracked tables, never-witnessed unknown columns and missing primary keys;
+    /// witnessed columns dropped by DDL are omitted with a warning. Changed sets retire dependents.
     pub pg_columns: std::collections::BTreeMap<crate::table_ref::TableRef, Vec<String>>,
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
     /// delivery); still parsed so existing `ELECTRIC_CIRCUITS_PG_POLL_MS` settings are accepted.
@@ -451,7 +452,7 @@ impl Config {
         let mut pg_columns = std::collections::BTreeMap::new();
         let raw_columns = g("ELECTRIC_CIRCUITS_PG_COLUMNS").unwrap_or_default();
         if !raw_columns.trim().is_empty() {
-            for entry in raw_columns.split(';') {
+            for entry in raw_columns.trim().strip_suffix(';').unwrap_or(raw_columns.trim()).split(';') {
                 let (table, columns) = entry
                     .trim()
                     .split_once(':')
@@ -1409,6 +1410,14 @@ mod tests {
             let result = try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", raw)]);
             assert!(result.is_err(), "invalid ingest column setting must refuse boot: {raw}");
         }
+    }
+
+    #[test]
+    fn ingest_projection_accepts_a_trailing_separator() {
+        let result = try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", "public.users:id,name; ")]);
+        assert!(result.is_ok(), "a trailing semicolon must be accepted: {result:?}");
+        assert_eq!(result.unwrap().pg_columns[&"public.users".into()], ["id", "name"]);
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", "public.users:id;;other.users:id")]).is_err());
     }
 
     #[test]

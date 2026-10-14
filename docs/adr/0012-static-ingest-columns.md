@@ -11,10 +11,13 @@ values for unchanged rows. Physical schema fingerprints cannot distinguish that 
 ## Decision
 
 `ELECTRIC_CIRCUITS_PG_COLUMNS` lists qualified tables and column names:
-`schema.table:col,col;schema.table:col`. A missing table entry means all compiled columns, including stored generated columns absent from pgoutput. Boot
-rejects untracked tables, unknown columns and lists missing any primary-key component before
+`schema.table:col,col;schema.table:col` (a trailing semicolon is accepted). Library mode logs a
+warning that the setting is ignored. A missing table entry means all compiled columns, including
+stored generated columns absent from pgoutput. Boot rejects untracked tables, unknown columns
+never recorded in a witness, and lists missing any primary-key component before
 slot/publication/replica-identity mutations. Each supervised source receives entries for its own
-tracked tables; entries tracked by no source refuse startup. Schema preflight reads take a
+tracked tables; entries tracked by no source refuse startup. After startup, such entries are ignored
+with a warning so source removals and other reconciliation actions still apply. Schema preflight reads take a
 backfill-sized budget permit per configured table. The compiled
 engine schema is projected while its physical `SchemaFingerprint` remains intact. Drift refreshes
 reapply the setting. Replication removes unlisted new/old cells before buffering; snapshot and
@@ -38,12 +41,18 @@ set with its last recorded one. Any difference (widening, narrowing or removing 
 retires every dependent shape, including shapes whose subquery reads the table. The existing
 retirement path writes durable `Dropped`, closes/deletes the stream, then writes durable `Retired`.
 Only after completion does boot write the new `ingestColumns` event durably. Outstanding retirement
-intents recovered from the catalog must complete before this witness too. Unchanged sets do nothing.
+intents recovered from the catalog must complete before this witness too. Unchanged recorded sets do nothing.
+An explicit list without a witness always records one, even if it names every current column;
+that case preserves shapes and prevents a later unlisted ADD COLUMN from appearing to change projection.
 After an epoch reset, boot still records changed sets before starting the replacement ingestor.
 Legacy comparison uses the unprojected compiled schema, including unpublished stored generated
-columns. Runtime drift on an unprojected table writes its current full-width witness after dependent
-retirements and before schema installation; post-DDL shapes then retain their streams at restart.
-These corrections use the existing event format.
+columns. Catalog validation precedes projection preflight: a missing configured column that appears
+in a prior witness was dropped by DDL, so compilation omits it and warns with its table and name.
+A missing name never witnessed remains a fatal typo. Historical names are derived from existing
+events; retained engine history is bounded by configured names. This distinction survives the next
+witness narrowing the effective set. Runtime drift writes any changed effective set after dependent
+retirements and before schema installation, including dropping listed columns; post-DDL shapes then
+retain their streams at restart. No event format changes are needed.
 
 ## Consequences
 
@@ -59,5 +68,9 @@ These corrections use the existing event format.
   arrangements and result state remain outside the transient byte ledger.
 - PostgreSQL still publishes full rows and supplies full wire tuples. This is engine-side projection,
   not publication column-list support. Unlisted data may remain in old log segments until retention.
+- External change-log consumers (ADR-0010) receive the projected new **and** old rows too. A column-set
+  change at restart is not signalled to pinned consumers, and their pins are not evicted. Consumers
+  can encounter mixed-width envelopes across that boundary and must coordinate column settings
+  with the deployment; shape retirement does not provide a consumer reset signal.
 - A binary predating this event cannot enforce projection provenance. Rolling back to such a binary
   against a projected catalog is unsupported; use an isolated fresh namespace and fresh shapes.

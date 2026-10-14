@@ -878,9 +878,19 @@ impl HttpDurableStreamsStore {
                     )
                     .await);
             }
-            // Do not retain a timed response during admission. The positioned non-live retry
-            // reads the same bytes after credits arrive, with a fresh request deadline.
+            // Use the response directly when admission is immediate. Keep this exact FIFO
+            // future if it waits; only then discard the timed response and re-read its offset.
+            use std::future::Future;
+            let admission = budget.expect("enabled budget checked above").acquire(limit);
+            tokio::pin!(admission);
+            let first_poll = std::future::poll_fn(|cx| std::task::Poll::Ready(admission.as_mut().poll(cx))).await;
+            if let std::task::Poll::Ready(permit) = first_poll {
+                return Ok(self.response_budgeted(res, BodyRead::OnData, Some(path), permit, limit).await);
+            }
             drop(res);
+            let permit = admission.await;
+            let res = send(false).await?;
+            return Ok(self.response_budgeted(res, BodyRead::OnData, Some(path), permit, limit).await);
         }
         let permit = match budget {
             Some(budget) => budget.acquire(limit).await,
@@ -2182,6 +2192,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_budget_free_http_live_read_does_not_reissue() {
+        let store = HttpDurableStreamsStore::new_in_process("http://unused".into());
+        let budget = crate::memory_budget::MemoryBudget::new(Some(100));
+        let mut calls = Vec::new();
+        let response = store
+            .read_with_admission("changes/0", true, Some(&budget), 100, |live| {
+                calls.push(live);
+                async { Ok(reqwest::Response::from(axum::http::Response::new(reqwest::Body::from("[]")))) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(calls, [true], "an immediately admitted live page must use its first response");
+        assert_eq!(budget.held.load(std::sync::atomic::Ordering::Relaxed), 100);
+        assert_eq!(response.body.as_ref().unwrap().as_ref().unwrap(), "[]");
+        drop(response);
+        assert_eq!(budget.held.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
     async fn memory_budget_idle_long_poll_takes_no_body_reservation() {
         use std::future::Future;
         let config =
@@ -2289,8 +2318,11 @@ mod tests {
             })
         }
 
-        fn ensure<'a>(&'a self, _path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
-            Box::pin(async { Ok(response(201)) })
+        fn ensure<'a>(&'a self, path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
+            Box::pin(async move {
+                self.operations.lock().unwrap().push(format!("create:{path}"));
+                Ok(response(201))
+            })
         }
 
         fn append<'a>(

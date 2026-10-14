@@ -33,25 +33,19 @@ impl MemoryBudgetConfig {
     pub(crate) fn budget(&self) -> Arc<MemoryBudget> {
         self.resolved
             .get_or_init(|| {
-                let cgroup = crate::mem::cgroup_memory();
-                let limit = effective_limit(self.explicit, cgroup.version, cgroup.max_bytes);
+                let limit = self.explicit.filter(|bytes| *bytes > 0);
                 match limit {
                     Some(bytes) => tracing::info!(bytes, "process memory budget enabled"),
                     None => {
-                        tracing::info!("process memory budget disabled: no explicit setting or readable cgroup limit")
+                        tracing::info!(
+                            "process memory budget disabled: ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES is unset or zero"
+                        )
                     }
                 }
                 MemoryBudget::new(limit)
             })
             .clone()
     }
-}
-
-fn effective_limit(explicit: Option<u64>, version: Option<&str>, cgroup: Option<u64>) -> Option<u64> {
-    explicit.or_else(|| {
-        // Linux v1's page-rounded LONG_MAX is an unlimited sentinel, not a finite limit.
-        cgroup.filter(|v| version != Some("v1") || *v < (1u64 << 60)).map(|v| ((v as u128 * 3) / 5) as u64)
-    })
 }
 
 #[derive(Debug, Default)]
@@ -151,6 +145,24 @@ impl Permit {
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Grow without waiting or bypassing queued owners. A caller that cannot grow must release
+    /// its current ownership (spilling retained data when needed) before async admission.
+    pub fn try_grow(&mut self, bytes: u64) -> bool {
+        if bytes <= self.bytes {
+            return true;
+        }
+        let Some(budget) = &self.budget else { return false };
+        let mut state = budget.state.lock().unwrap();
+        let others = state.used - self.bytes;
+        if !state.queue.is_empty() || !budget.fits(others, bytes) {
+            return false;
+        }
+        state.used = others + bytes;
+        self.bytes = bytes;
+        budget.held.store(state.used, Ordering::Relaxed);
+        true
+    }
 }
 impl Drop for Permit {
     fn drop(&mut self) {
@@ -236,14 +248,47 @@ mod tests {
     }
 
     #[test]
-    fn memory_budget_resolution_obeys_override_finite_cgroup_and_missing_limit() {
-        assert_eq!(effective_limit(None, Some("v2"), Some(100)), Some(60));
-        assert_eq!(effective_limit(None, Some("v1"), Some(101)), Some(60));
-        assert_eq!(effective_limit(None, Some("v2"), None), None);
-        assert_eq!(effective_limit(None, Some("v1"), Some(9223372036854771712)), None);
-        assert_eq!(effective_limit(Some(7), Some("v1"), Some(u64::MAX)), Some(7));
-        assert_eq!(effective_limit(Some(0), Some("v2"), Some(100)), Some(0));
-        assert_eq!(effective_limit(None, Some("v2"), Some(u64::MAX)), Some(11068046444225730969));
+    fn memory_budget_opt_in_unset_ignores_readable_finite_cgroup() {
+        for version in ["v1", "v2"] {
+            let memory = crate::mem::CgroupMemory {
+                version: Some(version),
+                current_bytes: Some(20),
+                max_bytes: Some(100),
+                ..Default::default()
+            };
+            crate::mem::cgroup_fixture::with(memory, || {
+                assert_eq!(crate::mem::cgroup_memory(), memory);
+                let budget = MemoryBudgetConfig::resolve(None).unwrap().budget();
+                assert!(!budget.enabled(), "unset memory budget must stay disabled with a finite {version} limit");
+                assert_eq!(budget.limit(), 0);
+                assert_eq!(crate::mem::cgroup_memory(), memory, "snapshot counters must remain available");
+            });
+        }
+    }
+
+    #[test]
+    fn memory_budget_opt_in_zero_disables_admission() {
+        let budget = MemoryBudgetConfig::resolve(Some("0".into())).unwrap().budget();
+        assert!(!budget.enabled(), "only a positive explicit value enables admission");
+        assert_eq!(budget.limit(), 0);
+    }
+
+    #[test]
+    fn memory_budget_opt_in_positive_value_enables_exact_limit() {
+        for version in [None, Some("v1"), Some("v2")] {
+            let memory = crate::mem::CgroupMemory { version, max_bytes: Some(100), ..Default::default() };
+            crate::mem::cgroup_fixture::with(memory, || {
+                for bytes in [1, 128, u64::MAX] {
+                    let budget = MemoryBudgetConfig::resolve(Some(bytes.to_string())).unwrap().budget();
+                    assert!(budget.enabled());
+                    assert_eq!(budget.limit(), bytes);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn memory_budget_resolution_validates_input_and_shares_one_ledger() {
         for bad in ["-1", "128MiB", "wat", "18446744073709551616"] {
             assert!(MemoryBudgetConfig::resolve(Some(bad.into())).is_err(), "{bad}");
         }

@@ -93,6 +93,10 @@ unreachable, it retries with backoff. A table-mode poll reads only the one versi
 revision means no other control-table query. A changed revision or explicit refresh fetches all
 rows. File mode rereads its file on each poll and refresh.
 
+`ELECTRIC_CIRCUITS_PG_COLUMNS` entries tracked by no source refuse startup. After the first accepted
+snapshot, unused entries are ignored with a warning. Removing the last source for a projected table
+still stops it and removes its status/routing; later polls do not retry removed rows.
+
 Reconciliation is idempotent:
 
 - a new row starts one source;

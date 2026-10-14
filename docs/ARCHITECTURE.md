@@ -212,30 +212,39 @@ full published schema. pgoutput decoding drops unlisted cells from both images b
 buffering/spilling/appending; it still receives full wire tuples. Backfill and query-back row SQL
 selects only the compiled columns, and unavailable output/predicate columns (including nested inner
 predicates) are HTTP 400 errors naming table and column. All PK columns are mandatory. Drift
-re-introspection reapplies the configured set. Boot validates column names and PK membership before
-entering the epoch or mutating slots/publications/identity; these schema preflight reads take one
+re-introspection reapplies the configured set. After reading catalog witnesses, boot validates column
+names and PK membership before entering the epoch or mutating slots/publications/identity; these schema preflight reads take one
 backfill-sized permit per configured table. Supervised sources receive only their tracked entries;
-an entry tracked by no source is a fatal startup configuration error.
+an entry tracked by no source is a fatal startup configuration error. After startup, unused entries
+warn and are ignored, allowing removals and other plan actions to proceed. A trailing semicolon is
+accepted; library mode warns that the setting is ignored.
 
 The additive catalog event `ingestColumns { table, columns, hash }` records sorted effective names
 and their SHA-256; absent records mean all columns. Before dormant restore and ingest, boot retires
 every shape over a changed table, including subquery dependencies, awaiting durable `Dropped`,
 close/delete and durable `Retired` before appending the new set durably. A crash repeats unfinished
-retirements. Unchanged sets do nothing; legacy catalogs compare against the full compiled column
-set (including stored generated columns omitted from pgoutput), and need no migration. Runtime DDL
-on an unprojected table refreshes the full-width witness after dependent retirements and before
-installing the new schema, so post-DDL shapes survive an unchanged restart. Clients recreate retired
+retirements. Unchanged recorded sets do nothing; an explicit setting without a witness records one
+even when it names every current column, without retiring shapes in that case. Legacy comparison
+uses the full compiled column set, including stored generated columns omitted from pgoutput. A
+listed column absent after DDL is omitted with a warning when an existing witness recorded it; an
+absent name never witnessed is a fatal typo. Historical names are derived from existing events and
+retained only for configured names. Runtime DDL refreshes any changed effective-width witness after
+dependent retirements and before installing the new schema, so post-DDL shapes survive restart. Clients recreate retired
 streams and backfill newly included columns. Existing `SchemaChanged` and shape output lists keep
 their meanings. Catalog body reads use the shared page permits; projection reconciliation holds no
 permit while waiting for retirement. See [ADR-0012](adr/0012-static-ingest-columns.md).
 
 The process byte ledger (`memory_budget.rs`) is shared by all supervised sources. Its setting,
-`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, defaults to 60% of a readable finite cgroup limit; absent
-both, admission is disabled with one boot log. FIFO byte requests wait for capacity. An oversized
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, enables admission only at a positive byte count. Unset or
+`0` disables admission with one boot log, regardless of cgroup limits. It accounts only transient
+input, so the default stays off until a profiled boot peak shows which stage needs bounding.
+Cgroup counters remain in memory snapshot logs. Held spill (its own default 64 MiB cap) and ingest
+spill apply independently of admission. When enabled, FIFO byte requests wait for capacity. An oversized
 request requires no other owner; cancellation releases queued requests and owned credits.
-Non-live DS reads acquire before sending HTTP requests. Long-polls wait for data without credits,
-then discard that response and re-issue a non-live read at the same offset after admission; budget
-waits therefore cannot consume a request's body deadline.
+With admission enabled, non-live DS reads acquire before sending HTTP requests. Long-polls wait for data without credits,
+then consume that response if admission is immediate. Only an admission wait discards it and
+re-issues a non-live read at the same offset with a fresh deadline. The sequencer retains that
+read/admission across ordinary commands; explicit pause and shutdown cancel it.
 
 Catalog page credit lasts through the page visitor; sequencer body credit lasts through consumption
 or spill, including awaited blocking jobs. With admission enabled, every held run spills before the
@@ -245,7 +254,10 @@ Bounded spill-reader credit is released before the receipt can wait for a query-
 
 Ingest bounds its initial cap-plus-workspace reservation to one quarter of the process budget
 (at least one byte). Drain workspace uses actual buffered bytes up to the append cap, plus one
-envelope. It spills a capped buffer before waiting for a larger workspace or pool-dependent schema work, and never acknowledges while waiting. The
+envelope. Schema-message readmission restores the initial floor. Growth uses available capacity
+without waiting or bypassing queued peers, so fitting under-cap commits stay in memory. Otherwise
+it spills a capped buffer before larger workspace or pool-dependent schema waits, and never
+acknowledges while waiting. The
 never-spill escape hatch admits only input/drain workspace; its unbounded retained rows are unaccounted.
 Electric folds take ordinary FIFO permits for each capped DS page; backfills take one append-sized
 permit for each cursor frame. After consumption/decoding, each releases before requesting another.
@@ -945,6 +957,11 @@ later appends or estimate heap usage. The catalog remains append-only and uncomp
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
 | graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, writes a final `Offset` → catalog drains → exit 0; bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
+
+Public library constructors `Engine::new` and `Engine::new_with_config` are async and return
+`Result<Engine>`. They validate the complete catalog before creating engine tasks or exposing
+readiness/control operations; `boot_library` delegates to the same path. A failed or cancelled
+validation leaves no engine running. Postgres construction remains waiting for its boot validation.
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,

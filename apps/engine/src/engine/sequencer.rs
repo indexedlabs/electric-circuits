@@ -526,9 +526,17 @@ pub(crate) async fn sequencer_loop(
     // has to be visible rather than looking like an idle engine.
     let mut held_since: Option<std::time::Instant> = None;
     let mut held_warnings: u32 = 0;
+    // Own the positioned read across command arms. Cancelling/recreating it would abandon
+    // admission and rejoin the FIFO behind later readers during a control-plane burst.
+    let mut pending_read = None;
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
+        if pending_read.is_none() && !paused && !read_cap_failed {
+            let ds = ds.clone();
+            let (path, offset) = (read_path.clone(), read_off.clone());
+            pending_read = Some(Box::pin(async move { ds.read_budgeted(&path, &offset, true).await }));
+        }
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
@@ -645,6 +653,7 @@ pub(crate) async fn sequencer_loop(
                 }
                 Some(SequencerCmd::PauseReads { done }) => {
                     paused = true;
+                    pending_read = None;
                     let _ = done.send(());
                 }
                 Some(SequencerCmd::ResetTable { table }) => {
@@ -689,7 +698,9 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read_budgeted(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
+            res = async { pending_read.as_mut().expect("unpaused read exists").await }, if !paused && !read_cap_failed => {
+                pending_read = None;
+                match res {
                 Ok((rr, page_permit)) => {
                     // A PauseReads command may win immediately after an in-flight HTTP read returns.
                     // Discard that page before touching the cursor or checkpoint so an existing
@@ -1139,9 +1150,11 @@ pub(crate) async fn sequencer_loop(
                         back_off(&shutdown, std::time::Duration::from_millis(200)).await;
                     }
                 }
+                }
             },
         }
     }
+    drop(pending_read);
     drop(held);
     ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
     // The loop is only left on shutdown (or on the command channel closing, i.e. the engine going
@@ -2735,6 +2748,50 @@ mod held_spill_tests {
     use std::future::Future;
     use std::pin::Pin;
 
+    #[tokio::test]
+    async fn memory_budget_sequencer_command_preserves_read_fifo_position() {
+        let mut h = Harness::with_budget(u64::MAX, LogPosition::start(), None, Some(1024));
+        let budget = h.engine.ds.memory_budget().clone();
+        let owner = budget.acquire(1024).await;
+        h.store.pages_by_offset.lock().unwrap().insert("-1".into(), ("p1".into(), true, "[]".into()));
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(budget.waits.load(Ordering::Relaxed), 1, "sequencer queued first");
+        let mut peer = Box::pin(budget.acquire(1024));
+        std::future::poll_fn(|cx| {
+            assert!(peer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let (resp, ack) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::MemBytes { resp }).unwrap();
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(ack.await.unwrap(), 0, "commands remain serviceable while admission waits");
+        drop(owner);
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            h.processed.lock().unwrap().offset,
+            "p1",
+            "the first queued sequencer page must proceed before the later peer"
+        );
+        assert_eq!(budget.waits.load(Ordering::Relaxed), 2, "commands must not requeue a read");
+        drop(peer.await);
+        h.engine.shutdown.begin();
+        h.future.as_mut().await;
+        h.engine.close(Duration::from_secs(5)).await;
+    }
+
     struct Harness {
         engine: Engine,
         store: Arc<crate::ds::ScriptedStore>,
@@ -2814,7 +2871,10 @@ mod held_spill_tests {
                 .lock()
                 .unwrap()
                 .insert(from.into(), (to.into(), true, serde_json::to_string(&envelopes).unwrap()));
-            // Cancel the previous idle read so its replacement sees the newly supplied page.
+            // Explicitly pause/cancel the fixture's permanently idle read; ordinary commands
+            // preserve reads now. Resume at the same cursor with the newly supplied page.
+            let (done, _) = tokio::sync::oneshot::channel();
+            self.commands.send(SequencerCmd::PauseReads { done }).unwrap();
             let (done, _) = tokio::sync::oneshot::channel();
             self.commands.send(SequencerCmd::ResumeReads { done }).unwrap();
             std::future::poll_fn(|cx| {
@@ -3132,6 +3192,10 @@ mod held_spill_tests {
             .lock()
             .unwrap()
             .insert("p1".into(), ("p2".into(), true, serde_json::to_string(&vec![end]).unwrap()));
+        // This fixture's idle response is permanently pending; use the explicit cancellation
+        // command to expose the next page without relying on ordinary commands dropping reads.
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::PauseReads { done }).unwrap();
         let (done, _) = tokio::sync::oneshot::channel();
         h.commands.send(SequencerCmd::ResumeReads { done }).unwrap();
         tokio::time::timeout(Duration::from_secs(5), &mut h.future).await.expect("read failure must stop sequencing");

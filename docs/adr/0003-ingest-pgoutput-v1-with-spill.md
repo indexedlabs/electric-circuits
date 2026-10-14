@@ -23,8 +23,11 @@ Revisit v2 when large transactions measurably delay small ones — a latency rea
 ## Consequences
 
 Process byte admission adds a shared reservation ledger across ingest, sequencer input, boot catalog
-pages, backfills and Electric folds. `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` defaults to 60% of a finite
-readable cgroup limit; unset without a limit disables it with one boot log. Oversized requests wait
+pages, backfills and Electric folds. `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` enables admission only
+when set to a positive byte count; unset or `0` disables it with one boot log, regardless of cgroup
+limits. It accounts only transient input, so the default stays off until a profiled boot peak shows
+which stage needs bounding. Cgroup counters remain in memory snapshot logs. Held spill (its own
+default 64 MiB cap) and ingest spill apply independently of admission. Oversized requests wait
 for an empty ledger, and permit/waiter owners release on cancellation. Byte reservations are not an
 RSS ceiling: retained state, output batches, protocol buffers and allocator slack are additional.
 
@@ -37,8 +40,12 @@ the existing NDJSON format, replay pins, highwater rules and cleanup ownership.
 
 An ingestor initially reserves the smaller of its cap plus append workspace and one quarter of the
 process budget (at least one byte). Drain workspace is bounded by actual buffered bytes and the append
-cap, plus one envelope. A capped ingestor may spill earlier to release that reservation before
-waiting for a larger frame/drain workspace or pool-dependent schema work. This prevents a backfill waiting for memory while holding a pool slot from blocking the ingestor
+cap, plus one envelope. Admission after a schema message restores the original reservation floor,
+not the last wire frame's size. A larger workspace grows the existing permit only when capacity
+fits immediately and nobody is queued; it never waits while retaining credit. Otherwise a capped
+ingestor spills before waiting for a larger reservation or pool-dependent schema work. The initial
+share is not a spill threshold: an under-cap commit with available capacity stays in memory.
+This prevents a backfill waiting for memory while holding a pool slot from blocking the ingestor
 that owns the needed memory. The documented `0 = never spill` mode retains rows outside the ledger;
 its input/drain workspace uses ordinary FIFO requests, without forcing exclusivity.
 
@@ -50,8 +57,9 @@ Retained fold maps, decoded backfill rows, collected results and response conver
 like arrangement state. Snapshot SQL, xid fences, pool ownership and results are unchanged. Every fold page checks
 lifecycle/degradation before admission, after releasing the previous permit. Waiting ingest never advances applied LSN, and acknowledgement still
 follows the last durable append. Non-live DS reads acquire before HTTP send; long-polls wait for
-data without credits, discard the response, then re-read the same offset after admission with a
-fresh HTTP deadline.
+data without credits and consume that response if admission is immediate. Only a real admission
+wait discards it and re-reads the same offset with a fresh HTTP deadline. The sequencer preserves
+its pending read/admission across ordinary commands; explicit pause and shutdown cancel it.
 
 The process gauges are `engine_memory_budget_bytes` and `engine_memory_permits_held_bytes`; the
 counter is `engine_memory_permit_waits_total`. Source endpoints observe the same process totals.

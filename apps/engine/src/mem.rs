@@ -300,7 +300,33 @@ fn read_cgroup_v1() -> Option<CgroupMemory> {
 /// Read the Linux cgroup memory files. On non-Linux hosts without a mounted memory controller all
 /// fields are `None`; the sampler still reports process RSS and engine cardinalities.
 pub fn cgroup_memory() -> CgroupMemory {
+    #[cfg(test)]
+    if let Some(memory) = cgroup_fixture::MEMORY.get() {
+        return memory;
+    }
     read_cgroup_v2().or_else(read_cgroup_v1).unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) mod cgroup_fixture {
+    use super::CgroupMemory;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static MEMORY: Cell<Option<CgroupMemory>> = const { Cell::new(None) };
+    }
+
+    /// Synchronous and thread-local so parallel tests cannot change each other's probe.
+    pub(crate) fn with(memory: CgroupMemory, test: impl FnOnce()) {
+        struct Restore(Option<CgroupMemory>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MEMORY.set(self.0);
+            }
+        }
+        let _restore = Restore(MEMORY.replace(Some(memory)));
+        test();
+    }
 }
 
 fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {

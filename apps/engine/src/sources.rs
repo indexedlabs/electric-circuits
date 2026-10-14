@@ -452,9 +452,13 @@ impl SourcesSupervisor {
         if self.inner.shutdown.is_shutting_down() {
             bail!("sources reconcile interrupted by shutdown");
         }
+        let started = self.inner.state.lock().await.fetched;
         for table in self.inner.config.pg_columns.keys() {
             if !snapshot.rows.iter().any(|row| source_tracks(row, table)) {
-                return Err(UnknownProjectionTable(table.clone()).into());
+                if !started {
+                    return Err(UnknownProjectionTable(table.clone()).into());
+                }
+                tracing::warn!(%table, "ignoring ingest column setting: no current source tracks the table");
             }
         }
         let (running, failed) = {
@@ -1424,6 +1428,50 @@ mod tests {
         let result = supervisor.apply_snapshot(SourceSnapshot { revision: 1, rows: vec![] }).await;
         assert!(result.is_err(), "a projection tracked by no source must be rejected before activation");
         assert!(!supervisor.inner.state.lock().await.fetched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_poll_removes_the_last_tracking_source() -> Result<()> {
+        use tower::ServiceExt;
+        let file = std::env::temp_dir().join(format!("projection-removal-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"[]")?;
+        let mut config = file_mode_config(file.to_str().unwrap());
+        config.pg_columns.insert("public.thread_messages".into(), vec!["id".into()]);
+        let supervisor = SourcesSupervisor::new(config)?;
+        let engine = Engine::new_supervised_for_test(supervisor.inner.restart_notify.clone());
+        let row = valid_row("alpha", 1, "file:/must-not-restart");
+        {
+            let mut state = supervisor.inner.state.lock().await;
+            state.fetched = true;
+            state.last_revision = Some(1);
+            state.running.insert(
+                "alpha".into(),
+                SourceRuntime { row: row.clone(), engine: engine.clone(), router: Router::new(), worker: None },
+            );
+            // A failed row removed from the same snapshot must not be retried from the cache.
+            state.failed.insert("failed".into(), FailedSource { row, error: "previous boot".into() });
+        }
+        let result = supervisor.poll_once().await;
+        std::fs::remove_file(&file)?;
+        assert!(result.is_ok(), "runtime removal must reconcile despite unused projection: {result:?}");
+        assert!(engine.shutdown_token().is_shutting_down(), "removed source must stop");
+        assert!(supervisor.summaries().await.is_empty(), "removed sources must leave status");
+        for path in ["/sources/alpha/status", "/sources/alpha/health"] {
+            let response = supervisor
+                .router()
+                .oneshot(axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+        std::fs::write(&file, b"[]")?;
+        for _ in 0..2 {
+            supervisor.poll_once().await?;
+            assert!(supervisor.summaries().await.is_empty(), "later polls must not restart removed rows");
+        }
+        std::fs::remove_file(file)?;
+        engine.close(Duration::from_secs(1)).await;
         Ok(())
     }
 

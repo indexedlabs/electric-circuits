@@ -321,15 +321,13 @@ impl TxnBuffer {
         metrics: std::sync::Arc<crate::metrics::Metrics>,
     ) -> Result<Self> {
         let mut txn = Self::with_metrics(xid, cfg, metrics);
-        // Leave room for peer pages even when the configured caps exceed a small process
-        // budget. Growth spills/releases this owner before joining the FIFO again.
-        let bytes = txn
-            .cfg
-            .memory_bytes
-            .saturating_add(txn.cfg.append_bytes)
-            .min((txn.metrics.memory_budget.limit() / 4).max(1));
-        txn.memory_permit = txn.metrics.memory_budget.acquire(bytes).await;
+        txn.memory_permit = txn.metrics.memory_budget.acquire(txn.initial_reservation()).await;
         Ok(txn)
+    }
+
+    fn initial_reservation(&self) -> u64 {
+        // Leave room for peer pages even when configured caps exceed a small process budget.
+        self.cfg.memory_bytes.saturating_add(self.cfg.append_bytes).min((self.metrics.memory_budget.limit() / 4).max(1))
     }
 
     pub(crate) async fn reserve_input(&mut self, wire_bytes: u64) -> Result<()> {
@@ -347,10 +345,13 @@ impl TxnBuffer {
         }
         // In never-spill mode there is no finite buffer cap to reserve. Its retained rows
         // are unaccounted; input/drain workspace still uses ordinary FIFO page admission.
-        let bytes = if self.cfg.memory_bytes == 0 { workspace } else { self.mem_bytes.saturating_add(workspace) };
-        if bytes > self.memory_permit.bytes() {
+        let bytes = if self.cfg.memory_bytes == 0 { workspace } else { self.mem_bytes.saturating_add(workspace) }
+            .max(self.initial_reservation());
+        if !self.memory_permit.try_grow(bytes) {
+            // The configured transaction cap, not the last wire frame or initial share, owns
+            // spilling. Only contention forces an earlier spill: never hold bytes while waiting.
             self.release_for_schema()?;
-            self.memory_permit = self.metrics.memory_budget.acquire(workspace).await;
+            self.memory_permit = self.metrics.memory_budget.acquire(workspace.max(self.initial_reservation())).await;
         }
         Ok(())
     }
@@ -474,9 +475,9 @@ impl TxnBuffer {
             xid = self.xid,
             bytes = self.buffered_bytes,
             changes = self.count,
-            "large transaction: buffering it in memory would exceed {} bytes; spilling to {} (ADR-0003)",
-            self.cfg.memory_bytes,
-            self.spill_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            memory_cap = self.cfg.memory_bytes,
+            path = %self.spill_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            "transaction spilling at a memory-cap or admission boundary (ADR-0003)",
         );
         Ok(())
     }
@@ -851,6 +852,51 @@ mod tests {
         .await;
         assert_eq!(metrics.memory_budget.waits.load(Ordering::Relaxed), 0);
         drop((work, sequencer_page, fold_page));
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_relation_readmission_keeps_one_row_in_memory() {
+        let dir = Scratch::new("budget-relation");
+        let metrics = budget_metrics(512 * 1024 * 1024);
+        let config = TxnBufferConfig { spill_dir: dir.path().to_owned(), ..Default::default() };
+        let mut txn = TxnBuffer::admitted(11, config, metrics.clone()).await.unwrap();
+        let initial = metrics.memory_budget.held.load(Ordering::Relaxed);
+        // Begin -> Relation (callback can acquire PG/backfill credits) -> Insert -> Commit.
+        txn.reserve_input(128).await.unwrap();
+        txn.release_for_schema().unwrap();
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+        txn.reserve_input(1024).await.unwrap();
+        assert_eq!(
+            metrics.memory_budget.held.load(Ordering::Relaxed),
+            initial,
+            "schema callbacks must not shrink the next transaction reservation to a wire frame"
+        );
+        txn.push(env_of("row", 100), 1024).unwrap();
+        txn.reserve_drain().await.unwrap();
+        assert!(!txn.spilled(), "one row after Relation must stay in memory through commit");
+        assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_under_cap_commit_does_not_spill_when_growth_fits() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = Scratch::new("budget-commit");
+        let metrics = budget_metrics(512 * MIB);
+        let peer = metrics.memory_budget.acquire(64 * MIB).await;
+        let config = TxnBufferConfig { spill_dir: dir.path().to_owned(), ..Default::default() };
+        let mut txn = TxnBuffer::admitted(11, config, metrics.clone()).await.unwrap();
+        for key in ["one", "two"] {
+            txn.reserve_input(35 * MIB).await.unwrap();
+            txn.push(env_of(key, (35 * MIB) as usize), 35 * MIB).unwrap();
+        }
+        assert!(txn.buffered_bytes() < TxnBufferConfig::default().memory_bytes);
+        assert!(!txn.spilled());
+        txn.reserve_drain().await.unwrap();
+        assert!(!txn.spilled(), "commit workspace must not force an under-cap transaction to disk when credits fit");
+        assert_eq!(metrics.memory_budget.waits.load(Ordering::Relaxed), 0);
+        assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 2);
+        drop((txn, peer));
         assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
     }
 

@@ -585,6 +585,7 @@ pub struct Engine {
     txn_cfg: Arc<std::sync::Mutex<crate::txn_buffer::TxnBufferConfig>>,
     /// Deployment projection, separate from physical schema fingerprints and shape SELECT lists.
     pg_columns: Arc<std::collections::BTreeMap<TableRef, Vec<String>>>,
+    pg_columns_seen: Arc<std::sync::RwLock<std::collections::BTreeMap<TableRef, HashSet<String>>>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
@@ -1277,9 +1278,15 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
-    /// Construct a production engine only from storage admission completed before engine setup.
-    pub fn new(admission: StoreAdmission) -> Self {
-        Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None)
+    /// Construct a library engine after validating its complete catalog. Fails before engine
+    /// tasks or control surfaces exist if storage is unreadable or the catalog is invalid.
+    /// Cancellation during validation releases the current page and starts no engine work.
+    pub async fn new(admission: StoreAdmission) -> Result<Self> {
+        let (_, bytes) = Self::read_catalog(&admission.ds, Some(&admission.binding)).await?;
+        let engine =
+            Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None);
+        engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
+        Ok(engine)
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
@@ -1333,24 +1340,29 @@ impl Engine {
     /// Validate the complete catalog before exposing a library-mode engine as ready. Postgres
     /// boot performs this fold during epoch validation instead, after event-zero admission.
     pub async fn boot_library(admission: StoreAdmission, config: &crate::config::Config) -> Result<Self> {
-        let engine = Self::new_with_config(admission, None, PostgresSetup::EngineManaged, config);
-        engine.set_waiting();
-        if let Err(error) = engine.fold_catalog().await {
-            engine.close(config.shutdown_grace).await;
-            return Err(error);
-        }
-        engine.health.store(HEALTH_ACTIVE, Ordering::Relaxed);
-        Ok(engine)
+        Self::new_with_config(admission, None, PostgresSetup::EngineManaged, config).await
     }
 
-    /// Construct using the resolved per-Engine storage and pool settings.
-    pub fn new_with_config(
-        admission: StoreAdmission,
+    /// Construct using resolved storage/pool settings. Library mode validates the entire catalog
+    /// before construction; errors/cancellation start no engine work. Postgres mode remains
+    /// waiting until `setup_postgres` validates the catalog and completes boot.
+    pub async fn new_with_config(
+        mut admission: StoreAdmission,
         pg_url: Option<String>,
         setup: PostgresSetup,
         config: &crate::config::Config,
-    ) -> Self {
-        Self::new_configured(admission, pg_url, setup, config, None)
+    ) -> Result<Self> {
+        let bytes = if pg_url.is_none() {
+            admission.ds = admission.ds.with_memory_budget(config);
+            Some(Self::read_catalog(&admission.ds, Some(&admission.binding)).await?.1)
+        } else {
+            None
+        };
+        let engine = Self::new_configured(admission, pg_url, setup, config, None);
+        if let Some(bytes) = bytes {
+            engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
+        }
+        Ok(engine)
     }
 
     pub(crate) fn new_supervised(
@@ -1371,6 +1383,9 @@ impl Engine {
         restart_notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
         let postgres = pg_url.is_some();
+        if !postgres && !config.pg_columns.is_empty() {
+            tracing::warn!("ELECTRIC_CIRCUITS_PG_COLUMNS is ignored in library mode");
+        }
         let engine =
             Self::new_inner(admission.ds, pg_url, Some(admission.binding), setup, Some(config), restart_notify);
         if postgres {
@@ -1535,6 +1550,7 @@ impl Engine {
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             txn_cfg: Arc::new(std::sync::Mutex::new(crate::txn_buffer::TxnBufferConfig::default())),
             pg_columns: Arc::new(config.map(|c| c.pg_columns.clone()).unwrap_or_default()),
+            pg_columns_seen: Arc::default(),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
@@ -2318,8 +2334,30 @@ impl Engine {
     fn compile_ingest_table(&self, table: &TableRef, def: &crate::schema::TableDef) -> Result<TableSchema> {
         let full = TableSchema::from_def(table, def)?;
         match self.pg_columns.get(table) {
-            Some(columns) => full.project_ingest(columns).context("ELECTRIC_CIRCUITS_PG_COLUMNS"),
+            Some(columns) => {
+                let seen = self.pg_columns_seen.read().unwrap();
+                let columns: Vec<_> = columns.iter().filter(|column| {
+                    if !def.columns.contains_key(*column) && seen.get(table).is_some_and(|names| names.contains(*column)) {
+                        tracing::warn!(%table, %column, "configured ingest column was dropped; projecting without it");
+                        false
+                    } else {
+                        true
+                    }
+                }).cloned().collect();
+                full.project_ingest(&columns).context("ELECTRIC_CIRCUITS_PG_COLUMNS")
+            }
             None => Ok(full),
+        }
+    }
+
+    fn remember_ingest_columns(&self, table: &TableRef, columns: &[String]) {
+        if let Some(configured) = self.pg_columns.get(table) {
+            self.pg_columns_seen
+                .write()
+                .unwrap()
+                .entry(table.clone())
+                .or_default()
+                .extend(columns.iter().filter(|name| configured.contains(name)).cloned());
         }
     }
 
@@ -2390,14 +2428,6 @@ impl Engine {
         // identity or schema setup can mutate Postgres or storage. RLS is unsupported in the first
         // profile because it can make logical replication silently selective.
         crate::pg::reject_rls_tables(&client, &tables).await?;
-        // Validate the static projection before slot/publication/identity writes. Compilation
-        // uses all catalog columns regardless of generated-column publication policy; only the
-        // physical fingerprint depends on that policy and is re-read after identity setup below.
-        for table in self.pg_columns.keys() {
-            let _permit = self.metrics.memory_budget.acquire(crate::pg::backfill_config().append_bytes).await;
-            let def = crate::pg::introspect(&client, table, false).await?;
-            self.compile_ingest_table(table, &def)?;
-        }
         // --- The epoch (ADR-0004) ---
         //
         // Read the durable catalog and DECIDE before restoring anything: the epoch the catalog's
@@ -2421,6 +2451,15 @@ impl Engine {
                  silently orphan every shape already in the log). Fix durable-streams and restart.",
             )
         })?;
+        // The validated catalog supplies the history that distinguishes a dropped column from a
+        // typo. Validate projection before epoch/slot/publication/identity writes. Compilation
+        // uses all catalog columns regardless of generated-column publication policy; only the
+        // physical fingerprint depends on that policy and is re-read after identity setup below.
+        for table in self.pg_columns.keys() {
+            let _permit = self.metrics.memory_budget.acquire(crate::pg::backfill_config().append_bytes).await;
+            let def = crate::pg::introspect(&client, table, false).await?;
+            self.compile_ingest_table(table, &def)?;
+        }
         self.adopt_epoch_binding(fold.binding.clone());
         let verdict = self.verify_epoch_at_boot(&client, slot).await?;
         let restored = match boot_epoch_action(&verdict) {
@@ -2652,8 +2691,8 @@ impl Engine {
         if compiled.contains_key(crate::runtime_authority::marker_table()) {
             bail!("runtime authority marker is private and cannot be an application table");
         }
-        // Library mode has no durable catalog to fold, so the current segment is whatever this
-        // process already resolved (0 on a fresh engine) and nothing rotates it — there is no
+        // Library construction validated the catalog but does not restore its Postgres state.
+        // The current segment is whatever this process resolved (0 on a fresh engine); there is no
         // ingestor. The CURRENT segment stream is what gets created, never a bare `changes`.
         self.init_change_log(
             self.changes.state().current(),
