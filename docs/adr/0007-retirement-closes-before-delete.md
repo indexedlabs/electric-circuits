@@ -22,8 +22,10 @@ Retirement is therefore written down in two halves and retried to completion:
   create); `Retired { id }` is the durable **completion**, written only once storage accepted the
   delete (404/410 count — deletion is idempotent).
 - A failed retirement goes to a background **retirement queue** (`engine/retirement.rs`) that retries
-  it with backoff (500 ms → 5 s) until it lands. Nothing waits on the queue: the shape is gone from
-  the engine either way, and `GET /shapes/{id}` stays 404 while its stream is still being retired.
+  it with backoff (500 ms → 5 s) until it lands. Ordinary drift with unchanged effective columns
+  does not wait on the queue, so other tables keep ingesting. The shape is gone from the engine
+  either way, and `GET /shapes/{id}` stays 404 while its stream is still being retired. An effective
+  column-set transition waits for completion before its durable witness ([ADR-0012](0012-static-ingest-columns.md)).
 - Every boot enqueues each `Dropped` the catalog fold could not match with a `Retired`. That closes
   the crash window (the in-memory queue is lost at exit and costs nothing, because the intent is
   durable) and doubles as the orphan-`shape/*` GC — bounded by the catalog rather than by a storage

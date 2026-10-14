@@ -326,16 +326,8 @@ impl Engine {
             );
 
             // Retire, THEN swap. Never the other way round.
-            let retired = self.retire_dependents(table, "schema drift").await;
-            // A changed effective projection (including a dropped listed column) must be
-            // witnessed only after completion, before any post-DDL shape can be admitted.
-            for id in retired {
-                let barrier = self.purge_barriers.lock().unwrap().get(&id).cloned();
-                if let Some(barrier) = barrier
-                    && let Err(error) = barrier.wait().await
-                {
-                    return self.unresolved(table, &format!("schema retirement failed: {error:#}")).await;
-                }
+            if let Err(error) = self.retire_schema_dependents(table, &ts).await {
+                return self.unresolved(table, &format!("schema retirement failed: {error:#}")).await;
             }
         } else if was_unresolved {
             tracing::warn!("{table}: re-introspection succeeded; un-parking it");
@@ -536,6 +528,26 @@ impl Engine {
         ids
     }
 
+    /// The retirement phase of drift, called while the table's resolve lock is held.
+    async fn retire_schema_dependents(&self, table: &TableRef, ts: &TableSchema) -> Result<()> {
+        let columns_changed =
+            self.state.lock().await.tables.get(table).is_some_and(|old| {
+                old.columns.iter().map(|(name, _)| name).ne(ts.columns.iter().map(|(name, _)| name))
+            });
+        let retired = self.retire_dependents(table, "schema drift").await;
+        // Only a new ingestColumns witness requires completed retirements. Ordinary drift
+        // queues failed deletion and keeps ingest moving for the other tables (ADR-0007).
+        if columns_changed {
+            for id in retired {
+                let barrier = self.purge_barriers.lock().unwrap().get(&id).cloned();
+                if let Some(barrier) = barrier {
+                    barrier.wait().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Install (or, with `None`, remove) a table's compiled schema in **every** holder at once —
     /// the ingestor/sequencer's shared view, the engine's own registry and the subquery registry's
     /// copy — and drop the sequencer's executor for it, which is keyed by the old schema. Installing
@@ -698,6 +710,132 @@ mod tests {
     use crate::ds::DsClient;
     use crate::pg::SnapshotGate;
     use crate::schema::{Schema, compile_schema};
+
+    #[tokio::test(start_paused = true)]
+    async fn changed_projection_drift_still_waits_for_retirement() {
+        use std::{future::Future, task::Poll, time::Duration};
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://drift".into(), store.clone()));
+        let schema: Schema = serde_json::from_value(serde_json::json!({"tables": {
+            "a":{"columns":{"id":{"type":"int"},"name":{"type":"text"}},"primaryKey":"id"}
+        }}))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let a = engine.create_shape(&"a".into(), None, None, true, false).await.unwrap();
+        *store.fail_delete_path.lock().unwrap() = Some(a.stream_path.clone());
+        let ts = engine.state.lock().await.tables[&a.table].project_ingest(&["id".into()]).unwrap();
+        let mut drift = Box::pin(async {
+            let _resolve = engine.begin_resolve(&a.table).await;
+            engine.retire_schema_dependents(&a.table, &ts).await.unwrap();
+            engine.swap_table_schema(&a.table, Some(ts)).await.unwrap();
+        });
+        std::future::poll_fn(|cx| {
+            assert!(drift.as_mut().poll(cx).is_pending(), "changed columns must wait for DELETE");
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(engine.pending_retirements(), 1);
+        assert_eq!(engine.state.lock().await.tables[&a.table].columns.len(), 2, "new schema not installed early");
+        *store.fail_delete_path.lock().unwrap() = None; // storage recovers; existing retry queue owns completion
+        tokio::time::timeout(Duration::from_secs(5), drift).await.expect("retirement recovery deadline");
+        {
+            let writes = store.appended.lock().unwrap();
+            let kinds: Vec<_> = writes
+                .iter()
+                .filter(|(path, _, _)| path.ends_with("meta/catalog"))
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+                .filter_map(|e| match e["t"].as_str() {
+                    Some(t @ ("dropped" | "retired" | "ingestColumns")) => Some(t.to_string()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(kinds, ["dropped", "retired", "ingestColumns"]);
+        }
+        engine.close(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_projection_drift_does_not_block_other_table_commits() {
+        use std::{future::Future, task::Poll, time::Duration};
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://drift".into(), store.clone()));
+        let schema: Schema = serde_json::from_value(serde_json::json!({"tables": {
+            "a":{"columns":{"id":{"type":"int"}},"primaryKey":"id"},
+            "b":{"columns":{"id":{"type":"int"}},"primaryKey":"id"}
+        }}))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let a = engine.create_shape(&"a".into(), None, None, true, false).await.unwrap();
+        let b = engine.create_shape(&"b".into(), None, None, true, false).await.unwrap();
+        *store.fail_delete_path.lock().unwrap() = Some(a.stream_path.clone());
+        let ts = engine.state.lock().await.tables[&a.table].clone();
+        let _resolve = engine.begin_resolve(&a.table).await;
+        let mut retire = Box::pin(engine.retire_schema_dependents(&a.table, &ts));
+        let ready = std::future::poll_fn(|cx| Poll::Ready(retire.as_mut().poll(cx))).await;
+        assert_eq!(engine.pending_retirements(), 1, "DELETE failed and is owned by the retry queue");
+        assert!(matches!(ready, Poll::Ready(Ok(()))), "unchanged projection must continue after queueing retirement");
+        drop(retire);
+        engine.swap_table_schema(&a.table, Some(ts)).await.unwrap();
+        drop(_resolve);
+
+        // The source cannot append these later commits until its inline drift callback returns.
+        for (seq, commit) in [(1, "b-first"), (2, "b-second")] {
+            let row = crate::ds::Envelope {
+                type_: b.table.to_string(),
+                key: seq.to_string(),
+                value: Some(serde_json::json!({"id":seq})),
+                old: None,
+                headers: crate::ds::EnvelopeHeaders {
+                    operation: "insert".into(),
+                    txid: Some(seq.to_string()),
+                    lsn: Some(format!("0/{seq}0")),
+                    seq: Some(0),
+                    last: None,
+                    offset: None,
+                },
+            };
+            let mut fence = row.clone();
+            fence.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+            fence.key = commit.into();
+            fence.value = None;
+            fence.headers.seq = Some(1);
+            fence.headers.last = Some(true);
+            engine.changes.append_commit(&[row, fence]).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let changed = store.appended_changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if engine.source_drain_receipt(commit).is_some() {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("other table's durable source receipt must advance");
+            assert_eq!(engine.source_drain_receipt(commit).unwrap().commit_lsn, format!("0/{seq}0"));
+            assert_eq!(engine.pending_retirements(), 1, "DELETE remains unavailable");
+        }
+        {
+            let writes = store.appended.lock().unwrap();
+            let rows: Vec<crate::ds::Envelope> = writes
+                .iter()
+                .filter(|(path, _, _)| path.ends_with(&b.stream_path))
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<crate::ds::Envelope>>(body).unwrap())
+                .collect();
+            assert_eq!(rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["1", "2"]);
+            let catalog: Vec<serde_json::Value> = writes
+                .iter()
+                .filter(|(path, _, _)| path.ends_with("meta/catalog"))
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+                .collect();
+            assert!(!catalog.iter().any(|e| e["t"] == "ingestColumns" || e["t"] == "retired"));
+        }
+        engine.close(Duration::from_secs(5)).await;
+    }
 
     /// A library-mode engine with one table compiled, wired into both schema holders the way
     /// `setup_postgres` does. No durable-streams server behind it: nothing here appends.

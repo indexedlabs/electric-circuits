@@ -1526,9 +1526,14 @@ impl<'a> BackfillReader<'a> {
         let Some(stream) = self.stream.as_mut() else { return Ok(None) };
         let shutdown = &self.client.inner.shutdown;
         let memory = &shutdown.metrics().memory_budget;
-        let mut permit = tokio::select! {
-            _ = shutdown.wait() => anyhow::bail!("backfill frame interrupted by shutdown"),
-            permit = memory.acquire(self.budget) => permit,
+        // Disabled admission must not add a row-level shutdown cut to an in-flight cursor.
+        let mut permit = if memory.enabled() {
+            tokio::select! {
+                _ = shutdown.wait() => anyhow::bail!("backfill frame interrupted by shutdown"),
+                permit = memory.acquire(self.budget) => permit,
+            }
+        } else {
+            crate::memory_budget::Permit::default()
         };
         let Some(row) = stream.next().await else {
             self.stream = None;
@@ -1538,7 +1543,7 @@ impl<'a> BackfillReader<'a> {
         // The wire driver owns this frame already. Reserve before decoding its JSON and row
         // into the engine page. JSONB's payload is text plus its one-byte version prefix.
         let raw: JsonWireBytes = row.try_get(0)?;
-        if raw.0 > self.budget {
+        if memory.enabled() && raw.0 > self.budget {
             // The driver already owns this indivisible frame. Release the bounded read credit
             // before admitting its actual size for decoding; never wait with another permit.
             drop(permit);

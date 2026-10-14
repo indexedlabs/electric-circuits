@@ -2258,6 +2258,7 @@ mod tests {
         pub(crate) head_count: std::sync::atomic::AtomicUsize,
         pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_append_path: Option<String>,
+        pub(crate) fail_delete_path: std::sync::Mutex<Option<String>>,
         /// Hold a particular catalog event before committing it (crash/restart cut).
         pub(crate) catalog_event_gate: std::sync::Mutex<Option<(String, Arc<BodyGate>)>>,
         /// How many non-live reads the store accepts and then never finishes. It models a provider
@@ -2519,6 +2520,9 @@ mod tests {
         fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("delete:{path}"));
+                if self.fail_delete_path.lock().unwrap().as_deref().is_some_and(|p| path.ends_with(p)) {
+                    return Ok(response(503));
+                }
                 Ok(response(204))
             })
         }

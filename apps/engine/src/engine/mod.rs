@@ -2740,6 +2740,23 @@ impl Engine {
         // subquery state needed for a non-live page); other predicates use the compiled-form emitter.
         let where_sql = match where_.as_ref() {
             Some(p) if crate::subquery::predicate_has_subquery(p) => {
+                // Reuse the predicate compiler's column/type checks without registering any
+                // maintained nodes for this one-shot query. Every nested table is projected too.
+                struct Validate<'a>(&'a HashMap<TableRef, TableSchema>);
+                impl crate::predicate::SubqueryCollector for Validate<'_> {
+                    fn collect(
+                        &mut self,
+                        table: &TableRef,
+                        project: &str,
+                        where_: Option<&PredicateJson>,
+                    ) -> Result<crate::predicate::SubquerySig> {
+                        let ts = self.0.get(table).with_context(|| format!("unknown subquery table '{table}'"))?;
+                        ts.column_index(project)?;
+                        CompiledPredicate::compile_opt_with(where_, ts, self)?;
+                        Ok(crate::predicate::subquery_sig(table, project, where_))
+                    }
+                }
+                CompiledPredicate::compile_with(p, &ts, &mut Validate(&schemas))?;
                 Some(crate::sql::predicate_json_to_sql(p, 1, &schemas, table))
             }
             Some(p) => {

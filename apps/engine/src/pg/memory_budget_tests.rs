@@ -133,6 +133,35 @@ async fn serve(
 }
 
 #[tokio::test]
+async fn memory_budget_disabled_backfill_keeps_reading_after_shutdown() {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        assert!(!metrics.memory_budget.enabled());
+        let rows = (0..64).map(|id| serde_json::json!({"id":id}).to_string()).collect();
+        let mut pg = BackfillFixture::with_rows(metrics, rows).await;
+        let shutdown = pg.client.inner.shutdown.clone();
+        let scope = SettleScope::internal(&pg.table.table);
+        let mut reader = backfill_reader(&mut pg.client, &pg.table, None, &scope).await.unwrap();
+        reader.budget = 1; // also exercises admission for an indivisible larger frame
+        pg.arrived.notified().await;
+        shutdown.begin();
+        for id in 0..64 {
+            pg.release.notify_one();
+            let row = reader.next_row().await;
+            assert!(row.is_ok(), "disabled admission must not interrupt the in-flight cursor at row {id}: {row:?}");
+            assert_eq!(pg.table.key_string(&row.unwrap().unwrap().0).unwrap(), id.to_string());
+            if id < 63 {
+                pg.arrived.notified().await;
+            }
+        }
+        assert!(reader.next_row().await.unwrap().is_none());
+        reader.finish().await;
+    })
+    .await
+    .expect("backfill fixture deadline");
+}
+
+#[tokio::test]
 async fn memory_budget_backfill_fixture_reads_real_driver_frames() {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut pg = BackfillFixture::new(Arc::new(crate::metrics::Metrics::default())).await;

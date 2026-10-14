@@ -560,10 +560,62 @@ fn source_receipt_matches(event: &Json, commit: &str) -> bool {
     event["t"] == "sourceDrained" && event["sourceCommitId"] == commit
 }
 
+#[tokio::test]
+async fn ingest_projection_subset_subqueries_reject_every_unlisted_column() {
+    use tower::ServiceExt;
+    let (engine, _, mut compiled) = fixture(Some("public.users:id,name"), &[]);
+    let inner: TableRef = "public.projects".into();
+    compiled.insert(
+        inner.clone(),
+        TableSchema::from_def(&inner, &definition()).unwrap().project_ingest(&["id".into(), "name".into()]).unwrap(),
+    );
+    engine.state.lock().await.tables = compiled;
+    let subquery = json!({"col":"id", "in":{"table":"projects", "project":"id"}});
+    let cases = [
+        ("users", json!({"and":[{"col":"payload","op":"eq","value":"x"},subquery.clone()]})),
+        ("users", json!({"or":[subquery.clone(),{"not":{"col":"payload","isNull":true}}]})),
+        ("users", json!({"col":"payload","in":{"table":"projects","project":"id"}})),
+        ("projects", json!({"col":"id","in":{"table":"projects","project":"payload"}})),
+        (
+            "projects",
+            json!({"col":"id","in":{"table":"projects","project":"id","where":{"col":"payload","op":"eq","value":"x"}}}),
+        ),
+        (
+            "projects",
+            json!({"col":"id","in":{"table":"projects","project":"id","where":{"not":{"col":"payload","isNull":true}}}}),
+        ),
+        (
+            "users",
+            json!({"col":"id","in":{"table":"projects","project":"id","where":{"col":"id","in":{"table":"users","project":"id","where":{"col":"payload","op":"eq","value":"x"}}}}}),
+        ),
+    ];
+    for (table, predicate) in cases {
+        let response = crate::http::router(engine.clone())
+            .oneshot(
+                axum::http::Request::post("/v1/subsets/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(json!({"table":"users", "where":predicate}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{predicate}: {body}");
+        assert!(body.contains(table) && body.contains("payload"), "must name the unlisted table and column: {body}");
+    }
+    engine.close(DEADLINE).await;
+}
+
 #[test]
 fn ingest_projection_receipt_observer_matches_the_catalog_wire_contract() {
     let commit = "018f5f4d-70c2-7d70-a4d5-5f7355078f85";
-    let receipt = json!({"t":"sourceDrained", "sourceCommitId":commit, "commitLsn":"0/16B6C50"});
+    let receipt = serde_json::to_value(CatalogEvent::SourceDrained(SourceDrainReceipt {
+        source_commit_id: commit.into(),
+        commit_lsn: "0/16B6C50".into(),
+    }))
+    .unwrap();
     assert!(
         source_receipt_matches(&receipt, commit),
         "the live-test fence must recognize the catalog's camelCase receipt"

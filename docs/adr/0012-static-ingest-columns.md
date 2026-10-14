@@ -21,7 +21,7 @@ with a warning so source removals and other reconciliation actions still apply. 
 backfill-sized budget permit per configured table. The compiled
 engine schema is projected while its physical `SchemaFingerprint` remains intact. Drift refreshes
 reapply the setting. Replication removes unlisted new/old cells before buffering; snapshot and
-query-back SQL select the same columns. Shape output/predicate references outside that schema return
+query-back SQL select the same columns. Shape and subset output/predicate references outside that schema return
 400 naming the table and column, including subquery inner references.
 
 The additive catalog event is:
@@ -52,7 +52,9 @@ A missing name never witnessed remains a fatal typo. Historical names are derive
 events; retained engine history is bounded by configured names. This distinction survives the next
 witness narrowing the effective set. Runtime drift writes any changed effective set after dependent
 retirements and before schema installation, including dropping listed columns; post-DDL shapes then
-retain their streams at restart. No event format changes are needed.
+retain their streams at restart. Drift whose effective columns are unchanged queues failed stream
+retirements without waiting for completion, preserving ingest progress on other tables (ADR-0007).
+No event format changes are needed.
 
 ## Consequences
 

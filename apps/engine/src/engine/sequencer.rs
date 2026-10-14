@@ -801,14 +801,17 @@ pub(crate) async fn sequencer_loop(
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                         loop {
+                            // Finish ready input on shutdown. Only a pending spill read or its
+                            // admission wait yields the page back to the replay boundary.
                             let next_chunk = tokio::select! {
+                                biased;
+                                result = transaction.next_chunk() => result,
                                 _ = shutdown.wait() => {
-                                    tracing::info!("sequencer: shutdown during held input; preserving replay boundary");
+                                    tracing::info!("sequencer: shutdown while awaiting transaction input; preserving replay boundary");
                                     highwater = txn_highwater;
                                     processing_failed = true;
                                     break;
                                 },
-                                result = transaction.next_chunk() => result,
                             };
                             let chunk = match next_chunk {
                                 Ok(Some(chunk)) => chunk,
@@ -2747,6 +2750,40 @@ mod held_spill_tests {
     use super::*;
     use std::future::Future;
     use std::pin::Pin;
+
+    #[tokio::test]
+    async fn shutdown_finishes_a_ready_in_memory_page() {
+        // No output streams: isolate page-input completion from independently interruptible
+        // reliable appends (covered by shutdown_append_cannot_be_reported_as_a_completed_flush).
+        let mut h = Harness::new(u64::MAX);
+        let table: TableRef = "public.items".into();
+        let def = serde_json::from_value(serde_json::json!({
+            "columns":{"id":{"type":"int"},"blob":{"type":"text"}},"primaryKey":"id"
+        }))
+        .unwrap();
+        h.engine.tables_shared.write().unwrap().insert(table.clone(), TableSchema::from_def(&table, &def).unwrap());
+        let registry = h.engine.subqueries.clone();
+        let held = registry.lock().await;
+        let rows: Vec<_> = (1..=64).map(|seq| change(&seq.to_string(), "0/10", seq, true)).collect();
+        h.store
+            .pages_by_offset
+            .lock()
+            .unwrap()
+            .insert("-1".into(), ("p1".into(), true, serde_json::to_string(&rows).unwrap()));
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(h.engine.metrics.envelopes.load(Ordering::Relaxed), 1, "first row reached the held registry lock");
+        h.engine.shutdown.begin();
+        drop(held);
+        let checkpoint = h.finish().await;
+        assert_eq!(h.engine.metrics.envelopes.load(Ordering::Relaxed), 64, "shutdown must finish ready page input");
+        assert_eq!(checkpoint, (LogPosition { segment: 0, offset: "p1".into() }, Some((0x10, 64))));
+        assert!(h.files().is_empty());
+        h.engine.close(Duration::from_secs(5)).await;
+    }
 
     #[tokio::test]
     async fn memory_budget_sequencer_command_preserves_read_fifo_position() {
