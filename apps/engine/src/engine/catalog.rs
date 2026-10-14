@@ -178,7 +178,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-fn ingest_columns_hash(columns: &[String]) -> Result<String> {
+pub(super) fn ingest_columns_hash(columns: &[String]) -> Result<String> {
     use sha2::{Digest, Sha256};
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(columns)?)))
 }
@@ -1315,15 +1315,7 @@ impl Engine {
                 // Legacy + no setting is deliberately a no-op, including after physical DDL:
                 // the existing schema fingerprint restore path owns that retirement.
                 None if !self.pg_columns.contains_key(table) => false,
-                None => {
-                    let mut full: Vec<String> = ts
-                        .fingerprint
-                        .as_ref()
-                        .map(|fp| fp.columns.iter().map(|c| c.name.clone()).collect())
-                        .unwrap_or_else(|| current.clone());
-                    full.sort();
-                    full != current
-                }
+                None => ts.ingest_full_columns != current,
             };
             if differs {
                 changed.insert(table.clone(), current);
@@ -2431,6 +2423,35 @@ mod tests {
         .unwrap();
         assert!(pages > 1 && bytes > 0);
         assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn library_boot_validates_the_entire_binding_history() {
+        let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
+        let mut other = expected_store_bound();
+        other.query_generation = "other-query".into();
+        let conflicting = catalog_event("conflict", CatalogEvent::StoreBound(other));
+        let config = crate::config::Config::resolve(|_| None).unwrap();
+        let mut accepted = Vec::new();
+        for (name, tail) in [
+            ("duplicate eid", bound.to_string()),
+            ("conflicting binding", conflicting.to_string()),
+            ("malformed tail", "invalid JSON".into()),
+        ] {
+            let store = Arc::new(crate::ds::ScriptedStore::default());
+            store
+                .pages_by_offset
+                .lock()
+                .unwrap()
+                .insert("-1".into(), ("tail".into(), true, format!("[{bound}, {tail}]")));
+            let ds = DsClient::with_test_store("scripted://library-boot".into(), store);
+            let admission = Engine::admit_store(ds, expected_store_bound(), false).await.unwrap();
+            if let Ok(engine) = Engine::boot_library(admission, &config).await {
+                accepted.push(name);
+                engine.close(OTTO_5492_DEADLINE).await;
+            }
+        }
+        assert!(accepted.is_empty(), "library boot accepted invalid catalogs: {accepted:?}");
     }
 
     #[tokio::test]

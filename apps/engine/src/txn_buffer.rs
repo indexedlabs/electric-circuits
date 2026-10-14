@@ -321,7 +321,13 @@ impl TxnBuffer {
         metrics: std::sync::Arc<crate::metrics::Metrics>,
     ) -> Result<Self> {
         let mut txn = Self::with_metrics(xid, cfg, metrics);
-        let bytes = txn.cfg.memory_bytes.saturating_add(txn.cfg.append_bytes);
+        // Leave room for peer pages even when the configured caps exceed a small process
+        // budget. Growth spills/releases this owner before joining the FIFO again.
+        let bytes = txn
+            .cfg
+            .memory_bytes
+            .saturating_add(txn.cfg.append_bytes)
+            .min((txn.metrics.memory_budget.limit() / 4).max(1));
         txn.memory_permit = txn.metrics.memory_budget.acquire(bytes).await;
         Ok(txn)
     }
@@ -331,7 +337,8 @@ impl TxnBuffer {
     }
 
     pub(crate) async fn reserve_drain(&mut self) -> Result<()> {
-        self.reserve_workspace(self.cfg.append_bytes.saturating_add(self.max_envelope_bytes)).await
+        self.reserve_workspace(self.cfg.append_bytes.min(self.buffered_bytes).saturating_add(self.max_envelope_bytes))
+            .await
     }
 
     async fn reserve_workspace(&mut self, workspace: u64) -> Result<()> {
@@ -343,7 +350,7 @@ impl TxnBuffer {
         let bytes = if self.cfg.memory_bytes == 0 { workspace } else { self.mem_bytes.saturating_add(workspace) };
         if bytes > self.memory_permit.bytes() {
             self.release_for_schema()?;
-            self.memory_permit = self.metrics.memory_budget.acquire(workspace.max(self.cfg.append_bytes)).await;
+            self.memory_permit = self.metrics.memory_budget.acquire(workspace).await;
         }
         Ok(())
     }
@@ -816,6 +823,35 @@ mod tests {
         let mut metrics = crate::metrics::Metrics::default();
         metrics.memory_budget = crate::memory_budget::MemoryBudget::new(Some(bytes));
         std::sync::Arc::new(metrics)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_default_small_transaction_shares_capacity_with_page_reads() {
+        use std::{future::Future, task::Poll};
+        const MIB: u64 = 1024 * 1024;
+        let dir = Scratch::new("budget-default-small");
+        let metrics = budget_metrics(32 * MIB);
+        let sequencer_page = metrics.memory_budget.acquire(8 * MIB).await;
+        let fold_page = metrics.memory_budget.acquire(8 * MIB).await;
+        let config = TxnBufferConfig { spill_dir: dir.path().to_owned(), ..Default::default() };
+        let mut work = Box::pin(async {
+            let mut txn = TxnBuffer::admitted(11, config, metrics.clone()).await.unwrap();
+            txn.reserve_input(1000).await.unwrap();
+            txn.push(env_of("row", 100), 1000).unwrap();
+            txn.reserve_drain().await.unwrap();
+            assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 1);
+        });
+        std::future::poll_fn(|cx| {
+            assert!(
+                work.as_mut().poll(cx).is_ready(),
+                "a small transaction with default caps must fit alongside page readers"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(metrics.memory_budget.waits.load(Ordering::Relaxed), 0);
+        drop((work, sequencer_page, fold_page));
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

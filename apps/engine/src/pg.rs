@@ -2116,8 +2116,6 @@ mod tests {
         assert_eq!(measured as usize, serde_json::to_vec(&j).unwrap().len());
     }
 
-    /// The default budget must be appendable: a value above the durable-streams body cap could
-    /// never land, and 16 MiB leaves three orders of magnitude of headroom.
     #[test]
     fn ingest_projection_backfill_and_query_back_sql_excludes_unlisted_columns() {
         let table = crate::table_ref::TableRef::parse("public.projected").unwrap();
@@ -2134,6 +2132,8 @@ mod tests {
         assert!(!row_json_expr(&wide).contains("payload"));
     }
 
+    /// The default budget must be appendable: a value above the durable-streams body cap could
+    /// never land, and 16 MiB leaves three orders of magnitude of headroom.
     #[test]
     fn default_backfill_budget_is_within_the_storage_body_cap() {
         let d = BackfillConfig::default();

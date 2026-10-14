@@ -606,6 +606,9 @@ async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow
     }
     let shutdown = engine.shutdown_token();
     while !fold.done {
+        // Retention/degradation can change while consuming a page. Reactivation may itself
+        // need memory, so perform this check only after releasing the previous page owner.
+        engine.shape_fold_input(path).await?;
         let (page, permit) = tokio::select! {
             _ = shutdown.wait() => anyhow::bail!("shape fold interrupted by shutdown"),
             page = ds.read_budgeted(path, &fold.offset, false) => page?,
@@ -1289,6 +1292,53 @@ mod tests {
         let third = drive_fold(&engine, "shape/s3", StreamFold::to_tail()).await.unwrap();
         assert_eq!(third.rows, second.rows);
         assert_eq!(budget.waits.load(Ordering::Relaxed), 1, "a retained result must not delay another fold");
+    }
+
+    async fn check_fold_lifecycle_between_pages(dormant: bool) {
+        use std::{future::Future, task::Poll};
+        {
+            let store = Arc::new(crate::ds::ScriptedStore::default());
+            let engine = budget_engine(&budget_config(1), store.clone()).await;
+            store.pages_by_offset.lock().unwrap().get_mut("-1").unwrap().1 = false;
+            let gate = Arc::new(crate::ds::BodyGate::default());
+            *store.body_gate.lock().unwrap() = Some(gate.clone());
+            let mut fold = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::to_tail()));
+            std::future::poll_fn(|cx| {
+                assert!(fold.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            if dormant {
+                engine
+                    .park_dormant_shape_for_test(
+                        "s1",
+                        "public.items",
+                        crate::changelog::LogPosition { segment: 999, offset: "gone".into() },
+                    )
+                    .await;
+            } else {
+                engine.force_degraded();
+            }
+            *store.body_gate.lock().unwrap() = None;
+            gate.released.notify_one();
+            let result = tokio::time::timeout(Duration::from_secs(5), fold).await.unwrap();
+            assert!(
+                result.is_err(),
+                "page two must refuse a {} shape",
+                if dormant { "dormant, expired" } else { "degraded" }
+            );
+            assert_eq!(engine.metrics.memory_budget.held.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_budget_fold_checks_degradation_between_pages() {
+        check_fold_lifecycle_between_pages(false).await;
+    }
+
+    #[tokio::test]
+    async fn memory_budget_fold_checks_dormancy_between_pages() {
+        check_fold_lifecycle_between_pages(true).await;
     }
 
     #[tokio::test]

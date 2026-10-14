@@ -179,14 +179,10 @@ async fn main() -> Result<()> {
             engine
         }
         _ => {
-            // Library mode: no Postgres source; the engine is `active` from construction. Shutdown
-            // and readiness still apply — there is simply nothing Postgres-shaped to wait for.
-            let engine = Engine::new_with_config(
-                admission,
-                None,
-                electric_circuits_engine::engine::PostgresSetup::EngineManaged,
-                &config,
-            );
+            // Library mode still validates the entire store-binding history before readiness.
+            let engine = Engine::boot_library(admission, &config)
+                .await
+                .unwrap_or_else(|e| refuse_boot("library catalog store binding", &e));
             statsd::consumers_ready(engine.table_count().await as u64);
             engine
         }

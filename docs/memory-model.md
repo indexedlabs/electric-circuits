@@ -221,8 +221,10 @@ Backfills and Electric folds use ordinary FIFO frame/page permits, releasing eac
 and before requesting another. Only an individual oversized request requires an empty ledger.
 Retained fold maps, decoded rows and collected results remain outside the ledger, like arrangement
 state. The ingestor's `TXN_MEMORY_BYTES=0` escape hatch still never spills: only its input/drain
-workspace is admitted, with its unbounded retained rows unaccounted. Capped ingestors reserve their
-cap plus append workspace and may spill earlier before larger workspace or schema/pool waits. See
+workspace is admitted, with its unbounded retained rows unaccounted. Initial ingest reservations
+are capped at one quarter of the process budget (at least one byte).
+Drain workspace uses actual buffered bytes up to the append cap, plus one envelope. Capped ingestors
+may spill earlier before larger workspace or schema/pool waits. See
 [engine configuration](../apps/engine/README.md#process-byte-admission) for owner lifetimes and costs.
 
 `ELECTRIC_CIRCUITS_PG_COLUMNS` additionally reduces row width before transaction buffering and

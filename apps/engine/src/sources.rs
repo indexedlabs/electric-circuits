@@ -139,6 +139,10 @@ struct SourceSnapshot {
     rows: Vec<SourceRow>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("ELECTRIC_CIRCUITS_PG_COLUMNS: unknown tracked table '{0}' across sources")]
+struct UnknownProjectionTable(crate::table_ref::TableRef);
+
 impl SourcesSupervisor {
     pub fn new(config: Config) -> Result<Self> {
         let _ = config.memory_budget.budget();
@@ -224,6 +228,7 @@ impl SourcesSupervisor {
         loop {
             match self.refresh().await {
                 Ok(_) => return Ok(()),
+                Err(error) if error.is::<UnknownProjectionTable>() => return Err(error),
                 Err(error) => {
                     attempt = attempt.saturating_add(1);
                     let delay =
@@ -446,6 +451,11 @@ impl SourcesSupervisor {
     async fn apply_snapshot(&self, snapshot: SourceSnapshot) -> Result<i64> {
         if self.inner.shutdown.is_shutting_down() {
             bail!("sources reconcile interrupted by shutdown");
+        }
+        for table in self.inner.config.pg_columns.keys() {
+            if !snapshot.rows.iter().any(|row| source_tracks(row, table)) {
+                return Err(UnknownProjectionTable(table.clone()).into());
+            }
         }
         let (running, failed) = {
             let state = self.inner.state.lock().await;
@@ -683,6 +693,10 @@ async fn boot_source(
     Ok((engine.clone(), crate::http::router_with_introspection(engine, child.trace)))
 }
 
+fn source_tracks(row: &SourceRow, table: &crate::table_ref::TableRef) -> bool {
+    row.tables.iter().any(|tracked| crate::table_ref::TableRef::parse(tracked).is_ok_and(|tracked| tracked == *table))
+}
+
 fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> Result<Config> {
     let sources = base.sources.as_ref().context("source config missing")?;
     let source_root = sources.storage_dir.join(&row.source_id);
@@ -714,7 +728,12 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
     child.dbsp = base.dbsp.clone();
     child.dbsp.dir = source_root.join("dbsp");
     child.memory_budget = base.memory_budget.clone();
-    child.pg_columns = base.pg_columns.clone();
+    child.pg_columns = base
+        .pg_columns
+        .iter()
+        .filter(|(table, _)| source_tracks(row, table))
+        .map(|(table, columns)| (table.clone(), columns.clone()))
+        .collect();
     child.txn = base.txn.clone();
     child.txn.spill_dir = source_root.join("txn-spill");
     child.backfill = base.backfill;
@@ -1380,6 +1399,32 @@ mod tests {
         let error = supervisor.inner.state.lock().await.failed["alpha"].error.clone();
         engine.close(std::time::Duration::from_secs(1)).await;
         assert!(!error.contains("resolve failed"), "restart notification attempted boot before a poll tick: {error}");
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_is_scoped_to_each_supervised_source() -> Result<()> {
+        let mut base = file_mode_config("/unused");
+        base.pg_columns.insert("public.items".into(), vec!["id".into()]);
+        base.pg_columns.insert("public.users".into(), vec!["id".into(), "name".into()]);
+        for table in ["public.items", "public.users", " public.users "] {
+            let mut row = valid_row("alpha", 1, "file:/unused");
+            row.tables = vec![table.into()];
+            let child = source_engine_config(&base, &row, "postgres://localhost/unused")?;
+            assert_eq!(child.pg_columns.len(), 1, "a source must not inherit another source's projection");
+            assert_eq!(child.pg_columns.get(&table.into()), base.pg_columns.get(&table.into()));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_rejects_a_table_tracked_by_no_source() -> Result<()> {
+        let mut base = file_mode_config("/unused");
+        base.pg_columns.insert("public.items".into(), vec!["id".into()]);
+        let supervisor = SourcesSupervisor::new(base)?;
+        let result = supervisor.apply_snapshot(SourceSnapshot { revision: 1, rows: vec![] }).await;
+        assert!(result.is_err(), "a projection tracked by no source must be rejected before activation");
+        assert!(!supervisor.inner.state.lock().await.fetched);
+        Ok(())
     }
 
     #[tokio::test]

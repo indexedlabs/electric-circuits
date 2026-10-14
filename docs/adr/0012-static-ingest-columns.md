@@ -11,8 +11,11 @@ values for unchanged rows. Physical schema fingerprints cannot distinguish that 
 ## Decision
 
 `ELECTRIC_CIRCUITS_PG_COLUMNS` lists qualified tables and column names:
-`schema.table:col,col;schema.table:col`. A missing table entry means all published columns. Boot
-rejects untracked tables, unknown columns and lists missing any primary-key component. The compiled
+`schema.table:col,col;schema.table:col`. A missing table entry means all compiled columns, including stored generated columns absent from pgoutput. Boot
+rejects untracked tables, unknown columns and lists missing any primary-key component before
+slot/publication/replica-identity mutations. Each supervised source receives entries for its own
+tracked tables; entries tracked by no source refuse startup. Schema preflight reads take a
+backfill-sized budget permit per configured table. The compiled
 engine schema is projected while its physical `SchemaFingerprint` remains intact. Drift refreshes
 reapply the setting. Replication removes unlisted new/old cells before buffering; snapshot and
 query-back SQL select the same columns. Shape output/predicate references outside that schema return
@@ -37,6 +40,10 @@ retirement path writes durable `Dropped`, closes/deletes the stream, then writes
 Only after completion does boot write the new `ingestColumns` event durably. Outstanding retirement
 intents recovered from the catalog must complete before this witness too. Unchanged sets do nothing.
 After an epoch reset, boot still records changed sets before starting the replacement ingestor.
+Legacy comparison uses the unprojected compiled schema, including unpublished stored generated
+columns. Runtime drift on an unprojected table writes its current full-width witness after dependent
+retirements and before schema installation; post-DDL shapes then retain their streams at restart.
+These corrections use the existing event format.
 
 ## Consequences
 

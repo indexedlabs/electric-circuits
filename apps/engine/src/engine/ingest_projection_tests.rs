@@ -109,6 +109,26 @@ async fn restore(engine: &Engine, compiled: &HashMap<TableRef, TableSchema>) {
 }
 
 #[tokio::test]
+async fn ingest_projection_legacy_compares_full_compiled_columns() {
+    let mut results = Vec::new();
+    for (setting, retire) in [("public.users:id,name,payload", false), ("public.users:id,name", true)] {
+        // An unpublished stored generated column is in the compiled schema/backfill, but
+        // absent from the physical pgoutput fingerprint.
+        let mut def = definition();
+        def.fingerprint.as_mut().unwrap().columns.retain(|c| c.name != "payload");
+        let mut events = catalog(None);
+        events[0]["rec"]["fingerprint"] = json!(def.fingerprint);
+        let (engine, _, _) = fixture(Some(setting), &events);
+        let table = TableRef::parse("public.users").unwrap();
+        let compiled = HashMap::from([(table.clone(), engine.compile_ingest_table(&table, &def).unwrap())]);
+        restore(&engine, &compiled).await;
+        results.push(engine.state.lock().await.shapes.contains_key("s1") != retire);
+        engine.close(DEADLINE).await;
+    }
+    assert_eq!(results, [true, true], "legacy narrowing is relative to compiled columns, including generated columns");
+}
+
+#[tokio::test]
 async fn ingest_projection_restart_matrix() {
     for (label, previous, setting, retire) in [
         ("unchanged", Some(&["id", "name"][..]), Some("public.users:name,id"), false),
@@ -452,4 +472,115 @@ async fn ingest_projection_keeps_other_tables_and_deduplicates_witnesses() {
         [json!("s1")]
     );
     engine.close(DEADLINE).await;
+}
+
+/// Inherited real-PG regression: real pgoutput, snapshot/engine and public shape reads; the
+/// append/read log is an in-memory fixture, so this is not file-backed release qualification.
+#[tokio::test]
+#[ignore = "requires PostgreSQL via ELECTRIC_CIRCUITS_TEST_PG_URL; stream storage is scripted"]
+async fn ingest_projection_real_postgres_live_changes_match_sql() -> Result<()> {
+    let url = std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL")?;
+    let mut client = crate::pg::connect(&url).await?;
+    let name = format!("projection_{}", uuid::Uuid::new_v4().simple());
+    let table = TableRef::new("public", &name)?;
+    let slot = format!("{name}_slot");
+    client
+        .batch_execute(&format!(
+            "create table {} (id integer primary key, name text, payload text); \
+         create table if not exists public.circuits_source_fence (source_commit_id uuid primary key)",
+            table.quote_qualified(),
+        ))
+        .await?;
+    let config = crate::config::Config::resolve(|key| match key {
+        "ELECTRIC_CIRCUITS_PG_COLUMNS" => Some(format!("{table}:id,name")),
+        "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES" => Some("134217728".into()),
+        _ => None,
+    })?;
+    let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+    let engine = Engine::new_inner(
+        DsClient::with_test_store("scripted://projection-live".into(), store.clone()),
+        Some(url),
+        None,
+        PostgresSetup::EngineManaged,
+        Some(&config),
+        None,
+    );
+    let result = tokio::time::timeout(Duration::from_secs(45), async {
+        engine.setup_postgres(&[TableSelector::One(table.clone())], &slot).await?;
+        let shape = engine.create_shape(&table, None, None, false, false).await?;
+        let mut rows = std::collections::BTreeMap::new();
+        let mut offset = "-1".to_owned();
+        for sql in [
+            format!("insert into {} values (1, 'first', repeat('x', 16384))", table.quote_qualified()),
+            format!(
+                "update {} set name = 'second', payload = repeat('y', 32768) where id = 1",
+                table.quote_qualified()
+            ),
+            format!("update {} set payload = 'unlisted-only change' where id = 1", table.quote_qualified()),
+            format!("delete from {} where id = 1", table.quote_qualified()),
+        ] {
+            let commit = uuid::Uuid::new_v4();
+            let tx = client.transaction().await?;
+            tx.batch_execute(&sql).await?;
+            // Independent oracle at exactly this source transaction, before its final marker.
+            let oracle: Vec<Json> = tx
+                .query(
+                    &format!(
+                        "select jsonb_build_object('id', id, 'name', name) from {} order by id",
+                        table.quote_qualified()
+                    ),
+                    &[],
+                )
+                .await?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            tx.execute("insert into public.circuits_source_fence (source_commit_id) values ($1)", &[&commit]).await?;
+            tx.commit().await?;
+            // Event-driven causal fence: the sequencer writes SourceDrained only after all
+            // preceding direct/deferred outputs. No sleeps, unrelated SQL polling or sentinels.
+            loop {
+                let changed = store.appended_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if appended(&store)
+                    .iter()
+                    .any(|ev| ev["t"] == "sourceDrained" && ev["source_commit_id"] == commit.to_string())
+                {
+                    break;
+                }
+                changed.await;
+            }
+            loop {
+                let page = engine.read_shape_stream(&shape.stream_path, &offset, false).await?;
+                for env in page.envelopes {
+                    for image in [&env.value, &env.old].into_iter().flatten() {
+                        anyhow::ensure!(image.get("payload").is_none(), "unlisted column leaked: {image}");
+                    }
+                    if env.headers.operation == "delete" {
+                        rows.remove(&env.key);
+                    } else if let Some(value) = env.value {
+                        rows.insert(env.key, value);
+                    }
+                }
+                let next = page.next_offset.unwrap_or_else(|| offset.clone());
+                let done = page.up_to_date || next == offset;
+                offset = next;
+                if done {
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                rows.values().cloned().collect::<Vec<_>>() == oracle,
+                "shape differs from SQL after {sql}: {rows:?} vs {oracle:?}"
+            );
+            client.execute("delete from public.circuits_source_fence where source_commit_id = $1", &[&commit]).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("live projection deadline: {e}")));
+    engine.close(Duration::from_secs(10)).await;
+    client.batch_execute(&format!("select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '{slot}'; drop publication if exists {slot}_pub; drop table {}", table.quote_qualified())).await?;
+    result
 }

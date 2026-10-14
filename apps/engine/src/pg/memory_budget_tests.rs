@@ -238,6 +238,7 @@ async fn memory_budget_ingest_schema_wait_does_not_pin_backfill_frame_admission(
         // The ingestor owns all byte capacity; the backfill owns the only pool connection.
         let cfg = crate::txn_buffer::TxnBufferConfig { memory_bytes: 60, append_bytes: 40, ..Default::default() };
         let mut txn = crate::txn_buffer::TxnBuffer::admitted(1, cfg, metrics).await.unwrap();
+        txn.reserve_input(100).await.unwrap();
         let mut schema_connection = Box::pin(pool.get());
         let mut rows = Box::pin(async {
             let scope = SettleScope::internal(&pg.table.table);

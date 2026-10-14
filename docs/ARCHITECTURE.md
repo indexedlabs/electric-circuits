@@ -212,13 +212,19 @@ full published schema. pgoutput decoding drops unlisted cells from both images b
 buffering/spilling/appending; it still receives full wire tuples. Backfill and query-back row SQL
 selects only the compiled columns, and unavailable output/predicate columns (including nested inner
 predicates) are HTTP 400 errors naming table and column. All PK columns are mandatory. Drift
-re-introspection reapplies the configured set.
+re-introspection reapplies the configured set. Boot validates column names and PK membership before
+entering the epoch or mutating slots/publications/identity; these schema preflight reads take one
+backfill-sized permit per configured table. Supervised sources receive only their tracked entries;
+an entry tracked by no source is a fatal startup configuration error.
 
 The additive catalog event `ingestColumns { table, columns, hash }` records sorted effective names
 and their SHA-256; absent records mean all columns. Before dormant restore and ingest, boot retires
 every shape over a changed table, including subquery dependencies, awaiting durable `Dropped`,
 close/delete and durable `Retired` before appending the new set durably. A crash repeats unfinished
-retirements. Unchanged sets do nothing; legacy catalogs need no migration. Clients recreate retired
+retirements. Unchanged sets do nothing; legacy catalogs compare against the full compiled column
+set (including stored generated columns omitted from pgoutput), and need no migration. Runtime DDL
+on an unprojected table refreshes the full-width witness after dependent retirements and before
+installing the new schema, so post-DDL shapes survive an unchanged restart. Clients recreate retired
 streams and backfill newly included columns. Existing `SchemaChanged` and shape output lists keep
 their meanings. Catalog body reads use the shared page permits; projection reconciliation holds no
 permit while waiting for retirement. See [ADR-0012](adr/0012-static-ingest-columns.md).
@@ -227,6 +233,9 @@ The process byte ledger (`memory_budget.rs`) is shared by all supervised sources
 `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, defaults to 60% of a readable finite cgroup limit; absent
 both, admission is disabled with one boot log. FIFO byte requests wait for capacity. An oversized
 request requires no other owner; cancellation releases queued requests and owned credits.
+Non-live DS reads acquire before sending HTTP requests. Long-polls wait for data without credits,
+then discard that response and re-issue a non-live read at the same offset after admission; budget
+waits therefore cannot consume a request's body deadline.
 
 Catalog page credit lasts through the page visitor; sequencer body credit lasts through consumption
 or spill, including awaited blocking jobs. With admission enabled, every held run spills before the
@@ -234,15 +243,16 @@ next read. Pages containing runtime/source receipts or continuing a held run spi
 input before processing; ordinary complete pages retain the original credit without extra disk I/O.
 Bounded spill-reader credit is released before the receipt can wait for a query-back.
 
-Ingest reserves its cap and append workspace before buffering, spills a capped buffer before waiting
-for a larger workspace or pool-dependent schema work, and never acknowledges while waiting. The
+Ingest bounds its initial cap-plus-workspace reservation to one quarter of the process budget
+(at least one byte). Drain workspace uses actual buffered bytes up to the append cap, plus one
+envelope. It spills a capped buffer before waiting for a larger workspace or pool-dependent schema work, and never acknowledges while waiting. The
 never-spill escape hatch admits only input/drain workspace; its unbounded retained rows are unaccounted.
 Electric folds take ordinary FIFO permits for each capped DS page; backfills take one append-sized
 permit for each cursor frame. After consumption/decoding, each releases before requesting another.
 A larger indivisible backfill frame drops the smaller credit before admitting its actual wire size.
 Only an individual request above the budget needs exclusive admission, so fitting pages/frames can
 run concurrently. Retained fold maps, decoded rows and result sets are outside the ledger, like
-arrangement state. Fold admission follows shape reactivation; snapshot SQL and xid fences are unchanged.
+arrangement state. Every fold page checks lifecycle/degradation before admission; snapshot SQL and xid fences are unchanged.
 The ledger covers transient input reservations, not RSS or all retained state; see
 [the memory model](memory-model.md#6-transient-operation-budgets) and
 [engine configuration](../apps/engine/README.md#process-byte-admission).
@@ -907,8 +917,9 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 Store admission reads only the first catalog event to validate the immutable `storeBound` identity.
 It buffers that capped response body but decodes no later events. The subsequent fold reads the
 whole catalog page by page and checks bindings before `eid` de-duplication, so a duplicate or
-reordered `storeBound` still refuses boot before restore. After a successful fold, `catalog read
-complete` logs `catalog_bytes`: the sum of response-body lengths, including JSON framing and
+reordered `storeBound` still refuses boot before restore. Library-mode boot also completes this
+validation before publishing readiness, even though it restores no Postgres shapes. After a
+successful fold, `catalog read complete` logs `catalog_bytes`: the sum of response-body lengths, including JSON framing and
 repeated events, excluding admission reads. The same boot measurement is the `catalog_bytes`
 JSON gauge and `engine_catalog_bytes` Prometheus gauge; it survives metric reset and does not track
 later appends or estimate heap usage. The catalog remains append-only and uncompacted.

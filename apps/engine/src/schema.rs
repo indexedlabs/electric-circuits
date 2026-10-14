@@ -220,6 +220,9 @@ pub struct TableSchema {
     /// The table's identity; its canonical `schema.name` `Display` is what goes on the wire.
     pub table: TableRef,
     pub columns: Vec<(String, ColumnType)>,
+    /// Unprojected compiled columns, including stored generated columns absent from pgoutput.
+    /// Boot uses this transient provenance when interpreting a legacy catalog without a witness.
+    pub(crate) ingest_full_columns: Vec<String>,
     pub index: HashMap<String, usize>,
     /// First primary-key column index/name/type. For single-PK tables this IS the pk; for composite-PK
     /// tables (only used as subquery inner tables) it's the first key column — prefer `pk_cols`/`key_string`.
@@ -351,6 +354,7 @@ impl TableSchema {
         let pk_type = columns[pk_index].1;
         Ok(TableSchema {
             table: table.clone(),
+            ingest_full_columns: columns.iter().map(|(name, _)| name.clone()).collect(),
             columns,
             index,
             pk_index,

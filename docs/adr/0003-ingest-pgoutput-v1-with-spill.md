@@ -35,9 +35,10 @@ input across blocking jobs and are released only after consumption/spill. Reader
 end before receipt waits. Scratch writers are flushed/closed before those waits. All files retain
 the existing NDJSON format, replay pins, highwater rules and cleanup ownership.
 
-A capped ingestor reserves its cap plus append workspace before buffering and may spill earlier to
-release that reservation before waiting for a larger frame/drain workspace or pool-dependent schema
-work. This prevents a backfill waiting for memory while holding a pool slot from blocking the ingestor
+An ingestor initially reserves the smaller of its cap plus append workspace and one quarter of the
+process budget (at least one byte). Drain workspace is bounded by actual buffered bytes and the append
+cap, plus one envelope. A capped ingestor may spill earlier to release that reservation before
+waiting for a larger frame/drain workspace or pool-dependent schema work. This prevents a backfill waiting for memory while holding a pool slot from blocking the ingestor
 that owns the needed memory. The documented `0 = never spill` mode retains rows outside the ledger;
 its input/drain workspace uses ordinary FIFO requests, without forcing exclusivity.
 
@@ -46,9 +47,11 @@ budget or DS read cap. They release credit after decoding/consumption and before
 A larger indivisible backfill frame drops the smaller permit before admitting its actual wire size.
 Only a single request larger than the process budget requires exclusivity; fitting requests coexist.
 Retained fold maps, decoded backfill rows, collected results and response conversion stay unaccounted,
-like arrangement state. Snapshot SQL, xid fences, pool ownership and results are unchanged. Fold
-admission follows activation. Waiting ingest never advances applied LSN, and acknowledgement still
-follows the last durable append.
+like arrangement state. Snapshot SQL, xid fences, pool ownership and results are unchanged. Every fold page checks
+lifecycle/degradation before admission, after releasing the previous permit. Waiting ingest never advances applied LSN, and acknowledgement still
+follows the last durable append. Non-live DS reads acquire before HTTP send; long-polls wait for
+data without credits, discard the response, then re-read the same offset after admission with a
+fresh HTTP deadline.
 
 The process gauges are `engine_memory_budget_bytes` and `engine_memory_permits_held_bytes`; the
 counter is `engine_memory_permit_waits_total`. Source endpoints observe the same process totals.

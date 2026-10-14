@@ -839,7 +839,55 @@ impl HttpDurableStreamsStore {
     }
 
     async fn response(&self, res: reqwest::Response, body_read: BodyRead, path: Option<&str>) -> StoreResponse {
-        self.response_budgeted(res, body_read, path, None, self.caps.ds_read_max_bytes()).await
+        self.response_budgeted(
+            res,
+            body_read,
+            path,
+            crate::memory_budget::Permit::default(),
+            self.caps.ds_read_max_bytes(),
+        )
+        .await
+    }
+
+    // The transport closure permits deterministic deadline tests without a socket server.
+    async fn read_with_admission<F, Fut>(
+        &self,
+        path: &str,
+        live: bool,
+        budget: Option<&Arc<crate::memory_budget::MemoryBudget>>,
+        limit: u64,
+        mut send: F,
+    ) -> Result<StoreResponse>
+    where
+        F: FnMut(bool) -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response>>,
+    {
+        if live {
+            let res = send(true).await?;
+            if budget.is_none_or(|budget| !budget.enabled())
+                || !res.status().is_success()
+                || res.status() == reqwest::StatusCode::NO_CONTENT
+            {
+                return Ok(self
+                    .response_budgeted(
+                        res,
+                        BodyRead::OnData,
+                        Some(path),
+                        crate::memory_budget::Permit::default(),
+                        limit,
+                    )
+                    .await);
+            }
+            // Do not retain a timed response during admission. The positioned non-live retry
+            // reads the same bytes after credits arrive, with a fresh request deadline.
+            drop(res);
+        }
+        let permit = match budget {
+            Some(budget) => budget.acquire(limit).await,
+            None => crate::memory_budget::Permit::default(),
+        };
+        let res = send(false).await?;
+        Ok(self.response_budgeted(res, BodyRead::OnData, Some(path), permit, limit).await)
     }
 
     async fn response_budgeted(
@@ -847,7 +895,7 @@ impl HttpDurableStreamsStore {
         res: reqwest::Response,
         body_read: BodyRead,
         path: Option<&str>,
-        budget: Option<&Arc<crate::memory_budget::MemoryBudget>>,
+        permit: crate::memory_budget::Permit,
         limit: u64,
     ) -> StoreResponse {
         let status = res.status().as_u16();
@@ -865,12 +913,6 @@ impl HttpDurableStreamsStore {
         // `read` and `read_json` used `res.text().await?` after a successful GET; turning an
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
-        // An idle long-poll owns no body bytes: await data headers before admission. The cap
-        // reserves the maximum body capacity, including responses without a content length.
-        let permit = match budget.filter(|_| should_read) {
-            Some(budget) => budget.acquire(limit).await,
-            None => crate::memory_budget::Permit::default(),
-        };
         let body = if should_read {
             Some(
                 read_body_bounded(res, limit, path.unwrap_or("<unknown>"), self.caps.advertised_max_value_bytes())
@@ -948,13 +990,15 @@ impl DurableStreamStore for HttpDurableStreamsStore {
         limit: u64,
     ) -> StoreFuture<'a> {
         Box::pin(async move {
-            let mut url = format!("{}?offset={}", self.stream_url(path), offset);
-            if live {
-                url.push_str("&live=long-poll");
-            }
-            let client = if live { &self.live_http } else { &self.http };
-            let res = client.get(url).send().await.with_context(|| format!("GET {path}"))?;
-            Ok(self.response_budgeted(res, BodyRead::OnData, Some(path), budget, limit).await)
+            self.read_with_admission(path, live, budget, limit, |live| async move {
+                let mut url = format!("{}?offset={}", self.stream_url(path), offset);
+                if live {
+                    url.push_str("&live=long-poll");
+                }
+                let client = if live { &self.live_http } else { &self.http };
+                client.get(url).send().await.with_context(|| format!("GET {path}"))
+            })
+            .await
         })
     }
 
@@ -2080,6 +2124,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_budget_http_admission_does_not_spend_the_response_deadline() {
+        use std::{future::Future, task::Poll};
+        use tokio::time::{Duration, Instant};
+        use tokio_stream::StreamExt;
+        tokio::time::pause();
+        for live in [false, true] {
+            let store = HttpDurableStreamsStore::new_in_process("http://unused".into());
+            let budget = crate::memory_budget::MemoryBudget::new(Some(100));
+            let owner = budget.acquire(100).await;
+            let sends = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut read = Box::pin(store.read_with_admission("changes/0", live, Some(&budget), 100, |is_live| {
+                sends.lock().unwrap().push(is_live);
+                // Model a transport body whose request deadline begins at send, independently
+                // of admission. This drives the same HTTP read orchestration and body reader.
+                let deadline = Instant::now() + Duration::from_secs(1);
+                async move {
+                    let body = reqwest::Body::wrap_stream(tokio_stream::once(()).map(move |_| {
+                        if Instant::now() >= deadline {
+                            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request body deadline elapsed"))
+                        } else {
+                            Ok(axum::body::Bytes::from_static(b"[]"))
+                        }
+                    }));
+                    Ok(reqwest::Response::from(axum::http::Response::new(body)))
+                }
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(read.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(2)).await;
+            drop(owner);
+            let response = read.await.unwrap();
+            assert!(response.body.as_ref().unwrap().is_ok(), "budget wait must not expire the HTTP body (live={live})");
+            assert_eq!(*sends.lock().unwrap(), if live { vec![true, false] } else { vec![false] });
+            drop(response);
+            assert_eq!(budget.held.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_budget_disabled_http_live_read_does_not_reissue() {
+        let store = HttpDurableStreamsStore::new_in_process("http://unused".into());
+        let budget = crate::memory_budget::MemoryBudget::new(None);
+        let mut calls = Vec::new();
+        let response = store
+            .read_with_admission("changes/0", true, Some(&budget), 100, |live| {
+                calls.push(live);
+                async { Ok(reqwest::Response::from(axum::http::Response::new(reqwest::Body::from("[]")))) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(response.body.unwrap().unwrap(), "[]");
+        assert_eq!(calls, [true], "disabled admission must preserve the single long-poll request");
+    }
+
+    #[tokio::test]
     async fn memory_budget_idle_long_poll_takes_no_body_reservation() {
         use std::future::Future;
         let config =
@@ -2106,6 +2208,9 @@ mod tests {
         pub(crate) caps: Arc<ReadCaps>,
         pub(crate) body_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
         pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        /// Opt-in append/read log for real-pgoutput tests. Cursors count appends per stream.
+        pub(crate) read_appended: bool,
+        pub(crate) appended_changed: tokio::sync::Notify,
         pub(crate) append_notifiers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_read_body: bool,
@@ -2209,6 +2314,7 @@ mod tests {
                 }
                 self.operations.lock().unwrap().push("append".to_string());
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
+                self.appended_changed.notify_waiters();
                 for (suffix, signal) in self.append_notifiers.lock().unwrap().iter() {
                     if path.ends_with(suffix) {
                         signal.notify_one();
@@ -2222,6 +2328,33 @@ mod tests {
             Box::pin(async move {
                 self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_offsets.lock().unwrap().push(offset.to_string());
+                if self.read_appended {
+                    loop {
+                        let changed = self.appended_changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        let (end, events) = {
+                            let log = self.appended.lock().unwrap();
+                            let entries: Vec<_> = log.iter().filter(|(p, _, _)| p == path).collect();
+                            let events: Vec<serde_json::Value> = entries
+                                .iter()
+                                .skip(offset.parse().unwrap_or(0))
+                                .flat_map(|(_, _, body)| {
+                                    serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()
+                                })
+                                .collect();
+                            (entries.len(), events)
+                        };
+                        if !events.is_empty() || !live {
+                            let mut res = response(200);
+                            res.next_offset = Some(end.to_string());
+                            res.up_to_date = true;
+                            res.body = Some(Ok(serde_json::to_string(&events).unwrap()));
+                            return Ok(res);
+                        }
+                        changed.await;
+                    }
+                }
                 if live
                     && self
                         .cap_breach_live_reads
@@ -2329,10 +2462,14 @@ mod tests {
             })
         }
 
-        fn head<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+        fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
+                if self.read_appended {
+                    res.next_offset =
+                        Some(self.appended.lock().unwrap().iter().filter(|(p, _, _)| p == path).count().to_string());
+                }
                 if let Some(offset) = self.head_offsets.lock().unwrap().pop() {
                     res.next_offset = Some(offset);
                 }

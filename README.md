@@ -91,7 +91,8 @@ columns or predicates return 400. See [configuration](docs/deployment-postgres.m
 Transient ingest, sequencing, catalog, backfill frames and Electric snapshot pages share process byte
 admission through `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` (default: 60% of a readable cgroup limit).
 See [the transient memory budgets](docs/memory-model.md#6-transient-operation-budgets) for reservation
-lifetimes, spill behavior and the retained state outside this budget.
+lifetimes, spill behavior and the retained state outside this budget. Initial ingest reservations
+are capped relative to that budget so small transactions can share capacity with page readers.
 
 ## The system
 

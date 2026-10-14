@@ -25,6 +25,8 @@ use crate::table_ref::{TableRef, TableSelector};
 use crate::value::{Row, Value};
 use std::time::Duration;
 
+#[cfg(test)]
+mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
 mod drift;
@@ -1328,6 +1330,19 @@ impl Engine {
         )
     }
 
+    /// Validate the complete catalog before exposing a library-mode engine as ready. Postgres
+    /// boot performs this fold during epoch validation instead, after event-zero admission.
+    pub async fn boot_library(admission: StoreAdmission, config: &crate::config::Config) -> Result<Self> {
+        let engine = Self::new_with_config(admission, None, PostgresSetup::EngineManaged, config);
+        engine.set_waiting();
+        if let Err(error) = engine.fold_catalog().await {
+            engine.close(config.shutdown_grace).await;
+            return Err(error);
+        }
+        engine.health.store(HEALTH_ACTIVE, Ordering::Relaxed);
+        Ok(engine)
+    }
+
     /// Construct using the resolved per-Engine storage and pool settings.
     pub fn new_with_config(
         admission: StoreAdmission,
@@ -2318,6 +2333,16 @@ impl Engine {
         // `waiting` while the engine is trying to reach Postgres, not `starting`.
         self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         let client = crate::pg::connect_owned(&url, &self.shutdown).await?;
+        self.setup_postgres_connected(client, selectors, slot).await
+    }
+
+    async fn setup_postgres_connected(
+        &self,
+        client: tokio_postgres::Client,
+        selectors: &[TableSelector],
+        slot: &str,
+    ) -> Result<()> {
+        let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         // `wal_level` is checked explicitly, first, rather than left to surface as a slot-creation
         // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
         crate::pg::check_wal_level(&client).await?;
@@ -2365,6 +2390,14 @@ impl Engine {
         // identity or schema setup can mutate Postgres or storage. RLS is unsupported in the first
         // profile because it can make logical replication silently selective.
         crate::pg::reject_rls_tables(&client, &tables).await?;
+        // Validate the static projection before slot/publication/identity writes. Compilation
+        // uses all catalog columns regardless of generated-column publication policy; only the
+        // physical fingerprint depends on that policy and is re-read after identity setup below.
+        for table in self.pg_columns.keys() {
+            let _permit = self.metrics.memory_budget.acquire(crate::pg::backfill_config().append_bytes).await;
+            let def = crate::pg::introspect(&client, table, false).await?;
+            self.compile_ingest_table(table, &def)?;
+        }
         // --- The epoch (ADR-0004) ---
         //
         // Read the durable catalog and DECIDE before restoring anything: the epoch the catalog's

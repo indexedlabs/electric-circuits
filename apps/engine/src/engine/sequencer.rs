@@ -791,7 +791,12 @@ pub(crate) async fn sequencer_loop(
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                         loop {
                             let next_chunk = tokio::select! {
-                                _ = shutdown.wait() => Err(anyhow::anyhow!("sequencer input admission interrupted by shutdown")),
+                                _ = shutdown.wait() => {
+                                    tracing::info!("sequencer: shutdown during held input; preserving replay boundary");
+                                    highwater = txn_highwater;
+                                    processing_failed = true;
+                                    break;
+                                },
                                 result = transaction.next_chunk() => result,
                             };
                             let chunk = match next_chunk {
@@ -1267,11 +1272,9 @@ async fn prepare_transactions(
     // A receipt needs query-back credits, and a previously held input needs a spill-reader
     // reservation. In either case spill the rest of this page before taking those dependencies.
     // Ordinary complete pages can consume their page owner directly, without scratch I/O.
-    let spill_ready = held.is_some()
-        || envs.iter().any(|env| {
-            env.type_ == crate::runtime_authority::ENVELOPE_TYPE
-                || env.type_ == crate::replication::SOURCE_FENCE_ENVELOPE
-        });
+    let mut spill_ready = envs.iter().any(|env| {
+        env.type_ == crate::runtime_authority::ENVELOPE_TYPE || env.type_ == crate::replication::SOURCE_FENCE_ENVELOPE
+    });
     let mut ready = Vec::new();
     if let Some(mut run) = held.take() {
         let lead = envs.iter().take_while(|env| run_key(env) == key_ref(&run.key)).count();
@@ -1280,6 +1283,7 @@ async fn prepare_transactions(
                 "sequencer: discarding orphan held transaction fragment");
             metrics.sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
         } else {
+            spill_ready = true;
             let rest = envs.split_off(lead);
             envs.retain(|env| match (env.headers.seq, run.last_seq) {
                 (Some(seq), Some(last)) => seq > last,
@@ -2939,6 +2943,35 @@ mod held_spill_tests {
                 offset: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn memory_budget_orphan_discard_does_not_spool_the_following_complete_page() {
+        let h = Harness::with_budget(u64::MAX, LogPosition::start_of(0), None, Some(10000));
+        let budget = h.engine.metrics.memory_budget.clone();
+        let cfg = h.engine.txn_cfg.lock().unwrap().clone();
+        let first = prepare_transactions(
+            vec![change("1", "0/10", 0, false)],
+            None,
+            &cfg,
+            h.engine.metrics.clone(),
+            Some(Arc::new(budget.acquire(4000).await)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.files().len(), 1);
+        let page = prepare_transactions(
+            vec![change("2", "0/20", 0, true)],
+            first.held,
+            &cfg,
+            h.engine.metrics.clone(),
+            Some(Arc::new(budget.acquire(4000).await)),
+        )
+        .await
+        .unwrap();
+        assert!(h.files().is_empty(), "an orphan discard leaves an ordinary complete page, which needs no scratch I/O");
+        assert_eq!(page.ready.len(), 1);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 4000);
     }
 
     #[tokio::test]
