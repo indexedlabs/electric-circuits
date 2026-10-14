@@ -25,12 +25,15 @@ use crate::table_ref::{TableRef, TableSelector};
 use crate::value::{Row, Value};
 use std::time::Duration;
 
+#[cfg(test)]
+mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
 mod drift;
 pub(crate) mod emission;
 pub(crate) mod epoch;
 mod executors;
+mod held;
 mod introspection;
 mod lifecycle;
 pub(crate) mod membership;
@@ -502,8 +505,9 @@ pub struct Engine {
     /// Flip batches enqueued but not yet fully propagated. Part of the convergence barrier:
     /// drained change log + `pending_flips == 0` ⇒ all subquery effects have landed. An abandoned
     /// batch keeps its count forever, so the barrier can never report "everything landed" over
-    /// effects that were lost — the engine degrades instead (see [`DegradeState`]).
-    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    /// effects that were lost — the engine degrades instead (see [`DegradeState`]). Each batch is
+    /// indexed by its originating commit LSN so receipt barriers can wait for just their prefix.
+    pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
     /// Latched when the live sequencer encounters an unrecoverable body-cap breach.
@@ -579,6 +583,10 @@ pub struct Engine {
     /// `setup_postgres` (which spawns the ingestor). Defaults apply when nothing sets them — the
     /// binary always does, from the boot config.
     txn_cfg: Arc<std::sync::Mutex<crate::txn_buffer::TxnBufferConfig>>,
+    /// Deployment projection, separate from physical schema fingerprints and shape SELECT lists.
+    pg_columns: Arc<std::collections::BTreeMap<TableRef, Vec<String>>>,
+    /// Witnessed tables, with historical column names retained only when configured.
+    pg_columns_seen: Arc<std::sync::RwLock<std::collections::BTreeMap<TableRef, HashSet<String>>>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
@@ -705,14 +713,67 @@ pub(crate) enum FlipWork {
     /// Work that reached a shape while it was still being created, run against that one shape now
     /// that it is installed (see `SubqueryRegistry::finish_create`). Its dependency walk already
     /// happened, so there is nothing left to walk.
-    Deferred { shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
+    Deferred { commit_lsn: u64, shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
     /// Work that reached a fresh parent NODE while a create was still seeding it, re-derived now
     /// that its set is installed (see `SubqueryRegistry::finish_create`). Unlike `Deferred`, this
     /// one DOES walk: reconciling the node produces flips, and the dependents below it — the
     /// create's own shape included — have not seen them.
     DeferredNode {
+        commit_lsn: u64,
         work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::DeferredNodeWork)>,
     },
+}
+
+impl FlipWork {
+    fn commit_lsn(&self) -> u64 {
+        match self {
+            Self::Walk { lsn, .. } => lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0),
+            Self::Deferred { commit_lsn, .. } | Self::DeferredNode { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+}
+
+/// Outstanding propagation and append batches, indexed by their originating commit LSN.
+/// Unknown origins use zero, so they hold every marker. Entries disappear after the last
+/// batch at that position lands; storage is O(distinct outstanding commit positions).
+/// The total and index share one short, non-async lock so receipts never see a partial update.
+#[derive(Default)]
+pub(crate) struct PendingFlips {
+    state: std::sync::Mutex<(i64, BTreeMap<u64, usize>)>,
+}
+
+impl PendingFlips {
+    fn add(&self, commit_lsn: u64) {
+        self.add_all(std::iter::once(commit_lsn));
+    }
+
+    /// Reserve an entire handoff before any worker can complete one of its batches. The
+    /// receipt check must not observe an empty prefix between two batches of the same create.
+    fn add_all(&self, origins: impl IntoIterator<Item = u64>) {
+        let mut state = self.state.lock().unwrap();
+        for commit_lsn in origins {
+            state.0 += 1;
+            *state.1.entry(commit_lsn).or_default() += 1;
+        }
+    }
+
+    fn complete(&self, commit_lsn: u64) {
+        let mut state = self.state.lock().unwrap();
+        let count = state.1.get_mut(&commit_lsn).expect("completed an untracked flip batch");
+        *count -= 1;
+        if *count == 0 {
+            state.1.remove(&commit_lsn);
+        }
+        state.0 -= 1;
+    }
+
+    fn count(&self) -> i64 {
+        self.state.lock().unwrap().0
+    }
+
+    fn has_at_or_before(&self, marker_lsn: u64) -> bool {
+        self.state.lock().unwrap().1.first_key_value().is_some_and(|(&lsn, _)| lsn <= marker_lsn)
+    }
 }
 
 /// Everything a tailer needs to route deltas through the subquery layer: the shared registry for
@@ -722,7 +783,7 @@ pub(crate) enum FlipWork {
 struct SubqueryHandle {
     registry: Arc<Mutex<SubqueryRegistry>>,
     flip_tx: mpsc::UnboundedSender<FlipWork>,
-    pending_flips: Arc<std::sync::atomic::AtomicI64>,
+    pending_flips: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
 }
 
@@ -737,7 +798,7 @@ struct SubqueryHandle {
 fn spawn_flip_propagator(
     registry: Arc<Mutex<SubqueryRegistry>>,
     mut rx: mpsc::UnboundedReceiver<FlipWork>,
-    pending: Arc<std::sync::atomic::AtomicI64>,
+    pending: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     shutdown: crate::shutdown::ShutdownToken,
@@ -753,6 +814,7 @@ fn spawn_flip_propagator(
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
             shutdown.spawn_background(async move {
+                let commit_lsn = fw.commit_lsn();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
                 // is treated exactly like a live one, because its effects are just as lost.
                 let failed = match fw {
@@ -762,21 +824,23 @@ fn spawn_flip_propagator(
                             .err()
                             .map(|e| (e, work.len()))
                     }
-                    FlipWork::Deferred { shape_id, mut work } => {
+                    FlipWork::Deferred { shape_id, mut work, .. } => {
                         crate::subquery::propagate_deferred_with_retry(&registry, &shape_id, &mut work)
                             .await
                             .err()
                             .map(|e| (e, work.len()))
                     }
-                    FlipWork::DeferredNode { mut work } => {
+                    FlipWork::DeferredNode { mut work, .. } => {
                         // The walk the re-derivations feed starts empty and is carried across the
                         // retries with them, so an exhausted batch reports both halves of what it
                         // never got through.
                         let mut walk = std::collections::VecDeque::new();
-                        crate::subquery::propagate_deferred_node_with_retry(&registry, &mut work, &mut walk, &trace_tx)
-                            .await
-                            .err()
-                            .map(|e| (e, work.len() + walk.len()))
+                        crate::subquery::propagate_deferred_node_with_retry(
+                            &registry, &mut work, &mut walk, commit_lsn, &trace_tx,
+                        )
+                        .await
+                        .err()
+                        .map(|e| (e, work.len() + walk.len()))
                     }
                 };
                 if let Some((e, unfinished)) = failed {
@@ -799,7 +863,7 @@ fn spawn_flip_propagator(
                 // Decremented only after propagation finished enqueueing every resulting
                 // batch — each batch carries its own pending increment until it lands, so
                 // the barrier never reads zero with effects in flight.
-                pending.fetch_sub(1, Ordering::SeqCst);
+                pending.complete(commit_lsn);
                 drop(permit);
             });
         }
@@ -1215,9 +1279,15 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
-    /// Construct a production engine only from storage admission completed before engine setup.
-    pub fn new(admission: StoreAdmission) -> Self {
-        Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None)
+    /// Construct a library engine after checking store bindings across every catalog page.
+    /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
+    /// Cancellation during validation releases the current page and starts no engine work.
+    pub async fn new(admission: StoreAdmission) -> Result<Self> {
+        let bytes = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
+        let engine =
+            Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None);
+        engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
+        Ok(engine)
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
@@ -1268,14 +1338,32 @@ impl Engine {
         )
     }
 
-    /// Construct using the resolved per-Engine storage and pool settings.
-    pub fn new_with_config(
-        admission: StoreAdmission,
+    /// Validate the complete catalog before exposing a library-mode engine as ready. Postgres
+    /// boot performs this fold during epoch validation instead, after event-zero admission.
+    pub async fn boot_library(admission: StoreAdmission, config: &crate::config::Config) -> Result<Self> {
+        Self::new_with_config(admission, None, PostgresSetup::EngineManaged, config).await
+    }
+
+    /// Construct using resolved storage/pool settings. Library mode checks bindings across all catalog
+    /// pages before construction; errors/cancellation start no engine work. Postgres mode remains
+    /// waiting until `setup_postgres` validates the catalog and completes boot.
+    pub async fn new_with_config(
+        mut admission: StoreAdmission,
         pg_url: Option<String>,
         setup: PostgresSetup,
         config: &crate::config::Config,
-    ) -> Self {
-        Self::new_configured(admission, pg_url, setup, config, None)
+    ) -> Result<Self> {
+        let bytes = if pg_url.is_none() {
+            admission.ds = admission.ds.with_memory_budget(config);
+            Some(Self::check_catalog_binding(&admission.ds, &admission.binding).await?)
+        } else {
+            None
+        };
+        let engine = Self::new_configured(admission, pg_url, setup, config, None);
+        if let Some(bytes) = bytes {
+            engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
+        }
+        Ok(engine)
     }
 
     pub(crate) fn new_supervised(
@@ -1296,6 +1384,9 @@ impl Engine {
         restart_notify: Option<Arc<tokio::sync::Notify>>,
     ) -> Self {
         let postgres = pg_url.is_some();
+        if !postgres && !config.pg_columns.is_empty() {
+            tracing::warn!("ELECTRIC_CIRCUITS_PG_COLUMNS is ignored in library mode");
+        }
         let engine =
             Self::new_inner(admission.ds, pg_url, Some(admission.binding), setup, Some(config), restart_notify);
         if postgres {
@@ -1316,10 +1407,16 @@ impl Engine {
         if let Some(binding) = binding {
             store_bound.set(binding).expect("fresh store binding proof");
         }
-        let metrics = Arc::new(crate::metrics::Metrics::new(
+        let ds = match config {
+            Some(config) => ds.with_memory_budget(config),
+            None => ds,
+        };
+        let mut metrics = crate::metrics::Metrics::new(
             config.map_or_else(|| crate::config::stack_id().to_owned(), |c| c.stack_id.clone()),
             restart_notify.is_some(),
-        ));
+        );
+        metrics.memory_budget = ds.memory_budget().clone();
+        let metrics = Arc::new(metrics);
         let memory_gauges = Arc::new(crate::mem::Gauges::default());
         let source_id = restart_notify.as_ref().map(|_| metrics.stack_id.clone());
         let telemetry = crate::mem::init_otel(metrics.clone(), memory_gauges.clone(), source_id.as_deref());
@@ -1345,7 +1442,7 @@ impl Engine {
         )));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
-        let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let pending_flips = Arc::new(PendingFlips::default());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1453,6 +1550,8 @@ impl Engine {
             retrying: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             txn_cfg: Arc::new(std::sync::Mutex::new(crate::txn_buffer::TxnBufferConfig::default())),
+            pg_columns: Arc::new(config.map(|c| c.pg_columns.clone()).unwrap_or_default()),
+            pg_columns_seen: Arc::default(),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
@@ -1921,7 +2020,7 @@ impl Engine {
     }
 
     /// Configure large-transaction handling on the ingest path — the per-transaction memory cap,
-    /// the spill directory and the append byte budget (ADR-0003). Call before
+    /// the sequencer held-input cap, spill directory and append byte budget (ADR-0003). Call before
     /// [`setup_postgres`](Self::setup_postgres), which spawns the ingestor.
     pub fn set_txn_config(&self, cfg: crate::txn_buffer::TxnBufferConfig) {
         *self.txn_cfg.lock().unwrap() = cfg;
@@ -2007,7 +2106,7 @@ impl Engine {
 
     /// Flip batches enqueued but not yet propagated (convergence-barrier term; see `flip_tx`).
     pub fn pending_flips(&self) -> i64 {
-        self.pending_flips.load(std::sync::atomic::Ordering::SeqCst)
+        self.pending_flips.count()
     }
 
     /// Flip batches abandoned after exhausting their retries — membership effects the engine
@@ -2127,6 +2226,8 @@ impl Engine {
         if st.sequencer.is_none() {
             let start = self.seq_start.lock().unwrap().clone();
             let highwater = *self.seq_highwater.lock().unwrap();
+            let txn_cfg = self.txn_cfg.lock().unwrap().clone();
+            crate::txn_buffer::sweep_held_spill_dir(&txn_cfg.spill_dir);
             st.sequencer = Some(spawn_sequencer(
                 self.ds.clone(),
                 self.tables_shared.clone(),
@@ -2146,6 +2247,7 @@ impl Engine {
                 self.restore_reads_paused.clone(),
                 self.read_cap_failed.clone(),
                 self.retention.pending_buffer_max_bytes,
+                txn_cfg,
                 self.pg_pool.as_ref().map(crate::pg::Pool::sequenced),
                 self.shutdown.clone(),
             ));
@@ -2221,6 +2323,46 @@ impl Engine {
         self.health_status()
     }
 
+    fn validate_ingest_tables(&self, tables: &[TableRef]) -> Result<()> {
+        for table in self.pg_columns.keys() {
+            if !tables.contains(table) {
+                bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: unknown tracked table '{table}'");
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_ingest_table(&self, table: &TableRef, def: &crate::schema::TableDef) -> Result<TableSchema> {
+        let full = TableSchema::from_def(table, def)?;
+        match self.pg_columns.get(table) {
+            Some(columns) => {
+                let seen = self.pg_columns_seen.read().unwrap();
+                let columns: Vec<_> = columns.iter().filter(|column| {
+                    if !def.columns.contains_key(*column) && seen.get(table).is_some_and(|names| names.contains(*column)) {
+                        tracing::warn!(%table, %column, "configured ingest column was dropped; projecting without it");
+                        false
+                    } else {
+                        true
+                    }
+                }).cloned().collect();
+                full.project_ingest(&columns).context("ELECTRIC_CIRCUITS_PG_COLUMNS")
+            }
+            None => Ok(full),
+        }
+    }
+
+    fn tracks_ingest_columns(&self, table: &TableRef) -> bool {
+        self.pg_columns.contains_key(table) || self.pg_columns_seen.read().unwrap().contains_key(table)
+    }
+
+    fn remember_ingest_columns(&self, table: &TableRef, columns: &[String]) {
+        let mut seen = self.pg_columns_seen.write().unwrap();
+        let names = seen.entry(table.clone()).or_default();
+        if let Some(configured) = self.pg_columns.get(table) {
+            names.extend(columns.iter().filter(|name| configured.contains(name)).cloned());
+        }
+    }
+
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
     /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
     /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
@@ -2231,6 +2373,16 @@ impl Engine {
         // `waiting` while the engine is trying to reach Postgres, not `starting`.
         self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         let client = crate::pg::connect_owned(&url, &self.shutdown).await?;
+        self.setup_postgres_connected(client, selectors, slot).await
+    }
+
+    async fn setup_postgres_connected(
+        &self,
+        client: tokio_postgres::Client,
+        selectors: &[TableSelector],
+        slot: &str,
+    ) -> Result<()> {
+        let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         // `wal_level` is checked explicitly, first, rather than left to surface as a slot-creation
         // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
         crate::pg::check_wal_level(&client).await?;
@@ -2273,6 +2425,7 @@ impl Engine {
         }
         tables.sort();
         tables.dedup();
+        self.validate_ingest_tables(&tables)?;
         // Validate tracked-table visibility before any durable catalog, slot, publication,
         // identity or schema setup can mutate Postgres or storage. RLS is unsupported in the first
         // profile because it can make logical replication silently selective.
@@ -2300,6 +2453,15 @@ impl Engine {
                  silently orphan every shape already in the log). Fix durable-streams and restart.",
             )
         })?;
+        // The validated catalog supplies the history that distinguishes a dropped column from a
+        // typo. Validate projection before epoch/slot/publication/identity writes. Compilation
+        // uses all catalog columns regardless of generated-column publication policy; only the
+        // physical fingerprint depends on that policy and is re-read after identity setup below.
+        for table in self.pg_columns.keys() {
+            let _permit = self.metrics.memory_budget.acquire(crate::pg::backfill_config().append_bytes).await;
+            let def = crate::pg::introspect(&client, table, false).await?;
+            self.compile_ingest_table(table, &def)?;
+        }
         self.adopt_epoch_binding(fold.binding.clone());
         let verdict = self.verify_epoch_at_boot(&client, slot).await?;
         let restored = match boot_epoch_action(&verdict) {
@@ -2365,7 +2527,7 @@ impl Engine {
             {
                 bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
             }
-            let ts = TableSchema::from_def(t, &def)?;
+            let ts = self.compile_ingest_table(t, &def)?;
             compiled.insert(t.clone(), ts);
         }
         *self.tables_shared.write().unwrap() = compiled.clone();
@@ -2385,6 +2547,11 @@ impl Engine {
         // routing sees every replayed change.
         if let Some(fold) = restored {
             self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume).await.context("catalog restore")?;
+        } else {
+            // Epoch reset retired the old records already. Still commit the projection witness
+            // before new ingest. The existing catalog reader holds Slice 5 page permits.
+            let mut fold = self.fold_catalog().await?;
+            self.reconcile_ingest_columns(&mut fold, &compiled).await?;
         }
         {
             let mut st = self.state.lock().await;
@@ -2526,8 +2693,8 @@ impl Engine {
         if compiled.contains_key(crate::runtime_authority::marker_table()) {
             bail!("runtime authority marker is private and cannot be an application table");
         }
-        // Library mode has no durable catalog to fold, so the current segment is whatever this
-        // process already resolved (0 on a fresh engine) and nothing rotates it — there is no
+        // Library construction validated the catalog but does not restore its Postgres state.
+        // The current segment is whatever this process resolved (0 on a fresh engine); there is no
         // ingestor. The CURRENT segment stream is what gets created, never a bare `changes`.
         self.init_change_log(
             self.changes.state().current(),
@@ -2575,6 +2742,23 @@ impl Engine {
         // subquery state needed for a non-live page); other predicates use the compiled-form emitter.
         let where_sql = match where_.as_ref() {
             Some(p) if crate::subquery::predicate_has_subquery(p) => {
+                // Reuse the predicate compiler's column/type checks without registering any
+                // maintained nodes for this one-shot query. Every nested table is projected too.
+                struct Validate<'a>(&'a HashMap<TableRef, TableSchema>);
+                impl crate::predicate::SubqueryCollector for Validate<'_> {
+                    fn collect(
+                        &mut self,
+                        table: &TableRef,
+                        project: &str,
+                        where_: Option<&PredicateJson>,
+                    ) -> Result<crate::predicate::SubquerySig> {
+                        let ts = self.0.get(table).with_context(|| format!("unknown subquery table '{table}'"))?;
+                        ts.column_index(project)?;
+                        CompiledPredicate::compile_opt_with(where_, ts, self)?;
+                        Ok(crate::predicate::subquery_sig(table, project, where_))
+                    }
+                }
+                CompiledPredicate::compile_with(p, &ts, &mut Validate(&schemas))?;
                 Some(crate::sql::predicate_json_to_sql(p, 1, &schemas, table))
             }
             Some(p) => {
@@ -2767,6 +2951,12 @@ impl Engine {
         // lifecycle-map check when the shape is active (the common case).
         self.ensure_active(sid_of_path(path)).await?;
         self.ds.read(path, offset, live).await
+    }
+
+    /// Resolve lifecycle before holding a fold reservation: wake/replay can itself need budget.
+    pub(crate) async fn shape_fold_input(&self, path: &str) -> Result<DsClient> {
+        self.ensure_active(sid_of_path(path)).await?;
+        Ok(self.ds.clone())
     }
 
     /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:

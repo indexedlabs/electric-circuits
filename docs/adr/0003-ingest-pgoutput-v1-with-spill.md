@@ -22,17 +22,59 @@ Revisit v2 when large transactions measurably delay small ones — a latency rea
 
 ## Consequences
 
+Process byte admission adds a shared reservation ledger across ingest, sequencer input, boot catalog
+pages, backfills and Electric folds. `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` enables admission only
+when set to a positive byte count; unset or `0` disables it with one boot log, regardless of cgroup
+limits. It accounts only transient input, so the default stays off until a profiled boot peak shows
+which stage needs bounding. Cgroup counters remain in memory snapshot logs. Held spill (its own
+default 64 MiB cap) and ingest spill apply independently of admission. Oversized requests wait
+for an empty ledger, and permit/waiter owners release on cancellation. Byte reservations are not an
+RSS ceiling: retained state, output batches, protocol buffers and allocator slack are additional.
+
+An enabled ledger makes held input spill before another page is read, even below the held cap. A
+page that carries a receipt or continues a held transaction spills all remaining input before
+processing; other complete pages consume their original reservation directly. Page permits follow
+input across blocking jobs and are released only after consumption/spill. Reader workspace permits
+end before receipt waits. Scratch writers are flushed/closed before those waits. All files retain
+the existing NDJSON format, replay pins, highwater rules and cleanup ownership.
+
+An ingestor initially reserves the smaller of its cap plus append workspace and one quarter of the
+process budget (at least one byte). Drain workspace is bounded by actual buffered bytes and the append
+cap, plus one envelope. Admission after a schema message restores the original reservation floor,
+not the last wire frame's size. A larger workspace grows the existing permit only when capacity
+fits immediately and nobody is queued; it never waits while retaining credit. Otherwise a capped
+ingestor spills before waiting for a larger reservation or pool-dependent schema work. The initial
+share is not a spill threshold: an under-cap commit with available capacity stays in memory.
+This prevents a backfill waiting for memory while holding a pool slot from blocking the ingestor
+that owns the needed memory. The documented `0 = never spill` mode retains rows outside the ledger;
+its input/drain workspace uses ordinary FIFO requests, without forcing exclusivity.
+
+Backfill readers and Electric materialization/key folds reserve per frame/page, sized to the append
+budget or DS read cap. They release credit after decoding/consumption and before requesting more.
+A larger indivisible backfill frame drops the smaller permit before admitting its actual wire size.
+Only a single request larger than the process budget requires exclusivity; fitting requests coexist.
+Retained fold maps, decoded backfill rows, collected results and response conversion stay unaccounted,
+like arrangement state. Snapshot SQL, xid fences, pool ownership and results are unchanged. Every fold page checks
+lifecycle/degradation before admission, after releasing the previous permit. Waiting ingest never advances applied LSN, and acknowledgement still
+follows the last durable append. Non-live DS reads acquire before HTTP send; long-polls wait for
+data without credits and consume that response if admission is immediate. Only a real admission
+wait discards it and re-reads the same offset with a fresh HTTP deadline. The sequencer preserves
+its pending read/admission across ordinary commands; explicit pause and shutdown cancel it.
+
+The process gauges are `engine_memory_budget_bytes` and `engine_memory_permits_held_bytes`; the
+counter is `engine_memory_permit_waits_total`. Source endpoints observe the same process totals.
+This is a transient admission policy, not a new catalog/change-log format or recovery authority.
+
 Peak **ingestor** memory is bounded by `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (default 134217728,
 128 MiB; `0` never spills) plus one chunk — the chunk held parsed, plus its serialized body while
 the POST is in flight. That is a bound on the ingestor, not on the engine: the sequencer's read
-page, the run it holds (see below) and its per-transaction `txn_pending` are bounded by a
-transaction's size, not by this knob. The cap is measured on what is actually held (inline size plus
+page and per-transaction `txn_pending` are not bounded by this knob; held input has its own cap below. The cap is measured on what is actually held (inline size plus
 owned heap, the engine's `HeapSize` estimate), so nothing is serialized on the way in and an
 ordinary commit costs exactly what it did before this ADR. Past the cap the buffer is serialized out
 to one newline-delimited-JSON file under `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` (default a private 0700
 `<temp dir>/circuits-txn-spill-<uid>`; files are `O_EXCL`, mode 0600), memory is released, and every
 further change of that transaction is written straight to the file; that directory therefore needs
-room for the largest transaction the database can produce, and is probed for writability at boot —
+room for concurrent ingest and sequencer held spills, and is probed for writability at boot —
 an unusable one refuses the boot rather than failing every large commit. The file is scratch, never
 state: it is removed at commit, at abort, and when the replication connection is torn down, and a
 leftover from a process that died mid-transaction is swept at the next boot by pid liveness. Pids
@@ -48,6 +90,13 @@ connection down unacknowledged, Postgres re-delivers the whole transaction, and 
 `(lsn, seq)` de-duplication discards the chunks that already landed. Rotation stays a
 transaction-boundary decision, so a segment never splits a commit by policy.
 
+Runtime and source/deployment drain receipts also wait for the complete transaction and its direct
+appends, then for pending subquery propagation and emission batches whose originating commit LSN is
+at or before the marker's LSN. A later commit's pending work does not delay an earlier receipt.
+Propagation passes its origin to nested work, create replay and ordered stream appends; an unknown
+origin conservatively holds every marker. This changes neither the ingest acknowledgement boundary
+nor the aggregate `pendingFlips` convergence metric. Shutdown and degradation still refuse receipts.
+
 **Chunking must not become visible as several transactions.** Durable-streams exposes each append
 atomically, so a reader long-polling the segment tail sees chunk 1 on its own; splitting a page into
 transactions by `(txid, lsn)` alone would fan that chunk out and flush it to the shape streams as if
@@ -56,6 +105,23 @@ it were a whole commit. The ingestor therefore marks the **last envelope of ever
 writers mark their one-envelope writes, and the sequencer **holds** a trailing run that no marker
 terminates: the held envelopes are carried into the next read and the transaction is processed and
 flushed only once the marker arrives.
+
+When process byte admission is disabled, the held run has a separate envelope-memory cap, `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (67108864,
+64 MiB; `0` spills immediately). Strictly past it, input moves to a unique
+`circuits-held-<uuid>-<pid>.ndjson` file in the same spill directory, using the ingestor's NDJSON
+format **without restamping**. Further held input goes straight to that file. After the end marker,
+the sequencer reads bounded chunks rather than reconstructing a transaction vector; chunk boundaries
+never flush partial output. Per-transaction output and arrangement batches remain proportional to the
+transaction; the current read page, one oversized envelope, decode storage and 1 MiB I/O buffers are
+additional to the held-input cap. This is an input bound, not a total engine memory budget.
+
+One awaited blocking operation per sequencer owns spill I/O. The scratch owner removes the file after
+processing/receipt completion, on orphan or epoch-fragment discard, and on shutdown. A cancelled
+blocking operation drops its owner when it finishes. Read/write/parse/truncation failures stop
+sequencing at the replay boundary without publishing the failed transaction's highwater. Stale held
+files join the ingest boot sweep; active held owners are registered so a later ingestor/source boot
+cannot remove them. The directory is required and probed even when ingest spilling is disabled.
+No durable format or recovery authority changes: a restart replays the change log, not scratch.
 
 Re-delivery folds into the hold, carefully. An interrupted chunked commit is acknowledged nowhere, so
 Postgres re-sends it from its start; and because acknowledgements are flushed on an interval, a
@@ -83,4 +149,17 @@ not idempotent under duplicates.
 
 `GET /metrics` reports `txn_spills_total`, `txn_spill_bytes` (cumulative bytes ever spilled) and
 `txn_chunked_appends_total` (the chunk appends made by commits too large for one append; an ordinary
-commit contributes 0).
+commit contributes 0). It also reports `sequencer_held_bytes` (estimated in-memory input, excluding
+disk/I/O buffers) and `sequencer_held_spills_total` (transactions spilled). Prometheus exports
+`engine_sequencer_held_bytes` and `engine_sequencer_held_spills_total`; counter reset preserves the gauge.
+
+### Static ingest projection (ADR-0012)
+
+A deployment may restrict each tracked table with `ELECTRIC_CIRCUITS_PG_COLUMNS`. Both new and old
+images lose unlisted columns before transaction buffering, spilling and append sizing; all primary
+keys remain. This reduces retained/log bytes but does not reduce PostgreSQL's full-row wire frames.
+The NDJSON scratch format, change envelopes, transaction markers, acknowledgement and held-run rules
+remain unchanged. Backfills/query-backs use the same projected schema. A changed effective set retires
+dependent streams at boot, durably before its additive catalog witness and before ingest starts;
+clients recreate from fresh snapshots. Physical schema fingerprints remain full-width. See
+[ADR-0012](0012-static-ingest-columns.md).

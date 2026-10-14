@@ -82,6 +82,24 @@ How a query registers onto its circuit, end to end:
 [docs/how-queries-become-live.md](docs/how-queries-become-live.md). Engine internals and cost
 model: [docs/ivm-engine-internals.md](docs/ivm-engine-internals.md).
 
+Deployments can omit unused row payloads before buffering with
+`ELECTRIC_CIRCUITS_PG_COLUMNS=public.agent_run:id,status` (one list per tracked table, including all
+primary-key columns). Backfills and query-backs use that same column set. Changing it requires a
+restart and retires dependent streams so clients recreate from fresh snapshots; unlisted shape
+columns or predicates return 400. See [configuration](docs/deployment-postgres.md).
+
+Transient ingest, sequencing, catalog, backfill frames and Electric snapshot pages share process byte
+admission when `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` is set to a positive byte count. Admission is
+off by default (unset or `0`), regardless of cgroup limits. It accounts only transient input, so the
+default stays off until a profiled boot peak shows which stage needs bounding. Cgroup counters remain
+in memory snapshot logs; held and ingest spill caps apply independently of admission.
+See [the transient memory budgets](docs/memory-model.md#6-transient-operation-budgets) for reservation
+lifetimes, spill behavior and the retained state outside this budget. When enabled, initial ingest reservations
+are capped relative to that budget so small transactions can share capacity with page readers.
+An under-cap transaction grows its reservation without spilling when capacity is immediately
+available; it releases credit before any admission wait. Sequencer reads retain their FIFO place
+across commands, and immediately admitted live pages need only one request.
+
 ## The system
 
 ```

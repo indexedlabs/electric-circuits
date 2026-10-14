@@ -83,7 +83,8 @@ Three ideas carry the whole design:
 - **runtime authority drain** (`runtime_authority.rs`) — a private gateway receipt family, separate
   from deployment handoff. The source's `public.native_sync_authority_fence` INSERT/UPDATE becomes
   an ordered runtime envelope carrying its admitted ingress incarnation. The sequencer waits for
-  the complete transaction and deferred effects before publishing an exact user/generation/marker
+  the complete transaction and deferred effects originating at or before its commit LSN before
+  publishing an exact user/generation/marker
   receipt into a bounded, expiring memory cache. Reset invalidates queued and in-flight old
   incarnations; runtime traffic never advances deployment catalog/closure provenance. See the
   [runtime integration contract](../apps/engine/README.md#runtime-authority-drain) for publication,
@@ -182,9 +183,9 @@ every further change of that transaction goes straight to the file. At the commi
 streamed back in order, stamped, and appended in chunks of at most
 `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB, ≤ the durable-streams body cap) — **acknowledging
 the slot, publishing `last_lsn` and releasing the drain barrier only after the LAST chunk lands**.
-Peak **ingestor** memory is the cap plus one chunk (the sequencer's own read page, held run and
-pending appends are bounded by the transaction's size, not by this knob), and transaction size never
-invalidates a shape.
+Peak **ingestor** memory is the cap plus one chunk. The sequencer has a separate held-input cap;
+read pages and pending appends are not bounded by the ingest knob. Transaction size never invalidates
+a shape. The shared spill directory must fit concurrent ingest and held-input scratch.
 
 **Chunking is not visible as several transactions.** Durable-streams exposes each append atomically,
 so the sequencer's long-poll returns chunk 1 on its own; splitting a page by `(txid, lsn)` alone would
@@ -193,6 +194,82 @@ a **transaction-end marker** on the last envelope of every transaction (`headers
 single-chunk commits too; library-mode writers stamp their one-envelope writes), and the sequencer
 **holds** a trailing run that no marker terminates: held envelopes are carried into the next read and
 the transaction is processed and flushed only when the marker arrives.
+
+Without process byte admission, held input spills strictly past `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (default 67108864, 64 MiB;
+`0` spills immediately). `engine/held.rs` owns the memory/file transition and streams the same NDJSON
+envelope format back without changing stamps or rebuilding a whole input vector. The sequencer awaits
+one blocking disk operation at a time, decoding chunks up to `min(cap, 1 MiB)` (at least one byte),
+plus an indivisible envelope. Reader/writer buffers are 1 MiB each; the cap excludes these buffers,
+the current page, per-transaction output and arrangement deltas. Only input is bounded by this cap.
+Unique `circuits-held-<uuid>-<pid>.ndjson` files share the ingestor's private directory. Their owner
+removes them after transaction flush/receipt, on orphan/epoch-fragment discard and shutdown. Boot
+sweeps remove stale files; registered active held files survive an ingestor/source boot sweep. Disk
+errors stop the sequencer without advancing past the safe replay boundary; recovery rereads the log.
+
+`ELECTRIC_CIRCUITS_PG_COLUMNS` optionally restricts each tracked table's ingest columns. The
+compiled positional schema contains that set; the physical `SchemaFingerprint` still contains the
+full published schema. pgoutput decoding drops unlisted cells from both images before envelope
+buffering/spilling/appending; it still receives full wire tuples. Backfill and query-back row SQL
+selects only the compiled columns, and unavailable output/predicate columns (including nested inner
+predicates) are HTTP 400 errors naming table and column. All PK columns are mandatory. Drift
+re-introspection reapplies the configured set. After reading catalog witnesses, boot validates column
+names and PK membership before entering the epoch or mutating slots/publications/identity; these schema preflight reads take one
+backfill-sized permit per configured table. Supervised sources receive only their tracked entries;
+an entry tracked by no source is a fatal startup configuration error. After startup, unused entries
+warn once per table and are ignored, allowing removals and other plan actions to proceed. A trailing semicolon is
+accepted; library mode warns that the setting is ignored.
+
+The additive catalog event `ingestColumns { table, columns, hash }` records sorted effective names
+and their SHA-256; absent records mean all columns. Before dormant restore and ingest, boot retires
+every shape over a changed table, including subquery dependencies, awaiting durable `Dropped`,
+close/delete and durable `Retired` before appending the new set durably. A crash repeats unfinished
+retirements. Unchanged recorded sets do nothing; an explicit setting without a witness records one
+even when it names every current column, without retiring shapes in that case. Legacy comparison
+uses the full compiled column set, including stored generated columns omitted from pgoutput. A
+listed column absent after DDL is omitted with a warning when an existing witness recorded it; an
+absent name never witnessed is a fatal typo. Historical names are derived from existing events and
+retained only for configured names, with one entry per witnessed table even after its setting is
+removed. Runtime DDL on a configured or previously witnessed table refreshes a changed effective-width
+witness after dependent retirements and before installing the new schema. With neither setting nor
+witness, ADD/DROP COLUMN queues retirement without waiting or writing a witness. Clients recreate retired
+streams and backfill newly included columns. Existing `SchemaChanged` and shape output lists keep
+their meanings. Catalog body reads use the shared page permits; projection reconciliation holds no
+permit while waiting for retirement. See [ADR-0012](adr/0012-static-ingest-columns.md).
+
+The process byte ledger (`memory_budget.rs`) is shared by all supervised sources. Its setting,
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, enables admission only at a positive byte count. Unset or
+`0` disables admission with one boot log, regardless of cgroup limits. It accounts only transient
+input, so the default stays off until a profiled boot peak shows which stage needs bounding.
+Cgroup counters remain in memory snapshot logs. Held spill (its own default 64 MiB cap) and ingest
+spill apply independently of admission. When enabled, FIFO byte requests wait for capacity. An oversized
+request requires no other owner; cancellation releases queued requests and owned credits.
+With admission enabled, non-live DS reads acquire before sending HTTP requests. Long-polls wait for data without credits,
+then consume that response if admission is immediate. Only an admission wait discards it and
+re-issues a non-live read at the same offset with a fresh deadline. The sequencer retains that
+read/admission across ordinary commands; explicit pause and shutdown cancel it.
+
+Catalog page credit lasts through the page visitor; sequencer body credit lasts through consumption
+or spill, including awaited blocking jobs. With admission enabled, every held run spills before the
+next read. Pages containing runtime/source receipts or continuing a held run spill all remaining
+input before processing; ordinary complete pages retain the original credit without extra disk I/O.
+Bounded spill-reader credit is released before the receipt can wait for a query-back.
+
+Ingest bounds its initial cap-plus-workspace reservation to one quarter of the process budget
+(at least one byte). Drain workspace uses actual buffered bytes up to the append cap, plus one
+envelope. Schema-message readmission restores the initial floor. Growth uses available capacity
+without waiting or bypassing queued peers, so fitting under-cap commits stay in memory. Otherwise
+it spills a capped buffer before larger workspace or pool-dependent schema waits, and never
+acknowledges while waiting. The
+never-spill escape hatch admits only input/drain workspace; its unbounded retained rows are unaccounted.
+Electric folds take ordinary FIFO permits for each capped DS page; backfills take one append-sized
+permit for each cursor frame. After consumption/decoding, each releases before requesting another.
+A larger indivisible backfill frame drops the smaller credit before admitting its actual wire size.
+Only an individual request above the budget needs exclusive admission, so fitting pages/frames can
+run concurrently. Retained fold maps, decoded rows and result sets are outside the ledger, like
+arrangement state. Every fold page checks lifecycle/degradation before admission; snapshot SQL and xid fences are unchanged.
+The ledger covers transient input reservations, not RSS or all retained state; see
+[the memory model](memory-model.md#6-transient-operation-budgets) and
+[engine configuration](../apps/engine/README.md#process-byte-admission).
 
 A re-delivery has to fold into that hold. When the ingestor fails part-way it acknowledges nothing,
 so Postgres re-sends the interrupted transaction from its start — and, because acknowledgements are
@@ -595,7 +672,13 @@ sequencer feeds every table's deltas into:
   order alone is not freshness for a query-back, whose rows were read before it took the lock; the
   per-pk recency fence below closes that gap.) The engine exposes the in-flight count
   (`GET /replication/lsn` → `pendingFlips`) as the extra convergence-barrier term; it covers both
-  undrained flips and enqueued-but-unlanded lane batches. A failed query-back is **retried**, and
+  undrained flips and enqueued-but-unlanded lane batches. Internally those batches retain the
+  originating commit LSN, including nested propagation, create replay and resulting lane appends.
+  Runtime and source/deployment receipts wait only for pending origins at or before their marker's
+  commit LSN; later work does not hold that barrier. Unknown origins conservatively hold every
+  marker. Create replay batches are separated by origin; coalesced re-derivations keep the earliest
+  covered origin. The index retains only outstanding origins, while `pendingFlips` remains the
+  total across all commits. Shutdown and degradation still refuse receipts. A failed query-back is **retried**, and
   the retry resumes the DAG walk where the failure stopped (the walk consumes transitions, so
   restarting it from the roots would derive nothing and silently lose the dependents' moves). If
   the retries are exhausted the batch's effects are gone for good — the node already moved — so
@@ -845,6 +928,17 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 
 ## 9. Consistency & durability model (summary)
 
+Store admission reads only the first catalog event to validate the immutable `storeBound` identity.
+It buffers that capped response body but decodes no later events. The subsequent fold reads the
+whole catalog page by page and checks bindings before `eid` de-duplication, so a duplicate or
+reordered `storeBound` still refuses boot before restore. Library-mode boot also completes this
+binding validation before publishing readiness, without folding or retaining nonbinding catalog
+history. Its `catalog binding check complete` log and the Postgres fold's `catalog read complete`
+log report `catalog_bytes`: the sum of response-body lengths, including JSON framing and
+repeated events, excluding admission reads. The same boot measurement is the `catalog_bytes`
+JSON gauge and `engine_catalog_bytes` Prometheus gauge; it survives metric reset and does not track
+later appends or estimate heap usage. The catalog remains append-only and uncompacted.
+
 | seam | mechanism | guarantee |
 |---|---|---|
 | backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
@@ -866,6 +960,12 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
 | graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, writes a final `Offset` → catalog drains → exit 0; bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
+
+Public library constructors `Engine::new` and `Engine::new_with_config` are async and return
+`Result<Engine>`. They check store bindings across every catalog page before creating engine tasks
+or exposing readiness/control operations; `boot_library` delegates to the same path. They do not
+restore or validate nonbinding records. A failed or cancelled
+validation leaves no engine running. Postgres construction remains waiting for its boot validation.
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,
@@ -912,9 +1012,10 @@ than the mechanism.
 ## 11. Telemetry
 
 - `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
-  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions,
+  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for ingest and
+  `sequencer_held_spills_total` for held transactions spilled to disk,
   `backfill_chunked_appends_total` for streamed backfills, `sequencer_orphan_fragments_total`) +
-  gauges (`changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the
+  gauges (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `sequencer_held_bytes`, `shutdown_in_progress`, and the
   replication-slot trio below) + log-bucket latency histograms (`process_envelope`, `family_step`,
   `append`) with p50/p99/p999/max.
 - **Replication-slot gauges**, engine-owned and sampled every ~10 s on a fresh connection: `replication_slot_retained_wal_bytes`

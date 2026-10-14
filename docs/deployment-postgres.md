@@ -77,6 +77,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE` | for nonlocal PG | — | Absolute path to a PEM CA bundle used by both ordinary queries and logical replication. The engine image includes the AWS RDS us-east-1 roots at `/etc/ssl/certs/aws-rds-us-east-1-bundle.pem`. |
 | `ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME` | no | URL host | Optional DNS name used for certificate verification and SNI when the URL host is an IP address. |
 | `ELECTRIC_CIRCUITS_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` / `*` for every table with a primary key in that schema. `*` and an empty setting both mean `public.*` — never every schema. |
+| `ELECTRIC_CIRCUITS_PG_COLUMNS` | no | all columns | Static ingest columns per tracked table: `schema.table:col,col;schema.table:col`. Every primary-key column is required. Unknown tables, never-witnessed column names, or missing keys refuse boot; previously witnessed columns dropped by DDL are omitted with a warning. Missing entries keep all columns; trailing `;` is accepted and library mode warns/ignores the setting. Changing a set requires restart and retires dependent shapes before ingest resumes; clients recreate from a fresh snapshot. |
 | `ELECTRIC_CIRCUITS_PG_SLOT`   | no       | `electric_circuits`  | Logical replication slot name (unique per engine). |
 | `ELECTRIC_CIRCUITS_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
 | `ELECTRIC_CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
@@ -107,8 +108,10 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | no | `67108864` | Per-shape ceiling for the deltas buffered while a shape is being created or woken. Past it the shape is retired and the client recreates it (`pending_buffer_overflows`). `0` = no ceiling. |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | no | `4` | Multiplier for replay admission against recorded backfill bytes. |
 | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |
+| `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | no | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; incomplete input spills past this cap (`0` spills immediately). With the process budget enabled, held input spills before the next page regardless of this cap. Does not cap read pages or transaction output. |
+| `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | no | disabled | Opt-in transient byte admission shared across sources. A positive value enables it; unset or `0` disables it regardless of cgroup limits. Requests larger than the budget wait for an empty ledger. Retained results and arrangement state remain outside the ledger. |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | no | `67108864` | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot. |
-| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines. |
+| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Shared directory for ingest and sequencer held spill (created 0700, files 0600). One large commit can briefly need about twice its serialized change size. Must be writable at boot and must not be shared between engines. |
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
 | `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
@@ -277,6 +280,22 @@ immutable revision configured on the receiving process. A quiescing or shutting-
 therefore cannot replay a promote request and reclaim the row for itself. The successor alone may
 perform the idempotent exact-generation promotion.
 
+- **Limiting ingest columns:** set `ELECTRIC_CIRCUITS_PG_COLUMNS="public.agent_run:id,status"`
+  to omit large unused payloads from both new and old change-log rows. The publication still sends
+  full rows; projection happens before transaction buffering/spilling. Backfills and query-backs
+  select only listed columns. Shape output lists and predicates (including inner subqueries) that
+  name an unavailable column return 400 with its table and name. Every PK component must remain.
+  At restart, a changed effective set (including removing a restriction) retires all dependent
+  shapes before dormant restore or ingest. Clients see deleted streams / Electric 409 and recreate
+  from a fresh snapshot. Unchanged sets retain ordinary restore behavior; existing subquery shapes
+  still follow their usual restart retirement. Catalogs without projection records mean all columns.
+  An explicit all-columns list also records a witness. A listed column dropped by DDL is omitted
+  with a warning naming the table/column if any witness recorded it; a never-witnessed missing name
+  is still a fatal typo. Changed effective sets retire dependents through the same path.
+  External change-log consumers receive projected new and old rows. Column-set changes at restart
+  are not signalled to pinned consumers, and pins are not evicted: consumers can see mixed-width
+  envelopes and must coordinate with deployment settings. Shape retirement supplies no consumer
+  reset signal. See [ADR-0012](adr/0012-static-ingest-columns.md) for ordering and rollback limitations.
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
   replica identity on the new table and introspect it at startup.
 - **Change-log disk is bounded by segment size/age and the retain window.** Every committed change
@@ -296,13 +315,14 @@ perform the idempotent exact-generation promotion.
   `UPDATE`/`DELETE` under `REPLICA IDENTITY FULL` carries the old *and* new row for every change. Past
   `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (128 MiB of held changes) the buffer is written to one
   temporary file in `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` and memory is released, so peak **ingestor**
-  memory is that cap plus one append chunk whatever the transaction's size. That bound is the
-  ingestor's alone: downstream, the sequencer reads and applies the transaction as one unit, so its
-  read page and pending appends still scale with the transaction — size the pod for the largest
-  transaction you expect to sync, not just for this knob. **Size the spill directory for the largest
-  single transaction your database can produce** — the file holds that transaction's changes as JSON,
-  roughly the size of the rows involved (doubled for updates and deletes, which carry the prior row
-  too), and it exists only between that transaction's `BEGIN` and its commit. The directory defaults
+  memory is that cap plus one append chunk whatever the transaction's size. The sequencer's input
+  pages are bounded by the read cap; its incomplete held run spills past
+  `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (64 MiB by default). Read/held input no longer scales with
+  the whole transaction, but transaction output and pending appends still can — size the pod for
+  those as well. **Ingest and sequencer held spill share the directory: one large commit can briefly
+  require about twice its serialized change size**, because ingest spill remains until its last
+  append lands while the sequencer may already be spilling that input. Include old/new row images
+  when estimating change bytes, and allow headroom for concurrent sources. The directory defaults
   to a private `<temp dir>/circuits-txn-spill-<uid>` (0700, files 0600), is **probed at boot** — an
   unwritable one refuses the boot rather than failing every large commit — and must not be shared
   between engines (leftovers are identified by pid, which means nothing across containers): give each

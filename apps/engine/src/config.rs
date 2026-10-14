@@ -9,11 +9,20 @@
 //!
 //! Unknown `ELECTRIC_*` vars are collected into [`Config::noop_vars`] and logged once as
 //! "accepted (no-op)" — they must never crash the boot.
+//!
+//! | Setting | Default | Meaning |
+//! | --- | --- | --- |
+//! | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in shared transient byte admission: a positive value enables it; unset or `0` disables it and logs once, regardless of cgroup limits. |
+//!
+//! Configuration clones share one lazily initialized budget, including supervised sources.
+//! Reservations cover transient inputs, not retained fold maps, decoded backfill rows, allocator
+//! overhead or retained engine state. Folds/backfills release each page/frame before requesting more.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+pub use crate::memory_budget::MemoryBudgetConfig;
 use crate::table_ref::{TableRef, TableSelector};
 use crate::txn_buffer::TxnBufferConfig;
 use crate::{
@@ -79,6 +88,12 @@ pub struct Config {
     /// (`*` and an empty setting both mean `public.*` — see [`TableSelector`]). Malformed entries
     /// are dropped with a warning rather than crashing the boot.
     pub tables: Vec<TableSelector>,
+    /// Static per-table ingest projection (`ELECTRIC_CIRCUITS_PG_COLUMNS`):
+    /// `schema.table:col,col;schema.table:col` (optional trailing `;`). Missing tables keep all
+    /// columns; library mode warns and ignores this setting. Lists are sorted and deduplicated.
+    /// Boot rejects untracked tables, never-witnessed unknown columns and missing primary keys;
+    /// witnessed columns dropped by DDL are omitted with a warning. Changed sets retire dependents.
+    pub pg_columns: std::collections::BTreeMap<crate::table_ref::TableRef, Vec<String>>,
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
     /// delivery); still parsed so existing `ELECTRIC_CIRCUITS_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
@@ -117,8 +132,11 @@ pub struct Config {
     /// mandatory infrastructure — the sub-knobs below tune it, but it can no longer be turned off.
     pub dbsp: DbspConfig,
     /// Large-transaction handling on the ingest path (ADR-0003): the per-transaction memory cap
-    /// before the buffer spills to disk, the spill directory, and the byte budget for one append.
+    /// before the buffer spills to disk, the sequencer held-input cap, the shared spill directory,
+    /// and the byte budget for one append.
     pub txn: TxnBufferConfig,
+    /// Process byte admission (`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`); see the module table.
+    pub memory_budget: MemoryBudgetConfig,
     /// Per-Engine membership spill cache settings.
     pub subq_storage: crate::subq_circuit::StorageSettings,
     /// Backfill streaming: the byte budget for one backfill append and the off-by-default
@@ -431,6 +449,32 @@ impl Config {
             );
         }
 
+        let mut pg_columns = std::collections::BTreeMap::new();
+        let raw_columns = g("ELECTRIC_CIRCUITS_PG_COLUMNS").unwrap_or_default();
+        if !raw_columns.trim().is_empty() {
+            for entry in raw_columns.trim().strip_suffix(';').unwrap_or(raw_columns.trim()).split(';') {
+                let (table, columns) = entry
+                    .trim()
+                    .split_once(':')
+                    .context("ELECTRIC_CIRCUITS_PG_COLUMNS: expected schema.table:col,col;schema.table:col")?;
+                let table = table.trim();
+                let qualified =
+                    crate::table_ref::TableRef::parse(table).context("ELECTRIC_CIRCUITS_PG_COLUMNS: invalid table")?;
+                if table != qualified.as_str() {
+                    bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: table '{table}' must be qualified as schema.table");
+                }
+                let mut names: Vec<String> = columns.split(',').map(|c| c.trim().to_owned()).collect();
+                if names.iter().any(|c| c.is_empty() || c.contains(':') || c.chars().any(char::is_control)) {
+                    bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: table '{table}' has an invalid column list");
+                }
+                names.sort();
+                names.dedup();
+                if pg_columns.insert(qualified, names).is_some() {
+                    bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: duplicate table '{table}'");
+                }
+            }
+        }
+
         let poll_ms = g("ELECTRIC_CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
         let instance_id = g("ELECTRIC_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -668,6 +712,7 @@ impl Config {
             json_logs,
             slot,
             tables,
+            pg_columns,
             poll_ms,
             instance_id,
             stack_id,
@@ -684,6 +729,7 @@ impl Config {
             memory_bytes_log_period,
             dbsp,
             txn,
+            memory_budget: MemoryBudgetConfig::resolve(g("ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES"))?,
             subq_storage: crate::subq_circuit::StorageSettings::resolve(g),
             backfill,
             shutdown_grace,
@@ -706,7 +752,7 @@ impl Config {
         let base = format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
              secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} json_logs={} memory_log_period={:?} memory_bytes_log_period={:?} initialize_namespace={} log={} \
-             txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
+             txn_memory_bytes={} held_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
@@ -728,6 +774,7 @@ impl Config {
             self.initialize_namespace,
             self.log_filter,
             self.txn.memory_bytes,
+            self.txn.held_memory_bytes,
             self.txn.append_bytes,
             self.txn.spill_dir.display(),
             self.backfill.append_bytes,
@@ -1348,6 +1395,38 @@ mod tests {
         );
         assert_eq!(c.dbsp.checkpoint_every, None, "0 means checkpoint only at shutdown");
         assert_eq!(c.dbsp.min_storage_bytes, Some(2048 * 1024));
+    }
+
+    #[test]
+    fn ingest_projection_refuses_malformed_setting() {
+        for raw in [
+            "public.users",
+            "users:id",
+            "public.*:id",
+            "public.users:",
+            "public.users:id,,name",
+            "public.users:id;public.users:name",
+        ] {
+            let result = try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", raw)]);
+            assert!(result.is_err(), "invalid ingest column setting must refuse boot: {raw}");
+        }
+    }
+
+    #[test]
+    fn ingest_projection_accepts_a_trailing_separator() {
+        let result = try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", "public.users:id,name; ")]);
+        assert!(result.is_ok(), "a trailing semicolon must be accepted: {result:?}");
+        assert_eq!(result.unwrap().pg_columns[&"public.users".into()], ["id", "name"]);
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", "public.users:id;;other.users:id")]).is_err());
+    }
+
+    #[test]
+    fn ingest_projection_canonicalizes_each_table_independently() {
+        let config = cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", "public.users: name,id,id ; other.users:id")]);
+        assert_eq!(config.pg_columns[&"public.users".into()], ["id", "name"]);
+        assert_eq!(config.pg_columns[&"other.users".into()], ["id"]);
+        assert_eq!(config.pg_columns.len(), 2);
+        assert!(cfg(&[]).pg_columns.is_empty());
     }
 
     /// The selector grammar, and the fact that a typo is FATAL rather than quietly dropped — a

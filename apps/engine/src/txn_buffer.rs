@@ -22,8 +22,8 @@
 //!
 //! Peak **ingestor** memory is therefore the cap plus one chunk (held parsed, plus its serialized
 //! body while the POST is in flight), for a transaction of any size. That is a bound on the
-//! ingestor, not on the engine: the sequencer's own read page, its held run and `txn_pending` are
-//! bounded by the transaction's size, not by this knob. Nothing is ever invalidated, refused or
+//! ingestor, not on the engine: the sequencer has a separate held-input cap
+//! (`ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES`); read pages and `txn_pending` are not bounded by this knob. Nothing is ever invalidated, refused or
 //! purged because a transaction was large — the ADR is explicit that transaction size must never
 //! cost a shape its stream.
 //!
@@ -74,6 +74,10 @@ const STAMP_BYTES: u64 = 96;
 /// transactions serially, so one process has at most one buffered transaction at a time.
 const SPILL_PREFIX: &str = "circuits-txn-";
 const SPILL_SUFFIX: &str = ".ndjson";
+const HELD_SPILL_PREFIX: &str = "circuits-held-";
+// The ingestor may start its sweep after the sequencer starts replay. A process-local live
+// registry prevents that sweep (and another source's boot) from unlinking an active held file.
+static LIVE_HELD_SPILLS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The default spill directory: a PRIVATE (0700) per-uid subdirectory of the system temp dir, not
 /// the temp dir itself. Spill files carry row data, and the system temp dir is world-readable.
@@ -87,11 +91,14 @@ fn default_spill_dir() -> PathBuf {
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. `0` = never spill. |
+/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. Workspace/schema admission may spill earlier. `0` = never spill; only input/drain workspace is ledgered. |
+/// | `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-input bytes before spilling. `0` spills every held envelope. |
 /// | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Largest POST body one commit's append may build. Must be > 0 and ≤ [`DS_MAX_BODY_BYTES`]. |
 /// | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Where spill files are written. Needs room for the largest transaction. |
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxnBufferConfig {
+    /// Sequencer held-input cap. Unlike the ingest escape hatch, zero spills immediately.
+    pub held_memory_bytes: u64,
     /// Buffered in-memory bytes ([`envelope_memory_bytes`]) before the transaction spills. `0`
     /// disables spilling entirely (the pre-ADR-0003 behaviour: buffer the whole transaction in
     /// memory).
@@ -105,6 +112,7 @@ pub struct TxnBufferConfig {
 impl Default for TxnBufferConfig {
     fn default() -> Self {
         TxnBufferConfig {
+            held_memory_bytes: 64 * 1024 * 1024,
             memory_bytes: 128 * 1024 * 1024,
             append_bytes: 64 * 1024 * 1024,
             spill_dir: default_spill_dir(),
@@ -120,6 +128,7 @@ impl TxnBufferConfig {
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<TxnBufferConfig> {
         let d = TxnBufferConfig::default();
         let memory_bytes = bytes_var(&get, "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES", d.memory_bytes)?;
+        let held_memory_bytes = bytes_var(&get, "ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES", d.held_memory_bytes)?;
         let append_bytes = bytes_var(&get, "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES", d.append_bytes)?;
         if append_bytes == 0 {
             bail!(
@@ -138,7 +147,7 @@ impl TxnBufferConfig {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or(d.spill_dir);
-        Ok(TxnBufferConfig { memory_bytes, append_bytes, spill_dir })
+        Ok(TxnBufferConfig { held_memory_bytes, memory_bytes, append_bytes, spill_dir })
     }
 
     /// Resolve from the process environment.
@@ -151,11 +160,8 @@ impl TxnBufferConfig {
     /// and is retried forever against the same broken directory, so an unwritable one is a boot
     /// failure with a named message rather than an ingest loop nobody reads the logs of.
     ///
-    /// Skipped when spilling is disabled (`memory_bytes == 0`): nothing will ever be written there.
+    /// Required even when ingest spilling is disabled: the sequencer can still spill held input.
     pub fn probe(&self) -> Result<()> {
-        if self.memory_bytes == 0 {
-            return Ok(());
-        }
         ensure_spill_dir(&self.spill_dir)?;
         let probe = self.spill_dir.join(format!("{SPILL_PREFIX}probe-{}{SPILL_SUFFIX}", std::process::id()));
         let _ = std::fs::remove_file(&probe);
@@ -186,6 +192,37 @@ fn ensure_spill_dir(dir: &Path) -> Result<()> {
 /// Create one spill file: `O_EXCL` (never adopt a file we did not just make) and mode 0600.
 fn spill_open(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
+}
+
+/// A held transaction's scratch-file owner. Shares the ingestor's private directory, exclusive
+/// creation and NDJSON envelope format, but uses a unique name: ingest and sequencing can hold
+/// the same xid concurrently, and multiple source engines can live in this process.
+pub(crate) struct HeldSpillFile {
+    pub(crate) path: PathBuf,
+}
+
+impl HeldSpillFile {
+    pub(crate) fn create(dir: &Path) -> Result<(Self, std::fs::File)> {
+        ensure_spill_dir(dir)?;
+        let path =
+            dir.join(format!("{HELD_SPILL_PREFIX}{}-{}{SPILL_SUFFIX}", uuid::Uuid::new_v4(), std::process::id()));
+        let mut live = LIVE_HELD_SPILLS.lock().unwrap();
+        let file = spill_open(&path).with_context(|| format!("creating held-transaction spill {}", path.display()))?;
+        live.push(path.clone());
+        Ok((Self { path }, file))
+    }
+}
+
+impl Drop for HeldSpillFile {
+    fn drop(&mut self) {
+        let mut live = LIVE_HELD_SPILLS.lock().unwrap();
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), %error, "removing held-transaction spill failed");
+        }
+        live.retain(|path| path != &self.path);
+    }
 }
 
 fn bytes_var(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> Result<u64> {
@@ -235,6 +272,7 @@ pub struct TxnBuffer {
     mem: Vec<Envelope>,
     /// In-memory bytes currently held in `mem` ([`envelope_memory_bytes`]).
     mem_bytes: u64,
+    max_envelope_bytes: u64,
     spill: Option<Spill>,
     /// Envelopes pushed so far.
     count: u64,
@@ -245,6 +283,8 @@ pub struct TxnBuffer {
     raw_bytes: u64,
     /// `__el_sync` counter carried by this transaction (drain barrier).
     sync: Option<i64>,
+    // Last: release admission after both memory and spill buffers have been dropped.
+    memory_permit: crate::memory_budget::Permit,
 }
 
 impl TxnBuffer {
@@ -263,12 +303,69 @@ impl TxnBuffer {
             cfg,
             mem: Vec::new(),
             mem_bytes: 0,
+            memory_permit: crate::memory_budget::Permit::default(),
+            max_envelope_bytes: 0,
             spill: None,
             count: 0,
             buffered_bytes: 0,
             raw_bytes: 0,
             sync: None,
         }
+    }
+
+    /// Admission happens before receiving/decoding changes into the transaction. A waiter has
+    /// no acknowledged transaction; cancellation drops this scratch owner and PG replays it.
+    pub(crate) async fn admitted(
+        xid: u32,
+        cfg: TxnBufferConfig,
+        metrics: std::sync::Arc<crate::metrics::Metrics>,
+    ) -> Result<Self> {
+        let mut txn = Self::with_metrics(xid, cfg, metrics);
+        txn.memory_permit = txn.metrics.memory_budget.acquire(txn.initial_reservation()).await;
+        Ok(txn)
+    }
+
+    fn initial_reservation(&self) -> u64 {
+        // Leave room for peer pages even when configured caps exceed a small process budget.
+        self.cfg.memory_bytes.saturating_add(self.cfg.append_bytes).min((self.metrics.memory_budget.limit() / 4).max(1))
+    }
+
+    pub(crate) async fn reserve_input(&mut self, wire_bytes: u64) -> Result<()> {
+        self.reserve_workspace(wire_bytes).await
+    }
+
+    pub(crate) async fn reserve_drain(&mut self) -> Result<()> {
+        self.reserve_workspace(self.cfg.append_bytes.min(self.buffered_bytes).saturating_add(self.max_envelope_bytes))
+            .await
+    }
+
+    async fn reserve_workspace(&mut self, workspace: u64) -> Result<()> {
+        if !self.metrics.memory_budget.enabled() {
+            return Ok(());
+        }
+        // In never-spill mode there is no finite buffer cap to reserve. Its retained rows
+        // are unaccounted; input/drain workspace still uses ordinary FIFO page admission.
+        let bytes = if self.cfg.memory_bytes == 0 { workspace } else { self.mem_bytes.saturating_add(workspace) }
+            .max(self.initial_reservation());
+        if !self.memory_permit.try_grow(bytes) {
+            // The configured transaction cap, not the last wire frame or initial share, owns
+            // spilling. Only contention forces an earlier spill: never hold bytes while waiting.
+            self.release_for_schema()?;
+            self.memory_permit = self.metrics.memory_budget.acquire(workspace.max(self.initial_reservation())).await;
+        }
+        Ok(())
+    }
+
+    /// Schema callbacks may need a pool slot held by a backfill waiting for a frame permit.
+    /// Relinquish byte ownership first, spilling capped input; never-spill retains its rows.
+    pub(crate) fn release_for_schema(&mut self) -> Result<()> {
+        if self.metrics.memory_budget.enabled() {
+            if self.cfg.memory_bytes > 0 && !self.mem.is_empty() {
+                self.begin_spill()?;
+            }
+            self.memory_permit = crate::memory_budget::Permit::default();
+        }
+        Ok(())
     }
 
     pub fn xid(&self) -> u32 {
@@ -320,6 +417,7 @@ impl TxnBuffer {
     /// transaction.
     pub fn push(&mut self, env: Envelope, raw_len: u64) -> Result<()> {
         let bytes = envelope_memory_bytes(&env);
+        self.max_envelope_bytes = self.max_envelope_bytes.max(bytes);
         self.count += 1;
         self.buffered_bytes += bytes;
         self.raw_bytes += raw_len;
@@ -377,9 +475,9 @@ impl TxnBuffer {
             xid = self.xid,
             bytes = self.buffered_bytes,
             changes = self.count,
-            "large transaction: buffering it in memory would exceed {} bytes; spilling to {} (ADR-0003)",
-            self.cfg.memory_bytes,
-            self.spill_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            memory_cap = self.cfg.memory_bytes,
+            path = %self.spill_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            "transaction spilling at a memory-cap or admission boundary (ADR-0003)",
         );
         Ok(())
     }
@@ -623,7 +721,8 @@ impl Iterator for TxnDrain<'_> {
 /// Remove spill files a previous process left behind (it died between `Begin` and `Commit`).
 /// Returns how many were removed.
 ///
-/// Only files this engine names (`circuits-txn-<xid>-<pid>.ndjson`) are considered, and only ones
+/// Only files this engine names (`circuits-txn-<xid>-<pid>.ndjson` or
+/// `circuits-held-<uuid>-<pid>.ndjson`) are considered, and only ones
 /// whose pid is not a live process — several engines could share a spill dir, and one must never
 /// delete another's live buffer. `kill -0` is the liveness test (same as the dbsp state-dir sweep in
 /// `subq_circuit.rs`), with `EPERM` read as ALIVE: a process owned by another uid exists.
@@ -637,20 +736,34 @@ impl Iterator for TxnDrain<'_> {
 /// Our own pid is NOT special-cased: a successor that happens to be given its predecessor's pid must
 /// still be able to sweep the file that predecessor left. `live` lets the caller name the spill files
 /// this process genuinely owns right now (the ingestor holds at most one, and never during boot), so
-/// "the pid is ours" alone is not taken as evidence the file is in use.
+/// "the pid is ours" alone is not taken as evidence the file is in use. Held files register their
+/// ownership until drop, so an ingestor boot sweep also preserves a sequencer already replaying.
 pub fn sweep_spill_dir(dir: &Path) -> usize {
     sweep_spill_dir_except(dir, &[])
 }
 
 /// [`sweep_spill_dir`], keeping the named files (paths this process is actively writing).
 pub fn sweep_spill_dir_except(dir: &Path, live: &[PathBuf]) -> usize {
+    sweep_spills(dir, live, false)
+}
+
+/// Sweep held scratch before sequencing starts, without touching an already-running ingestor.
+pub(crate) fn sweep_held_spill_dir(dir: &Path) -> usize {
+    sweep_spills(dir, &[], true)
+}
+
+fn sweep_spills(dir: &Path, live: &[PathBuf], held_only: bool) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     let mut removed = 0usize;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
+        if held_only && !name.starts_with(HELD_SPILL_PREFIX) {
+            continue;
+        }
         let Some(pid) = spill_file_pid(&name) else { continue };
         let path = entry.path();
-        if live.contains(&path) {
+        let active_held = LIVE_HELD_SPILLS.lock().unwrap();
+        if live.contains(&path) || active_held.contains(&path) {
             continue;
         }
         // Our own pid with no live buffer for it means a predecessor that had this pid — stale.
@@ -670,6 +783,11 @@ pub fn sweep_spill_dir_except(dir: &Path, live: &[PathBuf]) -> usize {
 
 /// The pid encoded in a spill file's name, if the name is one of ours.
 fn spill_file_pid(name: &str) -> Option<u32> {
+    if let Some(body) = name.strip_prefix(HELD_SPILL_PREFIX).and_then(|body| body.strip_suffix(SPILL_SUFFIX)) {
+        let (id, pid) = body.rsplit_once('-')?;
+        uuid::Uuid::parse_str(id).ok()?;
+        return pid.parse::<u32>().ok();
+    }
     let body = name.strip_prefix(SPILL_PREFIX)?.strip_suffix(SPILL_SUFFIX)?;
     // `<xid>-<pid>`: split off the END, an xid is never itself hyphenated but this is the safe read.
     let (xid, pid) = body.rsplit_once('-')?;
@@ -694,6 +812,179 @@ mod tests {
     use super::*;
     use crate::ds::EnvelopeHeaders;
 
+    async fn assert_waiting<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    fn budget_metrics(bytes: u64) -> std::sync::Arc<crate::metrics::Metrics> {
+        let mut metrics = crate::metrics::Metrics::default();
+        metrics.memory_budget = crate::memory_budget::MemoryBudget::new(Some(bytes));
+        std::sync::Arc::new(metrics)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_default_small_transaction_shares_capacity_with_page_reads() {
+        use std::{future::Future, task::Poll};
+        const MIB: u64 = 1024 * 1024;
+        let dir = Scratch::new("budget-default-small");
+        let metrics = budget_metrics(32 * MIB);
+        let sequencer_page = metrics.memory_budget.acquire(8 * MIB).await;
+        let fold_page = metrics.memory_budget.acquire(8 * MIB).await;
+        let config = TxnBufferConfig { spill_dir: dir.path().to_owned(), ..Default::default() };
+        let mut work = Box::pin(async {
+            let mut txn = TxnBuffer::admitted(11, config, metrics.clone()).await.unwrap();
+            txn.reserve_input(1000).await.unwrap();
+            txn.push(env_of("row", 100), 1000).unwrap();
+            txn.reserve_drain().await.unwrap();
+            assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 1);
+        });
+        std::future::poll_fn(|cx| {
+            assert!(
+                work.as_mut().poll(cx).is_ready(),
+                "a small transaction with default caps must fit alongside page readers"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(metrics.memory_budget.waits.load(Ordering::Relaxed), 0);
+        drop((work, sequencer_page, fold_page));
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_relation_readmission_keeps_one_row_in_memory() {
+        let dir = Scratch::new("budget-relation");
+        let metrics = budget_metrics(512 * 1024 * 1024);
+        let config = TxnBufferConfig { spill_dir: dir.path().to_owned(), ..Default::default() };
+        let mut txn = TxnBuffer::admitted(11, config, metrics.clone()).await.unwrap();
+        let initial = metrics.memory_budget.held.load(Ordering::Relaxed);
+        // Begin -> Relation (callback can acquire PG/backfill credits) -> Insert -> Commit.
+        txn.reserve_input(128).await.unwrap();
+        txn.release_for_schema().unwrap();
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+        txn.reserve_input(1024).await.unwrap();
+        assert_eq!(
+            metrics.memory_budget.held.load(Ordering::Relaxed),
+            initial,
+            "schema callbacks must not shrink the next transaction reservation to a wire frame"
+        );
+        txn.push(env_of("row", 100), 1024).unwrap();
+        txn.reserve_drain().await.unwrap();
+        assert!(!txn.spilled(), "one row after Relation must stay in memory through commit");
+        assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_under_cap_commit_does_not_spill_when_growth_fits() {
+        const MIB: u64 = 1024 * 1024;
+        let dir = Scratch::new("budget-commit");
+        let metrics = budget_metrics(512 * MIB);
+        let peer = metrics.memory_budget.acquire(64 * MIB).await;
+        let config = TxnBufferConfig { spill_dir: dir.path().to_owned(), ..Default::default() };
+        let mut txn = TxnBuffer::admitted(11, config, metrics.clone()).await.unwrap();
+        for key in ["one", "two"] {
+            txn.reserve_input(35 * MIB).await.unwrap();
+            txn.push(env_of(key, (35 * MIB) as usize), 35 * MIB).unwrap();
+        }
+        assert!(txn.buffered_bytes() < TxnBufferConfig::default().memory_bytes);
+        assert!(!txn.spilled());
+        txn.reserve_drain().await.unwrap();
+        assert!(!txn.spilled(), "commit workspace must not force an under-cap transaction to disk when credits fit");
+        assert_eq!(metrics.memory_budget.waits.load(Ordering::Relaxed), 0);
+        assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 2);
+        drop((txn, peer));
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_never_spill_ingest_shares_capacity_and_yields_before_schema_work() {
+        let dir = Scratch::new("budget-schema");
+        let metrics = budget_metrics(100);
+        let peer = metrics.memory_budget.acquire(60).await;
+        let mut admitted = Box::pin(TxnBuffer::admitted(11, cfg(dir.path(), 0, 10), metrics.clone()));
+        let mut txn = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            let std::task::Poll::Ready(txn) = admitted.as_mut().poll(cx) else {
+                panic!("a ten-byte ingest workspace must share the remaining capacity");
+            };
+            std::task::Poll::Ready(txn.unwrap())
+        })
+        .await;
+        txn.push(env_of("row", 1000), 1000).unwrap();
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 70);
+        txn.release_for_schema().unwrap();
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 60);
+        assert!(!txn.spilled(), "schema work must preserve the never-spill setting");
+        assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 1);
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ingest_admission_waits_and_cancellation_releases_the_queue() {
+        let dir = Scratch::new("budget-wait");
+        let metrics = budget_metrics(100);
+        let owner = metrics.memory_budget.acquire(100).await;
+        let mut admitted = Box::pin(TxnBuffer::admitted(11, cfg(dir.path(), 90, 10), metrics.clone()));
+        assert_waiting(admitted.as_mut()).await;
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 100);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        drop(admitted);
+        drop(owner);
+        drop(TxnBuffer::admitted(12, cfg(dir.path(), 90, 10), metrics.clone()).await.unwrap());
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ingest_spills_before_waiting_for_a_larger_workspace() {
+        let dir = Scratch::new("budget-spill");
+        let metrics = budget_metrics(10000);
+        let mut txn = TxnBuffer::admitted(11, cfg(dir.path(), 2000, 100), metrics.clone()).await.unwrap();
+        txn.push(env_of("row", 100), 100).unwrap();
+        assert!(!txn.spilled());
+        let other = metrics.memory_budget.acquire(100).await;
+        let mut reserve = Box::pin(txn.reserve_input(20000));
+        assert_waiting(reserve.as_mut()).await;
+        assert_eq!(
+            metrics.memory_budget.held.load(Ordering::Relaxed),
+            100,
+            "the ingestor must release its earlier byte owner before waiting"
+        );
+        drop(other);
+        reserve.await.unwrap();
+        assert!(txn.spilled());
+        txn.reserve_drain().await.unwrap();
+        let flat: Vec<_> = drain_all(&mut txn).into_iter().flatten().collect();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].key, "row");
+        drop(txn);
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_never_spill_ingest_admits_workspace_without_spilling() {
+        let dir = Scratch::new("budget-never-spill");
+        let metrics = budget_metrics(100);
+        let mut txn = TxnBuffer::admitted(11, cfg(dir.path(), 0, 100), metrics.clone()).await.unwrap();
+        txn.reserve_input(2000).await.unwrap();
+        txn.push(env_of("row", 1000), 1000).unwrap();
+        assert!(!txn.spilled());
+        let mut peer = Box::pin(metrics.memory_budget.acquire(1));
+        assert_waiting(peer.as_mut()).await;
+        txn.reserve_drain().await.unwrap();
+        let flat: Vec<_> = drain_all(&mut txn).into_iter().flatten().collect();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].key, "row");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "zero retains never-spill semantics");
+        drop(txn);
+        drop(peer.await);
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
+
     fn env_of(key: &str, payload: usize) -> Envelope {
         Envelope {
             type_: "public.items".to_string(),
@@ -712,7 +1003,7 @@ mod tests {
     }
 
     fn cfg(dir: &Path, memory_bytes: u64, append_bytes: u64) -> TxnBufferConfig {
-        TxnBufferConfig { memory_bytes, append_bytes, spill_dir: dir.to_path_buf() }
+        TxnBufferConfig { memory_bytes, append_bytes, spill_dir: dir.to_path_buf(), ..Default::default() }
     }
 
     /// A unique scratch dir under the system temp dir, removed by [`Scratch`]'s drop.
@@ -1040,8 +1331,8 @@ mod tests {
         let err = bad.probe().expect_err("cannot create a dir under a file");
         assert!(format!("{err:#}").contains("spill"), "{err:#}");
 
-        // Spilling disabled: the dir is never used, so it is never probed.
-        cfg(&blocker.join("under-a-file"), 0, 4096).probe().expect("no spilling, no probe");
+        // Disabling ingest spill does not disable the sequencer held-input cap.
+        assert!(cfg(&blocker.join("under-a-file"), 0, 4096).probe().is_err());
     }
 
     #[test]
@@ -1056,18 +1347,21 @@ mod tests {
     fn config_defaults_and_overrides() {
         let d = TxnBufferConfig::resolve(|_| None).unwrap();
         assert_eq!(d.memory_bytes, 128 * 1024 * 1024);
+        assert_eq!(d.held_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(d.append_bytes, 64 * 1024 * 1024);
         assert_eq!(d.spill_dir, default_spill_dir(), "a private per-uid subdir, not the shared temp dir");
         assert!(d.spill_dir.starts_with(std::env::temp_dir()));
 
         let c = TxnBufferConfig::resolve(|k| match k {
             "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES" => Some("4096".to_string()),
+            "ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES" => Some(" 8192 ".to_string()),
             "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES" => Some("16384".to_string()),
             "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some("/var/tmp/circuits".to_string()),
             _ => None,
         })
         .unwrap();
         assert_eq!(c.memory_bytes, 4096);
+        assert_eq!(c.held_memory_bytes, 8192);
         assert_eq!(c.append_bytes, 16384);
         assert_eq!(c.spill_dir, PathBuf::from("/var/tmp/circuits"));
 
@@ -1078,6 +1372,47 @@ mod tests {
                 .memory_bytes,
             0
         );
+    }
+
+    #[test]
+    fn held_cap_accepts_zero_and_refuses_invalid_bytes() {
+        let resolve = |value: &str| {
+            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES").then(|| value.into()))
+        };
+        assert_eq!(resolve("0").unwrap().held_memory_bytes, 0);
+        assert_eq!(resolve("").unwrap().held_memory_bytes, 64 * 1024 * 1024);
+        for value in ["-1", "64MiB", "18446744073709551616"] {
+            let error = resolve(value).unwrap_err();
+            assert!(format!("{error:#}").contains("ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES"));
+        }
+    }
+
+    #[test]
+    fn held_boot_sweep_preserves_active_files_and_other_live_processes() {
+        let dir = Scratch::new("held-sweep");
+        let (first, _) = HeldSpillFile::create(dir.path()).unwrap();
+        let (second, _) = HeldSpillFile::create(dir.path()).unwrap();
+        assert_ne!(first.path, second.path);
+        let stale = |pid| dir.path().join(format!("circuits-held-{}-{pid}.ndjson", uuid::Uuid::new_v4()));
+        let reused_pid = stale(std::process::id());
+        let dead_pid = stale(2_000_000_000);
+        let live_pid = stale(parent_pid_or_self());
+        let unrelated = dir.path().join("circuits-held-not-a-uuid-1234.ndjson");
+        let ingest = dir.path().join(format!("circuits-txn-42-{}.ndjson", std::process::id()));
+        for file in [&reused_pid, &dead_pid, &live_pid, &unrelated, &ingest] {
+            std::fs::write(file, b"scratch").unwrap();
+        }
+        assert_eq!(sweep_held_spill_dir(dir.path()), 2);
+        assert!(!reused_pid.exists());
+        assert!(!dead_pid.exists());
+        assert!(ingest.exists(), "sequencer startup must not delete the ingestor's active buffer");
+        assert_eq!(sweep_spill_dir_except(dir.path(), std::slice::from_ref(&ingest)), 0);
+        for file in [&first.path, &second.path, &live_pid, &unrelated, &ingest] {
+            assert!(file.exists(), "{}", file.display());
+        }
+        let path = first.path.clone();
+        drop(first);
+        assert!(!path.exists());
     }
 
     /// A misconfigured append budget is boot-fatal, never silently replaced by the default.

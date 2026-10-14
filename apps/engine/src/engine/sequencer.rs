@@ -156,6 +156,7 @@ pub(crate) fn spawn_sequencer(
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     // Per-shape ceiling for the pending-creation buffer (see `buffer_pending`).
     pending_buffer_max_bytes: u64,
+    txn_cfg: crate::txn_buffer::TxnBufferConfig,
     // Postgres mode: where each transaction's xid is noted before it is fanned out, so a backfill or
     // subset snapshot that still excludes it can be retaken (`pg::SequencedXids`).
     sequenced: Option<Arc<crate::pg::SequencedXids>>,
@@ -191,6 +192,7 @@ pub(crate) fn spawn_sequencer(
         pause_gate,
         read_cap_latch,
         pending_buffer_max_bytes,
+        txn_cfg,
         sequenced,
         shutdown,
         party,
@@ -459,6 +461,7 @@ pub(crate) async fn sequencer_loop(
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
     read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
     pending_buffer_max_bytes: u64,
+    txn_cfg: crate::txn_buffer::TxnBufferConfig,
     sequenced: Option<Arc<crate::pg::SequencedXids>>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
@@ -511,7 +514,7 @@ pub(crate) async fn sequencer_loop(
     // fraction of a commit, which per-transaction atomic emission forbids. So an unterminated
     // trailing run is HELD here and carried into the next read, and the transaction is processed
     // (and flushed) only once the marker arrives.
-    let mut held: Vec<Envelope> = Vec::new();
+    let mut held: Option<super::held::Transaction> = None;
     // Where a restart must resume while a run is held: the read position from BEFORE the page the
     // held run started in. `processed` (and therefore the checkpoint, and therefore the segment
     // deletion floor) never moves past it, so a crash re-reads the whole held transaction. The read
@@ -523,9 +526,17 @@ pub(crate) async fn sequencer_loop(
     // has to be visible rather than looking like an idle engine.
     let mut held_since: Option<std::time::Instant> = None;
     let mut held_warnings: u32 = 0;
+    // Own the positioned read across command arms. Cancelling/recreating it would abandon
+    // admission and rejoin the FIFO behind later readers during a control-plane burst.
+    let mut pending_read = None;
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
+        if pending_read.is_none() && !paused && !read_cap_failed {
+            let ds = ds.clone();
+            let (path, offset) = (read_path.clone(), read_off.clone());
+            pending_read = Some(Box::pin(async move { ds.read_budgeted(&path, &offset, true).await }));
+        }
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
@@ -642,6 +653,7 @@ pub(crate) async fn sequencer_loop(
                 }
                 Some(SequencerCmd::PauseReads { done }) => {
                     paused = true;
+                    pending_read = None;
                     let _ = done.send(());
                 }
                 Some(SequencerCmd::ResetTable { table }) => {
@@ -686,8 +698,10 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
-                Ok(rr) => {
+            res = async { pending_read.as_mut().expect("unpaused read exists").await }, if !paused && !read_cap_failed => {
+                pending_read = None;
+                match res {
+                Ok((rr, page_permit)) => {
                     // A PauseReads command may win immediately after an in-flight HTTP read returns.
                     // Discard that page before touching the cursor or checkpoint so an existing
                     // sequencer can be fenced without advancing the retry boundary.
@@ -718,104 +732,40 @@ pub(crate) async fn sequencer_loop(
                     // cleared when a held transaction completes on this page. If a later
                     // transaction then fails, replay must still include that completed prefix.
                     let held_replay_from = held_from.clone();
-                    // Re-attach the run held from an earlier page (ADR-0003).
-                    //
-                    // A re-delivery complicates this: when the ingestor fails part-way through a
-                    // chunked commit it acknowledges nothing, so Postgres re-sends that whole
-                    // transaction — and, because acknowledgements are flushed on an interval, it
-                    // can re-send earlier COMPLETE commits ahead of it too. So the "already held,
-                    // skip it" filter applies to the LEADING run of this page and only while that
-                    // run is the held transaction: `seq` is the running index over one transaction,
-                    // so it is meaningless against any other one, and applying it page-wide would
-                    // silently drop whole transactions whose seqs happen to be lower.
-                    let held_key = held.last().map(run_key_owned);
-                    let mut merged_from = None;
-                    if let Some(key) = held_key {
-                        let lead = envs.iter().take_while(|e| run_key(e) == key_ref(&key)).count();
-                        if lead == 0 && !envs.is_empty() {
-                            // The held transaction is not what came next. Two things produce that,
-                            // and neither can ever complete this fragment: a reconnect re-delivering
-                            // earlier complete commits first (the held transaction's own
-                            // re-delivery follows in full, and the complete ones are skipped by the
-                            // `(lsn, seq)` highwater if already applied), and an epoch reset, which
-                            // abandons the fragment outright. Discarding it is the only correct
-                            // move — emitting a fragment of a transaction is what the marker exists
-                            // to prevent.
-                            tracing::warn!(
-                                "sequencer: the held (incomplete) transaction {:?} was followed by a different one \
-                                 {:?}; discarding the fragment — it will arrive again in full (a reconnect \
-                                 re-delivers earlier complete commits first) or has been abandoned (epoch reset)",
-                                key,
-                                run_key_owned(&envs[0]),
-                            );
-                            ds.metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
-                            held.clear();
-                            held_from = None;
-                            held_since = None;
+                    let page_permit = Arc::new(page_permit);
+                    let page_credit = ds.memory_budget().enabled().then(|| page_permit.clone());
+                    let page = match prepare_transactions(envs, held.take(), &txn_cfg, ds.metrics().clone(), page_credit).await {
+                        Ok(page) => page,
+                        Err(error) => {
+                            tracing::error!(%error, "sequencer held spill failed; preserving replay boundary");
+                            pos = held_replay_from.clone().unwrap_or_else(|| LogPosition { segment: pos.segment, offset: read_off.clone() });
+                            held_from = held_replay_from;
+                            shutdown.begin();
+                            break;
+                        }
+                    };
+                    drop(page_permit);
+                    held = page.held;
+                    if let Some(run) = &held {
+                        if page.new_hold {
+                            held_from = Some(LogPosition { segment: pos.segment, offset: read_off.clone() });
+                            held_since = Some(std::time::Instant::now());
                             held_warnings = 0;
-                            ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
-                        } else {
-                            // Only the leading run is filtered; everything after the first envelope
-                            // of a different transaction passes through untouched.
-                            let last_seq = held.last().and_then(|e| e.headers.seq);
-                            let mut rest = envs.split_off(lead);
-                            envs.retain(|e| match (e.headers.seq, last_seq) {
-                                (Some(seq), Some(hs)) => seq > hs,
-                                _ => true,
-                            });
-                            envs.append(&mut rest);
-                            let mut merged = std::mem::take(&mut held);
-                            merged.append(&mut envs);
-                            envs = merged;
-                            merged_from = Some(key);
                         }
-                    }
-                    // Hold back a TRAILING run that is not terminated by the transaction-end marker
-                    // (ADR-0003): it is a commit whose remaining chunks have not been appended yet.
-                    // Everything before it is complete and processed now.
-                    match unterminated_tail(&envs) {
-                        Some(cut) => {
-                            // Is this the SAME transaction that was already held, or a new one that
-                            // starts after the held one completed on this page? A new hold must
-                            // re-pin to THIS page, or a catch-up over consecutive chunked commits
-                            // would keep the pin (and the checkpoint) frozen at the first page for
-                            // the whole run.
-                            let continuation = merged_from.as_ref().is_some_and(|k| run_key(&envs[cut]) == key_ref(k));
-                            if !continuation {
-                                held_from = Some(LogPosition { segment: pos.segment, offset: read_off.clone() });
-                                held_since = Some(std::time::Instant::now());
-                                held_warnings = 0;
-                            }
-                            held = envs.split_off(cut);
-                            ds.metrics().sequencer_held_run.store(1, Ordering::Relaxed);
-                            let since = *held_since.get_or_insert_with(std::time::Instant::now);
-                            // A hold longer than a minute is no longer "the next chunk is coming":
-                            // ingest has stalled mid-transaction, and everything downstream of
-                            // `processed` is frozen with it. Say so, then once a minute after that.
-                            if since.elapsed() >= HELD_RUN_WARN_AFTER * (held_warnings + 1) {
-                                held_warnings += 1;
-                                tracing::warn!(
-                                    "sequencer: transaction {:?} at lsn {:?} has been incomplete on the change \
-                                     log for {:?} ({} envelope(s) held); the change-log position is pinned at \
-                                     {} until its final chunk arrives",
-                                    held.first().and_then(|e| e.headers.txid.clone()),
-                                    held.first().and_then(|e| e.headers.lsn.clone()),
-                                    since.elapsed(),
-                                    held.len(),
-                                    published(&pos, &held_from),
-                                );
-                            }
+                        ds.metrics().sequencer_held_run.store(1, Ordering::Relaxed);
+                        let since = *held_since.get_or_insert_with(std::time::Instant::now);
+                        if since.elapsed() >= HELD_RUN_WARN_AFTER * (held_warnings + 1) {
+                            held_warnings += 1;
+                            tracing::warn!(txid = ?run.key.0, lsn = ?run.key.1, envelopes = run.count,
+                                elapsed = ?since.elapsed(), position = %published(&pos, &held_from),
+                                "sequencer transaction remains incomplete; replay position is pinned");
                         }
-                        // Nothing is held any more (the marker arrived, or never was one): release
-                        // the pin so `processed`, the checkpoint and the deletion floor move again.
-                        // Safe here — the run it was pinning is processed and flushed below, before
-                        // anything is published.
-                        None => {
-                            held_from = None;
-                            held_since = None;
-                            held_warnings = 0;
-                            ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
-                        }
+                    } else {
+                        // Processing below finishes before this released pin can be published.
+                        held_from = None;
+                        held_since = None;
+                        held_warnings = 0;
+                        ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
                     }
                     // Split the read batch into transactions (runs of equal (txid, lsn) — the
                     // ingestor appends whole commits contiguously, in commit order) and flush each
@@ -825,21 +775,15 @@ pub(crate) async fn sequencer_loop(
                     // (ADR-0003) is processed once, whole, not chunk by chunk.
                     let mut touched = false;
                     let mut processing_failed = false;
-                    let mut i = 0;
-                    while i < envs.len() {
+                    for mut transaction in page.ready {
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
                         let txn_highwater = highwater;
-                        let txid = envs[i].headers.txid.clone();
-                        let lsn = envs[i].headers.lsn.clone();
+                        let (txid, lsn) = transaction.key.clone();
                         let mut source_fence: Option<String> = None;
                         let runtime_incarnation = runtime_receipts.lock().unwrap().incarnation();
                         let mut runtime_fences = crate::runtime_authority::PendingRuntimeFences::default();
-                        let mut j = i + 1;
-                        while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
-                            j += 1;
-                        }
                         // Before any of this transaction reaches a shape stream or a feed: a
                         // snapshot of a table it touched, taken from here on, that still excludes
                         // it must be retaken, or whatever it is paired with (a BeginShape point, a
@@ -848,109 +792,131 @@ pub(crate) async fn sequencer_loop(
                         if let (Some(seen), Some(xid)) = (&sequenced, txid.as_deref().and_then(|t| t.parse::<u64>().ok())) {
                             seen.note(
                                 xid,
-                                envs[i..j].iter().map(|e| e.type_.as_str()).filter(|t| !t.starts_with("__circuits.")),
+                                transaction.tables.iter().map(String::as_str).filter(|t| !t.starts_with("__circuits.")),
                             );
                         }
-                        // Feed this transaction into the dbsp counts pipelines and step the
-                        // circuit BEFORE fanning it out, so circuit-served aggregates emit
-                        // within the transaction that changed them. The counts layer re-checks
-                        // its own (lsn, seq) highwater, so feeding pre-dedup envelopes is safe.
-                        let txn_arr_deltas = if let Some(arr) = &arr {
-                            let deltas: Vec<_> = envs[i..j]
-                                .iter()
-                                .filter_map(|env| stamped_delta_for_arrangements(&tables, arr, &arr_gates, env))
-                                .collect();
-                            deltas
-                        } else {
-                            Vec::new()
-                        };
+                        // Keep one transaction's output and arrangement batch, but stream its
+                        // INPUT from memory/file chunks. Neither chunk boundaries nor spill replay
+                        // flush partial output or publish partial highwater.
+                        let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                        for k in i..j {
-                            // Skip redelivered changes (see `highwater` above).
-                            let pos = match (envs[k].headers.lsn.as_deref(), envs[k].headers.seq) {
-                                (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
-                                _ => None,
+                        loop {
+                            // Finish ready input on shutdown. Only a pending spill read or its
+                            // admission wait yields the page back to the replay boundary.
+                            let next_chunk = tokio::select! {
+                                biased;
+                                result = transaction.next_chunk() => result,
+                                _ = shutdown.wait() => {
+                                    tracing::info!("sequencer: shutdown while awaiting transaction input; preserving replay boundary");
+                                    highwater = txn_highwater;
+                                    processing_failed = true;
+                                    break;
+                                },
                             };
-                            if let (Some(p), Some(hw)) = (pos, highwater) {
-                                if p <= hw {
-                                    tracing::debug!("sequencer: skipping duplicate change at {p:?}");
-                                    continue;
-                                }
-                            }
-                            if envs[k].type_ == crate::runtime_authority::ENVELOPE_TYPE {
-                                runtime_fences.stage(&envs[k], runtime_incarnation);
-                                touched = true;
-                                if let Some(position) = pos { highwater = Some(position); }
-                                continue;
-                            }
-                            if envs[k].type_ == crate::replication::SOURCE_FENCE_ENVELOPE {
-                                if source_fence.replace(envs[k].key.clone()).is_some() {
-                                    tracing::error!(
-                                        "sequencer: transaction {txid:?} at {lsn:?} contains more than one source fence"
-                                    );
+                            let chunk = match next_chunk {
+                                Ok(Some(chunk)) => chunk,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    tracing::error!(%error, "reading held transaction failed; preserving replay boundary");
                                     highwater = txn_highwater;
                                     processing_failed = true;
                                     break;
                                 }
-                                touched = true;
-                                if let Some(position) = pos {
-                                    highwater = Some(position);
-                                }
-                                continue;
-                            }
-                            let Some(exec) = exec_for(&mut execs, &tables, &envs[k].type_) else {
-                                tracing::error!("sequencer: change for unknown table '{}'", envs[k].type_);
-                                if let Some(p) = pos { highwater = Some(p); }
-                                continue;
                             };
-                            // LIBRARY MODE: no Postgres wrote this change, so nothing stamped a
-                            // before-image on it. Fill it in from the sequencer's own per-key view
-                            // (`TableExec::library_rows`) HERE — after the de-duplication highwater
-                            // (a re-delivered duplicate must never fold into the view twice) and
-                            // ahead of everything downstream: the pending-shape buffers, the
-                            // fan-out, the aggregate folds. From this point the envelope is
-                            // indistinguishable from a replicated one.
-                            //
-                            // The counts pipelines were fed above, from the un-stamped page. That
-                            // is not a gap: the circuit tier seeds from a Postgres snapshot and
-                            // refuses to start without a `pg_url`, so `arr` is always `None` here
-                            // in library mode.
-                            if library_mode {
-                                exec.stamp_before_image(&mut envs[k]);
-                            }
-                            // Buffer for in-flight creations on this table: their `BeginShape` was
-                            // acknowledged before the creator's snapshot, so everything the
-                            // snapshot cannot contain lands in the buffer.
-                            for (pending_id, pending) in exec.pending.iter_mut() {
-                                let was_overflowed = pending.overflowed;
-                                if !buffer_pending(pending, &envs[k], pending_buffer_max_bytes) && !was_overflowed {
-                                    ds.metrics().pending_buffer_overflows.fetch_add(1, Ordering::Relaxed);
-                                    tracing::error!(
-                                        shape_id = pending_id,
-                                        cap_bytes = pending_buffer_max_bytes,
-                                        "pending shape buffer exceeded ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES \
-                                         while the shape was still being created or replayed; dropping the buffer \
-                                         and refusing activation, so the caller recreates from a fresh backfill"
-                                    );
+                            for mut env in chunk {
+                                // The circuit retains its own dedup highwater, as on the page path.
+                                if let Some(arr) = &arr
+                                    && let Some(delta) = stamped_delta_for_arrangements(&tables, arr, &arr_gates, &env)
+                                {
+                                    txn_arr_deltas.push(delta);
+                                }
+                                // Skip redelivered changes (see `highwater` above).
+                                let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
+                                    (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
+                                    _ => None,
+                                };
+                                if let (Some(p), Some(hw)) = (pos, highwater) {
+                                    if p <= hw {
+                                        tracing::debug!("sequencer: skipping duplicate change at {p:?}");
+                                        continue;
+                                    }
+                                }
+                                if env.type_ == crate::runtime_authority::ENVELOPE_TYPE {
+                                    runtime_fences.stage(&env, runtime_incarnation);
+                                    touched = true;
+                                    if let Some(position) = pos { highwater = Some(position); }
+                                    continue;
+                                }
+                                if env.type_ == crate::replication::SOURCE_FENCE_ENVELOPE {
+                                    if source_fence.replace(env.key.clone()).is_some() {
+                                        tracing::error!(
+                                            "sequencer: transaction {txid:?} at {lsn:?} contains more than one source fence"
+                                        );
+                                        highwater = txn_highwater;
+                                        processing_failed = true;
+                                        break;
+                                    }
+                                    touched = true;
+                                    if let Some(position) = pos {
+                                        highwater = Some(position);
+                                    }
+                                    continue;
+                                }
+                                let Some(exec) = exec_for(&mut execs, &tables, &env.type_) else {
+                                    tracing::error!("sequencer: change for unknown table '{}'", env.type_);
+                                    if let Some(p) = pos { highwater = Some(p); }
+                                    continue;
+                                };
+                                // LIBRARY MODE: no Postgres wrote this change, so nothing stamped a
+                                // before-image on it. Fill it in from the sequencer's own per-key view
+                                // (`TableExec::library_rows`) HERE — after the de-duplication highwater
+                                // (a re-delivered duplicate must never fold into the view twice) and
+                                // ahead of everything downstream: the pending-shape buffers, the
+                                // fan-out, the aggregate folds. From this point the envelope is
+                                // indistinguishable from a replicated one.
+                                //
+                                // The counts pipelines were fed above, from the un-stamped page. That
+                                // is not a gap: the circuit tier seeds from a Postgres snapshot and
+                                // refuses to start without a `pg_url`, so `arr` is always `None` here
+                                // in library mode.
+                                if library_mode {
+                                    exec.stamp_before_image(&mut env);
+                                }
+                                // Buffer for in-flight creations on this table: their `BeginShape` was
+                                // acknowledged before the creator's snapshot, so everything the
+                                // snapshot cannot contain lands in the buffer.
+                                for (pending_id, pending) in exec.pending.iter_mut() {
+                                    let was_overflowed = pending.overflowed;
+                                    if !buffer_pending(pending, &env, pending_buffer_max_bytes) && !was_overflowed {
+                                        ds.metrics().pending_buffer_overflows.fetch_add(1, Ordering::Relaxed);
+                                        tracing::error!(
+                                            shape_id = pending_id,
+                                            cap_bytes = pending_buffer_max_bytes,
+                                            "pending shape buffer exceeded ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES \
+                                             while the shape was still being created or replayed; dropping the buffer \
+                                             and refusing activation, so the caller recreates from a fresh backfill"
+                                        );
+                                    }
+                                }
+                                if let Err(e) = process_envelope(
+                                    ds.metrics(), &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
+                                    &mut exec.aggregates, &exec.agg_index, env, &mut txn_pending,
+                                    &subq, &trace_tx, library_mode,
+                                )
+                                .await
+                                {
+                                    tracing::error!("process_envelope failed: {e:#}; stopping before publishing this transaction");
+                                    highwater = txn_highwater;
+                                    processing_failed = true;
+                                    break;
+                                }
+                                exec.envelopes_total += 1;
+                                touched = true;
+                                if let Some(p) = pos {
+                                    highwater = Some(p);
                                 }
                             }
-                            if let Err(e) = process_envelope(
-                                ds.metrics(), &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
-                                &mut exec.aggregates, &exec.agg_index, envs[k].clone(), &mut txn_pending,
-                                &subq, &trace_tx, library_mode,
-                            )
-                            .await
-                            {
-                                tracing::error!("process_envelope failed: {e:#}; stopping before publishing this transaction");
-                                highwater = txn_highwater;
-                                processing_failed = true;
-                                break;
-                            }
-                            exec.envelopes_total += 1;
-                            touched = true;
-                            if let Some(p) = pos {
-                                highwater = Some(p);
-                            }
+                            if processing_failed { break; }
                         }
                         if processing_failed {
                             // Do not run the count fold or flush the partial transaction. The
@@ -984,7 +950,7 @@ pub(crate) async fn sequencer_loop(
                             break;
                         }
                         if source_fence.is_some() || !runtime_fences.is_empty() {
-                            if !wait_for_source_effects(&subq, &shutdown).await {
+                            if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
                                 tracing::error!(
                                     "sequencer: drain fence could not reach a receipt before shutdown/degradation"
                                 );
@@ -1035,7 +1001,6 @@ pub(crate) async fn sequencer_loop(
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
                         }
-                        i = j;
                     }
                     if processing_failed {
                         // The read cursor advances before processing; rewind it to the page that
@@ -1188,9 +1153,13 @@ pub(crate) async fn sequencer_loop(
                         back_off(&shutdown, std::time::Duration::from_millis(200)).await;
                     }
                 }
+                }
             },
         }
     }
+    drop(pending_read);
+    drop(held);
+    ds.metrics().sequencer_held_run.store(0, Ordering::Relaxed);
     // The loop is only left on shutdown (or on the command channel closing, i.e. the engine going
     // away). A completed batch is fully flushed; a processing/append failure rewinds to its replay
     // boundary above. One last `Offset` makes that safe position (and the
@@ -1209,11 +1178,16 @@ pub(crate) async fn sequencer_loop(
 }
 
 /// A source receipt is stronger than "the sequencer task exited" or "the slot was released": it
-/// waits for every deferred propagation/emission batch to land and refuses to publish after the
-/// engine has degraded. Runtime and deployment markers share this effect barrier, while their
-/// receipts and admission remain separate. A short poll keeps the hot paths
-/// and emission lanes unchanged.
-async fn wait_for_source_effects(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken) -> bool {
+/// waits for deferred propagation/emission batches originating at or before the marker's commit
+/// LSN to land and refuses to publish after shutdown or degradation. Runtime and deployment markers
+/// share this effect barrier, while their receipts and admission remain separate. Later origins
+/// cannot delay this prefix; unknown origins (zero) hold every marker. The existing short poll
+/// services completion without adding wake-ups to the hot paths.
+async fn wait_for_source_effects(
+    subq: &SubqueryHandle,
+    shutdown: &crate::shutdown::ShutdownToken,
+    marker_lsn: u64,
+) -> bool {
     loop {
         if shutdown.is_shutting_down() {
             return false;
@@ -1221,7 +1195,7 @@ async fn wait_for_source_effects(subq: &SubqueryHandle, shutdown: &crate::shutdo
         if subq.degrade.degraded.load(Ordering::Acquire) {
             return false;
         }
-        if subq.pending_flips.load(Ordering::Acquire) == 0 {
+        if !subq.pending_flips.has_at_or_before(marker_lsn) {
             return true;
         }
         tokio::select! {
@@ -1261,7 +1235,7 @@ fn run_key(env: &Envelope) -> (Option<&str>, Option<&str>) {
 }
 
 /// [`run_key`], owned — needed to remember a held run's identity across the move that re-attaches it.
-fn run_key_owned(env: &Envelope) -> (Option<String>, Option<String>) {
+pub(super) fn run_key_owned(env: &Envelope) -> (Option<String>, Option<String>) {
     (env.headers.txid.clone(), env.headers.lsn.clone())
 }
 
@@ -1293,6 +1267,90 @@ fn unterminated_tail(envs: &[Envelope]) -> Option<usize> {
         i -= 1;
     }
     Some(i)
+}
+
+struct TransactionPage {
+    ready: Vec<super::held::Transaction>,
+    held: Option<super::held::Transaction>,
+    new_hold: bool,
+}
+
+/// Preserve ADR-0003's leading-run redelivery filter and trailing hold without ever loading an
+/// existing spilled run into the page vector. Complete inputs retain their scratch owners until
+/// processing (including the transaction flush) finishes.
+async fn prepare_transactions(
+    mut envs: Vec<Envelope>,
+    mut held: Option<super::held::Transaction>,
+    cfg: &crate::txn_buffer::TxnBufferConfig,
+    metrics: Arc<crate::metrics::Metrics>,
+    page_credit: Option<Arc<crate::memory_budget::Permit>>,
+) -> Result<TransactionPage> {
+    // A receipt needs query-back credits, and a previously held input needs a spill-reader
+    // reservation. In either case spill the rest of this page before taking those dependencies.
+    // Ordinary complete pages can consume their page owner directly, without scratch I/O.
+    let mut spill_ready = envs.iter().any(|env| {
+        env.type_ == crate::runtime_authority::ENVELOPE_TYPE || env.type_ == crate::replication::SOURCE_FENCE_ENVELOPE
+    });
+    let mut ready = Vec::new();
+    if let Some(mut run) = held.take() {
+        let lead = envs.iter().take_while(|env| run_key(env) == key_ref(&run.key)).count();
+        if lead == 0 && !envs.is_empty() {
+            tracing::warn!(held = ?run.key, next = ?run_key_owned(&envs[0]),
+                "sequencer: discarding orphan held transaction fragment");
+            metrics.sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
+        } else {
+            spill_ready = true;
+            let rest = envs.split_off(lead);
+            envs.retain(|env| match (env.headers.seq, run.last_seq) {
+                (Some(seq), Some(last)) => seq > last,
+                _ => true,
+            });
+            if !envs.is_empty() {
+                run = run.with_page_permit(page_credit.clone()).append(envs).await?;
+            }
+            envs = rest;
+            if run.complete || !envs.is_empty() {
+                ready.push(run);
+            } else {
+                held = Some(run);
+            }
+        }
+    }
+    let mut new_hold = false;
+    if let Some(cut) = unterminated_tail(&envs) {
+        let tail = envs.split_off(cut);
+        held = Some(
+            super::held::Transaction::held(cfg.clone(), metrics.clone())
+                .with_page_permit(page_credit.clone())
+                .append(tail)
+                .await?,
+        );
+        new_hold = true;
+    }
+    let mut iter = envs.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        let key = run_key_owned(&first);
+        let mut run = vec![first];
+        while iter.peek().is_some_and(|env| run_key(env) == key_ref(&key)) {
+            if let Some(env) = iter.next() {
+                run.push(env);
+            }
+        }
+        ready.push(super::held::Transaction::page(run, metrics.clone()).with_page_permit(page_credit.clone()));
+    }
+    if metrics.memory_budget.enabled() {
+        if spill_ready {
+            let mut spooled = Vec::with_capacity(ready.len());
+            for txn in ready {
+                spooled.push(txn.spool(cfg.clone()).await?);
+            }
+            ready = spooled;
+        }
+        if let Some(txn) = held.take() {
+            held = Some(txn.spool(cfg.clone()).await?);
+        }
+    }
+    Ok(TransactionPage { ready, held, new_hold })
 }
 
 /// Make a pending shape live: register its routing, then replay its buffered deltas through the
@@ -2042,10 +2100,10 @@ pub(crate) async fn process_envelope(
             }
         }
         if !work.is_empty() {
-            subq.pending_flips.fetch_add(1, Ordering::SeqCst);
+            subq.pending_flips.add(lsn_u64);
             if subq.flip_tx.send(FlipWork::Walk { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
-                subq.pending_flips.fetch_sub(1, Ordering::SeqCst);
+                subq.pending_flips.complete(lsn_u64);
             }
         }
     }
@@ -2257,15 +2315,227 @@ mod txn_boundary_tests {
 mod source_fence_tests {
     use super::*;
 
+    // Exercise the real barrier with named commit positions and deterministic completion.
+    fn commits_pending(positions: &[u64]) -> SubqueryHandle {
+        let subq = handle(0);
+        for &position in positions {
+            subq.pending_flips.add(position);
+        }
+        subq
+    }
+
+    async fn drain_through(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken, marker: u64) -> bool {
+        wait_for_source_effects(subq, shutdown, marker).await
+    }
+
+    fn complete_commit(subq: &SubqueryHandle, position: u64) {
+        subq.pending_flips.complete(position);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_later_flip_does_not_delay_an_earlier_marker() {
+        use std::future::Future;
+        let subquery = commits_pending(&[0x30]);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let drain = drain_through(&subquery, &shutdown, 0x20);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert_eq!(
+                drain.as_mut().poll(cx),
+                std::task::Poll::Ready(true),
+                "a marker at 0/20 must not wait for a pending flip at 0/30"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn earlier_and_same_commit_flips_hold_only_their_marker_prefix() {
+        use std::future::Future;
+        let subquery = commits_pending(&[0x10, 0x20, 0x30]);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let drain = drain_through(&subquery, &shutdown, 0x20);
+        tokio::pin!(drain);
+        std::future::poll_fn(|cx| {
+            assert!(drain.as_mut().poll(cx).is_pending(), "earlier effects must hold the marker");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        complete_commit(&subquery, 0x10);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        std::future::poll_fn(|cx| {
+            assert!(drain.as_mut().poll(cx).is_pending(), "same-transaction effects must hold the marker");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        complete_commit(&subquery, 0x20);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        std::future::poll_fn(|cx| {
+            assert_eq!(
+                drain.as_mut().poll(cx),
+                std::task::Poll::Ready(true),
+                "the completed prefix must release its marker while the later flip stays pending"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_or_degradation_while_waiting_never_releases_a_receipt() {
+        use std::future::Future;
+        for degrade in [false, true] {
+            let subquery = commits_pending(&[0x10]);
+            let shutdown = crate::shutdown::ShutdownToken::new();
+            let drain = drain_through(&subquery, &shutdown, 0x20);
+            tokio::pin!(drain);
+            std::future::poll_fn(|cx| {
+                assert!(drain.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            if degrade {
+                subquery.degrade.mark();
+            } else {
+                shutdown.begin();
+            }
+            complete_commit(&subquery, 0x10);
+            tokio::time::advance(std::time::Duration::from_millis(10)).await;
+            assert!(!drain.await, "finished work must not bypass shutdown or degradation");
+        }
+    }
+
+    #[tokio::test]
+    async fn later_work_cannot_bypass_a_degraded_or_stopping_engine() {
+        for degrade in [false, true] {
+            let subquery = commits_pending(&[0x30]);
+            let shutdown = crate::shutdown::ShutdownToken::new();
+            if degrade {
+                subquery.degrade.mark();
+            } else {
+                shutdown.begin();
+            }
+            assert!(!drain_through(&subquery, &shutdown, 0x20).await);
+        }
+    }
+
+    #[test]
+    fn unknown_origins_are_conservative_and_commits_can_finish_out_of_order() {
+        let subquery = commits_pending(&[0, 0x10, 0x10, 0x30]);
+        complete_commit(&subquery, 0x30);
+        complete_commit(&subquery, 0x10);
+        assert!(subquery.pending_flips.has_at_or_before(0x20));
+        complete_commit(&subquery, 0x10);
+        assert!(subquery.pending_flips.has_at_or_before(0x01), "unknown work holds every prefix");
+        complete_commit(&subquery, 0);
+        assert!(!subquery.pending_flips.has_at_or_before(u64::MAX));
+        assert_eq!(subquery.pending_flips.count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_and_source_receipts_publish_at_the_same_commit_prefix() {
+        use crate::runtime_authority::{AuthorityMarker, RuntimeFence};
+        use std::future::Future;
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://receipt-prefix".into(), store.clone());
+        let engine = Engine::new_for_in_process_test(ds);
+        let marker = AuthorityMarker::parse(
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f85",
+            "018f5f4d-70c2-7d70-a4d5-5f7355078f81",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let mut runtime =
+            RuntimeFence { marker: marker.clone(), incarnation: engine.runtime_receipts.lock().unwrap().incarnation() }
+                .into_envelope();
+        runtime.headers.lsn = Some("0/20".into());
+        runtime.headers.txid = Some("2".into());
+        runtime.headers.seq = Some(0);
+        let mut source = runtime.clone();
+        source.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        source.key = "deployment-fence".into();
+        source.headers.seq = Some(1);
+        source.headers.last = Some(true);
+        let start = engine.seq_start.lock().unwrap().clone();
+        store.pages_by_offset.lock().unwrap().insert(
+            start.offset.clone(),
+            ("after-marker".into(), true, serde_json::to_string(&[runtime, source]).unwrap()),
+        );
+        engine.pending_flips.add(0x10);
+        engine.pending_flips.add(0x30);
+        let (_commands, rx) = mpsc::unbounded_channel();
+        let sequencer = sequencer_loop(
+            engine.ds.clone(),
+            engine.tables_shared.clone(),
+            start.clone(),
+            None,
+            engine.catalog_tx.clone(),
+            engine.source_receipts.clone(),
+            engine.last_source_receipt.clone(),
+            engine.source_receipt_progress.clone(),
+            engine.runtime_receipts.clone(),
+            rx,
+            Arc::new(std::sync::Mutex::new(start)),
+            Default::default(),
+            Default::default(),
+            engine.subquery_handle(),
+            engine.trace_tx.clone(),
+            None,
+            HashMap::new(),
+            true,
+            false,
+            engine.restore_reads_paused.clone(),
+            engine.read_cap_failed.clone(),
+            engine.retention.pending_buffer_max_bytes,
+            engine.txn_cfg.lock().unwrap().clone(),
+            None,
+            engine.shutdown.clone(),
+            engine.shutdown.party("test sequencer"),
+        );
+        tokio::pin!(sequencer);
+        std::future::poll_fn(|cx| {
+            assert!(sequencer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(engine.runtime_drain_receipt(&marker).unwrap().is_none());
+        assert!(engine.source_drain_receipt("deployment-fence").is_none());
+        engine.pending_flips.complete(0x10);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        std::future::poll_fn(|cx| {
+            assert!(sequencer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(engine.runtime_drain_receipt(&marker).unwrap().unwrap().commit_lsn, "0/20");
+        // The sequencer queued SourceDrained, but its catalog writer has not been scheduled yet.
+        assert!(engine.source_drain_receipt("deployment-fence").is_none());
+        tokio::time::timeout(Duration::from_secs(1), engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
+        std::future::poll_fn(|cx| {
+            assert!(sequencer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(engine.source_drain_receipt("deployment-fence").unwrap().commit_lsn, "0/20");
+        assert_eq!(engine.pending_flips(), 1, "later work is still pending after both receipts");
+        engine.shutdown.begin();
+        sequencer.await;
+    }
+
     fn handle(pending: i64) -> SubqueryHandle {
         let (flip_tx, _flip_rx) = mpsc::unbounded_channel();
+        let pending_flips = Arc::new(PendingFlips::default());
+        for _ in 0..pending {
+            pending_flips.add(0);
+        }
         SubqueryHandle {
             registry: Arc::new(Mutex::new(SubqueryRegistry::new(
                 DsClient::new_for_in_process_test("http://127.0.0.1:1"),
                 None,
             ))),
             flip_tx,
-            pending_flips: Arc::new(std::sync::atomic::AtomicI64::new(pending)),
+            pending_flips,
             degrade: DegradeState::new(),
         }
     }
@@ -2275,7 +2545,7 @@ mod source_fence_tests {
         let subquery = handle(0);
         let shutdown = crate::shutdown::ShutdownToken::new();
         shutdown.begin();
-        assert!(!wait_for_source_effects(&subquery, &shutdown).await);
+        assert!(!wait_for_source_effects(&subquery, &shutdown, 0x10).await);
     }
 
     #[tokio::test]
@@ -2283,10 +2553,10 @@ mod source_fence_tests {
         let subquery = handle(1);
         let pending = subquery.pending_flips.clone();
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let wait = tokio::spawn(async move { wait_for_source_effects(&subquery, &shutdown).await });
+        let wait = tokio::spawn(async move { wait_for_source_effects(&subquery, &shutdown, 0x10).await });
         tokio::task::yield_now().await;
         assert!(!wait.is_finished(), "a pending deferred write must hold the receipt barrier");
-        pending.store(0, Ordering::Release);
+        pending.complete(0);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(1), wait).await.unwrap().unwrap());
     }
 
@@ -2304,7 +2574,7 @@ mod source_fence_tests {
         .unwrap();
         let subquery = handle(1);
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let drain = wait_for_source_effects(&subquery, &shutdown);
+        let drain = wait_for_source_effects(&subquery, &shutdown, 0x10);
         tokio::pin!(drain);
         std::future::poll_fn(|cx| {
             assert!(drain.as_mut().poll(cx).is_pending(), "the deferred effect has not landed");
@@ -2312,7 +2582,7 @@ mod source_fence_tests {
         })
         .await;
         receipts.invalidate();
-        subquery.pending_flips.store(0, Ordering::Release);
+        subquery.pending_flips.complete(0);
         assert!(drain.await);
         receipts.publish(
             incarnation,
@@ -2343,7 +2613,7 @@ mod source_fence_tests {
         .unwrap();
         let subquery = handle(1);
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let drain = wait_for_source_effects(&subquery, &shutdown);
+        let drain = wait_for_source_effects(&subquery, &shutdown, 0x10);
         tokio::pin!(drain);
         std::future::poll_fn(|cx| {
             assert!(drain.as_mut().poll(cx).is_pending());
@@ -2351,7 +2621,7 @@ mod source_fence_tests {
         })
         .await;
         assert!(engine.runtime_drain_receipt(&marker).unwrap().is_none());
-        subquery.pending_flips.store(0, Ordering::Release);
+        subquery.pending_flips.complete(0);
         assert!(drain.await);
         let mut receipts = engine.runtime_receipts.lock().unwrap();
         receipts.publish(
@@ -2374,7 +2644,7 @@ mod source_fence_tests {
     async fn degraded_effects_cannot_manufacture_a_source_receipt() {
         let subquery = handle(0);
         subquery.degrade.mark();
-        assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new()).await);
+        assert!(!wait_for_source_effects(&subquery, &crate::shutdown::ShutdownToken::new(), 0x10).await);
     }
 }
 
@@ -2472,5 +2742,555 @@ mod pending_buffer_tests {
              (reported growth: {} bytes)",
             with_buffer - empty
         );
+    }
+}
+
+#[cfg(test)]
+mod held_spill_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    #[tokio::test]
+    async fn shutdown_finishes_a_ready_in_memory_page() {
+        // No output streams: isolate page-input completion from independently interruptible
+        // reliable appends (covered by shutdown_append_cannot_be_reported_as_a_completed_flush).
+        let mut h = Harness::new(u64::MAX);
+        let table: TableRef = "public.items".into();
+        let def = serde_json::from_value(serde_json::json!({
+            "columns":{"id":{"type":"int"},"blob":{"type":"text"}},"primaryKey":"id"
+        }))
+        .unwrap();
+        h.engine.tables_shared.write().unwrap().insert(table.clone(), TableSchema::from_def(&table, &def).unwrap());
+        let registry = h.engine.subqueries.clone();
+        let held = registry.lock().await;
+        let rows: Vec<_> = (1..=64).map(|seq| change(&seq.to_string(), "0/10", seq, true)).collect();
+        h.store
+            .pages_by_offset
+            .lock()
+            .unwrap()
+            .insert("-1".into(), ("p1".into(), true, serde_json::to_string(&rows).unwrap()));
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(h.engine.metrics.envelopes.load(Ordering::Relaxed), 1, "first row reached the held registry lock");
+        h.engine.shutdown.begin();
+        drop(held);
+        let checkpoint = h.finish().await;
+        assert_eq!(h.engine.metrics.envelopes.load(Ordering::Relaxed), 64, "shutdown must finish ready page input");
+        assert_eq!(checkpoint, (LogPosition { segment: 0, offset: "p1".into() }, Some((0x10, 64))));
+        assert!(h.files().is_empty());
+        h.engine.close(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn memory_budget_sequencer_command_preserves_read_fifo_position() {
+        let mut h = Harness::with_budget(u64::MAX, LogPosition::start(), None, Some(1024));
+        let budget = h.engine.ds.memory_budget().clone();
+        let owner = budget.acquire(1024).await;
+        h.store.pages_by_offset.lock().unwrap().insert("-1".into(), ("p1".into(), true, "[]".into()));
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(budget.waits.load(Ordering::Relaxed), 1, "sequencer queued first");
+        let mut peer = Box::pin(budget.acquire(1024));
+        std::future::poll_fn(|cx| {
+            assert!(peer.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let (resp, ack) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::MemBytes { resp }).unwrap();
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(ack.await.unwrap(), 0, "commands remain serviceable while admission waits");
+        drop(owner);
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            h.processed.lock().unwrap().offset,
+            "p1",
+            "the first queued sequencer page must proceed before the later peer"
+        );
+        assert_eq!(budget.waits.load(Ordering::Relaxed), 2, "commands must not requeue a read");
+        drop(peer.await);
+        h.engine.shutdown.begin();
+        h.future.as_mut().await;
+        h.engine.close(Duration::from_secs(5)).await;
+    }
+
+    struct Harness {
+        engine: Engine,
+        store: Arc<crate::ds::ScriptedStore>,
+        dir: std::path::PathBuf,
+        future: Pin<Box<dyn Future<Output = ()> + Send>>,
+        commands: mpsc::UnboundedSender<SequencerCmd>,
+        processed: Arc<std::sync::Mutex<LogPosition>>,
+    }
+
+    impl Harness {
+        fn new(cap: u64) -> Self {
+            Self::restore(cap, LogPosition::start_of(0), None)
+        }
+
+        fn restore(cap: u64, start: LogPosition, highwater: Option<(u64, u64)>) -> Self {
+            Self::with_budget(cap, start, highwater, None)
+        }
+
+        fn with_budget(cap: u64, start: LogPosition, highwater: Option<(u64, u64)>, budget: Option<u64>) -> Self {
+            let dir = std::env::temp_dir().join(format!("circuits-held-test-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&dir).unwrap();
+            let cfg = crate::txn_buffer::TxnBufferConfig::resolve(|key| match key {
+                "ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES" => Some(cap.to_string()),
+                "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some(dir.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .unwrap();
+            let store = Arc::new(crate::ds::ScriptedStore::default());
+            // Keep unknown offsets parked, rather than returning synthetic empty pages in a loop.
+            store.pages_by_offset.lock().unwrap().insert("unused".into(), ("unused".into(), true, "[]".into()));
+            let mut ds = DsClient::with_test_store("scripted://held".into(), store.clone());
+            if let Some(bytes) = budget {
+                let config = crate::config::Config::resolve(|key| {
+                    (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| bytes.to_string())
+                })
+                .unwrap();
+                ds = ds.with_memory_budget(&config);
+            }
+            let engine = Engine::new_for_in_process_test(ds);
+            engine.set_txn_config(cfg);
+            let processed = Arc::new(std::sync::Mutex::new(start.clone()));
+            let (commands, rx) = mpsc::unbounded_channel();
+            let future = Box::pin(sequencer_loop(
+                engine.ds.clone(),
+                engine.tables_shared.clone(),
+                start,
+                highwater,
+                engine.catalog_tx.clone(),
+                engine.source_receipts.clone(),
+                engine.last_source_receipt.clone(),
+                engine.source_receipt_progress.clone(),
+                engine.runtime_receipts.clone(),
+                rx,
+                processed.clone(),
+                Default::default(),
+                Default::default(),
+                engine.subquery_handle(),
+                engine.trace_tx.clone(),
+                None,
+                HashMap::new(),
+                false,
+                false,
+                engine.restore_reads_paused.clone(),
+                engine.read_cap_failed.clone(),
+                engine.retention.pending_buffer_max_bytes,
+                engine.txn_cfg.lock().unwrap().clone(),
+                None,
+                engine.shutdown.clone(),
+                engine.shutdown.party("held test"),
+            ));
+            Self { engine, store, dir, future, commands, processed }
+        }
+
+        async fn page(&mut self, from: &str, to: &str, envelopes: Vec<Envelope>) {
+            self.store
+                .pages_by_offset
+                .lock()
+                .unwrap()
+                .insert(from.into(), (to.into(), true, serde_json::to_string(&envelopes).unwrap()));
+            // Explicitly pause/cancel the fixture's permanently idle read; ordinary commands
+            // preserve reads now. Resume at the same cursor with the newly supplied page.
+            let (done, _) = tokio::sync::oneshot::channel();
+            self.commands.send(SequencerCmd::PauseReads { done }).unwrap();
+            let (done, _) = tokio::sync::oneshot::channel();
+            self.commands.send(SequencerCmd::ResumeReads { done }).unwrap();
+            std::future::poll_fn(|cx| {
+                assert!(self.future.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // The page has entered its processing branch. This command is served only after
+            // that branch finishes, including any disk I/O, appends and checkpoint work.
+            let (done, ack) = tokio::sync::oneshot::channel();
+            self.commands.send(SequencerCmd::Barrier { done }).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut self.future => panic!("sequencer stopped while processing page {from}"),
+                    result = ack => result.unwrap(),
+                }
+            })
+            .await
+            .expect("page processing deadline");
+        }
+
+        async fn receive<T>(&mut self, ack: tokio::sync::oneshot::Receiver<T>) -> T {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut self.future => panic!("sequencer stopped before command acknowledgement"),
+                    result = ack => result.unwrap(),
+                }
+            })
+            .await
+            .expect("command deadline")
+        }
+
+        async fn shape(&mut self) {
+            let table: TableRef = "public.items".into();
+            let def = serde_json::from_value(serde_json::json!({
+                "columns": {"id":{"type":"int"}, "blob":{"type":"text"}}, "primaryKey":"id"
+            }))
+            .unwrap();
+            let ts = TableSchema::from_def(&table, &def).unwrap();
+            self.engine.tables_shared.write().unwrap().insert(table.clone(), ts.clone());
+            let (ack, received) = tokio::sync::oneshot::channel();
+            self.commands
+                .send(SequencerCmd::BeginShape {
+                    table: table.clone(),
+                    shape_id: "s1".into(),
+                    num_id: 1,
+                    stream_path: "shape/s1".into(),
+                    pred: Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap()),
+                    out_cols: None,
+                    kind: CreateKind::Plain,
+                    ack,
+                })
+                .unwrap();
+            self.receive(received).await;
+            let (ready, received) = tokio::sync::oneshot::channel();
+            self.commands
+                .send(SequencerCmd::ActivateShape {
+                    table,
+                    shape_id: "s1".into(),
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                    agg_seed: None,
+                    emitted_seed: 0,
+                    ready,
+                })
+                .unwrap();
+            self.receive(received).await.unwrap();
+        }
+
+        fn output(&self) -> Vec<Vec<Envelope>> {
+            self.store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _, _)| path.ends_with("shape/s1"))
+                .map(|(_, _, body)| serde_json::from_slice(body).unwrap())
+                .collect()
+        }
+
+        async fn finish(&mut self) -> (LogPosition, Option<(u64, u64)>) {
+            self.engine.shutdown.begin();
+            tokio::time::timeout(Duration::from_secs(5), &mut self.future).await.expect("shutdown deadline");
+            // Drain the catalog writer after the loop queues its final safe checkpoint.
+            assert!(self.engine.catalog_tx.drain(Duration::from_secs(5)).await);
+            self.store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+                .filter_map(|value| serde_json::from_value::<CatalogEvent>(value).ok())
+                .find_map(|ev| match ev {
+                    CatalogEvent::Offset { pos, highwater } => Some((pos, highwater)),
+                    _ => None,
+                })
+                .expect("durable final offset")
+        }
+
+        fn files(&self) -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(&self.dir).unwrap().map(|e| e.unwrap().path()).collect()
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.engine.shutdown.begin();
+            // Drop the sequencer's scratch owner before removing its test directory.
+            self.future = Box::pin(async {});
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn change(txid: &str, lsn: &str, seq: u64, last: bool) -> Envelope {
+        Envelope {
+            type_: "public.items".into(),
+            key: seq.to_string(),
+            value: Some(serde_json::json!({"id": seq, "blob": "x".repeat(1024)})),
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "insert".into(),
+                txid: Some(txid.into()),
+                lsn: Some(lsn.into()),
+                seq: Some(seq),
+                last: last.then_some(true),
+                offset: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_budget_orphan_discard_does_not_spool_the_following_complete_page() {
+        let h = Harness::with_budget(u64::MAX, LogPosition::start_of(0), None, Some(10000));
+        let budget = h.engine.metrics.memory_budget.clone();
+        let cfg = h.engine.txn_cfg.lock().unwrap().clone();
+        let first = prepare_transactions(
+            vec![change("1", "0/10", 0, false)],
+            None,
+            &cfg,
+            h.engine.metrics.clone(),
+            Some(Arc::new(budget.acquire(4000).await)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.files().len(), 1);
+        let page = prepare_transactions(
+            vec![change("2", "0/20", 0, true)],
+            first.held,
+            &cfg,
+            h.engine.metrics.clone(),
+            Some(Arc::new(budget.acquire(4000).await)),
+        )
+        .await
+        .unwrap();
+        assert!(h.files().is_empty(), "an orphan discard leaves an ordinary complete page, which needs no scratch I/O");
+        assert_eq!(page.ready.len(), 1);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 4000);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ordinary_complete_input_keeps_its_credit_without_spilling() {
+        let h = Harness::with_budget(u64::MAX, LogPosition::start_of(0), None, Some(100));
+        let budget = h.engine.metrics.memory_budget.clone();
+        let credit = Arc::new(budget.acquire(200).await);
+        let cfg = h.engine.txn_cfg.lock().unwrap().clone();
+        let page = prepare_transactions(
+            vec![change("1", "0/10", 0, true)],
+            None,
+            &cfg,
+            h.engine.metrics.clone(),
+            Some(credit.clone()),
+        )
+        .await
+        .unwrap();
+        drop(credit);
+        assert!(h.files().is_empty(), "a complete page with no receipt dependency needs no disk I/O");
+        assert_eq!(budget.held.load(Ordering::Relaxed), 200, "decoded input still owns its page credit");
+        drop(page);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_page_spills_before_a_receipt_waits_on_another_byte_owner() {
+        let start = LogPosition::start_of(0);
+        let mut h = Harness::with_budget(u64::MAX, start.clone(), None, Some(1));
+        h.shape().await;
+        let appended = Arc::new(tokio::sync::Notify::new());
+        h.store.append_notifiers.lock().unwrap().insert("shape/s1".into(), appended.clone());
+        h.engine.pending_flips.add(0x10);
+        let engine = h.engine.clone();
+        let budget = engine.metrics.memory_budget.clone();
+        let worker = async {
+            appended.notified().await;
+            // A causally prior query-back cannot finish until it has memory. This is larger
+            // than the entire budget, so input from this page must have been released/spilled.
+            let _permit = budget.acquire(2).await;
+            assert!(engine.source_drain_receipt("budget-fence").is_none());
+            engine.pending_flips.complete(0x10);
+        };
+        let mut marker = change("1", "0/10", 1, true);
+        marker.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        marker.key = "budget-fence".into();
+        let page = vec![change("1", "0/10", 0, false), marker, change("2", "0/20", 0, false)];
+        tokio::join!(h.page(&start.offset, "p1", page), worker);
+        assert!(h.engine.source_drain_receipt("budget-fence").is_some());
+        assert_eq!(h.files().len(), 1, "later held input stays on disk across the receipt");
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0, "idle reads and held scratch own no input bytes");
+        assert_eq!(h.engine.metrics.sequencer_held_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(*h.processed.lock().unwrap(), start, "the later incomplete transaction still pins replay");
+        h.finish().await;
+        assert!(h.files().is_empty());
+    }
+
+    #[tokio::test]
+    async fn held_spill_waits_for_end_and_removes_the_file_after_processing() {
+        let mut h = Harness::new(512);
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false)]).await;
+        assert_eq!(h.files().len(), 1, "held input above the configured cap must move to a spill file");
+        assert_eq!(*h.processed.lock().unwrap(), start, "a spill cannot advance the replay boundary");
+        assert!(h.engine.source_drain_receipt("commit-1").is_none());
+        let mut end = change("1", "0/10", 1, true);
+        end.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        end.key = "commit-1".into();
+        h.page("p1", "p2", vec![end]).await;
+        assert_eq!(h.engine.source_drain_receipt("commit-1").unwrap().commit_lsn, "0/10");
+        assert_eq!(h.processed.lock().unwrap().offset, "p2");
+        assert!(h.files().is_empty(), "completed transaction scratch must be removed");
+    }
+
+    #[tokio::test]
+    async fn held_spill_is_removed_when_a_different_transaction_discards_the_fragment() {
+        let mut h = Harness::new(512);
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false)]).await;
+        assert_eq!(h.files().len(), 1, "the incomplete transaction must have spilled");
+        h.page("p1", "p2", vec![change("2", "0/20", 0, true)]).await;
+        assert!(h.files().is_empty(), "orphan/epoch-discarded scratch must be removed");
+        assert_eq!(h.engine.metrics.sequencer_orphan_fragments.load(Ordering::Relaxed), 1);
+        assert_eq!(h.processed.lock().unwrap().offset, "p2");
+    }
+    #[tokio::test]
+    async fn held_spill_filters_only_leading_redelivery_and_flushes_once_per_transaction() {
+        let mut h = Harness::new(512);
+        h.shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false), change("1", "0/10", 1, false)]).await;
+        assert!(h.output().is_empty(), "no prefix is visible before the end marker");
+        h.page("p1", "p2", vec![change("1", "0/10", 0, false), change("1", "0/10", 1, false)]).await;
+        assert_eq!(h.files().len(), 1, "redelivery keeps one scratch owner");
+        assert!(h.output().is_empty());
+        h.page(
+            "p2",
+            "p3",
+            vec![change("1", "0/10", 1, false), change("1", "0/10", 2, true), change("2", "0/20", 0, true)],
+        )
+        .await;
+        let batches = h.output();
+        assert_eq!(batches.len(), 2, "file read chunks must not become partial transaction appends");
+        assert_eq!(batches[0].iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["0", "1", "2"]);
+        assert!(batches[0].iter().all(|e| e.headers.lsn.as_deref() == Some("0/10")));
+        assert_eq!(batches[1].len(), 1, "a later run's low seq must survive the leading-run filter");
+        assert_eq!(batches[1][0].headers.lsn.as_deref(), Some("0/20"));
+        assert!(h.files().is_empty());
+        assert_eq!(h.engine.metrics.sequencer_held_spills.load(Ordering::Relaxed), 1);
+        assert_eq!(h.finish().await, (LogPosition { segment: 0, offset: "p3".into() }, Some((0x20, 0))));
+    }
+
+    #[tokio::test]
+    async fn held_consecutive_spills_repin_and_checkpoint_only_completed_highwater() {
+        let mut h = Harness::new(512);
+        h.shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false)]).await;
+        let first_file = h.files().pop().unwrap();
+        h.page("p1", "p2", vec![change("1", "0/10", 1, true), change("2", "0/20", 0, false)]).await;
+        assert!(!first_file.exists());
+        assert_eq!(h.files().len(), 1);
+        assert_eq!(h.processed.lock().unwrap().offset, "p1");
+        assert_eq!(h.output().len(), 1);
+        let (resp, received) = tokio::sync::oneshot::channel();
+        h.commands
+            .send(SequencerCmd::DeactivateShape { table: "public.items".into(), shape_id: "s1".into(), resp })
+            .unwrap();
+        assert_eq!(h.receive(received).await.unwrap().0.offset, "p1", "dormancy also uses the held boundary");
+        assert_eq!(h.finish().await, (LogPosition { segment: 0, offset: "p1".into() }, Some((0x10, 1))));
+        assert!(h.files().is_empty(), "shutdown releases incomplete scratch");
+        assert_eq!(h.engine.metrics.sequencer_held_run.load(Ordering::Relaxed), 0);
+        assert_eq!(h.engine.metrics.sequencer_held_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn held_memory_below_cap_is_released_on_shutdown() {
+        let mut h = Harness::new(64 * 1024 * 1024);
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false)]).await;
+        assert!(h.files().is_empty());
+        assert!(h.engine.metrics.sequencer_held_bytes.load(Ordering::Relaxed) > 0);
+        assert_eq!(h.finish().await, (start, None));
+        assert_eq!(h.engine.metrics.sequencer_held_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn held_missing_file_stops_without_output_receipt_or_checkpoint_advancement() {
+        let mut h = Harness::new(512);
+        h.shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false)]).await;
+        std::fs::remove_file(h.files().pop().unwrap()).unwrap();
+        let mut end = change("1", "0/10", 1, true);
+        end.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        end.key = "failed-commit".into();
+        h.store
+            .pages_by_offset
+            .lock()
+            .unwrap()
+            .insert("p1".into(), ("p2".into(), true, serde_json::to_string(&vec![end]).unwrap()));
+        // This fixture's idle response is permanently pending; use the explicit cancellation
+        // command to expose the next page without relying on ordinary commands dropping reads.
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::PauseReads { done }).unwrap();
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::ResumeReads { done }).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut h.future).await.expect("read failure must stop sequencing");
+        // The loop completed itself; use an inert future while draining its queued checkpoint.
+        h.future = Box::pin(async {});
+        assert_eq!(h.finish().await, (start.clone(), None));
+        assert_eq!(*h.processed.lock().unwrap(), start);
+        assert!(h.output().is_empty());
+        assert!(h.engine.source_drain_receipt("failed-commit").is_none());
+        assert!(h.files().is_empty());
+    }
+    #[tokio::test]
+    async fn held_checkpoint_restart_skips_complete_prefix_and_replays_incomplete_input() {
+        let start = LogPosition::start_of(0);
+        let mut h = Harness::new(512);
+        h.shape().await;
+        let page = vec![change("1", "0/10", 0, true), change("2", "0/20", 0, false)];
+        h.page(&start.offset, "p1", page.clone()).await;
+        assert_eq!(h.output().len(), 1);
+        let (saved, highwater) = h.finish().await;
+        assert_eq!(saved, start);
+        assert_eq!(highwater, Some((0x10, 0)), "complete prefix advances highwater while the position stays pinned");
+        assert!(h.files().is_empty());
+        let mut restored = Harness::restore(512, saved.clone(), highwater);
+        restored.shape().await;
+        restored.page(&saved.offset, "p1", page).await;
+        assert!(restored.output().is_empty(), "already checkpointed prefix must not be applied twice");
+        restored.page("p1", "p2", vec![change("2", "0/20", 1, true)]).await;
+        let out = restored.output();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["0", "1"]);
+        assert!(out[0].iter().all(|e| e.headers.lsn.as_deref() == Some("0/20")));
+        assert_eq!(restored.finish().await.1, Some((0x20, 1)));
+    }
+
+    #[tokio::test]
+    async fn held_write_failure_stops_at_page_boundary_and_hard_drop_removes_scratch() {
+        let mut h = Harness::new(512);
+        let start = LogPosition::start_of(0);
+        // Make the configured directory unusable after the boot probe point.
+        std::fs::remove_dir(&h.dir).unwrap();
+        std::fs::write(&h.dir, b"not a directory").unwrap();
+        h.store.pages_by_offset.lock().unwrap().insert(
+            start.offset.clone(),
+            ("p1".into(), true, serde_json::to_string(&vec![change("1", "0/10", 0, false)]).unwrap()),
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut h.future).await.expect("write failure must stop sequencing");
+        h.future = Box::pin(async {});
+        assert_eq!(h.finish().await, (start.clone(), None));
+        assert_eq!(*h.processed.lock().unwrap(), start);
+        assert_eq!(h.engine.metrics.sequencer_held_bytes.load(Ordering::Relaxed), 0);
+        std::fs::remove_file(&h.dir).unwrap();
+        std::fs::create_dir(&h.dir).unwrap();
+
+        let mut h = Harness::new(512);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false)]).await;
+        let path = h.files().pop().unwrap();
+        h.future = Box::pin(async {}); // terminal cancellation/replacement, no outstanding disk operation
+        assert!(!path.exists(), "dropping the sequencer must drop its scratch owner");
     }
 }

@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
     if let Some(target) = &config.statsd {
         statsd::init(target, &config.instance_id);
     }
+    let ds = ds.with_memory_budget(&config);
     let ds_base = ds.base().to_string();
     let admission = match Engine::admit_store(ds, store_bound, config.initialize_namespace).await {
         Ok(admission) => admission,
@@ -168,7 +169,9 @@ async fn main() -> Result<()> {
                 Some(url.clone()),
                 electric_circuits_engine::engine::PostgresSetup::EngineManaged,
                 &config,
-            );
+            )
+            .await
+            .unwrap_or_else(|e| refuse_boot("catalog", &e));
             // The dbsp arrangement circuit is mandatory infrastructure — always configured.
             tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
             engine.set_dbsp_config(config.dbsp.clone());
@@ -178,14 +181,10 @@ async fn main() -> Result<()> {
             engine
         }
         _ => {
-            // Library mode: no Postgres source; the engine is `active` from construction. Shutdown
-            // and readiness still apply — there is simply nothing Postgres-shaped to wait for.
-            let engine = Engine::new_with_config(
-                admission,
-                None,
-                electric_circuits_engine::engine::PostgresSetup::EngineManaged,
-                &config,
-            );
+            // Library mode still validates the entire store-binding history before readiness.
+            let engine = Engine::boot_library(admission, &config)
+                .await
+                .unwrap_or_else(|e| refuse_boot("library catalog store binding", &e));
             statsd::consumers_ready(engine.table_count().await as u64);
             engine
         }

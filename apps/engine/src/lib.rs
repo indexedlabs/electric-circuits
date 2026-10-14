@@ -27,6 +27,7 @@ pub mod fault;
 pub mod heap_size;
 pub mod http;
 pub mod mem;
+mod memory_budget;
 pub mod metrics;
 pub mod params;
 pub mod pg;

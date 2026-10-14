@@ -300,7 +300,33 @@ fn read_cgroup_v1() -> Option<CgroupMemory> {
 /// Read the Linux cgroup memory files. On non-Linux hosts without a mounted memory controller all
 /// fields are `None`; the sampler still reports process RSS and engine cardinalities.
 pub fn cgroup_memory() -> CgroupMemory {
+    #[cfg(test)]
+    if let Some(memory) = cgroup_fixture::MEMORY.get() {
+        return memory;
+    }
     read_cgroup_v2().or_else(read_cgroup_v1).unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) mod cgroup_fixture {
+    use super::CgroupMemory;
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static MEMORY: Cell<Option<CgroupMemory>> = const { Cell::new(None) };
+    }
+
+    /// Synchronous and thread-local so parallel tests cannot change each other's probe.
+    pub(crate) fn with(memory: CgroupMemory, test: impl FnOnce()) {
+        struct Restore(Option<CgroupMemory>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                MEMORY.set(self.0);
+            }
+        }
+        let _restore = Restore(MEMORY.replace(Some(memory)));
+        test();
+    }
 }
 
 fn log_memory_snapshot(card: &Cardinalities, bytes: Option<&HeapBytes>) {
@@ -659,6 +685,34 @@ pub(crate) fn init_otel(
         catalog_restore_retired,
         ""
     );
+    engine_gauge!(
+        "engine_catalog",
+        "Response-body bytes read by the latest successful catalog fold, excluding admission reads",
+        catalog_bytes,
+        "By"
+    );
+    for (name, description, held) in [
+        ("engine_memory_budget", "Configured process byte budget (zero also denotes disabled)", false),
+        ("engine_memory_permits_held", "Process byte reservations currently held", true),
+    ] {
+        let budget = metrics.memory_budget.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_gauge(name)
+            .with_description(description)
+            .with_unit("By")
+            .with_callback(move |obs| {
+                obs.observe(if held { budget.held.load(Ordering::Relaxed) } else { budget.limit() }, &attributes)
+            })
+            .build();
+    }
+    let budget = metrics.memory_budget.clone();
+    let memory_attributes = attributes.clone();
+    meter
+        .u64_observable_counter("engine_memory_permit_waits")
+        .with_description("Process byte requests that had to wait")
+        .with_callback(move |obs| obs.observe(budget.waits.load(Ordering::Relaxed), &memory_attributes))
+        .build();
     engine_counter!("engine_txn_spills", "Transactions whose buffer outgrew the memory cap (ADR-0003)", txn_spills, "");
     engine_counter!("engine_txn_spill", "Bytes ever written to transaction spill files", txn_spill_bytes, "By");
     engine_counter!(
@@ -691,6 +745,8 @@ pub(crate) fn init_otel(
         sequencer_held_run,
         ""
     );
+    engine_gauge!("engine_sequencer_held", "Estimated in-memory held envelope bytes", sequencer_held_bytes, "By");
+    engine_counter!("engine_sequencer_held_spills", "Held transactions spilled to disk", sequencer_held_spills, "");
     engine_gauge!("engine_shutdown_in_progress", "1 once a graceful shutdown has begun", shutdown_in_progress, "");
     engine_gauge!(
         "engine_replication_slot_retained_wal",
@@ -754,6 +810,62 @@ mod tests {
         drop(alpha_provider);
         assert_eq!(beta_provider.prometheus_text(), b);
         beta_provider.shutdown();
+    }
+
+    #[tokio::test]
+    async fn memory_budget_metrics_report_shared_reservations_and_survive_engine_reset() {
+        use super::*;
+        use std::future::Future;
+        let mut metrics = crate::metrics::Metrics::new("test".into(), false);
+        metrics.memory_budget = crate::memory_budget::MemoryBudget::new(Some(100));
+        let metrics = Arc::new(metrics);
+        let owner = metrics.memory_budget.acquire(200).await;
+        let mut wait = Box::pin(metrics.memory_budget.acquire(1));
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        metrics.reset();
+        let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
+        let scrape = telemetry.prometheus_text();
+        for (name, value) in [
+            ("engine_memory_budget_bytes", 100),
+            ("engine_memory_permits_held_bytes", 200),
+            ("engine_memory_permit_waits_total", 1),
+        ] {
+            assert!(
+                scrape.lines().any(|line| line.starts_with(name) && line.ends_with(&format!(" {value}"))),
+                "{scrape}"
+            );
+        }
+        assert_eq!(metrics.snapshot()["gauges"]["memory_permits_held_bytes"], 200);
+        assert_eq!(metrics.snapshot()["counters"]["memory_permit_waits_total"], 1);
+        drop((wait, owner));
+        assert_eq!(metrics.snapshot()["gauges"]["memory_permits_held_bytes"], 0);
+        telemetry.shutdown();
+    }
+
+    #[test]
+    fn held_metrics_export_bytes_and_spill_count() {
+        use super::*;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        metrics.sequencer_held_bytes.store(4096, Ordering::Relaxed);
+        metrics.sequencer_held_spills.store(2, Ordering::Relaxed);
+        let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
+        let scrape = telemetry.prometheus_text();
+        telemetry.shutdown();
+        assert!(
+            scrape.lines().any(|line| line.starts_with("engine_sequencer_held_bytes") && line.ends_with(" 4096")),
+            "{scrape}"
+        );
+        assert!(
+            scrape.lines().any(|line| line.starts_with("engine_sequencer_held_spills_total") && line.ends_with(" 2")),
+            "{scrape}"
+        );
+        let json = metrics.snapshot();
+        assert_eq!(json["gauges"]["sequencer_held_bytes"], 4096);
+        assert_eq!(json["counters"]["sequencer_held_spills_total"], 2);
     }
 
     #[test]

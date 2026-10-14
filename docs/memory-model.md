@@ -211,14 +211,46 @@ queries" (the per-feed key sets and the reconcile reverse index are host-side by
 
 ## 6. Transient operation budgets
 
-The following terms are intentionally separate from retained engine cardinalities:
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` shares transient byte admission across the process, including
+supervised sources, only when set to a positive byte count. Unset or `0` disables admission with one
+boot log, regardless of cgroup limits. It accounts only transient input, so the default stays off
+until a profiled boot peak shows which stage needs bounding. Cgroup counters remain in memory
+snapshot logs. Held spill (its own default 64 MiB cap) and ingest spill apply independently of
+admission. When enabled, FIFO requests wait for capacity; oversized requests need an empty
+ledger. Credits follow the working owner, including blocking spill I/O after cancellation.
+They are reservations/estimates, not allocator truth.
+
+When admission is enabled, backfills and Electric folds use ordinary FIFO frame/page permits, releasing each after consumption
+and before requesting another. Only an individual oversized request requires an empty ledger.
+Retained fold maps, decoded rows and collected results remain outside the ledger, like arrangement
+state. The ingestor's `TXN_MEMORY_BYTES=0` escape hatch still never spills: only its input/drain
+workspace is admitted, with its unbounded retained rows unaccounted. Initial ingest reservations
+are capped at one quarter of the process budget (at least one byte).
+Drain workspace uses actual buffered bytes up to the append cap, plus one envelope. Schema-message
+readmission restores the initial floor. Growth that fits immediately with no queued peer keeps
+an under-cap transaction in memory; otherwise capped ingestors spill before larger workspace or
+schema/pool waits. The sequencer keeps its read's FIFO position across ordinary commands. Live DS
+reads re-issue only if admission actually waits; an immediately admitted page uses one request. See
+[engine configuration](../apps/engine/README.md#process-byte-admission) for owner lifetimes and costs.
+
+`ELECTRIC_CIRCUITS_PG_COLUMNS` additionally reduces row width before transaction buffering and
+spilling, for both new and old images. Backfill/query-back SQL uses that same per-table column set;
+wire frames and historical change-log segments can still contain omitted columns. Projection changes
+retire dependent streams at boot before clients backfill the new set ([ADR-0012](adr/0012-static-ingest-columns.md)).
+
+The following terms are intentionally separate from retained engine cardinalities. Reservations and
+byte credits apply only when process admission is enabled; local spill and read caps apply independently:
 
 | operation | bounded memory | accounting/observation |
 |---|---|---|
+| shared process admission | admitted reservations can total at most the budget, except one exclusive oversized owner | `engine_memory_budget_bytes`, `engine_memory_permits_held_bytes`, `engine_memory_permit_waits_total`; shared totals must not be summed across source endpoints |
+| sequencer input | one capped body; held input spills before the next read when process admission is enabled; receipt/held-continuation pages spill before dependent work | body credit survives decode and follows input until consumed/spilled; `sequencer_held_bytes`, `sequencer_held_spills_total` |
+| boot catalog | one capped response body and parsed page | page credit survives the fold visitor; `catalog_bytes` records completed traversal |
+| Electric snapshot/key fold | one capped DS input page, released after folding | process byte reservations; retained maps/order/results, response conversion, handle keys and HTTP output are unaccounted |
 | logical-replication ingest | one transaction buffer (default 128 MiB) plus one append chunk (default 64 MiB) | `txn_spills`, `txn_spill_bytes`, `txn_chunked_appends`; RSS and allocator counters |
-| Postgres backfill | one streamed backfill chunk (`ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`) | `backfill_chunked_appends`, backfill diagnostics' `estimated_bytes` |
+| Postgres backfill | one append-sized cursor-frame reservation; larger indivisible frames readmit their actual wire size after releasing the smaller permit | decoded chunks/pending rows/collected results and driver buffering are unaccounted; `backfill_chunked_appends`, `estimated_bytes` |
 | dormant replay | one Durable Streams body and parsed page, each capped by `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` (default 16 MiB against a paged store, floored at the 64 MiB `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` budget), with at most `ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY` concurrent replays (default 2) | `reactivations_started/completed/failed`, `reactivation_bytes_scanned`, `reactivation_spans` |
-| shape emission | bounded sequencer append batches; durable-streams applies backpressure at the append boundary | `shape_appends`, append latency histogram, RSS/allocator counters |
+| shape emission | per-transaction pending appends and arrangement deltas remain proportional to the transaction and outside the input budget | `shape_appends`, append latency histogram, RSS/allocator counters |
 | pending-shape buffer (create or wake, between `BeginShape` and `ActivateShape`) | every delta of the shape's table for as long as its backfill or replay runs — and, since replays are permit-gated, for its wait for a permit too, making the window "replay duration x queue depth". Capped per shape by `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` (default 64 MiB); past the cap the buffer is dropped, activation refuses and the shape is recreated from a fresh backfill | `pending_buffer_overflows`; counted in the executor heap walk, so it appears in `GET /memory` |
 | subquery seeds | **unbounded inner seed term**: `backfill_where_reader(...).collect()` materializes the full inner relation; contributor/feed structures remain the retained terms described above | `bytes_subquery_registry`, `bytes_feed_sets`, seed diagnostics (the transient Vec is not yet ledgered) |
 

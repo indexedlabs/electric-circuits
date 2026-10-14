@@ -111,6 +111,8 @@ struct SupervisorState {
     failed: BTreeMap<String, FailedSource>,
     last_revision: Option<i64>,
     fetched: bool,
+    /// At most one entry per configured table; do not repeat warnings on every poll.
+    warned_unused_columns: std::collections::BTreeSet<crate::table_ref::TableRef>,
 }
 
 struct SourceRuntime {
@@ -139,8 +141,13 @@ struct SourceSnapshot {
     rows: Vec<SourceRow>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("ELECTRIC_CIRCUITS_PG_COLUMNS: unknown tracked table '{0}' across sources")]
+struct UnknownProjectionTable(crate::table_ref::TableRef);
+
 impl SourcesSupervisor {
     pub fn new(config: Config) -> Result<Self> {
+        let _ = config.memory_budget.budget();
         let sources = config.sources.clone().context("sources supervisor requires SOURCES_MODE")?;
         if matches!(sources.mode, SourcesMode::Table) && sources.pg_url.is_none() {
             bail!("sources table mode requires a control database URL");
@@ -157,6 +164,7 @@ impl SourcesSupervisor {
                     failed: BTreeMap::new(),
                     last_revision: None,
                     fetched: false,
+                    warned_unused_columns: Default::default(),
                 }),
                 reconcile: Mutex::new(()),
                 shutdown: ShutdownToken::new(),
@@ -223,6 +231,7 @@ impl SourcesSupervisor {
         loop {
             match self.refresh().await {
                 Ok(_) => return Ok(()),
+                Err(error) if error.is::<UnknownProjectionTable>() => return Err(error),
                 Err(error) => {
                     attempt = attempt.saturating_add(1);
                     let delay =
@@ -445,6 +454,17 @@ impl SourcesSupervisor {
     async fn apply_snapshot(&self, snapshot: SourceSnapshot) -> Result<i64> {
         if self.inner.shutdown.is_shutting_down() {
             bail!("sources reconcile interrupted by shutdown");
+        }
+        let started = self.inner.state.lock().await.fetched;
+        for table in self.inner.config.pg_columns.keys() {
+            if !snapshot.rows.iter().any(|row| source_tracks(row, table)) {
+                if !started {
+                    return Err(UnknownProjectionTable(table.clone()).into());
+                }
+                if self.inner.state.lock().await.warned_unused_columns.insert(table.clone()) {
+                    tracing::warn!(%table, "ignoring ingest column setting: no current source tracks the table");
+                }
+            }
         }
         let (running, failed) = {
             let state = self.inner.state.lock().await;
@@ -682,6 +702,10 @@ async fn boot_source(
     Ok((engine.clone(), crate::http::router_with_introspection(engine, child.trace)))
 }
 
+fn source_tracks(row: &SourceRow, table: &crate::table_ref::TableRef) -> bool {
+    row.tables.iter().any(|tracked| crate::table_ref::TableRef::parse(tracked).is_ok_and(|tracked| tracked == *table))
+}
+
 fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> Result<Config> {
     let sources = base.sources.as_ref().context("source config missing")?;
     let source_root = sources.storage_dir.join(&row.source_id);
@@ -712,6 +736,13 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
     child.subq_storage.own_children_in(source_root.join("subq"));
     child.dbsp = base.dbsp.clone();
     child.dbsp.dir = source_root.join("dbsp");
+    child.memory_budget = base.memory_budget.clone();
+    child.pg_columns = base
+        .pg_columns
+        .iter()
+        .filter(|(table, _)| source_tracks(row, table))
+        .map(|(table, columns)| (table.clone(), columns.clone()))
+        .collect();
     child.txn = base.txn.clone();
     child.txn.spill_dir = source_root.join("txn-spill");
     child.backfill = base.backfill;
@@ -736,13 +767,17 @@ async fn source_ds(config: &Config, source_id: &str) -> Result<(DsClient, Stream
             connection.client_key_path.clone(),
             scope.clone(),
         )?;
-        return Ok((DsClient::connect(connection).await?, scope));
+        return Ok((DsClient::connect(connection).await?.with_memory_budget(config), scope));
     }
     if let Some(base_url) = config.ds_in_process_test_url.as_ref() {
         #[cfg(any(test, feature = "test-support"))]
         {
             let scope = source_scope(&StreamScope::in_process_test_scope(), source_id)?;
-            return Ok((DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope.clone()), scope));
+            return Ok((
+                DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope.clone())
+                    .with_memory_budget(config),
+                scope,
+            ));
         }
         #[cfg(not(any(test, feature = "test-support")))]
         {
@@ -1373,6 +1408,143 @@ mod tests {
         let error = supervisor.inner.state.lock().await.failed["alpha"].error.clone();
         engine.close(std::time::Duration::from_secs(1)).await;
         assert!(!error.contains("resolve failed"), "restart notification attempted boot before a poll tick: {error}");
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_is_scoped_to_each_supervised_source() -> Result<()> {
+        let mut base = file_mode_config("/unused");
+        base.pg_columns.insert("public.items".into(), vec!["id".into()]);
+        base.pg_columns.insert("public.users".into(), vec!["id".into(), "name".into()]);
+        for table in ["public.items", "public.users", " public.users "] {
+            let mut row = valid_row("alpha", 1, "file:/unused");
+            row.tables = vec![table.into()];
+            let child = source_engine_config(&base, &row, "postgres://localhost/unused")?;
+            assert_eq!(child.pg_columns.len(), 1, "a source must not inherit another source's projection");
+            assert_eq!(child.pg_columns.get(&table.into()), base.pg_columns.get(&table.into()));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_rejects_a_table_tracked_by_no_source() -> Result<()> {
+        let mut base = file_mode_config("/unused");
+        base.pg_columns.insert("public.items".into(), vec!["id".into()]);
+        let supervisor = SourcesSupervisor::new(base)?;
+        let result = supervisor.apply_snapshot(SourceSnapshot { revision: 1, rows: vec![] }).await;
+        assert!(result.is_err(), "a projection tracked by no source must be rejected before activation");
+        assert!(!supervisor.inner.state.lock().await.fetched);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_unused_table_warns_once_per_table() -> Result<()> {
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Capture(Arc::default());
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        let mut config = file_mode_config("/unused");
+        for table in ["public.items", "public.users"] {
+            config.pg_columns.insert(table.into(), vec!["id".into()]);
+        }
+        let supervisor = SourcesSupervisor::new(config)?;
+        // A previously accepted source snapshot has since removed both configured tables.
+        supervisor.inner.state.lock().await.fetched = true;
+        for revision in 1..=3 {
+            supervisor.apply_snapshot(SourceSnapshot { revision, rows: vec![] }).await?;
+        }
+        let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        for table in ["public.items", "public.users"] {
+            assert_eq!(
+                logs.lines()
+                    .filter(|line| line.contains("no current source tracks the table") && line.contains(table))
+                    .count(),
+                1,
+                "one unused-setting warning per table: {logs}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_poll_removes_the_last_tracking_source() -> Result<()> {
+        use tower::ServiceExt;
+        let file = std::env::temp_dir().join(format!("projection-removal-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&file, b"[]")?;
+        let mut config = file_mode_config(file.to_str().unwrap());
+        config.pg_columns.insert("public.thread_messages".into(), vec!["id".into()]);
+        let supervisor = SourcesSupervisor::new(config)?;
+        let engine = Engine::new_supervised_for_test(supervisor.inner.restart_notify.clone());
+        let row = valid_row("alpha", 1, "file:/must-not-restart");
+        {
+            let mut state = supervisor.inner.state.lock().await;
+            state.fetched = true;
+            state.last_revision = Some(1);
+            state.running.insert(
+                "alpha".into(),
+                SourceRuntime { row: row.clone(), engine: engine.clone(), router: Router::new(), worker: None },
+            );
+            // A failed row removed from the same snapshot must not be retried from the cache.
+            state.failed.insert("failed".into(), FailedSource { row, error: "previous boot".into() });
+        }
+        let result = supervisor.poll_once().await;
+        std::fs::remove_file(&file)?;
+        assert!(result.is_ok(), "runtime removal must reconcile despite unused projection: {result:?}");
+        assert!(engine.shutdown_token().is_shutting_down(), "removed source must stop");
+        assert!(supervisor.summaries().await.is_empty(), "removed sources must leave status");
+        for path in ["/sources/alpha/status", "/sources/alpha/health"] {
+            let response = supervisor
+                .router()
+                .oneshot(axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+        std::fs::write(&file, b"[]")?;
+        for _ in 0..2 {
+            supervisor.poll_once().await?;
+            assert!(supervisor.summaries().await.is_empty(), "later polls must not restart removed rows");
+        }
+        std::fs::remove_file(file)?;
+        engine.close(Duration::from_secs(1)).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_budget_is_shared_by_supervised_sources() -> Result<()> {
+        use std::future::Future;
+        let mut base = file_mode_config("/unused");
+        base.memory_budget = crate::config::MemoryBudgetConfig::resolve(Some("100".into()))?;
+        let alpha = source_engine_config(&base, &valid_row("alpha", 1, "file:/unused"), "postgres://localhost/unused")?;
+        let beta = source_engine_config(&base, &valid_row("beta", 1, "file:/unused"), "postgres://localhost/unused")?;
+        let a = alpha.memory_budget.budget();
+        let b = beta.memory_budget.budget();
+        assert!(Arc::ptr_eq(&a, &b));
+        let first = a.acquire(100).await;
+        let mut second = Box::pin(b.acquire(1));
+        std::future::poll_fn(|cx| {
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        drop(second.await);
+        Ok(())
     }
 
     #[tokio::test]

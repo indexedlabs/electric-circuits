@@ -489,9 +489,20 @@ async fn stream_loop(
         }
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
-                txn = Some(TxnBuffer::with_metrics(xid, txn_cfg.clone(), shutdown.metrics().clone()));
+                drop(txn.take()); // a replaced Begin must release its old reservation before waiting
+                // No applied-LSN update can execute while this admission is waiting.
+                txn = Some(tokio::select! {
+                    _ = shutdown.wait() => { client.abort(); return Ok(StreamEnd::ShuttingDown); },
+                    admitted = TxnBuffer::admitted(xid, txn_cfg.clone(), shutdown.metrics().clone()) => admitted?,
+                });
             }
             ReplicationEvent::XLogData { data, .. } => {
+                if let Some(txn) = &mut txn {
+                    tokio::select! {
+                        _ = shutdown.wait() => { client.abort(); return Ok(StreamEnd::ShuttingDown); },
+                        reserved = txn.reserve_input(data.len() as u64) => reserved?,
+                    }
+                }
                 let msg = pgoutput::decode(&data)?;
                 // Schema-bearing messages are handled — and the engine's handling AWAITED — before
                 // anything else is decoded, so the dependents of a drifted/truncated table are
@@ -499,10 +510,16 @@ async fn stream_loop(
                 // change for it arrives (ADR-0005).
                 let txn_ref = txn.as_ref().map(|t: &TxnBuffer| TxnRef { xid: t.xid() });
                 if let Message::Relation { .. } = msg {
+                    if let Some(txn) = &mut txn {
+                        txn.release_for_schema()?;
+                    }
                     dec.on_relation(msg, events, txn_ref).await;
                     continue;
                 }
                 if let Message::Truncate { rel_ids } = &msg {
+                    if let Some(txn) = &mut txn {
+                        txn.release_for_schema()?;
+                    }
                     dec.on_truncate(rel_ids, events, txn_ref).await;
                     continue;
                 }
@@ -589,6 +606,7 @@ pub async fn append_commit_chunked(
     commit_lsn: &str,
     started: std::time::Instant,
 ) -> Result<u64> {
+    buf.reserve_drain().await?;
     let (xid, changes, bytes, spilled) = (buf.xid(), buf.len(), buf.buffered_bytes(), buf.spilled());
     let stamp = Stamp { lsn: commit_lsn.to_string(), txid: xid.to_string() };
     let mut chunks = 0u64;
@@ -1055,6 +1073,36 @@ mod tests {
         let t = TableRef::parse("users").unwrap();
         let ts = TableSchema::from_def(&t, &users_def(Some(users_fingerprint()))).unwrap();
         HashMap::from([(t, ts)])
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_drops_old_and_new_before_transaction_buffering() {
+        let table = TableRef::parse("public.users").unwrap();
+        let full = fingerprinted_users().remove(&table).unwrap();
+        let projected = full.project_ingest(&["id".into(), "tenant".into()]).unwrap();
+        assert_eq!(projected.fingerprint, full.fingerprint);
+        let (decoder, events) = decoder(&shared(HashMap::from([(table, projected)]))).await;
+        assert!(events.drifts.lock().unwrap().is_empty(), "projection must not masquerade as physical drift");
+        let unlisted = "large payload".repeat(100_000);
+        let insert = env_of(decoder.on_change(Message::Insert { rel_id: 1, new: vec![t("1"), t("7"), t(&unlisted)] }));
+        assert_eq!(insert.value, Some(serde_json::json!({"id":1,"tenant":7})));
+        let update = env_of(decoder.on_change(Message::Update {
+            rel_id: 1,
+            old: Some(OldTuple::Full(vec![t("1"), t("7"), t(&unlisted)])),
+            new: vec![t("1"), t("8"), Cell::UnchangedToast],
+        }));
+        assert_eq!(update.old, Some(serde_json::json!({"id":1,"tenant":7})));
+        assert_eq!(update.value, Some(serde_json::json!({"id":1,"tenant":8})));
+        let delete = env_of(
+            decoder.on_change(Message::Delete { rel_id: 1, old: OldTuple::Full(vec![t("1"), t("8"), t(&unlisted)]) }),
+        );
+        assert_eq!(delete.old, Some(serde_json::json!({"id":1,"tenant":8})));
+        assert!(delete.value.is_none());
+        assert_eq!(delete.key, "1");
+        assert!(
+            serde_json::to_vec(&[insert, update, delete]).unwrap().len() < 1024,
+            "unlisted payload must be absent before buffering/spilling/appending"
+        );
     }
 
     fn rel_col(name: &str, type_oid: u32) -> crate::pgoutput::RelColumn {

@@ -87,9 +87,12 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |
 | `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | `67108864` (64 MiB) | Per-shape ceiling for the live deltas a shape buffers between `BeginShape` and `ActivateShape` (its Postgres backfill, or its change-log replay plus the wait for a reactivation permit). Past it the buffer is dropped, activation refuses with a typed outcome and the caller recreates from a fresh backfill — the same answer an over-budget replay gives. `0` = no ceiling |
-| `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |
+| `ELECTRIC_CIRCUITS_PG_COLUMNS` | all columns | Static per-table ingest lists: `schema.table:col,col;schema.table:col`. Must include every PK column. Unknown names never witnessed and missing keys refuse boot before slot/publication/identity writes; witnessed columns dropped by DDL are omitted with a warning. Sources receive their tracked entries (unused entries refuse startup, then warn once per table and ignore on later polls); unavailable shape output/predicate columns return 400. Changed effective sets retire dependent shapes durably at restart; clients recreate/backfill. Missing entries keep all columns. A trailing `;` is accepted; library mode warns and ignores the setting |
+| `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in transient byte admission shared by all sources. A positive value enables it; unset or `0` disables it with one boot log, regardless of cgroup limits. Oversized requests wait for an empty budget |
+| `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk; budgeted workspace growth or schema callbacks may spill earlier. `0` = never spill (buffer the whole transaction in RAM) |
+| `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; strictly past this cap, incomplete input spills as NDJSON. `0` spills immediately. An enabled process budget spills held input before the next page regardless of this cap. Does not cap read pages or transaction output |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
-| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for the largest transaction the database can produce, must be writable at boot, and must not be shared between engines |
+| `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for concurrent ingest and sequencer held spills, must be writable at boot (even with ingest spill disabled), and must not be shared between engines |
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | `16777216` (16 MiB) | Backfill: byte budget for one snapshot append. A shape's backfill is **streamed** from a `REPEATABLE READ` cursor and appended chunk by chunk, so engine memory per backfill is one chunk whatever the table's size. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
 | `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | `0` (off) | Backfill: when > 0, `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** create with a clear, retryable error (`canceling statement due to statement timeout`); nothing is retired and nothing is purged, and the client may simply try again |
 | `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS` | `10000` | How long a backfill or subset snapshot may wait — the pool wait for its retake included — for transactions the sequencer has already fanned out (on the tables the read depends on) to become visible to new snapshots (a synchronous standby that has not acknowledged them). The waiting request holds no pooled connection. Past it a subset query or shape create answers a retryable 503 with `Retry-After` and the create is rolled back; nothing is retired. |
@@ -188,7 +191,11 @@ configuration rejection). Valid receipts use `Cache-Control: no-store` and this 
 ```
 
 Unknown tuples return `drained:false, receipt:null`. Receipt publication follows the full source
-transaction boundary, its stream appends, and all preceding deferred membership/emission work.
+transaction boundary, its stream appends, and deferred membership/emission batches originating at
+or before the marker's commit LSN. Later pending work does not delay the receipt. Runtime and
+source/deployment markers share this commit-scoped barrier; unknown work origins hold every marker,
+and shutdown or degradation still prevents publication. `pendingFlips` remains an aggregate count
+of pending batches across all commit positions.
 Runtime markers do not write `SourceDrained` catalog events or advance deployment closure progress;
 the controller's separate source fence and receipt protocol above remain unchanged. A server
 receipt does not prove that a client has applied the subsequent stream tail.
@@ -482,6 +489,14 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   `eid` it has already applied — so the writer's retry-in-place (a response lost after the append
   committed) can never double-apply a join, a leave or anything else. A catalog written before this
   (no `eid`, no `subscription`) is boot-fatal, like the pre-ADR-0002 and pre-ADR-0006 formats.
+- **Store admission decodes only catalog event zero**, the expected `storeBound`, and stops there.
+  The transport still buffers its capped page body. Public library constructors `Engine::new` and
+  `Engine::new_with_config` are async and return `Result<Engine>`: store bindings must validate across
+  every page before an engine or its background tasks exist. Library mode does not fold, retain or
+  validate nonbinding history. `boot_library` uses the same path; cancellation releases page credit
+  and starts no engine work. The Postgres catalog fold reads every page
+  once and rejects duplicate or reordered bindings before event-id de-duplication, including a
+  repeated binding with the same `eid`. No shapes restore from an invalid catalog.
 
 ### Durability of a create, and of a retirement
 
@@ -604,11 +619,14 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `replication_slot_retained_wal_bytes` | gauge | `pg_current_wal_lsn() - restart_lsn` — the WAL **Postgres is holding on disk for this engine**. The number that fills the source database's volume when the engine falls behind or stops |
 | `replication_confirmed_flush_lag_bytes` | gauge | `pg_current_wal_lsn() - confirmed_flush_lsn` — ingest lag, in bytes of WAL |
 | `replication_slot_active` | gauge | `1` while a walsender holds the slot; `0` when it does not, and when the slot is not there at all |
+| `sequencer_held_bytes` | gauge | Estimated in-memory held input bytes; excludes disk data and file I/O buffers; not reset by counter reset |
+| `sequencer_held_spills_total` | counter | Held transactions that crossed their cap and spilled to disk |
 | `sequencer_held_run` | gauge | `1` while the sequencer is holding an incomplete transaction (ADR-0003). A hold pins the change-log position — the restart point, the convergence barrier, the segment-deletion floor — so a hold that does not end must be visible as a level |
 | `sequencer_orphan_fragments_total` | counter | incomplete transaction fragments discarded because a different transaction followed them (a reconnect re-delivering earlier commits first, or an epoch reset) |
 | `backfill_chunked_appends_total` | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0) |
 | `shutdown_in_progress` | gauge | `1` once a graceful shutdown has begun |
 | `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
+| `catalog_bytes` | gauge | response-body bytes read by the latest successful boot catalog fold, including JSON framing, whitespace, unknown events and duplicate events; excludes admission reads and HTTP headers. Exported as `engine_catalog_bytes` in Prometheus and logged once per successful fold as `catalog read complete` with `catalog_bytes`. This is a boot measurement, not a live size or heap estimate; metric reset preserves it |
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
 | `catalog_restore_retired_total` | counter | shape records retired at boot because storage answered their stream `HEAD` with 404/410 or `closed` (ADR-0011). StatsD emits the same as `electric.catalog.restore.retired.count` tagged `reason:missing` / `reason:closed`. Non-zero after a boot means a shape was orphaned by a crash (or storage lost a stream); a burst is worth a look |
@@ -662,6 +680,59 @@ produced by the engine (rotation creates the successor first), so that state is 
 than skipped past — as is a boot whose restored position, or whose recorded current segment, names a
 stream storage no longer has.
 
+### Process byte admission
+
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` enables transient byte admission across all sources only
+when set to a positive byte count. Unset or `0` disables admission with one boot log, regardless
+of cgroup limits. The budget accounts only transient input, so the default stays off until a
+profiled boot peak shows which stage needs bounding. Memory snapshot logs still read cgroup
+counters. Held spill (its own default 64 MiB cap) and ingest spill remain independent of admission.
+When enabled, waiters are FIFO and cancellation removes the waiter; a request above the entire
+budget runs only when no other positive reservation is held. Reservations are capacity/byte
+estimates, not an RSS ceiling.
+
+The following reservation lifetimes apply when admission is enabled.
+
+Sequencer and catalog reads reserve their current response-body cap before accumulating a body;
+non-live HTTP reads acquire before send. Idle long-polls reserve nothing until data headers arrive,
+and use the first response when admission is immediate. Only an admission wait discards/re-issues
+at the same offset with a fresh deadline. Ordinary commands keep the sequencer read and its FIFO
+place alive; explicit pause/shutdown cancels it. Catalog visits retain the permit through
+decoding and folding. Sequencer input keeps its page owner until consumed or spilled. With admission
+enabled, incomplete input spills before the next page; a page containing a receipt or continuing a
+held transaction spills its remaining input before processing, so query-backs and spill readers can
+obtain their own reservations. Ordinary complete pages need no extra scratch I/O. Spill jobs keep
+credits through blocking I/O even when their async caller is cancelled.
+
+Ingest bounds its initial cap-plus-append reservation to one quarter of the process budget (at least
+one byte), leaving capacity for page readers under small budgets. Drain workspace uses buffered bytes
+up to the append cap, plus one envelope. After schema callbacks, admission restores the initial
+floor. Larger requests grow in place only when immediately available with no queued peer; fitting
+under-cap commits do not spill. Otherwise a capped buffer spills before waiting for a larger
+reservation, and releases its credits before schema callbacks can wait for a backfill's pool slot.
+`TXN_MEMORY_BYTES=0` still never spills: its unbounded retained rows are outside the ledger, while
+input/drain workspace takes ordinary FIFO permits. Waiting cannot acknowledge PostgreSQL;
+acknowledgement still follows the last durable chunk.
+
+Electric snapshot/key folds reserve one response-body cap per page and release it after consuming
+that page. Backfills reserve `BACKFILL_APPEND_BYTES` before each cursor frame, releasing it after
+row decoding. An indivisible larger frame relinquishes the smaller reservation before admitting its
+actual wire size for decoding. Driver/transport buffering itself remains outside this accounting.
+Neither stage holds a permit while waiting for another. They share capacity with other work and
+become exclusive only when that one page/frame request exceeds the entire budget.
+
+Retained fold maps, row/order vectors, decoded backfill chunks/pending rows, collected seed/candidate
+sets, response conversion and handle caches remain unaccounted, like arrangement state. Keeping a
+result does not retain input credit. Every fold page checks lifecycle/degradation before admission; backfill snapshot
+SQL, connection ownership, xid fencing and row results are unchanged.
+
+Prometheus exposes `engine_memory_budget_bytes`, `engine_memory_permits_held_bytes` and
+`engine_memory_permit_waits_total`; `/metrics` exposes the corresponding gauges and wait counter.
+These are process totals, also when observed through a source's metrics endpoint: do not sum them
+across sources. Per-engine counter reset leaves these process totals intact. Retained membership,
+seed/candidate sets, transaction output/arrangement batches, driver/transport buffers and allocator
+slack remain outside this admission ledger. A single oversized page/frame request can exceed the budget.
+
 ### Large transactions
 
 A transaction is only appendable once its `Commit` frame arrives (before that the commit LSN is
@@ -674,8 +745,8 @@ serializes the whole buffer out to one temporary file under `ELECTRIC_CIRCUITS_T
 (newline-delimited JSON, mode 0600 in a 0700 directory), releases the memory, and writes every
 further change of that transaction straight to the file. Peak **ingestor** memory is then the cap
 plus one chunk, for a transaction of any size — a bound on the ingestor, not on the engine: the
-sequencer's read page, the run it holds, and its per-transaction pending appends are still bounded by
-the transaction's size. **Transaction size never invalidates anything** — there is no fail-loud
+sequencer's held input has its own cap below; read pages and per-transaction pending appends are not
+bounded by the ingest knob. **Transaction size never invalidates anything** — there is no fail-loud
 branch, no shape is retired and nothing is purged for being big. The spill directory is probed at
 boot; an unwritable one refuses the boot rather than failing every large commit.
 
@@ -699,6 +770,15 @@ belongs to the held transaction, because a reconnect can re-deliver earlier comp
 and their seqs restart from 0. If the held transaction is not what comes next at all (that reconnect,
 or an epoch reset), the fragment is discarded — it will arrive again in full.
 
+With process admission disabled, held input stays in memory up to `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (64 MiB by default,
+`0` spills immediately). Past it, the sequencer writes incoming envelopes, with stamps intact, to
+a unique `circuits-held-<uuid>-<pid>.ndjson` file in the same private spill directory. It reads bounded
+chunks only after the end marker arrives and flushes output once per transaction. Scratch is removed
+after processing, on orphan/epoch-fragment discard and on shutdown; stale files are swept at boot.
+Spill errors stop sequencing at the safe replay boundary. The cap estimates envelope memory, not RSS: it
+excludes the current read page, one indivisible envelope, I/O buffers, pending output and arrangement
+deltas. Output and arrangement batches still grow with transaction size.
+
 While a run is held, nothing is published past the page it began in: the restart point,
 `GET /tables/{name}/offset`, the segment-deletion floor and the resume position of a shape going
 dormant all stay there, so a crash (or a park) re-reads the whole transaction. A page that completes
@@ -711,7 +791,10 @@ The spill file is scratch, not state: it is removed at commit, at abort and on c
 and a file left by a process that died mid-transaction is swept at the next boot by pid liveness.
 Pids only mean something inside one pid namespace, so a spill directory must belong to exactly one
 engine — give each engine its own `ELECTRIC_CIRCUITS_TXN_SPILL_DIR`. `GET /metrics` reports
-`txn_spills_total`, `txn_spill_bytes` and `txn_chunked_appends_total`.
+`txn_spills_total`, `txn_spill_bytes` and `txn_chunked_appends_total`. Sequencer spill metrics are
+`sequencer_held_bytes` (in-memory envelope estimate, excluding disk and I/O buffers) and
+`sequencer_held_spills_total` (transactions spilled). Prometheus exports
+`engine_sequencer_held_bytes` and `engine_sequencer_held_spills_total`.
 
 ## Schema changes
 
