@@ -409,6 +409,12 @@ mod tests {
                 .expect("completion waiter must be released")
                 .is_err()
         );
-        assert_eq!(queue.pending(), 0);
+        // The waiter is released before the worker decrements its pending count, so wait for the
+        // count rather than asserting it the instant the waiter returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while queue.pending() != 0 {
+            assert!(std::time::Instant::now() < deadline, "the cancelled retirement stayed pending");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }
