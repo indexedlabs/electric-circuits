@@ -575,7 +575,7 @@ async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json
     let mut off = "-1".to_string();
     let mut bytes = 0u64;
     loop {
-        let (body, next, up_to_date) = ds.read_json_body(CATALOG_STREAM, &off).await?;
+        let (body, next, up_to_date, _permit) = ds.read_json_body(CATALOG_STREAM, &off).await?;
         bytes = bytes.saturating_add(body.len() as u64);
         let page = if body.trim().is_empty() {
             Vec::new()
@@ -596,7 +596,7 @@ async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json
 async fn read_first_catalog_event(ds: &DsClient) -> Result<Option<serde_json::Value>> {
     let mut off = "-1".to_string();
     loop {
-        let (body, next, up_to_date) = ds.read_json_body(CATALOG_STREAM, &off).await?;
+        let (body, next, up_to_date, _permit) = ds.read_json_body(CATALOG_STREAM, &off).await?;
         let body = body.trim();
         if !body.is_empty() {
             let rest = body.strip_prefix('[').context("catalog page must be a JSON array")?.trim_start();
@@ -2288,6 +2288,35 @@ mod tests {
         assert!(fold.pending_retire.is_empty());
         assert_eq!(fold.seen.len(), 7, "unknown and duplicate events are not applied");
         engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    #[tokio::test]
+    async fn memory_budget_covers_catalog_admission_and_the_page_visitor() {
+        use std::future::Future;
+        let config =
+            crate::config::Config::resolve(|key| (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| "1".into()))
+                .unwrap();
+        let (ds, _) = paged_catalog(&paged_catalog_fixture(), 2);
+        let ds = ds.with_memory_budget(&config);
+        let budget = ds.memory_budget().clone();
+        let owner = budget.acquire(2).await;
+        let mut admission = Box::pin(Engine::admit_store(ds.clone(), expected_store_bound(), false));
+        std::future::poll_fn(|cx| {
+            assert!(admission.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(owner);
+        drop(admission.await.unwrap());
+        let mut pages = 0;
+        let bytes = visit_catalog_pages(&ds, |_| {
+            pages += 1;
+            assert!(budget.held.load(Ordering::Relaxed) > 0, "decoded catalog pages must retain their credits");
+        })
+        .await
+        .unwrap();
+        assert!(pages > 1 && bytes > 0);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

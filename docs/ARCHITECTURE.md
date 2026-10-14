@@ -195,7 +195,7 @@ single-chunk commits too; library-mode writers stamp their one-envelope writes),
 **holds** a trailing run that no marker terminates: held envelopes are carried into the next read and
 the transaction is processed and flushed only when the marker arrives.
 
-Held input spills strictly past `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (default 67108864, 64 MiB;
+Without process byte admission, held input spills strictly past `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (default 67108864, 64 MiB;
 `0` spills immediately). `engine/held.rs` owns the memory/file transition and streams the same NDJSON
 envelope format back without changing stamps or rebuilding a whole input vector. The sequencer awaits
 one blocking disk operation at a time, decoding chunks up to `min(cap, 1 MiB)` (at least one byte),
@@ -205,6 +205,30 @@ Unique `circuits-held-<uuid>-<pid>.ndjson` files share the ingestor's private di
 removes them after transaction flush/receipt, on orphan/epoch-fragment discard and shutdown. Boot
 sweeps remove stale files; registered active held files survive an ingestor/source boot sweep. Disk
 errors stop the sequencer without advancing past the safe replay boundary; recovery rereads the log.
+
+The process byte ledger (`memory_budget.rs`) is shared by all supervised sources. Its setting,
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, defaults to 60% of a readable finite cgroup limit; absent
+both, admission is disabled with one boot log. FIFO byte requests wait for capacity. An oversized
+request requires no other owner; cancellation releases queued requests and owned credits.
+
+Catalog page credit lasts through the page visitor; sequencer body credit lasts through consumption
+or spill, including awaited blocking jobs. With admission enabled, every held run spills before the
+next read. Pages containing runtime/source receipts or continuing a held run spill all remaining
+input before processing; ordinary complete pages retain the original credit without extra disk I/O.
+Bounded spill-reader credit is released before the receipt can wait for a query-back.
+
+Ingest reserves its cap and append workspace before buffering, spills a capped buffer before waiting
+for a larger workspace or pool-dependent schema work, and never acknowledges while waiting. The
+never-spill escape hatch admits only input/drain workspace; its unbounded retained rows are unaccounted.
+Electric folds take ordinary FIFO permits for each capped DS page; backfills take one append-sized
+permit for each cursor frame. After consumption/decoding, each releases before requesting another.
+A larger indivisible backfill frame drops the smaller credit before admitting its actual wire size.
+Only an individual request above the budget needs exclusive admission, so fitting pages/frames can
+run concurrently. Retained fold maps, decoded rows and result sets are outside the ledger, like
+arrangement state. Fold admission follows shape reactivation; snapshot SQL and xid fences are unchanged.
+The ledger covers transient input reservations, not RSS or all retained state; see
+[the memory model](memory-model.md#6-transient-operation-budgets) and
+[engine configuration](../apps/engine/README.md#process-byte-admission).
 
 A re-delivery has to fold into that hold. When the ingestor fails part-way it acknowledges nothing,
 so Postgres re-sends the interrupted transaction from its start — and, because acknowledgements are

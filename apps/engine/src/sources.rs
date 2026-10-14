@@ -141,6 +141,7 @@ struct SourceSnapshot {
 
 impl SourcesSupervisor {
     pub fn new(config: Config) -> Result<Self> {
+        let _ = config.memory_budget.budget();
         let sources = config.sources.clone().context("sources supervisor requires SOURCES_MODE")?;
         if matches!(sources.mode, SourcesMode::Table) && sources.pg_url.is_none() {
             bail!("sources table mode requires a control database URL");
@@ -712,6 +713,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
     child.subq_storage.own_children_in(source_root.join("subq"));
     child.dbsp = base.dbsp.clone();
     child.dbsp.dir = source_root.join("dbsp");
+    child.memory_budget = base.memory_budget.clone();
     child.txn = base.txn.clone();
     child.txn.spill_dir = source_root.join("txn-spill");
     child.backfill = base.backfill;
@@ -736,13 +738,17 @@ async fn source_ds(config: &Config, source_id: &str) -> Result<(DsClient, Stream
             connection.client_key_path.clone(),
             scope.clone(),
         )?;
-        return Ok((DsClient::connect(connection).await?, scope));
+        return Ok((DsClient::connect(connection).await?.with_memory_budget(config), scope));
     }
     if let Some(base_url) = config.ds_in_process_test_url.as_ref() {
         #[cfg(any(test, feature = "test-support"))]
         {
             let scope = source_scope(&StreamScope::in_process_test_scope(), source_id)?;
-            return Ok((DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope.clone()), scope));
+            return Ok((
+                DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope.clone())
+                    .with_memory_budget(config),
+                scope,
+            ));
         }
         #[cfg(not(any(test, feature = "test-support")))]
         {
@@ -1373,6 +1379,28 @@ mod tests {
         let error = supervisor.inner.state.lock().await.failed["alpha"].error.clone();
         engine.close(std::time::Duration::from_secs(1)).await;
         assert!(!error.contains("resolve failed"), "restart notification attempted boot before a poll tick: {error}");
+    }
+
+    #[tokio::test]
+    async fn memory_budget_is_shared_by_supervised_sources() -> Result<()> {
+        use std::future::Future;
+        let mut base = file_mode_config("/unused");
+        base.memory_budget = crate::config::MemoryBudgetConfig::resolve(Some("100".into()))?;
+        let alpha = source_engine_config(&base, &valid_row("alpha", 1, "file:/unused"), "postgres://localhost/unused")?;
+        let beta = source_engine_config(&base, &valid_row("beta", 1, "file:/unused"), "postgres://localhost/unused")?;
+        let a = alpha.memory_budget.budget();
+        let b = beta.memory_budget.budget();
+        assert!(Arc::ptr_eq(&a, &b));
+        let first = a.acquire(100).await;
+        let mut second = Box::pin(b.acquire(1));
+        std::future::poll_fn(|cx| {
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        drop(second.await);
+        Ok(())
     }
 
     #[tokio::test]

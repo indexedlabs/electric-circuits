@@ -144,6 +144,8 @@ pub struct Metrics {
     /// GAUGE: response-body bytes read by the latest successful catalog fold (including framing
     /// and duplicate events). Excludes admission reads; preserved by `reset()`.
     pub(crate) catalog_bytes: AtomicU64,
+    /// Process totals shared by source engines; an individual engine reset must not clear them.
+    pub(crate) memory_budget: std::sync::Arc<crate::memory_budget::MemoryBudget>,
     /// ADR-0007: retirement attempts that failed and were re-queued.
     pub retirement_retries: AtomicU64,
     pub txn_spills: AtomicU64, // ADR-0003: transactions whose buffer outgrew the memory cap and went to disk
@@ -244,6 +246,7 @@ impl Metrics {
             catalog_append_retries: AtomicU64::new(0),
             catalog_restore_retired: AtomicU64::new(0),
             catalog_bytes: AtomicU64::new(0),
+            memory_budget: crate::memory_budget::MemoryBudget::new(None),
             retirement_retries: AtomicU64::new(0),
             retirements_pending: AtomicU64::new(0),
             backfill_chunked_appends: AtomicU64::new(0),
@@ -306,6 +309,7 @@ impl Metrics {
                 "retirement_retries_total": self.retirement_retries.load(Ordering::Relaxed),
                 "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
                 "sequencer_held_spills_total": self.sequencer_held_spills.load(Ordering::Relaxed),
+                "memory_permit_waits_total": self.memory_budget.waits.load(Ordering::Relaxed),
                 "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
                 "backfill_chunked_appends_total": self.backfill_chunked_appends.load(Ordering::Relaxed),
@@ -313,6 +317,8 @@ impl Metrics {
             },
             "gauges": {
                 "catalog_bytes": self.catalog_bytes.load(Ordering::Relaxed),
+                "memory_budget_bytes": self.memory_budget.limit(),
+                "memory_permits_held_bytes": self.memory_budget.held.load(Ordering::Relaxed),
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
                 "sequencer_held_bytes": self.sequencer_held_bytes.load(Ordering::Relaxed),

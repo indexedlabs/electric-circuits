@@ -489,9 +489,20 @@ async fn stream_loop(
         }
         match ev {
             ReplicationEvent::Begin { xid, .. } => {
-                txn = Some(TxnBuffer::with_metrics(xid, txn_cfg.clone(), shutdown.metrics().clone()));
+                drop(txn.take()); // a replaced Begin must release its old reservation before waiting
+                // No applied-LSN update can execute while this admission is waiting.
+                txn = Some(tokio::select! {
+                    _ = shutdown.wait() => { client.abort(); return Ok(StreamEnd::ShuttingDown); },
+                    admitted = TxnBuffer::admitted(xid, txn_cfg.clone(), shutdown.metrics().clone()) => admitted?,
+                });
             }
             ReplicationEvent::XLogData { data, .. } => {
+                if let Some(txn) = &mut txn {
+                    tokio::select! {
+                        _ = shutdown.wait() => { client.abort(); return Ok(StreamEnd::ShuttingDown); },
+                        reserved = txn.reserve_input(data.len() as u64) => reserved?,
+                    }
+                }
                 let msg = pgoutput::decode(&data)?;
                 // Schema-bearing messages are handled — and the engine's handling AWAITED — before
                 // anything else is decoded, so the dependents of a drifted/truncated table are
@@ -499,10 +510,16 @@ async fn stream_loop(
                 // change for it arrives (ADR-0005).
                 let txn_ref = txn.as_ref().map(|t: &TxnBuffer| TxnRef { xid: t.xid() });
                 if let Message::Relation { .. } = msg {
+                    if let Some(txn) = &mut txn {
+                        txn.release_for_schema()?;
+                    }
                     dec.on_relation(msg, events, txn_ref).await;
                     continue;
                 }
                 if let Message::Truncate { rel_ids } = &msg {
+                    if let Some(txn) = &mut txn {
+                        txn.release_for_schema()?;
+                    }
                     dec.on_truncate(rel_ids, events, txn_ref).await;
                     continue;
                 }
@@ -589,6 +606,7 @@ pub async fn append_commit_chunked(
     commit_lsn: &str,
     started: std::time::Instant,
 ) -> Result<u64> {
+    buf.reserve_drain().await?;
     let (xid, changes, bytes, spilled) = (buf.xid(), buf.len(), buf.buffered_bytes(), buf.spilled());
     let stamp = Stamp { lsn: commit_lsn.to_string(), txid: xid.to_string() };
     let mut chunks = 0u64;

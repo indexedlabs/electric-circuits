@@ -87,8 +87,9 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum replay span budget; combined with the recorded backfill size when replay-vs-recreate admission is enabled |
 | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Multiplier applied to recorded backfill bytes for replay admission |
 | `ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES` | `67108864` (64 MiB) | Per-shape ceiling for the live deltas a shape buffers between `BeginShape` and `ActivateShape` (its Postgres backfill, or its change-log replay plus the wait for a reactivation permit). Past it the buffer is dropped, activation refuses with a typed outcome and the caller recreates from a fresh backfill — the same answer an over-budget replay gives. `0` = no ceiling |
-| `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |
-| `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; strictly past this cap, incomplete input spills as NDJSON. `0` spills immediately. Does not cap read pages or transaction output |
+| `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | 60% of a finite readable cgroup memory limit | Process byte admission shared by all sources. Unset without a readable limit disables admission and logs once. `0` allows only exclusive positive requests; it does not disable admission. Oversized requests wait for an empty budget |
+| `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk; budgeted workspace growth or schema callbacks may spill earlier. `0` = never spill (buffer the whole transaction in RAM) |
+| `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-envelope memory estimate; strictly past this cap, incomplete input spills as NDJSON. `0` spills immediately. An enabled process budget spills held input before the next page regardless of this cap. Does not cap read pages or transaction output |
 | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
 | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for concurrent ingest and sequencer held spills, must be writable at boot (even with ingest spill disabled), and must not be shared between engines |
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | `16777216` (16 MiB) | Backfill: byte budget for one snapshot append. A shape's backfill is **streamed** from a `REPEATABLE READ` cursor and appended chunk by chunk, so engine memory per backfill is one chunk whatever the table's size. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
@@ -674,6 +675,49 @@ produced by the engine (rotation creates the successor first), so that state is 
 than skipped past — as is a boot whose restored position, or whose recorded current segment, names a
 stream storage no longer has.
 
+### Process byte admission
+
+`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` admits transient byte owners across all sources. The
+unset default is 60% of the readable finite cgroup limit (v1 unlimited sentinels are excluded).
+Without either an explicit setting or a limit, boot logs once that admission is disabled.
+Waiters are FIFO and cancellation removes the waiter; a request above the entire budget runs
+only when no other positive reservation is held. An explicit zero therefore serializes all
+positive requests. Reservations are capacity/byte estimates, not an RSS ceiling.
+
+Sequencer and catalog reads reserve their current response-body cap before accumulating a body;
+idle long-polls reserve nothing until data headers arrive. Catalog visits retain the permit through
+decoding and folding. Sequencer input keeps its page owner until consumed or spilled. With admission
+enabled, incomplete input spills before the next page; a page containing a receipt or continuing a
+held transaction spills its remaining input before processing, so query-backs and spill readers can
+obtain their own reservations. Ordinary complete pages need no extra scratch I/O. Spill jobs keep
+credits through blocking I/O even when their async caller is cancelled.
+
+Ingest reserves its memory cap plus append workspace before buffering, and reserves larger frame or
+drain workspaces before using them. A capped buffer spills before waiting for a larger reservation,
+and releases its credits before schema callbacks can wait for a backfill's pool slot.
+`TXN_MEMORY_BYTES=0` still never spills: its unbounded retained rows are outside the ledger, while
+input/drain workspace takes ordinary FIFO permits. Waiting cannot acknowledge PostgreSQL;
+acknowledgement still follows the last durable chunk.
+
+Electric snapshot/key folds reserve one response-body cap per page and release it after consuming
+that page. Backfills reserve `BACKFILL_APPEND_BYTES` before each cursor frame, releasing it after
+row decoding. An indivisible larger frame relinquishes the smaller reservation before admitting its
+actual wire size for decoding. Driver/transport buffering itself remains outside this accounting.
+Neither stage holds a permit while waiting for another. They share capacity with other work and
+become exclusive only when that one page/frame request exceeds the entire budget.
+
+Retained fold maps, row/order vectors, decoded backfill chunks/pending rows, collected seed/candidate
+sets, response conversion and handle caches remain unaccounted, like arrangement state. Keeping a
+result does not retain input credit. Fold admission follows lifecycle activation; backfill snapshot
+SQL, connection ownership, xid fencing and row results are unchanged.
+
+Prometheus exposes `engine_memory_budget_bytes`, `engine_memory_permits_held_bytes` and
+`engine_memory_permit_waits_total`; `/metrics` exposes the corresponding gauges and wait counter.
+These are process totals, also when observed through a source's metrics endpoint: do not sum them
+across sources. Per-engine counter reset leaves these process totals intact. Retained membership,
+seed/candidate sets, transaction output/arrangement batches, driver/transport buffers and allocator
+slack remain outside this admission ledger. A single oversized page/frame request can exceed the budget.
+
 ### Large transactions
 
 A transaction is only appendable once its `Commit` frame arrives (before that the commit LSN is
@@ -711,7 +755,7 @@ belongs to the held transaction, because a reconnect can re-deliver earlier comp
 and their seqs restart from 0. If the held transaction is not what comes next at all (that reconnect,
 or an epoch reset), the fragment is discarded — it will arrive again in full.
 
-Held input stays in memory up to `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (64 MiB by default,
+With process admission disabled, held input stays in memory up to `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (64 MiB by default,
 `0` spills immediately). Past it, the sequencer writes incoming envelopes, with stamps intact, to
 a unique `circuits-held-<uuid>-<pid>.ndjson` file in the same private spill directory. It reads bounded
 chunks only after the end marker arrives and flushes output once per transaction. Scratch is removed

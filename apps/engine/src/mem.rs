@@ -665,6 +665,28 @@ pub(crate) fn init_otel(
         catalog_bytes,
         "By"
     );
+    for (name, description, held) in [
+        ("engine_memory_budget", "Configured process byte budget (zero also denotes disabled)", false),
+        ("engine_memory_permits_held", "Process byte reservations currently held", true),
+    ] {
+        let budget = metrics.memory_budget.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_gauge(name)
+            .with_description(description)
+            .with_unit("By")
+            .with_callback(move |obs| {
+                obs.observe(if held { budget.held.load(Ordering::Relaxed) } else { budget.limit() }, &attributes)
+            })
+            .build();
+    }
+    let budget = metrics.memory_budget.clone();
+    let memory_attributes = attributes.clone();
+    meter
+        .u64_observable_counter("engine_memory_permit_waits")
+        .with_description("Process byte requests that had to wait")
+        .with_callback(move |obs| obs.observe(budget.waits.load(Ordering::Relaxed), &memory_attributes))
+        .build();
     engine_counter!("engine_txn_spills", "Transactions whose buffer outgrew the memory cap (ADR-0003)", txn_spills, "");
     engine_counter!("engine_txn_spill", "Bytes ever written to transaction spill files", txn_spill_bytes, "By");
     engine_counter!(
@@ -762,6 +784,40 @@ mod tests {
         drop(alpha_provider);
         assert_eq!(beta_provider.prometheus_text(), b);
         beta_provider.shutdown();
+    }
+
+    #[tokio::test]
+    async fn memory_budget_metrics_report_shared_reservations_and_survive_engine_reset() {
+        use super::*;
+        use std::future::Future;
+        let mut metrics = crate::metrics::Metrics::new("test".into(), false);
+        metrics.memory_budget = crate::memory_budget::MemoryBudget::new(Some(100));
+        let metrics = Arc::new(metrics);
+        let owner = metrics.memory_budget.acquire(200).await;
+        let mut wait = Box::pin(metrics.memory_budget.acquire(1));
+        std::future::poll_fn(|cx| {
+            assert!(wait.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        metrics.reset();
+        let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
+        let scrape = telemetry.prometheus_text();
+        for (name, value) in [
+            ("engine_memory_budget_bytes", 100),
+            ("engine_memory_permits_held_bytes", 200),
+            ("engine_memory_permit_waits_total", 1),
+        ] {
+            assert!(
+                scrape.lines().any(|line| line.starts_with(name) && line.ends_with(&format!(" {value}"))),
+                "{scrape}"
+            );
+        }
+        assert_eq!(metrics.snapshot()["gauges"]["memory_permits_held_bytes"], 200);
+        assert_eq!(metrics.snapshot()["counters"]["memory_permit_waits_total"], 1);
+        drop((wait, owner));
+        assert_eq!(metrics.snapshot()["gauges"]["memory_permits_held_bytes"], 0);
+        telemetry.shutdown();
     }
 
     #[test]

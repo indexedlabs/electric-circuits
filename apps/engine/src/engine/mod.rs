@@ -1374,10 +1374,16 @@ impl Engine {
         if let Some(binding) = binding {
             store_bound.set(binding).expect("fresh store binding proof");
         }
-        let metrics = Arc::new(crate::metrics::Metrics::new(
+        let ds = match config {
+            Some(config) => ds.with_memory_budget(config),
+            None => ds,
+        };
+        let mut metrics = crate::metrics::Metrics::new(
             config.map_or_else(|| crate::config::stack_id().to_owned(), |c| c.stack_id.clone()),
             restart_notify.is_some(),
-        ));
+        );
+        metrics.memory_budget = ds.memory_budget().clone();
+        let metrics = Arc::new(metrics);
         let memory_gauges = Arc::new(crate::mem::Gauges::default());
         let source_id = restart_notify.as_ref().map(|_| metrics.stack_id.clone());
         let telemetry = crate::mem::init_otel(metrics.clone(), memory_gauges.clone(), source_id.as_deref());
@@ -2828,6 +2834,12 @@ impl Engine {
         // lifecycle-map check when the shape is active (the common case).
         self.ensure_active(sid_of_path(path)).await?;
         self.ds.read(path, offset, live).await
+    }
+
+    /// Resolve lifecycle before holding a fold reservation: wake/replay can itself need budget.
+    pub(crate) async fn shape_fold_input(&self, path: &str) -> Result<DsClient> {
+        self.ensure_active(sid_of_path(path)).await?;
+        Ok(self.ds.clone())
     }
 
     /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:

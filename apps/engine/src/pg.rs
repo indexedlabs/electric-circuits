@@ -1412,13 +1412,30 @@ pub fn chunk_is_full(chunk_rows: usize, chunk_bytes: u64, row_bytes: u64, budget
     chunk_rows > 0 && chunk_bytes.saturating_add(row_bytes) > budget
 }
 
+/// Inspect byte length without allocating/decoding a PostgreSQL JSON frame.
+#[derive(Debug)]
+struct JsonWireBytes(u64);
+impl<'a> tokio_postgres::types::FromSql<'a> for JsonWireBytes {
+    fn from_sql(
+        _: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> std::result::Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(raw.len() as u64))
+    }
+    fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+        *ty == tokio_postgres::types::Type::JSON || *ty == tokio_postgres::types::Type::JSONB
+    }
+}
+
 /// A backfill snapshot being read, one chunk at a time.
 ///
 /// The `REPEATABLE READ` transaction is open and its fences are already captured; rows arrive over a
 /// `query_raw` cursor with tokio-postgres's own backpressure, so the engine never holds more than
 /// **one chunk**, whatever the table's size. Shape creation is two-phase (a pending buffer, then a
 /// gated activation), so appending the snapshot chunk by chunk needs no protocol change: the shape
-/// is not live until `ActivateShape` lands either way.
+/// is not live until `ActivateShape` lands either way. Byte admission covers one cursor frame through
+/// decoding, released before the next frame. Decoded chunks/pending rows and collected result sets
+/// are retained state outside the ledger; one append-sized request is reserved before each read.
 pub struct BackfillReader<'a> {
     client: &'a PooledClient,
     ts: &'a TableSchema,
@@ -1507,11 +1524,29 @@ impl<'a> BackfillReader<'a> {
     /// One row off the cursor, with the bytes it will cost in an append body.
     async fn next_row(&mut self) -> Result<Option<(Row, u64)>> {
         let Some(stream) = self.stream.as_mut() else { return Ok(None) };
+        let shutdown = &self.client.inner.shutdown;
+        let memory = &shutdown.metrics().memory_budget;
+        let mut permit = tokio::select! {
+            _ = shutdown.wait() => anyhow::bail!("backfill frame interrupted by shutdown"),
+            permit = memory.acquire(self.budget) => permit,
+        };
         let Some(row) = stream.next().await else {
             self.stream = None;
             return Ok(None);
         };
         let row = row.with_context(|| format!("backfill select {}", self.ts.table))?;
+        // The wire driver owns this frame already. Reserve before decoding its JSON and row
+        // into the engine page. JSONB's payload is text plus its one-byte version prefix.
+        let raw: JsonWireBytes = row.try_get(0)?;
+        if raw.0 > self.budget {
+            // The driver already owns this indivisible frame. Release the bounded read credit
+            // before admitting its actual size for decoding; never wait with another permit.
+            drop(permit);
+            permit = tokio::select! {
+                _ = shutdown.wait() => anyhow::bail!("backfill frame interrupted by shutdown"),
+                permit = memory.acquire(raw.0) => permit,
+            };
+        }
         let j: serde_json::Value = row.get(0);
         // Measured on the jsonb the SELECT returned — already in hand, so no extra allocation, and
         // an upper bound on the emitted value (a projection emits fewer columns, never more).
@@ -1521,6 +1556,9 @@ impl<'a> BackfillReader<'a> {
         let key_bytes = self.ts.key_string(&r).map(|k| k.len() as u64).unwrap_or(0);
         let estimated_bytes = value_bytes + key_bytes + self.frame;
         self.estimated_bytes = self.estimated_bytes.saturating_add(estimated_bytes);
+        drop(j);
+        drop(row);
+        drop(permit); // decoded rows, including the pending row and collected results, are unaccounted
         Ok(Some((r, estimated_bytes)))
     }
 
@@ -1835,6 +1873,9 @@ async fn query_subset_in_txn(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+pub(crate) mod memory_budget_tests;
 
 #[cfg(test)]
 mod tests {

@@ -22,6 +22,38 @@ Revisit v2 when large transactions measurably delay small ones — a latency rea
 
 ## Consequences
 
+Process byte admission adds a shared reservation ledger across ingest, sequencer input, boot catalog
+pages, backfills and Electric folds. `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` defaults to 60% of a finite
+readable cgroup limit; unset without a limit disables it with one boot log. Oversized requests wait
+for an empty ledger, and permit/waiter owners release on cancellation. Byte reservations are not an
+RSS ceiling: retained state, output batches, protocol buffers and allocator slack are additional.
+
+An enabled ledger makes held input spill before another page is read, even below the held cap. A
+page that carries a receipt or continues a held transaction spills all remaining input before
+processing; other complete pages consume their original reservation directly. Page permits follow
+input across blocking jobs and are released only after consumption/spill. Reader workspace permits
+end before receipt waits. Scratch writers are flushed/closed before those waits. All files retain
+the existing NDJSON format, replay pins, highwater rules and cleanup ownership.
+
+A capped ingestor reserves its cap plus append workspace before buffering and may spill earlier to
+release that reservation before waiting for a larger frame/drain workspace or pool-dependent schema
+work. This prevents a backfill waiting for memory while holding a pool slot from blocking the ingestor
+that owns the needed memory. The documented `0 = never spill` mode retains rows outside the ledger;
+its input/drain workspace uses ordinary FIFO requests, without forcing exclusivity.
+
+Backfill readers and Electric materialization/key folds reserve per frame/page, sized to the append
+budget or DS read cap. They release credit after decoding/consumption and before requesting more.
+A larger indivisible backfill frame drops the smaller permit before admitting its actual wire size.
+Only a single request larger than the process budget requires exclusivity; fitting requests coexist.
+Retained fold maps, decoded backfill rows, collected results and response conversion stay unaccounted,
+like arrangement state. Snapshot SQL, xid fences, pool ownership and results are unchanged. Fold
+admission follows activation. Waiting ingest never advances applied LSN, and acknowledgement still
+follows the last durable append.
+
+The process gauges are `engine_memory_budget_bytes` and `engine_memory_permits_held_bytes`; the
+counter is `engine_memory_permit_waits_total`. Source endpoints observe the same process totals.
+This is a transient admission policy, not a new catalog/change-log format or recovery authority.
+
 Peak **ingestor** memory is bounded by `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (default 134217728,
 128 MiB; `0` never spills) plus one chunk — the chunk held parsed, plus its serialized body while
 the POST is in flight. That is a bound on the ingestor, not on the engine: the sequencer's read
@@ -63,7 +95,7 @@ writers mark their one-envelope writes, and the sequencer **holds** a trailing r
 terminates: the held envelopes are carried into the next read and the transaction is processed and
 flushed only once the marker arrives.
 
-The held run has a separate envelope-memory cap, `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (67108864,
+When process byte admission is disabled, the held run has a separate envelope-memory cap, `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (67108864,
 64 MiB; `0` spills immediately). Strictly past it, input moves to a unique
 `circuits-held-<uuid>-<pid>.ndjson` file in the same spill directory, using the ingestor's NDJSON
 format **without restamping**. Further held input goes straight to that file. After the end marker,

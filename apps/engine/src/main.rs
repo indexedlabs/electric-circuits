@@ -134,6 +134,7 @@ async fn main() -> Result<()> {
     if let Some(target) = &config.statsd {
         statsd::init(target, &config.instance_id);
     }
+    let ds = ds.with_memory_budget(&config);
     let ds_base = ds.base().to_string();
     let admission = match Engine::admit_store(ds, store_bound, config.initialize_namespace).await {
         Ok(admission) => admission,

@@ -1,10 +1,11 @@
 //! Sequencer transaction input: complete page runs stay in memory; incomplete runs spill past
-//! their cap. The input is streamed back without restamping or rebuilding a transaction vector.
+//! their cap. With process admission enabled, held input and pages that need another byte owner
+//! spill before that wait. Input streams back without restamping or rebuilding a transaction vector.
 //! One awaited blocking operation per sequencer owns disk work; cancellation drops its returned
 //! owner when the operation finishes. Spill files are scratch, never the recovery authority.
 
 use std::collections::{HashSet, VecDeque};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::sync::{Arc, atomic::Ordering};
 
 use anyhow::{Context, Result, ensure};
@@ -24,6 +25,9 @@ pub(super) struct Transaction {
     mem: VecDeque<Envelope>,
     mem_bytes: u64,
     spill: Option<Spilled>,
+    max_envelope_bytes: u64,
+    read_permit: crate::memory_budget::Permit,
+    page_permit: Option<Arc<crate::memory_budget::Permit>>,
     // None for an already-complete run from a read page: it is not held input.
     cfg: Option<TxnBufferConfig>,
     metrics: Arc<Metrics>,
@@ -34,6 +38,7 @@ struct Spilled {
     writer: Option<BufWriter<std::fs::File>>,
     reader: Option<BufReader<std::fs::File>>,
     read: usize,
+    max_line_bytes: u64,
 }
 
 impl Transaction {
@@ -47,6 +52,9 @@ impl Transaction {
             mem: VecDeque::new(),
             mem_bytes: 0,
             spill: None,
+            max_envelope_bytes: 0,
+            read_permit: crate::memory_budget::Permit::default(),
+            page_permit: None,
             cfg: Some(cfg),
             metrics,
         }
@@ -62,7 +70,13 @@ impl Transaction {
         txn
     }
 
+    pub fn with_page_permit(mut self, permit: Option<Arc<crate::memory_budget::Permit>>) -> Self {
+        self.page_permit = permit;
+        self
+    }
+
     fn note(&mut self, env: &Envelope) {
+        self.max_envelope_bytes = self.max_envelope_bytes.max(envelope_memory_bytes(env));
         if self.count == 0 {
             self.key = super::sequencer::run_key_owned(env);
         }
@@ -92,8 +106,13 @@ impl Transaction {
             self.mem.push_back(env);
             if self.mem_bytes > cfg.held_memory_bytes {
                 let (file, handle) = HeldSpillFile::create(&cfg.spill_dir)?;
-                let mut spill =
-                    Spilled { file, writer: Some(BufWriter::with_capacity(IO_BYTES, handle)), reader: None, read: 0 };
+                let mut spill = Spilled {
+                    file,
+                    writer: Some(BufWriter::with_capacity(IO_BYTES, handle)),
+                    reader: None,
+                    read: 0,
+                    max_line_bytes: 0,
+                };
                 while let Some(env) = self.mem.pop_front() {
                     spill.write(&env)?;
                 }
@@ -109,19 +128,73 @@ impl Transaction {
         Ok(self)
     }
 
+    /// The page reservation covers memory until this finishes. Spill even a complete page run
+    /// before processing: its receipt may wait on a query-back that needs the same budget.
+    pub async fn spool(self, cfg: TxnBufferConfig) -> Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let mut txn = self;
+            if txn.spill.is_none() && !txn.mem.is_empty() {
+                let (file, handle) = HeldSpillFile::create(&cfg.spill_dir)?;
+                let mut spill = Spilled {
+                    file,
+                    writer: Some(BufWriter::with_capacity(IO_BYTES, handle)),
+                    reader: None,
+                    read: 0,
+                    max_line_bytes: 0,
+                };
+                while let Some(env) = txn.mem.pop_front() {
+                    spill.write(&env)?;
+                }
+                txn.mem = VecDeque::new();
+                if txn.cfg.is_some() {
+                    txn.metrics.sequencer_held_bytes.fetch_sub(txn.mem_bytes, Ordering::Relaxed);
+                    txn.metrics.sequencer_held_spills.fetch_add(1, Ordering::Relaxed);
+                }
+                txn.mem_bytes = 0;
+                txn.spill = Some(spill);
+            }
+            if let Some(spill) = &mut txn.spill
+                && let Some(mut writer) = spill.writer.take()
+            {
+                writer.flush().context("flushing input page spill")?;
+            }
+            txn.page_permit = None;
+            Ok(txn)
+        })
+        .await
+        .context("joining input page spill")?
+    }
+
     /// At most one bounded chunk (plus one indivisible envelope) is decoded at a time. The
     /// transaction owner keeps the file until its last append/receipt has finished processing.
     pub async fn next_chunk(&mut self) -> Result<Option<Vec<Envelope>>> {
+        // Reserve the bounded reader workspace once, including its persistent BufReader.
+        // Keep that owner across chunks; the terminal None releases before receipt waits.
+        if let Some(spill) = &self.spill
+            && self.read_permit.bytes() == 0
+        {
+            let bytes =
+                self.max_envelope_bytes.saturating_add(spill.max_line_bytes).saturating_add(3 * IO_BYTES as u64);
+            self.read_permit = self.metrics.memory_budget.acquire(bytes).await;
+        }
+
         let budget = self.cfg.as_ref().map_or(IO_BYTES as u64, |cfg| cfg.held_memory_bytes.min(IO_BYTES as u64).max(1));
         if let Some(mut spill) = self.spill.take() {
             let expected = self.count;
-            let (spill, result) = tokio::task::spawn_blocking(move || {
+            // The blocking job must own its reservation too: aborting the async waiter does
+            // not stop a running disk operation or free the envelopes it is decoding.
+            let permit = std::mem::take(&mut self.read_permit);
+            let (spill, result, permit) = tokio::task::spawn_blocking(move || {
                 let result = spill.next_chunk(budget, expected);
-                (spill, result)
+                (spill, result, permit)
             })
             .await
             .context("joining held spill read")?;
             self.spill = Some(spill);
+            self.read_permit = permit;
+            if result.as_ref().is_ok_and(Option::is_none) {
+                self.read_permit = crate::memory_budget::Permit::default();
+            }
             return result;
         }
         let mut out = Vec::new();
@@ -152,6 +225,14 @@ impl Drop for Transaction {
 
 impl Spilled {
     fn write(&mut self, env: &Envelope) -> Result<()> {
+        self.max_line_bytes = self.max_line_bytes.max(crate::txn_buffer::serialized_json_len(env)?.saturating_add(1));
+        if self.writer.is_none() && self.reader.is_none() && self.read == 0 {
+            let handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.file.path)
+                .context("reopening held spill for append")?;
+            self.writer = Some(BufWriter::with_capacity(IO_BYTES, handle));
+        }
         let writer = self.writer.as_mut().context("writing held spill after replay started")?;
         // Exactly the ingestor's NDJSON Envelope format, retaining all incoming stamps.
         serde_json::to_writer(&mut *writer, env).context("serializing held envelope")?;
@@ -161,18 +242,27 @@ impl Spilled {
     fn next_chunk(&mut self, budget: u64, expected: usize) -> Result<Option<Vec<Envelope>>> {
         if let Some(mut writer) = self.writer.take() {
             writer.flush().with_context(|| format!("flushing held spill {}", self.file.path.display()))?;
+        }
+        if self.reader.is_none() && self.read < expected {
             self.reader = Some(BufReader::with_capacity(
                 IO_BYTES,
                 std::fs::File::open(&self.file.path)
                     .with_context(|| format!("opening held spill {}", self.file.path.display()))?,
             ));
         }
+        if self.read == expected && self.reader.is_none() {
+            return Ok(None);
+        }
         let reader = self.reader.as_mut().context("held spill has no reader")?;
         let mut out = Vec::new();
         let mut bytes = 0;
         loop {
             let mut line = Vec::new();
-            let n = reader.read_until(b'\n', &mut line).context("reading held spill")?;
+            let n = (&mut *reader)
+                .take(self.max_line_bytes.saturating_add(1))
+                .read_until(b'\n', &mut line)
+                .context("reading held spill")?;
+            ensure!(n as u64 <= self.max_line_bytes, "held spill line exceeded the written envelope size");
             if n == 0 {
                 ensure!(self.read == expected, "held spill truncated: read {} of {expected} envelopes", self.read);
                 break;
@@ -186,6 +276,9 @@ impl Spilled {
             if bytes >= budget {
                 break;
             }
+        }
+        if out.is_empty() {
+            self.reader = None;
         }
         Ok((!out.is_empty()).then_some(out))
     }
@@ -230,6 +323,29 @@ mod tests {
                 offset: Some(format!("original-{seq}")),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn memory_budget_scratch_job_keeps_page_credit_after_its_waiter_is_dropped() {
+        let dir = Scratch::new();
+        let budget = crate::memory_budget::MemoryBudget::new(Some(10));
+        let permit = Arc::new(budget.acquire(20).await);
+        let txn = dir.txn(0, &Arc::new(Metrics::default())).with_page_permit(Some(permit.clone()));
+        let (started, arrived) = tokio::sync::oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let (done, terminal) = tokio::sync::oneshot::channel();
+        let task = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            held.recv().unwrap();
+            drop(txn);
+            done.send(()).unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), arrived).await.unwrap().unwrap();
+        drop((task, permit));
+        assert_eq!(budget.held.load(Ordering::Relaxed), 20, "running scratch work still owns the allocation");
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), terminal).await.unwrap().unwrap();
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

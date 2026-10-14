@@ -91,7 +91,7 @@ fn default_spill_dir() -> PathBuf {
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. `0` = never spill. |
+/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. Workspace/schema admission may spill earlier. `0` = never spill; only input/drain workspace is ledgered. |
 /// | `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` | `67108864` (64 MiB) | Sequencer held-input bytes before spilling. `0` spills every held envelope. |
 /// | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Largest POST body one commit's append may build. Must be > 0 and ≤ [`DS_MAX_BODY_BYTES`]. |
 /// | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Where spill files are written. Needs room for the largest transaction. |
@@ -272,6 +272,7 @@ pub struct TxnBuffer {
     mem: Vec<Envelope>,
     /// In-memory bytes currently held in `mem` ([`envelope_memory_bytes`]).
     mem_bytes: u64,
+    max_envelope_bytes: u64,
     spill: Option<Spill>,
     /// Envelopes pushed so far.
     count: u64,
@@ -282,6 +283,8 @@ pub struct TxnBuffer {
     raw_bytes: u64,
     /// `__el_sync` counter carried by this transaction (drain barrier).
     sync: Option<i64>,
+    // Last: release admission after both memory and spill buffers have been dropped.
+    memory_permit: crate::memory_budget::Permit,
 }
 
 impl TxnBuffer {
@@ -300,12 +303,61 @@ impl TxnBuffer {
             cfg,
             mem: Vec::new(),
             mem_bytes: 0,
+            memory_permit: crate::memory_budget::Permit::default(),
+            max_envelope_bytes: 0,
             spill: None,
             count: 0,
             buffered_bytes: 0,
             raw_bytes: 0,
             sync: None,
         }
+    }
+
+    /// Admission happens before receiving/decoding changes into the transaction. A waiter has
+    /// no acknowledged transaction; cancellation drops this scratch owner and PG replays it.
+    pub(crate) async fn admitted(
+        xid: u32,
+        cfg: TxnBufferConfig,
+        metrics: std::sync::Arc<crate::metrics::Metrics>,
+    ) -> Result<Self> {
+        let mut txn = Self::with_metrics(xid, cfg, metrics);
+        let bytes = txn.cfg.memory_bytes.saturating_add(txn.cfg.append_bytes);
+        txn.memory_permit = txn.metrics.memory_budget.acquire(bytes).await;
+        Ok(txn)
+    }
+
+    pub(crate) async fn reserve_input(&mut self, wire_bytes: u64) -> Result<()> {
+        self.reserve_workspace(wire_bytes).await
+    }
+
+    pub(crate) async fn reserve_drain(&mut self) -> Result<()> {
+        self.reserve_workspace(self.cfg.append_bytes.saturating_add(self.max_envelope_bytes)).await
+    }
+
+    async fn reserve_workspace(&mut self, workspace: u64) -> Result<()> {
+        if !self.metrics.memory_budget.enabled() {
+            return Ok(());
+        }
+        // In never-spill mode there is no finite buffer cap to reserve. Its retained rows
+        // are unaccounted; input/drain workspace still uses ordinary FIFO page admission.
+        let bytes = if self.cfg.memory_bytes == 0 { workspace } else { self.mem_bytes.saturating_add(workspace) };
+        if bytes > self.memory_permit.bytes() {
+            self.release_for_schema()?;
+            self.memory_permit = self.metrics.memory_budget.acquire(workspace.max(self.cfg.append_bytes)).await;
+        }
+        Ok(())
+    }
+
+    /// Schema callbacks may need a pool slot held by a backfill waiting for a frame permit.
+    /// Relinquish byte ownership first, spilling capped input; never-spill retains its rows.
+    pub(crate) fn release_for_schema(&mut self) -> Result<()> {
+        if self.metrics.memory_budget.enabled() {
+            if self.cfg.memory_bytes > 0 && !self.mem.is_empty() {
+                self.begin_spill()?;
+            }
+            self.memory_permit = crate::memory_budget::Permit::default();
+        }
+        Ok(())
     }
 
     pub fn xid(&self) -> u32 {
@@ -357,6 +409,7 @@ impl TxnBuffer {
     /// transaction.
     pub fn push(&mut self, env: Envelope, raw_len: u64) -> Result<()> {
         let bytes = envelope_memory_bytes(&env);
+        self.max_envelope_bytes = self.max_envelope_bytes.max(bytes);
         self.count += 1;
         self.buffered_bytes += bytes;
         self.raw_bytes += raw_len;
@@ -750,6 +803,105 @@ fn process_alive(pid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::ds::EnvelopeHeaders;
+
+    async fn assert_waiting<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    fn budget_metrics(bytes: u64) -> std::sync::Arc<crate::metrics::Metrics> {
+        let mut metrics = crate::metrics::Metrics::default();
+        metrics.memory_budget = crate::memory_budget::MemoryBudget::new(Some(bytes));
+        std::sync::Arc::new(metrics)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_never_spill_ingest_shares_capacity_and_yields_before_schema_work() {
+        let dir = Scratch::new("budget-schema");
+        let metrics = budget_metrics(100);
+        let peer = metrics.memory_budget.acquire(60).await;
+        let mut admitted = Box::pin(TxnBuffer::admitted(11, cfg(dir.path(), 0, 10), metrics.clone()));
+        let mut txn = std::future::poll_fn(|cx| {
+            use std::future::Future;
+            let std::task::Poll::Ready(txn) = admitted.as_mut().poll(cx) else {
+                panic!("a ten-byte ingest workspace must share the remaining capacity");
+            };
+            std::task::Poll::Ready(txn.unwrap())
+        })
+        .await;
+        txn.push(env_of("row", 1000), 1000).unwrap();
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 70);
+        txn.release_for_schema().unwrap();
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 60);
+        assert!(!txn.spilled(), "schema work must preserve the never-spill setting");
+        assert_eq!(drain_all(&mut txn).into_iter().flatten().count(), 1);
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ingest_admission_waits_and_cancellation_releases_the_queue() {
+        let dir = Scratch::new("budget-wait");
+        let metrics = budget_metrics(100);
+        let owner = metrics.memory_budget.acquire(100).await;
+        let mut admitted = Box::pin(TxnBuffer::admitted(11, cfg(dir.path(), 90, 10), metrics.clone()));
+        assert_waiting(admitted.as_mut()).await;
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 100);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        drop(admitted);
+        drop(owner);
+        drop(TxnBuffer::admitted(12, cfg(dir.path(), 90, 10), metrics.clone()).await.unwrap());
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ingest_spills_before_waiting_for_a_larger_workspace() {
+        let dir = Scratch::new("budget-spill");
+        let metrics = budget_metrics(10000);
+        let mut txn = TxnBuffer::admitted(11, cfg(dir.path(), 2000, 100), metrics.clone()).await.unwrap();
+        txn.push(env_of("row", 100), 100).unwrap();
+        assert!(!txn.spilled());
+        let other = metrics.memory_budget.acquire(100).await;
+        let mut reserve = Box::pin(txn.reserve_input(20000));
+        assert_waiting(reserve.as_mut()).await;
+        assert_eq!(
+            metrics.memory_budget.held.load(Ordering::Relaxed),
+            100,
+            "the ingestor must release its earlier byte owner before waiting"
+        );
+        drop(other);
+        reserve.await.unwrap();
+        assert!(txn.spilled());
+        txn.reserve_drain().await.unwrap();
+        let flat: Vec<_> = drain_all(&mut txn).into_iter().flatten().collect();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].key, "row");
+        drop(txn);
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_never_spill_ingest_admits_workspace_without_spilling() {
+        let dir = Scratch::new("budget-never-spill");
+        let metrics = budget_metrics(100);
+        let mut txn = TxnBuffer::admitted(11, cfg(dir.path(), 0, 100), metrics.clone()).await.unwrap();
+        txn.reserve_input(2000).await.unwrap();
+        txn.push(env_of("row", 1000), 1000).unwrap();
+        assert!(!txn.spilled());
+        let mut peer = Box::pin(metrics.memory_budget.acquire(1));
+        assert_waiting(peer.as_mut()).await;
+        txn.reserve_drain().await.unwrap();
+        let flat: Vec<_> = drain_all(&mut txn).into_iter().flatten().collect();
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].key, "row");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "zero retains never-spill semantics");
+        drop(txn);
+        drop(peer.await);
+        assert_eq!(metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
 
     fn env_of(key: &str, payload: usize) -> Envelope {
         Envelope {

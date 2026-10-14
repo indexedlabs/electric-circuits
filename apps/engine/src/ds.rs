@@ -387,6 +387,8 @@ pub(crate) struct StoreResponse {
     next_offset: Option<String>,
     up_to_date: bool,
     closed: bool,
+    // Drop owned body storage before returning its credits.
+    permit: crate::memory_budget::Permit,
 }
 
 impl StoreResponse {
@@ -709,6 +711,15 @@ pub(crate) trait DurableStreamStore: Send + Sync {
         response_body: BodyRead,
     ) -> StoreFuture<'a>;
     fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a>;
+    fn read_budgeted<'a>(
+        &'a self,
+        path: &'a str,
+        offset: &'a str,
+        live: bool,
+        budget: Option<&'a Arc<crate::memory_budget::MemoryBudget>>,
+        limit: u64,
+    ) -> StoreFuture<'a>;
+
     fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
     fn close<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
     fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
@@ -828,6 +839,17 @@ impl HttpDurableStreamsStore {
     }
 
     async fn response(&self, res: reqwest::Response, body_read: BodyRead, path: Option<&str>) -> StoreResponse {
+        self.response_budgeted(res, body_read, path, None, self.caps.ds_read_max_bytes()).await
+    }
+
+    async fn response_budgeted(
+        &self,
+        res: reqwest::Response,
+        body_read: BodyRead,
+        path: Option<&str>,
+        budget: Option<&Arc<crate::memory_budget::MemoryBudget>>,
+        limit: u64,
+    ) -> StoreResponse {
         let status = res.status().as_u16();
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
@@ -843,20 +865,21 @@ impl HttpDurableStreamsStore {
         // `read` and `read_json` used `res.text().await?` after a successful GET; turning an
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
+        // An idle long-poll owns no body bytes: await data headers before admission. The cap
+        // reserves the maximum body capacity, including responses without a content length.
+        let permit = match budget.filter(|_| should_read) {
+            Some(budget) => budget.acquire(limit).await,
+            None => crate::memory_budget::Permit::default(),
+        };
         let body = if should_read {
             Some(
-                read_body_bounded(
-                    res,
-                    self.caps.ds_read_max_bytes(),
-                    path.unwrap_or("<unknown>"),
-                    self.caps.advertised_max_value_bytes(),
-                )
-                .await,
+                read_body_bounded(res, limit, path.unwrap_or("<unknown>"), self.caps.advertised_max_value_bytes())
+                    .await,
             )
         } else {
             None
         };
-        StoreResponse { status, body, next_offset, up_to_date, closed }
+        StoreResponse { status, permit, body, next_offset, up_to_date, closed }
     }
 }
 
@@ -916,6 +939,25 @@ impl DurableStreamStore for HttpDurableStreamsStore {
         })
     }
 
+    fn read_budgeted<'a>(
+        &'a self,
+        path: &'a str,
+        offset: &'a str,
+        live: bool,
+        budget: Option<&'a Arc<crate::memory_budget::MemoryBudget>>,
+        limit: u64,
+    ) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let mut url = format!("{}?offset={}", self.stream_url(path), offset);
+            if live {
+                url.push_str("&live=long-poll");
+            }
+            let client = if live { &self.live_http } else { &self.http };
+            let res = client.get(url).send().await.with_context(|| format!("GET {path}"))?;
+            Ok(self.response_budgeted(res, BodyRead::OnData, Some(path), budget, limit).await)
+        })
+    }
+
     fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
@@ -949,6 +991,7 @@ pub struct DsClient {
     shutdown: Option<crate::shutdown::ShutdownToken>,
     metrics: Arc<crate::metrics::Metrics>,
     caps: Arc<ReadCaps>,
+    memory_budget: Arc<crate::memory_budget::MemoryBudget>,
     base: String,
     scope: StreamScope,
     store: Arc<dyn DurableStreamStore>,
@@ -963,6 +1006,16 @@ pub struct DsClient {
 }
 
 impl DsClient {
+    /// Share the boot configuration's process budget, also across supervised source clients.
+    pub fn with_memory_budget(mut self, config: &crate::config::Config) -> Self {
+        self.memory_budget = config.memory_budget.budget();
+        self
+    }
+
+    pub(crate) fn memory_budget(&self) -> &Arc<crate::memory_budget::MemoryBudget> {
+        &self.memory_budget
+    }
+
     pub(crate) fn metrics(&self) -> &Arc<crate::metrics::Metrics> {
         &self.metrics
     }
@@ -1005,6 +1058,7 @@ impl DsClient {
             base,
             scope,
             caps: store.read_caps(),
+            memory_budget: crate::memory_budget::MemoryBudget::new(None),
             store,
             reconcile: std::sync::Arc::new(std::sync::Mutex::new(None)),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1169,7 +1223,7 @@ impl DsClient {
 
     /// Read raw JSON events (non-envelope streams). Returns `(events, next_offset, up_to_date)`.
     pub async fn read_json(&self, path: &str, offset: &str) -> Result<(Vec<serde_json::Value>, Option<String>, bool)> {
-        let (body, next_offset, up_to_date) = self.read_json_body(path, offset).await?;
+        let (body, next_offset, up_to_date, _permit) = self.read_json_body(path, offset).await?;
         let events: Vec<serde_json::Value> = if body.trim().is_empty() {
             Vec::new()
         } else {
@@ -1181,19 +1235,27 @@ impl DsClient {
     /// One capped JSON page before decoding, for catalog event-zero admission and byte accounting.
     /// Preserves `read_json`'s empty/missing-stream and fallible-body semantics. The returned body
     /// is still page-sized; callers can decode a prefix without allocating every event in it.
-    pub(crate) async fn read_json_body(&self, path: &str, offset: &str) -> Result<(String, Option<String>, bool)> {
+    pub(crate) async fn read_json_body(
+        &self,
+        path: &str,
+        offset: &str,
+    ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
-        let res = self.store.read(&physical_path, offset, false).await?;
+        let mut res = self
+            .store
+            .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
+            .await?;
         if res.status == 204 || res.status == 404 {
-            return Ok((String::new(), res.next_offset, true));
+            return Ok((String::new(), res.next_offset, true, res.permit));
         }
         if !(200..300).contains(&res.status) {
             return Err(status_error("GET", path, res.status, ""));
         }
         let next_offset = res.next_offset.clone();
         let up_to_date = res.up_to_date;
+        let permit = std::mem::take(&mut res.permit);
         let body = res.required_body()?;
-        Ok((body, next_offset, up_to_date))
+        Ok((body, next_offset, up_to_date, permit))
     }
 
     /// Append envelopes. A retired stream (404/410/closed) is an error here; the live path uses
@@ -1477,17 +1539,46 @@ impl DsClient {
 
     /// Read from `offset` (use "-1" for the beginning). `live` enables long-poll tailing.
     pub async fn read(&self, path: &str, offset: &str, live: bool) -> Result<ReadResult> {
+        self.read_owned(path, offset, live, false).await.map(|(page, _)| page)
+    }
+
+    pub(crate) async fn read_budgeted(
+        &self,
+        path: &str,
+        offset: &str,
+        live: bool,
+    ) -> Result<(ReadResult, crate::memory_budget::Permit)> {
+        self.read_owned(path, offset, live, true).await
+    }
+
+    async fn read_owned(
+        &self,
+        path: &str,
+        offset: &str,
+        live: bool,
+        budgeted: bool,
+    ) -> Result<(ReadResult, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
-        let res = self.store.read(&physical_path, offset, live).await?;
+        let mut res = if budgeted {
+            self.store
+                .read_budgeted(&physical_path, offset, live, Some(&self.memory_budget), self.read_max_bytes())
+                .await?
+        } else {
+            self.store.read(&physical_path, offset, live).await?
+        };
+        let permit = std::mem::take(&mut res.permit);
 
         // 204 = long-poll timeout / no new data / a close that woke this long-poll.
         if res.status == 204 {
-            return Ok(ReadResult {
-                envelopes: Vec::new(),
-                next_offset: res.next_offset,
-                up_to_date: res.up_to_date,
-                closed: res.closed,
-            });
+            return Ok((
+                ReadResult {
+                    envelopes: Vec::new(),
+                    next_offset: res.next_offset,
+                    up_to_date: res.up_to_date,
+                    closed: res.closed,
+                },
+                permit,
+            ));
         }
         // A stream that is not there is a TYPED error (see `StreamGone`), never a generic read
         // failure: on the change log every caller has its own, very different answer to it.
@@ -1506,7 +1597,7 @@ impl DsClient {
         } else {
             serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
         };
-        Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
+        Ok((ReadResult { envelopes, next_offset, up_to_date, closed }, permit))
     }
 
     /// Read one page while decoding row bodies only for `table` and change-log control envelopes.
@@ -1888,7 +1979,7 @@ impl<'de> Deserialize<'de> for StrictJson {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{ScriptedStore, readiness_json};
+pub(crate) use tests::{BodyGate, ScriptedStore, readiness_json};
 
 #[cfg(test)]
 mod tests {
@@ -1957,10 +2048,65 @@ mod tests {
         assert_eq!(ReadCaps::default().ds_read_max_bytes(), (16 * 1024 * 1024).max(floor));
     }
 
+    #[tokio::test]
+    async fn memory_budget_read_credit_outlives_decode_and_errors_release_it() {
+        use std::future::Future;
+        let config =
+            crate::config::Config::resolve(|key| (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| "1".into()))
+                .unwrap();
+        let store = Arc::new(ScriptedStore::default());
+        let body = serde_json::json!([{"type":"public.items","key":"one","value":{"id":"one"},"headers":{"operation":"upsert"}}]).to_string();
+        store.pages_by_offset.lock().unwrap().insert("-1".into(), ("end".into(), true, body));
+        let ds = DsClient::with_test_store("scripted://budget-read".into(), store).with_memory_budget(&config);
+        let first = ds.read_budgeted("changes/0", "-1", false).await.unwrap();
+        assert_eq!(first.0.envelopes.len(), 1);
+        assert!(ds.memory_budget().held.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let mut second = Box::pin(ds.read_budgeted("changes/0", "-1", false));
+        std::future::poll_fn(|cx| {
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        drop(second.await.unwrap());
+        assert_eq!(ds.memory_budget().held.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let failure = DsClient::with_test_store(
+            "scripted://budget-error".into(),
+            Arc::new(ScriptedStore { fail_read_body: true, ..Default::default() }),
+        )
+        .with_memory_budget(&config);
+        assert!(failure.read_json_body("catalog", "-1").await.is_err());
+        assert_eq!(ds.memory_budget().held.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_idle_long_poll_takes_no_body_reservation() {
+        use std::future::Future;
+        let config =
+            crate::config::Config::resolve(|key| (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| "1".into()))
+                .unwrap();
+        let ds = DsClient::with_test_store(
+            "scripted://budget-idle".into(),
+            Arc::new(ScriptedStore { stall_live_reads: true, ..Default::default() }),
+        )
+        .with_memory_budget(&config);
+        let mut read = Box::pin(ds.read_budgeted("changes/0", "-1", true));
+        std::future::poll_fn(|cx| {
+            assert!(read.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(ds.memory_budget().held.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(ds.memory_budget().acquire(2).await);
+        assert_eq!(ds.memory_budget().waits.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     #[derive(Default)]
     pub(crate) struct ScriptedStore {
         pub(crate) caps: Arc<ReadCaps>,
+        pub(crate) body_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
         pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
+        pub(crate) append_notifiers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_read_body: bool,
         pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
@@ -1999,9 +2145,23 @@ mod tests {
         pub(crate) head_status: u16,
     }
 
+    #[derive(Default)]
+    pub(crate) struct BodyGate {
+        pub arrived: std::sync::atomic::AtomicUsize,
+        pub released: tokio::sync::Notify,
+    }
+
+    impl BodyGate {
+        async fn hold(&self) {
+            self.arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.released.notified().await;
+        }
+    }
+
     fn response(status: u16) -> StoreResponse {
         StoreResponse {
             status,
+            permit: crate::memory_budget::Permit::default(),
             body: Some(Ok(String::new())),
             next_offset: Some("opaque-provider-token".to_string()),
             up_to_date: true,
@@ -2039,6 +2199,11 @@ mod tests {
                 }
                 self.operations.lock().unwrap().push("append".to_string());
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
+                for (suffix, signal) in self.append_notifiers.lock().unwrap().iter() {
+                    if path.ends_with(suffix) {
+                        signal.notify_one();
+                    }
+                }
                 Ok(response(204))
             })
         }
@@ -2125,6 +2290,32 @@ mod tests {
                     }
                 }
                 Ok(res)
+            })
+        }
+
+        fn read_budgeted<'a>(
+            &'a self,
+            path: &'a str,
+            offset: &'a str,
+            live: bool,
+            budget: Option<&'a Arc<crate::memory_budget::MemoryBudget>>,
+            limit: u64,
+        ) -> StoreFuture<'a> {
+            Box::pin(async move {
+                // Scripted bodies are prebuilt fixture input. Like HTTP headers, an idle
+                // long-poll must resolve before taking memory for a response body.
+                let mut response = self.read(path, offset, live).await?;
+                if (200..300).contains(&response.status)
+                    && response.status != 204
+                    && let Some(budget) = budget
+                {
+                    response.permit = budget.acquire(limit).await;
+                }
+                let gate = self.body_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.hold().await;
+                }
+                Ok(response)
             })
         }
 

@@ -82,6 +82,11 @@ How a query registers onto its circuit, end to end:
 [docs/how-queries-become-live.md](docs/how-queries-become-live.md). Engine internals and cost
 model: [docs/ivm-engine-internals.md](docs/ivm-engine-internals.md).
 
+Transient ingest, sequencing, catalog, backfill frames and Electric snapshot pages share process byte
+admission through `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` (default: 60% of a readable cgroup limit).
+See [the transient memory budgets](docs/memory-model.md#6-transient-operation-budgets) for reservation
+lifetimes, spill behavior and the retained state outside this budget.
+
 ## The system
 
 ```

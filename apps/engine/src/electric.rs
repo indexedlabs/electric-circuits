@@ -593,10 +593,24 @@ impl StreamFold {
 
 /// Drive a [`StreamFold`] with catch-up reads until it completes.
 async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow::Result<StreamFold> {
+    let ds = engine.shape_fold_input(path).await?;
+    if !ds.memory_budget().enabled() {
+        while !fold.done {
+            let page = engine.read_shape_stream(path, &fold.offset, false).await?;
+            fold.apply_page(page);
+        }
+        return Ok(fold);
+    }
+    let shutdown = engine.shutdown_token();
     while !fold.done {
-        let offset = fold.offset.clone();
-        let r = engine.read_shape_stream(path, &offset, false).await?;
-        fold.apply_page(r);
+        let (page, permit) = tokio::select! {
+            _ = shutdown.wait() => anyhow::bail!("shape fold interrupted by shutdown"),
+            page = ds.read_budgeted(path, &fold.offset, false) => page?,
+        };
+        fold.apply_page(page);
+        // The page has been consumed. Retained map/order/result storage is outside the ledger.
+        // Never keep this owner while requesting the next page.
+        drop(permit);
     }
     Ok(fold)
 }
@@ -1141,6 +1155,163 @@ mod tests {
     use crate::schema::{ColumnDef, TableDef};
     use crate::shutdown::ShutdownToken;
     use std::collections::BTreeMap;
+
+    fn budget_config(bytes: u64) -> crate::config::Config {
+        crate::config::Config::resolve(|key| {
+            (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| bytes.to_string())
+        })
+        .unwrap()
+    }
+
+    async fn budget_engine(config: &crate::config::Config, store: Arc<crate::ds::ScriptedStore>) -> Engine {
+        let binding =
+            crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope());
+        let mut event = serde_json::to_value(&binding).unwrap();
+        event.as_object_mut().unwrap().insert("t".into(), "storeBound".into());
+        store.read_pages.lock().unwrap().push(("bound".into(), true, format!("[{event}]")));
+        let ds = crate::ds::DsClient::with_test_store("scripted://budget-revision".into(), store.clone());
+        let admission = Engine::admit_store(ds, binding, false).await.unwrap();
+        let mut row = env("upsert", "one", "01");
+        row.value = Some(serde_json::json!({"id":"one", "body":"x".repeat(1024)}));
+        store
+            .pages_by_offset
+            .lock()
+            .unwrap()
+            .insert("-1".into(), ("01".into(), true, serde_json::to_string(&vec![row]).unwrap()));
+        Engine::new_with_config(admission, None, crate::engine::PostgresSetup::EngineManaged, config)
+    }
+
+    #[tokio::test]
+    async fn memory_budget_two_folds_backfill_and_sequencer_read_concurrently() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let page_bytes = store.caps.ds_read_max_bytes();
+        let frame_bytes = crate::pg::backfill_config().append_bytes;
+        let config = budget_config(3 * page_bytes + frame_bytes);
+        let engine = budget_engine(&config, store.clone()).await;
+        let budget = engine.metrics.memory_budget.clone();
+        let mut pg = crate::pg::memory_budget_tests::BackfillFixture::new(engine.metrics.clone()).await;
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.body_gate.lock().unwrap() = Some(gate.clone());
+        let ds = engine.shape_fold_input("shape/s1").await.unwrap();
+        let mut first = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::to_tail()));
+        let mut second = Box::pin(drive_fold(&engine, "shape/s2", StreamFold::to_tail()));
+        let mut sequencer = Box::pin(ds.read_budgeted("changes/0", "-1", true));
+        let mut backfill = Box::pin(async {
+            let scope = crate::pg::SettleScope::internal(&pg.table.table);
+            let reader = crate::pg::backfill_reader(&mut pg.client, &pg.table, None, &scope).await.unwrap();
+            reader.collect().await.unwrap().0
+        });
+        let mut pg_arrived = Box::pin(pg.arrived.notified());
+        let mut pg_held = false;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                assert!(second.as_mut().poll(cx).is_pending());
+                assert!(backfill.as_mut().poll(cx).is_pending());
+                assert!(sequencer.as_mut().poll(cx).is_pending());
+                assert_eq!(
+                    budget.waits.load(Ordering::Relaxed),
+                    0,
+                    "two folds, a backfill and a sequencer page that fit must not wait for memory"
+                );
+                pg_held |= !pg_held && pg_arrived.as_mut().poll(cx).is_ready();
+                if gate.arrived.load(Ordering::SeqCst) == 3 && pg_held {
+                    assert_eq!(budget.held.load(Ordering::Relaxed), 3 * page_bytes + frame_bytes);
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("all four inputs must reach their held gates");
+        gate.released.notify_waiters();
+        pg.release.notify_one();
+        let (first, second, rows, page) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(first, second, backfill, sequencer) })
+                .await
+                .expect("released inputs must finish");
+        assert_eq!(first.unwrap().rows.len(), 1);
+        assert_eq!(second.unwrap().rows.len(), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            budget.held.load(Ordering::Relaxed),
+            page_bytes,
+            "retained decoded rows must not keep fold/backfill frame credits"
+        );
+        drop(page.unwrap());
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    /// Oversized page admission remains exclusive until the in-flight input owner drops.
+    /// A completed map is retained result state, so it must not keep the page's reservation.
+    #[tokio::test]
+    async fn memory_budget_serializes_oversized_shape_folds_until_the_owner_drops() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let engine = budget_engine(&budget_config(128), store.clone()).await;
+        let budget = engine.metrics.memory_budget.clone();
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.body_gate.lock().unwrap() = Some(gate.clone());
+        let mut first = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::to_tail()));
+        let mut second = Box::pin(drive_fold(&engine, "shape/s2", StreamFold::to_tail()));
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            assert_eq!(
+                gate.arrived.load(Ordering::SeqCst),
+                1,
+                "an oversized in-flight page must exclude a second fold page"
+            );
+            assert_eq!(budget.waits.load(Ordering::Relaxed), 1);
+            Poll::Ready(())
+        })
+        .await;
+        drop(first);
+        std::future::poll_fn(|cx| {
+            assert!(second.as_mut().poll(cx).is_pending());
+            assert_eq!(
+                gate.arrived.load(Ordering::SeqCst),
+                2,
+                "dropping the first owner must unblock the next fold page"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        gate.released.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(5), second).await.unwrap().unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0, "retained result is outside the ledger");
+        *store.body_gate.lock().unwrap() = None;
+        let third = drive_fold(&engine, "shape/s3", StreamFold::to_tail()).await.unwrap();
+        assert_eq!(third.rows, second.rows);
+        assert_eq!(budget.waits.load(Ordering::Relaxed), 1, "a retained result must not delay another fold");
+    }
+
+    #[tokio::test]
+    async fn memory_budget_fold_releases_between_pages_while_retaining_rows() {
+        use std::sync::atomic::Ordering;
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let engine = budget_engine(&budget_config(1), store.clone()).await;
+        {
+            let mut pages = store.pages_by_offset.lock().unwrap();
+            pages.get_mut("-1").unwrap().1 = false;
+            let mut row = env("upsert", "two", "02");
+            row.value = Some(serde_json::json!({"id":"two"}));
+            pages.insert("01".into(), ("02".into(), true, serde_json::to_string(&vec![row]).unwrap()));
+        }
+        let fold = tokio::time::timeout(Duration::from_secs(5), drive_fold(&engine, "shape/s1", StreamFold::to_tail()))
+            .await
+            .expect("next page must not wait on the fold's own previous page")
+            .unwrap();
+        assert_eq!(fold.order, ["one", "two"]);
+        assert_eq!(fold.rows.len(), 2);
+        assert_eq!(fold.offset, "02");
+        assert_eq!(engine.metrics.memory_budget.waits.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.metrics.memory_budget.held.load(Ordering::Relaxed), 0);
+    }
 
     /// An Electric client's recreate signal is the protocol's own `must-refetch` (409 + the control
     /// message), not a 500. A shape retired because its dormant replay exceeded the budget is

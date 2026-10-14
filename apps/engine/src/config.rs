@@ -9,11 +9,20 @@
 //!
 //! Unknown `ELECTRIC_*` vars are collected into [`Config::noop_vars`] and logged once as
 //! "accepted (no-op)" — they must never crash the boot.
+//!
+//! | Setting | Default | Meaning |
+//! | --- | --- | --- |
+//! | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | 60% of a finite readable cgroup limit | Shared process byte admission; unset with no limit disables it and logs once. `0` admits positive requests exclusively. |
+//!
+//! Configuration clones share one lazily initialized budget, including supervised sources.
+//! Reservations cover transient inputs, not retained fold maps, decoded backfill rows, allocator
+//! overhead or retained engine state. Folds/backfills release each page/frame before requesting more.
 
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+pub use crate::memory_budget::MemoryBudgetConfig;
 use crate::table_ref::{TableRef, TableSelector};
 use crate::txn_buffer::TxnBufferConfig;
 use crate::{
@@ -120,6 +129,8 @@ pub struct Config {
     /// before the buffer spills to disk, the sequencer held-input cap, the shared spill directory,
     /// and the byte budget for one append.
     pub txn: TxnBufferConfig,
+    /// Process byte admission (`ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`); see the module table.
+    pub memory_budget: MemoryBudgetConfig,
     /// Per-Engine membership spill cache settings.
     pub subq_storage: crate::subq_circuit::StorageSettings,
     /// Backfill streaming: the byte budget for one backfill append and the off-by-default
@@ -685,6 +696,7 @@ impl Config {
             memory_bytes_log_period,
             dbsp,
             txn,
+            memory_budget: MemoryBudgetConfig::resolve(g("ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES"))?,
             subq_storage: crate::subq_circuit::StorageSettings::resolve(g),
             backfill,
             shutdown_grace,

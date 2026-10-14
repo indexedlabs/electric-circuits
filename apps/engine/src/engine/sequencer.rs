@@ -689,8 +689,8 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
-                Ok(rr) => {
+            res = ds.read_budgeted(&read_path, &read_off, true), if !paused && !read_cap_failed => match res {
+                Ok((rr, page_permit)) => {
                     // A PauseReads command may win immediately after an in-flight HTTP read returns.
                     // Discard that page before touching the cursor or checkpoint so an existing
                     // sequencer can be fenced without advancing the retry boundary.
@@ -721,7 +721,9 @@ pub(crate) async fn sequencer_loop(
                     // cleared when a held transaction completes on this page. If a later
                     // transaction then fails, replay must still include that completed prefix.
                     let held_replay_from = held_from.clone();
-                    let page = match prepare_transactions(envs, held.take(), &txn_cfg, ds.metrics().clone()).await {
+                    let page_permit = Arc::new(page_permit);
+                    let page_credit = ds.memory_budget().enabled().then(|| page_permit.clone());
+                    let page = match prepare_transactions(envs, held.take(), &txn_cfg, ds.metrics().clone(), page_credit).await {
                         Ok(page) => page,
                         Err(error) => {
                             tracing::error!(%error, "sequencer held spill failed; preserving replay boundary");
@@ -731,6 +733,7 @@ pub(crate) async fn sequencer_loop(
                             break;
                         }
                     };
+                    drop(page_permit);
                     held = page.held;
                     if let Some(run) = &held {
                         if page.new_hold {
@@ -787,7 +790,11 @@ pub(crate) async fn sequencer_loop(
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
                         loop {
-                            let chunk = match transaction.next_chunk().await {
+                            let next_chunk = tokio::select! {
+                                _ = shutdown.wait() => Err(anyhow::anyhow!("sequencer input admission interrupted by shutdown")),
+                                result = transaction.next_chunk() => result,
+                            };
+                            let chunk = match next_chunk {
                                 Ok(Some(chunk)) => chunk,
                                 Ok(None) => break,
                                 Err(error) => {
@@ -1255,7 +1262,16 @@ async fn prepare_transactions(
     mut held: Option<super::held::Transaction>,
     cfg: &crate::txn_buffer::TxnBufferConfig,
     metrics: Arc<crate::metrics::Metrics>,
+    page_credit: Option<Arc<crate::memory_budget::Permit>>,
 ) -> Result<TransactionPage> {
+    // A receipt needs query-back credits, and a previously held input needs a spill-reader
+    // reservation. In either case spill the rest of this page before taking those dependencies.
+    // Ordinary complete pages can consume their page owner directly, without scratch I/O.
+    let spill_ready = held.is_some()
+        || envs.iter().any(|env| {
+            env.type_ == crate::runtime_authority::ENVELOPE_TYPE
+                || env.type_ == crate::replication::SOURCE_FENCE_ENVELOPE
+        });
     let mut ready = Vec::new();
     if let Some(mut run) = held.take() {
         let lead = envs.iter().take_while(|env| run_key(env) == key_ref(&run.key)).count();
@@ -1270,7 +1286,7 @@ async fn prepare_transactions(
                 _ => true,
             });
             if !envs.is_empty() {
-                run = run.append(envs).await?;
+                run = run.with_page_permit(page_credit.clone()).append(envs).await?;
             }
             envs = rest;
             if run.complete || !envs.is_empty() {
@@ -1283,7 +1299,12 @@ async fn prepare_transactions(
     let mut new_hold = false;
     if let Some(cut) = unterminated_tail(&envs) {
         let tail = envs.split_off(cut);
-        held = Some(super::held::Transaction::held(cfg.clone(), metrics.clone()).append(tail).await?);
+        held = Some(
+            super::held::Transaction::held(cfg.clone(), metrics.clone())
+                .with_page_permit(page_credit.clone())
+                .append(tail)
+                .await?,
+        );
         new_hold = true;
     }
     let mut iter = envs.into_iter().peekable();
@@ -1295,7 +1316,19 @@ async fn prepare_transactions(
                 run.push(env);
             }
         }
-        ready.push(super::held::Transaction::page(run, metrics.clone()));
+        ready.push(super::held::Transaction::page(run, metrics.clone()).with_page_permit(page_credit.clone()));
+    }
+    if metrics.memory_budget.enabled() {
+        if spill_ready {
+            let mut spooled = Vec::with_capacity(ready.len());
+            for txn in ready {
+                spooled.push(txn.spool(cfg.clone()).await?);
+            }
+            ready = spooled;
+        }
+        if let Some(txn) = held.take() {
+            held = Some(txn.spool(cfg.clone()).await?);
+        }
     }
     Ok(TransactionPage { ready, held, new_hold })
 }
@@ -2713,6 +2746,10 @@ mod held_spill_tests {
         }
 
         fn restore(cap: u64, start: LogPosition, highwater: Option<(u64, u64)>) -> Self {
+            Self::with_budget(cap, start, highwater, None)
+        }
+
+        fn with_budget(cap: u64, start: LogPosition, highwater: Option<(u64, u64)>, budget: Option<u64>) -> Self {
             let dir = std::env::temp_dir().join(format!("circuits-held-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&dir).unwrap();
             let cfg = crate::txn_buffer::TxnBufferConfig::resolve(|key| match key {
@@ -2724,8 +2761,15 @@ mod held_spill_tests {
             let store = Arc::new(crate::ds::ScriptedStore::default());
             // Keep unknown offsets parked, rather than returning synthetic empty pages in a loop.
             store.pages_by_offset.lock().unwrap().insert("unused".into(), ("unused".into(), true, "[]".into()));
-            let engine =
-                Engine::new_for_in_process_test(DsClient::with_test_store("scripted://held".into(), store.clone()));
+            let mut ds = DsClient::with_test_store("scripted://held".into(), store.clone());
+            if let Some(bytes) = budget {
+                let config = crate::config::Config::resolve(|key| {
+                    (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| bytes.to_string())
+                })
+                .unwrap();
+                ds = ds.with_memory_budget(&config);
+            }
+            let engine = Engine::new_for_in_process_test(ds);
             engine.set_txn_config(cfg);
             let processed = Arc::new(std::sync::Mutex::new(start.clone()));
             let (commands, rx) = mpsc::unbounded_channel();
@@ -2895,6 +2939,60 @@ mod held_spill_tests {
                 offset: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn memory_budget_ordinary_complete_input_keeps_its_credit_without_spilling() {
+        let h = Harness::with_budget(u64::MAX, LogPosition::start_of(0), None, Some(100));
+        let budget = h.engine.metrics.memory_budget.clone();
+        let credit = Arc::new(budget.acquire(200).await);
+        let cfg = h.engine.txn_cfg.lock().unwrap().clone();
+        let page = prepare_transactions(
+            vec![change("1", "0/10", 0, true)],
+            None,
+            &cfg,
+            h.engine.metrics.clone(),
+            Some(credit.clone()),
+        )
+        .await
+        .unwrap();
+        drop(credit);
+        assert!(h.files().is_empty(), "a complete page with no receipt dependency needs no disk I/O");
+        assert_eq!(budget.held.load(Ordering::Relaxed), 200, "decoded input still owns its page credit");
+        drop(page);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn memory_budget_page_spills_before_a_receipt_waits_on_another_byte_owner() {
+        let start = LogPosition::start_of(0);
+        let mut h = Harness::with_budget(u64::MAX, start.clone(), None, Some(1));
+        h.shape().await;
+        let appended = Arc::new(tokio::sync::Notify::new());
+        h.store.append_notifiers.lock().unwrap().insert("shape/s1".into(), appended.clone());
+        h.engine.pending_flips.add(0x10);
+        let engine = h.engine.clone();
+        let budget = engine.metrics.memory_budget.clone();
+        let worker = async {
+            appended.notified().await;
+            // A causally prior query-back cannot finish until it has memory. This is larger
+            // than the entire budget, so input from this page must have been released/spilled.
+            let _permit = budget.acquire(2).await;
+            assert!(engine.source_drain_receipt("budget-fence").is_none());
+            engine.pending_flips.complete(0x10);
+        };
+        let mut marker = change("1", "0/10", 1, true);
+        marker.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        marker.key = "budget-fence".into();
+        let page = vec![change("1", "0/10", 0, false), marker, change("2", "0/20", 0, false)];
+        tokio::join!(h.page(&start.offset, "p1", page), worker);
+        assert!(h.engine.source_drain_receipt("budget-fence").is_some());
+        assert_eq!(h.files().len(), 1, "later held input stays on disk across the receipt");
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0, "idle reads and held scratch own no input bytes");
+        assert_eq!(h.engine.metrics.sequencer_held_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(*h.processed.lock().unwrap(), start, "the later incomplete transaction still pins replay");
+        h.finish().await;
+        assert!(h.files().is_empty());
     }
 
     #[tokio::test]
