@@ -22,3 +22,8 @@ memtest.txt
 /results/
 data/dbsp/
 packages/bench/data/
+
+# Mighty Next stores intent remotely; never recreate the retired mt store here.
+# Only the hosted review checks live in the repository.
+.mighty/*
+!.mighty/checks/
