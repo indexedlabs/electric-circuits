@@ -18,6 +18,14 @@ use crate::value::{Row, Value};
 /// (ADR-0005) — nobody keeps a private immutable copy.
 pub type SharedTables = Arc<std::sync::RwLock<HashMap<TableRef, TableSchema>>>;
 
+/// A caller named a column outside the table's serving schema (including ingest projection).
+#[derive(Debug, thiserror::Error)]
+#[error("unknown column '{column}' on table '{table}'")]
+pub(crate) struct UnknownColumn {
+    table: TableRef,
+    column: String,
+}
+
 /// `pg_class.relreplident` for `REPLICA IDENTITY FULL` — the only value the engine can serve: an
 /// UPDATE/DELETE must carry the full old row for the delta algebra to retract it.
 pub const REPLICA_IDENTITY_FULL: u8 = b'f';
@@ -301,6 +309,31 @@ pub fn join_key_components<I: IntoIterator<Item = S>, S: AsRef<str>>(parts: I) -
 }
 
 impl TableSchema {
+    /// Narrow the engine's positional schema, preserving Postgres's full physical fingerprint.
+    /// The same view controls tuple decoding, predicates, backfills and query-backs.
+    pub(crate) fn project_ingest(&self, names: &[String]) -> Result<Self> {
+        let mut indices = names.iter().map(|c| self.column_index(c)).collect::<Result<Vec<_>>>()?;
+        indices.sort_unstable();
+        indices.dedup();
+        for &pk in &self.pk_cols {
+            if !indices.contains(&pk) {
+                anyhow::bail!(
+                    "ELECTRIC_CIRCUITS_PG_COLUMNS: table '{}' is missing primary-key column '{}'",
+                    self.table,
+                    self.columns[pk].0
+                );
+            }
+        }
+        let mut projected = self.clone();
+        projected.columns = indices.iter().map(|&i| self.columns[i].clone()).collect();
+        projected.pg_types = indices.iter().map(|&i| self.pg_types[i].clone()).collect();
+        projected.has_defaults = indices.iter().map(|&i| self.has_defaults[i]).collect();
+        projected.index = projected.columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
+        projected.pk_cols = self.pk_cols.iter().map(|&i| projected.index[&self.columns[i].0]).collect();
+        projected.pk_index = projected.pk_cols[0];
+        Ok(projected)
+    }
+
     pub fn from_def(table: &TableRef, def: &TableDef) -> Result<Self> {
         let columns: Vec<(String, ColumnType)> = def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
         let pg_types: Vec<Option<String>> = def.columns.values().map(|d| d.pg_type.clone()).collect();
@@ -379,7 +412,10 @@ impl TableSchema {
     }
 
     pub fn column_index(&self, col: &str) -> Result<usize> {
-        self.index.get(col).copied().ok_or_else(|| anyhow::anyhow!("unknown column '{col}'"))
+        self.index
+            .get(col)
+            .copied()
+            .ok_or_else(|| UnknownColumn { table: self.table.clone(), column: col.to_string() }.into())
     }
 
     pub fn column_type(&self, idx: usize) -> ColumnType {

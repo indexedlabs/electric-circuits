@@ -2119,6 +2119,22 @@ mod tests {
     /// The default budget must be appendable: a value above the durable-streams body cap could
     /// never land, and 16 MiB leaves three orders of magnitude of headroom.
     #[test]
+    fn ingest_projection_backfill_and_query_back_sql_excludes_unlisted_columns() {
+        let table = crate::table_ref::TableRef::parse("public.projected").unwrap();
+        let def = serde_json::from_value(serde_json::json!({
+            "columns":{"id":{"type":"int"}, "name":{"type":"text"}, "payload":{"type":"text"}},
+            "primaryKey":"id"
+        }))
+        .unwrap();
+        let full = TableSchema::from_def(&table, &def).unwrap();
+        let narrow = full.project_ingest(&["id".into()]).unwrap();
+        assert_eq!(row_json_expr(&narrow), "jsonb_build_object('id', to_jsonb(t.\"id\"))");
+        let wide = full.project_ingest(&["id".into(), "name".into()]).unwrap();
+        assert_eq!(row_json_expr(&wide), "jsonb_build_object('id', to_jsonb(t.\"id\"), 'name', t.\"name\"::text)");
+        assert!(!row_json_expr(&wide).contains("payload"));
+    }
+
+    #[test]
     fn default_backfill_budget_is_within_the_storage_body_cap() {
         let d = BackfillConfig::default();
         assert_eq!(d.append_bytes, 16 * 1024 * 1024);

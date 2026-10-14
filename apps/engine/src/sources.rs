@@ -714,6 +714,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
     child.dbsp = base.dbsp.clone();
     child.dbsp.dir = source_root.join("dbsp");
     child.memory_budget = base.memory_budget.clone();
+    child.pg_columns = base.pg_columns.clone();
     child.txn = base.txn.clone();
     child.txn.spill_dir = source_root.join("txn-spill");
     child.backfill = base.backfill;

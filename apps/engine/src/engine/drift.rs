@@ -287,7 +287,7 @@ impl Engine {
         }
         drop(client);
 
-        let ts = match TableSchema::from_def(table, &def) {
+        let ts = match self.compile_ingest_table(table, &def) {
             Ok(ts) => ts,
             Err(e) => {
                 // e.g. the migration dropped the primary key. Nothing can be served from it, and no

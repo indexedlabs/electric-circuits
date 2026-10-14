@@ -77,6 +77,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_PG_TLS_CA_BUNDLE` | for nonlocal PG | — | Absolute path to a PEM CA bundle used by both ordinary queries and logical replication. The engine image includes the AWS RDS us-east-1 roots at `/etc/ssl/certs/aws-rds-us-east-1-bundle.pem`. |
 | `ELECTRIC_CIRCUITS_PG_TLS_SERVER_NAME` | no | URL host | Optional DNS name used for certificate verification and SNI when the URL host is an IP address. |
 | `ELECTRIC_CIRCUITS_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` / `*` for every table with a primary key in that schema. `*` and an empty setting both mean `public.*` — never every schema. |
+| `ELECTRIC_CIRCUITS_PG_COLUMNS` | no | all columns | Static ingest columns per tracked table: `schema.table:col,col;schema.table:col`. Every primary-key column is required. Unknown tables/columns or missing keys refuse boot. Missing entries keep all columns. Changing a set requires restart and retires dependent shapes before ingest resumes; clients recreate from a fresh snapshot. |
 | `ELECTRIC_CIRCUITS_PG_SLOT`   | no       | `electric_circuits`  | Logical replication slot name (unique per engine). |
 | `ELECTRIC_CIRCUITS_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
 | `ELECTRIC_CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
@@ -277,6 +278,16 @@ immutable revision configured on the receiving process. A quiescing or shutting-
 therefore cannot replay a promote request and reclaim the row for itself. The successor alone may
 perform the idempotent exact-generation promotion.
 
+- **Limiting ingest columns:** set `ELECTRIC_CIRCUITS_PG_COLUMNS="public.agent_run:id,status"`
+  to omit large unused payloads from both new and old change-log rows. The publication still sends
+  full rows; projection happens before transaction buffering/spilling. Backfills and query-backs
+  select only listed columns. Shape output lists and predicates (including inner subqueries) that
+  name an unavailable column return 400 with its table and name. Every PK component must remain.
+  At restart, a changed effective set (including removing a restriction) retires all dependent
+  shapes before dormant restore or ingest. Clients see deleted streams / Electric 409 and recreate
+  from a fresh snapshot. Unchanged sets retain ordinary restore behavior; existing subquery shapes
+  still follow their usual restart retirement. Catalogs without projection records mean all columns.
+  See [ADR-0012](adr/0012-static-ingest-columns.md) for ordering and rollback limitations.
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
   replica identity on the new table and introspect it at startup.
 - **Change-log disk is bounded by segment size/age and the retain window.** Every committed change

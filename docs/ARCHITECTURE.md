@@ -206,6 +206,23 @@ removes them after transaction flush/receipt, on orphan/epoch-fragment discard a
 sweeps remove stale files; registered active held files survive an ingestor/source boot sweep. Disk
 errors stop the sequencer without advancing past the safe replay boundary; recovery rereads the log.
 
+`ELECTRIC_CIRCUITS_PG_COLUMNS` optionally restricts each tracked table's ingest columns. The
+compiled positional schema contains that set; the physical `SchemaFingerprint` still contains the
+full published schema. pgoutput decoding drops unlisted cells from both images before envelope
+buffering/spilling/appending; it still receives full wire tuples. Backfill and query-back row SQL
+selects only the compiled columns, and unavailable output/predicate columns (including nested inner
+predicates) are HTTP 400 errors naming table and column. All PK columns are mandatory. Drift
+re-introspection reapplies the configured set.
+
+The additive catalog event `ingestColumns { table, columns, hash }` records sorted effective names
+and their SHA-256; absent records mean all columns. Before dormant restore and ingest, boot retires
+every shape over a changed table, including subquery dependencies, awaiting durable `Dropped`,
+close/delete and durable `Retired` before appending the new set durably. A crash repeats unfinished
+retirements. Unchanged sets do nothing; legacy catalogs need no migration. Clients recreate retired
+streams and backfill newly included columns. Existing `SchemaChanged` and shape output lists keep
+their meanings. Catalog body reads use the shared page permits; projection reconciliation holds no
+permit while waiting for retirement. See [ADR-0012](adr/0012-static-ingest-columns.md).
+
 The process byte ledger (`memory_budget.rs`) is shared by all supervised sources. Its setting,
 `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, defaults to 60% of a readable finite cgroup limit; absent
 both, admission is disabled with one boot log. FIFO byte requests wait for capacity. An oversized

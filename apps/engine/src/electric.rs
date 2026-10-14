@@ -432,6 +432,9 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::schema::UnknownColumn>().is_some() {
+            return ApiError::bad_request(format!("{e:#}"));
+        }
         // Matched by TYPE, exactly as the native surface does (`http.rs`): a create that kept losing
         // the same race is not a server fault — the request is valid and the engine is busy retiring
         // things underneath it — so an Electric client is told to come back rather than to treat the
@@ -1014,9 +1017,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         // failure past this point (stream creation, backfill, reads) is internal (500).
         if let Some(cols) = &columns {
             for c in cols {
-                if ts.column_index(c).is_err() {
-                    return Err(ApiError::bad_request(format!("unknown column '{c}'")));
-                }
+                ts.column_index(c).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
             }
         }
         if let Some(pr) = &pred {

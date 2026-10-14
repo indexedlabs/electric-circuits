@@ -581,6 +581,8 @@ pub struct Engine {
     /// `setup_postgres` (which spawns the ingestor). Defaults apply when nothing sets them — the
     /// binary always does, from the boot config.
     txn_cfg: Arc<std::sync::Mutex<crate::txn_buffer::TxnBufferConfig>>,
+    /// Deployment projection, separate from physical schema fingerprints and shape SELECT lists.
+    pg_columns: Arc<std::collections::BTreeMap<TableRef, Vec<String>>>,
     /// The dbsp arrangement layer, once started (see [`crate::arrangements`]).
     arrangements: Arc<std::sync::Mutex<Option<crate::arrangements::Arrangements>>>,
     /// Per-table seed-snapshot gates fencing the arrangement feed (fresh seeds only; empty
@@ -1517,6 +1519,7 @@ impl Engine {
             retrying: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dbsp_cfg: Arc::new(std::sync::Mutex::new(None)),
             txn_cfg: Arc::new(std::sync::Mutex::new(crate::txn_buffer::TxnBufferConfig::default())),
+            pg_columns: Arc::new(config.map(|c| c.pg_columns.clone()).unwrap_or_default()),
             arrangements: Arc::new(std::sync::Mutex::new(None)),
             arr_gates: Arc::new(std::sync::RwLock::new(HashMap::new())),
             epoch: EpochState::new(),
@@ -2288,6 +2291,23 @@ impl Engine {
         self.health_status()
     }
 
+    fn validate_ingest_tables(&self, tables: &[TableRef]) -> Result<()> {
+        for table in self.pg_columns.keys() {
+            if !tables.contains(table) {
+                bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: unknown tracked table '{table}'");
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_ingest_table(&self, table: &TableRef, def: &crate::schema::TableDef) -> Result<TableSchema> {
+        let full = TableSchema::from_def(table, def)?;
+        match self.pg_columns.get(table) {
+            Some(columns) => full.project_ingest(columns).context("ELECTRIC_CIRCUITS_PG_COLUMNS"),
+            None => Ok(full),
+        }
+    }
+
     /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
     /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
     /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
@@ -2340,6 +2360,7 @@ impl Engine {
         }
         tables.sort();
         tables.dedup();
+        self.validate_ingest_tables(&tables)?;
         // Validate tracked-table visibility before any durable catalog, slot, publication,
         // identity or schema setup can mutate Postgres or storage. RLS is unsupported in the first
         // profile because it can make logical replication silently selective.
@@ -2432,7 +2453,7 @@ impl Engine {
             {
                 bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
             }
-            let ts = TableSchema::from_def(t, &def)?;
+            let ts = self.compile_ingest_table(t, &def)?;
             compiled.insert(t.clone(), ts);
         }
         *self.tables_shared.write().unwrap() = compiled.clone();
@@ -2452,6 +2473,11 @@ impl Engine {
         // routing sees every replayed change.
         if let Some(fold) = restored {
             self.apply_catalog(fold, &compiled, catalog::RestoreMode::Resume).await.context("catalog restore")?;
+        } else {
+            // Epoch reset retired the old records already. Still commit the projection witness
+            // before new ingest. The existing catalog reader holds Slice 5 page permits.
+            let mut fold = self.fold_catalog().await?;
+            self.reconcile_ingest_columns(&mut fold, &compiled).await?;
         }
         {
             let mut st = self.state.lock().await;

@@ -2124,6 +2124,8 @@ mod tests {
         pub(crate) head_count: std::sync::atomic::AtomicUsize,
         pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_append_path: Option<String>,
+        /// Hold a particular catalog event before committing it (crash/restart cut).
+        pub(crate) catalog_event_gate: std::sync::Mutex<Option<(String, Arc<BodyGate>)>>,
         /// How many non-live reads the store accepts and then never finishes. It models a provider
         /// that answers a replay `GET` and then stops yielding body bytes: the store call itself
         /// never resolves, exactly as the HTTP store's response future would not.
@@ -2196,6 +2198,14 @@ mod tests {
             Box::pin(async move {
                 if self.fail_append_path.as_deref().is_some_and(|p| path.ends_with(p)) {
                     return Err(anyhow::anyhow!("scripted append failure"));
+                }
+                let event_gate = self.catalog_event_gate.lock().unwrap().clone();
+                if let Some((kind, gate)) = event_gate
+                    && path.ends_with("meta/catalog")
+                    && serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+                        .is_ok_and(|events| events.iter().any(|ev| ev["t"] == kind))
+                {
+                    gate.hold().await;
                 }
                 self.operations.lock().unwrap().push("append".to_string());
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));
@@ -2330,12 +2340,18 @@ mod tests {
             })
         }
 
-        fn close<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
-            Box::pin(async { Ok(response(204)) })
+        fn close<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async move {
+                self.operations.lock().unwrap().push(format!("close:{path}"));
+                Ok(response(204))
+            })
         }
 
-        fn delete<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
-            Box::pin(async { Ok(response(204)) })
+        fn delete<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async move {
+                self.operations.lock().unwrap().push(format!("delete:{path}"));
+                Ok(response(204))
+            })
         }
     }
 

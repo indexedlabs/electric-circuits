@@ -82,6 +82,12 @@ How a query registers onto its circuit, end to end:
 [docs/how-queries-become-live.md](docs/how-queries-become-live.md). Engine internals and cost
 model: [docs/ivm-engine-internals.md](docs/ivm-engine-internals.md).
 
+Deployments can omit unused row payloads before buffering with
+`ELECTRIC_CIRCUITS_PG_COLUMNS=public.agent_run:id,status` (one list per tracked table, including all
+primary-key columns). Backfills and query-backs use that same column set. Changing it requires a
+restart and retires dependent streams so clients recreate from fresh snapshots; unlisted shape
+columns or predicates return 400. See [configuration](docs/deployment-postgres.md).
+
 Transient ingest, sequencing, catalog, backfill frames and Electric snapshot pages share process byte
 admission through `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` (default: 60% of a readable cgroup limit).
 See [the transient memory budgets](docs/memory-model.md#6-transient-operation-budgets) for reservation

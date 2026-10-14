@@ -141,3 +141,14 @@ not idempotent under duplicates.
 commit contributes 0). It also reports `sequencer_held_bytes` (estimated in-memory input, excluding
 disk/I/O buffers) and `sequencer_held_spills_total` (transactions spilled). Prometheus exports
 `engine_sequencer_held_bytes` and `engine_sequencer_held_spills_total`; counter reset preserves the gauge.
+
+### Static ingest projection (ADR-0012)
+
+A deployment may restrict each tracked table with `ELECTRIC_CIRCUITS_PG_COLUMNS`. Both new and old
+images lose unlisted columns before transaction buffering, spilling and append sizing; all primary
+keys remain. This reduces retained/log bytes but does not reduce PostgreSQL's full-row wire frames.
+The NDJSON scratch format, change envelopes, transaction markers, acknowledgement and held-run rules
+remain unchanged. Backfills/query-backs use the same projected schema. A changed effective set retires
+dependent streams at boot, durably before its additive catalog witness and before ingest starts;
+clients recreate from fresh snapshots. Physical schema fingerprints remain full-width. See
+[ADR-0012](0012-static-ingest-columns.md).

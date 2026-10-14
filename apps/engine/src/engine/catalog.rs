@@ -3,6 +3,10 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "ingest_projection_tests.rs"]
+mod ingest_projection_tests;
+
 /// The engine's durable **shape catalog**: an append-only event stream replayed at boot so a
 /// restart re-registers every shape itself instead of requiring a client re-registration storm.
 /// Plain/routed shapes resume with passthrough gates (the change log replays everything after the
@@ -150,6 +154,15 @@ pub(crate) enum CatalogEvent {
         table: TableRef,
         fingerprint: crate::schema::SchemaFingerprint,
     },
+    /// Effective ingest columns for one tracked table, committed only after all affected shape
+    /// retirements. Absent in legacy catalogs means all columns. This is independent of DDL and
+    /// the caller's per-shape SELECT list. Names are sorted, unique; hash is SHA-256 of their
+    /// compact JSON array (UTF-8). ADR-0012.
+    IngestColumns {
+        table: TableRef,
+        columns: Vec<String>,
+        hash: String,
+    },
     /// Durable deployment-handoff receipt. It is appended only after the sequencer processed the
     /// complete source transaction and every direct and deferred shape append caused by it landed.
     SourceDrained(SourceDrainReceipt),
@@ -163,6 +176,11 @@ pub(crate) enum CatalogEvent {
 /// `serde`'s `skip_serializing_if` wants a path, so the "omit the default" predicate is a function.
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn ingest_columns_hash(columns: &[String]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(columns)?)))
 }
 
 /// Exit code when the durable catalog **refused** an event (`EX_IOERR`): storage answered, the
@@ -548,6 +566,7 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
         CatalogEvent::SchemaChanged { .. } => "schemaChanged",
         CatalogEvent::SourceDrained(_) => "sourceDrained",
         CatalogEvent::SlotBound(_) => "slotBound",
+        CatalogEvent::IngestColumns { .. } => "ingestColumns",
     }
 }
 
@@ -890,6 +909,7 @@ type Restored = (
 /// in.
 pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
+    ingest_columns: std::collections::BTreeMap<TableRef, Vec<String>>,
     /// Shapes whose `Dropped` intent is in the log with no `Retired` completion after it: shape id →
     /// stream path. These are streams the engine promised to remove and did not — the boot hands
     /// them to the retirement queue (see [`Engine::apply_catalog`]).
@@ -940,6 +960,7 @@ impl Default for CatalogFold {
     fn default() -> Self {
         CatalogFold {
             recs: HashMap::new(),
+            ingest_columns: std::collections::BTreeMap::new(),
             pending_retire: HashMap::new(),
             max_shape_id: None,
             start_pos: LogPosition::start(),
@@ -1051,6 +1072,9 @@ impl CatalogFold {
             // Audit only (see the variant): the shapes it explains are already `Dropped`,
             // and the boot's own introspection is the authority on the schema.
             CatalogEvent::SchemaChanged { .. } => {}
+            CatalogEvent::IngestColumns { table, columns, .. } => {
+                self.ingest_columns.insert(table, columns);
+            }
             CatalogEvent::SourceDrained(receipt) => {
                 if !self.source_receipts.contains_key(&receipt.source_commit_id) {
                     self.source_receipts.insert(receipt.source_commit_id.clone(), receipt.clone());
@@ -1237,7 +1261,28 @@ impl Engine {
                         return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
                     }
                     let eid = ev["eid"].as_str().unwrap_or_default().to_string();
-                    let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
+                    // Unlike unknown future events, malformed projection provenance cannot be
+                    // ignored: treating it as legacy "all columns" could resume stale streams.
+                    let projection = ev["t"] == "ingestColumns";
+                    if projection {
+                        let raw = ev["table"].as_str().context("ingestColumns: missing table")?;
+                        if TableRef::parse(raw)?.as_str() != raw {
+                            bail!("ingestColumns: table '{raw}' must be qualified");
+                        }
+                    }
+                    let ev = match serde_json::from_value::<CatalogEvent>(ev) {
+                        Ok(ev) => ev,
+                        Err(e) if projection => return Err(e).context("invalid ingestColumns catalog event"),
+                        Err(_) => continue,
+                    };
+                    if let CatalogEvent::IngestColumns { columns, hash, .. } = &ev
+                        && (columns.is_empty()
+                            || columns.iter().any(String::is_empty)
+                            || columns.windows(2).any(|w| w[0] >= w[1])
+                            || *hash != ingest_columns_hash(columns)?)
+                    {
+                        bail!("invalid ingestColumns: expected sorted unique columns and matching SHA-256");
+                    }
                     fold.apply_once(&eid, ev);
                 }
                 Ok(())
@@ -1253,6 +1298,72 @@ impl Engine {
         Ok(fold)
     }
 
+    /// Complete projection changes before any old shape can be installed or ingest can start.
+    /// Each durable wait is crash-safe: boot either still sees the old set and repeats retirement,
+    /// or sees the new set only after every affected stream was deleted. No ledger permit or
+    /// engine-state lock is held while waiting on the writer/retirement queue.
+    pub(super) async fn reconcile_ingest_columns(
+        &self,
+        fold: &mut CatalogFold,
+        compiled: &HashMap<TableRef, TableSchema>,
+    ) -> Result<()> {
+        let mut changed = std::collections::BTreeMap::new();
+        for (table, ts) in compiled {
+            let current: Vec<String> = ts.columns.iter().map(|(name, _)| name.clone()).collect();
+            let differs = match fold.ingest_columns.get(table) {
+                Some(previous) => previous != &current,
+                // Legacy + no setting is deliberately a no-op, including after physical DDL:
+                // the existing schema fingerprint restore path owns that retirement.
+                None if !self.pg_columns.contains_key(table) => false,
+                None => {
+                    let mut full: Vec<String> = ts
+                        .fingerprint
+                        .as_ref()
+                        .map(|fp| fp.columns.iter().map(|c| c.name.clone()).collect())
+                        .unwrap_or_else(|| current.clone());
+                    full.sort();
+                    full != current
+                }
+            };
+            if differs {
+                changed.insert(table.clone(), current);
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        // Dropped records no longer carry a table. Finish all outstanding intents before writing
+        // any new projection witness, including a crash after Dropped but before Retired.
+        for (id, path) in fold.pending_retirements() {
+            self.retire_shape_stream_wait(&id, &path).await?;
+            fold.pending_retire.remove(&id);
+        }
+        for (table, columns) in changed {
+            let mut affected: Vec<_> = fold
+                .recs
+                .iter()
+                .filter(|(_, (rec, ..))| {
+                    rec.table == table || rec.where_json.as_ref().is_some_and(|w| referenced_tables(w).contains(&table))
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            affected.sort();
+            tracing::info!(%table, shapes = affected.len(), columns = columns.len(), "ingest column set changed; retiring dependent streams");
+            for id in affected {
+                let path = fold.recs[&id].0.stream_path.clone();
+                self.catalog_tx.send_durable(CatalogEvent::Dropped { id: id.clone() }).await?;
+                self.retire_shape_stream_wait(&id, &path).await?;
+                fold.recs.remove(&id);
+            }
+            let hash = ingest_columns_hash(&columns)?;
+            self.catalog_tx
+                .send_durable(CatalogEvent::IngestColumns { table: table.clone(), columns: columns.clone(), hash })
+                .await?;
+            fold.ingest_columns.insert(table, columns);
+        }
+        Ok(())
+    }
+
     /// Install a folded catalog: re-register every restorable shape with the (not yet spawned)
     /// sequencer — see [`CATALOG_STREAM`] for the restore semantics per shape kind — or, in
     /// [`RestoreMode::Park`], record them and stop there.
@@ -1262,6 +1373,9 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        if mode == RestoreMode::Resume {
+            self.reconcile_ingest_columns(&mut fold, compiled).await?;
+        }
         // Pins are independent of shapes: validate and install them before the empty-catalog fast
         // path and before the retention sweep can run after restore. `init_change_log` has already
         // rebuilt the retained segment set, but it validates only the sequencer checkpoint; every
@@ -2519,6 +2633,54 @@ mod tests {
             "subscription": "sub-a",
             "at": 100,
         })
+    }
+
+    #[tokio::test]
+    async fn ingest_projection_widening_retires_dormant_without_ddl() {
+        use sha2::{Digest, Sha256};
+        let mut created = created_event("public.users");
+        created["eid"] = serde_json::json!("created");
+        let events = vec![
+            catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound())),
+            serde_json::json!({"t":"ingestColumns", "eid":"columns", "table":"public.users",
+                "columns":["id"], "hash":format!("{:x}", Sha256::digest(br#"["id"]"#))}),
+            created,
+            catalog_event(
+                "dormant",
+                CatalogEvent::Dormant {
+                    id: "s1".into(),
+                    resume: LogPosition::start(),
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                },
+            ),
+        ];
+        let (ds, store) = paged_catalog(&events, 2);
+        let engine = Engine::new_for_in_process_test(ds);
+        let def = serde_json::from_value(serde_json::json!({
+            "columns":{"id":{"type":"int"}, "name":{"type":"text"}}, "primaryKey":"id"
+        }))
+        .unwrap();
+        let table = TableRef::parse("public.users").unwrap();
+        let compiled = HashMap::from([(table.clone(), TableSchema::from_def(&table, &def).unwrap())]);
+        let fold = engine.fold_catalog().await.unwrap();
+        engine.apply_catalog(fold, &compiled, RestoreMode::Resume).await.unwrap();
+        let kept = engine.state.lock().await.shapes.contains_key("s1");
+        engine.close(OTTO_5492_DEADLINE).await;
+        assert!(!kept, "widening ingest columns must retire the dormant stream before installation");
+        let appended: Vec<serde_json::Value> = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path.ends_with(CATALOG_STREAM))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+            .collect();
+        let order: Vec<&str> = appended
+            .iter()
+            .filter_map(|e| e["t"].as_str())
+            .filter(|t| matches!(*t, "dropped" | "retired" | "ingestColumns"))
+            .collect();
+        assert_eq!(order, ["dropped", "retired", "ingestColumns"], "retirement must be durable before the new set");
     }
 
     /// The catalog is strict where API ingress is lenient: a record must already carry the

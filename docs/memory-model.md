@@ -225,6 +225,11 @@ workspace is admitted, with its unbounded retained rows unaccounted. Capped inge
 cap plus append workspace and may spill earlier before larger workspace or schema/pool waits. See
 [engine configuration](../apps/engine/README.md#process-byte-admission) for owner lifetimes and costs.
 
+`ELECTRIC_CIRCUITS_PG_COLUMNS` additionally reduces row width before transaction buffering and
+spilling, for both new and old images. Backfill/query-back SQL uses that same per-table column set;
+wire frames and historical change-log segments can still contain omitted columns. Projection changes
+retire dependent streams at boot before clients backfill the new set ([ADR-0012](adr/0012-static-ingest-columns.md)).
+
 The following terms are intentionally separate from retained engine cardinalities:
 
 | operation | bounded memory | accounting/observation |

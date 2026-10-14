@@ -55,6 +55,7 @@ jobs:
           cargo test -p electric-circuits-engine --features test-support
           cargo test -p electric-circuits-engine --test deployment_ownership -- --ignored
           cargo test -p electric-circuits-engine --features test-support --test sources_table -- --ignored
+          cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4

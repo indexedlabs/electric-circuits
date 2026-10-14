@@ -88,6 +88,11 @@ pub struct Config {
     /// (`*` and an empty setting both mean `public.*` — see [`TableSelector`]). Malformed entries
     /// are dropped with a warning rather than crashing the boot.
     pub tables: Vec<TableSelector>,
+    /// Static per-table ingest projection (`ELECTRIC_CIRCUITS_PG_COLUMNS`):
+    /// `schema.table:col,col;schema.table:col`. Missing tables keep all columns. Lists are sorted
+    /// and deduplicated; boot introspection rejects untracked tables, unknown columns and missing
+    /// primary-key columns. A changed set retires dependent shapes before ingest starts.
+    pub pg_columns: std::collections::BTreeMap<crate::table_ref::TableRef, Vec<String>>,
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
     /// delivery); still parsed so existing `ELECTRIC_CIRCUITS_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
@@ -443,6 +448,32 @@ impl Config {
             );
         }
 
+        let mut pg_columns = std::collections::BTreeMap::new();
+        let raw_columns = g("ELECTRIC_CIRCUITS_PG_COLUMNS").unwrap_or_default();
+        if !raw_columns.trim().is_empty() {
+            for entry in raw_columns.split(';') {
+                let (table, columns) = entry
+                    .trim()
+                    .split_once(':')
+                    .context("ELECTRIC_CIRCUITS_PG_COLUMNS: expected schema.table:col,col;schema.table:col")?;
+                let table = table.trim();
+                let qualified =
+                    crate::table_ref::TableRef::parse(table).context("ELECTRIC_CIRCUITS_PG_COLUMNS: invalid table")?;
+                if table != qualified.as_str() {
+                    bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: table '{table}' must be qualified as schema.table");
+                }
+                let mut names: Vec<String> = columns.split(',').map(|c| c.trim().to_owned()).collect();
+                if names.iter().any(|c| c.is_empty() || c.contains(':') || c.chars().any(char::is_control)) {
+                    bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: table '{table}' has an invalid column list");
+                }
+                names.sort();
+                names.dedup();
+                if pg_columns.insert(qualified, names).is_some() {
+                    bail!("ELECTRIC_CIRCUITS_PG_COLUMNS: duplicate table '{table}'");
+                }
+            }
+        }
+
         let poll_ms = g("ELECTRIC_CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
         let instance_id = g("ELECTRIC_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -680,6 +711,7 @@ impl Config {
             json_logs,
             slot,
             tables,
+            pg_columns,
             poll_ms,
             instance_id,
             stack_id,
@@ -1362,6 +1394,30 @@ mod tests {
         );
         assert_eq!(c.dbsp.checkpoint_every, None, "0 means checkpoint only at shutdown");
         assert_eq!(c.dbsp.min_storage_bytes, Some(2048 * 1024));
+    }
+
+    #[test]
+    fn ingest_projection_refuses_malformed_setting() {
+        for raw in [
+            "public.users",
+            "users:id",
+            "public.*:id",
+            "public.users:",
+            "public.users:id,,name",
+            "public.users:id;public.users:name",
+        ] {
+            let result = try_cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", raw)]);
+            assert!(result.is_err(), "invalid ingest column setting must refuse boot: {raw}");
+        }
+    }
+
+    #[test]
+    fn ingest_projection_canonicalizes_each_table_independently() {
+        let config = cfg(&[("ELECTRIC_CIRCUITS_PG_COLUMNS", "public.users: name,id,id ; other.users:id")]);
+        assert_eq!(config.pg_columns[&"public.users".into()], ["id", "name"]);
+        assert_eq!(config.pg_columns[&"other.users".into()], ["id"]);
+        assert_eq!(config.pg_columns.len(), 2);
+        assert!(cfg(&[]).pg_columns.is_empty());
     }
 
     /// The selector grammar, and the fact that a typo is FATAL rather than quietly dropped — a
