@@ -134,7 +134,7 @@ impl Drop for Scratch {
 /// Fill a buffer with `n` envelopes under a cap small enough to force a spill and a budget small
 /// enough to force several chunks.
 fn spilled_buffer(dir: &std::path::Path, n: usize, memory_bytes: u64, append_bytes: u64) -> TxnBuffer {
-    let cfg = TxnBufferConfig { memory_bytes, append_bytes, spill_dir: dir.to_path_buf() };
+    let cfg = TxnBufferConfig { memory_bytes, append_bytes, spill_dir: dir.to_path_buf(), ..Default::default() };
     let mut buf = TxnBuffer::new(3141, cfg);
     for i in 0..n {
         buf.push(env_of(&format!("k{i:04}"), 48), 64).unwrap();
@@ -202,8 +202,12 @@ async fn a_small_commit_is_still_a_single_append() {
     let (ds, state) = recording_ds().await;
     let log = writer(ds);
 
-    let cfg =
-        TxnBufferConfig { memory_bytes: 128 * 1024 * 1024, append_bytes: 64 * 1024 * 1024, spill_dir: dir.0.clone() };
+    let cfg = TxnBufferConfig {
+        memory_bytes: 128 * 1024 * 1024,
+        append_bytes: 64 * 1024 * 1024,
+        spill_dir: dir.0.clone(),
+        ..Default::default()
+    };
     let mut buf = TxnBuffer::new(7, cfg);
     for i in 0..25 {
         buf.push(env_of(&format!("k{i}"), 16), 32).unwrap();
@@ -222,7 +226,8 @@ async fn an_empty_commit_appends_nothing() {
     let dir = Scratch::new("empty");
     let (ds, state) = recording_ds().await;
     let log = writer(ds);
-    let cfg = TxnBufferConfig { memory_bytes: 1024, append_bytes: 4096, spill_dir: dir.0.clone() };
+    let cfg =
+        TxnBufferConfig { memory_bytes: 1024, append_bytes: 4096, spill_dir: dir.0.clone(), ..Default::default() };
     let mut buf = TxnBuffer::new(1, cfg);
     assert_eq!(append_commit_chunked(&log, &mut buf, "0/1", std::time::Instant::now()).await.unwrap(), 0);
     assert!(state.appends.lock().unwrap().is_empty());

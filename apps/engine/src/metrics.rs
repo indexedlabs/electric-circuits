@@ -171,6 +171,10 @@ pub struct Metrics {
     /// segment-deletion floor — so a hold that does not end must be visible as a level, not only as
     /// a once-a-minute log line.
     pub sequencer_held_run: AtomicU64,
+    /// GAUGE: estimated in-memory held envelope bytes; excludes spilled data and file I/O buffers.
+    pub sequencer_held_bytes: AtomicU64,
+    /// COUNTER: held transactions that crossed their memory cap and spilled.
+    pub sequencer_held_spills: AtomicU64,
     pub sequencer_read_cap_failures: AtomicU64,
     /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
     pub shutdown_in_progress: AtomicU64,
@@ -245,6 +249,8 @@ impl Metrics {
             backfill_chunked_appends: AtomicU64::new(0),
             sequencer_orphan_fragments: AtomicU64::new(0),
             sequencer_held_run: AtomicU64::new(0),
+            sequencer_held_bytes: AtomicU64::new(0),
+            sequencer_held_spills: AtomicU64::new(0),
             sequencer_read_cap_failures: AtomicU64::new(0),
             shutdown_in_progress: AtomicU64::new(0),
             replication_slot_retained_wal_bytes: AtomicU64::new(0),
@@ -299,6 +305,7 @@ impl Metrics {
                 "catalog_restore_retired_total": self.catalog_restore_retired.load(Ordering::Relaxed),
                 "retirement_retries_total": self.retirement_retries.load(Ordering::Relaxed),
                 "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
+                "sequencer_held_spills_total": self.sequencer_held_spills.load(Ordering::Relaxed),
                 "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
                 "backfill_chunked_appends_total": self.backfill_chunked_appends.load(Ordering::Relaxed),
@@ -308,6 +315,7 @@ impl Metrics {
                 "catalog_bytes": self.catalog_bytes.load(Ordering::Relaxed),
                 "changes_segments_retained": self.changes_segments_retained.load(Ordering::Relaxed),
                 "sequencer_held_run": self.sequencer_held_run.load(Ordering::Relaxed),
+                "sequencer_held_bytes": self.sequencer_held_bytes.load(Ordering::Relaxed),
                 "sequencer_read_cap_failures_total": self.sequencer_read_cap_failures.load(Ordering::Relaxed),
                 "shutdown_in_progress": self.shutdown_in_progress.load(Ordering::Relaxed),
                 "subscriptions_live": self.subscriptions_live.load(Ordering::Relaxed),
@@ -356,12 +364,14 @@ impl Metrics {
         self.catalog_restore_retired.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);
         self.txn_spills.store(0, Ordering::Relaxed);
+        self.sequencer_held_spills.store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
         self.txn_chunked_appends.store(0, Ordering::Relaxed);
         self.backfill_chunked_appends.store(0, Ordering::Relaxed);
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
-        // (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`,
+        // (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `sequencer_held_bytes`,
+        // `shutdown_in_progress`,
         // `retirements_pending`, and the three replication-slot gauges the sampler republishes).
         self.process_envelope.reset();
         self.family_step.reset();

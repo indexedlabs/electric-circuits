@@ -125,7 +125,11 @@ A page can end **mid-transaction**: a commit too large for one request body reac
 several appends (ADR-0003), and durable-streams exposes each atomically. The trailing run of such a
 page is HELD — carried into the next read, de-duplicated within itself by `seq` — until the envelope
 carrying the transaction-end marker (`headers.last`) arrives, so what the steps below see is always a
-complete transaction. Nothing is published past the page a held run began in.
+complete transaction. Past `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (64 MiB by default), held input
+spills to NDJSON scratch in the ingest spill directory. On completion it is read in bounded chunks;
+per-transaction output and arrangement batches are still accumulated until the whole transaction
+finishes. Nothing is published past the page a held run began in. Scratch is removed on processing,
+discard or shutdown and swept after a crash; the change log remains the recovery authority.
 
 For each change:
 

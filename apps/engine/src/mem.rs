@@ -697,6 +697,8 @@ pub(crate) fn init_otel(
         sequencer_held_run,
         ""
     );
+    engine_gauge!("engine_sequencer_held", "Estimated in-memory held envelope bytes", sequencer_held_bytes, "By");
+    engine_counter!("engine_sequencer_held_spills", "Held transactions spilled to disk", sequencer_held_spills, "");
     engine_gauge!("engine_shutdown_in_progress", "1 once a graceful shutdown has begun", shutdown_in_progress, "");
     engine_gauge!(
         "engine_replication_slot_retained_wal",
@@ -760,6 +762,28 @@ mod tests {
         drop(alpha_provider);
         assert_eq!(beta_provider.prometheus_text(), b);
         beta_provider.shutdown();
+    }
+
+    #[test]
+    fn held_metrics_export_bytes_and_spill_count() {
+        use super::*;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        metrics.sequencer_held_bytes.store(4096, Ordering::Relaxed);
+        metrics.sequencer_held_spills.store(2, Ordering::Relaxed);
+        let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
+        let scrape = telemetry.prometheus_text();
+        telemetry.shutdown();
+        assert!(
+            scrape.lines().any(|line| line.starts_with("engine_sequencer_held_bytes") && line.ends_with(" 4096")),
+            "{scrape}"
+        );
+        assert!(
+            scrape.lines().any(|line| line.starts_with("engine_sequencer_held_spills_total") && line.ends_with(" 2")),
+            "{scrape}"
+        );
+        let json = metrics.snapshot();
+        assert_eq!(json["gauges"]["sequencer_held_bytes"], 4096);
+        assert_eq!(json["counters"]["sequencer_held_spills_total"], 2);
     }
 
     #[test]

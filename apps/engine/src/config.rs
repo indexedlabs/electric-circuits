@@ -117,7 +117,8 @@ pub struct Config {
     /// mandatory infrastructure — the sub-knobs below tune it, but it can no longer be turned off.
     pub dbsp: DbspConfig,
     /// Large-transaction handling on the ingest path (ADR-0003): the per-transaction memory cap
-    /// before the buffer spills to disk, the spill directory, and the byte budget for one append.
+    /// before the buffer spills to disk, the sequencer held-input cap, the shared spill directory,
+    /// and the byte budget for one append.
     pub txn: TxnBufferConfig,
     /// Per-Engine membership spill cache settings.
     pub subq_storage: crate::subq_circuit::StorageSettings,
@@ -706,7 +707,7 @@ impl Config {
         let base = format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
              secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} json_logs={} memory_log_period={:?} memory_bytes_log_period={:?} initialize_namespace={} log={} \
-             txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
+             txn_memory_bytes={} held_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
@@ -728,6 +729,7 @@ impl Config {
             self.initialize_namespace,
             self.log_filter,
             self.txn.memory_bytes,
+            self.txn.held_memory_bytes,
             self.txn.append_bytes,
             self.txn.spill_dir.display(),
             self.backfill.append_bytes,

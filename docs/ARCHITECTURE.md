@@ -183,9 +183,9 @@ every further change of that transaction goes straight to the file. At the commi
 streamed back in order, stamped, and appended in chunks of at most
 `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB, ≤ the durable-streams body cap) — **acknowledging
 the slot, publishing `last_lsn` and releasing the drain barrier only after the LAST chunk lands**.
-Peak **ingestor** memory is the cap plus one chunk (the sequencer's own read page, held run and
-pending appends are bounded by the transaction's size, not by this knob), and transaction size never
-invalidates a shape.
+Peak **ingestor** memory is the cap plus one chunk. The sequencer has a separate held-input cap;
+read pages and pending appends are not bounded by the ingest knob. Transaction size never invalidates
+a shape. The shared spill directory must fit concurrent ingest and held-input scratch.
 
 **Chunking is not visible as several transactions.** Durable-streams exposes each append atomically,
 so the sequencer's long-poll returns chunk 1 on its own; splitting a page by `(txid, lsn)` alone would
@@ -194,6 +194,17 @@ a **transaction-end marker** on the last envelope of every transaction (`headers
 single-chunk commits too; library-mode writers stamp their one-envelope writes), and the sequencer
 **holds** a trailing run that no marker terminates: held envelopes are carried into the next read and
 the transaction is processed and flushed only when the marker arrives.
+
+Held input spills strictly past `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (default 67108864, 64 MiB;
+`0` spills immediately). `engine/held.rs` owns the memory/file transition and streams the same NDJSON
+envelope format back without changing stamps or rebuilding a whole input vector. The sequencer awaits
+one blocking disk operation at a time, decoding chunks up to `min(cap, 1 MiB)` (at least one byte),
+plus an indivisible envelope. Reader/writer buffers are 1 MiB each; the cap excludes these buffers,
+the current page, per-transaction output and arrangement deltas. Only input is bounded by this cap.
+Unique `circuits-held-<uuid>-<pid>.ndjson` files share the ingestor's private directory. Their owner
+removes them after transaction flush/receipt, on orphan/epoch-fragment discard and shutdown. Boot
+sweeps remove stale files; registered active held files survive an ingestor/source boot sweep. Disk
+errors stop the sequencer without advancing past the safe replay boundary; recovery rereads the log.
 
 A re-delivery has to fold into that hold. When the ingestor fails part-way it acknowledges nothing,
 so Postgres re-sends the interrupted transaction from its start — and, because acknowledgements are
@@ -928,9 +939,10 @@ than the mechanism.
 ## 11. Telemetry
 
 - `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
-  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions,
+  `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for ingest and
+  `sequencer_held_spills_total` for held transactions spilled to disk,
   `backfill_chunked_appends_total` for streamed backfills, `sequencer_orphan_fragments_total`) +
-  gauges (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `shutdown_in_progress`, and the
+  gauges (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `sequencer_held_bytes`, `shutdown_in_progress`, and the
   replication-slot trio below) + log-bucket latency histograms (`process_envelope`, `family_step`,
   `append`) with p50/p99/p999/max.
 - **Replication-slot gauges**, engine-owned and sampled every ~10 s on a fresh connection: `replication_slot_retained_wal_bytes`

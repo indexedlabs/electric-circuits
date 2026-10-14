@@ -31,6 +31,7 @@ mod drift;
 pub(crate) mod emission;
 pub(crate) mod epoch;
 mod executors;
+mod held;
 mod introspection;
 mod lifecycle;
 pub(crate) mod membership;
@@ -1978,7 +1979,7 @@ impl Engine {
     }
 
     /// Configure large-transaction handling on the ingest path — the per-transaction memory cap,
-    /// the spill directory and the append byte budget (ADR-0003). Call before
+    /// the sequencer held-input cap, spill directory and append byte budget (ADR-0003). Call before
     /// [`setup_postgres`](Self::setup_postgres), which spawns the ingestor.
     pub fn set_txn_config(&self, cfg: crate::txn_buffer::TxnBufferConfig) {
         *self.txn_cfg.lock().unwrap() = cfg;
@@ -2184,6 +2185,8 @@ impl Engine {
         if st.sequencer.is_none() {
             let start = self.seq_start.lock().unwrap().clone();
             let highwater = *self.seq_highwater.lock().unwrap();
+            let txn_cfg = self.txn_cfg.lock().unwrap().clone();
+            crate::txn_buffer::sweep_held_spill_dir(&txn_cfg.spill_dir);
             st.sequencer = Some(spawn_sequencer(
                 self.ds.clone(),
                 self.tables_shared.clone(),
@@ -2203,6 +2206,7 @@ impl Engine {
                 self.restore_reads_paused.clone(),
                 self.read_cap_failed.clone(),
                 self.retention.pending_buffer_max_bytes,
+                txn_cfg,
                 self.pg_pool.as_ref().map(crate::pg::Pool::sequenced),
                 self.shutdown.clone(),
             ));

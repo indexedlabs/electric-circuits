@@ -25,14 +25,13 @@ Revisit v2 when large transactions measurably delay small ones — a latency rea
 Peak **ingestor** memory is bounded by `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (default 134217728,
 128 MiB; `0` never spills) plus one chunk — the chunk held parsed, plus its serialized body while
 the POST is in flight. That is a bound on the ingestor, not on the engine: the sequencer's read
-page, the run it holds (see below) and its per-transaction `txn_pending` are bounded by a
-transaction's size, not by this knob. The cap is measured on what is actually held (inline size plus
+page and per-transaction `txn_pending` are not bounded by this knob; held input has its own cap below. The cap is measured on what is actually held (inline size plus
 owned heap, the engine's `HeapSize` estimate), so nothing is serialized on the way in and an
 ordinary commit costs exactly what it did before this ADR. Past the cap the buffer is serialized out
 to one newline-delimited-JSON file under `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` (default a private 0700
 `<temp dir>/circuits-txn-spill-<uid>`; files are `O_EXCL`, mode 0600), memory is released, and every
 further change of that transaction is written straight to the file; that directory therefore needs
-room for the largest transaction the database can produce, and is probed for writability at boot —
+room for concurrent ingest and sequencer held spills, and is probed for writability at boot —
 an unusable one refuses the boot rather than failing every large commit. The file is scratch, never
 state: it is removed at commit, at abort, and when the replication connection is torn down, and a
 leftover from a process that died mid-transaction is swept at the next boot by pid liveness. Pids
@@ -64,6 +63,23 @@ writers mark their one-envelope writes, and the sequencer **holds** a trailing r
 terminates: the held envelopes are carried into the next read and the transaction is processed and
 flushed only once the marker arrives.
 
+The held run has a separate envelope-memory cap, `ELECTRIC_CIRCUITS_HELD_MEMORY_BYTES` (67108864,
+64 MiB; `0` spills immediately). Strictly past it, input moves to a unique
+`circuits-held-<uuid>-<pid>.ndjson` file in the same spill directory, using the ingestor's NDJSON
+format **without restamping**. Further held input goes straight to that file. After the end marker,
+the sequencer reads bounded chunks rather than reconstructing a transaction vector; chunk boundaries
+never flush partial output. Per-transaction output and arrangement batches remain proportional to the
+transaction; the current read page, one oversized envelope, decode storage and 1 MiB I/O buffers are
+additional to the held-input cap. This is an input bound, not a total engine memory budget.
+
+One awaited blocking operation per sequencer owns spill I/O. The scratch owner removes the file after
+processing/receipt completion, on orphan or epoch-fragment discard, and on shutdown. A cancelled
+blocking operation drops its owner when it finishes. Read/write/parse/truncation failures stop
+sequencing at the replay boundary without publishing the failed transaction's highwater. Stale held
+files join the ingest boot sweep; active held owners are registered so a later ingestor/source boot
+cannot remove them. The directory is required and probed even when ingest spilling is disabled.
+No durable format or recovery authority changes: a restart replays the change log, not scratch.
+
 Re-delivery folds into the hold, carefully. An interrupted chunked commit is acknowledged nowhere, so
 Postgres re-sends it from its start; and because acknowledgements are flushed on an interval, a
 reconnect can re-send earlier **complete** commits ahead of it. The "already held, skip it" filter
@@ -90,4 +106,6 @@ not idempotent under duplicates.
 
 `GET /metrics` reports `txn_spills_total`, `txn_spill_bytes` (cumulative bytes ever spilled) and
 `txn_chunked_appends_total` (the chunk appends made by commits too large for one append; an ordinary
-commit contributes 0).
+commit contributes 0). It also reports `sequencer_held_bytes` (estimated in-memory input, excluding
+disk/I/O buffers) and `sequencer_held_spills_total` (transactions spilled). Prometheus exports
+`engine_sequencer_held_bytes` and `engine_sequencer_held_spills_total`; counter reset preserves the gauge.
