@@ -2772,6 +2772,8 @@ async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it(
         let mut st = engine.state.lock().await;
         engine.ensure_sequencer(&mut st);
     }
+    // This current-thread fixture returns its in-memory error and runs the cap handler
+    // in the same poll as read arrival; a suspending body would need a completion fence.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let (_, _, live) = reads.recv().await.unwrap();

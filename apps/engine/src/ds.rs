@@ -253,13 +253,14 @@ pub struct StreamHead {
     pub closed: bool,
 }
 
-/// A read hit a stream that is not there: deleted (404) or soft-deleted (410).
+/// A read reported a missing stream: deleted (404) or soft-deleted (410).
 ///
 /// A typed error because callers make very different decisions about it than about a transient read
 /// failure. On the change log (ADR-0006) it is never expected — a segment is deleted only once
-/// nothing can resume inside it — so the sequencer logs it, halts reads and latches a data-admission
-/// refusal while requesting a host restart. Boot treats it as fatal for the position it is about to
-/// resume, and a dormant shape's replay treats it as "this shape can never be brought up to date", which evicts it.
+/// nothing can resume inside it — so a GET 404/410 is terminal for the current process: the sequencer
+/// halts reads, latches a data-admission refusal and requests a host restart. The next boot re-verifies
+/// the whole required segment chain; intact storage can resume, but a confirmed gap is fatal. A dormant
+/// shape's replay treats it as "this shape can never be brought up to date", which evicts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGone {
     pub path: String,
@@ -2638,6 +2639,8 @@ mod tests {
         pub(crate) streams: Option<std::sync::Mutex<HashMap<String, bool>>>,
         /// Status for an absent stream on GET/HEAD; zero retains the normal 404 default.
         pub(crate) missing_status: u16,
+        /// One live GET response for a matching path suffix, without deleting storage.
+        pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
         pub(crate) head_fault: std::sync::Mutex<Option<(String, u16)>>,
         pub(crate) head_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, u16)>>>,
@@ -2860,6 +2863,12 @@ mod tests {
                 self.read_offsets.lock().unwrap().push(offset.to_string());
                 if let Some(observer) = self.read_observer.lock().unwrap().as_ref() {
                     let _ = observer.send((path.to_string(), offset.to_string(), live));
+                }
+                {
+                    let mut fault = self.read_fault.lock().unwrap();
+                    if live && fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
+                        return Ok(response(fault.take().unwrap().1));
+                    }
                 }
                 let gate = self.read_gate.lock().unwrap().clone();
                 if let Some((suffix, gated_live, gate)) = gate

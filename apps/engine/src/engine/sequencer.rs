@@ -1098,17 +1098,15 @@ pub(crate) async fn sequencer_loop(
                 }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
                     ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
-                    // The segment the sequencer is reading has been DELETED under it. The sweeper
-                    // deletes only below the durable checkpoint, and the boot refuses to start on a
-                    // missing segment. Preserve the replay boundary and withdraw readiness just
-                    // as for an unrecoverable read-cap breach; an idle-looking healthy loop would
-                    // otherwise serve stale shapes forever.
+                    // A GET 404/410 is terminal for this process, even if a proxy misreported it.
+                    // Preserve the replay boundary and withdraw readiness as for a terminal cap
+                    // breach. The next boot verifies the whole chain: intact storage can resume,
+                    // but an actual gap refuses boot instead of serving stale shapes.
                     sequencer_read_failed = true;
                     read_failure_latch.store(true, Ordering::SeqCst);
                     tracing::error!(
-                        "sequencer: the change-log segment it is reading is GONE ({e:#}). Nothing may delete a \
-                         segment the durable checkpoint has not passed, so storage has lost data or something \
-                         outside the engine deleted it; live reads halted and readiness withdrawn. Requesting restart.",
+                        "sequencer: GET reported the change-log segment is GONE ({e:#}); live reads halted \
+                         and readiness withdrawn. Requesting restart; boot will re-verify the segment chain.",
                     );
                     shutdown.restart_or_exit(75);
                 }

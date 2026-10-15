@@ -2621,11 +2621,10 @@ impl Engine {
     /// creation is recorded as `ChangesRotated { segment: 0, at }` so the age criterion has a start
     /// time to measure from.
     ///
-    /// It is also where the **sequencer's** start position is vouched for. A segment is deleted only
-    /// once the durable checkpoint is past it, so a checkpoint naming a segment storage no longer
-    /// has is an impossible state — and one the sequencer cannot recover from, since it would spin
-    /// on a 404 forever. It is fatal here, at boot, with a message that names the segment, rather
-    /// than a retry loop inside a spawned task nobody is watching.
+    /// It also vouches for the **sequencer's** whole replay chain, from its start position through
+    /// the resolved current segment. A segment is deleted only once the durable checkpoint is past
+    /// it, so any gap in that range is fatal at boot, with a message naming the segment. Otherwise
+    /// replay would repeatedly request a runtime restart when it reached the same missing data.
     async fn init_change_log(
         &self,
         from_fold: u32,
@@ -2667,14 +2666,23 @@ impl Engine {
                 segment_path(seq_start.segment)
             );
         }
-        // Seed the writer's tail from storage, so the size budget and `force_rotate` are right from
-        // the first commit after a restart instead of from the first append this process makes
-        // (which would read the segment as empty and never rotate on size).
-        let tail = if seq_start.segment == resolved {
-            start_head.and_then(|h| h.next_offset)
-        } else {
-            self.ds.head(&segment_path(resolved)).await.ok().flatten().and_then(|h| h.next_offset)
-        };
+        // Resolving the writer can start ahead of the checkpoint. Every intervening segment is
+        // still needed for replay, even if the checkpoint already consumed its rotation pointer.
+        // Keep unavailable HEAD errors intact so the outer boot loop retries them, not a gap.
+        let mut tail = start_head.and_then(|h| h.next_offset);
+        for predecessor in seq_start.segment..resolved {
+            let path = segment_path(predecessor + 1);
+            let head = self.ds.head(&path).await.with_context(|| format!("checking required replay segment {path}"))?;
+            let Some(head) = head else {
+                bail!(
+                    "durable catalog resumes the change log at {seq_start}, but required segment {path} \
+                     does not exist. A segment is deleted only once the durable checkpoint has passed \
+                     it — refusing to boot with an incomplete replay chain."
+                );
+            };
+            tail = head.next_offset;
+        }
+        // The last verified HEAD also seeds the writer's size budget from its current tail.
         self.changes.state().adopt(resolved, starts, tail);
         self.metrics.changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
         tracing::info!("change log: current segment is {}", segment_path(resolved));

@@ -923,7 +923,7 @@ async fn crashsim_terminal_refusal_survives_shutdown_admission() {
     run.stop().await;
 }
 
-async fn restore_at_closed_tail(status: u16) -> (Run, LogPosition) {
+async fn closed_tail_snapshot() -> (Arc<ScriptedStore>, Arc<std::sync::Mutex<Oracle>>, LogPosition) {
     let mut seed = Run::new(store(), Default::default()).await;
     seed.fresh().await;
     seed.create("s1", None, true).await;
@@ -943,21 +943,35 @@ async fn restore_at_closed_tail(status: u16) -> (Run, LogPosition) {
     let tail = LogPosition { segment: 0, offset: head.next_offset.unwrap() };
     assert_ne!(tail.offset, "-1", "checkpoint must be beyond the rotation pointer");
     seed.engine.catalog_tx.send_durable(CatalogEvent::Offset { pos: tail.clone(), highwater: None }).await.unwrap();
-    if status != 503 {
-        seed.engine.ds.delete_stream("changes/1").await.unwrap();
-    }
     assert!(seed.engine.ds.head("changes/2").await.unwrap().is_some());
     let oracle = seed.oracle.clone();
-    let mut saved = seed.crash().await;
-    if status == 503 {
-        *saved.head_fault.lock().unwrap() = Some(("changes/1".into(), 503));
-    } else {
+    (seed.crash().await, oracle, tail)
+}
+
+async fn lose_successor_after_boot_check(status: u16) -> (Run, LogPosition) {
+    let (mut saved, oracle, tail) = closed_tail_snapshot().await;
+    if status != 503 {
         Arc::get_mut(&mut saved).unwrap().missing_status = status;
     }
-    let (tx, mut heads) = mpsc::unbounded_channel();
-    *saved.head_observer.lock().unwrap() = Some(tx);
     let mut restarted = Run::new(saved, oracle).await;
-    restarted.boot().await;
+    let fold = restarted.engine.fold_catalog().await.unwrap();
+    restarted
+        .engine
+        .init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos())
+        .await
+        .unwrap();
+    // The chain was intact at boot validation. Lose the successor before the reader
+    // starts, so this still exercises the runtime fallback after boot gains its check.
+    if status == 503 {
+        *restarted.store.head_fault.lock().unwrap() = Some(("changes/1".into(), 503));
+    } else {
+        restarted.engine.ds.delete_stream("changes/1").await.unwrap();
+    }
+    let (tx, mut heads) = mpsc::unbounded_channel();
+    *restarted.store.head_observer.lock().unwrap() = Some(tx);
+    let compiled = restarted.engine.tables_shared.read().unwrap().clone();
+    restarted.engine.apply_catalog(fold, &compiled, RestoreMode::Resume).await.unwrap();
+    restarted.check_clients().await;
     bounded("successor HEAD answered", async {
         loop {
             let (path, observed) = heads.recv().await.unwrap();
@@ -972,9 +986,92 @@ async fn restore_at_closed_tail(status: u16) -> (Run, LogPosition) {
 }
 
 #[tokio::test]
-async fn crashsim_missing_successor_after_closed_tail_restore_is_terminal() {
+async fn crashsim_boot_refuses_a_gap_between_checkpoint_and_writer() {
+    for status in [404, 410, 503] {
+        let (mut saved, _, tail) = closed_tail_snapshot().await;
+        Arc::get_mut(&mut saved).unwrap().missing_status = status;
+        let ds = DsClient::with_test_store("scripted://boot-gap".into(), saved.clone());
+        if status == 503 {
+            *saved.head_fault.lock().unwrap() = Some(("changes/1".into(), 503));
+        } else {
+            ds.delete_stream("changes/1").await.unwrap();
+        }
+        // Exercise the real PG boot admission gate without opening a connection. This is
+        // the segment-validation phase, before restore or ACTIVE publication.
+        let engine = Engine::new_pg_for_in_process_test(ds, "postgres://unused.invalid/unused".into());
+        engine.health.store(HEALTH_STARTING, Ordering::Release);
+        let fold = engine.fold_catalog().await.unwrap();
+        assert_eq!(fold.start_pos(), tail);
+        let error = engine
+            .init_change_log(fold.current_segment, fold.segment_starts.clone(), &tail)
+            .await
+            .expect_err("boot must validate every segment needed for replay");
+        assert!(format!("{error:#}").contains("changes/1"), "missing context: {error:#}");
+        assert_eq!(engine.health_status(), "starting", "failed boot must never publish active");
+        assert!(engine.ensure_not_degraded().unwrap_err().is::<DeploymentNotReady>());
+        assert!(engine.state.lock().await.sequencer.is_none(), "validation must precede replay");
+        assert!(!engine.shutdown.restart_requested(), "boot must not enter a runtime exit-75 loop");
+        if status == 503 {
+            assert_eq!(crate::pg::boot_disposition(&error), crate::pg::BootFailure::Retryable);
+            engine.init_change_log(fold.current_segment, fold.segment_starts.clone(), &tail).await.unwrap();
+            assert_eq!(engine.changes.state().current(), 2);
+        } else {
+            assert_eq!(crate::pg::boot_disposition(&error), crate::pg::BootFailure::Fatal);
+            assert!(format!("{error:#}").contains("refusing to boot"));
+        }
+        assert_eq!(engine.close(DEADLINE).await, crate::shutdown::ShutdownOutcome::Complete);
+        assert_eq!(checkpoints(&saved).last().unwrap().0, tail, "failed boot must not rewrite its checkpoint");
+    }
+}
+
+#[tokio::test]
+async fn crashsim_false_live_get_loss_restarts_and_boots_intact_chain() {
+    for get_status in [404, 410] {
+        let mut run = Run::new(store(), Default::default()).await;
+        run.fresh().await;
+        run.create("s1", None, true).await;
+        run.write(0x10, 1, Some("before false GET loss")).await;
+        let position = run.processed().await;
+        let command = run.engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
+        let (done, ack) = tokio::sync::oneshot::channel();
+        command.send(SequencerCmd::PauseReads { done }).unwrap();
+        bounded("pause before false GET loss", ack).await.unwrap();
+        while run.reads.try_recv().is_ok() {}
+        *run.store.read_fault.lock().unwrap() = Some(("changes/0".into(), get_status));
+        let (done, ack) = tokio::sync::oneshot::channel();
+        command.send(SequencerCmd::ResumeReads { done }).unwrap();
+        bounded("resume with false GET loss", ack).await.unwrap();
+        run.read_at(&position).await;
+        // This current-thread fixture returns the fault and runs its handler in the
+        // same poll as read arrival; a suspending response would need a completion fence.
+        assert!(
+            run.engine.shutdown.restart_requested(),
+            "GET {get_status} must request restart even with intact storage"
+        );
+        assert_eq!(bounded("false GET loss restart", run.engine.shutdown.wait_for_restart()).await, 75);
+        assert_eq!(run.engine.health_status(), "degraded");
+        assert_eq!(run.engine.readiness_status(), "shutting_down");
+        assert_eq!(run.processed().await, position, "a failed GET must preserve the replay boundary");
+        assert_eq!(replay_failed_diagnostic(&run).await, true);
+        assert_replay_refused(&run).await;
+        assert_eq!(run.engine.metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 1);
+        assert!(run.engine.ds.head("changes/0").await.unwrap().is_some(), "the GET fault must not delete storage");
+        run.stop().await;
+        assert_eq!(checkpoints(&run.store).last().unwrap().0, position);
+
+        let mut restarted = Run::new(retained(&run.store), run.oracle.clone()).await;
+        restarted.boot().await;
+        restarted.probe_after_restart().await;
+        assert_eq!(restarted.engine.health_status(), "active");
+        assert!(!restarted.engine.shutdown.restart_requested());
+        restarted.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn crashsim_successor_lost_after_boot_check_is_terminal() {
     for status in [404, 410] {
-        let (run, tail) = restore_at_closed_tail(status).await;
+        let (run, tail) = lose_successor_after_boot_check(status).await;
         assert_eq!(run.processed().await, tail, "loss must not skip to the existing writer segment");
         assert_eq!(run.engine.health_status(), "degraded", "confirmed missing successor must withdraw readiness");
         assert!(run.engine.shutdown.restart_requested(), "successor loss must request restart");
@@ -992,7 +1089,7 @@ async fn crashsim_missing_successor_after_closed_tail_restore_is_terminal() {
 
 #[tokio::test]
 async fn crashsim_transient_successor_head_retries_and_delivers() {
-    let (mut run, _) = restore_at_closed_tail(503).await;
+    let (mut run, _) = lose_successor_after_boot_check(503).await;
     assert_eq!(run.engine.health_status(), "active");
     assert!(!run.engine.shutdown.restart_requested());
     run.drain().await;
