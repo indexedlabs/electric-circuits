@@ -967,6 +967,22 @@ or exposing readiness/control operations; `boot_library` delegates to the same p
 restore or validate nonbinding records. A failed or cancelled
 validation leaves no engine running. Postgres construction remains waiting for its boot validation.
 
+Postgres boot binds HTTP before catalog restore. Shape/aggregate creation, dormant reactivation and
+guarded reads refuse work until the engine is active; native create returns `503` with
+`{"error":"engine is not the active ready writer; retry"}` and `Retry-After: 1`. Readiness probes
+alone cannot prevent early traffic. Restore installs the replay position and its paired
+de-duplication highwater under the same state lock used to spawn the sequencer. An existing reader
+started at a different checkpoint triggers a source restart (standalone exit `75`): reseating it
+would require reconciling effects and pending work it may already have produced.
+
+The catalog writer checks every `Offset` at dequeue against the restored/last durable floor and
+logs an error instead of appending a lower position. Equal positions remain valid, including their
+paired highwater. Floor seeding is serialized with checkpoint validation and append/retry, so it
+cannot race an in-flight checkpoint. A sequencer that never completed a read emits no shutdown
+checkpoint. When folding an older catalog, a regressing offset logs an error with both positions;
+the last offset/highwater pair remains authoritative. This diagnoses existing corruption without
+guessing a repair: a checkpoint naming a missing segment still refuses boot.
+
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,
 stream, and client, including live replication, batched mutations, NULLs, and concurrent writers.

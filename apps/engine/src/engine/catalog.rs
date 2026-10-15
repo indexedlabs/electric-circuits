@@ -267,6 +267,9 @@ pub(crate) struct CatalogWriter {
     /// segment `n` while the durable checkpoint still says `(n, X)` — and a crash in that window
     /// leaves a boot resuming inside a stream that no longer exists.
     durable: Arc<std::sync::Mutex<Option<LogPosition>>>,
+    /// Serializes boot's floor adoption with checkpoint appends. Only the catalog writer and
+    /// boot acquire it; no state lock is held while waiting, and ordinary lifecycle events do not.
+    checkpoint_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CatalogWriter {
@@ -289,7 +292,8 @@ impl CatalogWriter {
     /// log order still matches the state-mutation order; only the WAIT moves to the caller's own
     /// await point (after the lock is released, immediately before it answers its client).
     ///
-    /// It resolves successfully only after the append lands. The writer retries a transient failure
+    /// It resolves successfully only after the append lands (or a stale Offset is covered by the
+    /// newer durable floor). The writer retries a transient failure
     /// forever and exits [`EXIT_CATALOG_REFUSED`] on a definite refusal; if the writer task itself is
     /// lost, the typed error prevents any caller from manufacturing durability. There is deliberately
     /// no timeout — a create while storage is down waits, because the alternative is telling a client
@@ -367,7 +371,8 @@ impl CatalogWriter {
 
     /// Adopt the checkpoint the boot restored from the catalog: it is by definition already durable,
     /// and without it nothing could be deleted until this process wrote its first checkpoint.
-    pub(crate) fn seed_durable_offset(&self, pos: LogPosition) {
+    pub(crate) async fn seed_durable_offset(&self, pos: LogPosition) {
+        let _checkpoint = self.checkpoint_gate.lock().await;
         let mut g = self.durable.lock().unwrap();
         if g.as_ref().is_none_or(|cur| *cur < pos) {
             *g = Some(pos);
@@ -391,7 +396,8 @@ impl CatalogWriter {
 /// Spawn the single catalog writer: events are appended strictly in send order (senders enqueue
 /// while holding the engine-state lock, so the log order matches the state-mutation order).
 ///
-/// **The writer never drops an event.** A transient failure (transport, timeout, 5xx) retries THAT
+/// **The writer never drops a lifecycle event.** A stale Offset is rejected when a newer durable
+/// floor already covers it. A transient failure (transport, timeout, 5xx) retries THAT
 /// event in place, forever, so the log keeps its order and a restart cannot under-restore; a
 /// definite refusal requests a source restart (standalone: [`EXIT_CATALOG_REFUSED`]), because memory and the durable
 /// record disagree has no honest way to continue. The retry loop is bounded in practice by the
@@ -403,6 +409,8 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
     let counter = in_flight.clone();
     let durable: Arc<std::sync::Mutex<Option<LogPosition>>> = Arc::new(std::sync::Mutex::new(None));
     let landed = durable.clone();
+    let checkpoint_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let writer_checkpoint_gate = checkpoint_gate.clone();
     let landed_seq = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let writer_landed_seq = landed_seq.clone();
     let landed_notify = Arc::new(tokio::sync::Notify::new());
@@ -422,6 +430,26 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                 CatalogEvent::Offset { pos, .. } => Some(pos.clone()),
                 _ => None,
             };
+            // Check at dequeue, not enqueue: earlier queued offsets may have advanced the floor.
+            // Keep boot's seed outside this append/retry critical section so it cannot advance
+            // the floor underneath an in-flight append. The existing shutdown watchdog bounds
+            // a storage outage; no engine-state lock is held across these storage waits.
+            let _checkpoint_guard = if checkpoint.is_some() { Some(writer_checkpoint_gate.lock().await) } else { None };
+            let floor = landed.lock().unwrap().clone();
+            if let (Some(pos), Some(floor)) = (&checkpoint, floor)
+                && *pos < floor
+            {
+                tracing::error!(checkpoint = %pos, durable_floor = %floor, "refusing regressing catalog checkpoint");
+                // Its durability barrier is already covered by the newer floor. Account for
+                // this no-op so drains and later client-facing lifecycle barriers still finish.
+                writer_landed_seq.store(seq, Ordering::SeqCst);
+                writer_landed_notify.notify_waiters();
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+                counter.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
             let json = match serde_json::to_value(&ev) {
                 // The `eid` rides on the wire beside the event's own fields (the enum is
                 // internally tagged, so the value is always a JSON object).
@@ -513,6 +541,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
         shutdown: writer_shutdown,
         in_flight,
         durable,
+        checkpoint_gate,
         eid_nonce: process_nonce(),
         next_eid: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         landed_seq,
@@ -1053,6 +1082,12 @@ impl CatalogFold {
                 self.pending_retire.remove(&id);
             }
             CatalogEvent::Offset { pos, highwater } => {
+                if pos < self.start_pos {
+                    tracing::error!(
+                        previous = %self.start_pos, checkpoint = %pos,
+                        "catalog checkpoint regressed; preserving the last recorded position for boot validation"
+                    );
+                }
                 self.start_pos = pos;
                 self.start_highwater = highwater;
             }
@@ -1503,12 +1538,29 @@ impl Engine {
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The restored checkpoint IS durable (it was read back out of the log), so it is the
         // segment-deletion floor from boot rather than from this process's first checkpoint.
-        self.catalog_tx.seed_durable_offset(start_pos.clone());
-        *self.seq_start.lock().unwrap() = start_pos;
-        // The de-duplication highwater is restored with the position (ADR-0003), so a prefix of a
-        // chunked commit that was applied and checkpointed before a crash is not applied twice when
-        // Postgres re-delivers the transaction.
-        *self.seq_highwater.lock().unwrap() = start_highwater;
+        self.catalog_tx.seed_durable_offset(start_pos.clone()).await;
+        {
+            // Share ensure_sequencer's lock: checking the existing reader and installing both
+            // cursor halves must be atomic with spawning it. Reseating a reader that may already
+            // have fanned out changes would need to reconcile its executors and pending work.
+            let st = self.state.lock().await;
+            let mut start = self.seq_start.lock().unwrap();
+            let mut highwater = self.seq_highwater.lock().unwrap();
+            if st.sequencer.is_some() && (*start != start_pos || *highwater != start_highwater) {
+                tracing::error!(
+                    spawned_at = %*start, restored_at = %start_pos,
+                    spawned_highwater = ?*highwater, restored_highwater = ?start_highwater,
+                    "catalog restore found a sequencer started at a different checkpoint; requesting restart (75)"
+                );
+                self.shutdown.restart_or_exit(75);
+                anyhow::bail!(
+                    "catalog restore: sequencer already started at {start}; restored checkpoint is {start_pos}"
+                );
+            }
+            *start = start_pos;
+            // Restore de-duplication with the position, including a completed chunk prefix.
+            *highwater = start_highwater;
+        }
 
         if mode == RestoreMode::Park {
             // The epoch broke: hold the records, touch nothing else (see `RestoreMode::Park`).
@@ -1845,9 +1897,6 @@ pub(crate) mod testing {
         missing_heads: Mutex<HashSet<String>>,
         closed_heads: Mutex<HashSet<String>>,
         events: Mutex<Vec<serde_json::Value>>,
-        /// Opt-in read cut: report the requested cursor, then hold the response forever.
-        /// The engine can cancel the read, but no page can complete before shutdown.
-        held_change_reads: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::changelog::LogPosition>>>,
     }
 
     pub(crate) struct FakeDs {
@@ -1866,10 +1915,7 @@ pub(crate) mod testing {
                     axum::routing::put(|| async { axum::http::StatusCode::OK })
                         .get(
                             |State(st): State<Arc<FakeDsState>>,
-                             axum::extract::Path(path): axum::extract::Path<String>,
-                             axum::extract::Query(query): axum::extract::Query<
-                                std::collections::HashMap<String, String>,
-                            >| async move {
+                             axum::extract::Path(path): axum::extract::Path<String>| async move {
                                 let logical = logical_path(&path);
                                 if logical == "meta/catalog" {
                                     return (
@@ -1877,16 +1923,6 @@ pub(crate) mod testing {
                                         axum::Json(st.events.lock().unwrap().clone()),
                                     )
                                         .into_response();
-                                }
-                                let observer = st.held_change_reads.lock().unwrap().clone();
-                                if let Some(observer) = observer
-                                    && let Some(segment) = logical.strip_prefix("changes/")
-                                {
-                                    let _ = observer.send(crate::changelog::LogPosition {
-                                        segment: segment.parse().unwrap(),
-                                        offset: query.get("offset").expect("read must specify a cursor").clone(),
-                                    });
-                                    return std::future::pending::<axum::response::Response>().await;
                                 }
                                 axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response()
                             },
@@ -2005,12 +2041,6 @@ pub(crate) mod testing {
             &self.url
         }
 
-        pub(crate) fn hold_change_reads(&self) -> tokio::sync::mpsc::UnboundedReceiver<crate::changelog::LogPosition> {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            *self.state.held_change_reads.lock().unwrap() = Some(tx);
-            rx
-        }
-
         /// Answer the next `n` catalog appends with 503.
         pub(crate) fn fail_appends(&self, n: u32) {
             self.state.fail_appends.store(n, Ordering::SeqCst);
@@ -2104,6 +2134,24 @@ mod tests {
     use super::*;
     use testing::FakeDs;
 
+    fn boot_race_store() -> (Arc<crate::ds::ScriptedStore>, tokio::sync::mpsc::UnboundedReceiver<LogPosition>) {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *store.held_change_reads.lock().unwrap() = Some(tx);
+        (store, rx)
+    }
+
+    fn boot_race_events(store: &crate::ds::ScriptedStore) -> Vec<serde_json::Value> {
+        store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path.ends_with("meta/catalog"))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+            .collect()
+    }
+
     const OTTO_5492_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
     async fn otto_5492_read(reads: &mut tokio::sync::mpsc::UnboundedReceiver<LogPosition>) -> LogPosition {
@@ -2165,10 +2213,9 @@ mod tests {
     }
 
     async fn otto_5492_boot_with_request(race_request: bool) {
-        let server = FakeDs::start().await;
-        let mut reads = server.hold_change_reads();
+        let (store, mut reads) = boot_race_store();
         let engine = Engine::new_pg_for_in_process_test(
-            DsClient::new_for_in_process_test(server.url()),
+            DsClient::with_test_store("scripted://boot-race".into(), store.clone()),
             // No SQL is needed: changesOnly skips snapshots. Never contact another lane's PG.
             "postgres://postgres@127.0.0.1:55532/postgres".into(),
         );
@@ -2189,14 +2236,8 @@ mod tests {
         engine.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
         if race_request {
             let response = otto_5492_create(&engine).await;
-            assert!(
-                response.status().is_success() || response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "boot admission must succeed safely or refuse retryably: {}",
-                response.status()
-            );
-            if response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE {
-                assert!(response.headers().contains_key("retry-after"), "boot refusal must be retryable");
-            }
+            assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["retry-after"], "1");
         }
         let premature = engine.state.lock().await.sequencer.is_some();
         tokio::time::timeout(OTTO_5492_DEADLINE, engine.apply_catalog(fold, &compiled, RestoreMode::Resume))
@@ -2205,7 +2246,12 @@ mod tests {
             .unwrap();
         engine.ensure_sequencer(&mut *engine.state.lock().await);
         let read = otto_5492_read(&mut reads).await;
+        engine.health.store(HEALTH_ACTIVE, Ordering::Release);
+        assert_eq!(otto_5492_create(&engine).await.status(), axum::http::StatusCode::OK);
         otto_5492_stop(&engine).await;
+        let next_boot = engine.fold_catalog().await.expect("fold after shutdown with the first read still held");
+        assert_eq!(next_boot.start_pos(), saved, "an unread shutdown must preserve the restored checkpoint");
+        assert_eq!(next_boot.start_highwater, Some((0x10, 2)), "preserve the matching de-duplication frontier");
 
         assert_eq!(
             (premature, read),
@@ -2225,25 +2271,99 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn otto_5492_unread_sequencer_shutdown_preserves_catalog_position() {
-        let server = FakeDs::start().await;
-        let mut reads = server.hold_change_reads();
+    async fn boot_race_catalog_rejects_offsets_below_durable_floor() {
+        let (store, _reads) = boot_race_store();
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://boot-race".into(), store.clone()));
+        let floor = pos(1080, "0000000000000000_0000001015737962");
+        engine.catalog_tx.seed_durable_offset(floor.clone()).await;
+        // Same enqueue path as periodic sequencer checkpoints, including a same-segment rewind.
+        for p in [LogPosition::start(), pos(1080, "-1"), floor.clone(), pos(1081, "-1"), floor.clone()] {
+            engine.catalog_tx.send(CatalogEvent::Offset { pos: p, highwater: Some((0x10, 2)) });
+        }
+        tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
+        let offsets: Vec<LogPosition> = boot_race_events(&store)
+            .into_iter()
+            .filter(|event| event["t"] == "offset")
+            .map(|event| serde_json::from_value(event["pos"].clone()).unwrap())
+            .collect();
+        otto_5492_stop(&engine).await;
+        assert_eq!(offsets, vec![floor, pos(1081, "-1")], "only equal or advancing checkpoints may reach storage");
+    }
+
+    #[test]
+    fn boot_race_fold_logs_regression_without_silently_repairing_the_catalog() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Capture::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        let floor = pos(1080, "0000000000000000_0000001015737962");
+        for regressed in [LogPosition::start(), pos(1080, "-1")] {
+            output.0.lock().unwrap().clear();
+            let mut fold = fold_of(vec![
+                CatalogEvent::Offset { pos: floor.clone(), highwater: Some((8241725836464, 3)) },
+                // Equal positions can legitimately advance the paired highwater.
+                CatalogEvent::Offset { pos: floor.clone(), highwater: Some((8241725836464, 4)) },
+            ]);
+            assert!(output.0.lock().unwrap().is_empty(), "advancing/equal checkpoints are valid");
+            for _ in 0..2 {
+                fold.apply_once("stale-shutdown", CatalogEvent::Offset { pos: regressed.clone(), highwater: None });
+            }
+            assert_eq!(fold.start_pos(), regressed, "diagnosis must not guess a repaired replay frontier");
+            assert_eq!(fold.start_highwater, None, "keep the position/highwater pair from the last event");
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(logs.lines().count(), 1, "one ERROR for the regressing event, not its retry: {logs}");
+            assert!(
+                logs.contains("catalog checkpoint regressed")
+                    && logs.contains(&floor.to_string())
+                    && logs.contains(&regressed.to_string()),
+                "diagnostic must identify both checkpoints: {logs}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_race_restore_after_spawn_requests_restart_and_preserves_position() {
+        let (store, mut reads) = boot_race_store();
         // Inject the already-stale task below admission, independently of the boot-latch fix.
         // Library construction allows this even if Postgres spawning is later boot-gated.
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let engine = Engine::new_inner(
+            DsClient::with_test_store("scripted://boot-race".into(), store.clone()),
+            None,
+            None,
+            PostgresSetup::EngineManaged,
+            None,
+            Some(Arc::new(tokio::sync::Notify::new())),
+        );
         let fold = otto_5492_saved_catalog(&engine).await;
         let saved = fold.start_pos();
         engine.ensure_sequencer(&mut *engine.state.lock().await);
         assert_eq!(otto_5492_read(&mut reads).await, LogPosition::start(), "inject a stale live cursor");
 
-        tokio::time::timeout(OTTO_5492_DEADLINE, engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume))
-            .await
-            .expect("restore must complete while the read is held")
-            .unwrap();
-        assert_eq!(*engine.seq_start.lock().unwrap(), saved, "restore installed its newer checkpoint");
-        // The HTTP handler never completes a page. Stop only after the resumed read has arrived.
-        otto_5492_read(&mut reads).await;
+        let restored =
+            tokio::time::timeout(OTTO_5492_DEADLINE, engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume))
+                .await
+                .expect("restore must reject promptly while the read is held");
+        let restart_requested = engine.shutdown.restart_requested();
         otto_5492_stop(&engine).await;
+        assert!(restored.is_err(), "restore must refuse an already-running sequencer at a different position");
+        assert!(restart_requested, "the invariant breach must request a fatal restart, not leave a stale reader alive");
         let next_boot = engine.fold_catalog().await.expect("fold the persisted catalog after shutdown");
         assert_eq!(
             next_boot.start_pos(),
@@ -2255,9 +2375,9 @@ mod tests {
 
     #[tokio::test]
     async fn otto_5492_library_define_schema_still_starts_and_creates() {
-        let server = FakeDs::start().await;
-        let mut reads = server.hold_change_reads();
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let (store, mut reads) = boot_race_store();
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://boot-race".into(), store.clone()));
         let schema = serde_json::from_value(serde_json::json!({
             "tables": { "users": { "columns": { "id": { "type": "int" } }, "primaryKey": "id" } }
         }))
@@ -2274,10 +2394,9 @@ mod tests {
     async fn otto_5492_schema_route_during_pg_boot_cannot_start_sequencer() {
         use tower::ServiceExt;
 
-        let server = FakeDs::start().await;
-        let mut reads = server.hold_change_reads();
+        let (store, mut reads) = boot_race_store();
         let engine = Engine::new_pg_for_in_process_test(
-            DsClient::new_for_in_process_test(server.url()),
+            DsClient::with_test_store("scripted://boot-race".into(), store.clone()),
             "postgres://postgres@127.0.0.1:55532/postgres".into(),
         );
         let fold = otto_5492_saved_catalog(&engine).await;
@@ -2316,10 +2435,9 @@ mod tests {
 
     #[tokio::test]
     async fn otto_5492_define_schema_rejects_active_pg_at_engine_boundary() {
-        let server = FakeDs::start().await;
-        let _reads = server.hold_change_reads();
+        let (store, _reads) = boot_race_store();
         let engine = Engine::new_pg_for_in_process_test(
-            DsClient::new_for_in_process_test(server.url()),
+            DsClient::with_test_store("scripted://boot-race".into(), store.clone()),
             "postgres://postgres@127.0.0.1:55532/postgres".into(),
         );
         // This API is never supported in PostgreSQL mode, including after the boot gate opens.
@@ -3391,6 +3509,7 @@ mod tests {
             landed_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             landed_notify: Arc::new(tokio::sync::Notify::new()),
             durable: Arc::new(std::sync::Mutex::new(None)),
+            checkpoint_gate: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let outcome =

@@ -2255,6 +2255,9 @@ mod tests {
         /// Every offset a read was asked for, in order. A coalesced scan's routing is only correct
         /// if the scan STARTS at the earliest parked cursor, which is invisible from the pages.
         pub(crate) read_offsets: std::sync::Mutex<Vec<String>>,
+        /// Observe and hold change-log reads at their requested position (boot-race cut).
+        pub(crate) held_change_reads:
+            std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::changelog::LogPosition>>>,
         pub(crate) head_count: std::sync::atomic::AtomicUsize,
         pub(crate) head_offsets: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_append_path: Option<String>,
@@ -2361,6 +2364,16 @@ mod tests {
             Box::pin(async move {
                 self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_offsets.lock().unwrap().push(offset.to_string());
+                let observer = self.held_change_reads.lock().unwrap().clone();
+                if let Some(observer) = observer
+                    && let Some((_, segment)) = path.rsplit_once("/changes/")
+                {
+                    let _ = observer.send(crate::changelog::LogPosition {
+                        segment: segment.parse().unwrap(),
+                        offset: offset.to_string(),
+                    });
+                    std::future::pending::<()>().await;
+                }
                 if self.read_appended {
                     loop {
                         let changed = self.appended_changed.notified();

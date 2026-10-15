@@ -3025,6 +3025,28 @@ mod held_spill_tests {
         }
     }
 
+    #[tokio::test]
+    async fn boot_race_final_checkpoint_cannot_overwrite_seeded_floor() {
+        let mut h = Harness::new(4096);
+        let floor = LogPosition { segment: 1080, offset: "0000000000000000_0000001015737962".into() };
+        h.engine
+            .catalog_tx
+            .send_durable(CatalogEvent::Offset { pos: floor.clone(), highwater: Some((0x10, 2)) })
+            .await
+            .unwrap();
+        h.engine.catalog_tx.seed_durable_offset(floor.clone()).await;
+        // A completed stale read defeats the older unread-shutdown guard. Exercise the actual
+        // sequencer final checkpoint and catalog writer, not just monotonic in-memory tracking.
+        h.page("-1", "p1", vec![]).await;
+        assert_eq!(h.processed.lock().unwrap().segment, 0);
+        let checkpoint = h.finish().await;
+        assert_eq!(
+            checkpoint,
+            (floor, Some((0x10, 2))),
+            "shutdown must preserve the durable restart cursor and highwater"
+        );
+    }
+
     fn change(txid: &str, lsn: &str, seq: u64, last: bool) -> Envelope {
         Envelope {
             type_: "public.items".into(),
