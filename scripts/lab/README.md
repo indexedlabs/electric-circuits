@@ -21,6 +21,8 @@ python3 scripts/lab/hardening.py backlog --engine /absolute/path/to/engine --mb 
 python3 scripts/lab/hardening.py restart --engine /absolute/path/to/engine
 python3 scripts/lab/hardening.py catalog --engine /absolute/path/to/engine --mb 200
 python3 scripts/lab/hardening.py rolling --engine /absolute/path/to/engine
+python3 scripts/lab/rolling_contract.py --engine /absolute/path/to/engine
+python3 scripts/lab/append_limit.py --engine /absolute/path/to/engine --mb 500
 ```
 
 `--ds` selects an already-installed durable-streams binary; the runner never
@@ -54,3 +56,26 @@ all `.agent` artifacts, including builds, with an 8 GB ceiling and a 12 GB free
 floor; it stops 300 MB early. Run scenarios serially. Keep unrelated generated
 data out of this checkout while running, and account separately for any build
 artifacts placed outside `.agent`.
+
+The rolling contract runs the local controller prototype in `rolling_prototype.py`.
+It uses the existing `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS=0` setting, with the same
+close → fresh receipt → quiesce → old exit → slot release → promote → ready → open
+sequence as the baseline. The unchanged contract checks exact materialization and
+a maximum two-second progress gap. A real load balancer needs its own proven route
+withdrawal; this experiment does not qualify zero drain there. It also does not
+pre-fold catalogs or provide automatic failover after owner death.
+
+Two expensive known-red regression tests are opt-in Rust integration tests:
+
+```sh
+cargo test -p electric-circuits-engine --features test-support \
+  --test hardening_lab -- --ignored --test-threads=1
+python3 -B -m unittest discover -s scripts/lab -v
+```
+
+On the installed DS 0.1.5, a 500 MB atomic append returns `500 wal stage failed`,
+and a 200 MB catalog prevents engine restart because an unpaged response exceeds
+the 64 MiB admission cap. The tests keep their success assertions and fail visibly;
+they are not expected-failure passes. The storage/protocol design needs resolution
+before a green result is possible. See `.agent/REPORT.md` for exact evidence and
+the distinction between this provider artifact and production storage.
