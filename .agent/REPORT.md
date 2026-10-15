@@ -1,0 +1,21 @@
+# Local hardening lab report
+
+## Milestone 1 — scope and preflight (2026-10-15)
+
+- Authorized base: `224cd1c`, branch `mh/hardening-lab`; initial tracked checkout clean. Local commits only; no pushes.
+- Read `.agent/BRIEF.md`, including the disk update. All generated data stays in this worktree or owned `/tmp` directories; loopback only. No cloud tools, external endpoints, credential files, other worktrees, or unrelated cleanup.
+- Initial `df -k /`: 23,731,780 KiB available (22.63 GiB). Updated limits: **8 GB total generated files**, stop/clean owned data below **12 GB free**. Build/dependency artifacts count toward the cap too. Scenarios run serially and remove their own data afterward.
+- Tools found: Homebrew PostgreSQL **18.6**, Rust **1.96.0** installed, Node **22.23.2**, cached Corepack pnpm **10.15.1** (`COREPACK_ENABLE_NETWORK=0 corepack pnpm --version`), installed durable-streams server. No local `target/` or `node_modules/` initially.
+- Applied `electric-circuits-testing` and `electric-circuits-rust-code`. This is an explicitly authorized local probe/prototype, not a production-readiness task packet or release qualification. Preserve genuine red before any engine behavior fix. No production capability claims from these measurements.
+- Initial source finding: managed standby returns from `claim_managed_ownership` before catalog restore. Promotion wakes the ordinary boot retry loop; current standby does **not** pre-fold the catalog. Ownership is persisted CAS, not an automatic lease/failover system.
+- Planned contract: N public plain shapes, steady committed writes with a marker last in each transaction, server drain receipt followed by client materialization, then comparison with an independently specified SQL state after writers quiesce. Measure source-commit-to-receipt and source-commit-to-client separately. Fault cuts: stopped engine/WAL backlog, committed 10/100/500 MB transactions, SIGTERM/SIGKILL, managed handover. This is the direct loopback development topology with real file-backed streams.
+- No persistent lab processes started yet. Commands and child PIDs will be retained in run artifacts.
+
+## Milestone 2 — isolated build and first real-stack smoke
+
+- Built the exact base exported with `git archive HEAD`, without touching another worktree. Rust command: `cargo build --locked --offline -p electric-circuits-engine --features test-support`, Rust 1.96.0, six jobs, dev/test debug info 0, incremental off. Finished in 6m27s; two existing dead-code warnings. Copied only the lockfile-selected cached crate archives and index into `.agent/lab-build/cargo-home`; no crate network access.
+- Installed frozen npm dependencies through the cached pnpm 10.15.1, with isolated HOME/store and lifecycle scripts disabled. Only lockfile-pinned package downloads. Baseline TypeScript check passed (raw `.agent/results/typecheck.log`).
+- New `scripts/lab/hardening.py` is a stdlib-only loopback runner modeled on conformance. It uses the existing explicit `test-support` DS transport, so no credential file is read. It records all service/psql PIDs, monitors total created bytes, and tears down each fixture.
+- Runner smoke failures retained: HTTP helper shadowed the `http` module; DS root returns text rather than JSON. Corrected the runner before measurements. Both failed setups reaped all children. Build monitor encountered a transient `du` ENOENT during compilation; the build was immediately adopted by a replacement monitor and completed. Disk accounting now tolerates disappearing temporary files while retaining the reported total. These are harness errors, not engine-red evidence.
+- First successful 10 MB tracked transaction: 9,961,472 payload bytes, 10,701,840 WAL bytes, SQL transaction 86.6 ms, commit-to-drain receipt 1043.9 ms, following marker 1047.7 ms. 121 tick commits: client p50 12.5 ms / p99 923.8 ms. Sampled engine RSS peak 75,956,224 bytes. All 152 bulk rows and 121 tick rows matched SQL; zero feed errors. Peak total artifacts 2,799,063,040 bytes, all children reaped, fixture deleted. Raw run: `.agent/results/transaction-20261015-010639/`.
+- These measurements use an unoptimized binary with debug info disabled; they are characterization only. Native feeds read DS directly. Ordinary restart error behavior for the Electric adapter needs a separate probe.
