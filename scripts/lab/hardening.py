@@ -28,6 +28,10 @@ MAX_CREATED = 8_000_000_000
 MIN_FREE = 12_000_000_000
 
 
+def disk_violation(created, free):
+    return created >= MAX_CREATED - 300_000_000 or free < MIN_FREE + 300_000_000
+
+
 def http(url, method='GET', body=None, admin=False, timeout=10):
     u = urllib.parse.urlsplit(url)
     if u.scheme != 'http' or u.hostname != '127.0.0.1':
@@ -180,11 +184,18 @@ class Lab:
         self.children, self.logs, self.feeds = [], [], []
         self.samples, self.commits, self.arrivals, self.receipts = [], {}, {}, {}
         self.errors, self.result = [], {'scenario': args.scenario, 'shapes': args.shapes}
+        self.result.update(runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            engine_sha256=hashlib.sha256(args.engine.read_bytes()).hexdigest(),
+            ds_sha256=hashlib.sha256(args.ds.read_bytes()).hexdigest(),
+            git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip())
         self.engine = None
         self.engineurl = None
         self.sequence = 0
         self.guard_error = None
         self.guard_thread = None
+        self.adapter_stop = threading.Event()
+        self.adapter_thread = None
+        self.adapter_observations = []
         self.env = {'PATH': '/opt/homebrew/bin:/usr/bin:/bin', 'HOME': str(self.data),
                     'TMPDIR': str(self.data), 'LC_ALL': 'C', 'PGPASSFILE': str(self.data/'absent-passfile')}
         self.sql = None
@@ -223,7 +234,7 @@ class Lab:
                     if value:
                         rss[str(p.pid)] = {'name': name, 'bytes': int(value) * 1024}
             self.samples.append({'at': time.time(), 'created_bytes': used, 'free_bytes': free, 'rss': rss})
-            if used >= MAX_CREATED - 300_000_000 or free < MIN_FREE + 300_000_000:
+            if disk_violation(used, free):
                 self.guard_error = f'disk guard: created={used}, free={free}; stopping with 300 MB headroom'
                 self.record('disk_stop', error=self.guard_error)
                 self.stop.set()
@@ -369,6 +380,30 @@ CREATE TABLE electric_circuits.writer_ownership (
             if self.writer.is_alive():
                 raise RuntimeError('writer did not finish')
 
+    def watch_adapter(self):
+        # Controller-selected loopback endpoint, not an ALB qualification. Keep
+        # the Electric handle/offset across restarts and retain reset responses.
+        def watch():
+            offset, handle = '-1', None
+            while not self.adapter_stop.is_set() and not self.stop.is_set():
+                query = {'table': 'ticks', 'where': 'cohort = 0', 'offset': offset}
+                if handle:
+                    query['handle'] = handle
+                try:
+                    status, headers, body = http(self.engineurl+'/v1/shape?'+urllib.parse.urlencode(query), timeout=2)
+                    if status == 200:
+                        handle = headers.get('electric-handle', handle)
+                        offset = headers.get('electric-offset', offset)
+                    elif status == 409:
+                        offset, handle = '-1', None
+                    self.adapter_observations.append({'at': time.time(), 'status': status,
+                        'retry_after': headers.get('retry-after')})
+                except (OSError, http_client.HTTPException) as e:
+                    self.adapter_observations.append({'at': time.time(), 'status': 'transport', 'error': str(e)})
+                self.adapter_stop.wait(.05)
+        self.adapter_thread = threading.Thread(target=watch, daemon=True)
+        self.adapter_thread.start()
+
     def drain(self, marker, url=None, seconds=240):
         return self.await_('drained-'+marker,
             lambda: self.request('/_admin/drained-through/'+marker, url=url).get('drained'), seconds)
@@ -384,6 +419,8 @@ CREATE TABLE electric_circuits.writer_ownership (
             raise AssertionError(self.errors)
         self.result['change_latency'] = summary([max(0, (self.arrivals[k]-v[0])*1000)
             for k, v in self.commits.items() if k in self.arrivals])
+        arrivals = sorted(self.arrivals.values())
+        self.result['max_native_progress_gap_ms'] = max(((b-a)*1000 for a,b in zip(arrivals, arrivals[1:])), default=0)
         missing = sorted(self.commits.keys()-self.arrivals.keys())
         if missing:
             raise AssertionError(f'unobserved committed ticks {missing[:10]}')
@@ -485,6 +522,7 @@ CREATE TABLE electric_circuits.writer_ownership (
 
     def restart(self):
         self.setup()
+        self.watch_adapter()
         self.start_load(160)
         rng = random.Random(90210)
         cuts = []
@@ -503,6 +541,7 @@ CREATE TABLE electric_circuits.writer_ownership (
 
     def rolling(self):
         self.setup(managed=True)
+        self.watch_adapter()
         self.start_load(150)
         self.await_('load-arrived', lambda: self.sequence >= 10)
         successor = str(uuid.uuid4())
@@ -540,6 +579,9 @@ CREATE TABLE electric_circuits.writer_ownership (
     def cleanup(self):
         self.write_stop.set()
         self.stop.set()
+        self.adapter_stop.set()
+        if self.adapter_thread:
+            self.adapter_thread.join(timeout=5)
         if self.writer:
             self.writer.join(timeout=5)
         for f in self.feeds:
@@ -562,6 +604,20 @@ CREATE TABLE electric_circuits.writer_ownership (
         self.result['min_free_bytes'] = min((s['free_bytes'] for s in self.samples), default=0)
         self.result['engine_peak_rss_bytes'] = max((v['bytes'] for s in self.samples for v in s['rss'].values() if v['name'].startswith('engine')), default=0)
         self.result['all_children_reaped'] = all(p.poll() is not None for _, p in self.children)
+        counts = {}
+        outages, first_error = [], None
+        for observation in self.adapter_observations:
+            status = str(observation['status'])
+            counts[status] = counts.get(status, 0) + 1
+            if status != '200' and first_error is None:
+                first_error = observation['at']
+            elif status == '200' and first_error is not None:
+                outages.append((observation['at']-first_error)*1000)
+                first_error = None
+        self.result['adapter_status_counts'] = counts
+        self.result['adapter_recovered_outages_ms'] = outages
+        self.result['adapter_outage_unresolved'] = first_error is not None
+        (self.out/'adapter.json').write_text(json.dumps(self.adapter_observations, indent=2))
         (self.out/'samples.json').write_text(json.dumps(self.samples, indent=2))
         (self.out/'result.json').write_text(json.dumps(self.result, indent=2))
         for f in self.logs:
