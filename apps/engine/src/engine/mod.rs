@@ -2267,7 +2267,9 @@ impl Engine {
         v
     }
 
-    /// The `/v1/health` status string: `degraded` | `waiting` | `starting` | `active` (exact, no
+    /// The `/v1/health` status string includes `storage_unavailable` while a reliable append retries
+    /// after a failure. It clears when all failed writes finish; unlike degradation it is not latched.
+    /// Other states: `degraded` | `waiting` | `starting` | `active` (exact, no
     /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
     /// effects, or whose epoch broke under the refuse policy (ADR-0004), is not healthy however far
     /// along its boot got. The two are one status word on purpose: the fleet healthcheck
@@ -2287,6 +2289,9 @@ impl Engine {
             || self.read_cap_failed.load(std::sync::atomic::Ordering::Relaxed)
         {
             return "degraded";
+        }
+        if self.ds.has_failed_appends() {
+            return "storage_unavailable";
         }
         match self.health.load(std::sync::atomic::Ordering::Relaxed) {
             HEALTH_WAITING => "waiting",
@@ -2311,7 +2316,7 @@ impl Engine {
     /// `active` (200) means every precondition for serving is met: Postgres connected, the slot
     /// verified against the epoch binding, the durable catalog restored, the ingestor spawned, no
     /// degradation, no broken epoch. Anything else is 503 with the word that says why —
-    /// `waiting` (no Postgres yet), `starting` (introspecting / restoring), `degraded`,
+    /// `waiting` (no Postgres yet), `starting` (introspecting / restoring), `degraded`, `storage_unavailable`,
     /// or `shutting_down`.
     ///
     /// Shutdown outranks everything: the instant a `SIGTERM` lands this reports `shutting_down`, so
