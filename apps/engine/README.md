@@ -472,7 +472,7 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | `0` | a graceful shutdown completed inside its grace period |
 | `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
 | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
-| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested if catalog restore finds a sequencer already started at a different checkpoint |
+| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested if catalog restore finds a sequencer already started at a different checkpoint, or the Postgres-mode catalog writer refuses an `Offset` before its durable floor is known |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 
 ### Subscriptions: identified, idempotent, leased
