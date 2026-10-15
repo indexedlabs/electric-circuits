@@ -574,6 +574,14 @@ an operator should be seeing anyway.
 
 ### Boot: fatal vs retryable
 
+Until PostgreSQL setup and catalog restore finish, shape, aggregate, subset and resume requests
+are refused with HTTP 503. The native routes and Electric `/v1/shape` include `Retry-After: 1` so
+clients can retry after boot; requests cannot start replay from an unrestored cursor.
+
+If a required live change-log segment returns 404/410, the sequencer preserves its replay
+checkpoint, halts reads and reports degraded readiness. Commands and shutdown remain responsive;
+restart revalidates the catalog and required segments before serving again.
+
 A Postgres failure at boot is classified, not guessed at (`pg::classify`), and the two classes get
 opposite treatment.
 

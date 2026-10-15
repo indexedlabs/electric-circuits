@@ -41,7 +41,7 @@ async fn managed_public_traffic_waits_for_full_engine_readiness_after_claim() {
 async fn live_read_cap_failure_withdraws_readiness_once() {
     let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     assert_eq!(engine.readiness_status(), "active");
-    engine.read_cap_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    engine.sequencer_read_failed.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(engine.readiness_status(), "degraded");
     assert_eq!(engine.readiness_status(), "degraded");
 }

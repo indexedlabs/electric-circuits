@@ -926,6 +926,10 @@ fn degraded(why: &anyhow::Error) -> Response {
     let len = body.len() as u64;
     let mut headers = HeaderMap::new();
     headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // Boot admission is temporary, just like the same typed refusal from shape_inner.
+    if why.downcast_ref::<crate::engine::DeploymentNotReady>().is_some() {
+        headers.insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
     let mut resp = (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response();
     resp.extensions_mut().insert(BodyLen(len));
     resp
