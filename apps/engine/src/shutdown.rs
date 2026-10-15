@@ -140,14 +140,21 @@ impl ShutdownToken {
         self.inner.restart_reason.load(std::sync::atomic::Ordering::Acquire) != 0
     }
 
-    /// Fatal Engine conditions restart one supervised source; the standalone binary keeps its exit code.
+    /// Request a restart from the host. Library code never terminates its caller's process;
+    /// the standalone binary owns exit policy and supervised sources notify their owner.
     pub(crate) fn restart_or_exit(&self, code: i32) {
-        if self.inner.restart_notify.is_some() {
-            self.inner.restart_reason.store(code, std::sync::atomic::Ordering::Release);
-            self.begin();
-        } else {
-            std::process::exit(code);
-        }
+        self.inner.restart_reason.store(code, std::sync::atomic::Ordering::Release);
+        self.begin();
+        self.inner.tx.send_replace(true);
+    }
+
+    /// Wait for a fatal restart request and return its exit code, including an already pending
+    /// request. Ordinary shutdown does not resolve this future. Cancellation has no side effects;
+    /// embedders may observe the code without exiting, while the standalone host exits explicitly.
+    pub async fn wait_for_restart(&self) -> i32 {
+        let mut rx = self.inner.tx.subscribe();
+        let _ = rx.wait_for(|_| self.inner.restart_reason.load(std::sync::atomic::Ordering::Acquire) != 0).await;
+        self.inner.restart_reason.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Track work on the caller's runtime, including work started by host HTTP handlers.
@@ -501,7 +508,54 @@ mod ownership_tests {
         notify.notified().await;
         assert!(failed.is_shutting_down());
         assert!(failed.restart_requested());
+        assert_eq!(failed.wait_for_restart().await, 74);
         assert!(!healthy.is_shutting_down());
         assert!(!healthy.restart_requested());
+    }
+
+    #[test]
+    fn review_1_library_restart_must_not_exit_its_host() {
+        const CHILD: &str = "CIRCUITS_REVIEW_1_RESTART_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let token = ShutdownToken::new();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let restart = token.wait_for_restart();
+                tokio::pin!(restart);
+                token.begin();
+                std::future::poll_fn(|cx| {
+                    assert!(
+                        std::future::Future::poll(restart.as_mut(), cx).is_pending(),
+                        "ordinary shutdown is not fatal"
+                    );
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                token.restart_or_exit(75);
+                assert!(token.is_shutting_down());
+                assert!(token.restart_requested());
+                assert_eq!(tokio::time::timeout(Duration::from_secs(2), restart).await.unwrap(), 75);
+                assert_eq!(token.wait_for_restart().await, 75, "late observers also receive the exit code");
+            });
+            return;
+        }
+        // A subprocess turns the old process::exit into an assertion failure in this test,
+        // instead of terminating the entire lib test runner as the CI failure did.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "shutdown::ownership_tests::review_1_library_restart_must_not_exit_its_host",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"), "child must select the regression");
+        assert!(
+            output.status.success(),
+            "a library restart must return control to its host, got {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
