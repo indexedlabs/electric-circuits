@@ -1,0 +1,15 @@
+{
+  "command": [
+    "/Users/mh/labs/electric-circuits-wt-lab/.agent/bin/hardening-lab-tests",
+    "--ignored",
+    "--test-threads=1",
+    "--nocapture"
+  ],
+  "pid": 37805,
+  "env": {
+    "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
+    "HOME": "/Users/mh/labs/electric-circuits-wt-lab/.agent/gate-tmp",
+    "TMPDIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/gate-tmp",
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}

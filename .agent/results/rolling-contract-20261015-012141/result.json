@@ -1,0 +1,72 @@
+{
+  "scenario": "rolling-contract",
+  "shapes": 8,
+  "runner_sha256": "cf1e6ce368b33683af06354210ee2dde555b1c1f9f5ef2d7683a17569c2cfc11",
+  "engine_sha256": "36d58a02623c3c67130fee7e520b2cd015a2dae7449b3e6cfcfbbf710e2ba197",
+  "ds_sha256": "1cd958a396afecca7a80e65ece5b8cb43546bc9a1684e9e73fe6159ce5594f3b",
+  "git_head": "8ac261ed4ab78ae1c4815f23345e39a67e5e33c5",
+  "initial_boot_ms": 1676.7292500007898,
+  "standby": {
+    "controlAdmission": false,
+    "coordinationKey": "ffe0e611dd707cbfb8cf4a86529918d0c0f9b0cc8c7739b5bd36e9a18b099e63",
+    "generation": 1,
+    "handoffId": null,
+    "ownerRevision": "41c9c3fb-c1ed-40cf-a2ae-14f65c291add",
+    "phase": "active",
+    "readiness": "standby",
+    "revision": "47590e8d-03ee-4db1-bad6-ea106de97020",
+    "role": "standby",
+    "sourceCommitId": null
+  },
+  "standby_bind_ms": 538.5791249573231,
+  "handover_ms": 796.9751358032227,
+  "old_drain_exit_ms": 554.2552471160889,
+  "promotion_to_ready_ms": 99.27773475646973,
+  "successor": {
+    "controlAdmission": true,
+    "coordinationKey": "ffe0e611dd707cbfb8cf4a86529918d0c0f9b0cc8c7739b5bd36e9a18b099e63",
+    "generation": 2,
+    "handoffId": "36a424b1-e420-4b82-9c6b-cf0ac3a8b97a",
+    "ownerRevision": "47590e8d-03ee-4db1-bad6-ea106de97020",
+    "phase": "active",
+    "readiness": "active",
+    "revision": "47590e8d-03ee-4db1-bad6-ea106de97020",
+    "role": "active",
+    "sourceCommitId": "dd125db6-f439-4ee7-968c-da76dd5d0ef8"
+  },
+  "final_receipt_ms": 21.480321884155273,
+  "verified_rows": [
+    18,
+    19,
+    19,
+    19,
+    19,
+    19,
+    19,
+    19,
+    0
+  ],
+  "feed_errors": [],
+  "change_latency": {
+    "count": 151,
+    "p50_ms": 13.983011245727539,
+    "p99_ms": 405.6558609008789,
+    "max_ms": 484.2560291290283
+  },
+  "max_native_progress_gap_ms": 542.4480438232422,
+  "outcome": "pass",
+  "peak_created_bytes": 2750210048,
+  "min_free_bytes": 16776314880,
+  "engine_peak_rss_bytes": 58064896,
+  "all_children_reaped": true,
+  "adapter_status_counts": {
+    "200": 254,
+    "transport": 7,
+    "503": 1,
+    "409": 1
+  },
+  "adapter_recovered_outages_ms": [
+    529.7718048095703
+  ],
+  "adapter_outage_unresolved": false
+}

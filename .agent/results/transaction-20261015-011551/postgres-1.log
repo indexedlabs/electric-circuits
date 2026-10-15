@@ -1,0 +1,37 @@
+2026-10-15 01:15:52.809 PDT [23508] LOG:  starting PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+2026-10-15 01:15:52.809 PDT [23508] LOG:  listening on IPv4 address "127.0.0.1", port 55047
+2026-10-15 01:15:52.830 PDT [23521] LOG:  database system was shut down at 2026-10-15 01:15:52 PDT
+2026-10-15 01:15:52.832 PDT [23508] LOG:  database system is ready to accept connections
+2026-10-15 01:15:55.252 PDT [23598] LOG:  logical decoding found consistent point at 0/17F5B68
+2026-10-15 01:15:55.252 PDT [23598] DETAIL:  There are no running transactions.
+2026-10-15 01:15:55.252 PDT [23598] STATEMENT:  select pg_create_logical_replication_slot($1, 'pgoutput')
+2026-10-15 01:15:55.426 PDT [23606] LOG:  starting logical decoding for slot "lab_slot"
+2026-10-15 01:15:55.426 PDT [23606] DETAIL:  Streaming transactions committing after 0/17F5BA0, reading WAL from 0/17F5B68.
+2026-10-15 01:15:55.426 PDT [23606] STATEMENT:  START_REPLICATION SLOT lab_slot LOGICAL 0/0 (proto_version '1', publication_names 'lab_slot_pub', messages 'true')
+2026-10-15 01:15:55.441 PDT [23606] LOG:  logical decoding found consistent point at 0/17F5B68
+2026-10-15 01:15:55.441 PDT [23606] DETAIL:  There are no running transactions.
+2026-10-15 01:15:55.441 PDT [23606] STATEMENT:  START_REPLICATION SLOT lab_slot LOGICAL 0/0 (proto_version '1', publication_names 'lab_slot_pub', messages 'true')
+2026-10-15 01:15:57.976 PDT [23516] LOG:  checkpoints are occurring too frequently (5 seconds apart)
+2026-10-15 01:15:57.976 PDT [23516] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-10-15 01:15:57.987 PDT [23516] LOG:  checkpoint starting: wal
+2026-10-15 01:16:01.393 PDT [23516] LOG:  checkpoint complete: wrote 14135 buffers (86.3%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=2.742 s, sync=0.566 s, total=3.406 s; sync files=64, longest=0.558 s, average=0.009 s; distance=123844 kB, estimate=123844 kB; lsn=0/111A5420, redo lsn=0/907E238
+2026-10-15 01:16:01.394 PDT [23516] LOG:  checkpoints are occurring too frequently (4 seconds apart)
+2026-10-15 01:16:01.394 PDT [23516] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-10-15 01:16:01.394 PDT [23516] LOG:  checkpoint starting: wal
+2026-10-15 01:16:05.060 PDT [23516] LOG:  checkpoint complete: wrote 14236 buffers (86.9%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=3.340 s, sync=0.323 s, total=3.666 s; sync files=10, longest=0.305 s, average=0.033 s; distance=132269 kB, estimate=132269 kB; lsn=0/19487198, redo lsn=0/111A9748
+2026-10-15 01:16:05.066 PDT [23516] LOG:  checkpoints are occurring too frequently (4 seconds apart)
+2026-10-15 01:16:05.066 PDT [23516] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-10-15 01:16:05.066 PDT [23516] LOG:  checkpoint starting: wal
+2026-10-15 01:16:07.542 PDT [23516] LOG:  checkpoint complete: wrote 12164 buffers (74.2%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=1.775 s, sync=0.688 s, total=2.476 s; sync files=10, longest=0.682 s, average=0.069 s; distance=134048 kB, estimate=134048 kB; lsn=0/20B341A0, redo lsn=0/19491818
+2026-10-15 01:16:07.600 PDT [23516] LOG:  checkpoints are occurring too frequently (2 seconds apart)
+2026-10-15 01:16:07.600 PDT [23516] HINT:  Consider increasing the configuration parameter "max_wal_size".
+2026-10-15 01:16:07.653 PDT [23516] LOG:  checkpoint starting: wal
+2026-10-15 01:16:11.530 PDT [23606] LOG:  could not send data to client: Broken pipe
+2026-10-15 01:16:11.530 PDT [23606] FATAL:  connection to client lost
+2026-10-15 01:16:13.627 PDT [23508] LOG:  received smart shutdown request
+2026-10-15 01:16:13.633 PDT [23508] LOG:  background worker "logical replication launcher" (PID 23525) exited with exit code 1
+2026-10-15 01:16:13.754 PDT [23516] LOG:  checkpoint complete: wrote 14967 buffers (91.4%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=6.055 s, sync=0.045 s, total=6.154 s; sync files=10, longest=0.044 s, average=0.005 s; distance=130490 kB, estimate=133692 kB; lsn=0/217EBB08, redo lsn=0/21400150
+2026-10-15 01:16:13.754 PDT [23516] LOG:  shutting down
+2026-10-15 01:16:13.754 PDT [23516] LOG:  checkpoint starting: shutdown immediate
+2026-10-15 01:16:13.761 PDT [23516] LOG:  checkpoint complete: wrote 479 buffers (2.9%), wrote 1 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=0.005 s, sync=0.002 s, total=0.008 s; sync files=6, longest=0.001 s, average=0.001 s; distance=4014 kB, estimate=120724 kB; lsn=0/217EBB80, redo lsn=0/217EBB80
+2026-10-15 01:16:13.772 PDT [23508] LOG:  database system is shut down

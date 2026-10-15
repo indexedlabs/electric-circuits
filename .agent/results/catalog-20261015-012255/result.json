@@ -1,0 +1,28 @@
+{
+  "scenario": "catalog",
+  "shapes": 8,
+  "runner_sha256": "cf1e6ce368b33683af06354210ee2dde555b1c1f9f5ef2d7683a17569c2cfc11",
+  "engine_sha256": "36d58a02623c3c67130fee7e520b2cd015a2dae7449b3e6cfcfbbf710e2ba197",
+  "ds_sha256": "1cd958a396afecca7a80e65ece5b8cb43546bc9a1684e9e73fe6159ce5594f3b",
+  "git_head": "8ac261ed4ab78ae1c4815f23345e39a67e5e33c5",
+  "initial_boot_ms": 769.3374580703676,
+  "stops": [
+    {
+      "signal": 15,
+      "code": 0,
+      "ms": 2053.7277499679476
+    }
+  ],
+  "catalog_fixture": "25 API join/release pairs plus synthetic valid join/left history",
+  "catalog_appended_bytes": 200167560,
+  "catalog_event_pairs": 1003000,
+  "outcome": "fail",
+  "error": "RuntimeError('engine catalog-restart exited 78')",
+  "peak_created_bytes": 3036200960,
+  "min_free_bytes": 16328638464,
+  "engine_peak_rss_bytes": 57409536,
+  "all_children_reaped": true,
+  "adapter_status_counts": {},
+  "adapter_recovered_outages_ms": [],
+  "adapter_outage_unresolved": false
+}

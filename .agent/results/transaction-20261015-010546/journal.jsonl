@@ -1,0 +1,9 @@
+{"at": 1792051546.3625479, "kind": "spawn", "name": "initdb", "pid": 81289, "argv": ["/opt/homebrew/opt/postgresql@18/bin/initdb", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-010546/pg", "-U", "postgres", "--auth=trust", "--no-sync"]}
+{"at": 1792051547.020664, "kind": "spawn", "name": "postgres", "pid": 81323, "argv": ["/opt/homebrew/opt/postgresql@18/bin/postgres", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-010546/pg", "-h", "127.0.0.1", "-p", "57827", "-c", "unix_socket_directories=", "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8", "-c", "max_wal_size=256MB", "-c", "min_wal_size=80MB", "-c", "logical_decoding_work_mem=32MB"]}
+{"at": 1792051547.0502322, "kind": "gate", "name": "pg-listening"}
+{"at": 1792051547.0536299, "kind": "spawn", "name": "psql", "pid": 81335, "argv": ["/opt/homebrew/opt/postgresql@18/bin/psql", "-X", "-Atq", "-w", "-v", "ON_ERROR_STOP=1", "postgres://postgres@127.0.0.1:57827/postgres?sslmode=disable"]}
+{"at": 1792051547.118989, "kind": "spawn", "name": "ds", "pid": 81340, "argv": ["/Users/mh/.cargo/bin/durable-streams-server", "--host", "127.0.0.1", "--port", "57838", "--data-dir", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-010546/ds", "--durability", "wal", "--long-poll-timeout-ms", "500"]}
+{"at": 1792051547.854582, "kind": "reaped", "name": "ds", "pid": 81340, "code": 0}
+{"at": 1792051547.856695, "kind": "reaped", "name": "psql", "pid": 81335, "code": -15}
+{"at": 1792051547.88072, "kind": "reaped", "name": "postgres", "pid": 81323, "code": 0}
+{"at": 1792051547.881248, "kind": "reaped", "name": "initdb", "pid": 81289, "code": 0}

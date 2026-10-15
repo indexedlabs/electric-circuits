@@ -1,0 +1,43 @@
+{
+  "scenario": "transaction",
+  "shapes": 8,
+  "runner_sha256": "69164d77fbc70e0c20397273effbd7d598e6ddd4dbba05bc6eb89704444ee993",
+  "engine_sha256": "36d58a02623c3c67130fee7e520b2cd015a2dae7449b3e6cfcfbbf710e2ba197",
+  "ds_sha256": "1cd958a396afecca7a80e65ece5b8cb43546bc9a1684e9e73fe6159ce5594f3b",
+  "git_head": "ae3ef25c8b59261826b81e036bae95f99daaff7a",
+  "initial_boot_ms": 2006.313875084743,
+  "table": "untracked",
+  "payload_bytes": 99942400,
+  "transaction_ms": 1816.352128982544,
+  "commit_to_receipt_ms": 721.1298942565918,
+  "behind_marker_ms": 736.1578941345215,
+  "wal_bytes": 107293912,
+  "final_receipt_ms": 27.323007583618164,
+  "verified_rows": [
+    15,
+    16,
+    15,
+    15,
+    15,
+    15,
+    15,
+    15,
+    0
+  ],
+  "feed_errors": [],
+  "change_latency": {
+    "count": 121,
+    "p50_ms": 23.702621459960938,
+    "p99_ms": 571.7439651489258,
+    "max_ms": 656.0931205749512
+  },
+  "max_native_progress_gap_ms": 503.0548572540283,
+  "outcome": "pass",
+  "peak_created_bytes": 2951741440,
+  "min_free_bytes": 17387196416,
+  "engine_peak_rss_bytes": 65404928,
+  "all_children_reaped": true,
+  "adapter_status_counts": {},
+  "adapter_recovered_outages_ms": [],
+  "adapter_outage_unresolved": false
+}

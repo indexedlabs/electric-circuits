@@ -1,0 +1,4 @@
+{"at": 1792051510.8596601, "kind": "spawn", "name": "initdb", "pid": 79466, "argv": ["/opt/homebrew/opt/postgresql@18/bin/initdb", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-010510/pg", "-U", "postgres", "--auth=trust", "--no-sync"]}
+{"at": 1792051511.732403, "kind": "spawn", "name": "postgres", "pid": 79510, "argv": ["/opt/homebrew/opt/postgresql@18/bin/postgres", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-010510/pg", "-h", "127.0.0.1", "-p", "57034", "-c", "unix_socket_directories=", "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8", "-c", "max_wal_size=256MB", "-c", "min_wal_size=80MB", "-c", "logical_decoding_work_mem=32MB"]}
+{"at": 1792051511.73697, "kind": "reaped", "name": "postgres", "pid": 79510, "code": -15}
+{"at": 1792051511.737108, "kind": "reaped", "name": "initdb", "pid": 79466, "code": 0}

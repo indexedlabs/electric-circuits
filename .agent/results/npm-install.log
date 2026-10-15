@@ -1,0 +1,28 @@
+Scope: all 14 workspace projects
+Lockfile is up to date, resolution step is skipped
+Progress: resolved 1, reused 0, downloaded 0, added 0
+Packages: +176
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ WARN  GET https://registry.npmjs.org/loupe/-/loupe-3.2.1.tgz error (ENOTFOUND). Will retry in 10 seconds. 2 retries left.
+
+   ╭──────────────────────────────────────────╮
+   │                                          │
+   │   Update available! 10.15.1 → 12.11.2.   │
+   │   Changelog: https://pnpm.io/v/12.11.2   │
+   │     To update, run: pnpm add -g pnpm     │
+   │                                          │
+   ╰──────────────────────────────────────────╯
+
+Progress: resolved 176, reused 0, downloaded 57, added 55
+Progress: resolved 176, reused 0, downloaded 150, added 131
+Progress: resolved 176, reused 0, downloaded 171, added 175
+Progress: resolved 176, reused 0, downloaded 172, added 175
+Progress: resolved 176, reused 0, downloaded 172, added 176, done
+
+devDependencies:
++ @types/node 22.20.1
++ tsx 4.22.4
++ typescript 7.0.2
++ vitest 3.2.6
+
+Done in 11s using pnpm v10.15.1

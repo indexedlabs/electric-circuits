@@ -1,0 +1,35 @@
+{
+  "scenario": "transaction",
+  "shapes": 8,
+  "initial_boot_ms": 609.658292029053,
+  "table": "bulk",
+  "payload_bytes": 99942400,
+  "transaction_ms": 1681.4568042755127,
+  "commit_to_receipt_ms": 29381.901264190674,
+  "behind_marker_ms": 29394.00005340576,
+  "wal_bytes": 107325552,
+  "final_receipt_ms": 1204.1778564453125,
+  "verified_rows": [
+    15,
+    16,
+    15,
+    15,
+    15,
+    15,
+    15,
+    15,
+    1525
+  ],
+  "feed_errors": [],
+  "change_latency": {
+    "count": 121,
+    "p50_ms": 23332.247018814087,
+    "p99_ms": 29233.53099822998,
+    "max_ms": 29346.330881118774
+  },
+  "outcome": "pass",
+  "peak_created_bytes": 3368644608,
+  "min_free_bytes": 19332247552,
+  "engine_peak_rss_bytes": 240959488,
+  "all_children_reaped": true
+}

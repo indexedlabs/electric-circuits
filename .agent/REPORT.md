@@ -60,3 +60,47 @@
 - To avoid rebuilding the engine during the disk squeeze, compiled the new Rust integration-test file with pinned **rustc 1.96.0 --test**, linking the already-built lockfile-pinned serde_json rlib and binding the exact measured engine via Cargo's usual compile-time binary-path variable. Exact command/env are in `.agent/results/rust-regression-build-command.json`. The two opt-in real-storage tests are now executing serially from the clean `bb3ae9a` source export; this is not a claim that the full Cargo test gate ran.
 - Full `pnpm engine:test` / `pnpm test` are **blocked under this brief's hard limits**, not passed: the Rust StatsD lane binds `0.0.0.0:0` (`apps/engine/src/statsd.rs:106`), the secret-resolution lane reads credential files, and conformance defaults to reading TLS private-key fixtures. The external Electric oracle additionally requires a sibling checkout, which this brief forbids accessing. No browser/demo or production gateway/ALB qualification was performed. No production Rust behavior was modified.
 - Hardened runner teardown against already-exited process groups and monitor failure, bounded psql connection/statement waits, and made the free-space floor conservatively **12 GiB** (matching `df -h`) with 300 MB headroom. These are runner safeguards, not new engine flags.
+
+## Milestone 8 — final results, retained failures, cleanup
+
+The local lab and controller prototype are committed on `mh/hardening-lab`. No pushes. Production Rust behavior is unchanged. The two provider failures are **unfixed known-red regressions**, not qualified behavior.
+
+| Scenario | Measured result | Correctness / outcome |
+|---|---|---|
+| Steady, 8 tick shapes + 1 bulk shape, 10 writes/s | client p50 **14.0 ms**, p99 **55.9 ms** | 121 commits match SQL |
+| Tracked 10 MB | following marker **1.048 s**, RSS **76.0 MB** | 152 bulk rows + ticks match SQL |
+| Tracked 100 MB | following marker **29.394 s**, RSS **241.0 MB** | 1,525 bulk rows + ticks match SQL |
+| Tracked 500 MB | drain **>240 s**, RSS **798.3 MB** | FAIL: shape append receives storage HTTP 500 |
+| Untracked 10 / 100 / 500 MB | following marker **0.090 / 0.736 / 1.950 s** | all tracked materializations match SQL |
+| 2.014 GB WAL backlog | readiness **1.496 s**, catch-up **17.392 s**, RSS **60.6 MB** | 49 ticks match SQL |
+| Four seeded restart cuts | cut-to-receipt **1.378–3.575 s** | 161 ticks match SQL, four Electric handle resets |
+| Managed handover baseline → prototype | native progress gap **2.524 → 0.542 s**, Electric outage **2.488 → 0.530 s** | unchanged contract red → green, 151 ticks correct |
+| 50.156 MB catalog / 506,000 amplified events | boot **8.817 s**, RSS **479.4 MB** | 101 ticks match SQL |
+| 200.168 MB catalog / 2,006,000 amplified events | exits **78**, initial read exceeds **64 MiB** cap | FAIL on installed unpaged DS 0.1.5 |
+
+All MB in the table are decimal except explicitly marked MiB. The engine is the pinned unoptimized development build, not a release build. Peak RSS is sampled and is not a strict memory bound. Catalog history was amplified from the real event schema after 25 actual API churn pairs; it is not a lifecycle-throughput benchmark.
+
+Validation and evidence:
+
+- The Rust regression executable ran **2 tests: 0 passed, 2 failed, 0 ignored, 0 filtered**, exit 101, in 24.29 s. Both failures executed their intended semantic assertion: HTTP 500 (`wal stage failed`) versus 204 for the 500,614,981-byte append; failed restoration versus success for the 200 MB catalog. The repeat isolated append failed in 1.833 s. All fixture processes were reaped. Raw `.agent/results/rust-regressions.log`.
+- Three Python runner regressions pass; `cargo fmt --check` and the TypeScript no-emit check pass. Full Rust/TS, external oracle, and browser/gateway lanes are not claimed green; limitations are listed in Milestone 7 and `.agent/results/validation-summary.json`.
+- `.agent/results/evidence-index.json` hashes raw artifacts and pins engine/DS/Postgres identities. It also verifies that **both `rolling_contract.py` and `hardening.py` were byte-identical between the red and green exports**. Only the local controller prototype changed the existing drain setting.
+- Older result JSON calls the current controller branch head `git_head`; for exported sources that is **not necessarily the tested source commit**. In particular, the Rust tests both used the immutable `bb3ae9a` export while the controller advanced during execution. Use the export/build identity recorded here and the runner hashes. The runner now calls that diagnostic `control_head` and records hashes of all lab Python sources to avoid this ambiguity.
+- Cleanup audit: **106 directly spawned fixture children recorded, 106 reaped, zero live recorded PIDs**. Build/install/test PIDs 53381 / 77792 / 12801 / 37805 also no longer exist. Every scenario data directory is gone. Large build/dependency artifacts were removed; roughly 131 MB of measured binaries, clean source exports and evidence remain for replay. Peak recorded task artifacts were **5.938 GB**, below the 8 GB limit. No observed run crossed the 12 GB free-space floor.
+
+Ranked next steps (simplest first):
+
+1. Keep the existing managed handover sequence: explicitly open initial admission; start B as standby; close A admission; commit a fresh source fence; quiesce; confirm old exit and slot release; promote the exact generation/revisions; await readiness; open admission. The local zero-drain experiment removes about two seconds. A real load balancer must prove route withdrawal before adopting that setting.
+2. Where consumers do not need large payload columns, use the already-supported static ingest projection and an appropriately explicit publication. Retest the real query set; this lab did not measure projected 500 MB transactions, and source WAL still has to be scanned.
+3. Resolve the DS provider boundaries before claiming large-transaction or large-catalog readiness: atomic large appends currently return `wal stage failed`, and unpaged reads prevent catalog admission. Keep the two Rust repros red until the storage capability is fixed and pinned. Do not split one transaction into separately visible shape appends or just remove memory bounds.
+4. Once bounded paging works, reduce catalog replay cost with a reviewed durable snapshot/checkpoint or read-only incremental warm fold that catches up to an exact final tail. The 50 MB / 8.8 s result already shows that eliminating a two-second drain cannot make large-catalog handover seamless. Preserve identity, epoch, highwater, subscription and retirement witnesses; this requires design, not a small local patch.
+5. Treat unplanned owner death separately from rolling deployment. The persisted revision/generation CAS is not an expiring lease or automatic HA takeover. A killed owner can restart with its own revision; a different standby requires a fenced takeover design and failure-matrix qualification.
+
+Replay now (no rebuild needed on this machine):
+
+```sh
+python3 -B scripts/lab/rolling_contract.py --engine .agent/bin/electric-circuits-engine-base
+.agent/bin/hardening-lab-tests --ignored --test-threads=1
+```
+
+The first command exercises the local prototype; the second deliberately reproduces the two known-red provider contracts. Both may refuse to start if the conservative disk headroom is unavailable. No production rollout is authorized or implied.

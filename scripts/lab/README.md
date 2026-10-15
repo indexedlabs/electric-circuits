@@ -52,7 +52,7 @@ Runs own `.agent/lab-data/<scenario>-<timestamp>` and remove it in `finally`.
 `.agent/results/` retains JSON results, a PID/operation journal, resource samples,
 and raw process logs. Processes have an explicit environment and process group;
 cleanup signals only recorded children and waits for exit. Disk monitoring counts
-all `.agent` artifacts, including builds, with an 8 GB ceiling and a 12 GB free
+all `.agent` artifacts, including builds, with an 8 GB ceiling and a 12 GiB free
 floor; it stops 300 MB early. Run scenarios serially. Keep unrelated generated
 data out of this checkout while running, and account separately for any build
 artifacts placed outside `.agent`.

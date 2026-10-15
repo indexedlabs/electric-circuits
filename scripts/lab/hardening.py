@@ -192,7 +192,9 @@ class Lab:
         self.result.update(runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             engine_sha256=hashlib.sha256(args.engine.read_bytes()).hexdigest(),
             ds_sha256=hashlib.sha256(args.ds.read_bytes()).hexdigest(),
-            git_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip())
+            control_head=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=WORKSPACE, text=True).strip(),
+            source_files_sha256={str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted((ROOT/'scripts/lab').glob('*.py'))})
         self.engine = None
         self.engineurl = None
         self.sequence = 0

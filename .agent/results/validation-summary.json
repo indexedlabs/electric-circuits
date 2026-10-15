@@ -1,0 +1,27 @@
+{
+  "python_boundary_tests": {
+    "exit": 0,
+    "passed": 3
+  },
+  "cargo_fmt_check": {
+    "exit": 0,
+    "source": "bb3ae9a"
+  },
+  "typescript_no_emit": {
+    "exit": 0,
+    "source": "224cd1c",
+    "note": "No TypeScript files changed"
+  },
+  "rust_opt_in_regressions": {
+    "exit": 101,
+    "passed": 0,
+    "failed": 2,
+    "ignored": 0,
+    "filtered": 0,
+    "source": "bb3ae9a clean export; exact base engine binary"
+  },
+  "full_engine_test": "blocked: wildcard StatsD bind and credential-file tests violate the brief",
+  "full_pnpm_test": "blocked: credential-file fixtures violate the brief",
+  "external_electric_oracle": "blocked: sibling checkout prohibited",
+  "browser_gateway_release_qualification": "not performed; no qualification claim"
+}

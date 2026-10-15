@@ -1,0 +1,71 @@
+{"at": 1792052174.414078, "kind": "spawn", "name": "initdb", "pid": 25082, "argv": ["/opt/homebrew/opt/postgresql@18/bin/initdb", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/pg", "-U", "postgres", "--auth=trust", "--no-sync"]}
+{"at": 1792052175.609597, "kind": "spawn", "name": "postgres", "pid": 25139, "argv": ["/opt/homebrew/opt/postgresql@18/bin/postgres", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/pg", "-h", "127.0.0.1", "-p", "56118", "-c", "unix_socket_directories=", "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8", "-c", "max_wal_size=256MB", "-c", "min_wal_size=80MB", "-c", "logical_decoding_work_mem=32MB"]}
+{"at": 1792052175.6392891, "kind": "gate", "name": "pg-listening"}
+{"at": 1792052175.6420732, "kind": "spawn", "name": "psql", "pid": 25143, "argv": ["/opt/homebrew/opt/postgresql@18/bin/psql", "-X", "-Atq", "-w", "-v", "ON_ERROR_STOP=1", "postgres://postgres@127.0.0.1:56118/postgres?sslmode=disable"]}
+{"at": 1792052175.710956, "kind": "spawn", "name": "ds", "pid": 25159, "argv": ["/Users/mh/.cargo/bin/durable-streams-server", "--host", "127.0.0.1", "--port", "56123", "--data-dir", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/ds", "--durability", "wal", "--long-poll-timeout-ms", "500"]}
+{"at": 1792052176.494506, "kind": "gate", "name": "ds-listening"}
+{"at": 1792052176.494941, "kind": "engine-config", "label": "A", "env": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin", "HOME": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614", "TMPDIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614", "LC_ALL": "C", "PGPASSFILE": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/absent-passfile", "ELECTRIC_CIRCUITS_BIND": "127.0.0.1:56188", "ELECTRIC_CIRCUITS_DS_URL": "http://127.0.0.1:56123", "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST": "1", "ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE": "1", "ELECTRIC_CIRCUITS_PG_URL": "postgres://postgres@127.0.0.1:56118/postgres?sslmode=disable", "ELECTRIC_CIRCUITS_PG_TABLES": "ticks,bulk", "ELECTRIC_CIRCUITS_PG_SLOT": "lab_slot", "ELECTRIC_CIRCUITS_CONTROL_SECRET": "local-lab-only", "ELECTRIC_CIRCUITS_LOG": "info", "ELECTRIC_CIRCUITS_DBSP_DIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/dbsp-A", "ELECTRIC_CIRCUITS_TXN_SPILL_DIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/spill-A", "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "3600", "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "3600"}}
+{"at": 1792052176.520959, "kind": "spawn", "name": "engine-A", "pid": 25181, "argv": ["/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-build/target/debug/electric-circuits-engine"]}
+{"at": 1792052177.152213, "kind": "gate", "name": "engine-A-ready"}
+{"at": 1792052177.462521, "kind": "commit", "n": 1, "marker": "e04799ed-b7a0-4a76-89b7-9324003a196a", "committed_at": 1792052177.4623091}
+{"at": 1792052177.463837, "kind": "commit", "n": 2, "marker": "b5fffd6d-7edd-4112-acc6-3e999def1003", "committed_at": 1792052177.4637299}
+{"at": 1792052177.464759, "kind": "commit", "n": 3, "marker": "7fb2e515-4bbf-4264-b97d-d13cfdc08d53", "committed_at": 1792052177.464597}
+{"at": 1792052177.485573, "kind": "commit", "n": 4, "marker": "4e0e1d81-1d19-4024-9961-58e60ff2b0c9", "committed_at": 1792052177.485337}
+{"at": 1792052177.517594, "kind": "commit", "n": 5, "marker": "ad7071aa-af1d-46a8-a0fb-6971a13ca47b", "committed_at": 1792052177.517469}
+{"at": 1792052177.5313542, "kind": "commit", "n": 6, "marker": "af9fe9de-bfd7-43f7-9a5a-c69028a0eeff", "committed_at": 1792052177.531168}
+{"at": 1792052177.53775, "kind": "commit", "n": 7, "marker": "6abc4d67-9839-4660-845a-498557659500", "committed_at": 1792052177.537611}
+{"at": 1792052177.544671, "kind": "commit", "n": 8, "marker": "4a220a3b-80b5-44ca-b6de-c1eb875f00c5", "committed_at": 1792052177.5444832}
+{"at": 1792052177.554801, "kind": "commit", "n": 9, "marker": "7140ce27-72e4-4d30-9b50-4fb5b6761eca", "committed_at": 1792052177.554662}
+{"at": 1792052177.564642, "kind": "commit", "n": 10, "marker": "61e50762-0eb5-4550-903f-51bd99df80cf", "committed_at": 1792052177.564409}
+{"at": 1792052177.6861281, "kind": "gate", "name": "drained-61e50762-0eb5-4550-903f-51bd99df80cf"}
+{"at": 1792052179.734012, "kind": "engine-exit", "pid": 25181, "signal": 15, "code": 0}
+{"at": 1792052180.4975538, "kind": "commit", "n": 11, "marker": "cf76ecb9-5977-4fd2-808e-310c2f9cfe62", "committed_at": 1792052180.497184}
+{"at": 1792052180.733461, "kind": "commit", "n": 12, "marker": "a157243a-bea5-4ae7-98fc-2a9e6e99e5a4", "committed_at": 1792052180.733344}
+{"at": 1792052181.272835, "kind": "commit", "n": 13, "marker": "87b19d18-e8ae-4339-afdc-c3470c6ad708", "committed_at": 1792052181.272541}
+{"at": 1792052181.511453, "kind": "commit", "n": 14, "marker": "9c694d86-7527-474e-ac60-f85bad649c57", "committed_at": 1792052181.5110662}
+{"at": 1792052182.348423, "kind": "commit", "n": 15, "marker": "3ddd6be9-b9f3-4645-af94-de9a00daf6ec", "committed_at": 1792052182.3482308}
+{"at": 1792052182.830838, "kind": "commit", "n": 16, "marker": "45a506a1-dc06-4427-b4ff-424a2ec2626e", "committed_at": 1792052182.830595}
+{"at": 1792052183.461283, "kind": "commit", "n": 17, "marker": "0db882ff-5b5c-44ab-a016-3316df58b618", "committed_at": 1792052183.460969}
+{"at": 1792052184.0268018, "kind": "commit", "n": 18, "marker": "72811848-440c-4f5a-a46b-919d68f76957", "committed_at": 1792052184.026463}
+{"at": 1792052184.430526, "kind": "commit", "n": 19, "marker": "6dd935cb-0c14-4c40-9322-16724720822d", "committed_at": 1792052184.430211}
+{"at": 1792052184.7316768, "kind": "commit", "n": 20, "marker": "826e6b63-a2c3-4d21-9bde-2a5561bd6398", "committed_at": 1792052184.7315059}
+{"at": 1792052185.2590542, "kind": "commit", "n": 21, "marker": "7f450e4e-2bdb-446c-b0fb-50462e4b874a", "committed_at": 1792052185.258883}
+{"at": 1792052185.719442, "kind": "commit", "n": 22, "marker": "4d8e4c14-534c-4ae7-925c-8115f04d3786", "committed_at": 1792052185.719317}
+{"at": 1792052186.8684611, "kind": "commit", "n": 23, "marker": "69f12cd2-f6ca-44a0-b120-c3030a353e78", "committed_at": 1792052186.868284}
+{"at": 1792052187.253706, "kind": "commit", "n": 24, "marker": "2bfde664-c711-4d0c-83f4-4b6ec4b0c70e", "committed_at": 1792052187.253592}
+{"at": 1792052188.2746282, "kind": "commit", "n": 25, "marker": "6b8b4c12-5c15-4050-ad13-a96e08c23576", "committed_at": 1792052188.274466}
+{"at": 1792052188.60175, "kind": "commit", "n": 26, "marker": "f0150798-7851-43f4-9421-b062822af1a7", "committed_at": 1792052188.601621}
+{"at": 1792052189.1876, "kind": "commit", "n": 27, "marker": "ff87df46-7587-4e3d-8571-88c0d2182947", "committed_at": 1792052189.187412}
+{"at": 1792052189.512942, "kind": "commit", "n": 28, "marker": "c9170714-a4a8-4f90-85f6-8b96ed670791", "committed_at": 1792052189.5126889}
+{"at": 1792052189.88833, "kind": "commit", "n": 29, "marker": "346628c2-2a2e-4de5-9043-8a092320120e", "committed_at": 1792052189.88803}
+{"at": 1792052190.411396, "kind": "commit", "n": 30, "marker": "cdbcd2d2-026b-482a-b8f5-def22132540e", "committed_at": 1792052190.411214}
+{"at": 1792052191.5046341, "kind": "commit", "n": 31, "marker": "8311533b-d988-458e-8d97-c52133d244c2", "committed_at": 1792052191.5043998}
+{"at": 1792052191.741106, "kind": "commit", "n": 32, "marker": "ff14237e-f37a-43c8-93a7-262bfa661492", "committed_at": 1792052191.74086}
+{"at": 1792052193.404316, "kind": "commit", "n": 33, "marker": "ec363c09-ce06-440f-8538-428c5f48015a", "committed_at": 1792052193.404091}
+{"at": 1792052193.7819772, "kind": "commit", "n": 34, "marker": "42a4e041-a666-41b1-81f5-fbc49ac3c51e", "committed_at": 1792052193.7817118}
+{"at": 1792052194.302853, "kind": "commit", "n": 35, "marker": "079a59b3-58c4-4068-ba74-64459e19757b", "committed_at": 1792052194.302649}
+{"at": 1792052194.569742, "kind": "commit", "n": 36, "marker": "dfb9cb6b-dae6-4633-8c18-87594520ce15", "committed_at": 1792052194.5696}
+{"at": 1792052196.61262, "kind": "commit", "n": 37, "marker": "bb9df231-037c-4267-a5bb-9f4a356d8710", "committed_at": 1792052196.612233}
+{"at": 1792052197.2092822, "kind": "commit", "n": 38, "marker": "7eb5ff47-7655-446d-96cb-deb12590e945", "committed_at": 1792052197.208949}
+{"at": 1792052197.6035898, "kind": "commit", "n": 39, "marker": "55065ab7-e49a-4b2c-b115-f593f18ef4b9", "committed_at": 1792052197.6034591}
+{"at": 1792052198.652132, "kind": "commit", "n": 40, "marker": "666abd5d-dd56-4d94-b5c3-91500f8046d8", "committed_at": 1792052198.651938}
+{"at": 1792052199.872689, "kind": "commit", "n": 41, "marker": "cfb87cea-eeda-4a18-a48d-4fc0910dc81c", "committed_at": 1792052199.8723469}
+{"at": 1792052200.405087, "kind": "commit", "n": 42, "marker": "f5d57e02-56af-4488-82b1-f19b1289f5f8", "committed_at": 1792052200.4048939}
+{"at": 1792052201.231151, "kind": "commit", "n": 43, "marker": "e5602bb1-7a57-4f25-81ac-d1d03359728b", "committed_at": 1792052201.2308779}
+{"at": 1792052201.608146, "kind": "commit", "n": 44, "marker": "4615e05f-cd32-4c84-8c9b-9da8b393e0dc", "committed_at": 1792052201.607779}
+{"at": 1792052201.9773571, "kind": "commit", "n": 45, "marker": "9eed61ac-a7b1-4d43-8a47-5719bb145791", "committed_at": 1792052201.977122}
+{"at": 1792052202.78512, "kind": "commit", "n": 46, "marker": "d9d9c19d-c9e8-492a-9530-b509bbbb9524", "committed_at": 1792052202.7847621}
+{"at": 1792052203.331962, "kind": "commit", "n": 47, "marker": "146153b0-60f4-4ef5-b659-8fa2453025fa", "committed_at": 1792052203.331566}
+{"at": 1792052203.33581, "kind": "engine-config", "label": "restart", "env": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin", "HOME": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614", "TMPDIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614", "LC_ALL": "C", "PGPASSFILE": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/absent-passfile", "ELECTRIC_CIRCUITS_BIND": "127.0.0.1:57231", "ELECTRIC_CIRCUITS_DS_URL": "http://127.0.0.1:56123", "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST": "1", "ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE": "1", "ELECTRIC_CIRCUITS_PG_URL": "postgres://postgres@127.0.0.1:56118/postgres?sslmode=disable", "ELECTRIC_CIRCUITS_PG_TABLES": "ticks,bulk", "ELECTRIC_CIRCUITS_PG_SLOT": "lab_slot", "ELECTRIC_CIRCUITS_CONTROL_SECRET": "local-lab-only", "ELECTRIC_CIRCUITS_LOG": "info", "ELECTRIC_CIRCUITS_DBSP_DIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/dbsp-restart", "ELECTRIC_CIRCUITS_TXN_SPILL_DIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/backlog-20261015-011614/spill-restart", "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "3600", "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "3600"}}
+{"at": 1792052203.340225, "kind": "spawn", "name": "engine-restart", "pid": 27684, "argv": ["/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-build/target/debug/electric-circuits-engine"]}
+{"at": 1792052204.831838, "kind": "gate", "name": "engine-restart-ready"}
+{"at": 1792052204.8333461, "kind": "commit", "n": 48, "marker": "bfcbaf58-b761-430d-835c-9bd4fa5db752", "committed_at": 1792052204.833277}
+{"at": 1792052220.727576, "kind": "gate", "name": "drained-bfcbaf58-b761-430d-835c-9bd4fa5db752"}
+{"at": 1792052220.736342, "kind": "commit", "n": 49, "marker": "172d718f-1240-44f4-a3b2-2592941edffe", "committed_at": 1792052220.73613}
+{"at": 1792052220.7694058, "kind": "gate", "name": "drained-172d718f-1240-44f4-a3b2-2592941edffe"}
+{"at": 1792052224.950958, "kind": "reaped", "name": "engine-restart", "pid": 27684, "code": 0}
+{"at": 1792052224.951261, "kind": "reaped", "name": "engine-A", "pid": 25181, "code": 0}
+{"at": 1792052224.9559731, "kind": "reaped", "name": "ds", "pid": 25159, "code": 0}
+{"at": 1792052224.957598, "kind": "reaped", "name": "psql", "pid": 25143, "code": -15}
+{"at": 1792052225.4112031, "kind": "reaped", "name": "postgres", "pid": 25139, "code": 0}
+{"at": 1792052225.411398, "kind": "reaped", "name": "initdb", "pid": 25082, "code": 0}

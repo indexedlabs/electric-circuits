@@ -1,0 +1,141 @@
+{"at": 1792052105.083652, "kind": "spawn", "name": "initdb", "pid": 20603, "argv": ["/opt/homebrew/opt/postgresql@18/bin/initdb", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504/pg", "-U", "postgres", "--auth=trust", "--no-sync"]}
+{"at": 1792052106.309193, "kind": "spawn", "name": "postgres", "pid": 20724, "argv": ["/opt/homebrew/opt/postgresql@18/bin/postgres", "-D", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504/pg", "-h", "127.0.0.1", "-p", "53295", "-c", "unix_socket_directories=", "-c", "wal_level=logical", "-c", "max_replication_slots=8", "-c", "max_wal_senders=8", "-c", "max_wal_size=256MB", "-c", "min_wal_size=80MB", "-c", "logical_decoding_work_mem=32MB"]}
+{"at": 1792052106.361841, "kind": "gate", "name": "pg-listening"}
+{"at": 1792052106.374263, "kind": "spawn", "name": "psql", "pid": 20731, "argv": ["/opt/homebrew/opt/postgresql@18/bin/psql", "-X", "-Atq", "-w", "-v", "ON_ERROR_STOP=1", "postgres://postgres@127.0.0.1:53295/postgres?sslmode=disable"]}
+{"at": 1792052106.506969, "kind": "spawn", "name": "ds", "pid": 20747, "argv": ["/Users/mh/.cargo/bin/durable-streams-server", "--host", "127.0.0.1", "--port", "53301", "--data-dir", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504/ds", "--durability", "wal", "--long-poll-timeout-ms", "500"]}
+{"at": 1792052107.465558, "kind": "gate", "name": "ds-listening"}
+{"at": 1792052107.466101, "kind": "engine-config", "label": "A", "env": {"PATH": "/opt/homebrew/bin:/usr/bin:/bin", "HOME": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504", "TMPDIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504", "LC_ALL": "C", "PGPASSFILE": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504/absent-passfile", "ELECTRIC_CIRCUITS_BIND": "127.0.0.1:53372", "ELECTRIC_CIRCUITS_DS_URL": "http://127.0.0.1:53301", "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST": "1", "ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE": "1", "ELECTRIC_CIRCUITS_PG_URL": "postgres://postgres@127.0.0.1:53295/postgres?sslmode=disable", "ELECTRIC_CIRCUITS_PG_TABLES": "ticks,bulk", "ELECTRIC_CIRCUITS_PG_SLOT": "lab_slot", "ELECTRIC_CIRCUITS_CONTROL_SECRET": "local-lab-only", "ELECTRIC_CIRCUITS_LOG": "info", "ELECTRIC_CIRCUITS_DBSP_DIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504/dbsp-A", "ELECTRIC_CIRCUITS_TXN_SPILL_DIR": "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/transaction-20261015-011504/spill-A", "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "3600", "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "3600"}}
+{"at": 1792052107.482668, "kind": "spawn", "name": "engine-A", "pid": 20767, "argv": ["/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-build/target/debug/electric-circuits-engine"]}
+{"at": 1792052108.513057, "kind": "gate", "name": "engine-A-ready"}
+{"at": 1792052108.872284, "kind": "spawn", "name": "psql", "pid": 20898, "argv": ["/opt/homebrew/opt/postgresql@18/bin/psql", "-X", "-Atq", "-w", "-v", "ON_ERROR_STOP=1", "postgres://postgres@127.0.0.1:53295/postgres?sslmode=disable"]}
+{"at": 1792052108.956609, "kind": "commit", "n": 1, "marker": "01d9dd18-d6a2-44b3-884d-b1c66741595a", "committed_at": 1792052108.9563751}
+{"at": 1792052108.958951, "kind": "large-commit", "marker": "45a65c36-3bd6-42f1-82b6-f0a17bb2a89e", "table": "untracked", "rows": 152, "payload_bytes": 9961472}
+{"at": 1792052108.982162, "kind": "commit", "n": 2, "marker": "4313de56-cff5-4dfd-8d52-fa36b8798280", "committed_at": 1792052108.9819431}
+{"at": 1792052109.04267, "kind": "gate", "name": "drained-45a65c36-3bd6-42f1-82b6-f0a17bb2a89e"}
+{"at": 1792052109.0471182, "kind": "gate", "name": "drained-9c5ed013-464c-4835-8cdb-ca9e1a7fef93"}
+{"at": 1792052109.0835578, "kind": "commit", "n": 3, "marker": "ffe0f57f-9e11-4bce-af9c-edadbff65a6b", "committed_at": 1792052109.0832908}
+{"at": 1792052109.186154, "kind": "commit", "n": 4, "marker": "f0b6d6f0-a288-40c4-9d62-e2ec9108fe2e", "committed_at": 1792052109.185706}
+{"at": 1792052109.287194, "kind": "commit", "n": 5, "marker": "67b8466d-e2a3-4bcd-ac38-97f4c1391c9a", "committed_at": 1792052109.287053}
+{"at": 1792052109.390552, "kind": "commit", "n": 6, "marker": "3ba12e36-2884-4fde-ae88-46357e28488b", "committed_at": 1792052109.390063}
+{"at": 1792052109.495071, "kind": "commit", "n": 7, "marker": "14598e0c-8d5a-449e-b324-9d6900ce3265", "committed_at": 1792052109.494817}
+{"at": 1792052109.5960152, "kind": "commit", "n": 8, "marker": "b9fbb1aa-f0ef-4079-9bda-83657b001c0c", "committed_at": 1792052109.595797}
+{"at": 1792052109.698802, "kind": "commit", "n": 9, "marker": "3313236f-b216-40d4-a40f-b255de0dea20", "committed_at": 1792052109.6985521}
+{"at": 1792052109.8009799, "kind": "commit", "n": 10, "marker": "2678da38-1078-44d3-9529-3a0b29bc41c0", "committed_at": 1792052109.8007839}
+{"at": 1792052109.9102058, "kind": "commit", "n": 11, "marker": "c9d66fb0-caf3-4484-947f-8278e8cb27b5", "committed_at": 1792052109.9097888}
+{"at": 1792052110.008708, "kind": "commit", "n": 12, "marker": "503bc54f-4eec-431a-b9a4-b33e0ab5841c", "committed_at": 1792052110.008563}
+{"at": 1792052110.116815, "kind": "commit", "n": 13, "marker": "52cb0769-3f6b-4457-8737-a01af9f0e1af", "committed_at": 1792052110.116412}
+{"at": 1792052110.2146308, "kind": "commit", "n": 14, "marker": "18f6abf9-153c-4b3f-bf52-91d3d56c396b", "committed_at": 1792052110.214314}
+{"at": 1792052110.318611, "kind": "commit", "n": 15, "marker": "4bd05d8f-b5d6-4b09-982e-5d119a0bb38d", "committed_at": 1792052110.3183858}
+{"at": 1792052110.421689, "kind": "commit", "n": 16, "marker": "e9933439-a5b8-40fb-8088-05691b364bd7", "committed_at": 1792052110.4214451}
+{"at": 1792052110.526199, "kind": "commit", "n": 17, "marker": "da94e76a-7c05-4573-8591-606353b81d73", "committed_at": 1792052110.525984}
+{"at": 1792052110.63057, "kind": "commit", "n": 18, "marker": "389f37a1-5786-4946-8ea2-783ffb42730e", "committed_at": 1792052110.6303859}
+{"at": 1792052110.738542, "kind": "commit", "n": 19, "marker": "82211e6f-2a44-4c0c-839f-52af295a2c97", "committed_at": 1792052110.7371662}
+{"at": 1792052110.839512, "kind": "commit", "n": 20, "marker": "4a92aabc-8a24-43ed-9fe5-d11827c49e11", "committed_at": 1792052110.8393621}
+{"at": 1792052110.9410062, "kind": "commit", "n": 21, "marker": "84cb736a-f8ab-4bb9-8e5c-5d04d595e16c", "committed_at": 1792052110.940875}
+{"at": 1792052111.042652, "kind": "commit", "n": 22, "marker": "a8cff973-04aa-4dcc-b25c-cea7b2650bdc", "committed_at": 1792052111.04246}
+{"at": 1792052111.1459498, "kind": "commit", "n": 23, "marker": "d1fc20c9-ea31-40c2-9c99-9d004b34aa06", "committed_at": 1792052111.1457121}
+{"at": 1792052111.264576, "kind": "commit", "n": 24, "marker": "a507d2a9-5cd1-4591-94cf-e332d0ab66e3", "committed_at": 1792052111.264441}
+{"at": 1792052111.361774, "kind": "commit", "n": 25, "marker": "96ea613e-0fcf-4fd6-ab02-b38b885e71b9", "committed_at": 1792052111.361299}
+{"at": 1792052111.463616, "kind": "commit", "n": 26, "marker": "5db164f6-932d-47db-b046-db3fff8d9ed8", "committed_at": 1792052111.4632802}
+{"at": 1792052111.5739279, "kind": "commit", "n": 27, "marker": "92f79989-932a-47c7-b0cb-426c1b7301a5", "committed_at": 1792052111.5736802}
+{"at": 1792052111.680214, "kind": "commit", "n": 28, "marker": "4bfd77d8-4d47-4250-be3d-b16b3cf26ce7", "committed_at": 1792052111.679996}
+{"at": 1792052111.7921631, "kind": "commit", "n": 29, "marker": "5460c168-db41-499c-9ba6-99a01909514d", "committed_at": 1792052111.7919202}
+{"at": 1792052111.890781, "kind": "commit", "n": 30, "marker": "b950ecf7-d8c7-445c-9cda-d4631c5846ed", "committed_at": 1792052111.889914}
+{"at": 1792052111.9883058, "kind": "commit", "n": 31, "marker": "7334951b-1cd4-4484-b66b-bc3457c41cf2", "committed_at": 1792052111.98814}
+{"at": 1792052112.091933, "kind": "commit", "n": 32, "marker": "feca9c6d-fd98-4076-b49d-d717230a8c66", "committed_at": 1792052112.091764}
+{"at": 1792052112.20383, "kind": "commit", "n": 33, "marker": "de8ca0d5-e5fa-466f-bdf7-ec0bb9821d51", "committed_at": 1792052112.203649}
+{"at": 1792052112.301451, "kind": "commit", "n": 34, "marker": "907e0398-9ed9-4db3-99f7-c0894ee7664c", "committed_at": 1792052112.301138}
+{"at": 1792052112.404744, "kind": "commit", "n": 35, "marker": "b0863723-1f8b-404c-b921-220bca0896c3", "committed_at": 1792052112.40451}
+{"at": 1792052112.5068421, "kind": "commit", "n": 36, "marker": "11f11f72-7274-4676-ac12-0c419e02b334", "committed_at": 1792052112.5066292}
+{"at": 1792052112.608494, "kind": "commit", "n": 37, "marker": "e8b69afe-66a8-4a8b-ac5f-8eeaef4b32f5", "committed_at": 1792052112.608005}
+{"at": 1792052112.7099478, "kind": "commit", "n": 38, "marker": "a4d30e17-6eee-4ea5-b1a4-aa204fb2a921", "committed_at": 1792052112.709735}
+{"at": 1792052112.814826, "kind": "commit", "n": 39, "marker": "e0266dea-ecf2-4380-b5fc-5a7f6986c010", "committed_at": 1792052112.814547}
+{"at": 1792052112.923894, "kind": "commit", "n": 40, "marker": "09003f5c-a0f2-4156-ac6c-5667e7594b52", "committed_at": 1792052112.92367}
+{"at": 1792052113.021025, "kind": "commit", "n": 41, "marker": "8c00e50f-e7db-42e3-a773-4422bbc0f9f6", "committed_at": 1792052113.020137}
+{"at": 1792052113.126693, "kind": "commit", "n": 42, "marker": "e3377f20-86dd-4807-b843-88d6bc15f449", "committed_at": 1792052113.126493}
+{"at": 1792052113.227019, "kind": "commit", "n": 43, "marker": "8147b799-b715-4e71-93e3-32fec69162cd", "committed_at": 1792052113.226811}
+{"at": 1792052113.3317928, "kind": "commit", "n": 44, "marker": "2c65c684-da5c-4fbf-8ea1-8b62e2df5c68", "committed_at": 1792052113.331601}
+{"at": 1792052113.435364, "kind": "commit", "n": 45, "marker": "acd518f9-e262-4bf5-aa5e-c7cb91dd861b", "committed_at": 1792052113.4351318}
+{"at": 1792052113.539101, "kind": "commit", "n": 46, "marker": "b633acb3-0758-471a-8657-3f35f78c87e8", "committed_at": 1792052113.538947}
+{"at": 1792052113.6730409, "kind": "commit", "n": 47, "marker": "e3a16a70-6674-4931-a16d-a0938628e2b7", "committed_at": 1792052113.672905}
+{"at": 1792052113.745095, "kind": "commit", "n": 48, "marker": "76925a6a-87de-402f-b11d-6dd8e0df70b4", "committed_at": 1792052113.744936}
+{"at": 1792052113.850173, "kind": "commit", "n": 49, "marker": "4817a67c-9965-4c60-850f-3cbc683b6c41", "committed_at": 1792052113.849886}
+{"at": 1792052113.953502, "kind": "commit", "n": 50, "marker": "802b3c8c-2c28-42ca-a82b-33696a0720d8", "committed_at": 1792052113.953247}
+{"at": 1792052114.054056, "kind": "commit", "n": 51, "marker": "914972b7-fdcc-457b-9215-33fa4efff607", "committed_at": 1792052114.053866}
+{"at": 1792052114.1639209, "kind": "commit", "n": 52, "marker": "c9371943-98e7-4aed-9976-62e7b8e7caf4", "committed_at": 1792052114.163706}
+{"at": 1792052114.263834, "kind": "commit", "n": 53, "marker": "39615425-4cb7-4851-ae25-16eb45164ac4", "committed_at": 1792052114.263571}
+{"at": 1792052114.394318, "kind": "commit", "n": 54, "marker": "57895679-1b69-41df-9e24-d9e7b76d3b18", "committed_at": 1792052114.394122}
+{"at": 1792052114.483438, "kind": "commit", "n": 55, "marker": "c67358b8-956d-432f-9b31-ea80f8e19981", "committed_at": 1792052114.48321}
+{"at": 1792052114.578253, "kind": "commit", "n": 56, "marker": "12a6300b-cafc-4148-bf9e-e06b1d906eaa", "committed_at": 1792052114.578014}
+{"at": 1792052114.6840801, "kind": "commit", "n": 57, "marker": "d84191cd-eaf9-4098-a6cd-dcf946a830e7", "committed_at": 1792052114.683906}
+{"at": 1792052114.791241, "kind": "commit", "n": 58, "marker": "63ff44f7-f2a5-468d-8f35-3da7d82e6a13", "committed_at": 1792052114.7910242}
+{"at": 1792052114.8909922, "kind": "commit", "n": 59, "marker": "871820a2-17a1-409b-b845-dce72fdc6fdd", "committed_at": 1792052114.8904698}
+{"at": 1792052114.996887, "kind": "commit", "n": 60, "marker": "6605bf49-4491-4edf-adcf-824e10b20f10", "committed_at": 1792052114.996619}
+{"at": 1792052115.100171, "kind": "commit", "n": 61, "marker": "5368ce91-4e46-42f7-8565-db027a741411", "committed_at": 1792052115.1000478}
+{"at": 1792052115.205087, "kind": "commit", "n": 62, "marker": "325d287e-ff24-490a-8157-4eb5c539cee2", "committed_at": 1792052115.204729}
+{"at": 1792052115.305792, "kind": "commit", "n": 63, "marker": "a6ada8a4-b7b1-4691-803d-df5ed5ce2170", "committed_at": 1792052115.305541}
+{"at": 1792052115.410035, "kind": "commit", "n": 64, "marker": "ac764992-0012-4ed6-a71f-2c67bcb529db", "committed_at": 1792052115.4099011}
+{"at": 1792052115.513649, "kind": "commit", "n": 65, "marker": "9a08fbca-5f96-4549-9dcf-af29b847b4a1", "committed_at": 1792052115.513382}
+{"at": 1792052115.6132731, "kind": "commit", "n": 66, "marker": "4c518d38-b5db-4fe3-9aa0-2d186c2c280a", "committed_at": 1792052115.613148}
+{"at": 1792052115.717264, "kind": "commit", "n": 67, "marker": "a6a014b7-abdc-4afa-8bf1-e5147a152936", "committed_at": 1792052115.717131}
+{"at": 1792052115.8223941, "kind": "commit", "n": 68, "marker": "562103d7-0c1d-4fcf-9588-d97615750dab", "committed_at": 1792052115.8221529}
+{"at": 1792052115.92519, "kind": "commit", "n": 69, "marker": "833014f2-1cba-432b-93a7-283d13ecad77", "committed_at": 1792052115.9249449}
+{"at": 1792052116.03104, "kind": "commit", "n": 70, "marker": "821bf3c7-3f75-4909-a64e-0cbd16cfe3d1", "committed_at": 1792052116.0306802}
+{"at": 1792052116.1352801, "kind": "commit", "n": 71, "marker": "829a3376-6cca-4c8d-8e8f-daa534ffb355", "committed_at": 1792052116.134989}
+{"at": 1792052116.238257, "kind": "commit", "n": 72, "marker": "16d2013b-c3c3-43dd-9df9-b9bbc8d11530", "committed_at": 1792052116.238111}
+{"at": 1792052116.343767, "kind": "commit", "n": 73, "marker": "414e9125-4d8b-4c00-b791-597b879c58d0", "committed_at": 1792052116.3436139}
+{"at": 1792052116.4465091, "kind": "commit", "n": 74, "marker": "6cea13e5-91bd-45a3-aacc-f1ad1e691ade", "committed_at": 1792052116.446275}
+{"at": 1792052116.558889, "kind": "commit", "n": 75, "marker": "73c5e23d-8be4-43e9-9594-1375ab6699f5", "committed_at": 1792052116.55866}
+{"at": 1792052116.656759, "kind": "commit", "n": 76, "marker": "16bbaf57-92f7-446f-8f82-23d1114f7cdb", "committed_at": 1792052116.656579}
+{"at": 1792052116.810217, "kind": "commit", "n": 77, "marker": "7f926d6b-2f28-4a04-85e6-7c2ea4aafa1b", "committed_at": 1792052116.809998}
+{"at": 1792052116.87539, "kind": "commit", "n": 78, "marker": "4335a57e-ddc9-4c6a-8707-002a6e1a12ff", "committed_at": 1792052116.875179}
+{"at": 1792052116.976363, "kind": "commit", "n": 79, "marker": "de9df984-364f-4338-9f43-c466e6e6d003", "committed_at": 1792052116.976214}
+{"at": 1792052117.081802, "kind": "commit", "n": 80, "marker": "ebb4c4bd-247e-4ba0-b03b-33ea3459493b", "committed_at": 1792052117.081394}
+{"at": 1792052117.1825962, "kind": "commit", "n": 81, "marker": "d327dc5c-dbd6-44de-9859-5ce033f7774a", "committed_at": 1792052117.182419}
+{"at": 1792052117.288033, "kind": "commit", "n": 82, "marker": "59598b58-7851-4ebf-93b9-a0b4bcf3483a", "committed_at": 1792052117.287885}
+{"at": 1792052117.389295, "kind": "commit", "n": 83, "marker": "8bcf1d18-8df6-42fb-843b-54d02ece7fcd", "committed_at": 1792052117.388674}
+{"at": 1792052117.493356, "kind": "commit", "n": 84, "marker": "b80cb8b3-4660-4411-af5d-bfe20d3ad7e0", "committed_at": 1792052117.493105}
+{"at": 1792052117.5963252, "kind": "commit", "n": 85, "marker": "f684be11-9d0c-4f7d-acca-355c6c3fa18d", "committed_at": 1792052117.596119}
+{"at": 1792052117.700633, "kind": "commit", "n": 86, "marker": "dc159bf9-6d32-4e85-b1b2-88bf669409ee", "committed_at": 1792052117.700497}
+{"at": 1792052117.8063989, "kind": "commit", "n": 87, "marker": "12674066-5791-437b-b838-584946239962", "committed_at": 1792052117.8054981}
+{"at": 1792052117.911923, "kind": "commit", "n": 88, "marker": "d609ba83-ced0-48aa-9b7a-5f1758dd8b77", "committed_at": 1792052117.911361}
+{"at": 1792052118.01526, "kind": "commit", "n": 89, "marker": "2bc2ae20-9a57-4abc-a819-c85f35a074e2", "committed_at": 1792052118.015125}
+{"at": 1792052118.120672, "kind": "commit", "n": 90, "marker": "bf729deb-3de8-4ddd-b867-907c1b587a59", "committed_at": 1792052118.120213}
+{"at": 1792052118.222152, "kind": "commit", "n": 91, "marker": "5e92f66b-68a8-4099-a4e1-46ca71c73520", "committed_at": 1792052118.221927}
+{"at": 1792052118.326095, "kind": "commit", "n": 92, "marker": "d7d33f65-5a3d-497f-a447-4291fc7592e4", "committed_at": 1792052118.325886}
+{"at": 1792052118.430997, "kind": "commit", "n": 93, "marker": "b3c54f19-22cc-4477-a91b-13abff731fbf", "committed_at": 1792052118.430856}
+{"at": 1792052118.5313659, "kind": "commit", "n": 94, "marker": "10b58265-889a-4a7c-ae00-6384fe6fe267", "committed_at": 1792052118.531175}
+{"at": 1792052118.635061, "kind": "commit", "n": 95, "marker": "ed48d8e8-69b1-4938-8aee-136d344e06a9", "committed_at": 1792052118.6348212}
+{"at": 1792052118.741132, "kind": "commit", "n": 96, "marker": "d33aedb7-51c8-40b8-aac5-f00664312f55", "committed_at": 1792052118.7408981}
+{"at": 1792052118.845077, "kind": "commit", "n": 97, "marker": "d61f264e-6bb2-444b-afd6-448d72c3ca1f", "committed_at": 1792052118.8447602}
+{"at": 1792052118.946263, "kind": "commit", "n": 98, "marker": "53e3d24d-8da0-4542-9a2c-8d105b1f05b2", "committed_at": 1792052118.945889}
+{"at": 1792052119.050671, "kind": "commit", "n": 99, "marker": "5063ea6f-bf4c-45d7-b024-89ba7875126f", "committed_at": 1792052119.0505369}
+{"at": 1792052119.152805, "kind": "commit", "n": 100, "marker": "f4b96c12-3266-47e3-9cc6-10b3abb892f8", "committed_at": 1792052119.152437}
+{"at": 1792052119.257659, "kind": "commit", "n": 101, "marker": "f4c947ff-265d-41f7-9f29-71f2262e4250", "committed_at": 1792052119.257451}
+{"at": 1792052119.360291, "kind": "commit", "n": 102, "marker": "035c1a51-25c1-44fe-b73a-b5a7a0da7045", "committed_at": 1792052119.360162}
+{"at": 1792052119.465832, "kind": "commit", "n": 103, "marker": "01606821-0205-46d3-9fe5-634cc95f622e", "committed_at": 1792052119.465547}
+{"at": 1792052119.5684988, "kind": "commit", "n": 104, "marker": "427228fb-dbde-4a46-9807-08fb27e2a354", "committed_at": 1792052119.568228}
+{"at": 1792052119.6737201, "kind": "commit", "n": 105, "marker": "3f3a9f5d-b4ce-40c2-a4dd-d9f90567ae9f", "committed_at": 1792052119.673397}
+{"at": 1792052119.77827, "kind": "commit", "n": 106, "marker": "5d5b3e79-3b08-4de4-bae0-96611a43c004", "committed_at": 1792052119.7780428}
+{"at": 1792052119.8823, "kind": "commit", "n": 107, "marker": "2e68c18b-28ad-4c91-a4ef-540fa0b30cc3", "committed_at": 1792052119.8820338}
+{"at": 1792052119.986481, "kind": "commit", "n": 108, "marker": "0519e3f0-fe3b-4649-8ec9-7416f24d15b7", "committed_at": 1792052119.986253}
+{"at": 1792052120.089233, "kind": "commit", "n": 109, "marker": "d4c58a50-e1cc-4172-9f42-2edbe45f2a48", "committed_at": 1792052120.089102}
+{"at": 1792052120.194192, "kind": "commit", "n": 110, "marker": "c14ab938-aac7-453c-88b3-3965984f678c", "committed_at": 1792052120.194051}
+{"at": 1792052120.2982578, "kind": "commit", "n": 111, "marker": "2e237410-37e3-46a3-909e-7f0f46f45a88", "committed_at": 1792052120.2980008}
+{"at": 1792052120.4007292, "kind": "commit", "n": 112, "marker": "80c07c13-daf0-43f1-83c9-756c514dc713", "committed_at": 1792052120.400529}
+{"at": 1792052120.526963, "kind": "commit", "n": 113, "marker": "fa4cec0b-c7ec-48d1-b036-52700d6f9c16", "committed_at": 1792052120.525938}
+{"at": 1792052120.6249118, "kind": "commit", "n": 114, "marker": "a9844dd6-8fbc-4df6-99c2-b23e545a10d1", "committed_at": 1792052120.624671}
+{"at": 1792052120.717551, "kind": "commit", "n": 115, "marker": "c2c523dc-7f01-4025-85bb-3d76e8efa641", "committed_at": 1792052120.717404}
+{"at": 1792052120.844189, "kind": "commit", "n": 116, "marker": "0c4031a9-a64d-47a5-a3c7-d5150976227f", "committed_at": 1792052120.843999}
+{"at": 1792052120.9275799, "kind": "commit", "n": 117, "marker": "41decb52-2f67-486a-9be0-86dbb6726eab", "committed_at": 1792052120.927335}
+{"at": 1792052121.030686, "kind": "commit", "n": 118, "marker": "ad9f0ca9-07ee-4793-9d5d-c93a1addada9", "committed_at": 1792052121.030569}
+{"at": 1792052121.1355672, "kind": "commit", "n": 119, "marker": "4fde10b6-9e37-4f29-a0b2-8729dc715dc2", "committed_at": 1792052121.135309}
+{"at": 1792052121.236458, "kind": "commit", "n": 120, "marker": "3c0e588f-7ea3-4896-b420-cca1dc1a8ea8", "committed_at": 1792052121.236137}
+{"at": 1792052121.346837, "kind": "commit", "n": 121, "marker": "5922fe81-2a62-44fd-904a-efd7ab29237a", "committed_at": 1792052121.346617}
+{"at": 1792052121.380252, "kind": "gate", "name": "drained-5922fe81-2a62-44fd-904a-efd7ab29237a"}
+{"at": 1792052122.9853692, "kind": "reaped", "name": "psql", "pid": 20898, "code": 0}
+{"at": 1792052125.0537212, "kind": "reaped", "name": "engine-A", "pid": 20767, "code": 0}
+{"at": 1792052125.057871, "kind": "reaped", "name": "ds", "pid": 20747, "code": 0}
+{"at": 1792052125.059774, "kind": "reaped", "name": "psql", "pid": 20731, "code": -15}
+{"at": 1792052125.188559, "kind": "reaped", "name": "postgres", "pid": 20724, "code": 0}
+{"at": 1792052125.1887739, "kind": "reaped", "name": "initdb", "pid": 20603, "code": 0}

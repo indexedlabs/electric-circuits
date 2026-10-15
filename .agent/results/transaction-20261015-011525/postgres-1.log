@@ -1,0 +1,21 @@
+2026-10-15 01:15:27.527 PDT [22377] LOG:  starting PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+2026-10-15 01:15:27.527 PDT [22377] LOG:  listening on IPv4 address "127.0.0.1", port 54142
+2026-10-15 01:15:27.566 PDT [22392] LOG:  database system was shut down at 2026-10-15 01:15:27 PDT
+2026-10-15 01:15:27.579 PDT [22377] LOG:  database system is ready to accept connections
+2026-10-15 01:15:30.488 PDT [22537] LOG:  logical decoding found consistent point at 0/17F5B68
+2026-10-15 01:15:30.488 PDT [22537] DETAIL:  There are no running transactions.
+2026-10-15 01:15:30.488 PDT [22537] STATEMENT:  select pg_create_logical_replication_slot($1, 'pgoutput')
+2026-10-15 01:15:30.691 PDT [22553] LOG:  starting logical decoding for slot "lab_slot"
+2026-10-15 01:15:30.691 PDT [22553] DETAIL:  Streaming transactions committing after 0/17F5BA0, reading WAL from 0/17F5B68.
+2026-10-15 01:15:30.691 PDT [22553] STATEMENT:  START_REPLICATION SLOT lab_slot LOGICAL 0/0 (proto_version '1', publication_names 'lab_slot_pub', messages 'true')
+2026-10-15 01:15:30.692 PDT [22553] LOG:  logical decoding found consistent point at 0/17F5B68
+2026-10-15 01:15:30.692 PDT [22553] DETAIL:  There are no running transactions.
+2026-10-15 01:15:30.692 PDT [22553] STATEMENT:  START_REPLICATION SLOT lab_slot LOGICAL 0/0 (proto_version '1', publication_names 'lab_slot_pub', messages 'true')
+2026-10-15 01:15:47.323 PDT [22553] LOG:  could not send data to client: Broken pipe
+2026-10-15 01:15:47.329 PDT [22553] FATAL:  connection to client lost
+2026-10-15 01:15:49.399 PDT [22377] LOG:  received smart shutdown request
+2026-10-15 01:15:49.403 PDT [22377] LOG:  background worker "logical replication launcher" (PID 22400) exited with exit code 1
+2026-10-15 01:15:49.403 PDT [22389] LOG:  shutting down
+2026-10-15 01:15:49.403 PDT [22389] LOG:  checkpoint starting: shutdown immediate
+2026-10-15 01:15:51.145 PDT [22389] LOG:  checkpoint complete: wrote 12824 buffers (78.3%), wrote 3 SLRU buffers; 0 WAL file(s) added, 0 removed, 0 recycled; write=1.734 s, sync=0.005 s, total=1.742 s; sync files=64, longest=0.002 s, average=0.001 s; distance=105231 kB, estimate=105231 kB; lsn=0/7E50C38, redo lsn=0/7E50C38
+2026-10-15 01:15:51.162 PDT [22377] LOG:  database system is shut down
