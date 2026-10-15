@@ -972,8 +972,38 @@ later appends or estimate heap usage. The catalog remains append-only and uncomp
 Public library constructors `Engine::new` and `Engine::new_with_config` are async and return
 `Result<Engine>`. They check store bindings across every catalog page before creating engine tasks
 or exposing readiness/control operations; `boot_library` delegates to the same path. They do not
-restore or validate nonbinding records. A failed or cancelled
+restore or validate lifecycle records or checkpoints. Library replay begins at the start of the log;
+only this process's durable checkpoints advance its retention boundary. A failed or cancelled
 validation leaves no engine running. Postgres construction remains waiting for its boot validation.
+
+Postgres boot binds HTTP before catalog restore. Shape/aggregate creation, dormant reactivation and
+guarded reads refuse work until the engine is active; native create returns `503` with
+`{"error":"engine is not the active ready writer; retry"}` and `Retry-After: 1`. Readiness probes
+alone cannot prevent early traffic. Restore installs the replay position and its paired
+de-duplication highwater under the same state lock used to spawn the sequencer. An existing reader
+started at a different checkpoint triggers a source restart (standalone exit `75`): reseating it
+would require reconciling effects and pending work it may already have produced. Boot classifies
+the typed mismatch as `RestartRequested`, so it cannot race the host's exit `75` with a fatal exit `78`.
+A reader whose original start pair matches, even if it has since advanced, continues through the
+existing pause/register/resume handshake. The restart check compares spawn coordinates, not its
+current processed cursor.
+
+In Postgres mode the catalog writer starts with an unknown floor. Successful catalog reads establish the floor before
+restore work, including an empty catalog's `(changes/0@-1, None)` floor. An `Offset` before that point
+is refused before any storage append and requests a restart; it cannot hold a retry lock ahead of
+floor adoption. Every subsequent `Offset` is checked at dequeue against the durable position/highwater
+pair. A lower position, or an equal position with a lower/missing highwater, logs an error and is
+not appended. Equal pairs and advancing highwaters remain valid. Floor seeding is serialized with
+checkpoint validation and append/retry. Library mode does not adopt or enforce this floor.
+A sequencer that never completed a read emits no shutdown
+checkpoint. When folding an older catalog, a regressing offset logs an error with both positions;
+the last offset/highwater pair remains authoritative. This diagnoses existing corruption without
+guessing a repair: a checkpoint naming a missing segment still refuses boot.
+
+Fatal engine conditions request shutdown/restart from their host; library code never calls
+`process::exit`. Supervised sources notify their owner and leave other sources serving. The
+standalone binary watches `ShutdownToken::wait_for_restart` and exits with the requested code,
+including requests made before the listener starts or during ordinary shutdown.
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
 client-materialized set equals the oracle's `SELECT … WHERE <predicate>`* — through the real API,

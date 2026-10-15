@@ -315,6 +315,8 @@ pub const EXIT_CONFIG: i32 = 78;
 /// What the boot should do about a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootFailure {
+    /// Boot found unsafe running state: the host must restart the engine (standalone exit 75).
+    RestartRequested,
     /// Nothing the engine can do will change the answer: exit [`EXIT_CONFIG`] with a named message.
     Fatal,
     /// The condition may clear on its own (Postgres not up yet, DNS, a refused connection, a
@@ -418,11 +420,15 @@ pub fn failure_of(e: &tokio_postgres::Error) -> PgFailure<'_> {
 
 /// What the boot should do about an `anyhow` error from the Postgres setup path.
 ///
-/// Anything that is **not** a Postgres failure — an unusable `ELECTRIC_CIRCUITS_PG_TABLES` entry, a
+/// A restore mismatch requests a restart. Otherwise, anything that is **not** a Postgres failure —
+/// an unusable `ELECTRIC_CIRCUITS_PG_TABLES` entry, a
 /// publication with a column list, a `wal_level` that is not `logical`, a durable catalog the engine
 /// could not read — is fatal: those are the strictness refusals the engine already refused to boot
 /// past, and none of them changes by waiting.
 pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
+    if e.chain().any(|cause| cause.downcast_ref::<crate::engine::CatalogRestoreMismatch>().is_some()) {
+        return BootFailure::RestartRequested;
+    }
     // A managed standby is a successful observation, not a bad configuration. It remains alive
     // and polls the ownership row so that a later exact promotion can take effect.
     if e.chain().any(|cause| cause.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()) {

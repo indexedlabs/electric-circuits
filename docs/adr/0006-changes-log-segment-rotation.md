@@ -42,6 +42,17 @@ restored position names a segment storage does not have refuses to start rather 
 A reader leaving a closed segment steps to exactly the next one, never to the first open one: the
 segments in between are unread changes.
 
+In Postgres mode the writer rejects any `Offset` below its restored/last durable position/highwater pair, logging both.
+Before that floor is known it refuses checkpoint appends and requests a restart, so a stale writer
+cannot append while boot is still reading the catalog. It checks at dequeue, and serializes boot
+floor seeding with checkpoint appends; queued periodic or shutdown checkpoints cannot move the floor
+backwards. Equal positions may only preserve or advance their paired de-duplication highwater.
+Library mode does not adopt or enforce an old checkpoint floor: it replays from the start, and
+retention follows only this process's durable checkpoints.
+Folding an old catalog logs an error for a regressing offset but preserves
+the last position/highwater pair: choosing an earlier record would be an unproven repair. A missing
+resume segment therefore still refuses boot.
+
 The same rules apply to a supported external reader: it drops `__circuits.control` by type, holds
 until `last`, deduplicates by `(lsn, seq)`, and crosses only after the closed segment is drained.
 Its checkpoint also includes the immutable query generation returned by `GET /changes/position`; it

@@ -200,6 +200,14 @@ async fn main() -> Result<()> {
 
     // The Engine owns its meter provider, registry and cardinality sampler.
     let shutdown = engine.shutdown_token();
+    // Process exit belongs to this standalone host, never to the Engine library. A fatal
+    // request can predate listener setup or arrive during graceful shutdown.
+    let restart = shutdown.clone();
+    tokio::spawn(async move {
+        let code = restart.wait_for_restart().await;
+        std::io::stderr().flush().ok();
+        std::process::exit(code);
+    });
     electric_circuits_engine::mem::spawn_memory_logger(
         engine.clone(),
         config.memory_log_period,
@@ -313,8 +321,14 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
             Ok(()) => return true,
             Err(e) => e,
         };
-        if pg::boot_disposition(&err) == pg::BootFailure::Fatal {
-            refuse_boot(pg::boot_failure_name(&err), &err);
+        match pg::boot_disposition(&err) {
+            pg::BootFailure::RestartRequested => {
+                tracing::error!("boot: restart requested: {err:#}; exiting 75");
+                std::io::stderr().flush().ok();
+                std::process::exit(75);
+            }
+            pg::BootFailure::Fatal => refuse_boot(pg::boot_failure_name(&err), &err),
+            pg::BootFailure::Retryable => {}
         }
         // Back to `waiting`: the attempt left the phase wherever it failed (`starting`, if it got
         // as far as connecting), and reporting `starting` for the whole backoff would tell an
