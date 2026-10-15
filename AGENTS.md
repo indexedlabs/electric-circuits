@@ -583,8 +583,9 @@ canvas update, screenshot.
   the catalog, not the in-memory position) is past it and no shape pins it — a dormant shape pinning
   past `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted first, a reactivating one is never evicted
   mid-replay, and the plan is recomputed after the evictions so a skipped one cannot license a
-  delete. The current segment is never deleted, and a boot whose restored position names a missing
-  segment refuses to start.
+  delete. The current segment is never deleted, and a boot refuses to start (exit 78) when any segment
+  from its restored position through the current one is missing; a live read that later finds its
+  segment gone requests a restart (exit 75), and that boot re-checks the chain.
 - **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
   purge, eviction, drop-at-restore, schema drift, the degraded subquery reap. The close releases a tailing
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
