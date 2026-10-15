@@ -1,3 +1,5 @@
+// Inherited control / characterization of #28's boot refusal and the no-regression invariant.
+// This passes without PR #34's defense-in-depth guards; their genuine-red evidence is in Rust.
 // Restart under client traffic, with restore held at a real storage HEAD. No sleeps or
 // production test hooks: the proxy releases restore only after the boot requests complete.
 import { createServer, request } from 'node:http'
@@ -94,7 +96,7 @@ const schema: Schema = {
   tables: { items: { columns: { id: { type: 'int' }, n: { type: 'int' } }, primaryKey: 'id' } },
 }
 
-it('restart refuses boot traffic, resumes a retained segment, drains, and never regresses its checkpoint', async () => {
+it('characterizes #28: restart refuses boot traffic, drains, and preserves its checkpoint', async () => {
   let h: Harness | undefined
   let gate: Awaited<ReturnType<typeof restoreGate>> | undefined
   try {

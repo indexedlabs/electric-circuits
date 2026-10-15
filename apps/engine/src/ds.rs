@@ -2288,12 +2288,14 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct BodyGate {
         pub arrived: std::sync::atomic::AtomicUsize,
+        pub entered: tokio::sync::Notify,
         pub released: tokio::sync::Notify,
     }
 
     impl BodyGate {
         async fn hold(&self) {
             self.arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
             self.released.notified().await;
         }
     }

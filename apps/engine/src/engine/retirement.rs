@@ -346,7 +346,7 @@ mod tests {
         server.fail_deletes(2);
         let shutdown = crate::shutdown::ShutdownToken::new();
         let ds = DsClient::new_for_in_process_test(server.url());
-        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone(), None);
         let q = spawn_retirement_queue(ds, catalog.clone(), shutdown);
         q.enqueue("shape/s1", Some("s1"));
         assert_eq!(q.pending(), 1);
@@ -373,7 +373,7 @@ mod tests {
         let server = FakeDs::start().await;
         let shutdown = crate::shutdown::ShutdownToken::new();
         let ds = DsClient::new_for_in_process_test(server.url());
-        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone(), None);
         let q = spawn_retirement_queue(ds, catalog.clone(), shutdown);
         q.enqueue("shape/s9", None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -392,7 +392,7 @@ mod tests {
         server.fail_deletes(10);
         let shutdown = crate::shutdown::ShutdownToken::new();
         let ds = DsClient::new_for_in_process_test(server.url());
-        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let catalog = spawn_catalog_writer(ds.clone(), shutdown.clone(), None);
         let queue = spawn_retirement_queue(ds, catalog, shutdown.clone());
         let completion = RetirementCompletion::new();
         queue.enqueue_with_completion("shape/blocked", Some("blocked"), Some(completion.clone()));

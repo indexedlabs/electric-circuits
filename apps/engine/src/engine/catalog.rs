@@ -237,6 +237,8 @@ struct CatalogSend {
     done: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
+pub(super) type CatalogCheckpoint = (LogPosition, Option<(u64, u64)>);
+
 /// The catalog writer's ordered channel, plus the count of events sent but not yet appended.
 ///
 /// The counter exists for one caller: the circuit-tier drift path exits the process, and it must
@@ -266,7 +268,7 @@ pub(crate) struct CatalogWriter {
     /// checkpoint is an async append. Deleting on the in-memory position would let a sweep delete
     /// segment `n` while the durable checkpoint still says `(n, X)` — and a crash in that window
     /// leaves a boot resuming inside a stream that no longer exists.
-    durable: Arc<std::sync::Mutex<Option<LogPosition>>>,
+    durable: Arc<std::sync::Mutex<Option<CatalogCheckpoint>>>,
     /// Serializes boot's floor adoption with checkpoint appends. Only the catalog writer and
     /// boot acquire it; no state lock is held while waiting, and ordinary lifecycle events do not.
     checkpoint_gate: Arc<tokio::sync::Mutex<()>>,
@@ -366,16 +368,17 @@ impl CatalogWriter {
 
     /// The last change-log position whose `Offset` checkpoint is durable (see [`Self::durable`]).
     pub(crate) fn durable_offset(&self) -> Option<LogPosition> {
-        self.durable.lock().unwrap().clone()
+        self.durable.lock().unwrap().as_ref().map(|(pos, _)| pos.clone())
     }
 
     /// Adopt the checkpoint the boot restored from the catalog: it is by definition already durable,
     /// and without it nothing could be deleted until this process wrote its first checkpoint.
-    pub(crate) async fn seed_durable_offset(&self, pos: LogPosition) {
+    pub(crate) async fn seed_durable_offset(&self, pos: LogPosition, highwater: Option<(u64, u64)>) {
         let _checkpoint = self.checkpoint_gate.lock().await;
+        let checkpoint = (pos, highwater);
         let mut g = self.durable.lock().unwrap();
-        if g.as_ref().is_none_or(|cur| *cur < pos) {
-            *g = Some(pos);
+        if g.as_ref().is_none_or(|cur| *cur < checkpoint) {
+            *g = Some(checkpoint);
         }
     }
 
@@ -403,11 +406,15 @@ impl CatalogWriter {
 /// record disagree has no honest way to continue. The retry loop is bounded in practice by the
 /// shutdown grace: while it is retrying the writer registers a `catalog writer` shutdown party, so
 /// a `SIGTERM` during an outage exits 70 NAMING it rather than looking like a mystery hang.
-pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::ShutdownToken) -> CatalogWriter {
+pub(crate) fn spawn_catalog_writer(
+    ds: DsClient,
+    shutdown: crate::shutdown::ShutdownToken,
+    initial_checkpoint: Option<CatalogCheckpoint>,
+) -> CatalogWriter {
     let (tx, mut rx) = mpsc::unbounded_channel::<CatalogSend>();
     let in_flight = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let counter = in_flight.clone();
-    let durable: Arc<std::sync::Mutex<Option<LogPosition>>> = Arc::new(std::sync::Mutex::new(None));
+    let durable = Arc::new(std::sync::Mutex::new(initial_checkpoint));
     let landed = durable.clone();
     let checkpoint_gate = Arc::new(tokio::sync::Mutex::new(()));
     let writer_checkpoint_gate = checkpoint_gate.clone();
@@ -427,7 +434,7 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
             // position a restart would resume from, and treating it as one would license deleting
             // the segment underneath it.
             let checkpoint = match &ev {
-                CatalogEvent::Offset { pos, .. } => Some(pos.clone()),
+                CatalogEvent::Offset { pos, highwater } => Some((pos.clone(), *highwater)),
                 _ => None,
             };
             // Check at dequeue, not enqueue: earlier queued offsets may have advanced the floor.
@@ -436,10 +443,18 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
             // a storage outage; no engine-state lock is held across these storage waits.
             let _checkpoint_guard = if checkpoint.is_some() { Some(writer_checkpoint_gate.lock().await) } else { None };
             let floor = landed.lock().unwrap().clone();
-            if let (Some(pos), Some(floor)) = (&checkpoint, floor)
-                && *pos < floor
+            if checkpoint.is_some() && floor.is_none() {
+                // There may already be a newer checkpoint in storage. Never start an append or
+                // retry until boot has established that floor. A premature sequencer is an
+                // invariant failure: stop this writer/source and leave all durability waits failed.
+                tracing::error!(?checkpoint, "refusing catalog checkpoint before its durable floor is established");
+                shutdown.restart_or_exit(75);
+                return;
+            }
+            if let (Some(checkpoint), Some(floor)) = (&checkpoint, floor)
+                && *checkpoint < floor
             {
-                tracing::error!(checkpoint = %pos, durable_floor = %floor, "refusing regressing catalog checkpoint");
+                tracing::error!(?checkpoint, durable_floor = ?floor, "refusing regressing catalog checkpoint");
                 // Its durability barrier is already covered by the newer floor. Account for
                 // this no-op so drains and later client-facing lifecycle barriers still finish.
                 writer_landed_seq.store(seq, Ordering::SeqCst);
@@ -517,10 +532,10 @@ pub(crate) fn spawn_catalog_writer(ds: DsClient, shutdown: crate::shutdown::Shut
                     },
                 }
             }
-            if let Some(pos) = checkpoint {
+            if let Some(checkpoint) = checkpoint {
                 let mut g = landed.lock().unwrap();
-                if g.as_ref().is_none_or(|cur| *cur < pos) {
-                    *g = Some(pos);
+                if g.as_ref().is_none_or(|cur| *cur < checkpoint) {
+                    *g = Some(checkpoint);
                 }
             }
             writer_landed_seq.store(seq, Ordering::SeqCst);
@@ -1082,9 +1097,10 @@ impl CatalogFold {
                 self.pending_retire.remove(&id);
             }
             CatalogEvent::Offset { pos, highwater } => {
-                if pos < self.start_pos {
+                if (&pos, highwater) < (&self.start_pos, self.start_highwater) {
                     tracing::error!(
                         previous = %self.start_pos, checkpoint = %pos,
+                        previous_highwater = ?self.start_highwater, checkpoint_highwater = ?highwater,
                         "catalog checkpoint regressed; preserving the last recorded position for boot validation"
                     );
                 }
@@ -1262,6 +1278,9 @@ impl Engine {
     /// No shapes are installed — see [`Self::apply_catalog`] for that half.
     pub(crate) async fn fold_catalog(&self) -> Result<CatalogFold> {
         let (fold, bytes) = Self::read_catalog(&self.ds, self.store_bound.get()).await?;
+        // Establish admission before any later boot work can spawn a reader, including the
+        // empty-catalog and epoch-reset paths that do not install shape records.
+        self.catalog_tx.seed_durable_offset(fold.start_pos(), fold.start_highwater).await;
         // One entry per witnessed table; retained names are bounded by configuration,
         // not catalog length/DDL count. Empty entries remember witnesses after opt-out.
         let seen = fold
@@ -1281,19 +1300,36 @@ impl Engine {
         Ok(fold)
     }
 
-    // Library mode never restores catalog state: retain only the binding check and byte count.
+    // Library mode never restores lifecycle state. Retain the checkpoint floor while scanning
+    // bindings so its first checkpoint cannot erase an earlier process's durable frontier.
     // No background task/control surface exists if this read fails or is cancelled.
     pub(super) async fn check_catalog_binding(
         ds: &DsClient,
         expected: &crate::store_identity::StoreBound,
-    ) -> Result<u64> {
+    ) -> Result<(u64, Option<CatalogCheckpoint>)> {
         let mut binding = StoreBindingCheck::new(expected);
-        let bytes = visit_catalog_pages(ds, |page| binding.observe_page(&page))
-            .await
-            .context("reading catalog for store binding")?;
+        let mut checkpoint = Some((LogPosition::start(), None));
+        let bytes = visit_catalog_pages(ds, |page| {
+            binding.observe_page(&page);
+            for event in &page {
+                if event["t"] == "offset" {
+                    checkpoint = match (checkpoint.take(), serde_json::from_value(event.clone())) {
+                        // A delayed retry of an older event cannot lower the write floor. Keeping
+                        // the greatest observed pair costs constant space and does not rewrite the
+                        // catalog or select a different replay position (library mode restores none).
+                        (Some(floor), Ok(CatalogEvent::Offset { pos, highwater })) => Some(floor.max((pos, highwater))),
+                        // Preserve binding-only admission of legacy/nonbinding records. An
+                        // uninterpretable checkpoint cannot authorize subsequent checkpoint writes.
+                        _ => None,
+                    };
+                }
+            }
+        })
+        .await
+        .context("reading catalog for store binding")?;
         binding.finish().context("catalog store binding validation")?;
         tracing::info!(catalog_bytes = bytes, "catalog binding check complete");
-        Ok(bytes)
+        Ok((bytes, checkpoint))
     }
 
     pub(super) async fn read_catalog(
@@ -1446,6 +1482,7 @@ impl Engine {
         compiled: &HashMap<TableRef, TableSchema>,
         mode: RestoreMode,
     ) -> Result<()> {
+        self.catalog_tx.seed_durable_offset(fold.start_pos(), fold.start_highwater).await;
         if mode == RestoreMode::Resume {
             self.reconcile_ingest_columns(&mut fold, compiled).await?;
         }
@@ -1536,9 +1573,7 @@ impl Engine {
         let CatalogFold { recs, start_pos, start_highwater, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
-        // The restored checkpoint IS durable (it was read back out of the log), so it is the
-        // segment-deletion floor from boot rather than from this process's first checkpoint.
-        self.catalog_tx.seed_durable_offset(start_pos.clone()).await;
+        // The durable floor was adopted before any restore work, including the empty fast path.
         {
             // Share ensure_sequencer's lock: checking the existing reader and installing both
             // cursor halves must be atomic with spawning it. Reseating a reader that may already
@@ -2167,7 +2202,7 @@ mod tests {
         assert!(engine.catalog_tx.drain(OTTO_5492_DEADLINE).await, "final catalog writes must land");
     }
 
-    /// Persist a dormant shape and the incident's checkpoint through the actual catalog writer.
+    /// Prepopulate a previous process's dormant shape and checkpoint directly in storage.
     /// The dormant record keeps this test independent of snapshot SQL and boot replay backfills.
     async fn otto_5492_saved_catalog(engine: &Engine) -> CatalogFold {
         let saved = pos(270, "0000000000000000_0000000529873332");
@@ -2175,7 +2210,7 @@ mod tests {
         // Leave s1 available to the racing request, so an ID collision cannot hide the cursor bug.
         created["rec"]["id"] = serde_json::json!("s99");
         created["rec"]["stream_path"] = serde_json::json!("shape/s99");
-        for event in [
+        for (n, event) in [
             serde_json::from_value::<CatalogEvent>(created).unwrap(),
             CatalogEvent::Dormant {
                 id: "s99".into(),
@@ -2184,8 +2219,11 @@ mod tests {
             },
             CatalogEvent::ChangesRotated { segment: 270, at: crate::changelog::now_secs() },
             CatalogEvent::Offset { pos: saved.clone(), highwater: Some((0x10, 2)) },
-        ] {
-            engine.catalog_tx.send_durable(event).await.unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            engine.ds.append_json(CATALOG_STREAM, &[catalog_event(&format!("fixture-{n}"), event)]).await.unwrap();
         }
         let fold = engine.fold_catalog().await.expect("read the saved catalog through storage");
         assert_eq!(fold.start_pos(), saved, "fixture must contain the incident's saved checkpoint");
@@ -2276,7 +2314,7 @@ mod tests {
         let engine =
             Engine::new_for_in_process_test(DsClient::with_test_store("scripted://boot-race".into(), store.clone()));
         let floor = pos(1080, "0000000000000000_0000001015737962");
-        engine.catalog_tx.seed_durable_offset(floor.clone()).await;
+        engine.catalog_tx.seed_durable_offset(floor.clone(), None).await;
         // Same enqueue path as periodic sequencer checkpoints, including a same-segment rewind.
         for p in [LogPosition::start(), pos(1080, "-1"), floor.clone(), pos(1081, "-1"), floor.clone()] {
             engine.catalog_tx.send(CatalogEvent::Offset { pos: p, highwater: Some((0x10, 2)) });
@@ -2314,7 +2352,7 @@ mod tests {
             .finish();
         let _logs = tracing::subscriber::set_default(subscriber);
         let floor = pos(1080, "0000000000000000_0000001015737962");
-        for regressed in [LogPosition::start(), pos(1080, "-1")] {
+        for regressed in [LogPosition::start(), pos(1080, "-1"), floor.clone()] {
             output.0.lock().unwrap().clear();
             let mut fold = fold_of(vec![
                 CatalogEvent::Offset { pos: floor.clone(), highwater: Some((8241725836464, 3)) },
@@ -2336,6 +2374,126 @@ mod tests {
                 "diagnostic must identify both checkpoints: {logs}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn review_1_unseeded_writer_cannot_append_before_floor_adoption() {
+        let (store, _reads) = boot_race_store();
+        let ds = DsClient::with_test_store("scripted://unseeded-writer".into(), store.clone());
+        let floor = pos(1080, "0000000000000000_0000001015737962");
+        let highwater = Some((8241725836464, 3));
+        // Existing durable history, written by a PREVIOUS writer. The fresh writer knows nothing
+        // about it yet; unlike the original regression fixture, no write can seed its floor.
+        ds.append_json(
+            CATALOG_STREAM,
+            &[catalog_event("previous-process", CatalogEvent::Offset { pos: floor.clone(), highwater })],
+        )
+        .await
+        .unwrap();
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.catalog_event_gate.lock().unwrap() = Some(("offset".into(), gate.clone()));
+        let shutdown = crate::shutdown::ShutdownToken::with_supervisor(Some(Arc::new(tokio::sync::Notify::new())));
+        let writer = spawn_catalog_writer(ds.clone(), shutdown.clone(), None);
+        writer.send(CatalogEvent::Offset { pos: LogPosition::start(), highwater: None });
+        tokio::time::timeout(OTTO_5492_DEADLINE, async {
+            tokio::select! {
+                // Broken writer: the stale append is already in storage's hands.
+                _ = gate.entered.notified() => {},
+                // Correct refusal: fail closed without handing the append to storage.
+                _ = shutdown.wait() => {},
+            }
+        })
+        .await
+        .expect("checkpoint must either reach the held append or be refused");
+        // Start floor adoption only AFTER the writer has attempted the stale checkpoint.
+        let adoption = writer.seed_durable_offset(floor.clone(), highwater);
+        tokio::pin!(adoption);
+        let adopted = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(adoption.as_mut(), cx).is_ready())
+        })
+        .await;
+        gate.released.notify_one();
+        if !adopted {
+            tokio::time::timeout(OTTO_5492_DEADLINE, adoption).await.unwrap();
+        }
+        // Read after an ordered barrier (or terminal refusal); do not depend on a sleep.
+        tokio::time::timeout(OTTO_5492_DEADLINE, writer.wait_durable()).await.unwrap().ok();
+        let (fold, _) = Engine::read_catalog(&ds, None).await.unwrap();
+        shutdown.begin();
+        assert_eq!(fold.start_pos(), floor, "an unseeded writer must not overwrite the existing durable checkpoint");
+        assert_eq!(fold.start_highwater, highwater);
+        assert_eq!(gate.arrived.load(Ordering::SeqCst), 0, "no checkpoint append before floor adoption");
+    }
+
+    #[tokio::test]
+    async fn review_1_equal_position_cannot_lose_the_durable_highwater() {
+        let (store, _reads) = boot_race_store();
+        let ds = DsClient::with_test_store("scripted://highwater-floor".into(), store.clone());
+        let engine = Engine::new_for_in_process_test(ds.clone());
+        let floor = pos(1080, "0000000000000000_0000001015737962");
+        let highwater = Some((8241725836464, 3));
+        engine.catalog_tx.seed_durable_offset(floor.clone(), highwater).await;
+        engine.catalog_tx.send_durable(CatalogEvent::Offset { pos: floor.clone(), highwater }).await.unwrap();
+        // Equal-position checkpoints may advance a completed chunk prefix, never erase it.
+        for highwater in [Some((8241725836464, 2)), Some((8241725836463, 99)), None] {
+            engine.catalog_tx.send(CatalogEvent::Offset { pos: floor.clone(), highwater });
+        }
+        tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
+        let (fold, _) = Engine::read_catalog(&ds, None).await.unwrap();
+        otto_5492_stop(&engine).await;
+        assert_eq!(fold.start_pos(), floor);
+        assert_eq!(fold.start_highwater, highwater, "equal offsets must preserve the durable de-duplication frontier");
+        assert_eq!(boot_race_events(&store).len(), 1, "only the original checkpoint may be appended");
+    }
+
+    #[tokio::test]
+    async fn review_1_library_construction_adopts_the_existing_checkpoint_pair() {
+        for configured in [false, true] {
+            let (store, _reads) = boot_race_store();
+            let ds = DsClient::with_test_store("scripted://library-floor".into(), store);
+            let admission = Engine::admit_store(ds.clone(), expected_store_bound(), true).await.unwrap();
+            let floor = pos(1080, "0000000000000000_0000001015737962");
+            let highwater = Some((8241725836464, 3));
+            ds.append_json(
+                CATALOG_STREAM,
+                &[catalog_event("old-writer", CatalogEvent::Offset { pos: floor.clone(), highwater })],
+            )
+            .await
+            .unwrap();
+            let engine = if configured {
+                let config = crate::config::Config::resolve(|_| None).unwrap();
+                Engine::boot_library(admission, &config).await.unwrap()
+            } else {
+                Engine::new(admission).await.unwrap()
+            };
+            // Even the FIRST write must preserve the restored highwater at an equal position.
+            engine.catalog_tx.send(CatalogEvent::Offset { pos: floor.clone(), highwater: None });
+            tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
+            let (fold, _) = Engine::read_catalog(&ds, None).await.unwrap();
+            otto_5492_stop(&engine).await;
+            assert_eq!((fold.start_pos(), fold.start_highwater), (floor, highwater), "configured={configured}");
+        }
+    }
+
+    #[tokio::test]
+    async fn review_1_library_floor_does_not_rewind_on_a_retried_checkpoint() {
+        let (store, _reads) = boot_race_store();
+        let ds = DsClient::with_test_store("scripted://retried-floor".into(), store);
+        let admission = Engine::admit_store(ds.clone(), expected_store_bound(), true).await.unwrap();
+        let floor = pos(1080, "tail");
+        let earlier = catalog_event("earlier", CatalogEvent::Offset { pos: floor.clone(), highwater: Some((42, 3)) });
+        let later = catalog_event("later", CatalogEvent::Offset { pos: floor.clone(), highwater: Some((42, 4)) });
+        ds.append_json(CATALOG_STREAM, &[earlier.clone(), later, earlier]).await.unwrap();
+        let engine = Engine::new(admission).await.unwrap();
+        engine.catalog_tx.send(CatalogEvent::Offset { pos: floor.clone(), highwater: Some((42, 3)) });
+        tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
+        let (fold, _) = Engine::read_catalog(&ds, None).await.unwrap();
+        otto_5492_stop(&engine).await;
+        assert_eq!(
+            (fold.start_pos(), fold.start_highwater),
+            (floor, Some((42, 4))),
+            "a retried event cannot lower the floor"
+        );
     }
 
     #[tokio::test]
@@ -3456,6 +3614,7 @@ mod tests {
         let w = spawn_catalog_writer(
             DsClient::new_for_in_process_test(server.url()),
             crate::shutdown::ShutdownToken::new(),
+            None,
         );
         w.send(joined("s1", "sub-a", 100));
         w.send(left("s1", "sub-a"));
@@ -3476,6 +3635,7 @@ mod tests {
         let w = spawn_catalog_writer(
             DsClient::new_for_in_process_test(server.url()),
             crate::shutdown::ShutdownToken::new(),
+            None,
         );
         let landed = w.send_durable(joined("s1", "sub-a", 100));
         tokio::pin!(landed);
@@ -3716,6 +3876,7 @@ mod tests {
         let w = spawn_catalog_writer(
             DsClient::new_for_in_process_test(server.url()),
             crate::shutdown::ShutdownToken::new(),
+            None,
         );
         server.lose_responses(1);
         w.send(joined("s1", "sub-b", 200));
@@ -3745,6 +3906,7 @@ mod tests {
         let w = spawn_catalog_writer(
             DsClient::new_for_in_process_test(server.url()),
             crate::shutdown::ShutdownToken::new(),
+            None,
         );
         w.send(joined("s1", "sub-b", 200));
         w.send(joined("s1", "sub-c", 200));
@@ -4009,8 +4171,12 @@ mod tests {
             },
             CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
         ]);
-        let server = FakeDs::start().await;
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let (store, _reads) = boot_race_store();
+        let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://dead-reader".into(), store));
+        // This fixture tests a dead pause/resume handshake, not a reader spawned at the wrong
+        // checkpoint. Match the original start pair before terminating the task.
+        *engine.seq_start.lock().unwrap() = fold.start_pos();
+        *engine.seq_highwater.lock().unwrap() = fold.start_highwater;
         let cmd = {
             let mut st = engine.state.lock().await;
             engine.ensure_sequencer(&mut st).cmd_tx.clone()

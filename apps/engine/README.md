@@ -407,6 +407,13 @@ the restored sequencer position even when service discovery sends traffic before
 `POST /schema` is library-only and returns `400` in Postgres mode. If restore finds a sequencer
 already started at a different position or de-duplication highwater, it requests a source restart
 (standalone exit `75`) instead of continuing with the wrong reader.
+The comparison is against the reader's original start pair. A matching reader that has since
+advanced still follows the existing pause/register/resume handshake.
+
+Checkpoint writes are refused until the catalog's position/highwater floor is known. Writing an
+offset before floor adoption requests a restart without issuing an append. At an equal position,
+a lower or missing highwater is also rejected. Library hosts receive shutdown/restart requests;
+only the standalone binary turns a request into process exit. Supervised sources notify their owner.
 
 `/health` deliberately never fails for any of that. A kubelet restarts a pod whose *liveness* probe
 fails, and neither "Postgres is not up yet" nor "the epoch is broken and an operator must post

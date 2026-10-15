@@ -200,6 +200,14 @@ async fn main() -> Result<()> {
 
     // The Engine owns its meter provider, registry and cardinality sampler.
     let shutdown = engine.shutdown_token();
+    // Process exit belongs to this standalone host, never to the Engine library. A fatal
+    // request can predate listener setup or arrive during graceful shutdown.
+    let restart = shutdown.clone();
+    tokio::spawn(async move {
+        let code = restart.wait_for_restart().await;
+        std::io::stderr().flush().ok();
+        std::process::exit(code);
+    });
     electric_circuits_engine::mem::spawn_memory_logger(
         engine.clone(),
         config.memory_log_period,

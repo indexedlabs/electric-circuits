@@ -3034,7 +3034,7 @@ mod held_spill_tests {
             .send_durable(CatalogEvent::Offset { pos: floor.clone(), highwater: Some((0x10, 2)) })
             .await
             .unwrap();
-        h.engine.catalog_tx.seed_durable_offset(floor.clone()).await;
+        h.engine.catalog_tx.seed_durable_offset(floor.clone(), Some((0x10, 2))).await;
         // A completed stale read defeats the older unread-shutdown guard. Exercise the actual
         // sequencer final checkpoint and catalog writer, not just monotonic in-memory tracking.
         h.page("-1", "p1", vec![]).await;
