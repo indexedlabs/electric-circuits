@@ -104,3 +104,16 @@ python3 -B scripts/lab/rolling_contract.py --engine .agent/bin/electric-circuits
 ```
 
 The first command exercises the local prototype; the second deliberately reproduces the two known-red provider contracts. Both may refuse to start if the conservative disk headroom is unavailable. No production rollout is authorized or implied.
+
+## Final disk-stop update
+
+The last handoff check showed **11 GiB free**, below the brief's floor, after the lab had already stopped all processes and removed its large build/data directories. Immediately stopped further checks and deleted the remaining task-owned `.agent/bin/` binaries and `.agent/evidence/` source exports (about 130 MB), plus empty fixture/temp directories. No unrelated data was touched. The committed source, report and raw evidence remain.
+
+This supersedes Milestone 8's statement that replay binaries/exports remain: the two “Replay now” commands require rebuilding the engine/test executable first, after disk headroom is restored. The ordinary Cargo command is documented in `scripts/lab/README.md`. All measured results and hashes remain retained; no additional lab run began after the below-floor observation.
+
+Final filesystem reading after own-data cleanup:
+
+```text
+Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on
+/dev/disk3s1s1   926Gi    12Gi    10Gi    55%    459k  105M    0%   /
+```
