@@ -1,3 +1,0 @@
-{"at": 1792053387.60028, "kind": "spawn", "name": "ds", "pid": 39152, "argv": ["/Users/mh/.cargo/bin/durable-streams-server", "--host", "127.0.0.1", "--port", "60321", "--data-dir", "/Users/mh/labs/electric-circuits-wt-lab/.agent/lab-data/append-limit-20261015-013627/ds", "--durability", "wal"]}
-{"at": 1792053388.499136, "kind": "gate", "name": "ds-listening"}
-{"at": 1792053390.52156, "kind": "reaped", "name": "ds", "pid": 39152, "code": 0}
