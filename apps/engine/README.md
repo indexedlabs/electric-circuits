@@ -576,11 +576,15 @@ an operator should be seeing anyway.
 
 Until PostgreSQL setup and catalog restore finish, shape, aggregate, subset and resume requests
 are refused with HTTP 503. The native routes and Electric `/v1/shape` include `Retry-After: 1` so
-clients can retry after boot; requests cannot start replay from an unrestored cursor.
+clients can retry after boot or temporary managed-ownership admission; requests cannot start
+replay from an unrestored cursor. Terminal replay failure is a distinct 503 refusal with no
+`Retry-After`, in both managed and unmanaged deployments.
 
 If a required live change-log segment returns 404/410, the sequencer preserves its replay
-checkpoint, halts reads and reports degraded readiness. Commands and shutdown remain responsive;
-restart revalidates the catalog and required segments before serving again.
+checkpoint, halts reads, reports degraded readiness and refuses data requests until restart.
+Commands and graceful shutdown remain responsive. The lifetime counter
+`sequencer_stream_gone_failures_total` (`engine_sequencer_stream_gone_failures_total` in Prometheus)
+identifies this cause. Restart revalidates the catalog and required segments before serving again.
 
 A Postgres failure at boot is classified, not guessed at (`pg::classify`), and the two classes get
 opposite treatment.

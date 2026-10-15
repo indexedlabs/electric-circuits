@@ -4,7 +4,7 @@
 //! an engine outcome. The independent oracle is a primary-key map of scripted source writes.
 use super::*;
 use crate::ds::{AppendFault, BodyGate, ScriptedStore};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -74,15 +74,51 @@ fn assert_checkpoint_order(store: &ScriptedStore) {
     }
 }
 
+// Client acknowledgements, never reconstructed from the engine's registry or catalog fold.
+// One interrupted lifecycle request may have landed without its answer; only that exact
+// request is allowed either outcome. All previously acknowledged clients remain mandatory.
+#[derive(Clone)]
+struct Feed {
+    stream: String,
+    min_id: Option<u64>,
+    subscriptions: BTreeSet<String>,
+    active: bool,
+}
+
+#[derive(Clone)]
+enum PendingCall {
+    Create(String, Feed),
+    Release(String, String),
+    Purge(String),
+}
+
+#[derive(Clone, Default)]
+struct Oracle {
+    rows: Rows,
+    feeds: BTreeMap<String, Feed>,
+    removed: BTreeSet<String>,
+    pending: Option<PendingCall>,
+}
+
+impl Oracle {
+    fn pending_purge(&self, id: &str) -> bool {
+        matches!(&self.pending, Some(PendingCall::Purge(pending)) if pending == id)
+    }
+
+    fn retained_ids(&self) -> BTreeSet<String> {
+        self.feeds.keys().filter(|id| !self.pending_purge(id)).cloned().collect()
+    }
+}
+
 struct Run {
     engine: Engine,
     store: Arc<ScriptedStore>,
     reads: mpsc::UnboundedReceiver<(String, String, bool)>,
-    oracle: Arc<std::sync::Mutex<Rows>>,
+    oracle: Arc<std::sync::Mutex<Oracle>>,
 }
 
 impl Run {
-    async fn new(store: Arc<ScriptedStore>, oracle: Arc<std::sync::Mutex<Rows>>) -> Self {
+    async fn new(store: Arc<ScriptedStore>, oracle: Arc<std::sync::Mutex<Oracle>>) -> Self {
         let ds = DsClient::with_test_store("scripted://crash-consistency".into(), store.clone());
         let mut engine = Engine::new_for_in_process_test(ds);
         // Drive retention explicitly; no clock-dependent catalog records in a cut sweep.
@@ -102,6 +138,107 @@ impl Run {
         Self { engine, store, reads, oracle }
     }
 
+    async fn create(&self, id: &str, min_id: Option<u64>, share: bool) {
+        let subscription = format!("client-{id}");
+        let mut feed = Feed {
+            stream: format!("shape/{id}"),
+            min_id,
+            active: true,
+            subscriptions: if share { BTreeSet::from([subscription.clone()]) } else { BTreeSet::new() },
+        };
+        self.oracle.lock().unwrap().pending = Some(PendingCall::Create(id.into(), feed.clone()));
+        let predicate =
+            min_id.map(|id| serde_json::from_value(serde_json::json!({"col":"id","op":"gte","value":id})).unwrap());
+        let (record, claimed) = self
+            .engine
+            .create_shape_as(&"public.items".into(), predicate, None, false, share, Some(subscription.clone()))
+            .await
+            .unwrap();
+        assert_eq!(record.id, id);
+        assert_eq!(claimed, subscription);
+        feed.stream = record.stream_path;
+        let mut oracle = self.oracle.lock().unwrap();
+        oracle.feeds.insert(id.into(), feed);
+        oracle.pending = None;
+    }
+
+    async fn release(&self, id: &str) {
+        let subscription = self.oracle.lock().unwrap().feeds[id].subscriptions.first().unwrap().clone();
+        self.oracle.lock().unwrap().pending = Some(PendingCall::Release(id.into(), subscription.clone()));
+        self.engine.release_subscription_durable(id, Some(&subscription)).await.unwrap();
+        let mut oracle = self.oracle.lock().unwrap();
+        oracle.feeds.get_mut(id).unwrap().subscriptions.remove(&subscription);
+        oracle.pending = None;
+    }
+
+    async fn deactivate(&self, id: &str) {
+        self.engine.deactivate_shape(id).await.unwrap();
+        self.oracle.lock().unwrap().feeds.get_mut(id).unwrap().active = false;
+    }
+
+    async fn reactivate(&self, id: &str) {
+        bounded("reactivation", self.engine.ensure_active(id)).await.unwrap();
+        self.oracle.lock().unwrap().feeds.get_mut(id).unwrap().active = true;
+    }
+
+    async fn purge(&self, id: &str) {
+        self.oracle.lock().unwrap().pending = Some(PendingCall::Purge(id.into()));
+        self.engine.purge_shape_durable(id).await.unwrap();
+        let mut oracle = self.oracle.lock().unwrap();
+        oracle.feeds.remove(id);
+        oracle.removed.insert(id.into());
+        oracle.pending = None;
+    }
+
+    async fn check_clients(&self) {
+        let oracle = self.oracle.lock().unwrap().clone();
+        let required = oracle.retained_ids();
+        let mut allowed: BTreeSet<_> = oracle.feeds.keys().cloned().collect();
+        let mut feeds = oracle.feeds.clone();
+        if let Some(PendingCall::Create(id, feed)) = &oracle.pending {
+            allowed.insert(id.clone());
+            feeds.insert(id.clone(), feed.clone());
+        }
+        let state = self.engine.state.lock().await;
+        let actual: BTreeSet<_> = state.shapes.keys().cloned().collect();
+        assert!(required.is_subset(&actual), "lost acknowledged shapes: expected {required:?}, got {actual:?}");
+        assert!(actual.is_subset(&allowed), "unexpected restored shapes: allowed {allowed:?}, got {actual:?}");
+        assert!(oracle.removed.is_disjoint(&actual), "acknowledged removals resurrected: {:?}", oracle.removed);
+        let lives: BTreeSet<_> = self.engine.lives.lock().unwrap().keys().cloned().collect();
+        assert_eq!(lives, actual, "retained shapes must have lifecycle entries");
+        for (id, feed) in feeds {
+            if !actual.contains(&id) || oracle.pending_purge(&id) {
+                continue;
+            }
+            let subscriptions: BTreeSet<_> =
+                state.feed_shares.get(&id).map(|share| share.subs.keys().cloned().collect()).unwrap_or_default();
+            let mut after_pending = feed.subscriptions.clone();
+            if let Some(PendingCall::Release(shape, subscription)) = &oracle.pending
+                && shape == &id
+            {
+                after_pending.remove(subscription);
+            }
+            assert!(
+                subscriptions == feed.subscriptions || subscriptions == after_pending,
+                "lost acknowledged subscriptions for {id}: expected {:?}, got {subscriptions:?}",
+                feed.subscriptions
+            );
+        }
+    }
+
+    async fn probe_after_restart(&mut self) {
+        self.check_clients().await;
+        // Wake the independently expected feeds, not whatever restore happened to retain.
+        let retained = self.oracle.lock().unwrap().retained_ids();
+        for id in retained {
+            self.reactivate(&id).await;
+        }
+        self.drain().await;
+        self.check().await;
+        // A new row matching both predicates must arrive through every retained feed.
+        self.write(0x100, 42, Some("committed after restart")).await;
+    }
+
     async fn boot(&mut self) {
         let fold = self.engine.fold_catalog().await.expect("self-written catalog must decode");
         self.engine
@@ -110,6 +247,7 @@ impl Run {
             .expect("self-written checkpoint must name an existing segment");
         let compiled = self.engine.tables_shared.read().unwrap().clone();
         bounded("restore", self.engine.apply_catalog(fold, &compiled, RestoreMode::Resume)).await.unwrap();
+        self.check_clients().await;
     }
 
     async fn fresh(&mut self) {
@@ -140,7 +278,12 @@ impl Run {
         // Empty live reads park at the start sentinel; HEAD still reports the provider's zero tail.
         let offset = if offset == "0000000000000000_0000000000000000" { "-1".into() } else { offset };
         let target = LogPosition { segment: current, offset };
-        if self.engine.state.lock().await.sequencer.is_some() {
+        let sequencer_exists = self.engine.state.lock().await.sequencer.is_some();
+        assert!(
+            sequencer_exists || self.oracle.lock().unwrap().retained_ids().is_empty(),
+            "acknowledged feeds lost their sequencer"
+        );
+        if sequencer_exists {
             // A read at the new tail is issued only after the preceding page's output and
             // receipts complete. A command barrier alone can overtake an unread page.
             self.read_at(&target).await;
@@ -154,29 +297,28 @@ impl Run {
         assert_checkpoint_order(&self.store);
         let fold = self.engine.fold_catalog().await.unwrap();
         assert!(self.engine.ds.head(&fold.start_pos.path()).await.unwrap().is_some(), "checkpoint segment was deleted");
+        self.check_clients().await;
         let expected = self.oracle.lock().unwrap().clone();
-        let records: Vec<_> = self.engine.state.lock().await.shapes.values().cloned().collect();
-        for rec in records {
-            let active = self
-                .engine
-                .lives
-                .lock()
-                .unwrap()
-                .get(&rec.id)
-                .is_some_and(|life| matches!(life.state, LifeState::Active));
-            if active {
-                let wanted: Rows = expected
-                    .iter()
-                    .filter(|(_, row)| rec.id != "s2" || row["id"].as_i64().unwrap() >= 2)
-                    .map(|(key, row)| (key.clone(), row.clone()))
-                    .collect();
-                assert_eq!(materialize(&self.store, &rec.stream_path), wanted, "shape {} diverged", rec.id);
+        for (id, feed) in &expected.feeds {
+            if !feed.active || expected.pending_purge(id) {
+                continue;
             }
+            assert!(
+                self.engine.lives.lock().unwrap().get(id).is_some_and(|life| matches!(life.state, LifeState::Active)),
+                "expected active client {id} is not maintained"
+            );
+            let wanted: Rows = expected
+                .rows
+                .iter()
+                .filter(|(_, row)| feed.min_id.is_none_or(|min| row["id"].as_u64().unwrap() >= min))
+                .map(|(key, row)| (key.clone(), row.clone()))
+                .collect();
+            assert_eq!(materialize(&self.store, &feed.stream), wanted, "shape {id} diverged");
         }
     }
 
     async fn write(&mut self, lsn: u64, id: u64, value: Option<&str>) {
-        let old = self.oracle.lock().unwrap().get(&id.to_string()).cloned();
+        let old = self.oracle.lock().unwrap().rows.get(&id.to_string()).cloned();
         let row = value.map(|value| serde_json::json!({"id":id,"value":value}));
         let env = Envelope {
             type_: "public.items".into(),
@@ -201,9 +343,9 @@ impl Run {
         {
             let mut oracle = self.oracle.lock().unwrap();
             if let Some(row) = row {
-                oracle.insert(id.to_string(), row);
+                oracle.rows.insert(id.to_string(), row);
             } else {
-                oracle.remove(&id.to_string());
+                oracle.rows.remove(&id.to_string());
             }
         }
         self.drain().await;
@@ -238,18 +380,14 @@ impl Run {
 
 async fn workload(run: &mut Run) {
     run.fresh().await;
-    let table = TableRef::from("public.items");
-    let first = run.engine.create_shape(&table, None, None, false, true).await.unwrap();
-    assert_eq!(first.id, "s1");
+    run.create("s1", None, true).await;
     run.check().await;
-    let predicate = serde_json::from_value(serde_json::json!({"col":"id","op":"gte","value":2})).unwrap();
-    let second = run.engine.create_shape(&table, Some(predicate), None, false, true).await.unwrap();
-    assert_eq!(second.id, "s2");
+    run.create("s2", Some(2), true).await;
     run.check().await;
     run.write(0x10, 1, Some("one")).await;
     run.write(0x20, 2, Some("two")).await;
-    run.engine.release_subscription_durable("s2", None).await.unwrap();
-    run.engine.deactivate_shape("s2").await.unwrap();
+    run.release("s2").await;
+    run.deactivate("s2").await;
     assert!(matches!(run.engine.lives.lock().unwrap()["s2"].state, LifeState::Dormant { .. }));
     run.check().await;
     run.engine.changes.force_rotate().await;
@@ -263,7 +401,7 @@ async fn workload(run: &mut Run) {
     run.write(0x30, 2, Some("changed while dormant")).await;
     run.engine.sweep_change_log().await;
     assert!(run.engine.ds.head("changes/0").await.unwrap().is_some(), "dormant resume pins its segment");
-    bounded("reactivation", run.engine.ensure_active("s2")).await.unwrap();
+    run.reactivate("s2").await;
     run.check().await;
     run.engine.sweep_change_log().await;
     run.engine.catalog_tx.wait_durable().await.unwrap();
@@ -273,7 +411,7 @@ async fn workload(run: &mut Run) {
     );
     run.check().await;
     run.write(0x40, 1, None).await;
-    run.engine.purge_shape_durable("s2").await.unwrap();
+    run.purge("s2").await;
     run.check().await;
 }
 
@@ -314,7 +452,7 @@ async fn catalog_cut_sweep(graceful: bool) {
         let storage = store();
         let gate = Arc::new(BodyGate::default());
         *storage.append_fault.lock().unwrap() = Some((CATALOG_STREAM.into(), cut, AppendFault::Hold(gate.clone())));
-        let oracle = Arc::new(std::sync::Mutex::new(Rows::new()));
+        let oracle = Arc::new(std::sync::Mutex::new(Oracle::default()));
         let mut run = Run::new(storage.clone(), oracle.clone()).await;
         // Keep the request future local so cancellation and engine-task abortion are explicit.
         let mut work = Box::pin(workload(&mut run));
@@ -341,25 +479,7 @@ async fn catalog_cut_sweep(graceful: bool) {
         let mut restarted = Run::new(saved, oracle).await;
         bounded(&format!("restart after catalog append {cut}/{count}"), async {
             restarted.boot().await;
-            restarted.drain().await;
-            let dormant: Vec<_> = restarted
-                .engine
-                .lives
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, life)| matches!(life.state, LifeState::Dormant { .. }))
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in dormant {
-                restarted.engine.ensure_active(&id).await.unwrap_or_else(|error| {
-                    panic!(
-                        "cut {cut}/{count}, graceful={graceful}, resume {id}: {error:#}; catalog={:?}",
-                        events(&restarted.store, CATALOG_STREAM)
-                    )
-                });
-            }
-            restarted.check().await;
+            restarted.probe_after_restart().await;
             restarted.stop().await;
         })
         .await;
@@ -411,9 +531,9 @@ async fn crashsim_boot_requests_are_refused_at_each_phase() {
         let storage = store();
         let mut seed = Run::new(storage.clone(), Default::default()).await;
         seed.fresh().await;
-        seed.engine.create_shape(&"public.items".into(), None, None, false, true).await.unwrap();
-        seed.engine.release_subscription_durable("s1", None).await.unwrap();
-        seed.engine.deactivate_shape("s1").await.unwrap();
+        seed.create("s1", None, true).await;
+        seed.release("s1").await;
+        seed.deactivate("s1").await;
         seed.stop().await;
         let storage = retained(&storage);
         let mut run = Run::new(storage.clone(), Default::default()).await;
@@ -507,11 +627,11 @@ async fn crashsim_held_over_cap_survives_restart_and_drains_marker_in_two_pages(
         })
         .unwrap();
         let storage = store();
-        let oracle = Arc::new(std::sync::Mutex::new(Rows::new()));
+        let oracle = Arc::new(std::sync::Mutex::new(Oracle::default()));
         let mut run = Run::new(storage, oracle.clone()).await;
         run.engine.set_txn_config(config.clone());
         run.fresh().await;
-        run.engine.create_shape(&"public.items".into(), None, None, false, true).await.unwrap();
+        run.create("s1", None, true).await;
         let prefix: Vec<_> = (0..32).map(|seq| transaction_row(seq, false, "public.items")).collect();
         run.engine.changes.append_commit(&prefix).await.unwrap();
         let held_tail = LogPosition { segment: 0, offset: "0000000000000000_0000000000000001".into() };
@@ -536,7 +656,7 @@ async fn crashsim_held_over_cap_survives_restart_and_drains_marker_in_two_pages(
         let mut marker = transaction_row(32, true, crate::replication::SOURCE_FENCE_ENVELOPE);
         marker.key = "after-large-transaction".into();
         assert!(restarted.engine.source_drain_receipt(&marker.key).is_none());
-        *oracle.lock().unwrap() = prefix.iter().map(|env| (env.key.clone(), env.value.clone().unwrap())).collect();
+        oracle.lock().unwrap().rows = prefix.iter().map(|env| (env.key.clone(), env.value.clone().unwrap())).collect();
         restarted.engine.changes.append_commit(&[marker]).await.unwrap();
         // Fixed terminal: exactly one more page completes the two-page transaction and receipt.
         restarted.drain().await;
@@ -544,6 +664,7 @@ async fn crashsim_held_over_cap_survives_restart_and_drains_marker_in_two_pages(
         restarted.check().await;
         assert_eq!(events(&restarted.store, "shape/s1").len(), 32);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        restarted.write(0x100, 42, Some("after held transaction restart")).await;
         restarted.stop().await;
         std::fs::remove_dir(&dir).unwrap();
     }
@@ -553,7 +674,7 @@ async fn crashsim_held_over_cap_survives_restart_and_drains_marker_in_two_pages(
 async fn crashsim_untracked_transaction_advances_without_shape_output() {
     let mut run = Run::new(store(), Default::default()).await;
     run.fresh().await;
-    run.engine.create_shape(&"public.items".into(), None, None, false, true).await.unwrap();
+    run.create("s1", None, true).await;
     run.engine.changes.append_commit(&[transaction_row(0, true, "public.untracked")]).await.unwrap();
     run.drain().await;
     run.check().await;
@@ -567,8 +688,8 @@ async fn crashsim_partial_shape_fanout_replays_absolute_effects() {
     for fault in [AppendFault::Unavailable, AppendFault::CommitThenUnavailable] {
         let mut run = Run::new(store(), Default::default()).await;
         run.fresh().await;
-        for _ in 0..2 {
-            run.engine.create_shape(&"public.items".into(), None, None, false, false).await.unwrap();
+        for id in ["s1", "s2"] {
+            run.create(id, None, false).await;
         }
         *run.store.append_fault.lock().unwrap() = Some(("shape/s2".into(), 0, fault));
         // id=2 matches both independent feeds; one stream can land before its peer retries.
@@ -580,16 +701,16 @@ async fn crashsim_partial_shape_fanout_replays_absolute_effects() {
 
 #[tokio::test]
 async fn crashsim_slow_partial_fanout_never_checkpoints_and_crash_replays() {
-    let oracle = Arc::new(std::sync::Mutex::new(Rows::new()));
+    let oracle = Arc::new(std::sync::Mutex::new(Oracle::default()));
     let mut run = Run::new(store(), oracle.clone()).await;
     run.fresh().await;
-    for _ in 0..2 {
-        run.engine.create_shape(&"public.items".into(), None, None, false, false).await.unwrap();
+    for id in ["s1", "s2"] {
+        run.create(id, None, false).await;
     }
     let gate = Arc::new(BodyGate::default());
     *run.store.append_fault.lock().unwrap() = Some(("shape/s2".into(), 0, AppendFault::Hold(gate.clone())));
     let row = transaction_row(2, true, "public.items");
-    oracle.lock().unwrap().insert(row.key.clone(), row.value.clone().unwrap());
+    oracle.lock().unwrap().rows.insert(row.key.clone(), row.value.clone().unwrap());
     run.engine.changes.append_commit(&[row]).await.unwrap();
     bounded("held shape append", gate.entered.notified()).await;
     assert_eq!(run.processed().await, LogPosition::start(), "partially delivered transaction advanced");
@@ -598,8 +719,7 @@ async fn crashsim_slow_partial_fanout_never_checkpoints_and_crash_replays() {
     let saved = run.crash().await;
     let mut restarted = Run::new(saved, oracle).await;
     restarted.boot().await;
-    restarted.drain().await;
-    restarted.check().await;
+    restarted.probe_after_restart().await;
     restarted.stop().await;
 }
 
@@ -607,10 +727,10 @@ async fn crashsim_slow_partial_fanout_never_checkpoints_and_crash_replays() {
 async fn crashsim_missing_dormant_segment_retires_instead_of_serving_stale_rows() {
     let mut run = Run::new(store(), Default::default()).await;
     run.fresh().await;
-    run.engine.create_shape(&"public.items".into(), None, None, false, true).await.unwrap();
+    run.create("s1", None, true).await;
     run.write(0x10, 1, Some("before dormancy")).await;
-    run.engine.release_subscription_durable("s1", None).await.unwrap();
-    run.engine.deactivate_shape("s1").await.unwrap();
+    run.release("s1").await;
+    run.deactivate("s1").await;
     run.engine.changes.force_rotate().await;
     run.drain().await;
     // External loss is deliberately distinct from the engine's safe deletion planner.
@@ -626,11 +746,19 @@ async fn crashsim_missing_dormant_segment_retires_instead_of_serving_stale_rows(
     run.stop().await;
 }
 
-#[tokio::test(start_paused = true)]
-async fn crashsim_missing_live_segment_withdraws_readiness() {
-    let mut run = Run::new(store(), Default::default()).await;
+async fn lose_live_segment(status: u16) -> Run {
+    let mut run = Run::new(
+        Arc::new(ScriptedStore {
+            read_appended: true,
+            streams: Some(Default::default()),
+            missing_read_status: status,
+            ..Default::default()
+        }),
+        Default::default(),
+    )
+    .await;
     run.fresh().await;
-    run.engine.create_shape(&"public.items".into(), None, None, false, true).await.unwrap();
+    run.create("s1", None, true).await;
     let command = run.engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
     let (done, ack) = tokio::sync::oneshot::channel();
     command.send(SequencerCmd::PauseReads { done }).unwrap();
@@ -648,20 +776,133 @@ async fn crashsim_missing_live_segment_withdraws_readiness() {
     command.send(SequencerCmd::Barrier { done }).unwrap();
     bounded("missing segment handled", ack).await.unwrap();
     assert_eq!(run.processed().await, LogPosition::start());
-    let readiness = run.engine.readiness_status();
+    assert_eq!(run.engine.readiness_status(), "degraded");
+    run
+}
+
+async fn assert_replay_refused(run: &Run) {
+    use tower::ServiceExt;
+    for (method, path, body) in [
+        ("GET", "/shapes/s1/rows", ""),
+        ("POST", "/v1/shapes", r#"{"table":"public.items","changesOnly":true}"#),
+        ("POST", "/v1/aggregates", r#"{"table":"public.items","fn":"count"}"#),
+        ("POST", "/v1/subsets/query", r#"{"table":"public.items","limit":10}"#),
+        ("GET", "/shapes/s1/log?offset=-1&live=true", ""),
+        ("GET", "/v1/shape?table=public.items&offset=-1", ""),
+        ("GET", "/v1/shape?table=public.items&offset=0&handle=s1&live=true", ""),
+    ] {
+        let response = bounded(
+            "terminal replay refusal",
+            crate::http::router(run.engine.clone()).oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "terminal replay failure admitted {method} {path}"
+        );
+        assert!(
+            !response.headers().contains_key("retry-after"),
+            "restart-only refusal advertised a retry: {method} {path}"
+        );
+    }
+    let refusal = run.engine.ensure_not_degraded().unwrap_err();
+    assert!(refusal.downcast_ref::<DeploymentNotReady>().is_none(), "terminal replay is not boot admission");
+    assert!(refusal.downcast_ref::<ReplayFailed>().is_some());
+    assert!(refusal.to_string().contains("restart required"));
+    assert!(run.engine.ensure_active("s1").await.is_err());
+    assert!(run.engine.read_shape_stream("shape/s1", "-1", true).await.is_err());
+}
+
+async fn assert_latched_stop(mut run: Run) {
+    // Exercise commands after the failure without ever restarting the live reader.
+    let command = run.engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
+    for _ in 0..3 {
+        let (done, ack) = tokio::sync::oneshot::channel();
+        command.send(SequencerCmd::ResumeReads { done }).unwrap();
+        bounded("latched resume command", ack).await.unwrap();
+        let (done, ack) = tokio::sync::oneshot::channel();
+        command.send(SequencerCmd::Barrier { done }).unwrap();
+        bounded("latched command barrier", ack).await.unwrap();
+    }
+    while let Ok((path, _, live)) = run.reads.try_recv() {
+        assert!(!(live && path.ends_with("changes/0")), "latched reader retried its gone segment");
+    }
+    assert_eq!(run.processed().await, LogPosition::start());
     tokio::time::resume();
-    let _ = run.crash().await;
-    assert_ne!(readiness, "active", "permanently missing live segment leaves an unadvanceable engine ready");
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crashsim_missing_live_segment_withdraws_readiness() {
+    for (index, status) in [404, 410].into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::pause();
+        }
+        let run = lose_live_segment(status).await;
+        assert_replay_refused(&run).await;
+        assert_latched_stop(run).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn crashsim_missing_live_segment_is_not_managed_boot_retry() {
+    for (index, status) in [404, 410].into_iter().enumerate() {
+        if index > 0 {
+            tokio::time::pause();
+        }
+        let run = lose_live_segment(status).await;
+        *run.engine.managed_deployment.lock().unwrap() = Some(ManagedDeploymentState {
+            config: crate::deployment::ManagedDeploymentConfig {
+                revision: "018f0f46-93d0-7cf0-8b74-4bf0866ec285".into(),
+                initial_active: false,
+            },
+            coordination_key: "a".repeat(64),
+            role: ManagedRole::Active,
+            ownership: None,
+        });
+        assert_replay_refused(&run).await;
+        assert_latched_stop(run).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn crashsim_missing_live_segment_counts_failure_once() {
+    let run = lose_live_segment(410).await;
+    assert_eq!(
+        run.engine.metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"],
+        1,
+        "a terminal gone segment must be visible in metrics"
+    );
+    assert!(
+        run.engine
+            .prometheus_text()
+            .lines()
+            .any(|line| line.starts_with("engine_sequencer_stream_gone_failures_total") && line.ends_with(" 1")),
+        "gone-segment cause is missing from Prometheus"
+    );
+    let metrics = run.engine.metrics.clone();
+    metrics.reset(); // resetting a window must not erase a restart-only diagnosis
+    assert_latched_stop(run).await;
+    assert_eq!(metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 1);
 }
 
 #[tokio::test]
 async fn crashsim_reactivating_shape_pins_segment_until_replay_finishes() {
     let mut run = Run::new(store(), Default::default()).await;
     run.fresh().await;
-    run.engine.create_shape(&"public.items".into(), None, None, false, true).await.unwrap();
+    run.create("s1", None, true).await;
     run.write(0x10, 1, Some("old")).await;
-    run.engine.release_subscription_durable("s1", None).await.unwrap();
-    run.engine.deactivate_shape("s1").await.unwrap();
+    run.release("s1").await;
+    run.deactivate("s1").await;
     run.engine.changes.force_rotate().await;
     run.drain().await;
     run.write(0x20, 1, Some("new")).await;
@@ -685,6 +926,7 @@ async fn crashsim_reactivating_shape_pins_segment_until_replay_finishes() {
     gate.released.notify_one();
     bounded("replay released", &mut resume).await.unwrap();
     drop(resume);
+    run.oracle.lock().unwrap().feeds.get_mut("s1").unwrap().active = true;
     run.check().await;
     run.engine.sweep_change_log().await;
     run.engine.catalog_tx.wait_durable().await.unwrap();
@@ -716,9 +958,48 @@ async fn crashsim_503_at_every_workload_write() {
             let saved = retained(&run.store);
             let mut restarted = Run::new(saved, oracle).await;
             restarted.boot().await;
-            restarted.drain().await;
-            restarted.check().await;
+            restarted.probe_after_restart().await;
             restarted.stop().await;
         }
+    }
+}
+
+/// Negative controls for the oracle itself: a restored registry cannot choose which client
+/// promises get checked. Catch only the named semantic assertion, after a successful boot.
+#[tokio::test]
+async fn crashsim_oracle_rejects_lost_acknowledged_clients() {
+    for (mutation, assertion) in [
+        ("registry", "lost acknowledged shapes"),
+        ("lifecycle", "retained shapes must have lifecycle entries"),
+        ("subscription", "lost acknowledged subscriptions"),
+    ] {
+        let mut seed = Run::new(store(), Default::default()).await;
+        bounded("oracle control workload", workload(&mut seed)).await;
+        seed.stop().await;
+        let mut restored = Run::new(retained(&seed.store), seed.oracle.clone()).await;
+        restored.boot().await;
+        restored.drain().await;
+        match mutation {
+            "registry" => restored.engine.state.lock().await.shapes.clear(),
+            "lifecycle" => restored.engine.lives.lock().unwrap().clear(),
+            "subscription" => restored.engine.state.lock().await.feed_shares.get_mut("s1").unwrap().subs.clear(),
+            _ => unreachable!(),
+        }
+        let cleanup = restored.engine.clone();
+        let outcome =
+            bounded("oracle must reject corruption", tokio::spawn(async move { restored.check().await })).await;
+        assert_eq!(
+            bounded("oracle control cleanup", cleanup.close(DEADLINE)).await,
+            crate::shutdown::ShutdownOutcome::Complete
+        );
+        let panic = outcome.expect_err(&format!("oracle accepted lost acknowledged {mutation}"));
+        assert!(panic.is_panic(), "oracle task was cancelled, not a semantic failure");
+        let payload = panic.into_panic();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic");
+        assert!(message.contains(assertion), "wrong oracle failure for {mutation}: {message}");
     }
 }

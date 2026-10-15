@@ -1086,6 +1086,7 @@ pub(crate) async fn sequencer_loop(
                     }
                 }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
+                    ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
                     // The segment the sequencer is reading has been DELETED under it. The sweeper
                     // deletes only below the durable checkpoint, and the boot refuses to start on a
                     // missing segment. Preserve the replay boundary and withdraw readiness just

@@ -257,9 +257,9 @@ pub struct StreamHead {
 ///
 /// A typed error because callers make very different decisions about it than about a transient read
 /// failure. On the change log (ADR-0006) it is never expected — a segment is deleted only once
-/// nothing can resume inside it — so the sequencer treats it as an error to log loudly and back off
-/// from, the boot treats it as fatal for the position it is about to resume, and a dormant shape's
-/// replay treats it as "this shape can never be brought up to date", which evicts it.
+/// nothing can resume inside it — so the sequencer logs it, halts reads and latches a data-admission
+/// refusal until restart. Boot treats it as fatal for the position it is about to resume, and a
+/// dormant shape's replay treats it as "this shape can never be brought up to date", which evicts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGone {
     pub path: String,
@@ -2241,6 +2241,8 @@ mod tests {
         pub(crate) read_appended: bool,
         /// Opt-in stream lifecycle for crash tests: path -> closed. Absence means 404.
         pub(crate) streams: Option<std::sync::Mutex<HashMap<String, bool>>>,
+        /// Status for an absent stream on read; zero retains the normal 404 default.
+        pub(crate) missing_read_status: u16,
         /// One fault at the nth matching append, consumed before it is executed.
         pub(crate) append_fault: std::sync::Mutex<Option<(String, usize, AppendFault)>>,
         pub(crate) read_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>>,
@@ -2434,7 +2436,13 @@ mod tests {
                         changed.as_mut().enable();
                         let closed = if let Some(streams) = &self.streams {
                             match streams.lock().unwrap().get(path) {
-                                None => return Ok(response(404)),
+                                None => {
+                                    return Ok(response(if self.missing_read_status == 0 {
+                                        404
+                                    } else {
+                                        self.missing_read_status
+                                    }));
+                                }
                                 Some(closed) => *closed,
                             }
                         } else {

@@ -1768,6 +1768,7 @@ impl From<anyhow::Error> for AppError {
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
         let status = if retry_after
             || e.downcast_ref::<crate::engine::Degraded>().is_some()
+            || e.downcast_ref::<crate::engine::ReplayFailed>().is_some()
             || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
             || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))
