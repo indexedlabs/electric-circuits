@@ -321,8 +321,14 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
             Ok(()) => return true,
             Err(e) => e,
         };
-        if pg::boot_disposition(&err) == pg::BootFailure::Fatal {
-            refuse_boot(pg::boot_failure_name(&err), &err);
+        match pg::boot_disposition(&err) {
+            pg::BootFailure::RestartRequested => {
+                tracing::error!("boot: restart requested: {err:#}; exiting 75");
+                std::io::stderr().flush().ok();
+                std::process::exit(75);
+            }
+            pg::BootFailure::Fatal => refuse_boot(pg::boot_failure_name(&err), &err),
+            pg::BootFailure::Retryable => {}
         }
         // Back to `waiting`: the attempt left the phase wherever it failed (`starting`, if it got
         // as far as connecting), and reporting `starting` for the whole backoff would tell an

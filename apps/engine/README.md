@@ -410,9 +410,11 @@ already started at a different position or de-duplication highwater, it requests
 The comparison is against the reader's original start pair. A matching reader that has since
 advanced still follows the existing pause/register/resume handshake.
 
-Checkpoint writes are refused until the catalog's position/highwater floor is known. Writing an
+In Postgres mode, checkpoint writes are refused until the catalog's position/highwater floor is known. Writing an
 offset before floor adoption requests a restart without issuing an append. At an equal position,
-a lower or missing highwater is also rejected. Library hosts receive shutdown/restart requests;
+a lower or missing highwater is also rejected. Library mode neither adopts old checkpoints nor
+enforces this floor; its retention boundary follows this process's durable checkpoints.
+Library hosts receive shutdown/restart requests;
 only the standalone binary turns a request into process exit. Supervised sources notify their owner.
 
 `/health` deliberately never fails for any of that. A kubelet restarts a pod whose *liveness* probe
@@ -439,7 +441,7 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
    appended nothing. **Shutdown never advances the slot**; at worst it costs a bounded, de-duplicated
    replay.
 4. The **sequencer** finishes the batch it is processing, flushes it, and writes a final `Offset`
-   checkpoint only if it completed a read. The catalog writer rejects any checkpoint below the
+   checkpoint only if it completed a read. In Postgres mode the catalog writer rejects any checkpoint below the
    restored/last durable floor, including periodic and shutdown checkpoints. It drains accepted
    writes (≤ 10 s) so the next boot resumes from there rather than replaying since the last lazy
    2 s checkpoint.

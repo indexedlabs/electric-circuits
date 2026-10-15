@@ -2848,6 +2848,16 @@ mod held_spill_tests {
         }
 
         fn with_budget(cap: u64, start: LogPosition, highwater: Option<(u64, u64)>, budget: Option<u64>) -> Self {
+            Self::with_mode(cap, start, highwater, budget, false)
+        }
+
+        fn with_mode(
+            cap: u64,
+            start: LogPosition,
+            highwater: Option<(u64, u64)>,
+            budget: Option<u64>,
+            postgres: bool,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("circuits-held-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&dir).unwrap();
             let cfg = crate::txn_buffer::TxnBufferConfig::resolve(|key| match key {
@@ -2867,7 +2877,11 @@ mod held_spill_tests {
                 .unwrap();
                 ds = ds.with_memory_budget(&config);
             }
-            let engine = Engine::new_for_in_process_test(ds);
+            let engine = if postgres {
+                Engine::new_pg_for_in_process_test(ds, "postgres://postgres@127.0.0.1:55532/postgres".into())
+            } else {
+                Engine::new_for_in_process_test(ds)
+            };
             engine.set_txn_config(cfg);
             let processed = Arc::new(std::sync::Mutex::new(start.clone()));
             let (commands, rx) = mpsc::unbounded_channel();
@@ -3027,14 +3041,14 @@ mod held_spill_tests {
 
     #[tokio::test]
     async fn boot_race_final_checkpoint_cannot_overwrite_seeded_floor() {
-        let mut h = Harness::new(4096);
+        let mut h = Harness::with_mode(4096, LogPosition::start(), None, None, true);
         let floor = LogPosition { segment: 1080, offset: "0000000000000000_0000001015737962".into() };
+        h.engine.catalog_tx.seed_durable_offset(floor.clone(), Some((0x10, 2))).await;
         h.engine
             .catalog_tx
             .send_durable(CatalogEvent::Offset { pos: floor.clone(), highwater: Some((0x10, 2)) })
             .await
             .unwrap();
-        h.engine.catalog_tx.seed_durable_offset(floor.clone(), Some((0x10, 2))).await;
         // A completed stale read defeats the older unread-shutdown guard. Exercise the actual
         // sequencer final checkpoint and catalog writer, not just monotonic in-memory tracking.
         h.page("-1", "p1", vec![]).await;

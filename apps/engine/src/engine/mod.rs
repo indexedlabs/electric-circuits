@@ -99,6 +99,10 @@ impl std::fmt::Display for DeploymentNotReady {
 
 impl std::error::Error for DeploymentNotReady {}
 
+#[derive(Debug, thiserror::Error)]
+#[error("catalog restore found a sequencer at a different checkpoint; restart requested (75)")]
+pub(crate) struct CatalogRestoreMismatch;
+
 /// PostgreSQL owns its schemas; caller-defined schemas are a library-mode API only.
 #[derive(Debug, thiserror::Error)]
 #[error("define_schema is only supported in library mode; PostgreSQL schemas are introspected")]
@@ -1283,13 +1287,10 @@ impl Engine {
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
     pub async fn new(admission: StoreAdmission) -> Result<Self> {
-        let (bytes, checkpoint) = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
+        let bytes = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
         let engine =
             Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None);
         engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
-        if let Some((pos, highwater)) = checkpoint {
-            engine.catalog_tx.seed_durable_offset(pos, highwater).await;
-        }
         Ok(engine)
     }
 
@@ -1363,11 +1364,8 @@ impl Engine {
             None
         };
         let engine = Self::new_configured(admission, pg_url, setup, config, None);
-        if let Some((bytes, checkpoint)) = bytes {
+        if let Some(bytes) = bytes {
             engine.metrics.catalog_bytes.store(bytes, Ordering::Relaxed);
-            if let Some((pos, highwater)) = checkpoint {
-                engine.catalog_tx.seed_durable_offset(pos, highwater).await;
-            }
         }
         Ok(engine)
     }
@@ -1470,11 +1468,7 @@ impl Engine {
         );
         // Created before the writer so the writer can register a shutdown party while it is
         // retrying an append (see `spawn_catalog_writer`).
-        // Only the explicit library test constructor bypasses binding admission and assumes a
-        // fresh fixture. Production constructors establish the floor from catalog reads.
-        let initial_checkpoint =
-            (store_bound.get().is_none() && pg_url.is_none()).then(|| (LogPosition::start(), None));
-        let catalog_tx = spawn_catalog_writer(ds.clone(), shutdown.clone(), initial_checkpoint);
+        let catalog_tx = spawn_catalog_writer(ds.clone(), shutdown.clone(), pg_url.is_some());
         let retirements = spawn_retirement_queue(ds.clone(), catalog_tx.clone(), shutdown.clone());
         // The change log's writer records every rotation in the durable catalog, so a restart knows
         // which segment is current (and when each one began, for the retain window).
