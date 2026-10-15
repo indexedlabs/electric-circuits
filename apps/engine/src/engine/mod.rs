@@ -2284,8 +2284,8 @@ impl Engine {
     /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
     /// effects, cannot continue replay, or whose epoch broke under the refuse policy (ADR-0004)
     /// is not healthy however far along its boot got. These share one status word because the
-    /// fleet healthcheck string-compares the body. Membership/epoch details are exposed by
-    /// `GET /replication/lsn`; terminal replay failures are logged at the failing read.
+    /// fleet healthcheck string-compares the body. Membership/epoch details and the `replayFailed`
+    /// flag are exposed by `GET /replication/lsn`; the failing read logs the replay cause.
     pub fn health_status(&self) -> &'static str {
         if let Some((role, _)) = self.managed_status() {
             match role {

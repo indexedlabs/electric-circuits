@@ -258,8 +258,8 @@ pub struct StreamHead {
 /// A typed error because callers make very different decisions about it than about a transient read
 /// failure. On the change log (ADR-0006) it is never expected — a segment is deleted only once
 /// nothing can resume inside it — so the sequencer logs it, halts reads and latches a data-admission
-/// refusal until restart. Boot treats it as fatal for the position it is about to resume, and a
-/// dormant shape's replay treats it as "this shape can never be brought up to date", which evicts it.
+/// refusal while requesting a host restart. Boot treats it as fatal for the position it is about to
+/// resume, and a dormant shape's replay treats it as "this shape can never be brought up to date", which evicts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGone {
     pub path: String,
@@ -2241,8 +2241,11 @@ mod tests {
         pub(crate) read_appended: bool,
         /// Opt-in stream lifecycle for crash tests: path -> closed. Absence means 404.
         pub(crate) streams: Option<std::sync::Mutex<HashMap<String, bool>>>,
-        /// Status for an absent stream on read; zero retains the normal 404 default.
-        pub(crate) missing_read_status: u16,
+        /// Status for an absent stream on GET/HEAD; zero retains the normal 404 default.
+        pub(crate) missing_status: u16,
+        /// One transient HEAD response for a matching path suffix.
+        pub(crate) head_fault: std::sync::Mutex<Option<(String, u16)>>,
+        pub(crate) head_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, u16)>>>,
         /// One fault at the nth matching append, consumed before it is executed.
         pub(crate) append_fault: std::sync::Mutex<Option<(String, usize, AppendFault)>>,
         pub(crate) read_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>>,
@@ -2450,10 +2453,10 @@ mod tests {
                         let closed = if let Some(streams) = &self.streams {
                             match streams.lock().unwrap().get(path) {
                                 None => {
-                                    return Ok(response(if self.missing_read_status == 0 {
+                                    return Ok(response(if self.missing_status == 0 {
                                         404
                                     } else {
-                                        self.missing_read_status
+                                        self.missing_status
                                     }));
                                 }
                                 Some(closed) => *closed,
@@ -2601,9 +2604,16 @@ mod tests {
                 let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
                 if let Some(streams) = &self.streams {
                     match streams.lock().unwrap().get(path) {
-                        None => return Ok(response(404)),
+                        None => res.status = if self.missing_status == 0 { 404 } else { self.missing_status },
                         Some(closed) => res.closed = *closed,
                     }
+                }
+                let mut fault = self.head_fault.lock().unwrap();
+                if fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
+                    res.status = fault.take().unwrap().1;
+                }
+                if let Some(observer) = self.head_observer.lock().unwrap().as_ref() {
+                    let _ = observer.send((path.to_string(), res.status));
                 }
                 if self.read_appended {
                     let end = self.appended.lock().unwrap().iter().filter(|(p, _, _)| p == path).count();

@@ -469,8 +469,8 @@ pub(crate) async fn sequencer_loop(
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut paused = start_paused;
-    // A missing segment or unrecoverable body breach is terminal for this live loop. Commands
-    // and shutdown remain serviced, but reads stay halted and readiness withdrawn until restart.
+    // A missing segment or unrecoverable body breach is terminal for this live loop. Keep reads
+    // halted while the fatal restart request shuts it down at the safe checkpoint boundary.
     let mut sequencer_read_failed = false;
     // Whether the store has been re-attested since the last successful read. A read failure is the
     // only reconnect signal this client gets (reqwest owns the connection pool and reports no
@@ -1055,6 +1055,17 @@ pub(crate) async fn sequencer_loop(
                                         *processed.lock().unwrap() = published(&pos, &held_from);
                                         crossed = true;
                                     }
+                                    Err(e) if e.is::<crate::changelog::MissingSuccessor>() => {
+                                        ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
+                                        sequencer_read_failed = true;
+                                        read_failure_latch.store(true, Ordering::SeqCst);
+                                        tracing::error!(
+                                            "sequencer: cannot leave the closed segment {}: {e:#}. \
+                                             Live reads halted; requesting restart without skipping data.",
+                                            pos.path()
+                                        );
+                                        shutdown.restart_or_exit(75);
+                                    }
                                     Err(e) => {
                                         tracing::error!(
                                             "sequencer: cannot leave the closed segment {}: {e:#}. Backing off; \
@@ -1097,8 +1108,9 @@ pub(crate) async fn sequencer_loop(
                     tracing::error!(
                         "sequencer: the change-log segment it is reading is GONE ({e:#}). Nothing may delete a \
                          segment the durable checkpoint has not passed, so storage has lost data or something \
-                         outside the engine deleted it; live reads halted and readiness withdrawn. Restart required.",
+                         outside the engine deleted it; live reads halted and readiness withdrawn. Requesting restart.",
                     );
+                    shutdown.restart_or_exit(75);
                 }
                 Err(e) => {
                     if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
@@ -1129,6 +1141,7 @@ pub(crate) async fn sequencer_loop(
                                 read_failure_latch.store(true, Ordering::SeqCst);
                                 tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
                                     "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
+                                shutdown.restart_or_exit(75);
                             }
                         }
                     } else {

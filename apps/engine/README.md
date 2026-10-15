@@ -599,11 +599,22 @@ clients can retry after boot or temporary managed-ownership admission; requests 
 replay from an unrestored cursor. Terminal replay failure is a distinct 503 refusal with no
 `Retry-After`, in both managed and unmanaged deployments.
 
-If a required live change-log segment returns 404/410, the sequencer preserves its replay
-checkpoint, halts reads, reports degraded readiness and refuses data requests until restart.
-Commands and graceful shutdown remain responsive. The lifetime counter
+If a required live change-log segment returns 404/410, including a successor HEAD after restoring
+at a closed segment's tail, the sequencer preserves its replay checkpoint, latches data refusal,
+and requests a fatal restart with code `75`. A terminal read-cap breach requests the same restart.
+The engine health status is `degraded`; readiness becomes `shutting_down` as shutdown begins.
+The standalone binary exits with code `75` for its process supervisor to restart it; a supervised
+source notifies its owner, which queues replacement through the existing supervisor loop. Library
+mode never exits the host process: the embedder observes `shutdown_token().wait_for_restart()` and
+owns replacement. Restart revalidates the catalog and required segments before serving again;
+it does not repair missing data.
+
+Engine HTTP routes refuse data requests with 503 and no `Retry-After` during the exit window.
+Existing subscribers reading durable-streams directly bypass this refusal and receive no terminal
+signal from the latch; their streams stop advancing until recovery. `GET /replication/lsn` exposes
+`replayFailed` for either terminal replay cause. The lifetime counter
 `sequencer_stream_gone_failures_total` (`engine_sequencer_stream_gone_failures_total` in Prometheus)
-identifies this cause. Restart revalidates the catalog and required segments before serving again.
+identifies missing-segment failures specifically.
 
 A Postgres failure at boot is classified, not guessed at (`pg::classify`), and the two classes get
 opposite treatment.

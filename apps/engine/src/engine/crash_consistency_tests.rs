@@ -751,7 +751,7 @@ async fn lose_live_segment(status: u16) -> Run {
         Arc::new(ScriptedStore {
             read_appended: true,
             streams: Some(Default::default()),
-            missing_read_status: status,
+            missing_status: status,
             ..Default::default()
         }),
         Default::default(),
@@ -770,13 +770,9 @@ async fn lose_live_segment(status: u16) -> Run {
     command.send(SequencerCmd::ResumeReads { done }).unwrap();
     bounded("resume after loss", ack).await.unwrap();
     run.read_at(&LogPosition::start()).await;
-    // The fixture reports arrival immediately before returning the failure in the same poll.
-    // A subsequent barrier confirms the loop still handles commands after its error handler.
-    let (done, ack) = tokio::sync::oneshot::channel();
-    command.send(SequencerCmd::Barrier { done }).unwrap();
-    bounded("missing segment handled", ack).await.unwrap();
+    // Arrival and the terminal response handler share one poll on this current-thread runtime.
     assert_eq!(run.processed().await, LogPosition::start());
-    assert_eq!(run.engine.readiness_status(), "degraded");
+    assert_eq!(run.engine.health_status(), "degraded");
     run
 }
 
@@ -823,16 +819,9 @@ async fn assert_replay_refused(run: &Run) {
 }
 
 async fn assert_latched_stop(mut run: Run) {
-    // Exercise commands after the failure without ever restarting the live reader.
-    let command = run.engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
-    for _ in 0..3 {
-        let (done, ack) = tokio::sync::oneshot::channel();
-        command.send(SequencerCmd::ResumeReads { done }).unwrap();
-        bounded("latched resume command", ack).await.unwrap();
-        let (done, ack) = tokio::sync::oneshot::channel();
-        command.send(SequencerCmd::Barrier { done }).unwrap();
-        bounded("latched command barrier", ack).await.unwrap();
-    }
+    assert!(run.engine.shutdown.restart_requested(), "terminal replay must request a host restart");
+    assert_eq!(bounded("fatal restart notification", run.engine.shutdown.wait_for_restart()).await, 75);
+    assert_eq!(run.engine.readiness_status(), "shutting_down");
     while let Ok((path, _, live)) = run.reads.try_recv() {
         assert!(!(live && path.ends_with("changes/0")), "latched reader retried its gone segment");
     }
@@ -893,6 +882,125 @@ async fn crashsim_missing_live_segment_counts_failure_once() {
     metrics.reset(); // resetting a window must not erase a restart-only diagnosis
     assert_latched_stop(run).await;
     assert_eq!(metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 1);
+}
+
+async fn replay_failed_diagnostic(run: &Run) -> serde_json::Value {
+    use tower::ServiceExt;
+    let response = crate::http::router(run.engine.clone())
+        .oneshot(axum::http::Request::builder().uri("/replication/lsn").body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["replayFailed"].clone()
+}
+
+#[tokio::test]
+async fn crashsim_healthy_replay_diagnostic_is_false() {
+    let mut run = Run::new(store(), Default::default()).await;
+    run.fresh().await;
+    assert_eq!(replay_failed_diagnostic(&run).await, false, "healthy replay must report a boolean cause");
+    run.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn crashsim_terminal_replay_diagnostic_is_true() {
+    let run = lose_live_segment(404).await;
+    assert_eq!(replay_failed_diagnostic(&run).await, true, "terminal replay must expose its cause");
+    assert_latched_stop(run).await;
+}
+
+#[tokio::test]
+async fn crashsim_terminal_refusal_survives_shutdown_admission() {
+    let mut run = Run::new(store(), Default::default()).await;
+    run.fresh().await;
+    run.create("s1", None, true).await;
+    // Explicitly arrange the exit window so the refusal contract can fail independently
+    // of the missing restart hook. No healthy boot retry should mask a terminal cause.
+    run.engine.sequencer_read_failed.store(true, Ordering::SeqCst);
+    run.engine.shutdown.begin();
+    assert_replay_refused(&run).await;
+    run.stop().await;
+}
+
+async fn restore_at_closed_tail(status: u16) -> (Run, LogPosition) {
+    let mut seed = Run::new(store(), Default::default()).await;
+    seed.fresh().await;
+    seed.create("s1", None, true).await;
+    let command = seed.engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
+    let (done, ack) = tokio::sync::oneshot::channel();
+    command.send(SequencerCmd::PauseReads { done }).unwrap();
+    bounded("pause before rotation", ack).await.unwrap();
+    for _ in 0..2 {
+        // Empty segments do not rotate. An untracked transaction has no shape effect,
+        // but makes each rotation real and leaves the saved tail beyond its pointer.
+        seed.engine.changes.append_commit(&[transaction_row(0, true, "public.untracked")]).await.unwrap();
+        seed.engine.changes.force_rotate().await;
+    }
+    assert_eq!(seed.engine.changes.state().current(), 2);
+    let head = seed.engine.ds.head("changes/0").await.unwrap().unwrap();
+    assert!(head.closed);
+    let tail = LogPosition { segment: 0, offset: head.next_offset.unwrap() };
+    assert_ne!(tail.offset, "-1", "checkpoint must be beyond the rotation pointer");
+    seed.engine.catalog_tx.send_durable(CatalogEvent::Offset { pos: tail.clone(), highwater: None }).await.unwrap();
+    if status != 503 {
+        seed.engine.ds.delete_stream("changes/1").await.unwrap();
+    }
+    assert!(seed.engine.ds.head("changes/2").await.unwrap().is_some());
+    let oracle = seed.oracle.clone();
+    let mut saved = seed.crash().await;
+    if status == 503 {
+        *saved.head_fault.lock().unwrap() = Some(("changes/1".into(), 503));
+    } else {
+        Arc::get_mut(&mut saved).unwrap().missing_status = status;
+    }
+    let (tx, mut heads) = mpsc::unbounded_channel();
+    *saved.head_observer.lock().unwrap() = Some(tx);
+    let mut restarted = Run::new(saved, oracle).await;
+    restarted.boot().await;
+    bounded("successor HEAD answered", async {
+        loop {
+            let (path, observed) = heads.recv().await.unwrap();
+            if path.ends_with("changes/1") {
+                assert_eq!(observed, status);
+                break;
+            }
+        }
+    })
+    .await;
+    (restarted, tail)
+}
+
+#[tokio::test]
+async fn crashsim_missing_successor_after_closed_tail_restore_is_terminal() {
+    for status in [404, 410] {
+        let (run, tail) = restore_at_closed_tail(status).await;
+        assert_eq!(run.processed().await, tail, "loss must not skip to the existing writer segment");
+        assert_eq!(run.engine.health_status(), "degraded", "confirmed missing successor must withdraw readiness");
+        assert!(run.engine.shutdown.restart_requested(), "successor loss must request restart");
+        assert_eq!(bounded("successor restart notification", run.engine.shutdown.wait_for_restart()).await, 75);
+        assert_eq!(run.engine.readiness_status(), "shutting_down");
+        assert_eq!(replay_failed_diagnostic(&run).await, true);
+        assert_replay_refused(&run).await;
+        let metrics = run.engine.metrics.clone();
+        assert_eq!(metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 1);
+        run.stop().await;
+        assert_eq!(metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 1);
+        assert_eq!(checkpoints(&run.store).last().unwrap().0, tail, "shutdown must preserve the replay boundary");
+    }
+}
+
+#[tokio::test]
+async fn crashsim_transient_successor_head_retries_and_delivers() {
+    let (mut run, _) = restore_at_closed_tail(503).await;
+    assert_eq!(run.engine.health_status(), "active");
+    assert!(!run.engine.shutdown.restart_requested());
+    run.drain().await;
+    run.write(0x100, 42, Some("after transient HEAD failure")).await;
+    assert_eq!(run.engine.health_status(), "active");
+    assert!(!run.engine.shutdown.restart_requested());
+    assert_eq!(run.engine.metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 0);
+    run.stop().await;
 }
 
 #[tokio::test]
