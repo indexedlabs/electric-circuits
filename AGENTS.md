@@ -590,7 +590,7 @@ canvas update, screenshot.
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
   close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
   had no subscriber (plain `delete_stream`).
-- **The catalog writer never drops an event, and the two records a client is *promised* are durable
+- **The catalog writer never drops a lifecycle event, and the records a client is *promised* are durable
   before it is answered** (`engine/catalog.rs`). A failed append is classified with
   `ds::is_unavailable`: transport/timeout/5xx retries THAT event in place, forever, with backoff
   (100 ms → 5 s) — the queue is ordered and single-consumer, so everything behind it waits, which is
@@ -599,6 +599,10 @@ canvas update, screenshot.
   re-fold at boot can reconcile them — but only **once the catalog stream exists in this process**:
   until the creating PUT has succeeded, an append failure can just as well be "the stream is not
   there yet", so every failure is retried (a permanently-4xx PUT is retried forever, and says so).
+  In Postgres mode, an `Offset` below the durable position/highwater floor is not appended; its
+  durability barrier is acknowledged because the newer floor already covers it. An `Offset` before
+  the floor is known requests a restart (standalone exit `75`) without an append. Library mode does
+  not adopt or enforce this floor.
   The rule for which records wait: **durable-before-ack = every record a CLIENT is told about** —
   `Created` and the `Joined` of a NEW claim (`send_durable`, awaited before the HTTP answer, no
   timeout — a create while storage is down waits rather than handing back a shape a restart would
@@ -606,7 +610,7 @@ canvas update, screenshot.
   release or the purge survives a restart even under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, where no
   lease will ever repair it. A retry of an idempotent removal finds its mutation already applied,
   enqueues nothing and waits on the same barrier (`CatalogWriter::wait_durable`) rather than
-  answering from memory. **Queued-never-dropped = everything the engine does to itself**: a lease
+  answering from memory. **Queued-never-dropped = lifecycle work the engine does to itself**: a lease
   RENEWAL's `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the
   epoch reset, retention and the `/v1/shape` adapter — those have their own completion barriers, and
   the lease still reconverges them (the restore brings the shape back with its subscriptions' **lease
@@ -678,7 +682,7 @@ canvas update, screenshot.
 - **Every catalog event carries an `eid`, and the fold applies each one at most once** (ADR-0008).
   The id is assigned at ENQUEUE (`CatalogWriter::send*`), so every append attempt of one event —
   the first and every retry after a lost response — carries the same one; the boot fold keeps the
-  set it has seen and skips repeats. This is what makes "the writer never drops an event" safe for
+  set it has seen and skips repeats. This is what makes "the writer never drops a lifecycle event" safe for
   records whose effect is not naturally idempotent. A catalog event without an `eid` (or a
   shape-lifecycle event without a `subscription`) is boot-fatal, like the pre-ADR-0002 and
   pre-ADR-0006 formats — greenfield, no compat.
@@ -699,8 +703,9 @@ canvas update, screenshot.
   LOCALLY — the wire ack rides the replication client's status interval (1 s) and is not forced on
   the way out, so the last second's commits are re-delivered and de-duplicated by the sequencer
   highwater; mid-transaction it just stops, having appended nothing. **Shutdown never advances the
-  slot.** The sequencer then completes its batch, flushes, and writes a final `Offset` checkpoint;
-  the catalog writer drains; exit 0. **Shape streams are left untouched**
+  slot.** The sequencer then completes its batch and flushes. It emits a final `Offset` checkpoint
+  only if it completed a read and replay is not paused; the catalog writer applies the Postgres-mode
+  floor check above and drains accepted writes; exit 0. **Shape streams are left untouched**
   — closing a stream means "this shape is gone, re-subscribe", and a restart is not that. Every
   select that could block past the grace must join the shutdown token (the sequencer's change-log
   long-poll, the ingestor's `recv` and its backoff, `poll_live_until`); if you add a long-poll, join
