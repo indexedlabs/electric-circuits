@@ -1642,6 +1642,8 @@ impl DsClient {
             match self.append_once(path, envelopes).await {
                 Ok(_) => return true,
                 Err(AppendError::Gone(status)) => {
+                    // Reconciliation may wait on storage too; the append has already failed.
+                    failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     let reconciler = self.reconcile.lock().unwrap().clone();
                     let verdict = match reconciler {
                         Some(reconcile) => reconcile(path.to_string()).await,
@@ -1654,7 +1656,6 @@ impl DsClient {
                         );
                         return false;
                     }
-                    failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     false_gone += 1;
                     if false_gone == 1 {
                         tracing::warn!(
@@ -2333,6 +2334,79 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn terminal_append_reconciliation_withdraws_probes_until_finished() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+        use tower::ServiceExt;
+
+        async fn probes(engine: &crate::engine::Engine) -> [u16; 2] {
+            let router = crate::http::router(engine.clone());
+            let mut statuses = [0; 2];
+            for (i, route) in ["/ready", "/v1/health"].into_iter().enumerate() {
+                statuses[i] = router
+                    .clone()
+                    .oneshot(axum::http::Request::builder().uri(route).body(axum::body::Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16();
+            }
+            statuses
+        }
+
+        for status in [404, 410, 409] {
+            for outcome in [Some(GoneVerdict::Retry), Some(GoneVerdict::Discard), None] {
+                let store = Arc::new(ScriptedStore::default());
+                store.terminal_append_status.store(status, Ordering::Relaxed);
+                let ds = DsClient::with_test_store("scripted://held-reconciliation".into(), store.clone());
+                let gate = Arc::new(BodyGate::default());
+                let held = gate.clone();
+                ds.set_gone_reconciler(Arc::new(move |_| {
+                    let held = held.clone();
+                    Box::pin(async move {
+                        held.hold().await;
+                        outcome.unwrap_or(GoneVerdict::Discard)
+                    })
+                }));
+                let engine = crate::engine::Engine::new_for_in_process_test(ds.clone());
+                let envs: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+                    {"type":"items", "key":"1", "headers":{"operation":"delete"}}
+                ]))
+                .unwrap();
+                assert_eq!(probes(&engine).await, [200; 2]);
+                let mut pending = Box::pin(ds.append_reliable("shape/one", &envs));
+                std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(gate.arrived.load(Ordering::SeqCst), 1, "reconciliation is held");
+                assert!(store.appended.lock().unwrap().is_empty());
+                assert_eq!(
+                    probes(&engine).await,
+                    [503; 2],
+                    "both probes must withdraw while reconciling HTTP {status}, outcome {outcome:?}"
+                );
+
+                match outcome {
+                    Some(verdict) => {
+                        store.terminal_append_status.store(0, Ordering::Relaxed);
+                        gate.released.notify_one();
+                        let landed = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                            .await
+                            .expect("released reconciliation must finish")
+                            .unwrap();
+                        assert_eq!(landed, verdict == GoneVerdict::Retry);
+                    }
+                    None => drop(pending),
+                }
+                assert_eq!(probes(&engine).await, [200; 2], "guard released for {status}/{outcome:?}");
+                assert_eq!(store.appended.lock().unwrap().len(), usize::from(outcome == Some(GoneVerdict::Retry)));
+                engine.close(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn large_io_append_retry_cancellation_releases_health_and_reports_request_bytes() {
         use std::{future::Future, sync::atomic::Ordering, task::Poll};
         let store = Arc::new(ScriptedStore::default());
@@ -2558,6 +2632,8 @@ mod tests {
         /// Emulate a provider that rejects an oversized JSON append with HTTP 500.
         pub(crate) append_limit: std::sync::atomic::AtomicUsize,
         pub(crate) rejected_appends: std::sync::atomic::AtomicUsize,
+        /// Opt-in terminal-looking append failure; zero resumes successful writes.
+        pub(crate) terminal_append_status: std::sync::atomic::AtomicU16,
         pub(crate) body_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
         pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
         /// Opt-in append/read log for real-pgoutput tests. Cursors count appends per stream.
@@ -2682,6 +2758,12 @@ mod tests {
             _response_body: BodyRead,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
+                let terminal = self.terminal_append_status.load(std::sync::atomic::Ordering::Relaxed);
+                if terminal != 0 {
+                    let mut res = response(terminal);
+                    res.closed = terminal == 409;
+                    return Ok(res);
+                }
                 let limit = self.append_limit.load(std::sync::atomic::Ordering::Relaxed);
                 if limit > 0 && body.len() > limit {
                     self.rejected_appends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
