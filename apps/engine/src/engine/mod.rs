@@ -138,6 +138,12 @@ impl std::fmt::Display for Degraded {
 
 impl std::error::Error for Degraded {}
 
+/// Live replay has stopped permanently for this engine instance. Refuse data until restart;
+/// unlike boot/ownership admission, retrying the same instance cannot restore progress.
+#[derive(Debug, thiserror::Error)]
+#[error("degraded: live replay cannot continue; restart required")]
+pub struct ReplayFailed;
+
 /// A create or join finished its **catalog durability wait** only to find that the shape it was
 /// about to acknowledge is no longer the shape it made: retired by a schema drift / `TRUNCATE` /
 /// purge while the wait was in flight, or belonging to a superseded epoch.
@@ -514,8 +520,8 @@ pub struct Engine {
     pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
-    /// Latched when the live sequencer encounters an unrecoverable body-cap breach.
-    pub(crate) read_cap_failed: Arc<std::sync::atomic::AtomicBool>,
+    /// Latched when live replay cannot continue: a missing segment or unrecoverable body-cap breach.
+    pub(crate) sequencer_read_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Table schemas shared with the sequencer task and the replication ingestor — the set of
     /// tables the engine can **currently decode and route**, and the single place a drift swaps a
     /// schema (ADR-0005).
@@ -1525,7 +1531,7 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
-            read_cap_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
             retirements,
@@ -2119,7 +2125,8 @@ impl Engine {
         self.degrade.failures.load(Ordering::SeqCst)
     }
 
-    /// True once membership effects have been lost (see [`DegradeState`]). Latched until restart.
+    /// Membership-loss latch only (see [`DegradeState`]), not overall readiness. Data admission
+    /// also checks terminal replay failure, epoch state and boot/ownership readiness below.
     pub fn degraded(&self) -> bool {
         self.degrade.degraded.load(Ordering::SeqCst)
     }
@@ -2127,10 +2134,9 @@ impl Engine {
     /// The guard every membership-bearing create/read path takes: once degraded, refuse rather than
     /// answer with membership the engine knows is wrong.
     ///
-    /// Two independent degradations reach it, each with its own typed error (both 503): lost
-    /// membership effects ([`Degraded`], latched until restart) and a broken epoch under the refuse
-    /// policy ([`EpochBroken`], cleared by `POST /epoch/reset`). The epoch is checked first — it is
-    /// the more fundamental "this engine is not serving this database right now".
+    /// Independent terminal refusals have typed 503 errors: lost membership effects ([`Degraded`]),
+    /// halted replay ([`ReplayFailed`]), and a broken epoch under the refuse policy ([`EpochBroken`]).
+    /// These precede temporary boot/ownership admission, so they never advertise Retry-After.
     pub fn ensure_not_degraded(&self) -> Result<()> {
         // A reset in flight is checked FIRST: it is the transient, actionable one, and while it runs
         // the epoch is also (correctly) latched broken — "retry in a moment" is the useful answer.
@@ -2145,6 +2151,9 @@ impl Engine {
         }
         if self.degraded() {
             return Err(anyhow::Error::new(Degraded));
+        }
+        if self.sequencer_read_failed.load(Ordering::SeqCst) {
+            return Err(anyhow::Error::new(ReplayFailed));
         }
         // Schemas become visible before arrangement seeding and catalog restore finish. A
         // request admitted in that window could spawn the one-shot sequencer at changes/0,
@@ -2249,7 +2258,7 @@ impl Engine {
                 self.pg_url.is_none(),
                 self.restore_reads_paused.load(std::sync::atomic::Ordering::Acquire),
                 self.restore_reads_paused.clone(),
-                self.read_cap_failed.clone(),
+                self.sequencer_read_failed.clone(),
                 self.retention.pending_buffer_max_bytes,
                 txn_cfg,
                 self.pg_pool.as_ref().map(crate::pg::Pool::sequenced),
@@ -2273,10 +2282,10 @@ impl Engine {
 
     /// The `/v1/health` status string: `degraded` | `waiting` | `starting` | `active` (exact, no
     /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
-    /// effects, or whose epoch broke under the refuse policy (ADR-0004), is not healthy however far
-    /// along its boot got. The two are one status word on purpose: the fleet healthcheck
-    /// string-compares the body, and `GET /replication/lsn` is where the *reason* lives
-    /// (`flipFailures` vs `epoch.reason`).
+    /// effects, cannot continue replay, or whose epoch broke under the refuse policy (ADR-0004)
+    /// is not healthy however far along its boot got. These share one status word because the
+    /// fleet healthcheck string-compares the body. Membership/epoch details and the `replayFailed`
+    /// flag are exposed by `GET /replication/lsn`; the failing read logs the replay cause.
     pub fn health_status(&self) -> &'static str {
         if let Some((role, _)) = self.managed_status() {
             match role {
@@ -2288,7 +2297,7 @@ impl Engine {
         }
         if self.degraded()
             || self.epoch_broken().is_some()
-            || self.read_cap_failed.load(std::sync::atomic::Ordering::Relaxed)
+            || self.sequencer_read_failed.load(std::sync::atomic::Ordering::Relaxed)
         {
             return "degraded";
         }
