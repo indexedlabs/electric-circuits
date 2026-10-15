@@ -28,7 +28,8 @@ WORKSPACE = next((p.parent for p in ROOT.parents if p.name == '.agent'), ROOT)
 PG = Path('/opt/homebrew/opt/postgresql@18/bin')
 SCOPE = '/circuits/v1/test-stack/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/test-query/'
 MAX_CREATED = 8_000_000_000
-MIN_FREE = 12_000_000_000
+# df -h uses binary units on this host; this is conservative relative to 12 GB.
+MIN_FREE = 12 * 1024**3
 
 
 def disk_violation(created, free):
@@ -88,6 +89,7 @@ class SQL:
         self.p = lab.spawn('psql', [str(PG / 'psql'), '-X', '-Atq', '-w',
                                    '-v', 'ON_ERROR_STOP=1', lab.pgurl], pipe=True)
         self.lock = threading.Lock()
+        self.run("SET statement_timeout = '180s';")
 
     def run(self, sql):
         with self.lock:
@@ -200,7 +202,8 @@ class Lab:
         self.adapter_thread = None
         self.adapter_observations = []
         self.env = {'PATH': '/opt/homebrew/bin:/usr/bin:/bin', 'HOME': str(self.data),
-                    'TMPDIR': str(self.data), 'LC_ALL': 'C', 'PGPASSFILE': str(self.data/'absent-passfile')}
+                    'TMPDIR': str(self.data), 'LC_ALL': 'C', 'PGPASSFILE': str(self.data/'absent-passfile'),
+                    'PGCONNECT_TIMEOUT': '5'}
         self.sql = None
         self.write_stop = threading.Event()
         self.writer = None
@@ -227,6 +230,24 @@ class Lab:
             raise RuntimeError('lab stopped')
 
     def guard(self):
+        try:
+            self.sample_resources()
+        except Exception as error:
+            # Losing the monitor must stop the workload, not silently waive its
+            # resource limits. The owner thread observes stop and runs cleanup.
+            self.guard_error = f'disk monitor failed: {error}'
+            self.stop.set()
+            self.kill_owned()
+
+    def kill_owned(self):
+        for _, p in list(self.children):
+            if p.poll() is None:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def sample_resources(self):
         while not self.stop.is_set():
             used = int(subprocess.run(['/usr/bin/du', '-sk', str(WORKSPACE/'.agent')], capture_output=True).stdout.split()[0]) * 1024
             free = shutil.disk_usage('/').free
@@ -241,9 +262,7 @@ class Lab:
                 self.guard_error = f'disk guard: created={used}, free={free}; stopping with 300 MB headroom'
                 self.record('disk_stop', error=self.guard_error)
                 self.stop.set()
-                for _, p in list(self.children):
-                    if p.poll() is None:
-                        os.killpg(p.pid, signal.SIGKILL)
+                self.kill_owned()
                 return
             self.stop.wait(1)
 
@@ -600,8 +619,13 @@ CREATE TABLE electric_circuits.writer_ownership (
                 try:
                     os.killpg(p.pid, signal.SIGTERM)
                     p.wait(timeout=5)
+                except ProcessLookupError:
+                    p.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    os.killpg(p.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     p.wait(timeout=10)
             self.record('reaped', name=name, pid=p.pid, code=p.returncode)
         if self.guard_thread:

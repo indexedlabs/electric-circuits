@@ -9,6 +9,7 @@ import argparse
 import http.client
 import json
 from pathlib import Path
+import signal
 import threading
 import time
 
@@ -27,6 +28,9 @@ def main():
     args.ds = args.ds.resolve()
     args.scenario, args.shapes = 'append-limit', 0
     lab = Lab(args)
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(f'signal {signum}')
+    signal.signal(signal.SIGTERM, interrupted)
     try:
         lab.guard_thread = threading.Thread(target=lab.guard, daemon=True)
         lab.guard_thread.start()
