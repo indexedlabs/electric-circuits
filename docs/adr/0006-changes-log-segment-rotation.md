@@ -38,7 +38,8 @@ resume inside. Every change-log position becomes `(segment, offset)`; a catalog 
 predates this ADR and is refused at boot rather than coerced. The deletion floor is the **durable**
 checkpoint (the last `Offset` that reached storage), not the sequencer's in-memory position, so a
 crash can never leave a boot resuming inside a segment a sweep has deleted — and a boot whose
-restored position names a segment storage does not have refuses to start rather than spin on a 404.
+finds any segment from its restored position through the current one missing in storage refuses to
+start rather than spin on a 404.
 A reader leaving a closed segment steps to exactly the next one, never to the first open one: the
 segments in between are unread changes.
 
