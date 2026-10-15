@@ -1024,44 +1024,47 @@ async fn crashsim_boot_refuses_a_gap_between_checkpoint_and_writer() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn crashsim_unconfirmed_live_get_loss_retries_without_restart() {
-    for (index, (get_status, head_status)) in [(404, 200), (410, 200), (404, 503), (410, 503)].into_iter().enumerate() {
-        if index > 0 {
-            tokio::time::pause();
-        }
+#[tokio::test]
+async fn crashsim_false_live_get_loss_restarts_and_boots_intact_chain() {
+    for get_status in [404, 410] {
         let mut run = Run::new(store(), Default::default()).await;
         run.fresh().await;
         run.create("s1", None, true).await;
+        run.write(0x10, 1, Some("before false GET loss")).await;
+        let position = run.processed().await;
         let command = run.engine.state.lock().await.sequencer.as_ref().unwrap().cmd_tx.clone();
         let (done, ack) = tokio::sync::oneshot::channel();
         command.send(SequencerCmd::PauseReads { done }).unwrap();
         bounded("pause before false GET loss", ack).await.unwrap();
         while run.reads.try_recv().is_ok() {}
         *run.store.read_fault.lock().unwrap() = Some(("changes/0".into(), get_status));
-        if head_status != 200 {
-            *run.store.head_fault.lock().unwrap() = Some(("changes/0".into(), head_status));
-        }
-        let (tx, mut heads) = mpsc::unbounded_channel();
-        *run.store.head_observer.lock().unwrap() = Some(tx);
         let (done, ack) = tokio::sync::oneshot::channel();
         command.send(SequencerCmd::ResumeReads { done }).unwrap();
         bounded("resume with false GET loss", ack).await.unwrap();
-        run.read_at(&LogPosition::start()).await;
-        assert_eq!(run.engine.health_status(), "active", "a GET status alone must not latch replay failure");
-        assert!(!run.engine.shutdown.restart_requested());
-        let (path, status) = heads.try_recv().expect("the failed GET must be reconciled with HEAD");
-        assert!(path.ends_with("changes/0"));
-        assert_eq!(status, head_status);
-        assert_eq!(run.processed().await, LogPosition::start());
-        assert_eq!(replay_failed_diagnostic(&run).await, false);
-        // Retry must reach the same cursor and deliver a real later source transaction.
-        run.read_at(&LogPosition::start()).await;
-        run.write(0x100, 42, Some("after a false missing GET")).await;
-        assert_eq!(run.engine.metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 0);
-        assert_eq!(run.engine.health_status(), "active");
-        tokio::time::resume();
+        run.read_at(&position).await;
+        // This current-thread fixture returns the fault and runs its handler in the
+        // same poll as read arrival; a suspending response would need a completion fence.
+        assert!(
+            run.engine.shutdown.restart_requested(),
+            "GET {get_status} must request restart even with intact storage"
+        );
+        assert_eq!(bounded("false GET loss restart", run.engine.shutdown.wait_for_restart()).await, 75);
+        assert_eq!(run.engine.health_status(), "degraded");
+        assert_eq!(run.engine.readiness_status(), "shutting_down");
+        assert_eq!(run.processed().await, position, "a failed GET must preserve the replay boundary");
+        assert_eq!(replay_failed_diagnostic(&run).await, true);
+        assert_replay_refused(&run).await;
+        assert_eq!(run.engine.metrics.snapshot()["counters"]["sequencer_stream_gone_failures_total"], 1);
+        assert!(run.engine.ds.head("changes/0").await.unwrap().is_some(), "the GET fault must not delete storage");
         run.stop().await;
+        assert_eq!(checkpoints(&run.store).last().unwrap().0, position);
+
+        let mut restarted = Run::new(retained(&run.store), run.oracle.clone()).await;
+        restarted.boot().await;
+        restarted.probe_after_restart().await;
+        assert_eq!(restarted.engine.health_status(), "active");
+        assert!(!restarted.engine.shutdown.restart_requested());
+        restarted.stop().await;
     }
 }
 

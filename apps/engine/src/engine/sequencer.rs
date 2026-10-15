@@ -1097,38 +1097,16 @@ pub(crate) async fn sequencer_loop(
                     }
                 }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
-                    // A proxy may misroute a GET during a rollout. Only storage-confirmed
-                    // absence is terminal; a present segment or uncertain HEAD is retried.
-                    let confirmed = match ds.head(&read_path).await {
-                        Ok(None) => true,
-                        Ok(Some(_)) => {
-                            tracing::warn!("sequencer: GET reported {e:#}, but HEAD found {read_path}; retrying");
-                            false
-                        }
-                        Err(head_error) => {
-                            tracing::warn!(
-                                "sequencer: GET reported {e:#}; HEAD could not confirm loss of {read_path}: \
-                                 {head_error:#}; retrying"
-                            );
-                            false
-                        }
-                    };
-                    if !confirmed {
-                        back_off(&shutdown, std::time::Duration::from_secs(5)).await;
-                        continue;
-                    }
                     ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
-                    // The segment the sequencer is reading has been DELETED under it. The sweeper
-                    // deletes only below the durable checkpoint, and the boot refuses to start on a
-                    // missing segment. Preserve the replay boundary and withdraw readiness just
-                    // as for an unrecoverable read-cap breach; an idle-looking healthy loop would
-                    // otherwise serve stale shapes forever.
+                    // A GET 404/410 is terminal for this process, even if a proxy misreported it.
+                    // Preserve the replay boundary and withdraw readiness as for a terminal cap
+                    // breach. The next boot verifies the whole chain: intact storage can resume,
+                    // but an actual gap refuses boot instead of serving stale shapes.
                     sequencer_read_failed = true;
                     read_failure_latch.store(true, Ordering::SeqCst);
                     tracing::error!(
-                        "sequencer: the change-log segment it is reading is GONE ({e:#}). Nothing may delete a \
-                         segment the durable checkpoint has not passed, so storage has lost data or something \
-                         outside the engine deleted it; live reads halted and readiness withdrawn. Requesting restart.",
+                        "sequencer: GET reported the change-log segment is GONE ({e:#}); live reads halted \
+                         and readiness withdrawn. Requesting restart; boot will re-verify the segment chain.",
                     );
                     shutdown.restart_or_exit(75);
                 }

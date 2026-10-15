@@ -473,7 +473,7 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
 | `71` | shutdown **incomplete**: catalog drain or a source receipt missed the shutdown grace |
 | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
-| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested for a terminal live-replay failure (HEAD-confirmed missing segment or terminal read-cap breach), if catalog restore finds a sequencer already started at a different checkpoint, or if the Postgres-mode catalog writer refuses an `Offset` before its durable floor is known |
+| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested for a terminal live-replay failure (GET 404/410, missing successor or terminal read-cap breach), if catalog restore finds a sequencer already started at a different checkpoint, or if the Postgres-mode catalog writer refuses an `Offset` before its durable floor is known |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 
 ### Subscriptions: identified, idempotent, leased
@@ -600,17 +600,18 @@ clients can retry after boot or temporary managed-ownership admission; requests 
 replay from an unrestored cursor. Terminal replay failure is a distinct 503 refusal with no
 `Retry-After`, in both managed and unmanaged deployments.
 
-If HEAD confirms a required live change-log segment is missing (404/410), including a successor
-lookup at a closed segment's tail, the sequencer preserves its replay checkpoint, latches data refusal,
-and requests a fatal restart with code `75`. A terminal read-cap breach requests the same restart.
+A live change-log GET 404/410 is terminal for the current process, without a confirming HEAD or retry.
+The sequencer preserves its replay checkpoint, latches data refusal and requests a restart with code
+`75`. A missing successor found by HEAD at a closed segment's tail or a terminal read-cap breach
+requests the same restart.
 The engine health status is `degraded`; readiness becomes `shutting_down` as shutdown begins.
 The standalone binary exits with code `75` for its process supervisor to restart it; a supervised
 source notifies its owner, which queues replacement through the existing supervisor loop. Library
 mode never exits the host process: the embedder observes `shutdown_token().wait_for_restart()` and
-owns replacement. A GET 404/410 alone is retried if HEAD finds the segment or cannot confirm its absence.
-Before serving, boot verifies every segment from the saved checkpoint through the resolved current
-segment. Confirmed absence refuses boot with exit `78`; a transient HEAD failure follows the existing
-boot retry loop. Restart does not repair missing data or repeatedly publish active across a known gap.
+owns replacement. Before serving, the next boot verifies every segment from the saved checkpoint
+through the resolved current segment. After a transient false GET 404/410, an intact chain can resume.
+Confirmed absence refuses boot with exit `78`; a transient HEAD failure follows the existing boot retry
+loop. Restart does not repair missing data or repeatedly publish active across a known gap.
 
 Engine HTTP routes refuse data requests with 503 and no `Retry-After` during the exit window.
 Existing subscribers reading durable-streams directly bypass this refusal and receive no terminal

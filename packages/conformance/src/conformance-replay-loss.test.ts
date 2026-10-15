@@ -11,11 +11,10 @@ const schema: Schema = {
   tables: { items: { columns: { id: { type: 'int' } }, primaryKey: 'id' } },
 }
 
-it('exits 75 when a live change-log segment is confirmed missing after boot', async () => {
+it('exits 75 when a live change-log GET reports a missing segment after boot', async () => {
   let h: Harness | undefined
   let armed = false
   let getFailed = false
-  let headFailed = false
   try {
     h = await bootHarness(schema, {
       durableStreamsDurability: 'wal',
@@ -27,17 +26,13 @@ it('exits 75 when a live change-log segment is confirmed missing after boot', as
         const upstream = new URL(upstreamUrl)
         const server = createServer((incoming, outgoing) => {
           const target = new URL(incoming.url ?? '/', upstream)
-          if (armed && target.pathname === `/${testPhysicalPath('changes/0')}`) {
-            const liveGet = incoming.method === 'GET' && target.searchParams.has('live')
-            const confirmingHead = getFailed && incoming.method === 'HEAD'
-            if (liveGet || confirmingHead) {
-              if (liveGet) getFailed = true
-              if (confirmingHead) headFailed = true
-              incoming.resume()
-              outgoing.writeHead(404)
-              outgoing.end()
-              return
-            }
+          if (armed && incoming.method === 'GET' && target.searchParams.has('live')
+            && target.pathname === `/${testPhysicalPath('changes/0')}`) {
+            getFailed = true
+            incoming.resume()
+            outgoing.writeHead(404)
+            outgoing.end()
+            return
           }
           const forwarded = request(target, {
             method: incoming.method, headers: { ...incoming.headers, host: upstream.host },
@@ -70,12 +65,11 @@ it('exits 75 when a live change-log segment is confirmed missing after boot', as
     await createShape(h, { table: 'items' })
     await drainEngine(h)
     armed = true
-    // Wake any GET already forwarded before arming. The next live GET fails, and its
-    // confirming HEAD sees the same loss. The process exit is the terminal event.
+    // Wake any GET already forwarded before arming. The next live GET fails while
+    // storage and HEADs remain intact. The process exit is the terminal event.
     await pgQuery(h, 'INSERT INTO items (id) VALUES (1)')
     expect(await h.waitForEngineExit(10000)).toEqual({ code: 75, signal: null })
     expect(getFailed, 'the live-read fault must fire').toBe(true)
-    expect(headFailed, 'the engine must confirm the missing segment').toBe(true)
   } finally {
     await h?.shutdown()
   }
