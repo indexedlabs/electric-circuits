@@ -22,6 +22,9 @@ import urllib.parse
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
+# A clean source export can live under the controller's .agent/evidence tree.
+# Keep writable fixtures outside that export and count the controller's builds.
+WORKSPACE = next((p.parent for p in ROOT.parents if p.name == '.agent'), ROOT)
 PG = Path('/opt/homebrew/opt/postgresql@18/bin')
 SCOPE = '/circuits/v1/test-stack/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/test-query/'
 MAX_CREATED = 8_000_000_000
@@ -176,8 +179,8 @@ class Lab:
     def __init__(self, args):
         self.args = args
         self.name = args.scenario + '-' + time.strftime('%Y%m%d-%H%M%S')
-        self.out = ROOT / '.agent/results' / self.name
-        self.data = ROOT / '.agent/lab-data' / self.name
+        self.out = WORKSPACE / '.agent/results' / self.name
+        self.data = WORKSPACE / '.agent/lab-data' / self.name
         self.out.mkdir(parents=True)
         self.data.mkdir(parents=True)
         self.stop = threading.Event()
@@ -225,7 +228,7 @@ class Lab:
 
     def guard(self):
         while not self.stop.is_set():
-            used = int(subprocess.run(['/usr/bin/du', '-sk', str(ROOT/'.agent')], capture_output=True).stdout.split()[0]) * 1024
+            used = int(subprocess.run(['/usr/bin/du', '-sk', str(WORKSPACE/'.agent')], capture_output=True).stdout.split()[0]) * 1024
             free = shutil.disk_usage('/').free
             rss = {}
             for name, p in list(self.children):
@@ -305,6 +308,8 @@ CREATE TABLE electric_circuits.writer_ownership (
         self.revision = str(uuid.uuid4()) if managed else None
         self.engine, self.engineurl, boot = self.start_engine('A', self.revision, initial=managed)
         self.result['initial_boot_ms'] = boot
+        if managed:
+            self.request('/_admin/control-admission/open', 'POST')
         for i in range(self.args.shapes):
             rec = self.request('/shapes', 'POST', {'table': 'ticks', 'where': {'col': 'cohort', 'op': 'eq', 'value': i}})
             rec.update(table='ticks', cohort=i)
@@ -567,6 +572,7 @@ CREATE TABLE electric_circuits.writer_ownership (
         self.request('/_admin/deployment/promote', 'POST', {**handoff, 'successorRevision': successor}, url=burl)
         self.engine, self.engineurl = b, burl
         self.await_('successor-ready', lambda: http(burl+'/ready')[0] == 200, 180)
+        self.request('/_admin/control-admission/open', 'POST')
         ready_at = time.time()
         marker = str(uuid.uuid4())
         self.sql.run(f"INSERT INTO circuits_source_fence VALUES ('{marker}');")
