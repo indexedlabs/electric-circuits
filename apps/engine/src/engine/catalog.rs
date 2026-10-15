@@ -660,12 +660,12 @@ async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json
     }
 }
 
-/// Decode only event zero, then stop. The transport still buffers one capped page; the full fold
-/// owns validation of its remaining bytes/events and every later page, including duplicate bindings.
+/// Decode only event zero, then stop reading its response. The full fold owns validation of the
+/// remaining bytes/events and every later page, including duplicate bindings.
 async fn read_first_catalog_event(ds: &DsClient) -> Result<Option<serde_json::Value>> {
     let mut off = "-1".to_string();
     loop {
-        let (body, next, up_to_date, _permit) = ds.read_json_body(CATALOG_STREAM, &off).await?;
+        let (body, next, up_to_date, _permit) = ds.read_json_prefix(CATALOG_STREAM, &off).await?;
         let body = body.trim();
         if !body.is_empty() {
             let rest = body.strip_prefix('[').context("catalog page must be a JSON array")?.trim_start();

@@ -608,6 +608,13 @@ deleting it, §5.6) — i.e. the shape was dropped/evicted mid-flush; discard is
 shape envelopes are absolute per-pk (`upsert`/`delete` by key), an ambiguous-failure double-append
 is idempotent for readers.
 
+`GET /replication/lsn` reports `failingAppends`: the number of in-flight reliable appends retrying
+after failure, cleared on success, discard or cancellation. Terminal responses count only after
+reconciliation chooses Retry; a retirement Discard does not add a failure. This is diagnostic only,
+without affecting readiness, admission or retry policy. Repeated refusal ERROR logs include stream,
+status, envelope count and request bytes. Shape outputs still require one atomic append; they have
+no reader-side transaction-end protocol and must not be split into independently visible chunks.
+
 **A terminal answer is reconciled, not taken on trust.** "404" is what a proxy, a storage router or
 a failover says just as readily as a real deletion, and discarding the batch makes the sequencer
 advance past a committed Postgres change — leaving a still-registered shape permanently, silently
@@ -929,7 +936,9 @@ library mode do not carry native PostgreSQL type names, so a coarse `text` colum
 ## 9. Consistency & durability model (summary)
 
 Store admission reads only the first catalog event to validate the immutable `storeBound` identity.
-It buffers that capped response body but decodes no later events. The subsequent fold reads the
+It buffers only the prefix through that event, under the read byte cap, then drops the response;
+the size of the unread page tail cannot block admission. Empty pages are validated through EOF.
+The subsequent fold still enforces the ordinary page cap and reads the
 whole catalog page by page and checks bindings before `eid` de-duplication, so a duplicate or
 reordered `storeBound` still refuses boot before restore. Library-mode boot also completes this
 binding validation before publishing readiness, without folding or retaining nonbinding catalog
@@ -1065,7 +1074,8 @@ than the mechanism.
   series; a replacement starts fresh. Standalone metric names and route shapes stay the same.
 - **Probes:** `GET /health` is liveness (`ok` while the process runs, and never more than that);
   `GET /ready` is readiness (200 `active`, else 503 `waiting` / `starting` / `degraded` /
-  `shutting_down`); `GET /v1/health` is unchanged Electric-fleet parity. The HTTP surface comes up
+  `shutting_down`); `GET /v1/health` returns 200 `active`, 202 during boot, or 503 `degraded`.
+  Retrying appends do not alter either probe. The HTTP surface comes up
   before Postgres so readiness is answerable while the boot is still retrying.
 - `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
   indexes + shape contents, consumed by the **pipeline explorer** (`apps/pipeline-viz`).

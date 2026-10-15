@@ -409,6 +409,8 @@ pub(crate) enum BodyRead {
     OnFailure,
     OnData,
     Always,
+    /// Admission needs only the first JSON array value, never a resumable partial page.
+    FirstJson,
 }
 
 /// The cap against a store that advertises a page: four of the 4 MiB pages the server serves, so a
@@ -691,6 +693,83 @@ async fn read_body_bounded(
     String::from_utf8(body).context("durable-streams response body was not UTF-8")
 }
 
+/// Acquire at most `limit` bytes through the first array value, dropping the response immediately
+/// once it ends. JSON validation stays with the catalog. This scanner only finds the boundary;
+/// braces inside strings, escaped quotes and UTF-8 split across transport chunks are preserved.
+/// Empty arrays must reach EOF: a malformed empty page must never authorize initialization.
+async fn read_first_json_body(mut response: reqwest::Response, limit: u64, path: &str) -> Result<String> {
+    let mut body = Vec::new();
+    let mut array = false;
+    let mut value = false;
+    let mut empty = false;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut scalar = false;
+    while let Some(chunk) = response.chunk().await? {
+        for &byte in &chunk {
+            if body.len() as u64 >= limit {
+                return Err(anyhow::Error::new(ReadCapExceeded {
+                    path: path.into(),
+                    observed: body.len() as u64 + 1,
+                    limit,
+                    max_value_bytes: None,
+                }));
+            }
+            body.push(byte);
+            if empty {
+                continue;
+            }
+            if !array {
+                if byte.is_ascii_whitespace() {
+                    continue;
+                }
+                anyhow::ensure!(byte == b'[', "catalog page must be a JSON array");
+                array = true;
+                continue;
+            }
+            if !value {
+                if byte.is_ascii_whitespace() {
+                    continue;
+                }
+                if byte == b']' {
+                    empty = true;
+                    continue;
+                }
+                value = true;
+                scalar = !matches!(byte, b'{' | b'[' | b'"');
+            } else if scalar && (byte.is_ascii_whitespace() || matches!(byte, b',' | b']')) {
+                return String::from_utf8(body).context("catalog event zero was not UTF-8");
+            }
+            if quoted {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    quoted = false;
+                    if depth == 0 {
+                        return String::from_utf8(body).context("catalog event zero was not UTF-8");
+                    }
+                }
+            } else {
+                match byte {
+                    b'"' => quoted = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' if depth > 0 => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return String::from_utf8(body).context("catalog event zero was not UTF-8");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    String::from_utf8(body).context("catalog event zero was not UTF-8")
+}
+
 type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send + 'a>>;
 
 /// The engine-owned, provider-neutral single-attempt Durable Streams port.
@@ -711,6 +790,14 @@ pub(crate) trait DurableStreamStore: Send + Sync {
         response_body: BodyRead,
     ) -> StoreFuture<'a>;
     fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a>;
+    /// Event-zero admission only. A nonempty prefix is NOT a page and must not advance a cursor.
+    fn read_first<'a>(
+        &'a self,
+        path: &'a str,
+        offset: &'a str,
+        budget: &'a Arc<crate::memory_budget::MemoryBudget>,
+        limit: u64,
+    ) -> StoreFuture<'a>;
     fn read_budgeted<'a>(
         &'a self,
         path: &'a str,
@@ -916,14 +1003,16 @@ impl HttpDurableStreamsStore {
             BodyRead::Never => false,
             BodyRead::OnFailure => !(200..300).contains(&status),
             // Existing read paths return before acquiring a 204 body.
-            BodyRead::OnData => (200..300).contains(&status) && status != 204,
+            BodyRead::OnData | BodyRead::FirstJson => (200..300).contains(&status) && status != 204,
             BodyRead::Always => true,
         };
         // Keep acquisition fallible for the facade to interpret per operation.  In particular,
         // `read` and `read_json` used `res.text().await?` after a successful GET; turning an
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // The selected mode otherwise preserves the legacy per-operation best-effort behavior.
-        let body = if should_read {
+        let body = if should_read && matches!(body_read, BodyRead::FirstJson) {
+            Some(read_first_json_body(res, limit, path.unwrap_or("<unknown>")).await)
+        } else if should_read {
             Some(
                 read_body_bounded(res, limit, path.unwrap_or("<unknown>"), self.caps.advertised_max_value_bytes())
                     .await,
@@ -1012,6 +1101,25 @@ impl DurableStreamStore for HttpDurableStreamsStore {
         })
     }
 
+    fn read_first<'a>(
+        &'a self,
+        path: &'a str,
+        offset: &'a str,
+        budget: &'a Arc<crate::memory_budget::MemoryBudget>,
+        limit: u64,
+    ) -> StoreFuture<'a> {
+        Box::pin(async move {
+            let permit = budget.acquire(limit).await;
+            let res = self
+                .http
+                .get(format!("{}?offset={offset}", self.stream_url(path)))
+                .send()
+                .await
+                .with_context(|| format!("GET {path} (event zero)"))?;
+            Ok(self.response_budgeted(res, BodyRead::FirstJson, Some(path), permit, limit).await)
+        })
+    }
+
     fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
         Box::pin(async move {
             let res = self.http.head(self.stream_url(path)).send().await.with_context(|| format!("HEAD {path}"))?;
@@ -1057,9 +1165,29 @@ pub struct DsClient {
     /// what the retention disk-budget layer works from. It undercounts streams that already
     /// existed before the process started (restart persistence is the catalog work, GH #8).
     appended: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// In-flight reliable appends retrying after a failure. Diagnostic only; excludes retired streams.
+    failed_appends: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+struct FailedAppend<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> FailedAppend<'a> {
+    fn new(count: &'a std::sync::atomic::AtomicUsize) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for FailedAppend<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl DsClient {
+    pub(crate) fn failing_appends(&self) -> usize {
+        self.failed_appends.load(std::sync::atomic::Ordering::Relaxed)
+    }
     /// Share the boot configuration's process budget, also across supervised source clients.
     pub fn with_memory_budget(mut self, config: &crate::config::Config) -> Self {
         self.memory_budget = config.memory_budget.budget();
@@ -1116,6 +1244,7 @@ impl DsClient {
             store,
             reconcile: std::sync::Arc::new(std::sync::Mutex::new(None)),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            failed_appends: Arc::default(),
         }
     }
 
@@ -1286,7 +1415,7 @@ impl DsClient {
         Ok((events, next_offset, up_to_date))
     }
 
-    /// One capped JSON page before decoding, for catalog event-zero admission and byte accounting.
+    /// One capped JSON page before decoding, for full catalog validation/folding and byte accounting.
     /// Preserves `read_json`'s empty/missing-stream and fallible-body semantics. The returned body
     /// is still page-sized; callers can decode a prefix without allocating every event in it.
     pub(crate) async fn read_json_body(
@@ -1294,11 +1423,33 @@ impl DsClient {
         path: &str,
         offset: &str,
     ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
+        self.read_json_body_mode(path, offset, false).await
+    }
+
+    /// Only the first JSON value's prefix. Offset metadata is usable ONLY when the page is empty;
+    /// a nonempty prefix is never proof of a complete page or authorization to advance its cursor.
+    pub(crate) async fn read_json_prefix(
+        &self,
+        path: &str,
+        offset: &str,
+    ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
+        self.read_json_body_mode(path, offset, true).await
+    }
+
+    async fn read_json_body_mode(
+        &self,
+        path: &str,
+        offset: &str,
+        first_only: bool,
+    ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
-        let mut res = self
-            .store
-            .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
-            .await?;
+        let mut res = if first_only {
+            self.store.read_first(&physical_path, offset, &self.memory_budget, self.read_max_bytes()).await?
+        } else {
+            self.store
+                .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
+                .await?
+        };
         if res.status == 204 || res.status == 404 {
             return Ok((String::new(), res.next_offset, true, res.permit));
         }
@@ -1440,7 +1591,10 @@ impl DsClient {
             Err(AppendError::Gone(res.status))
         } else {
             let status = res.status;
-            Err(AppendError::Other(status_error("POST", path, status, &res.body_or_default())))
+            Err(AppendError::Other(
+                status_error("POST", path, status, &res.body_or_default())
+                    .context(format!("append rejected: {} envelopes, {payload_len} request bytes", envelopes.len())),
+            ))
         }
     }
 
@@ -1483,6 +1637,7 @@ impl DsClient {
     async fn append_reliable_inner(&self, path: &str, envelopes: &[Envelope]) -> bool {
         let mut attempt = 0u32;
         let mut false_gone = 0u32;
+        let mut failure = None;
         loop {
             match self.append_once(path, envelopes).await {
                 Ok(_) => return true,
@@ -1499,6 +1654,7 @@ impl DsClient {
                         );
                         return false;
                     }
+                    failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     false_gone += 1;
                     if false_gone == 1 {
                         tracing::warn!(
@@ -1512,6 +1668,7 @@ impl DsClient {
                     tokio::time::sleep(backoff).await;
                 }
                 Err(AppendError::Other(e)) => {
+                    failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     attempt += 1;
                     let backoff =
                         std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
@@ -2040,6 +2197,239 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn large_io_catalog_admission_reads_only_event_zero_under_the_cap() {
+        let store = Arc::new(ScriptedStore::default());
+        store.caps.effective.store(1024, std::sync::atomic::Ordering::Relaxed);
+        let expected = crate::store_identity::StoreBound::coupled_v1(&StreamScope::in_process_test_scope());
+        let mut event = serde_json::to_value(&expected).unwrap();
+        event["t"] = serde_json::json!("storeBound");
+        let body = format!("[{event},{}]", serde_json::json!({"padding": "x".repeat(4096)}));
+        assert!(event.to_string().len() < 1024 && body.len() > 1024);
+        store.pages_by_offset.lock().unwrap().insert("-1".into(), ("tail".into(), true, body));
+        let ds = DsClient::with_test_store("scripted://large-catalog".into(), store.clone());
+        let admission = crate::engine::Engine::admit_store(ds.clone(), expected, false).await;
+        assert!(
+            admission.is_ok(),
+            "event zero fits; the rest of its page must not block admission: {:?}",
+            admission.err()
+        );
+        let error = ds.read_json("meta/catalog", "-1").await.unwrap_err();
+        assert!(
+            error.downcast_ref::<ReadCapExceeded>().is_some(),
+            "ordinary reads must still enforce the cap: {error:#}"
+        );
+        assert!(store.appended.lock().unwrap().is_empty(), "admitting an existing binding never writes");
+    }
+
+    #[tokio::test]
+    async fn large_io_event_zero_stops_at_every_transport_split_and_exact_byte_cap() {
+        use tokio_stream::StreamExt;
+        let event = serde_json::json!({"nested": [{"text": "雪 } [ \\\" escaped"}], "n": 42});
+        let prefix = format!(" [ {event}").into_bytes();
+        for split in 0..=prefix.len() {
+            let chunks = vec![Ok::<_, std::io::Error>(prefix[..split].to_vec()), Ok(prefix[split..].to_vec())];
+            // Reading the next chunk would fail: admission must drop the response at event zero.
+            let stream =
+                tokio_stream::iter(chunks).chain(tokio_stream::once(Err(std::io::Error::other("unread tail"))));
+            let response = reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(stream)));
+            let body = read_first_json_body(response, prefix.len() as u64, "catalog").await.unwrap();
+            assert_eq!(body.as_bytes(), prefix, "transport split {split}");
+        }
+        for limit in [prefix.len() - 1, prefix.len(), prefix.len() + 1] {
+            let mut wire = prefix.clone();
+            wire.extend_from_slice(&[0xff; 4096]); // The same chunk's tail must not be copied or decoded.
+            let response = reqwest::Response::from(axum::http::Response::new(reqwest::Body::from(wire)));
+            let result = read_first_json_body(response, limit as u64, "catalog").await;
+            if limit < prefix.len() {
+                assert!(result.unwrap_err().downcast_ref::<ReadCapExceeded>().is_some());
+            } else {
+                assert_eq!(result.unwrap().as_bytes(), prefix);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_io_event_zero_read_errors_and_oversized_events_never_initialize() {
+        for head in ["[", "[]"] {
+            let stream = tokio_stream::iter(vec![Ok(head.to_string()), Err(std::io::Error::other("body interrupted"))]);
+            let response = reqwest::Response::from(axum::http::Response::new(reqwest::Body::wrap_stream(stream)));
+            let error = read_first_json_body(response, 1024, "catalog").await.unwrap_err();
+            assert!(is_unavailable(&error), "a body error before event zero/empty EOF cannot be hidden: {error:#}");
+        }
+        let config =
+            crate::config::Config::resolve(|key| (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| "1".into()))
+                .unwrap();
+        let expected = crate::store_identity::StoreBound::coupled_v1(&StreamScope::in_process_test_scope());
+        let store = Arc::new(ScriptedStore::default());
+        store.caps.effective.store(1024, std::sync::atomic::Ordering::Relaxed);
+        store.read_pages.lock().unwrap().push((
+            "tail".into(),
+            true,
+            format!("[{}]", serde_json::json!({"padding":"x".repeat(4096)})),
+        ));
+        let ds = DsClient::with_test_store("scripted://oversized-first-event".into(), store.clone())
+            .with_memory_budget(&config);
+        let error = crate::engine::Engine::admit_store(ds.clone(), expected, true).await.err().unwrap();
+        assert!(error.downcast_ref::<ReadCapExceeded>().is_some());
+        assert!(store.appended.lock().unwrap().is_empty());
+        assert_eq!(ds.memory_budget().held.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    async fn append_diagnostic_get(engine: &crate::engine::Engine, route: &str) -> (u16, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = crate::http::router(engine.clone())
+            .oneshot(axum::http::Request::builder().uri(route).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_io_append_failures_are_diagnostic_only() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+
+        let store = Arc::new(ScriptedStore::default());
+        store.append_limit.store(500, Ordering::Relaxed);
+        let ds = DsClient::with_test_store("scripted://append-limit".into(), store.clone());
+        let engine = crate::engine::Engine::new_for_in_process_test(ds.clone());
+        engine.install_managed_role_for_test(true);
+        let envs: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+            {"type":"public.items", "key":"1", "value":{"payload":"x".repeat(200)},
+             "headers":{"operation":"upsert", "txid":"42", "lsn":"0/42"}},
+            {"type":"public.items", "key":"2", "value":{"payload":"y".repeat(200)},
+             "headers":{"operation":"upsert", "txid":"42", "lsn":"0/42"}}
+        ]))
+        .unwrap();
+        assert!(serde_json::to_vec(&envs).unwrap().len() > 500);
+        let mut first = Box::pin(ds.append_reliable("shape/large-a", &envs));
+        let mut second = Box::pin(ds.append_reliable("shape/large-b", &envs));
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(store.rejected_appends.load(Ordering::Relaxed), 2);
+        assert!(store.appended.lock().unwrap().is_empty(), "no rejected transaction was delivered");
+        for route in ["/ready", "/v1/health"] {
+            assert_eq!(append_diagnostic_get(&engine, route).await, (200, serde_json::json!({"status":"active"})));
+        }
+        assert!(engine.managed_public_ready());
+        assert_eq!(append_diagnostic_get(&engine, "/tables").await.0, 200, "managed public admission stays open");
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 2);
+        store.append_limit.store(0, Ordering::Relaxed);
+        assert!(first.await.unwrap());
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 1);
+        engine.set_waiting();
+        for (route, status) in [("/ready", 503), ("/v1/health", 202)] {
+            assert_eq!(append_diagnostic_get(&engine, route).await, (status, serde_json::json!({"status":"waiting"})));
+        }
+        assert!(second.await.unwrap());
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
+        let writes = store.appended.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        for (_, _, body) in writes.iter() {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(body).unwrap(),
+                serde_json::to_value(&envs).unwrap()
+            );
+        }
+        drop(writes);
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_append_diagnostic_counts_retry_but_not_discard() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+        for status in [404, 410, 409] {
+            for outcome in [Some(GoneVerdict::Retry), Some(GoneVerdict::Discard), None] {
+                let store = Arc::new(ScriptedStore::default());
+                store.terminal_append_status.store(status, Ordering::Relaxed);
+                let ds = DsClient::with_test_store("scripted://held-reconciliation".into(), store.clone());
+                let gate = Arc::new(BodyGate::default());
+                let held = gate.clone();
+                ds.set_gone_reconciler(Arc::new(move |_| {
+                    let held = held.clone();
+                    Box::pin(async move {
+                        held.hold().await;
+                        outcome.unwrap_or(GoneVerdict::Discard)
+                    })
+                }));
+                let engine = crate::engine::Engine::new_for_in_process_test(ds.clone());
+                let envs: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+                    {"type":"items", "key":"1", "headers":{"operation":"delete"}}
+                ]))
+                .unwrap();
+                let mut pending = Box::pin(ds.append_reliable("shape/one", &envs));
+                std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(gate.arrived.load(Ordering::SeqCst), 1, "reconciliation is held");
+                assert!(store.appended.lock().unwrap().is_empty());
+                assert_eq!(ds.failed_appends.load(Ordering::Relaxed), 0, "not a storage failure before reconciliation");
+
+                match outcome {
+                    Some(verdict) => {
+                        store.terminal_append_status.store(0, Ordering::Relaxed);
+                        gate.released.notify_one();
+                        if verdict == GoneVerdict::Retry {
+                            std::future::poll_fn(|cx| {
+                                assert!(pending.as_mut().poll(cx).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 1);
+                        }
+                        let landed = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+                            .await
+                            .expect("released reconciliation must finish")
+                            .unwrap();
+                        assert_eq!(landed, verdict == GoneVerdict::Retry);
+                    }
+                    None => drop(pending),
+                }
+                assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
+                assert_eq!(store.appended.lock().unwrap().len(), usize::from(outcome == Some(GoneVerdict::Retry)));
+                engine.close(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_io_append_retry_cancellation_releases_diagnostic_and_reports_request_bytes() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+        let store = Arc::new(ScriptedStore::default());
+        store.append_limit.store(1, Ordering::Relaxed);
+        let ds = DsClient::with_test_store("scripted://cancel-append".into(), store);
+        let engine = crate::engine::Engine::new_for_in_process_test(ds.clone());
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
+        let envs: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+            {"type":"items", "key":"1", "headers":{"operation":"delete"}}
+        ]))
+        .unwrap();
+        let error = ds.append("shape/one", &envs).await.unwrap_err();
+        assert!(is_unavailable(&error), "retain retry classification");
+        assert!(format!("{error:#}").contains(&format!("{} request bytes", serde_json::to_vec(&envs).unwrap().len())));
+        let mut pending = Box::pin(ds.append_reliable("shape/one", &envs));
+        for _ in 0..3 {
+            std::future::poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 1);
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+        }
+        drop(pending);
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test]
     async fn reconciler_slot_is_first_wins_until_close_releases_it() {
         let client = DsClient::with_test_store("scripted://ownership".into(), Arc::new(ScriptedStore::default()));
         let owner = Arc::new(());
@@ -2235,6 +2625,11 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct ScriptedStore {
         pub(crate) caps: Arc<ReadCaps>,
+        /// Emulate a provider that rejects an oversized JSON append with HTTP 500.
+        pub(crate) append_limit: std::sync::atomic::AtomicUsize,
+        pub(crate) rejected_appends: std::sync::atomic::AtomicUsize,
+        /// Opt-in terminal-looking append failure; zero resumes successful writes.
+        pub(crate) terminal_append_status: std::sync::atomic::AtomicU16,
         pub(crate) body_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
         pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
         /// Opt-in append/read log for real-pgoutput tests. Cursors count appends per stream.
@@ -2333,6 +2728,31 @@ mod tests {
         fn read_caps(&self) -> Arc<ReadCaps> {
             self.caps.clone()
         }
+        fn read_first<'a>(
+            &'a self,
+            path: &'a str,
+            offset: &'a str,
+            budget: &'a Arc<crate::memory_budget::MemoryBudget>,
+            limit: u64,
+        ) -> StoreFuture<'a> {
+            Box::pin(async move {
+                let permit = budget.acquire(limit).await;
+                let mut res = self.read(path, offset, false).await?;
+                res.permit = permit;
+                if (200..300).contains(&res.status) && res.status != 204 {
+                    res.body = Some(match res.body.take() {
+                        Some(Ok(body)) => {
+                            let response =
+                                reqwest::Response::from(axum::http::Response::new(reqwest::Body::from(body)));
+                            read_first_json_body(response, limit, path).await
+                        }
+                        Some(Err(error)) => Err(error),
+                        None => Err(anyhow::anyhow!("scripted store omitted response body")),
+                    });
+                }
+                Ok(res)
+            })
+        }
         fn ready<'a>(&'a self) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push("ready".to_string());
@@ -2360,6 +2780,19 @@ mod tests {
             _response_body: BodyRead,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
+                let terminal = self.terminal_append_status.load(std::sync::atomic::Ordering::Relaxed);
+                if terminal != 0 {
+                    let mut res = response(terminal);
+                    res.closed = terminal == 409;
+                    return Ok(res);
+                }
+                let limit = self.append_limit.load(std::sync::atomic::Ordering::Relaxed);
+                if limit > 0 && body.len() > limit {
+                    self.rejected_appends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut res = response(500);
+                    res.body = Some(Ok("wal stage failed".into()));
+                    return Ok(res);
+                }
                 let fault = {
                     let mut scripted = self.append_fault.lock().unwrap();
                     match scripted.as_mut() {
@@ -2593,6 +3026,16 @@ mod tests {
                 let gate = self.body_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
                     gate.hold().await;
+                }
+                if let Some(Ok(body)) = &response.body
+                    && body.len() as u64 > limit
+                {
+                    response.body = Some(Err(anyhow::Error::new(ReadCapExceeded {
+                        path: path.into(),
+                        observed: body.len() as u64,
+                        limit,
+                        max_value_bytes: None,
+                    })));
                 }
                 Ok(response)
             })

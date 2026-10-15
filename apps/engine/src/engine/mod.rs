@@ -2686,6 +2686,11 @@ impl Engine {
         self.repl_lsn.lock().unwrap().clone()
     }
 
+    /// In-flight reliable appends retrying after failure; diagnostic, not readiness or a drain fence.
+    pub(crate) fn failing_appends(&self) -> usize {
+        self.ds.failing_appends()
+    }
+
     /// Highest `__el_sync` sentinel counter the ingestor has decoded-and-appended.
     pub fn replication_sync(&self) -> i64 {
         self.repl_sync.load(std::sync::atomic::Ordering::Relaxed)
