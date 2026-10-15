@@ -747,6 +747,12 @@ pub(crate) fn init_otel(
     );
     engine_gauge!("engine_sequencer_held", "Estimated in-memory held envelope bytes", sequencer_held_bytes, "By");
     engine_counter!("engine_sequencer_held_spills", "Held transactions spilled to disk", sequencer_held_spills, "");
+    engine_counter!(
+        "engine_sequencer_stream_gone_failures",
+        "Terminal missing-segment reads; restart required",
+        sequencer_stream_gone_failures,
+        ""
+    );
     engine_gauge!("engine_shutdown_in_progress", "1 once a graceful shutdown has begun", shutdown_in_progress, "");
     engine_gauge!(
         "engine_replication_slot_retained_wal",

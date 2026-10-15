@@ -1,6 +1,7 @@
 // The native shape catalog is the restart contract: once POST /shapes succeeds, a crash must not
 // turn that acknowledged shape into an unmaintained durable stream. This test puts an ordinary HTTP
-// reverse proxy between the engine and durable-streams and makes only catalog appends return 503.
+// reverse proxy between the engine and durable-streams and makes catalog appends return transient
+// 503s or a permanent 403; the latter must make the standalone process exit 74.
 // It uses no engine hooks or private APIs: PostgreSQL SQL, POST/GET /shapes, process restart, and the
 // durable stream URL returned by the native create response are the complete reproduction.
 
@@ -37,7 +38,7 @@ interface CatalogFaultProxy {
   failedCatalogAppends(): number
   failedShapeRetirements(): number
   lostCatalogResponses(): number
-  failCatalogAppends(fail: boolean): void
+  failCatalogAppends(fail: boolean, status?: 403 | 503): void
   failShapeRetirements(fail: boolean): void
   loseNextCatalogResponse(): void
   close(): Promise<void>
@@ -45,6 +46,7 @@ interface CatalogFaultProxy {
 
 async function startCatalogFaultProxy(upstreamUrl: string): Promise<CatalogFaultProxy> {
   let fail = false
+  let failureStatus: 403 | 503 = 503
   let failures = 0
   let failRetirements = false
   let retirementFailures = 0
@@ -56,8 +58,8 @@ async function startCatalogFaultProxy(upstreamUrl: string): Promise<CatalogFault
     if (fail && incoming.method === 'POST' && target.pathname === `/${testPhysicalPath('meta/catalog')}`) {
       failures += 1
       incoming.resume()
-      outgoing.writeHead(503, { 'content-type': 'text/plain' })
-      outgoing.end('catalog temporarily unavailable')
+      outgoing.writeHead(failureStatus, { 'content-type': 'text/plain' })
+      outgoing.end(failureStatus === 503 ? 'catalog temporarily unavailable' : 'catalog append refused')
       return
     }
     if (
@@ -114,8 +116,9 @@ async function startCatalogFaultProxy(upstreamUrl: string): Promise<CatalogFault
     failedCatalogAppends: () => failures,
     failedShapeRetirements: () => retirementFailures,
     lostCatalogResponses: () => lostCatalogResponses,
-    failCatalogAppends: (next) => {
+    failCatalogAppends: (next, status = 503) => {
       fail = next
+      failureStatus = status
     },
     failShapeRetirements: (next) => {
       failRetirements = next
@@ -162,6 +165,37 @@ afterEach(async () => {
 })
 
 describe('native catalog durability under a durable-streams status failure', () => {
+  it('exits 74 when storage permanently refuses a runtime catalog append', async () => {
+    let proxy: CatalogFaultProxy | undefined
+    h = await bootHarness(schema, {
+      wrapEngineDs: async (upstreamUrl) => {
+        proxy = await startCatalogFaultProxy(upstreamUrl)
+        return proxy
+      },
+      engineEnv: {
+        ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS: '0',
+        ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS: '5',
+      },
+    })
+    // A successful create proves the writer established its catalog stream before the fault.
+    const shape = await createShape(h, { table: 'items' })
+    proxy!.failCatalogAppends(true, 403)
+    const controller = new AbortController()
+    // The fatal exit may interrupt this HTTP request. Its response is not the exit-code oracle.
+    const deleting = fetch(`${h.engineUrl}/shapes/${shape.shapeId}?purge=true`, {
+      method: 'DELETE',
+      signal: controller.signal,
+    }).then((response) => response.body?.cancel(), () => undefined)
+    try {
+      const exit = await h.waitForEngineExit(15000)
+      expect(proxy!.failedCatalogAppends(), 'the storage fault must have reached the running engine').toBeGreaterThan(0)
+      expect(exit, h.engineStderr()).toEqual({ code: 74, signal: null })
+    } finally {
+      controller.abort()
+      await deleting
+    }
+  }, 60000)
+
   it('does not acknowledge a shape whose Created record was rejected by storage', async () => {
     let proxy: CatalogFaultProxy | undefined
     h = await bootHarness(schema, {

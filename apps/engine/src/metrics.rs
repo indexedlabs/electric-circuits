@@ -178,6 +178,9 @@ pub struct Metrics {
     /// COUNTER: held transactions that crossed their memory cap and spilled.
     pub sequencer_held_spills: AtomicU64,
     pub sequencer_read_cap_failures: AtomicU64,
+    /// Lifetime counter: terminal missing-segment reads. Kept across metrics reset because the
+    /// associated replay latch also lasts until restart.
+    pub sequencer_stream_gone_failures: AtomicU64,
     /// GAUGE: 1 once a `SIGTERM`/`SIGINT` graceful shutdown has begun (see [`crate::shutdown`]).
     pub shutdown_in_progress: AtomicU64,
     /// ADR-0008 GAUGE: live subscriptions across every shape — the claims pinning shapes against
@@ -255,6 +258,7 @@ impl Metrics {
             sequencer_held_bytes: AtomicU64::new(0),
             sequencer_held_spills: AtomicU64::new(0),
             sequencer_read_cap_failures: AtomicU64::new(0),
+            sequencer_stream_gone_failures: AtomicU64::new(0),
             shutdown_in_progress: AtomicU64::new(0),
             replication_slot_retained_wal_bytes: AtomicU64::new(0),
             replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
@@ -309,6 +313,7 @@ impl Metrics {
                 "retirement_retries_total": self.retirement_retries.load(Ordering::Relaxed),
                 "txn_spills_total": self.txn_spills.load(Ordering::Relaxed),
                 "sequencer_held_spills_total": self.sequencer_held_spills.load(Ordering::Relaxed),
+                "sequencer_stream_gone_failures_total": self.sequencer_stream_gone_failures.load(Ordering::Relaxed),
                 "memory_permit_waits_total": self.memory_budget.waits.load(Ordering::Relaxed),
                 "txn_spill_bytes": self.txn_spill_bytes.load(Ordering::Relaxed),
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),

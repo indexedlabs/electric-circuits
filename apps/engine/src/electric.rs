@@ -432,6 +432,14 @@ impl ApiError {
 
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::engine::ReplayFailed>().is_some() {
+            return ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!("{e:#}"),
+                retry_after: None,
+                must_refetch: false,
+            };
+        }
         if e.downcast_ref::<crate::schema::UnknownColumn>().is_some() {
             return ApiError::bad_request(format!("{e:#}"));
         }
@@ -926,6 +934,11 @@ fn degraded(why: &anyhow::Error) -> Response {
     let len = body.len() as u64;
     let mut headers = HeaderMap::new();
     headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // Boot/ownership admission is temporary. Terminal replay failure has a distinct type and
+    // intentionally gets no Retry-After, just like the conversion from shape_inner.
+    if why.downcast_ref::<crate::engine::DeploymentNotReady>().is_some() {
+        headers.insert(axum::http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
     let mut resp = (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response();
     resp.extensions_mut().insert(BodyLen(len));
     resp

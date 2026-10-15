@@ -41,7 +41,7 @@ async fn managed_public_traffic_waits_for_full_engine_readiness_after_claim() {
 async fn live_read_cap_failure_withdraws_readiness_once() {
     let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
     assert_eq!(engine.readiness_status(), "active");
-    engine.read_cap_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+    engine.sequencer_read_failed.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(engine.readiness_status(), "degraded");
     assert_eq!(engine.readiness_status(), "degraded");
 }
@@ -2757,10 +2757,12 @@ async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it(
     let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
     let paging = crate::ds::readiness_json(&identity)
         .replace("\"reserve\":{", "\"max_chunk_bytes\":4194304,\"max_value_bytes\":4194304,\"reserve\":{");
+    let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
         readiness_body: std::sync::Mutex::new(Some(paging)),
         cap_breach_live_reads: std::sync::atomic::AtomicUsize::new(1),
         stall_live_reads: true,
+        read_observer: std::sync::Mutex::new(Some(tx)),
         ..Default::default()
     });
     let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
@@ -2770,14 +2772,20 @@ async fn an_advertised_page_cap_still_latches_degraded_when_the_store_breaks_it(
         let mut st = engine.state.lock().await;
         engine.ensure_sequencer(&mut st);
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while engine.readiness_status() != "degraded" {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a store that broke its own advertised page must still withdraw readiness"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let (_, _, live) = reads.recv().await.unwrap();
+            if live {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("read-cap breach response");
+    assert_eq!(engine.health_status(), "degraded");
+    assert!(engine.shutdown.restart_requested(), "a terminal body-cap breach must request restart");
+    assert_eq!(engine.shutdown.wait_for_restart().await, 75);
+    assert_eq!(engine.close(std::time::Duration::from_secs(10)).await, crate::shutdown::ShutdownOutcome::Complete);
 }
 
 #[tokio::test]

@@ -153,7 +153,7 @@ pub(crate) fn spawn_sequencer(
     library_mode: bool,
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
-    read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
+    read_failure_latch: Arc<std::sync::atomic::AtomicBool>,
     // Per-shape ceiling for the pending-creation buffer (see `buffer_pending`).
     pending_buffer_max_bytes: u64,
     txn_cfg: crate::txn_buffer::TxnBufferConfig,
@@ -190,7 +190,7 @@ pub(crate) fn spawn_sequencer(
         library_mode,
         start_paused,
         pause_gate,
-        read_cap_latch,
+        read_failure_latch,
         pending_buffer_max_bytes,
         txn_cfg,
         sequenced,
@@ -459,7 +459,7 @@ pub(crate) async fn sequencer_loop(
     library_mode: bool,
     start_paused: bool,
     pause_gate: Arc<std::sync::atomic::AtomicBool>,
-    read_cap_latch: Arc<std::sync::atomic::AtomicBool>,
+    read_failure_latch: Arc<std::sync::atomic::AtomicBool>,
     pending_buffer_max_bytes: u64,
     txn_cfg: crate::txn_buffer::TxnBufferConfig,
     sequenced: Option<Arc<crate::pg::SequencedXids>>,
@@ -469,10 +469,9 @@ pub(crate) async fn sequencer_loop(
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut paused = start_paused;
-    // A bounded body breach is terminal for this live loop: retrying the same uncapped page can
-    // never make progress. Commands and shutdown remain serviced, but reads stay halted until a
-    // restart with a compatible store/cap.
-    let mut read_cap_failed = false;
+    // A missing segment or unrecoverable body breach is terminal for this live loop. Keep reads
+    // halted while the fatal restart request shuts it down at the safe checkpoint boundary.
+    let mut sequencer_read_failed = false;
     // Whether the store has been re-attested since the last successful read. A read failure is the
     // only reconnect signal this client gets (reqwest owns the connection pool and reports no
     // reconnect event), so the first failure of a streak re-reads readiness; the rest of the streak
@@ -532,7 +531,7 @@ pub(crate) async fn sequencer_loop(
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
-        if pending_read.is_none() && !paused && !read_cap_failed {
+        if pending_read.is_none() && !paused && !sequencer_read_failed {
             let ds = ds.clone();
             let (path, offset) = (read_path.clone(), read_off.clone());
             pending_read = Some(Box::pin(async move { ds.read_budgeted(&path, &offset, true).await }));
@@ -698,7 +697,7 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested at {}", published(&pos, &held_from));
                 break;
             }
-            res = async { pending_read.as_mut().expect("unpaused read exists").await }, if !paused && !read_cap_failed => {
+            res = async { pending_read.as_mut().expect("unpaused read exists").await }, if !paused && !sequencer_read_failed => {
                 pending_read = None;
                 match res {
                 Ok((rr, page_permit)) => {
@@ -1056,6 +1055,17 @@ pub(crate) async fn sequencer_loop(
                                         *processed.lock().unwrap() = published(&pos, &held_from);
                                         crossed = true;
                                     }
+                                    Err(e) if e.is::<crate::changelog::MissingSuccessor>() => {
+                                        ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
+                                        sequencer_read_failed = true;
+                                        read_failure_latch.store(true, Ordering::SeqCst);
+                                        tracing::error!(
+                                            "sequencer: cannot leave the closed segment {}: {e:#}. \
+                                             Live reads halted; requesting restart without skipping data.",
+                                            pos.path()
+                                        );
+                                        shutdown.restart_or_exit(75);
+                                    }
                                     Err(e) => {
                                         tracing::error!(
                                             "sequencer: cannot leave the closed segment {}: {e:#}. Backing off; \
@@ -1087,18 +1097,20 @@ pub(crate) async fn sequencer_loop(
                     }
                 }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
+                    ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
                     // The segment the sequencer is reading has been DELETED under it. The sweeper
                     // deletes only below the durable checkpoint, and the boot refuses to start on a
-                    // missing segment, so this is unreachable by design — say so at ERROR and back
-                    // off rather than spin quietly at 5 Hz on a 404.
+                    // missing segment. Preserve the replay boundary and withdraw readiness just
+                    // as for an unrecoverable read-cap breach; an idle-looking healthy loop would
+                    // otherwise serve stale shapes forever.
+                    sequencer_read_failed = true;
+                    read_failure_latch.store(true, Ordering::SeqCst);
                     tracing::error!(
                         "sequencer: the change-log segment it is reading is GONE ({e:#}). Nothing may delete a \
                          segment the durable checkpoint has not passed, so storage has lost data or something \
-                         outside the engine deleted it; the sequencer cannot advance. Backing off.",
+                         outside the engine deleted it; live reads halted and readiness withdrawn. Requesting restart.",
                     );
-                    // Cut short by a shutdown: this backoff is dead time, and spending 5 s of a
-                    // 25 s grace on it would be for nothing (the loop re-selects and breaks anyway).
-                    back_off(&shutdown, std::time::Duration::from_secs(5)).await;
+                    shutdown.restart_or_exit(75);
                 }
                 Err(e) => {
                     if let Some(cap) = e.downcast_ref::<crate::ds::ReadCapExceeded>() {
@@ -1125,10 +1137,11 @@ pub(crate) async fn sequencer_loop(
                                 back_off(&shutdown, std::time::Duration::from_millis(200)).await;
                             }
                             crate::ds::CapBreachOutcome::Latch => {
-                                read_cap_failed = true;
-                                read_cap_latch.store(true, Ordering::SeqCst);
+                                sequencer_read_failed = true;
+                                read_failure_latch.store(true, Ordering::SeqCst);
                                 tracing::error!(path = %cap.path, observed = cap.observed, limit = cap.limit,
                                     "sequencer halted live reads after a Durable Streams body-cap breach; restart required");
+                                shutdown.restart_or_exit(75);
                             }
                         }
                     } else {
@@ -2486,7 +2499,7 @@ mod source_fence_tests {
             true,
             false,
             engine.restore_reads_paused.clone(),
-            engine.read_cap_failed.clone(),
+            engine.sequencer_read_failed.clone(),
             engine.retention.pending_buffer_max_bytes,
             engine.txn_cfg.lock().unwrap().clone(),
             None,
@@ -2906,7 +2919,7 @@ mod held_spill_tests {
                 false,
                 false,
                 engine.restore_reads_paused.clone(),
-                engine.read_cap_failed.clone(),
+                engine.sequencer_read_failed.clone(),
                 engine.retention.pending_buffer_max_bytes,
                 engine.txn_cfg.lock().unwrap().clone(),
                 None,

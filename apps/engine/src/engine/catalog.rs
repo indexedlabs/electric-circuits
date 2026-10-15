@@ -7,6 +7,10 @@ use super::*;
 #[path = "ingest_projection_tests.rs"]
 mod ingest_projection_tests;
 
+#[cfg(test)]
+#[path = "crash_consistency_tests.rs"]
+mod crash_consistency_tests;
+
 /// The engine's durable **shape catalog**: an append-only event stream replayed at boot so a
 /// restart re-registers every shape itself instead of requiring a client re-registration storm.
 /// Plain/routed shapes resume with passthrough gates (the change log replays everything after the

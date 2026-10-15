@@ -491,15 +491,21 @@ impl ChangeLogWriter {
 pub async fn next_segment_for_reader(ds: &DsClient, closed: u32) -> Result<u32> {
     let next = closed + 1;
     if ds.head(&segment_path(next)).await?.is_none() {
-        bail!(
-            "change log: {} is closed but its successor {} does not exist — rotation always creates \
-             the successor before it closes the predecessor, so this storage state cannot have been \
-             produced by the engine. Refusing to skip ahead.",
-            segment_path(closed),
-            segment_path(next)
-        );
+        return Err(MissingSuccessor { closed, next }.into());
     }
     Ok(next)
+}
+
+/// Confirmed absent (HEAD 404/410), distinct from a failed lookup that may be retried.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "change log: changes/{closed} is closed but its successor changes/{next} does not exist — rotation always creates \
+     the successor before it closes the predecessor, so this storage state cannot have been \
+     produced by the engine. Refusing to skip ahead."
+)]
+pub(crate) struct MissingSuccessor {
+    closed: u32,
+    next: u32,
 }
 
 /// Resolve the segment the log is actually being **written** at, starting from the catalog fold's

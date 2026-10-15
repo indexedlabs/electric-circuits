@@ -1240,6 +1240,7 @@ async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
+    engine.ensure_not_degraded()?;
     let _control = engine.admit_control()?;
     let subscription = validate_new_subscription(req.subscription)?;
     let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
@@ -1673,6 +1674,8 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
         // Flip batches abandoned after exhausting their retries; non-zero means the engine is
         // degraded (its membership-bearing routes answer 503) and must be restarted.
         "flipFailures": engine.flip_failures(),
+        // Terminal live-replay loss or body-cap breach; admission stays closed until restart.
+        "replayFailed": engine.sequencer_read_failed.load(std::sync::atomic::Ordering::Relaxed),
         // Which replication slot, in which cluster, this engine is bound to (ADR-0004), and whether
         // that binding still holds. `state: "broken"` is the refuse policy's degraded state: ingest
         // is stopped, shape routes answer 503, and `POST /epoch/reset` is the way out.
@@ -1769,6 +1772,7 @@ impl From<anyhow::Error> for AppError {
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
         let status = if retry_after
             || e.downcast_ref::<crate::engine::Degraded>().is_some()
+            || e.downcast_ref::<crate::engine::ReplayFailed>().is_some()
             || e.downcast_ref::<crate::engine::EpochBroken>().is_some()
             || e.downcast_ref::<crate::engine::EpochResetting>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Disabled))

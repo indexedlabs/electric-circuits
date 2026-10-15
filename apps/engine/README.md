@@ -472,7 +472,7 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | `0` | a graceful shutdown completed inside its grace period |
 | `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
 | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
-| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested if catalog restore finds a sequencer already started at a different checkpoint |
+| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested if catalog restore finds a sequencer already started at a different checkpoint, or the Postgres-mode catalog writer refuses an `Offset` before its durable floor is known |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 
 ### Subscriptions: identified, idempotent, leased
@@ -592,6 +592,29 @@ boot finishes — the budget is per append, not per boot, and a storage outage t
 an operator should be seeing anyway.
 
 ### Boot: fatal vs retryable
+
+Until PostgreSQL setup and catalog restore finish, shape, aggregate, subset and resume requests
+are refused with HTTP 503. The native routes and Electric `/v1/shape` include `Retry-After: 1` so
+clients can retry after boot or temporary managed-ownership admission; requests cannot start
+replay from an unrestored cursor. Terminal replay failure is a distinct 503 refusal with no
+`Retry-After`, in both managed and unmanaged deployments.
+
+If a required live change-log segment returns 404/410, including a successor HEAD after restoring
+at a closed segment's tail, the sequencer preserves its replay checkpoint, latches data refusal,
+and requests a fatal restart with code `75`. A terminal read-cap breach requests the same restart.
+The engine health status is `degraded`; readiness becomes `shutting_down` as shutdown begins.
+The standalone binary exits with code `75` for its process supervisor to restart it; a supervised
+source notifies its owner, which queues replacement through the existing supervisor loop. Library
+mode never exits the host process: the embedder observes `shutdown_token().wait_for_restart()` and
+owns replacement. Restart revalidates the catalog and required segments before serving again;
+it does not repair missing data.
+
+Engine HTTP routes refuse data requests with 503 and no `Retry-After` during the exit window.
+Existing subscribers reading durable-streams directly bypass this refusal and receive no terminal
+signal from the latch; their streams stop advancing until recovery. `GET /replication/lsn` exposes
+`replayFailed` for either terminal replay cause. The lifetime counter
+`sequencer_stream_gone_failures_total` (`engine_sequencer_stream_gone_failures_total` in Prometheus)
+identifies missing-segment failures specifically.
 
 A Postgres failure at boot is classified, not guessed at (`pg::classify`), and the two classes get
 opposite treatment.

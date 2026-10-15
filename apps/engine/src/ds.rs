@@ -257,9 +257,9 @@ pub struct StreamHead {
 ///
 /// A typed error because callers make very different decisions about it than about a transient read
 /// failure. On the change log (ADR-0006) it is never expected — a segment is deleted only once
-/// nothing can resume inside it — so the sequencer treats it as an error to log loudly and back off
-/// from, the boot treats it as fatal for the position it is about to resume, and a dormant shape's
-/// replay treats it as "this shape can never be brought up to date", which evicts it.
+/// nothing can resume inside it — so the sequencer logs it, halts reads and latches a data-admission
+/// refusal while requesting a host restart. Boot treats it as fatal for the position it is about to
+/// resume, and a dormant shape's replay treats it as "this shape can never be brought up to date", which evicts it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamGone {
     pub path: String,
@@ -2190,7 +2190,7 @@ impl<'de> Deserialize<'de> for StrictJson {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{BodyGate, ScriptedStore, readiness_json};
+pub(crate) use tests::{AppendFault, BodyGate, ScriptedStore, readiness_json};
 
 #[cfg(test)]
 mod tests {
@@ -2634,6 +2634,17 @@ mod tests {
         pub(crate) appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
         /// Opt-in append/read log for real-pgoutput tests. Cursors count appends per stream.
         pub(crate) read_appended: bool,
+        /// Opt-in stream lifecycle for crash tests: path -> closed. Absence means 404.
+        pub(crate) streams: Option<std::sync::Mutex<HashMap<String, bool>>>,
+        /// Status for an absent stream on GET/HEAD; zero retains the normal 404 default.
+        pub(crate) missing_status: u16,
+        /// One transient HEAD response for a matching path suffix.
+        pub(crate) head_fault: std::sync::Mutex<Option<(String, u16)>>,
+        pub(crate) head_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, u16)>>>,
+        /// One fault at the nth matching append, consumed before it is executed.
+        pub(crate) append_fault: std::sync::Mutex<Option<(String, usize, AppendFault)>>,
+        pub(crate) read_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>>,
+        pub(crate) read_gate: std::sync::Mutex<Option<(String, bool, Arc<BodyGate>)>>,
         pub(crate) appended_changed: tokio::sync::Notify,
         pub(crate) append_notifiers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
@@ -2685,6 +2696,13 @@ mod tests {
         pub arrived: std::sync::atomic::AtomicUsize,
         pub entered: tokio::sync::Notify,
         pub released: tokio::sync::Notify,
+    }
+
+    pub(crate) enum AppendFault {
+        Hold(Arc<BodyGate>),
+        Unavailable,
+        /// The append is atomic, but its acknowledgement is lost (an ambiguous failure).
+        CommitThenUnavailable,
     }
 
     impl BodyGate {
@@ -2747,6 +2765,9 @@ mod tests {
         fn ensure<'a>(&'a self, path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
+                if let Some(streams) = &self.streams {
+                    streams.lock().unwrap().entry(path.to_string()).or_insert(false);
+                }
                 Ok(response(201))
             })
         }
@@ -2772,6 +2793,32 @@ mod tests {
                     res.body = Some(Ok("wal stage failed".into()));
                     return Ok(res);
                 }
+                let fault = {
+                    let mut scripted = self.append_fault.lock().unwrap();
+                    match scripted.as_mut() {
+                        Some((suffix, skip, _)) if path.ends_with(suffix.as_str()) => {
+                            if *skip == 0 {
+                                scripted.take().map(|(_, _, fault)| fault)
+                            } else {
+                                *skip -= 1;
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                match &fault {
+                    Some(AppendFault::Hold(gate)) => gate.hold().await,
+                    Some(AppendFault::Unavailable) => return Ok(response(503)),
+                    _ => {}
+                }
+                if let Some(streams) = &self.streams {
+                    match streams.lock().unwrap().get(path) {
+                        None => return Ok(response(404)),
+                        Some(true) => return Ok(response(410)),
+                        Some(false) => {}
+                    }
+                }
                 if self.fail_append_path.as_deref().is_some_and(|p| path.ends_with(p)) {
                     return Err(anyhow::anyhow!("scripted append failure"));
                 }
@@ -2791,14 +2838,36 @@ mod tests {
                         signal.notify_one();
                     }
                 }
-                Ok(response(204))
+                let mut res =
+                    response(if matches!(fault, Some(AppendFault::CommitThenUnavailable)) { 503 } else { 204 });
+                if self.streams.is_some() {
+                    let end = self.appended.lock().unwrap().iter().filter(|(p, _, _)| p == path).count();
+                    res.next_offset = Some(format!("0000000000000000_{end:016}"));
+                }
+                Ok(res)
             })
         }
 
         fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a> {
             Box::pin(async move {
+                // Like HTTP, each strict-fixture read gives the restore task a chance to
+                // finish its pause/resume handshake. Yield BEFORE reporting arrival so a
+                // missing-stream response and its caller's error handling share one poll.
+                if self.streams.is_some() {
+                    tokio::task::yield_now().await;
+                }
                 self.read_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.read_offsets.lock().unwrap().push(offset.to_string());
+                if let Some(observer) = self.read_observer.lock().unwrap().as_ref() {
+                    let _ = observer.send((path.to_string(), offset.to_string(), live));
+                }
+                let gate = self.read_gate.lock().unwrap().clone();
+                if let Some((suffix, gated_live, gate)) = gate
+                    && live == gated_live
+                    && path.ends_with(&suffix)
+                {
+                    gate.hold().await;
+                }
                 let observer = self.held_change_reads.lock().unwrap().clone();
                 if let Some(observer) = observer
                     && let Some((_, segment)) = path.rsplit_once("/changes/")
@@ -2814,22 +2883,41 @@ mod tests {
                         let changed = self.appended_changed.notified();
                         tokio::pin!(changed);
                         changed.as_mut().enable();
+                        let closed = if let Some(streams) = &self.streams {
+                            match streams.lock().unwrap().get(path) {
+                                None => {
+                                    return Ok(response(if self.missing_status == 0 {
+                                        404
+                                    } else {
+                                        self.missing_status
+                                    }));
+                                }
+                                Some(closed) => *closed,
+                            }
+                        } else {
+                            false
+                        };
                         let (end, events) = {
                             let log = self.appended.lock().unwrap();
                             let entries: Vec<_> = log.iter().filter(|(p, _, _)| p == path).collect();
                             let events: Vec<serde_json::Value> = entries
                                 .iter()
-                                .skip(offset.parse().unwrap_or(0))
+                                .skip(offset.rsplit('_').next().unwrap_or(offset).parse().unwrap_or(0))
                                 .flat_map(|(_, _, body)| {
                                     serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()
                                 })
                                 .collect();
                             (entries.len(), events)
                         };
-                        if !events.is_empty() || !live {
+                        if !events.is_empty() || !live || closed {
                             let mut res = response(200);
-                            res.next_offset = Some(end.to_string());
+                            res.next_offset = Some(if self.streams.is_some() {
+                                format!("0000000000000000_{end:016}")
+                            } else {
+                                end.to_string()
+                            });
                             res.up_to_date = true;
+                            res.closed = closed;
                             res.body = Some(Ok(serde_json::to_string(&events).unwrap()));
                             return Ok(res);
                         }
@@ -2957,9 +3045,26 @@ mod tests {
             Box::pin(async move {
                 self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
+                if let Some(streams) = &self.streams {
+                    match streams.lock().unwrap().get(path) {
+                        None => res.status = if self.missing_status == 0 { 404 } else { self.missing_status },
+                        Some(closed) => res.closed = *closed,
+                    }
+                }
+                let mut fault = self.head_fault.lock().unwrap();
+                if fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
+                    res.status = fault.take().unwrap().1;
+                }
+                if let Some(observer) = self.head_observer.lock().unwrap().as_ref() {
+                    let _ = observer.send((path.to_string(), res.status));
+                }
                 if self.read_appended {
-                    res.next_offset =
-                        Some(self.appended.lock().unwrap().iter().filter(|(p, _, _)| p == path).count().to_string());
+                    let end = self.appended.lock().unwrap().iter().filter(|(p, _, _)| p == path).count();
+                    res.next_offset = Some(if self.streams.is_some() {
+                        format!("0000000000000000_{end:016}")
+                    } else {
+                        end.to_string()
+                    });
                 }
                 if let Some(offset) = self.head_offsets.lock().unwrap().pop() {
                     res.next_offset = Some(offset);
@@ -2971,6 +3076,12 @@ mod tests {
         fn close<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("close:{path}"));
+                if let Some(streams) = &self.streams {
+                    let mut streams = streams.lock().unwrap();
+                    let Some(closed) = streams.get_mut(path) else { return Ok(response(404)) };
+                    *closed = true;
+                    self.appended_changed.notify_waiters();
+                }
                 Ok(response(204))
             })
         }
@@ -2980,6 +3091,11 @@ mod tests {
                 self.operations.lock().unwrap().push(format!("delete:{path}"));
                 if self.fail_delete_path.lock().unwrap().as_deref().is_some_and(|p| path.ends_with(p)) {
                     return Ok(response(503));
+                }
+                if let Some(streams) = &self.streams {
+                    streams.lock().unwrap().remove(path);
+                    self.appended.lock().unwrap().retain(|(p, _, _)| p != path);
+                    self.appended_changed.notify_waiters();
                 }
                 Ok(response(204))
             })
