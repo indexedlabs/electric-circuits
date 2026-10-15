@@ -1097,6 +1097,26 @@ pub(crate) async fn sequencer_loop(
                     }
                 }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
+                    // A proxy may misroute a GET during a rollout. Only storage-confirmed
+                    // absence is terminal; a present segment or uncertain HEAD is retried.
+                    let confirmed = match ds.head(&read_path).await {
+                        Ok(None) => true,
+                        Ok(Some(_)) => {
+                            tracing::warn!("sequencer: GET reported {e:#}, but HEAD found {read_path}; retrying");
+                            false
+                        }
+                        Err(head_error) => {
+                            tracing::warn!(
+                                "sequencer: GET reported {e:#}; HEAD could not confirm loss of {read_path}: \
+                                 {head_error:#}; retrying"
+                            );
+                            false
+                        }
+                    };
+                    if !confirmed {
+                        back_off(&shutdown, std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
                     ds.metrics().sequencer_stream_gone_failures.fetch_add(1, Ordering::Relaxed);
                     // The segment the sequencer is reading has been DELETED under it. The sweeper
                     // deletes only below the durable checkpoint, and the boot refuses to start on a
