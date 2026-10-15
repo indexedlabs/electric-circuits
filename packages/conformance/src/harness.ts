@@ -141,6 +141,7 @@ async function spawnEngine(
   slot: string,
   fault?: string,
   extraEnv?: Record<string, string>,
+  whileBooting?: (url: string) => Promise<void>,
 ): Promise<{ url: string; proc: ChildProcess; stderr: () => string; raw: RawEngine }> {
   const raw = spawnRawEngine({
     ELECTRIC_CIRCUITS_DS_URL: dsUrl,
@@ -153,7 +154,10 @@ async function spawnEngine(
     ...(fault ? { ELECTRIC_CIRCUITS_FAULT: fault } : {}),
     ...(extraEnv ?? {}),
   })
-  const url = await raw.waitForListening(20000).catch((e: Error) => {
+  const url = await (async () => {
+    if (whileBooting) await whileBooting(await raw.waitForBinding(20000))
+    return raw.waitForListening(20000)
+  })().catch((e: Error) => {
     raw.proc.kill('SIGKILL') // don't leak the child if it never reports listening
     throw e
   })
@@ -195,9 +199,10 @@ export interface Harness {
   /**
    * Boot a fresh engine process against the same durable streams, Postgres and slot — the second
    * half of `restartEngine`, exposed on its own for tests that stop the engine themselves (with a
-   * `SIGTERM`, say) rather than killing it.
+   * `SIGTERM`, say) rather than killing it. `whileBooting` runs after HTTP binds and before
+   * waiting for readiness, so a test can exercise traffic while an external restore gate is held.
    */
-  startEngine(): Promise<void>
+  startEngine(whileBooting?: (url: string) => Promise<void>): Promise<void>
   /**
    * Test-only Durable Streams crash/restart seam. The wrapper retains the same binary, endpoint,
    * and data directory; callers never receive its process or storage internals.
@@ -360,8 +365,8 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
         proc?.kill(sig)
       },
       waitForEngineExit: (timeoutMs = 30000) => spawned.raw.waitForExit(timeoutMs),
-      startEngine: async () => {
-        spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, { ...(access?.env ?? {}), ...(opts.engineEnv ?? {}) })
+      startEngine: async (whileBooting) => {
+        spawned = await spawnEngine(engineDsUrl, pgUrl, tables, slot, opts.fault, { ...(access?.env ?? {}), ...(opts.engineEnv ?? {}) }, whileBooting)
         proc = spawned.proc
         h.engineUrl = spawned.url
       },

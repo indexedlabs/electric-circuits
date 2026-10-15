@@ -400,6 +400,23 @@ membership effects, no broken epoch, no shutdown in progress. The HTTP surface c
 Postgres, deliberately — a readiness probe an orchestrator cannot reach is no probe at all — so an
 engine still waiting for its database answers `503 waiting` rather than refusing connections.
 
+Postgres shape/aggregate creation, dormant reactivation and guarded reads also refuse work until
+boot reaches `active`; a native create answers `503` with
+`{"error":"engine is not the active ready writer; retry"}` and `Retry-After: 1`. This protects
+the restored sequencer position even when service discovery sends traffic before `/ready` passes.
+`POST /schema` is library-only and returns `400` in Postgres mode. If restore finds a sequencer
+already started at a different position or de-duplication highwater, it requests a source restart
+(standalone exit `75`) instead of continuing with the wrong reader.
+The comparison is against the reader's original start pair. A matching reader that has since
+advanced still follows the existing pause/register/resume handshake.
+
+In Postgres mode, checkpoint writes are refused until the catalog's position/highwater floor is known. Writing an
+offset before floor adoption requests a restart without issuing an append. At an equal position,
+a lower or missing highwater is also rejected. Library mode neither adopts old checkpoints nor
+enforces this floor; its retention boundary follows this process's durable checkpoints.
+Library hosts receive shutdown/restart requests;
+only the standalone binary turns a request into process exit. Supervised sources notify their owner.
+
 `/health` deliberately never fails for any of that. A kubelet restarts a pod whose *liveness* probe
 fails, and neither "Postgres is not up yet" nor "the epoch is broken and an operator must post
 `/epoch/reset`" is fixed by a restart — the second is actively made worse by one.
@@ -424,8 +441,10 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
    appended nothing. **Shutdown never advances the slot**; at worst it costs a bounded, de-duplicated
    replay.
 4. The **sequencer** finishes the batch it is processing, flushes it, and writes a final `Offset`
-   checkpoint; the durable catalog writer drains it (≤ 10 s) so the next boot resumes from there
-   rather than replaying since the last lazy 2 s checkpoint.
+   checkpoint only if it completed a read. In Postgres mode the catalog writer rejects any checkpoint below the
+   restored/last durable floor, including periodic and shutdown checkpoints. It drains accepted
+   writes (≤ 10 s) so the next boot resumes from there rather than replaying since the last lazy
+   2 s checkpoint.
 5. Exit `0`.
 
 **Streams are never closed or retired on shutdown.** A shape's stream is left exactly as it is and
@@ -453,7 +472,7 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | `0` | a graceful shutdown completed inside its grace period |
 | `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
 | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
-| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it |
+| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested if catalog restore finds a sequencer already started at a different checkpoint |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 
 ### Subscriptions: identified, idempotent, leased
@@ -503,7 +522,7 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
 `POST /shapes` (and a join that takes a NEW claim — a lease *renewal* promises nothing that is not
 already in the log, so its record is queued like any other) is acknowledged only once its record has
 reached the durable catalog. The
-catalog writer never drops an event: a transient failure — transport, timeout, 5xx — retries **that**
+catalog writer never drops a lifecycle event: a transient failure — transport, timeout, 5xx — retries **that**
 event in place, forever, at 100 ms → 5 s, and everything queued behind it waits, which is what keeps
 the log's order equal to the engine's. So a create while durable-streams is down **waits** rather
 than handing back a shape a restart would forget; the client's own timeout is the bound, and a record
@@ -637,7 +656,7 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `sequencer_orphan_fragments_total` | counter | incomplete transaction fragments discarded because a different transaction followed them (a reconnect re-delivering earlier commits first, or an epoch reset) |
 | `backfill_chunked_appends_total` | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0) |
 | `shutdown_in_progress` | gauge | `1` once a graceful shutdown has begun |
-| `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
+| `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. Lifecycle events are never dropped, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
 | `catalog_bytes` | gauge | response-body bytes read by the latest successful boot catalog fold, including JSON framing, whitespace, unknown events and duplicate events; excludes admission reads and HTTP headers. Exported as `engine_catalog_bytes` in Prometheus and logged once per successful fold as `catalog read complete` with `catalog_bytes`. This is a boot measurement, not a live size or heap estimate; metric reset preserves it |
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |

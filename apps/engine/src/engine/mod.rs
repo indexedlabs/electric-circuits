@@ -99,6 +99,10 @@ impl std::fmt::Display for DeploymentNotReady {
 
 impl std::error::Error for DeploymentNotReady {}
 
+#[derive(Debug, thiserror::Error)]
+#[error("catalog restore found a sequencer at a different checkpoint; restart requested (75)")]
+pub(crate) struct CatalogRestoreMismatch;
+
 /// PostgreSQL owns its schemas; caller-defined schemas are a library-mode API only.
 #[derive(Debug, thiserror::Error)]
 #[error("define_schema is only supported in library mode; PostgreSQL schemas are introspected")]
@@ -1470,7 +1474,7 @@ impl Engine {
         );
         // Created before the writer so the writer can register a shutdown party while it is
         // retrying an append (see `spawn_catalog_writer`).
-        let catalog_tx = spawn_catalog_writer(ds.clone(), shutdown.clone());
+        let catalog_tx = spawn_catalog_writer(ds.clone(), shutdown.clone(), pg_url.is_some());
         let retirements = spawn_retirement_queue(ds.clone(), catalog_tx.clone(), shutdown.clone());
         // The change log's writer records every rotation in the durable catalog, so a restart knows
         // which segment is current (and when each one began, for the retain window).
