@@ -1165,7 +1165,7 @@ pub struct DsClient {
     /// what the retention disk-budget layer works from. It undercounts streams that already
     /// existed before the process started (restart persistence is the catalog work, GH #8).
     appended: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// In-flight reliable appends that have failed at least once. Shared with the engine's probes.
+    /// In-flight reliable appends retrying after a failure. Diagnostic only; excludes retired streams.
     failed_appends: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -1185,8 +1185,8 @@ impl Drop for FailedAppend<'_> {
 }
 
 impl DsClient {
-    pub(crate) fn has_failed_appends(&self) -> bool {
-        self.failed_appends.load(std::sync::atomic::Ordering::Relaxed) != 0
+    pub(crate) fn failing_appends(&self) -> usize {
+        self.failed_appends.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Share the boot configuration's process budget, also across supervised source clients.
     pub fn with_memory_budget(mut self, config: &crate::config::Config) -> Self {
@@ -1642,8 +1642,6 @@ impl DsClient {
             match self.append_once(path, envelopes).await {
                 Ok(_) => return true,
                 Err(AppendError::Gone(status)) => {
-                    // Reconciliation may wait on storage too; the append has already failed.
-                    failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     let reconciler = self.reconcile.lock().unwrap().clone();
                     let verdict = match reconciler {
                         Some(reconcile) => reconcile(path.to_string()).await,
@@ -1656,6 +1654,7 @@ impl DsClient {
                         );
                         return false;
                     }
+                    failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     false_gone += 1;
                     if false_gone == 1 {
                         tracing::warn!(
@@ -2276,16 +2275,26 @@ mod tests {
         assert_eq!(ds.memory_budget().held.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn large_io_rejected_shape_append_withdraws_health_until_all_retries_land() {
-        use std::{future::Future, sync::atomic::Ordering, task::Poll};
+    async fn append_diagnostic_get(engine: &crate::engine::Engine, route: &str) -> (u16, serde_json::Value) {
         use tower::ServiceExt;
+        let response = crate::http::router(engine.clone())
+            .oneshot(axum::http::Request::builder().uri(route).body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn large_io_append_failures_are_diagnostic_only() {
+        use std::{future::Future, sync::atomic::Ordering, task::Poll};
 
         let store = Arc::new(ScriptedStore::default());
         store.append_limit.store(500, Ordering::Relaxed);
         let ds = DsClient::with_test_store("scripted://append-limit".into(), store.clone());
         let engine = crate::engine::Engine::new_for_in_process_test(ds.clone());
-        let router = crate::http::router(engine.clone());
+        engine.install_managed_role_for_test(true);
         let envs: Vec<Envelope> = serde_json::from_value(serde_json::json!([
             {"type":"public.items", "key":"1", "value":{"payload":"x".repeat(200)},
              "headers":{"operation":"upsert", "txid":"42", "lsn":"0/42"}},
@@ -2305,22 +2314,20 @@ mod tests {
         assert_eq!(store.rejected_appends.load(Ordering::Relaxed), 2);
         assert!(store.appended.lock().unwrap().is_empty(), "no rejected transaction was delivered");
         for route in ["/ready", "/v1/health"] {
-            let response = router
-                .clone()
-                .oneshot(axum::http::Request::builder().uri(route).body(axum::body::Body::empty()).unwrap())
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "a rejected append must be visible on {route} while its transaction cannot drain"
-            );
+            assert_eq!(append_diagnostic_get(&engine, route).await, (200, serde_json::json!({"status":"active"})));
         }
+        assert!(engine.managed_public_ready());
+        assert_eq!(append_diagnostic_get(&engine, "/tables").await.0, 200, "managed public admission stays open");
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 2);
         store.append_limit.store(0, Ordering::Relaxed);
         assert!(first.await.unwrap());
-        assert_ne!(engine.readiness_status(), "active", "another append is still stalled");
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 1);
+        engine.set_waiting();
+        for (route, status) in [("/ready", 503), ("/v1/health", 202)] {
+            assert_eq!(append_diagnostic_get(&engine, route).await, (status, serde_json::json!({"status":"waiting"})));
+        }
         assert!(second.await.unwrap());
-        assert_eq!(engine.readiness_status(), "active", "successful delivery restores readiness");
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
         let writes = store.appended.lock().unwrap();
         assert_eq!(writes.len(), 2);
         for (_, _, body) in writes.iter() {
@@ -2334,25 +2341,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn terminal_append_reconciliation_withdraws_probes_until_finished() {
+    async fn terminal_append_diagnostic_counts_retry_but_not_discard() {
         use std::{future::Future, sync::atomic::Ordering, task::Poll};
-        use tower::ServiceExt;
-
-        async fn probes(engine: &crate::engine::Engine) -> [u16; 2] {
-            let router = crate::http::router(engine.clone());
-            let mut statuses = [0; 2];
-            for (i, route) in ["/ready", "/v1/health"].into_iter().enumerate() {
-                statuses[i] = router
-                    .clone()
-                    .oneshot(axum::http::Request::builder().uri(route).body(axum::body::Body::empty()).unwrap())
-                    .await
-                    .unwrap()
-                    .status()
-                    .as_u16();
-            }
-            statuses
-        }
-
         for status in [404, 410, 409] {
             for outcome in [Some(GoneVerdict::Retry), Some(GoneVerdict::Discard), None] {
                 let store = Arc::new(ScriptedStore::default());
@@ -2372,7 +2362,6 @@ mod tests {
                     {"type":"items", "key":"1", "headers":{"operation":"delete"}}
                 ]))
                 .unwrap();
-                assert_eq!(probes(&engine).await, [200; 2]);
                 let mut pending = Box::pin(ds.append_reliable("shape/one", &envs));
                 std::future::poll_fn(|cx| {
                     assert!(pending.as_mut().poll(cx).is_pending());
@@ -2381,16 +2370,20 @@ mod tests {
                 .await;
                 assert_eq!(gate.arrived.load(Ordering::SeqCst), 1, "reconciliation is held");
                 assert!(store.appended.lock().unwrap().is_empty());
-                assert_eq!(
-                    probes(&engine).await,
-                    [503; 2],
-                    "both probes must withdraw while reconciling HTTP {status}, outcome {outcome:?}"
-                );
+                assert_eq!(ds.failed_appends.load(Ordering::Relaxed), 0, "not a storage failure before reconciliation");
 
                 match outcome {
                     Some(verdict) => {
                         store.terminal_append_status.store(0, Ordering::Relaxed);
                         gate.released.notify_one();
+                        if verdict == GoneVerdict::Retry {
+                            std::future::poll_fn(|cx| {
+                                assert!(pending.as_mut().poll(cx).is_pending());
+                                Poll::Ready(())
+                            })
+                            .await;
+                            assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 1);
+                        }
                         let landed = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
                             .await
                             .expect("released reconciliation must finish")
@@ -2399,7 +2392,7 @@ mod tests {
                     }
                     None => drop(pending),
                 }
-                assert_eq!(probes(&engine).await, [200; 2], "guard released for {status}/{outcome:?}");
+                assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
                 assert_eq!(store.appended.lock().unwrap().len(), usize::from(outcome == Some(GoneVerdict::Retry)));
                 engine.close(std::time::Duration::from_secs(1)).await;
             }
@@ -2407,11 +2400,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn large_io_append_retry_cancellation_releases_health_and_reports_request_bytes() {
+    async fn large_io_append_retry_cancellation_releases_diagnostic_and_reports_request_bytes() {
         use std::{future::Future, sync::atomic::Ordering, task::Poll};
         let store = Arc::new(ScriptedStore::default());
         store.append_limit.store(1, Ordering::Relaxed);
         let ds = DsClient::with_test_store("scripted://cancel-append".into(), store);
+        let engine = crate::engine::Engine::new_for_in_process_test(ds.clone());
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
         let envs: Vec<Envelope> = serde_json::from_value(serde_json::json!([
             {"type":"items", "key":"1", "headers":{"operation":"delete"}}
         ]))
@@ -2426,11 +2421,12 @@ mod tests {
                 Poll::Ready(())
             })
             .await;
-            assert!(ds.has_failed_appends());
+            assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 1);
             tokio::time::advance(std::time::Duration::from_secs(3)).await;
         }
         drop(pending);
-        assert!(!ds.has_failed_appends(), "one guard per append, released even on cancellation");
+        assert_eq!(append_diagnostic_get(&engine, "/replication/lsn").await.1["failingAppends"], 0);
+        engine.close(std::time::Duration::from_secs(1)).await;
     }
 
     #[tokio::test]

@@ -698,13 +698,12 @@ fn page_should_continue(offset: &str, next: Option<&str>, up_to_date: bool, clos
 
 /// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200, `degraded` → 503 (the engine lost
 /// membership effects and only a restart fixes it; 503 keeps a load balancer from routing to it).
-/// `storage_unavailable` → 503 while a failed reliable append is still retrying; clears on recovery.
 /// Caches are disabled so the fleet's 500ms poll always sees the live phase.
 async fn health_v1(State(engine): State<Engine>) -> Response {
     let status = engine.health_status();
     let code = match status {
         "active" => StatusCode::OK,
-        "degraded" | "storage_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+        "degraded" => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::ACCEPTED,
     };
     let mut headers = HeaderMap::new();
@@ -717,12 +716,11 @@ async fn health_v1(State(engine): State<Engine>) -> Response {
 ///
 /// 200 `{"status":"active"}` when every precondition for serving is met (Postgres connected, slot
 /// verified, catalog restored, ingestor spawned, not degraded, epoch intact, not shutting down);
-/// 503 with the word that says why otherwise — `waiting`, `starting`, `degraded`, `storage_unavailable`, `shutting_down`.
+/// 503 with the word that says why otherwise — `waiting`, `starting`, `degraded`, `shutting_down`.
 ///
 /// It is deliberately NOT `/health`, which stays pure **liveness**: "ok" while the process runs, so
 /// a kubelet never restarts an engine that is merely waiting for Postgres to come up, or draining.
-/// `/v1/health` is unchanged — it is the benchmarking-fleet's healthcheck and its status/code
-/// mapping (202 while booting) is parity, not a probe contract.
+/// `/v1/health` retains the benchmarking-fleet's status/code mapping (202 while booting).
 async fn ready(State(engine): State<Engine>) -> Response {
     let status = engine.readiness_status();
     let code = if status == "active" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
@@ -1659,6 +1657,8 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
     Json(serde_json::json!({
         "lsn": engine.replication_lsn(),
         "sync": engine.replication_sync(),
+        // In-flight reliable appends retrying after failure. Diagnostic only, not a drain fence.
+        "failingAppends": engine.failing_appends(),
         // Deferred subquery flip batches not yet propagated. Convergence barrier = sync caught up
         // + per-table offsets at tail + pendingFlips == 0. An abandoned batch never decrements, so
         // pendingFlips can only reach 0 when every computed effect really did land.

@@ -608,11 +608,12 @@ deleting it, §5.6) — i.e. the shape was dropped/evicted mid-flush; discard is
 shape envelopes are absolute per-pk (`upsert`/`delete` by key), an ambiguous-failure double-append
 is idempotent for readers.
 
-A reliable append that fails withdraws readiness while it retries: `/ready` and `/v1/health`
-answer 503 `storage_unavailable` until all failed appends finish. This transient status does not
-retire shapes or change retry policy. Append refusal diagnostics include envelope count and request
-bytes. Shape outputs still require one atomic append; unlike change-log ingestion, they have no
-reader-side transaction-end protocol and must not be split into independently visible chunks.
+`GET /replication/lsn` reports `failingAppends`: the number of in-flight reliable appends retrying
+after failure, cleared on success, discard or cancellation. Terminal responses count only after
+reconciliation chooses Retry; a retirement Discard does not add a failure. This is diagnostic only,
+without affecting readiness, admission or retry policy. Repeated refusal ERROR logs include stream,
+status, envelope count and request bytes. Shape outputs still require one atomic append; they have
+no reader-side transaction-end protocol and must not be split into independently visible chunks.
 
 **A terminal answer is reconciled, not taken on trust.** "404" is what a proxy, a storage router or
 a failover says just as readily as a real deletion, and discarding the batch makes the sequencer
@@ -1073,8 +1074,8 @@ than the mechanism.
   series; a replacement starts fresh. Standalone metric names and route shapes stay the same.
 - **Probes:** `GET /health` is liveness (`ok` while the process runs, and never more than that);
   `GET /ready` is readiness (200 `active`, else 503 `waiting` / `starting` / `degraded` /
-  `storage_unavailable` / `shutting_down`); `GET /v1/health` also reports 503 while failed reliable
-  appends retry, retaining its 202 boot-phase responses. The HTTP surface comes up
+  `shutting_down`); `GET /v1/health` returns 200 `active`, 202 during boot, or 503 `degraded`.
+  Retrying appends do not alter either probe. The HTTP surface comes up
   before Postgres so readiness is answerable while the boot is still retrying.
 - `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
   indexes + shape contents, consumed by the **pipeline explorer** (`apps/pipeline-viz`).
