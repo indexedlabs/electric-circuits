@@ -33,9 +33,14 @@ describe('native: subquery seed capacity', () => {
     return h
   }
 
-  it.each([1, 2])('queues fresh seed N+1 when N=%i initializers are held', async (capacity) => {
+  it.each([
+    { capacity: 1, heldTable: 'slow_parent' },
+    { capacity: 2, heldTable: 'slow_parent' },
+    { capacity: 1, heldTable: 'slow_child' },
+    { capacity: 2, heldTable: 'slow_child' },
+  ])('queues fresh seed N+1 when N=$capacity and $heldTable is held', async ({ capacity, heldTable }) => {
     const harness = await boot(capacity)
-    const hold = await lockTable(harness, 'slow_parent')
+    const hold = await lockTable(harness, heldTable)
     const pending: Array<ReturnType<typeof createShape>> = []
     let released = false
     let overflowFinishedWhileHeld = false
@@ -48,8 +53,9 @@ describe('native: subquery seed capacity', () => {
           } },
         }))
       }
-      // Named external cut: all N distinct seed SELECTs have reached the held relation.
-      await waitFor(async () => (await tableLockWaiters(harness, 'slow_parent')).length === capacity, 'N held seeds')
+      // Holding slow_child lets each inner seed finish and keeps its collected rows
+      // alive during the outer backfill: capacity must cover that retained state too.
+      await waitFor(async () => (await tableLockWaiters(harness, heldTable)).length === capacity, 'N held initializers')
       const overflow = createShape(harness, {
         table: 'fast_child', where: { col: 'parent_id', in: { table: 'fast_parent', project: 'id' } },
       }).then((shape) => {

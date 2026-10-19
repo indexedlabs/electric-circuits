@@ -74,9 +74,14 @@ impl SubqueryAdmission {
 
 impl Default for SubqueryAdmission {
     fn default() -> Self {
-        Self::new(
+        let admission = Self::new(
             std::env::var("ELECTRIC_CIRCUITS_SUBQUERY_INIT_CONCURRENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
-        )
+        );
+        tracing::info!(
+            subquery_init_concurrency = admission.seed_slots.available_permits(),
+            "subquery initialization capacity configured"
+        );
+        admission
     }
 }
 
