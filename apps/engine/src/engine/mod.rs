@@ -53,6 +53,38 @@ use planning::*;
 use retirement::*;
 use sequencer::*;
 
+/// Only active creates own entries; waiters hold no partial reservation. This is request-owned
+/// coordination, not another worker queue. PostgreSQL work still uses the bounded engine pool.
+struct SubqueryAdmission {
+    nodes: std::sync::Mutex<HashSet<crate::predicate::SubquerySig>>,
+    changed: tokio::sync::Notify,
+    /// Bounds retained fresh initializer state across PG checkouts and cancellation cleanup.
+    seed_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl SubqueryAdmission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            nodes: Default::default(),
+            changed: Default::default(),
+            seed_slots: Arc::new(tokio::sync::Semaphore::new(capacity.clamp(1, tokio::sync::Semaphore::MAX_PERMITS))),
+        }
+    }
+}
+
+impl Default for SubqueryAdmission {
+    fn default() -> Self {
+        let admission = Self::new(
+            std::env::var("ELECTRIC_CIRCUITS_SUBQUERY_INIT_CONCURRENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+        );
+        tracing::info!(
+            subquery_init_concurrency = admission.seed_slots.available_permits(),
+            "subquery initialization capacity configured"
+        );
+        admission
+    }
+}
+
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
@@ -502,9 +534,9 @@ pub struct Engine {
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
     subqueries: Arc<Mutex<SubqueryRegistry>>,
-    /// One subquery initializer through phase C or rollback. Independent of the registry lock:
-    /// replication and existing streams keep running while Postgres seeds a new membership set.
-    subquery_init: Arc<Mutex<()>>,
+    /// Overlapping membership-node initializers serialize through phase C or rollback. Disjoint
+    /// predicates can seed/backfill concurrently without holding engine state or the registry.
+    subquery_init: Arc<SubqueryAdmission>,
     /// Best-effort per-envelope trace broadcast (see [`crate::trace`]). Events are serialized once
     /// and only when someone is subscribed; slow subscribers lag and drop.
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
@@ -1526,7 +1558,7 @@ impl Engine {
             source_receipt_progress: Arc::new(std::sync::Mutex::new(SourceReceiptProgress::default())),
             runtime_receipts: Arc::new(std::sync::Mutex::new(RuntimeReceipts::default())),
             subqueries,
-            subquery_init: Arc::new(Mutex::new(())),
+            subquery_init: Arc::new(SubqueryAdmission::default()),
             trace_tx,
             flip_tx,
             pending_flips,

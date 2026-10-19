@@ -585,12 +585,33 @@ refcount back for a join) and is typed `CreateRaced`, which the create **redoes*
 the definition is still valid, only the attempt lost a race, and every client would otherwise have
 to implement that loop. Exhausting the retries answers 503.
 
-**Subquery initialization is serialized within one engine.** A new subquery create acquires one
-async admission permit after ensuring its stream, before phase A. It releases the permit after
-phase C installs every seed; same-signature joiners use their existing readiness wait, and ordinary
-creates, replication and existing streams do not acquire this permit. A queued create remains
-cancellable and wakes on shutdown. The create-start log reports `admission_wait_ms` so restart and
-deployment handoff queues can be checked against caller deadlines.
+**Subquery initialization serializes only overlapping membership dependencies.** After ensuring
+its stream and before phase A, a new create reserves the canonical signatures of every membership
+node in its predicate, including nested children. The reservation is atomic: a request waiting on
+one node holds no others, so it cannot stall an unrelated create or form a lock-order cycle.
+Once phase A has registered the shape and pinned reused nodes by refcount, it releases their
+reservations; only fresh nodes remain reserved through installation. Shapes sharing an already-live
+node can therefore backfill concurrently too. Disjoint predicates seed and backfill concurrently
+through the existing bounded PostgreSQL pool. Fresh initializers also acquire one of
+`ELECTRIC_CIRCUITS_SUBQUERY_INIT_CONCURRENCY` slots (default **4**, minimum **1**) before phase A
+creates any seed or pending-shape buffers. A saturated initializer releases its node reservations
+while waiting, then reacquires and rechecks them. Reused-only creates bypass this capacity lane.
+Setting the cap to 1 serializes fresh initialization; live-node backfills can still overlap.
+No engine-state, admission-set or registry lock spans that PostgreSQL or stream I/O.
+
+The capacity slot stays with the create through the outer backfill and phase C, or through complete
+cancellation cleanup. It bounds the number of simultaneously retained fresh initializer sets,
+including collected seed rows held between PostgreSQL checkouts. It does not bound the size of one
+set or permanent membership state. The PostgreSQL pool bounds active checkouts, and the cursor byte
+budget bounds transport frames; neither accounts for those retained row vectors.
+
+The permit remains held until phase C installs every seed: a create must never reference another
+create's half-seeded node. Same-signature shape joiners keep their existing readiness wait; ordinary
+creates, replication, existing streams and direct subset snapshots do not acquire a node permit.
+A subset's maintained subquery feed does. Waiters remain cancellable and wake on shutdown. Each
+permit owns only its predicate's distinct signatures and removes them on release; waiters add no
+registry entries or worker tasks. The create-start log retains `admission_wait_ms`, including seed
+capacity waits, and reports their contribution separately as `seed_capacity_wait_ms`.
 
 On failure or cancellation before installation, `CreateGuard` transfers its rollback and permit to
 one cleanup task before awaiting anything. Explicit failure waits for that task; cancelling that
