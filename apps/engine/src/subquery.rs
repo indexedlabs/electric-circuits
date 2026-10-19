@@ -562,8 +562,8 @@ pub struct SubqueryRegistry {
     pending_shapes: Vec<PendingSubqueryShape>,
     /// Every node-refcount increment made by the in-flight `create_subquery_shape` (one entry per
     /// `collect()` call). On failure the create is rolled back exactly: each logged sig is decremented
-    /// once, and nodes that return to zero are removed. The registry mutex is held for the whole
-    /// create, so the log can't interleave with another create.
+    /// once, and nodes that return to zero are removed. The registry mutex is held for the phase-A
+    /// compile; the log then moves into that create's pending entry before releasing the lock.
     collect_log: Vec<SubquerySig>,
     ds: DsClient,
     pg_url: Option<String>,
@@ -1062,7 +1062,7 @@ impl SubqueryRegistry {
     /// it stay stale for the life of the shape. Deferring is the same answer
     /// [`queue_deferred`](Self::queue_deferred) gives for a not-yet-installed shape.
     ///
-    /// Exactly ONE create can own any seeding node: engine admission serializes initialization,
+    /// Exactly ONE create can own any seeding node: engine admission serializes creates with overlapping node signatures,
     /// so every seeding node is fresh for one in-flight create and that
     /// create's `finish_create` is the single place this queue is handed back — or, if the create
     /// dies, the node goes and the queue with it.

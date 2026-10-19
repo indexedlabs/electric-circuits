@@ -468,7 +468,7 @@ impl Engine {
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
                 let admission_started = std::time::Instant::now();
-                creating.admit_subquery().await?;
+                creating.admit_subquery(&where_json).await?;
                 self.create_subquery_three_phase(
                     &id,
                     table,
@@ -477,6 +477,7 @@ impl Engine {
                     out_cols,
                     changes_only,
                     admission_started.elapsed(),
+                    creating.admission.as_mut().expect("subquery admission acquired"),
                 )
                 .await?;
                 // Phase C installed every seed. Later durability/race checks do not need to hold
@@ -2199,8 +2200,10 @@ impl Engine {
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
         admission_wait: std::time::Duration,
+        admission: &mut SubqueryPermit,
     ) -> Result<()> {
-        // Phase A (brief lock). Admission prevents another create observing a half-seeded node.
+        // Phase A (brief lock). Dependency admission prevents a create observing a half-seeded
+        // shared node; disjoint creates may already be doing their phase-B I/O.
         let begin = self.subqueries.lock().await.begin_create(
             id,
             table,
@@ -2209,6 +2212,10 @@ impl Engine {
             out_cols.clone(),
             changes_only,
         )?;
+        // Phase A pins reused nodes by refcount. They already have complete membership, so
+        // their dependents need not wait for this shape's outer backfill. Keep ownership only
+        // of our fresh seeds, including any partly installed seed if phase C is cancelled.
+        admission.retain_fresh(&begin);
         tracing::info!(
             target: "electric_circuits_engine::shape_create",
             shape_id = id,
@@ -2469,6 +2476,105 @@ enum Registration {
     Registry,
 }
 
+struct SubqueryPermit {
+    admission: Arc<SubqueryAdmission>,
+    nodes: HashSet<crate::predicate::SubquerySig>,
+}
+
+impl SubqueryPermit {
+    fn retain_fresh(&mut self, begin: &crate::subquery::BeginCreate) {
+        let fresh: HashSet<_> = begin.seeds.iter().map(|(sig, _, _)| sig.clone()).collect();
+        let mut held = self.admission.nodes.lock().unwrap();
+        self.nodes.retain(|sig| {
+            if fresh.contains(sig) {
+                true
+            } else {
+                held.remove(sig);
+                false
+            }
+        });
+        drop(held);
+        self.admission.changed.notify_waiters();
+    }
+}
+
+impl Drop for SubqueryPermit {
+    fn drop(&mut self) {
+        let mut held = self.admission.nodes.lock().unwrap();
+        for sig in &self.nodes {
+            held.remove(sig);
+        }
+        drop(held);
+        self.admission.changed.notify_waiters();
+    }
+}
+
+/// Reserve every membership signature reachable from the predicate, including nested children
+/// even when a parent is already registered. The registry's collector may stop at a shared
+/// parent, but another initializer can still be using its child. Canonical signatures are the
+/// same identities `SubqueryRegistry::collect` uses, independent of outer columns/projections.
+fn initialization_nodes(predicate: &PredicateJson) -> HashSet<crate::predicate::SubquerySig> {
+    let mut nodes = HashSet::new();
+    let mut pending = vec![predicate];
+    while let Some(p) = pending.pop() {
+        match p {
+            PredicateJson::And { and } => pending.extend(and),
+            PredicateJson::Or { or } => pending.extend(or),
+            PredicateJson::Not { not } => pending.push(not),
+            PredicateJson::In { subquery, .. } => {
+                nodes.insert(crate::predicate::subquery_sig(
+                    &subquery.table,
+                    &subquery.project,
+                    subquery.where_.as_deref(),
+                ));
+                if let Some(inner) = &subquery.where_ {
+                    pending.push(inner);
+                }
+            }
+            PredicateJson::Leaf { .. } | PredicateJson::IsNull { .. } => {}
+        }
+    }
+    nodes
+}
+
+impl SubqueryAdmission {
+    fn try_acquire(self: &Arc<Self>, nodes: &HashSet<crate::predicate::SubquerySig>) -> Option<SubqueryPermit> {
+        let mut held = self.nodes.lock().unwrap();
+        if !held.is_disjoint(nodes) {
+            return None;
+        }
+        held.extend(nodes.iter().cloned());
+        Some(SubqueryPermit { admission: self.clone(), nodes: nodes.clone() })
+    }
+
+    async fn acquire(
+        self: &Arc<Self>,
+        predicate: &PredicateJson,
+        shutdown: &crate::shutdown::ShutdownToken,
+    ) -> Result<SubqueryPermit> {
+        let nodes = initialization_nodes(predicate);
+        loop {
+            // Subscribe before examining the set so a release between the check and the await
+            // cannot be lost. A blocked request reserves NOTHING: {A,B} waiting on A must not
+            // prevent an independent {B} from making progress, or create a lock-order cycle.
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if shutdown.is_shutting_down() {
+                bail!(crate::engine::sequencer::SHUTTING_DOWN);
+            }
+            if let Some(permit) = self.try_acquire(&nodes) {
+                return Ok(permit);
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.wait() => bail!(crate::engine::sequencer::SHUTTING_DOWN),
+                _ = changed => {}
+            }
+        }
+    }
+}
+
 /// Everything a create has registered before its first storage/registry await, given back if the
 /// create never reaches its own end.
 ///
@@ -2484,7 +2590,7 @@ struct CreateGuard {
     table: TableRef,
     stream_path: String,
     registration: Registration,
-    admission: Option<tokio::sync::OwnedMutexGuard<()>>,
+    admission: Option<SubqueryPermit>,
     armed: bool,
 }
 
@@ -2503,12 +2609,8 @@ impl CreateGuard {
 
     /// Queue without holding engine state or the registry. Shutdown wakes every waiter, and
     /// cancellation drops only this acquisition; it cannot release another create's permit.
-    async fn admit_subquery(&mut self) -> Result<()> {
-        self.admission = Some(tokio::select! {
-            biased;
-            _ = self.engine.shutdown.wait() => bail!(crate::engine::sequencer::SHUTTING_DOWN),
-            permit = self.engine.subquery_init.clone().lock_owned() => permit,
-        });
+    async fn admit_subquery(&mut self, predicate: &PredicateJson) -> Result<()> {
+        self.admission = Some(self.engine.subquery_init.acquire(predicate, &self.engine.shutdown_token()).await?);
         Ok(())
     }
 
@@ -3001,10 +3103,14 @@ mod cancellation_tests {
 
     /// The detached rollback must leave nothing a later identical create could join or conflict with.
     /// Call after dropping a guard that held admission, or after awaiting rollback explicitly.
-    async fn assert_rolled_back(engine: &Engine, id: &str) {
-        let _admission = tokio::time::timeout(std::time::Duration::from_secs(5), engine.subquery_init.lock())
-            .await
-            .expect("the cancelled create never finished cleanup");
+    async fn assert_rolled_back(engine: &Engine, id: &str, predicate: &PredicateJson) {
+        let _admission = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.subquery_init.acquire(predicate, &engine.shutdown_token()),
+        )
+        .await
+        .expect("the cancelled create never finished cleanup")
+        .unwrap();
         assert!(engine.get_shape(id).await.is_none(), "the cancelled registration survived cleanup");
         assert!(!engine.subqueries.lock().await.touches(&"outer_t".into()));
         let st = engine.state.lock().await;
@@ -3080,7 +3186,7 @@ mod cancellation_tests {
     async fn cancelled_before_install_unwinds_the_pending_registry_state() {
         let (engine, where_json) = engine_with_subquery_tables().await;
         let mut guard = register(&engine, "s1", &where_json).await;
-        guard.admit_subquery().await.unwrap();
+        guard.admit_subquery(&where_json).await.unwrap();
         let begin = engine
             .subqueries
             .lock()
@@ -3090,7 +3196,7 @@ mod cancellation_tests {
         assert_eq!(begin.seeds.len(), 1, "one fresh node to seed");
 
         drop(guard);
-        assert_rolled_back(&engine, "s1").await;
+        assert_rolled_back(&engine, "s1", &where_json).await;
     }
 
     /// Cancelled after `finish_create` installed the shape (its phase-C replay awaits, and the HTTP
@@ -3100,7 +3206,7 @@ mod cancellation_tests {
     async fn cancelled_after_install_drops_the_registered_shape() {
         let (engine, where_json) = engine_with_subquery_tables().await;
         let mut guard = register(&engine, "s1", &where_json).await;
-        guard.admit_subquery().await.unwrap();
+        guard.admit_subquery(&where_json).await.unwrap();
         let begin = engine
             .subqueries
             .lock()
@@ -3122,7 +3228,7 @@ mod cancellation_tests {
         assert!(engine.subqueries.lock().await.shapes.contains_key("s1"), "installed before the drop");
 
         drop(guard);
-        assert_rolled_back(&engine, "s1").await;
+        assert_rolled_back(&engine, "s1", &where_json).await;
         assert!(engine.graph().await.shapes.is_empty());
     }
 
@@ -3135,7 +3241,7 @@ mod cancellation_tests {
     async fn cancelled_mid_phase_c_unwinds_the_partly_seeded_node() {
         let (engine, where_json) = engine_with_subquery_tables().await;
         let mut guard = register(&engine, "s1", &where_json).await;
-        guard.admit_subquery().await.unwrap();
+        guard.admit_subquery(&where_json).await.unwrap();
         let node_id = {
             let mut reg = engine.subqueries.lock().await;
             let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
@@ -3147,7 +3253,7 @@ mod cancellation_tests {
         };
 
         drop(guard);
-        assert_rolled_back(&engine, "s1").await;
+        assert_rolled_back(&engine, "s1", &where_json).await;
         assert_eq!(
             engine.subqueries.lock().await.circuit_distinct(node_id),
             0,
@@ -3170,7 +3276,7 @@ mod cancellation_tests {
     async fn cancel_while_cleanup_is_blocked(explicit: bool) {
         let (engine, where_json) = engine_with_subquery_tables().await;
         let mut guard = register(&engine, "s1", &where_json).await;
-        guard.admit_subquery().await.unwrap();
+        guard.admit_subquery(&where_json).await.unwrap();
         let mut registry = engine.subqueries.lock().await;
         let begin = registry.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
         let sig = &begin.seeds[0].0;
@@ -3193,12 +3299,15 @@ mod cancellation_tests {
             }
         }
         drop(guard);
-        assert!(engine.subquery_init.try_lock().is_err(), "cleanup must retain admission while blocked");
+        assert!(
+            engine.subquery_init.try_acquire(&initialization_nodes(&where_json)).is_none(),
+            "cleanup must retain admission while blocked"
+        );
         drop(registry);
-        assert_rolled_back(&engine, "s1").await;
+        assert_rolled_back(&engine, "s1", &where_json).await;
         assert_eq!(engine.subqueries.lock().await.circuit_distinct(node_id), 0);
         let mut next = register(&engine, "s2", &where_json).await;
-        next.admit_subquery().await.unwrap();
+        next.admit_subquery(&where_json).await.unwrap();
         let begin = engine
             .subqueries
             .lock()
@@ -3212,26 +3321,29 @@ mod cancellation_tests {
     #[tokio::test]
     async fn cancelling_a_waiter_does_not_release_the_initializers_permit() {
         let (engine, where_json) = engine_with_subquery_tables().await;
-        let owner = engine.subquery_init.clone().lock_owned().await;
+        let owner = engine.subquery_init.acquire(&where_json, &engine.shutdown_token()).await.unwrap();
         let mut guard = register(&engine, "s1", &where_json).await;
         {
-            let waiting = guard.admit_subquery();
+            let waiting = guard.admit_subquery(&where_json);
             tokio::pin!(waiting);
             assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
         }
         guard.rollback().await;
-        assert!(engine.subquery_init.try_lock().is_err(), "a cancelled waiter released the owner");
+        assert!(
+            engine.subquery_init.try_acquire(&initialization_nodes(&where_json)).is_none(),
+            "a cancelled waiter released the owner"
+        );
         drop(owner);
-        assert_rolled_back(&engine, "s1").await;
+        assert_rolled_back(&engine, "s1", &where_json).await;
     }
 
     #[tokio::test]
     async fn shutdown_wakes_queued_initializers_without_waiting_for_the_owner() {
         let (engine, where_json) = engine_with_subquery_tables().await;
-        let _owner = engine.subquery_init.clone().lock_owned().await;
+        let _owner = engine.subquery_init.acquire(&where_json, &engine.shutdown_token()).await.unwrap();
         let mut guard = register(&engine, "s1", &where_json).await;
         {
-            let waiting = guard.admit_subquery();
+            let waiting = guard.admit_subquery(&where_json);
             tokio::pin!(waiting);
             assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
             engine.shutdown.begin();
@@ -3242,6 +3354,106 @@ mod cancellation_tests {
             assert_eq!(error.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
         }
         guard.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn an_initializer_waiting_on_a_shared_node_reserves_no_other_nodes() {
+        let admission = Arc::new(SubqueryAdmission::default());
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let a: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "id", "in": { "table": "a", "project": "id" }
+        }))
+        .unwrap();
+        let b: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "id", "in": { "table": "b", "project": "id" }
+        }))
+        .unwrap();
+        let both = PredicateJson::And { and: vec![b.clone(), a.clone()] };
+        let owner = admission.acquire(&a, &shutdown).await.unwrap();
+        let waiting = admission.acquire(&both, &shutdown);
+        tokio::pin!(waiting);
+        assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+        let independent = admission
+            .try_acquire(&initialization_nodes(&b))
+            .expect("a waiter on A cannot reserve B and block an unrelated initializer");
+        drop(owner);
+        assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+        drop(independent);
+        let permit = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap();
+        assert_eq!(admission.nodes.lock().unwrap().len(), 2);
+        drop(permit);
+        assert!(admission.nodes.lock().unwrap().is_empty(), "finished creates retain no signature entries");
+    }
+
+    #[test]
+    fn initialization_admission_covers_nested_canonical_nodes_once() {
+        let child: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "id", "in": { "table": "child", "project": "id", "where": {
+                "and": [{ "col": "x", "op": "eq", "value": 1 }, { "col": "y", "op": "eq", "value": 2 }]
+            }}
+        }))
+        .unwrap();
+        let reversed: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "other_outer_col", "in": { "table": "public.child", "project": "id", "where": {
+                "and": [{ "col": "y", "op": "eq", "value": 2 }, { "col": "x", "op": "eq", "value": 1 }]
+            }}, "negated": true
+        }))
+        .unwrap();
+        let parent: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "id", "in": { "table": "parent", "project": "id", "where": child }
+        }))
+        .unwrap();
+        let predicate =
+            PredicateJson::Or { or: vec![parent.clone(), PredicateJson::Not { not: Box::new(reversed.clone()) }] };
+        let nodes = initialization_nodes(&predicate);
+        assert_eq!(nodes.len(), 2, "the canonical child occurs once even through NOT/OR and nesting");
+        assert_eq!(initialization_nodes(&child), initialization_nodes(&reversed));
+        let admission = Arc::new(SubqueryAdmission::default());
+        let child_owner = admission.try_acquire(&initialization_nodes(&child)).unwrap();
+        assert!(admission.try_acquire(&initialization_nodes(&parent)).is_none(), "nested dependency must wait");
+        drop(child_owner);
+        assert!(admission.try_acquire(&nodes).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reused_node_is_released_before_the_outer_backfill() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let mut first = register(&engine, "s1", &where_json).await;
+        first.admit_subquery(&where_json).await.unwrap();
+        let mut reg = engine.subqueries.lock().await;
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
+        first.admission.as_mut().unwrap().retain_fresh(&begin);
+        assert!(engine.subquery_init.try_acquire(&initialization_nodes(&where_json)).is_none());
+        let seeds = begin
+            .seeds
+            .into_iter()
+            .map(|(sig, _, _)| (sig, Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, HashSet::new()).await.unwrap();
+        drop(reg);
+        first.complete();
+        drop(first);
+
+        // A distinct shape pins the already-live node in phase A, then pauses before phase B.
+        // No I/O, sleeps or fabricated membership: use the registry's actual seed decision.
+        let mut next = CreateGuard::new(&engine, "s2", &"outer_t".into(), "shape/s2", Registration::Registry);
+        next.admit_subquery(&where_json).await.unwrap();
+        let begin = engine
+            .subqueries
+            .lock()
+            .await
+            .begin_create("s2", &"outer_t".into(), "shape/s2", &where_json, None, false)
+            .unwrap();
+        assert!(begin.seeds.is_empty());
+        next.admission.as_mut().unwrap().retain_fresh(&begin);
+        let sibling = engine
+            .subquery_init
+            .try_acquire(&initialization_nodes(&where_json))
+            .expect("a reused node must not be held through the outer backfill");
+        drop(sibling);
+        next.rollback().await;
+        assert!(engine.subqueries.lock().await.shapes.contains_key("s1"), "rollback preserves the live owner");
+        assert!(engine.subquery_init.nodes.lock().unwrap().is_empty());
     }
 
     // --- the sharing rendezvous carries the creator's REASON ------------------------------------
