@@ -2204,14 +2204,34 @@ impl Engine {
     ) -> Result<()> {
         // Phase A (brief lock). Dependency admission prevents a create observing a half-seeded
         // shared node; disjoint creates may already be doing their phase-B I/O.
-        let begin = self.subqueries.lock().await.begin_create(
-            id,
-            table,
-            stream_path,
-            where_json,
-            out_cols.clone(),
-            changes_only,
-        )?;
+        let mut capacity_wait = Duration::ZERO;
+        let begin = loop {
+            let mut registry = self.subqueries.lock().await;
+            // Decide under the same lock as begin_create: a live node cannot disappear
+            // between this check and refcount pinning. Queued fresh creates have no registry
+            // seeds or delta buffers yet, so the cap also bounds those pending fresh sets.
+            let needs_seed = admission.nodes.iter().any(|sig| !registry.nodes.contains_key(sig));
+            if needs_seed && admission.seed_slot.is_none() {
+                if let Ok(slot) = self.subquery_init.seed_slots.clone().try_acquire_owned() {
+                    admission.seed_slot = Some(slot);
+                } else {
+                    drop(registry);
+                    tracing::info!(
+                        target: "electric_circuits_engine::shape_create",
+                        shape_id = id,
+                        table = %table,
+                        "subquery shape waiting for seed capacity"
+                    );
+                    let started = std::time::Instant::now();
+                    admission.wait_for_seed_slot(where_json, &self.shutdown_token()).await?;
+                    capacity_wait += started.elapsed();
+                    // Waiting releases node reservations. Recheck the registry after reacquiring:
+                    // another initializer may have installed these nodes in the meantime.
+                    continue;
+                }
+            }
+            break registry.begin_create(id, table, stream_path, where_json, out_cols.clone(), changes_only)?;
+        };
         // Phase A pins reused nodes by refcount. They already have complete membership, so
         // their dependents need not wait for this shape's outer backfill. Keep ownership only
         // of our fresh seeds, including any partly installed seed if phase C is cancelled.
@@ -2222,7 +2242,8 @@ impl Engine {
             table = %table,
             changes_only,
             subquery_nodes = begin.seeds.len() as u64,
-            admission_wait_ms = admission_wait.as_millis() as u64,
+            admission_wait_ms = (admission_wait + capacity_wait).as_millis() as u64,
+            seed_capacity_wait_ms = capacity_wait.as_millis() as u64,
             "subquery shape create started"
         );
         // Phase B (no registry lock): seed fresh nodes + backfill the shape, all from pooled PG.
@@ -2479,11 +2500,31 @@ enum Registration {
 struct SubqueryPermit {
     admission: Arc<SubqueryAdmission>,
     nodes: HashSet<crate::predicate::SubquerySig>,
+    seed_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl SubqueryPermit {
+    async fn wait_for_seed_slot(
+        &mut self,
+        predicate: &PredicateJson,
+        shutdown: &crate::shutdown::ShutdownToken,
+    ) -> Result<()> {
+        // Never wait for capacity while owning signatures: a mixed fresh/live predicate
+        // must not prevent live-node backfills from bypassing a saturated seed lane.
+        self.release_nodes();
+        self.seed_slot = Some(tokio::select! {
+            biased;
+            _ = shutdown.wait() => bail!(crate::engine::sequencer::SHUTTING_DOWN),
+            slot = self.admission.seed_slots.clone().acquire_owned() => slot.context("subquery seed admission closed")?,
+        });
+        let mut acquired = self.admission.acquire(predicate, shutdown).await?;
+        self.nodes = std::mem::take(&mut acquired.nodes);
+        Ok(())
+    }
+
     fn retain_fresh(&mut self, begin: &crate::subquery::BeginCreate) {
         let fresh: HashSet<_> = begin.seeds.iter().map(|(sig, _, _)| sig.clone()).collect();
+        let previous = self.nodes.len();
         let mut held = self.admission.nodes.lock().unwrap();
         self.nodes.retain(|sig| {
             if fresh.contains(sig) {
@@ -2494,18 +2535,33 @@ impl SubqueryPermit {
             }
         });
         drop(held);
+        if self.nodes.is_empty() {
+            // A create that waited for a slot may now find all its nodes already live.
+            self.seed_slot.take();
+        }
+        if self.nodes.len() != previous {
+            self.admission.changed.notify_waiters();
+        }
+    }
+
+    fn release_nodes(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        let mut held = self.admission.nodes.lock().unwrap();
+        for sig in self.nodes.drain() {
+            held.remove(&sig);
+        }
+        drop(held);
         self.admission.changed.notify_waiters();
     }
 }
 
 impl Drop for SubqueryPermit {
     fn drop(&mut self) {
-        let mut held = self.admission.nodes.lock().unwrap();
-        for sig in &self.nodes {
-            held.remove(sig);
-        }
-        drop(held);
-        self.admission.changed.notify_waiters();
+        self.release_nodes();
+        // The seed slot drops with this permit, including when CreateGuard transferred it
+        // to the shutdown-owned cleanup task. No slot is returned before rollback finishes.
     }
 }
 
@@ -2544,7 +2600,7 @@ impl SubqueryAdmission {
             return None;
         }
         held.extend(nodes.iter().cloned());
-        Some(SubqueryPermit { admission: self.clone(), nodes: nodes.clone() })
+        Some(SubqueryPermit { admission: self.clone(), nodes: nodes.clone(), seed_slot: None })
     }
 
     async fn acquire(
@@ -3274,9 +3330,11 @@ mod cancellation_tests {
     }
 
     async fn cancel_while_cleanup_is_blocked(explicit: bool) {
-        let (engine, where_json) = engine_with_subquery_tables().await;
+        let (mut engine, where_json) = engine_with_subquery_tables().await;
+        engine.subquery_init = Arc::new(SubqueryAdmission::new(1));
         let mut guard = register(&engine, "s1", &where_json).await;
         guard.admit_subquery(&where_json).await.unwrap();
+        guard.admission.as_mut().unwrap().wait_for_seed_slot(&where_json, &engine.shutdown_token()).await.unwrap();
         let mut registry = engine.subqueries.lock().await;
         let begin = registry.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
         let sig = &begin.seeds[0].0;
@@ -3303,8 +3361,15 @@ mod cancellation_tests {
             engine.subquery_init.try_acquire(&initialization_nodes(&where_json)).is_none(),
             "cleanup must retain admission while blocked"
         );
+        assert_eq!(engine.subquery_init.seed_slots.available_permits(), 0, "cleanup must also retain seed capacity");
         drop(registry);
         assert_rolled_back(&engine, "s1", &where_json).await;
+        let returned =
+            tokio::time::timeout(Duration::from_secs(5), engine.subquery_init.seed_slots.clone().acquire_owned())
+                .await
+                .expect("cleanup never returned its seed capacity")
+                .unwrap();
+        drop(returned);
         assert_eq!(engine.subqueries.lock().await.circuit_distinct(node_id), 0);
         let mut next = register(&engine, "s2", &where_json).await;
         next.admit_subquery(&where_json).await.unwrap();
@@ -3383,6 +3448,75 @@ mod cancellation_tests {
         assert_eq!(admission.nodes.lock().unwrap().len(), 2);
         drop(permit);
         assert!(admission.nodes.lock().unwrap().is_empty(), "finished creates retain no signature entries");
+    }
+
+    fn seed_predicate(table: &str) -> PredicateJson {
+        serde_json::from_value(serde_json::json!({ "col": "id", "in": { "table": table, "project": "id" } })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn seed_capacity_queues_n_plus_one_without_holding_node_reservations() {
+        for capacity in [1, 2, 4] {
+            let admission = Arc::new(SubqueryAdmission::new(capacity));
+            let shutdown = crate::shutdown::ShutdownToken::new();
+            let mut owners = Vec::new();
+            for n in 0..capacity {
+                let predicate = seed_predicate(&format!("inner_{n}"));
+                let mut owner = admission.acquire(&predicate, &shutdown).await.unwrap();
+                owner.wait_for_seed_slot(&predicate, &shutdown).await.unwrap();
+                owners.push(owner);
+            }
+            let predicate = seed_predicate("overflow");
+            let mut overflow = admission.acquire(&predicate, &shutdown).await.unwrap();
+            {
+                let waiting = overflow.wait_for_seed_slot(&predicate, &shutdown);
+                tokio::pin!(waiting);
+                assert!(
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await
+                );
+                assert_eq!(admission.seed_slots.available_permits(), 0);
+                assert!(
+                    admission.try_acquire(&initialization_nodes(&predicate)).is_some(),
+                    "capacity wait holds no nodes"
+                );
+                owners.pop();
+                tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap();
+            }
+            drop(overflow);
+            drop(owners);
+            assert_eq!(admission.seed_slots.available_permits(), capacity);
+            assert!(admission.nodes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_capacity_wait_is_cancellable_and_shutdown_aware() {
+        let admission = Arc::new(SubqueryAdmission::new(1));
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let a = seed_predicate("a");
+        let b = seed_predicate("b");
+        let mut owner = admission.acquire(&a, &shutdown).await.unwrap();
+        owner.wait_for_seed_slot(&a, &shutdown).await.unwrap();
+        let mut waiter = admission.acquire(&b, &shutdown).await.unwrap();
+        {
+            let cancelled = waiter.wait_for_seed_slot(&b, &shutdown);
+            tokio::pin!(cancelled);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(cancelled.as_mut().poll(cx).is_pending())).await);
+        }
+        assert!(waiter.nodes.is_empty());
+        assert!(waiter.seed_slot.is_none());
+        assert_eq!(admission.seed_slots.available_permits(), 0, "cancellation cannot release the owner's slot");
+        {
+            let waiting = waiter.wait_for_seed_slot(&b, &shutdown);
+            tokio::pin!(waiting);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+            shutdown.begin();
+            assert!(waiting.await.unwrap_err().to_string().contains(crate::engine::sequencer::SHUTTING_DOWN));
+        }
+        drop(waiter);
+        drop(owner);
+        assert_eq!(admission.seed_slots.available_permits(), 1);
+        assert!(admission.nodes.lock().unwrap().is_empty());
     }
 
     #[test]

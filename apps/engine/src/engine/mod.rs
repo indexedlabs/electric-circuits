@@ -55,10 +55,29 @@ use sequencer::*;
 
 /// Only active creates own entries; waiters hold no partial reservation. This is request-owned
 /// coordination, not another worker queue. PostgreSQL work still uses the bounded engine pool.
-#[derive(Default)]
 struct SubqueryAdmission {
     nodes: std::sync::Mutex<HashSet<crate::predicate::SubquerySig>>,
     changed: tokio::sync::Notify,
+    /// Bounds retained fresh initializer state across PG checkouts and cancellation cleanup.
+    seed_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl SubqueryAdmission {
+    fn new(capacity: usize) -> Self {
+        Self {
+            nodes: Default::default(),
+            changed: Default::default(),
+            seed_slots: Arc::new(tokio::sync::Semaphore::new(capacity.clamp(1, tokio::sync::Semaphore::MAX_PERMITS))),
+        }
+    }
+}
+
+impl Default for SubqueryAdmission {
+    fn default() -> Self {
+        Self::new(
+            std::env::var("ELECTRIC_CIRCUITS_SUBQUERY_INIT_CONCURRENCY").ok().and_then(|v| v.parse().ok()).unwrap_or(4),
+        )
+    }
 }
 
 pub use drift::ResolveLock;
