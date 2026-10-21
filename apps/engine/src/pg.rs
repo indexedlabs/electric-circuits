@@ -2350,11 +2350,11 @@ mod ownership_tests {
         let pool = Pool::new("postgres://unused/test".into(), 1);
         let held = pool.hold_slot_for_test().await;
         let mut timing = CheckoutTiming::default();
-        let waited = tokio::time::timeout(std::time::Duration::from_millis(20), pool.get_timed(&mut timing)).await;
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(30), pool.get_timed(&mut timing)).await;
         assert!(waited.is_err(), "the full pool keeps the checkout waiting");
         let (phase, since) = timing.in_progress.expect("the slot wait is still under way");
         assert_eq!(phase, QueryPhase::PoolWait);
-        assert!(since.elapsed() >= std::time::Duration::from_millis(20));
+        assert!(since.elapsed() >= std::time::Duration::from_millis(25));
         drop(held);
         pool.close();
     }

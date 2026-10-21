@@ -304,7 +304,8 @@ mod tests {
 
         let capture = Capture::start();
         let page = engine.query_subset(&table(), Some(predicate), None, None, None, None).await;
-        assert!(page.is_err(), "a string is not an integer literal");
+        let error = format!("{:#}", page.err().expect("a string is not an integer literal"));
+        assert!(error.contains("private-sentinel"), "the compiler must have quoted the value: {error}");
         let lines = capture.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(!lines[0].contains("private-sentinel"), "the predicate value leaked: {}", lines[0]);
@@ -338,7 +339,7 @@ mod tests {
         let mut log = SubsetQueryLog::start(&table());
         log.state_held();
         log.pool = Some((pool.in_use(), pool.size()));
-        let waited = tokio::time::timeout(Duration::from_millis(25), pool.get_timed(&mut log.checkout)).await;
+        let waited = tokio::time::timeout(Duration::from_millis(30), pool.get_timed(&mut log.checkout)).await;
         assert!(waited.is_err(), "the full pool keeps the page waiting");
         let logged = events(|| drop(log));
         assert_eq!(logged.len(), 1, "{logged:?}");

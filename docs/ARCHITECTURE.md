@@ -865,7 +865,7 @@ backfills, seeds and query-backs. Each page the engine accepts (one `ensure_not_
 already refused) logs one `subset query finished` event (target
 `electric_circuits_engine::subset_query`) when it ends. `outcome` is `ok`, `error` or `cancelled`
 (the request was dropped mid-await). A failed page names the `phase` it failed in (`prepare` for the
-predicate and columns, before Postgres) and why, without the error's text, which can quote predicate
+table lookup, predicate, columns and pool lookup, before Postgres) and why, without the error's text, which can quote predicate
 values: `error_kind` is `settle_timed_out`, `settle_rejected`, `settle_shared`, `settle_overflowed`,
 `postgres` (with its `sqlstate`), `postgres_closed` or `other`. A cancelled page names the `phase` it
 was dropped in and credits that phase with the time it had run. Phases a page never reached read 0:
