@@ -574,6 +574,8 @@ pub struct CheckoutTiming {
     /// The step under way and when it began, so a checkout dropped mid-await can still say where
     /// its time went; `None` between steps.
     pub in_progress: Option<(QueryPhase, std::time::Instant)>,
+    /// The last step begun, which names where a failed checkout failed.
+    pub last: Option<QueryPhase>,
 }
 
 /// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
@@ -680,6 +682,7 @@ impl PoolInner {
     async fn checkout(&self, timing: &mut CheckoutTiming) -> Result<(Client, tokio::sync::OwnedSemaphorePermit)> {
         let started = std::time::Instant::now();
         timing.in_progress = Some((QueryPhase::PoolWait, started));
+        timing.last = Some(QueryPhase::PoolWait);
         let permit = self.sem.clone().acquire_owned().await;
         timing.slot_wait = started.elapsed();
         timing.in_progress = None;
@@ -690,6 +693,7 @@ impl PoolInner {
             None => {
                 let dialing = std::time::Instant::now();
                 timing.in_progress = Some((QueryPhase::Connect, dialing));
+                timing.last = Some(QueryPhase::Connect);
                 let dialed = connect_owned(&self.url, &self.shutdown).await;
                 timing.connect = Some(dialing.elapsed());
                 timing.in_progress = None;
@@ -1868,6 +1872,8 @@ pub struct SubsetQueryTiming {
     pub select: std::time::Duration,
     /// The phase under way and when it began; `None` between phases (see [`CheckoutTiming`]).
     pub in_progress: Option<(QueryPhase, std::time::Instant)>,
+    /// The last phase begun, which names where a failed query failed.
+    pub last: Option<QueryPhase>,
 }
 
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
@@ -1907,12 +1913,14 @@ pub async fn query_subset_where(
 ) -> Result<SubsetQuery> {
     let started = std::time::Instant::now();
     timing.in_progress = Some((QueryPhase::Snapshot, started));
+    timing.last = Some(QueryPhase::Snapshot);
     let fences = begin_settled_snapshot(client, scope, 0, "subset").await;
     timing.snapshot = started.elapsed();
     timing.in_progress = None;
     let fences = fences?;
     let selecting = std::time::Instant::now();
     timing.in_progress = Some((QueryPhase::Select, selecting));
+    timing.last = Some(QueryPhase::Select);
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();

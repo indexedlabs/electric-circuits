@@ -48,13 +48,25 @@ impl SubsetQueryLog {
         self.state_wait = Some(self.started.elapsed());
     }
 
-    /// Log the page's outcome: `ok`, or `error` with the error's top-level message. Only the top
-    /// level: deeper causes can quote a caller's predicate values (a Postgres cast error does), and
-    /// those stay out of the logs.
+    /// Log the page's outcome: `ok`, or `error` with the phase it failed in and a value-free
+    /// description of why (see [`Failure`]).
     pub(super) fn finish<T>(mut self, result: &anyhow::Result<T>) {
         match result {
             Ok(_) => self.emit("ok", None, None),
-            Err(e) => self.emit("error", Some(e.to_string()), None),
+            Err(e) => {
+                let phase = self.failed_phase();
+                self.emit("error", Some(phase), Some(Failure::of(e)));
+            }
+        }
+    }
+
+    /// The last phase a failed page began: a Postgres phase, else `prepare` (compiling the
+    /// predicate and columns, after the lock), else the state lock itself.
+    fn failed_phase(&self) -> &'static str {
+        match self.query.last.or(self.checkout.last) {
+            Some(phase) => phase.name(),
+            None if self.state_wait.is_some() => "prepare",
+            None => "state_wait",
         }
     }
 
@@ -77,15 +89,17 @@ impl SubsetQueryLog {
         phase.name()
     }
 
-    fn emit(&mut self, outcome: &'static str, error: Option<String>, phase: Option<&'static str>) {
+    fn emit(&mut self, outcome: &'static str, phase: Option<&'static str>, failure: Option<Failure>) {
         self.logged = true;
         let (pool_in_use, pool_size) = self.pool.unwrap_or_default();
+        let (error_kind, sqlstate) = failure.map_or((None, None), |f| (Some(f.kind), f.sqlstate));
         tracing::info!(
             target: TARGET,
             table = %self.table,
             outcome,
             phase,
-            error = error.as_deref(),
+            error_kind,
+            sqlstate = sqlstate.as_deref(),
             rows = self.rows as u64,
             state_wait_ms = ms(self.state_wait.unwrap_or_default()),
             pool_wait_ms = ms(self.checkout.slot_wait),
@@ -105,8 +119,37 @@ impl Drop for SubsetQueryLog {
     fn drop(&mut self) {
         if !self.logged {
             let phase = self.credit_in_progress();
-            self.emit("cancelled", None, Some(phase));
+            self.emit("cancelled", Some(phase), None);
         }
+    }
+}
+
+/// Why a page failed, without its message. Messages can quote a caller's predicate values (a
+/// non-numeric string compared to an integer column fails with the string in the text, and so do
+/// Postgres cast errors), so the event carries a fixed category and, for a Postgres error, its
+/// SQLSTATE: enough to tell a settle wait, a refused connection (`53300`) or a cancelled statement
+/// (`57014`) apart.
+struct Failure {
+    kind: &'static str,
+    sqlstate: Option<String>,
+}
+
+impl Failure {
+    fn of(e: &anyhow::Error) -> Self {
+        if let Some(unsettled) = e.downcast_ref::<crate::pg::SnapshotUnsettled>() {
+            let kind = match unsettled.cause {
+                crate::pg::UnsettledCause::TimedOut => "settle_timed_out",
+                crate::pg::UnsettledCause::Rejected => "settle_rejected",
+                crate::pg::UnsettledCause::Shared => "settle_shared",
+                crate::pg::UnsettledCause::Overflowed => "settle_overflowed",
+            };
+            return Failure { kind, sqlstate: None };
+        }
+        if let Some(pg) = e.chain().find_map(|cause| cause.downcast_ref::<tokio_postgres::Error>()) {
+            let kind = if pg.is_closed() { "postgres_closed" } else { "postgres" };
+            return Failure { kind, sqlstate: pg.code().map(|code| code.code().to_owned()) };
+        }
+        Failure { kind: "other", sqlstate: None }
     }
 }
 
@@ -134,24 +177,49 @@ mod tests {
         }
     }
 
+    /// Captures the JSON events logged on this thread while it lives.
+    struct Capture {
+        captured: Captured,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl Capture {
+        fn start() -> Self {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_writer(move || writer.clone())
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            Capture { captured, _guard: tracing::subscriber::set_default(subscriber) }
+        }
+
+        /// The raw lines of the `subset query finished` events so far.
+        fn lines(&self) -> Vec<String> {
+            let bytes = self.captured.0.lock().unwrap().clone();
+            String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .filter(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["target"] == TARGET)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// Those events' fields.
+        fn events(&self) -> Vec<serde_json::Value> {
+            self.lines()
+                .iter()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"].clone())
+                .collect()
+        }
+    }
+
     /// The `subset query finished` events `run` logs, as JSON field maps.
     fn events(run: impl FnOnce()) -> Vec<serde_json::Value> {
-        let captured = Captured::default();
-        let writer = captured.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(move || writer.clone())
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        tracing::subscriber::with_default(subscriber, run);
-        let bytes = captured.0.lock().unwrap().clone();
-        String::from_utf8(bytes)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-            .filter(|event| event["target"] == TARGET)
-            .map(|event| event["fields"].clone())
-            .collect()
+        let capture = Capture::start();
+        run();
+        capture.events()
     }
 
     fn table() -> TableRef {
@@ -176,7 +244,7 @@ mod tests {
         assert_eq!(event["message"], "subset query finished");
         assert_eq!(event["table"], "public.items");
         assert_eq!(event["outcome"], "ok");
-        for absent in ["error", "phase"] {
+        for absent in ["error_kind", "sqlstate", "phase"] {
             assert!(event.get(absent).is_none_or(serde_json::Value::is_null), "{absent} in {event}");
         }
         for (field, value) in [
@@ -195,24 +263,57 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_page_keeps_the_phases_it_ran_and_only_its_top_level_error() {
+    fn a_settle_failure_names_its_phase_and_cause() {
         let logged = events(|| {
             let mut log = SubsetQueryLog::start(&table());
             log.state_held();
             log.pool = Some((20, 20));
             log.checkout.slot_wait = Duration::from_millis(30);
+            log.checkout.last = Some(QueryPhase::PoolWait);
             log.query.snapshot = Duration::from_millis(1500);
-            let failed: anyhow::Result<()> =
-                Err(anyhow::anyhow!("invalid input syntax for type uuid: \"secret\"").context("subset select"));
+            log.query.last = Some(QueryPhase::Snapshot);
+            let unsettled =
+                crate::pg::SnapshotUnsettled { cause: crate::pg::UnsettledCause::TimedOut, pending: vec![7] };
+            let failed: anyhow::Result<()> = Err(anyhow::Error::new(unsettled));
             log.finish(&failed);
         });
         assert_eq!(logged.len(), 1, "{logged:?}");
         let event = &logged[0];
         assert_eq!(event["outcome"], "error");
-        assert_eq!(event["error"], "subset select", "a predicate value never reaches the log");
+        assert_eq!(event["phase"], "snapshot");
+        assert_eq!(event["error_kind"], "settle_timed_out");
         assert_eq!(event["snapshot_ms"], 1500);
         assert_eq!(event["pool_wait_ms"], 30);
         assert_eq!(event["dialed"], false);
+    }
+
+    /// Through the real `Engine::query_subset` and predicate compiler: a non-numeric string compared
+    /// to an integer column fails with the string in its message, and none of it reaches the event.
+    #[tokio::test]
+    async fn a_rejected_predicate_logs_a_value_free_error_from_the_real_query_path() {
+        use crate::ds::DsClient;
+        use crate::engine::Engine;
+        use crate::schema::{TableDef, TableSchema};
+
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let def: TableDef =
+            serde_json::from_value(serde_json::json!({"columns":{"id":{"type":"int"}},"primaryKey":"id"})).unwrap();
+        engine.state.lock().await.tables.insert(table(), TableSchema::from_def(&table(), &def).unwrap());
+        let predicate =
+            serde_json::from_value(serde_json::json!({"col":"id","op":"eq","value":"private-sentinel"})).unwrap();
+
+        let capture = Capture::start();
+        let page = engine.query_subset(&table(), Some(predicate), None, None, None, None).await;
+        assert!(page.is_err(), "a string is not an integer literal");
+        let lines = capture.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!lines[0].contains("private-sentinel"), "the predicate value leaked: {}", lines[0]);
+        let event = &capture.events()[0];
+        assert_eq!(event["outcome"], "error");
+        assert_eq!(event["phase"], "prepare");
+        assert_eq!(event["error_kind"], "other");
+        drop(capture);
+        engine.close(Duration::from_secs(5)).await;
     }
 
     #[test]
