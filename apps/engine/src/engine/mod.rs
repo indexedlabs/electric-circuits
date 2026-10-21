@@ -2804,15 +2804,14 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SubsetPage> {
-        let started = std::time::Instant::now();
         let (ts, schemas) = {
             let st = self.state.lock().await;
+            log.state_held();
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
             // Clone the table schemas so the subquery SQL emitter can cast each leaf's param to its
             // column's native Postgres type (query_subset is one-shot; the clone is off the hot path).
             (ts, st.tables.clone())
         };
-        log.state_wait = started.elapsed();
         let out_cols = resolve_columns(&ts, columns)?;
         let order = match order_by {
             Some((col, desc)) => Some((ts.column_index(&col)?, desc)),

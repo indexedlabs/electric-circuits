@@ -4,12 +4,12 @@
 //!
 //! The event is emitted from a guard: a page that ends normally reports `ok` or `error`, and a page
 //! whose request is dropped mid-await (a client disconnect or an upstream timeout) reports
-//! `cancelled` with the phases it reached. Without the guard the slowest pages, the ones a caller
-//! gave up on, would never be logged.
+//! `cancelled`, naming the `phase` it was dropped in and crediting that phase with the time it had
+//! run. Without the guard the slowest pages, the ones a caller gave up on, would never be logged.
 
 use std::time::{Duration, Instant};
 
-use crate::pg::{CheckoutTiming, SubsetQueryTiming};
+use crate::pg::{CheckoutTiming, QueryPhase, SubsetQueryTiming};
 use crate::table_ref::TableRef;
 
 /// The log target, so the events can be filtered on their own.
@@ -19,8 +19,8 @@ pub(super) const TARGET: &str = "electric_circuits_engine::subset_query";
 pub(super) struct SubsetQueryLog {
     table: String,
     started: Instant,
-    /// Taking the engine-state lock and cloning the schemas.
-    pub(super) state_wait: Duration,
+    /// Taking the engine-state lock; `None` until the lock is held.
+    pub(super) state_wait: Option<Duration>,
     /// Pool occupancy and cap when the page asked for a connection; `None` until it asks.
     pub(super) pool: Option<(usize, usize)>,
     pub(super) checkout: CheckoutTiming,
@@ -34,7 +34,7 @@ impl SubsetQueryLog {
         SubsetQueryLog {
             table: table.to_string(),
             started: Instant::now(),
-            state_wait: Duration::ZERO,
+            state_wait: None,
             pool: None,
             checkout: CheckoutTiming::default(),
             query: SubsetQueryTiming::default(),
@@ -43,24 +43,51 @@ impl SubsetQueryLog {
         }
     }
 
-    /// Log the page's outcome: `ok`, or `error` with the error chain.
+    /// Record that the engine-state lock is held, the first phase.
+    pub(super) fn state_held(&mut self) {
+        self.state_wait = Some(self.started.elapsed());
+    }
+
+    /// Log the page's outcome: `ok`, or `error` with the error's top-level message. Only the top
+    /// level: deeper causes can quote a caller's predicate values (a Postgres cast error does), and
+    /// those stay out of the logs.
     pub(super) fn finish<T>(mut self, result: &anyhow::Result<T>) {
         match result {
-            Ok(_) => self.emit("ok", None),
-            Err(e) => self.emit("error", Some(format!("{e:#}"))),
+            Ok(_) => self.emit("ok", None, None),
+            Err(e) => self.emit("error", Some(e.to_string()), None),
         }
     }
 
-    fn emit(&mut self, outcome: &'static str, error: Option<String>) {
+    /// The phase a dropped page was in, with its elapsed time credited to that phase's field.
+    fn credit_in_progress(&mut self) -> &'static str {
+        if self.state_wait.is_none() {
+            self.state_wait = Some(self.started.elapsed());
+            return "state_wait";
+        }
+        let Some((phase, since)) = self.checkout.in_progress.take().or(self.query.in_progress.take()) else {
+            return "between_phases";
+        };
+        let elapsed = since.elapsed();
+        match phase {
+            QueryPhase::PoolWait => self.checkout.slot_wait = elapsed,
+            QueryPhase::Connect => self.checkout.connect = Some(elapsed),
+            QueryPhase::Snapshot => self.query.snapshot = elapsed,
+            QueryPhase::Select => self.query.select = elapsed,
+        }
+        phase.name()
+    }
+
+    fn emit(&mut self, outcome: &'static str, error: Option<String>, phase: Option<&'static str>) {
         self.logged = true;
         let (pool_in_use, pool_size) = self.pool.unwrap_or_default();
         tracing::info!(
             target: TARGET,
             table = %self.table,
             outcome,
+            phase,
             error = error.as_deref(),
             rows = self.rows as u64,
-            state_wait_ms = ms(self.state_wait),
+            state_wait_ms = ms(self.state_wait.unwrap_or_default()),
             pool_wait_ms = ms(self.checkout.slot_wait),
             dialed = self.checkout.connect.is_some(),
             connect_ms = ms(self.checkout.connect.unwrap_or_default()),
@@ -77,7 +104,8 @@ impl SubsetQueryLog {
 impl Drop for SubsetQueryLog {
     fn drop(&mut self) {
         if !self.logged {
-            self.emit("cancelled", None);
+            let phase = self.credit_in_progress();
+            self.emit("cancelled", None, Some(phase));
         }
     }
 }
@@ -134,11 +162,12 @@ mod tests {
     fn a_finished_page_logs_its_phases_once() {
         let logged = events(|| {
             let mut log = SubsetQueryLog::start(&table());
-            log.state_wait = Duration::from_millis(3);
+            log.state_wait = Some(Duration::from_millis(3));
             log.pool = Some((7, 20));
-            log.checkout =
-                CheckoutTiming { slot_wait: Duration::from_millis(40), connect: Some(Duration::from_millis(9)) };
-            log.query = SubsetQueryTiming { snapshot: Duration::from_millis(12), select: Duration::from_millis(150) };
+            log.checkout.slot_wait = Duration::from_millis(40);
+            log.checkout.connect = Some(Duration::from_millis(9));
+            log.query.snapshot = Duration::from_millis(12);
+            log.query.select = Duration::from_millis(150);
             log.rows = 5;
             log.finish(&anyhow::Ok(()));
         });
@@ -147,7 +176,9 @@ mod tests {
         assert_eq!(event["message"], "subset query finished");
         assert_eq!(event["table"], "public.items");
         assert_eq!(event["outcome"], "ok");
-        assert!(event.get("error").is_none_or(serde_json::Value::is_null), "{event}");
+        for absent in ["error", "phase"] {
+            assert!(event.get(absent).is_none_or(serde_json::Value::is_null), "{absent} in {event}");
+        }
         for (field, value) in [
             ("rows", 5),
             ("state_wait_ms", 3),
@@ -164,34 +195,58 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_page_keeps_the_phases_it_ran_and_its_cause() {
+    fn a_failed_page_keeps_the_phases_it_ran_and_only_its_top_level_error() {
         let logged = events(|| {
             let mut log = SubsetQueryLog::start(&table());
+            log.state_held();
             log.pool = Some((20, 20));
             log.checkout.slot_wait = Duration::from_millis(30);
             log.query.snapshot = Duration::from_millis(1500);
             let failed: anyhow::Result<()> =
-                Err(anyhow::anyhow!("snapshot did not settle").context("subset query-back"));
+                Err(anyhow::anyhow!("invalid input syntax for type uuid: \"secret\"").context("subset select"));
             log.finish(&failed);
         });
         assert_eq!(logged.len(), 1, "{logged:?}");
         let event = &logged[0];
         assert_eq!(event["outcome"], "error");
-        assert_eq!(event["error"], "subset query-back: snapshot did not settle");
+        assert_eq!(event["error"], "subset select", "a predicate value never reaches the log");
         assert_eq!(event["snapshot_ms"], 1500);
         assert_eq!(event["pool_wait_ms"], 30);
         assert_eq!(event["dialed"], false);
     }
 
     #[test]
-    fn a_dropped_page_logs_as_cancelled() {
+    fn a_page_dropped_before_the_lock_credits_the_state_wait() {
         let logged = events(|| {
-            let mut log = SubsetQueryLog::start(&table());
-            log.checkout.slot_wait = Duration::from_millis(80);
+            let log = SubsetQueryLog::start(&table());
+            std::thread::sleep(Duration::from_millis(15));
             drop(log);
         });
         assert_eq!(logged.len(), 1, "{logged:?}");
         assert_eq!(logged[0]["outcome"], "cancelled");
-        assert_eq!(logged[0]["pool_wait_ms"], 80);
+        assert_eq!(logged[0]["phase"], "state_wait");
+        assert!(logged[0]["state_wait_ms"].as_u64().unwrap() >= 15, "{}", logged[0]);
+    }
+
+    /// A page dropped while every pool slot is taken: the real checkout is left mid-wait, and the
+    /// event credits that wait to `pool_wait_ms` rather than reading 0.
+    #[tokio::test]
+    async fn a_page_dropped_waiting_for_a_slot_credits_the_pool_wait() {
+        let pool = crate::pg::Pool::new("postgres://unused/test".into(), 1);
+        let held = pool.hold_slot_for_test().await;
+        let mut log = SubsetQueryLog::start(&table());
+        log.state_held();
+        log.pool = Some((pool.in_use(), pool.size()));
+        let waited = tokio::time::timeout(Duration::from_millis(25), pool.get_timed(&mut log.checkout)).await;
+        assert!(waited.is_err(), "the full pool keeps the page waiting");
+        let logged = events(|| drop(log));
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        let event = &logged[0];
+        assert_eq!(event["outcome"], "cancelled");
+        assert_eq!(event["phase"], "pool_wait");
+        assert!(event["pool_wait_ms"].as_u64().unwrap() >= 25, "{event}");
+        assert_eq!((event["pool_in_use"].as_u64(), event["pool_size"].as_u64()), (Some(1), Some(1)));
+        drop(held);
+        pool.close();
     }
 }

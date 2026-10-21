@@ -539,6 +539,30 @@ pub(crate) async fn connect_owned(url: &str, owner: &crate::shutdown::ShutdownTo
     PgConnectionConfig::from_process_env(url)?.connect(Some(owner)).await
 }
 
+/// A timed step of a subset query, named in its telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPhase {
+    /// Waiting for one of a [`Pool`]'s slots.
+    PoolWait,
+    /// Dialing a new pooled connection.
+    Connect,
+    /// Opening a settled snapshot, settle wait included.
+    Snapshot,
+    /// The page `SELECT`, its decoding and the `COMMIT`.
+    Select,
+}
+
+impl QueryPhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            QueryPhase::PoolWait => "pool_wait",
+            QueryPhase::Connect => "connect",
+            QueryPhase::Snapshot => "snapshot",
+            QueryPhase::Select => "select",
+        }
+    }
+}
+
 /// Where a [`Pool`] checkout spent its time.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckoutTiming {
@@ -547,6 +571,9 @@ pub struct CheckoutTiming {
     /// Dialing a new connection (TCP, TLS, authentication) when no idle one was left; `None` when
     /// an idle connection was reused.
     pub connect: Option<std::time::Duration>,
+    /// The step under way and when it began, so a checkout dropped mid-await can still say where
+    /// its time went; `None` between steps.
+    pub in_progress: Option<(QueryPhase, std::time::Instant)>,
 }
 
 /// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
@@ -610,6 +637,12 @@ impl Pool {
         self.inner.size.saturating_sub(self.inner.sem.available_permits())
     }
 
+    /// Take one slot without a connection, so a test can fill the pool without a server.
+    #[cfg(test)]
+    pub(crate) async fn hold_slot_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.inner.sem.clone().acquire_owned().await.expect("test pool open")
+    }
+
     /// The settle set for snapshots taken on this pool (see [`SequencedXids`]). The sequencer that
     /// consumes this database's change log notes into it.
     pub fn sequenced(&self) -> Arc<SequencedXids> {
@@ -646,15 +679,20 @@ impl PoolInner {
     /// reports how long it waited.
     async fn checkout(&self, timing: &mut CheckoutTiming) -> Result<(Client, tokio::sync::OwnedSemaphorePermit)> {
         let started = std::time::Instant::now();
-        let permit = self.sem.clone().acquire_owned().await.context("pg pool closed")?;
+        timing.in_progress = Some((QueryPhase::PoolWait, started));
+        let permit = self.sem.clone().acquire_owned().await;
         timing.slot_wait = started.elapsed();
+        timing.in_progress = None;
+        let permit = permit.context("pg pool closed")?;
         let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
         let client = match reused {
             Some(c) => c,
             None => {
                 let dialing = std::time::Instant::now();
+                timing.in_progress = Some((QueryPhase::Connect, dialing));
                 let dialed = connect_owned(&self.url, &self.shutdown).await;
                 timing.connect = Some(dialing.elapsed());
+                timing.in_progress = None;
                 dialed?
             }
         };
@@ -1828,6 +1866,8 @@ pub struct SubsetQueryTiming {
     pub snapshot: std::time::Duration,
     /// The page `SELECT`, decoding its rows and the `COMMIT`.
     pub select: std::time::Duration,
+    /// The phase under way and when it began; `None` between phases (see [`CheckoutTiming`]).
+    pub in_progress: Option<(QueryPhase, std::time::Instant)>,
 }
 
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
@@ -1866,15 +1906,19 @@ pub async fn query_subset_where(
     timing: &mut SubsetQueryTiming,
 ) -> Result<SubsetQuery> {
     let started = std::time::Instant::now();
+    timing.in_progress = Some((QueryPhase::Snapshot, started));
     let fences = begin_settled_snapshot(client, scope, 0, "subset").await;
     timing.snapshot = started.elapsed();
+    timing.in_progress = None;
     let fences = fences?;
     let selecting = std::time::Instant::now();
+    timing.in_progress = Some((QueryPhase::Select, selecting));
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
     timing.select = selecting.elapsed();
+    timing.in_progress = None;
     let rows = result?;
     Ok(SubsetQuery { rows, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
 }
@@ -2273,6 +2317,37 @@ mod ownership_tests {
         assert_eq!(pool.in_use(), 0);
         drop(settling);
         assert_eq!(pool.in_use(), 0);
+        pool.close();
+    }
+
+    #[tokio::test]
+    async fn a_failed_checkout_still_reports_its_slot_wait() {
+        let pool = Pool::new("postgres://unused/test".into(), 1);
+        let held = pool.hold_slot_for_test().await;
+        let closer = pool.clone();
+        let close_later = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            closer.close();
+        });
+        let mut timing = CheckoutTiming::default();
+        assert!(pool.get_timed(&mut timing).await.is_err(), "a closed pool refuses the waiter");
+        assert!(timing.slot_wait >= std::time::Duration::from_millis(30), "{timing:?}");
+        assert!(timing.in_progress.is_none(), "{timing:?}");
+        close_later.await.unwrap();
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_checkout_dropped_while_waiting_names_the_slot_wait() {
+        let pool = Pool::new("postgres://unused/test".into(), 1);
+        let held = pool.hold_slot_for_test().await;
+        let mut timing = CheckoutTiming::default();
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(20), pool.get_timed(&mut timing)).await;
+        assert!(waited.is_err(), "the full pool keeps the checkout waiting");
+        let (phase, since) = timing.in_progress.expect("the slot wait is still under way");
+        assert_eq!(phase, QueryPhase::PoolWait);
+        assert!(since.elapsed() >= std::time::Duration::from_millis(20));
+        drop(held);
         pool.close();
     }
 }

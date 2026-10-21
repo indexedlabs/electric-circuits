@@ -861,14 +861,16 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
 Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
-backfills, seeds and query-backs. Each page logs one `subset query finished` event (target
-`electric_circuits_engine::subset_query`) when it ends: `outcome` is `ok`, `error` (with the error
-chain in `error`) or `cancelled` (the request was dropped mid-await). The event says where the time
-went, with the phases a failed or cancelled page never reached left at 0:
+backfills, seeds and query-backs. Each page the engine accepts (one `ensure_not_degraded` has not
+already refused) logs one `subset query finished` event (target
+`electric_circuits_engine::subset_query`) when it ends. `outcome` is `ok`, `error` (with the error's
+top-level message in `error`; deeper causes can quote predicate values and are not logged) or
+`cancelled` (the request was dropped mid-await). A cancelled page names the `phase` it was dropped in
+and credits that phase with the time it had run; phases a page never reached read 0:
 
 | Field | Time spent |
 |---|---|
-| `state_wait_ms` | taking the engine-state lock and cloning the schemas |
+| `state_wait_ms` | taking the engine-state lock |
 | `pool_wait_ms` | waiting for one of the pool's slots; `pool_in_use`/`pool_size` are its occupancy when the page asked |
 | `connect_ms` | dialing a new connection when no idle one was left (`dialed`) |
 | `snapshot_ms` | opening the settled snapshot, settle wait and the slot retake after one included |
