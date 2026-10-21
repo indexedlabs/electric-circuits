@@ -861,10 +861,19 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
 Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
-backfills, seeds and query-backs. Every page logs one `subset query finished` event (target
-`electric_circuits_engine::subset_query`) with its outcome, row count and where its time went:
-`state_wait_ms` (engine-state lock), `pool_wait_ms` with `pool_in_use`/`pool_size` at the request,
-`snapshot_ms` (opening the settled snapshot, settle wait included), `select_ms` and `total_ms`.
+backfills, seeds and query-backs. Each page logs one `subset query finished` event (target
+`electric_circuits_engine::subset_query`) when it ends: `outcome` is `ok`, `error` (with the error
+chain in `error`) or `cancelled` (the request was dropped mid-await). The event says where the time
+went, with the phases a failed or cancelled page never reached left at 0:
+
+| Field | Time spent |
+|---|---|
+| `state_wait_ms` | taking the engine-state lock and cloning the schemas |
+| `pool_wait_ms` | waiting for one of the pool's slots; `pool_in_use`/`pool_size` are its occupancy when the page asked |
+| `connect_ms` | dialing a new connection when no idle one was left (`dialed`) |
+| `snapshot_ms` | opening the settled snapshot, settle wait and the slot retake after one included |
+| `select_ms` | the page `SELECT`, decoding its rows and the `COMMIT` |
+| `total_ms` | the whole page, including projecting rows to JSON |
 
 The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk
 versions**: a row read from a page carries that page's snapshot (`snapshot` = `pg_current_snapshot()`
