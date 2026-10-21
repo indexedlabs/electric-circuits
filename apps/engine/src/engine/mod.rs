@@ -41,6 +41,7 @@ mod output;
 mod planning;
 mod retirement;
 mod sequencer;
+mod subset_query_log;
 #[cfg(test)]
 mod tests;
 
@@ -2784,8 +2785,28 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SubsetPage> {
+        // Every page logs where its time went once it ends; a page dropped mid-await logs as
+        // cancelled from the guard's `Drop` (see `subset_query_log`).
+        let mut log = subset_query_log::SubsetQueryLog::start(table);
+        let page = self.query_subset_logged(&mut log, table, where_, columns, order_by, limit, offset).await;
+        log.finish(&page);
+        page
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn query_subset_logged(
+        &self,
+        log: &mut subset_query_log::SubsetQueryLog,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<SubsetPage> {
         let (ts, schemas) = {
             let st = self.state.lock().await;
+            log.state_held();
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
             // Clone the table schemas so the subquery SQL emitter can cast each leaf's param to its
             // column's native Postgres type (query_subset is one-shot; the clone is off the hot path).
@@ -2829,8 +2850,13 @@ impl Engine {
         // the inner tables of any subquery in its predicate.
         let scope = crate::pg::SettleScope::request(table)
             .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
-        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
-        let sq = crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await?;
+        let pool = self.pg_pool.as_ref().context("Postgres pool unavailable")?;
+        log.pool = Some((pool.in_use(), pool.size()));
+        let mut client = pool.get_timed(&mut log.checkout).await?;
+        let sq =
+            crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset, &mut log.query)
+                .await?;
+        log.rows = sq.rows.len();
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
         Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
