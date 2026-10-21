@@ -2784,6 +2784,7 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SubsetPage> {
+        let started = std::time::Instant::now();
         let (ts, schemas) = {
             let st = self.state.lock().await;
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
@@ -2791,6 +2792,7 @@ impl Engine {
             // column's native Postgres type (query_subset is one-shot; the clone is off the hot path).
             (ts, st.tables.clone())
         };
+        let state_wait = started.elapsed();
         let out_cols = resolve_columns(&ts, columns)?;
         let order = match order_by {
             Some((col, desc)) => Some((ts.column_index(&col)?, desc)),
@@ -2829,8 +2831,35 @@ impl Engine {
         // the inner tables of any subquery in its predicate.
         let scope = crate::pg::SettleScope::request(table)
             .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
-        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
-        let sq = crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await?;
+        let pool = self.pg_pool.as_ref().context("Postgres pool unavailable")?;
+        // Where a slow page waited — the state lock, a pool slot, the settled snapshot, or the
+        // SELECT — and how full the pool was when it asked. Logged for every outcome, so a burst of
+        // queries shows which of these saturates.
+        let pool_in_use = pool.in_use();
+        let mut pool_wait = std::time::Duration::ZERO;
+        let queried = async {
+            let checkout = std::time::Instant::now();
+            let mut client = pool.get().await?;
+            pool_wait = checkout.elapsed();
+            crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await
+        }
+        .await;
+        let timing = queried.as_ref().map(|sq| sq.timing).unwrap_or_default();
+        tracing::info!(
+            target: "electric_circuits_engine::subset_query",
+            table = %table,
+            outcome = if queried.is_ok() { "ok" } else { "error" },
+            rows = queried.as_ref().map_or(0, |sq| sq.rows.len() as u64),
+            state_wait_ms = state_wait.as_millis() as u64,
+            pool_wait_ms = pool_wait.as_millis() as u64,
+            pool_in_use = pool_in_use as u64,
+            pool_size = pool.size() as u64,
+            snapshot_ms = timing.snapshot.as_millis() as u64,
+            select_ms = timing.select.as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64,
+            "subset query finished"
+        );
+        let sq = queried?;
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
         Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })

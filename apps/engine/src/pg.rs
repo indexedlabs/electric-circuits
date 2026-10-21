@@ -552,6 +552,8 @@ struct PoolInner {
     url: String,
     idle: std::sync::Mutex<Vec<Client>>,
     sem: Arc<tokio::sync::Semaphore>,
+    /// The checkout cap `sem` was created with, so [`Pool::in_use`] can report occupancy.
+    size: usize,
     /// What the sequencer reading this database's changes has fanned out without a snapshot having
     /// been seen to contain it — the settle record every snapshot on this pool is checked against,
     /// with its own visibility poller (a dedicated connection, outside this pool's `size`).
@@ -576,6 +578,7 @@ impl Pool {
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
+                size: size.max(1),
             }),
         };
         pool
@@ -585,6 +588,16 @@ impl Pool {
         self.inner.shutdown.begin();
         self.inner.sem.close();
         self.inner.idle.lock().unwrap().clear();
+    }
+
+    /// The most connections this pool checks out at once.
+    pub fn size(&self) -> usize {
+        self.inner.size
+    }
+
+    /// Checkouts holding a slot right now: a point-in-time reading for telemetry, not a reservation.
+    pub fn in_use(&self) -> usize {
+        self.inner.size.saturating_sub(self.inner.sem.available_permits())
     }
 
     /// The settle set for snapshots taken on this pool (see [`SequencedXids`]). The sequencer that
@@ -1780,6 +1793,19 @@ pub struct SubsetQuery {
     /// `pg_current_wal_insert_lsn()` at the snapshot: no change at or past it can be in the page, so
     /// a client may drop the snapshot once its tail passes this LSN.
     pub horizon: String,
+    /// Where the query's time went, for the caller's telemetry.
+    pub timing: SubsetQueryTiming,
+}
+
+/// The two Postgres phases of a subset query, timed separately so an operator can tell a settle
+/// wait from a slow `SELECT`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubsetQueryTiming {
+    /// Opening the settled snapshot: `BEGIN`, the snapshot fences and any settle wait, including the
+    /// pool wait to retake a connection after one.
+    pub snapshot: std::time::Duration,
+    /// The page `SELECT` and decoding its rows.
+    pub select: std::time::Duration,
 }
 
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
@@ -1813,13 +1839,22 @@ pub async fn query_subset_where(
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
+    let started = std::time::Instant::now();
     let fences = begin_settled_snapshot(client, scope, 0, "subset").await?;
+    let snapshot = started.elapsed();
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
+    let select = started.elapsed().saturating_sub(snapshot);
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
     let rows = result?;
-    Ok(SubsetQuery { rows, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
+    Ok(SubsetQuery {
+        rows,
+        lsn: fences.seed_lsn,
+        snapshot: fences.snapshot,
+        horizon: fences.horizon_lsn,
+        timing: SubsetQueryTiming { snapshot, select },
+    })
 }
 
 /// One `ORDER BY` term for a subset page.
@@ -2189,5 +2224,19 @@ mod ownership_tests {
         assert!(a.inner.sem.is_closed());
         assert!(!b.inner.sem.is_closed());
         b.close();
+    }
+
+    #[tokio::test]
+    async fn in_use_counts_held_checkout_slots() {
+        let pool = Pool::new("postgres://unused/test".into(), 3);
+        assert_eq!((pool.size(), pool.in_use()), (3, 0));
+        let first = pool.inner.sem.clone().acquire_owned().await.unwrap();
+        let second = pool.inner.sem.clone().acquire_owned().await.unwrap();
+        assert_eq!(pool.in_use(), 2);
+        drop(first);
+        assert_eq!(pool.in_use(), 1);
+        drop(second);
+        assert_eq!(pool.in_use(), 0);
+        pool.close();
     }
 }

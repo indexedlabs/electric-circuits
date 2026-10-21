@@ -860,6 +860,12 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 *only* here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
+Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
+backfills, seeds and query-backs. Every page logs one `subset query finished` event (target
+`electric_circuits_engine::subset_query`) with its outcome, row count and where its time went:
+`state_wait_ms` (engine-state lock), `pool_wait_ms` with `pool_in_use`/`pool_size` at the request,
+`snapshot_ms` (opening the settled snapshot, settle wait included), `select_ms` and `total_ms`.
+
 The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk
 versions**: a row read from a page carries that page's snapshot (`snapshot` = `pg_current_snapshot()`
 and `horizon` = `pg_current_wal_insert_lsn()`, returned with every page), and an applied delta
