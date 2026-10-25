@@ -20,6 +20,13 @@ use crate::table_ref::TableRef;
 /// Keep compound prototype fan-in bounded before any feed claim or Postgres work begins.
 const MAX_BATCH_TABLES: usize = 64;
 
+// The lifecycle API currently returns only the shape and subscription, not whether the claim was
+// fresh. Serialize this route's owner check with its create so concurrent lost-response retries do
+// not both arm compensation for one shared claim. The engine's normal DELETE path remains safe via
+// the subscription identity and durable idempotent release.
+static COMPOUND_CLAIM_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 // These types are deliberately documentation-only. Runtime requests continue to use the
 // validated domain types below; keeping the OpenAPI projection separate means a schema change
 // cannot accidentally change parsing or engine behavior without a compiler/test failure.
@@ -1262,11 +1269,9 @@ async fn load_scope(
         Ok(page) => page,
         Err(error) => {
             release_feed_claims(&mut created).await;
-            return Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                msg: format!("scope page failed after feed creation: {error:#}"),
-                retry_after: true,
-            });
+            let mut app_error = AppError::from(error);
+            app_error.msg = format!("scope page failed after feed creation: {}", app_error.msg);
+            return Err(app_error);
         }
     };
     let lease_seconds = engine.lease_seconds();
@@ -1296,6 +1301,7 @@ async fn load_scope(
 /// two steps of a load, shared by `/v1/scopes/load` and `/v1/subset-loads`. The offset is read after
 /// the feed exists and before any snapshot, so a client tailing from it misses nothing.
 async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String, FeedClaimGuard), AppError> {
+    let _claim_lock = COMPOUND_CLAIM_LOCK.lock().await;
     let subscription = validate_new_subscription(f.subscription)?;
     let fresh = match subscription.as_ref() {
         Some(id) => engine.subscription_owner(id).await.is_none(),
@@ -1342,11 +1348,12 @@ impl FeedClaimGuard {
     }
 
     async fn rollback(&mut self) {
-        if !std::mem::take(&mut self.armed) {
+        if !self.armed {
             return;
         }
-        if let Err(error) = self.engine.release_subscription_durable(&self.shape_id, Some(&self.subscription)).await {
-            tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim");
+        match self.engine.release_subscription_durable(&self.shape_id, Some(&self.subscription)).await {
+            Ok(()) => self.armed = false,
+            Err(error) => tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim"),
         }
     }
 }
@@ -1360,7 +1367,7 @@ impl Drop for FeedClaimGuard {
         let shape_id = self.shape_id.clone();
         let subscription = self.subscription.clone();
         let shutdown = engine.shutdown_token();
-        shutdown.spawn_background(async move {
+        let _ = shutdown.spawn(async move {
             if let Err(error) = engine.release_subscription_durable(&shape_id, Some(&subscription)).await {
                 tracing::warn!(shape = %shape_id, subscription = %subscription, %error, "failed to compensate cancelled subset-load claim");
             }
@@ -1502,11 +1509,9 @@ async fn subset_load(
         Ok(page) => page,
         Err(error) => {
             claim.rollback().await;
-            return Err(AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                msg: format!("subset page failed after feed creation: {error:#}"),
-                retry_after: true,
-            });
+            let mut app_error = AppError::from(error);
+            app_error.msg = format!("subset page failed after feed creation: {}", app_error.msg);
+            return Err(app_error);
         }
     };
     claim.complete();
