@@ -2841,6 +2841,22 @@ impl Engine {
         Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
     }
 
+    /// Validate a subset read without opening Postgres or changing engine state.
+    ///
+    /// HTTP compound loads use this before creating their changes-only feed so a malformed
+    /// page (for example an unknown `orderBy` column) cannot leave a subscription claim behind.
+    pub(crate) async fn validate_subset(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<()> {
+        self.plan_subset(table, where_, columns, order_by, limit, offset).await.map(|_| ())
+    }
+
     /// Several one-shot subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the
     /// scope load). The snapshot settles against every table any read depends on, so the pages are
     /// mutually consistent and share one set of fences.

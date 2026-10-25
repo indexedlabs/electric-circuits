@@ -129,6 +129,30 @@ describe('prototype: scope load', () => {
     expect(page.rows.map((r) => Number(r.id))).toEqual([15, 13])
   }, 60000)
 
+  it('rejects an invalid page before creating or claiming the feed', async () => {
+    const subscription = 'invalid-page-claim'
+    const invalid = await fetch(`${h.engineUrl}/v1/subset-loads`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        table: 'child',
+        where: childrenOfActive,
+        subscription,
+        query: { orderBy: { col: 'does_not_exist' } },
+      }),
+    })
+    expect(invalid.status).toBe(400)
+
+    // Change the feed predicate on the retry. If the invalid request left a claim behind this
+    // would be a subscription conflict; a clean 200 proves validation happened before creation.
+    const retry = await post<{ shapeId: string; subscription: string }>(h, '/v1/subset-loads', {
+      table: 'child',
+      subscription,
+    })
+    expect(retry.subscription).toBe(subscription)
+    expect(retry.shapeId).toBeTruthy()
+  }, 60000)
+
   it('batch query reads several tables in one snapshot with page bounds', async () => {
     const res = await post<{ snapshot: string; horizon: string; results: { key: string; rows: Row[] }[] }>(
       h, '/v1/subsets/query-batch', {

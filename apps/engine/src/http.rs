@@ -277,6 +277,22 @@ fn openapi_subset_feed() {}
 
 #[utoipa::path(
     post,
+    path = "/v1/subset-loads",
+    request_body = SubsetLoadRequest,
+    responses(
+        (status = 200, description = "Changes-only feed and snapshot page", body = SubsetLoadResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 415, description = "Unsupported media type", body = ErrorResponse),
+        (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
+        (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_subset_load() {}
+
+#[utoipa::path(
+    post,
     path = "/v1/aggregates",
     request_body = AggregateRequest,
     responses(
@@ -317,6 +333,7 @@ fn openapi_deployment_promote() {}
         openapi_release_shape,
         openapi_subset_query,
         openapi_subset_feed,
+        openapi_subset_load,
         openapi_aggregate,
         openapi_deployment_promote
     ),
@@ -334,6 +351,8 @@ fn openapi_deployment_promote() {}
         AggregateFunction,
         AggregateRequest,
         SubsetFeedRequest,
+        SubsetLoadRequest,
+        SubsetLoadResponse,
         DeploymentPromoteRequest,
         ErrorResponse
     ))
@@ -671,7 +690,7 @@ async fn normalize_extractor_rejection(request: axum::extract::Request, next: Ne
 }
 
 fn is_native_dto_path(path: &str) -> bool {
-    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/aggregates")
+    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/subset-loads" | "/v1/aggregates")
         || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
 }
 
@@ -976,7 +995,7 @@ struct DefineSchemaReq {
     schema: Schema,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SubsetOrderByReq {
     col: String,
     #[serde(default)]
@@ -1199,7 +1218,11 @@ async fn load_scope(
 async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String), AppError> {
     let subscription = validate_new_subscription(f.subscription)?;
     let (rec, sub) = engine.create_shape_as(&f.table, f.where_, f.columns, true, true, subscription).await?;
-    let offset = engine.stream_tail(&rec.stream_path).await?.ok_or_else(|| AppError {
+    let offset = engine.stream_tail(&rec.stream_path).await.map_err(|error| AppError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        msg: format!("read feed stream tail for {}: {error:#}", rec.table),
+        retry_after: true,
+    })?.ok_or_else(|| AppError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         msg: format!("feed stream for {} has no tail offset", rec.table),
         retry_after: true,
@@ -1208,7 +1231,7 @@ async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, S
 }
 
 /// The page a subset load reads; omitted fields default to the feed's predicate, no order, no limit.
-#[derive(Deserialize, Default)]
+#[derive(Clone, Deserialize, Default)]
 struct SubsetLoadQuery {
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
@@ -1229,6 +1252,44 @@ struct SubsetLoadReq {
     subscription: Option<String>,
     #[serde(default)]
     query: Option<SubsetLoadQuery>,
+}
+
+/// Documentation-only projection of the one-table compound load request.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadRequest {
+    table: String,
+    #[serde(rename = "where")]
+    where_: Option<Predicate>,
+    columns: Option<Vec<String>>,
+    subscription: Option<String>,
+    query: Option<SubsetLoadQueryDoc>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadQueryDoc {
+    #[serde(rename = "where")]
+    where_: Option<Predicate>,
+    order_by: Option<SubsetOrderBy>,
+    limit: Option<i64>,
+}
+
+/// Documentation-only projection of the one-table compound load response.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadResponse {
+    shape_id: String,
+    table: String,
+    stream_path: String,
+    stream_url: String,
+    subscription: String,
+    lease_seconds: u64,
+    offset: String,
+    rows: Vec<serde_json::Value>,
+    lsn: String,
+    snapshot: String,
+    horizon: String,
 }
 
 #[derive(Serialize)]
@@ -1253,19 +1314,38 @@ async fn subset_load(
     Json(req): Json<SubsetLoadReq>,
 ) -> Result<Json<SubsetLoadResp>, AppError> {
     engine.ensure_not_degraded()?;
+    let query = req.query.clone().unwrap_or_default();
     let create = CreateShapeReq {
         table: req.table.clone(),
         where_: req.where_.clone(),
         columns: req.columns.clone(),
         changes_only: true,
-        subscription: req.subscription,
+        subscription: req.subscription.clone(),
     };
+    // Validate the complete compound body before admission or subscription resolution can mutate
+    // state. In particular, an invalid page orderBy must not leave a feed claim behind.
+    validate_new_subscription(req.subscription)?;
+    validate_create_shape_request(&engine, &create).await?;
+    engine
+        .validate_subset(&req.table, req.where_.clone(), req.columns.clone(), None, None, None)
+        .await
+        .map_err(|error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false })?;
+    engine
+        .validate_subset(
+            &req.table,
+            query.where_.clone().or_else(|| req.where_.clone()),
+            req.columns.clone(),
+            query.order_by.as_ref().map(|o| (o.col.clone(), o.desc)),
+            query.limit,
+            None,
+        )
+        .await
+        .map_err(|error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false })?;
+
     let (rec, subscription, offset) = {
         let _control = engine.admit_control()?;
-        validate_create_shape_request(&engine, &create).await?;
         open_feed(&engine, create).await?
     };
-    let query = req.query.unwrap_or_default();
     let page = engine
         .query_subset(
             &req.table,
@@ -1275,7 +1355,12 @@ async fn subset_load(
             query.limit,
             None,
         )
-        .await?;
+        .await
+        .map_err(|error| AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: format!("subset page failed after feed creation: {error:#}"),
+            retry_after: true,
+        })?;
     Ok(Json(SubsetLoadResp {
         feed: ShapeResp::created(&engine, rec, subscription),
         offset,
