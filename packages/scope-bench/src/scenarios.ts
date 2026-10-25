@@ -4,7 +4,7 @@
 // its first seconds, a chat open, an agenda fling, a Stack visit and a Record open.
 
 import type { TableName } from './schema.js'
-import { HEAVY, type SeedSummary } from './seed.js'
+import { HEAVY, type SeedSummary, type UserIds } from './seed.js'
 
 export type Level = 'first' | 'visible' | 'background'
 export type Pred = Record<string, unknown>
@@ -37,7 +37,8 @@ const lte = (col: string, value: unknown) => ({ col, op: 'lte', value })
 const and = (...p: Pred[]) => ({ and: p })
 const or = (...p: Pred[]) => ({ or: p })
 const isIn = (col: string, table: TableName, project: string, where: Pred) => ({ col, in: { table, project, where } })
-const own = eq('user_id', HEAVY)
+// The account the scenarios are built for; set by scenarios() before it builds any scope.
+let own: Pred = eq('user_id', HEAVY)
 
 // --- Session ---------------------------------------------------------------------------------
 
@@ -51,7 +52,7 @@ export const sessionScope = (): Scope => ({
   tables: INVENTORIES.map((t) => ({ key: t, table: t })),
 })
 
-export const deckScope = (s: SeedSummary): Scope => ({
+export const deckScope = (s: { heavy: UserIds }): Scope => ({
   name: 'deck',
   level: 'first',
   tables: [
@@ -165,7 +166,9 @@ export const perCardLeases = (clientIds: string[]): Scope[] =>
 
 // --- Scenarios -------------------------------------------------------------------------------
 
-export function scenarios(s: SeedSummary, variant: 'today' | 'scoped' | 'series'): Scenario[] {
+export function scenarios(seed: SeedSummary, variant: 'today' | 'scoped' | 'series', user: string = HEAVY): Scenario[] {
+  own = eq('user_id', user)
+  const s = { heavy: seed.users[user] ?? seed.heavy }
   // The series variant holds a Series scope from launch; windows then carry only dated rows.
   const ws = variant !== 'series'
   const thread = s.heavy.threads[0]!

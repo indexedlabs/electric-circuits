@@ -18,9 +18,17 @@ const pad = (n: number) => randomBytes(Math.ceil((n * 3) / 4)).toString('base64'
 
 type Row = Record<string, unknown>
 
+export interface UserIds {
+  records: string[]
+  recordClientIds: string[]
+  threads: string[]
+  seriesParents: string[]
+}
+
 export interface SeedSummary {
   rows: Partial<Record<TableName, number>>
-  heavy: { records: string[]; recordClientIds: string[]; threads: string[]; seriesParents: string[] }
+  heavy: UserIds
+  users: Record<string, UserIds>
 }
 
 function rng(seed: number) {
@@ -186,12 +194,12 @@ async function insert(client: pg.Client, table: string, rows: Row[]) {
 
 export async function seed(client: pg.Client, otherUsers: number): Promise<SeedSummary> {
   const rand = rng(42)
-  const summary: SeedSummary = { rows: {}, heavy: { records: [], recordClientIds: [], threads: [], seriesParents: [] } }
+  const summary: SeedSummary = { rows: {}, heavy: { records: [], recordClientIds: [], threads: [], seriesParents: [] }, users: {} }
   const users = [HEAVY, ...Array.from({ length: otherUsers }, (_, i) => `u${i + 2}`)]
   for (const u of users) {
     const r = userRows(u, u === HEAVY ? 1 : 0.25, rand)
-    if (u === HEAVY)
-      summary.heavy = { records: r.records, recordClientIds: r.recordClientIds, threads: r.threads, seriesParents: r.seriesParents }
+    summary.users[u] = { records: r.records, recordClientIds: r.recordClientIds, threads: r.threads, seriesParents: r.seriesParents }
+    if (u === HEAVY) summary.heavy = summary.users[u]!
     for (const [t, rows] of Object.entries(r.out)) {
       await insert(client, t, rows!)
       summary.rows[t as TableName] = (summary.rows[t as TableName] ?? 0) + rows!.length

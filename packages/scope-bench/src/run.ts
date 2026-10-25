@@ -33,6 +33,9 @@ const DS_LONGPOLL_MS = Number(env('DS_LONGPOLL_MS', '5000'))
 // STEADY=1: while held, a reply streams into the thread (20 events/s for 10 s) and a message lands
 // every 5 s, besides the Record edits; hold-only gateway cost is reported separately.
 const STEADY = process.env.STEADY === '1'
+// DISTINCT_USERS=1: phone i signs in as u<i+2> (one of the lighter accounts) instead of all as u1.
+const DISTINCT_USERS = process.env.DISTINCT_USERS === '1'
+const phoneUser = (i: number) => (DISTINCT_USERS ? `u${i + 2}` : HEAVY)
 const ONLY = process.env.ONLY
 const ONLY_CONFIG = process.env.ONLY_CONFIG
 const OUT = env('OUT', join(process.cwd(), 'scope-bench-results.json'))
@@ -174,10 +177,11 @@ interface RunResult {
   error?: string
 }
 
-async function runOnce(admin: pg.Client, pgUrl: string, sc: Scenario, cfg: Config, rep: number): Promise<RunResult> {
+async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Config, rep: number): Promise<RunResult> {
+  const sc = scs[0]!
   const srv = await bootServers(pgUrl)
   const opts = { gateway: srv.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live }
-  const phones = Array.from({ length: PHONES }, () => new Phone(opts))
+  const phones = Array.from({ length: PHONES }, (_, i) => new Phone({ ...opts, user: phoneUser(i) }))
   // Statements the engine ran against Postgres and their execution time, from pg_stat_statements
   // (the bench's own writes are excluded by text match).
   const pgStats = async () => {
@@ -222,9 +226,9 @@ async function runOnce(admin: pg.Client, pgUrl: string, sc: Scenario, cfg: Confi
     // Per phone and screen: when its first-level tables were all in, and the first of them.
     const perScreen = new Map<string, { first: number | null; firstTable: number | null; all: number }[]>()
     await Promise.all(
-      phones.map((phone) =>
+      phones.map((phone, pi) =>
         Promise.all(
-          sc.events.map(async (ev) => {
+          (scs[pi] ?? sc).events.map(async (ev) => {
             await new Promise((r) => setTimeout(r, ev.at))
             const start = performance.now()
             await Promise.all(
@@ -336,12 +340,16 @@ async function main() {
     reopenChanged = s.heavy.recordClientIds.slice(0, 5)
     steadyThread = s.heavy.threads[0]!
     const byVariant = { today: scenarios(s, 'today'), scoped: scenarios(s, 'scoped'), series: scenarios(s, 'series') }
+    // Each phone's own copy of a scenario, built for its account.
+    const perPhone = (variant: Config['variant'], name: string) =>
+      Array.from({ length: PHONES }, (_, i) => scenarios(s, variant, phoneUser(i)).find((x) => x.name === name)!)
     const names = byVariant.scoped.map((x) => x.name).filter((n) => !ONLY || n.includes(ONLY))
 
     // Warm Postgres' buffer cache with one discarded pass so no design pays for a cold cache.
     for (const name of names) {
       const sc = byVariant.scoped.find((x) => x.name === name)!
-      await runOnce(admin, pgs.url, sc, { name: 'warm', variant: 'scoped', design: 'scope-load', slots: null, live: 'per-stream' }, 0)
+      void sc
+      await runOnce(admin, pgs.url, perPhone('scoped', name), { name: 'warm', variant: 'scoped', design: 'scope-load', slots: null, live: 'per-stream' }, 0)
     }
 
     const results: RunResult[] = []
@@ -350,7 +358,7 @@ async function main() {
         for (const cfg of CONFIGS) {
           const sc = byVariant[cfg.variant].find((x) => x.name === name)!
           if (cfg.resume && !sc.reopen) continue
-          const r = await runOnce(admin, pgs.url, sc, cfg, rep)
+          const r = await runOnce(admin, pgs.url, perPhone(cfg.variant, name), cfg, rep)
           results.push(r)
           console.log(
             `[${rep}] ${name.padEnd(14)} ${cfg.name.padEnd(17)} ` +

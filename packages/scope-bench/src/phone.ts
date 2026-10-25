@@ -23,6 +23,8 @@ export interface PhoneOpts {
   slots: number | null
   design: Design
   live: LiveMode
+  /** The signed-in account (default the heavy one). */
+  user?: string
 }
 
 export interface Held {
@@ -77,7 +79,9 @@ export class Phone {
     const r = await fetch(`${this.o.gateway}${path}`, {
       method,
       signal,
-      headers: payload ? { 'content-type': 'application/json', 'x-user': 'u1' } : { 'x-user': 'u1' },
+      headers: payload
+        ? { 'content-type': 'application/json', 'x-user': this.o.user ?? 'u1' }
+        : { 'x-user': this.o.user ?? 'u1' },
       body: payload ? JSON.stringify(payload) : undefined,
     })
     const buf = Buffer.from(await r.arrayBuffer())
