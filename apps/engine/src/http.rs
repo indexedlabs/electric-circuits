@@ -1235,12 +1235,12 @@ async fn load_scope(
     }
     // 1 + 2: create every feed and read its tail. Sequential admission keeps work bounded and
     // makes the compensation list complete if a later feed or the page read fails.
-    let mut created = Vec::with_capacity(feeds.len());
+    let mut created: Vec<(ShapeRecord, String, String, FeedClaimGuard)> = Vec::with_capacity(feeds.len());
     for f in feeds {
         match open_feed(&engine, f).await {
             Ok(feed) => created.push(feed),
             Err(error) => {
-                release_feed_claims(&engine, &created).await;
+                release_feed_claims(&mut created).await;
                 return Err(error);
             }
         }
@@ -1261,7 +1261,7 @@ async fn load_scope(
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {
-            release_feed_claims(&engine, &created).await;
+            release_feed_claims(&mut created).await;
             return Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 msg: format!("scope page failed after feed creation: {error:#}"),
@@ -1275,8 +1275,8 @@ async fn load_scope(
         .into_iter()
         .zip(created)
         .zip(page.pages)
-        .map(|((t, c), rows)| {
-            let (rec, subscription, offset) = c;
+        .map(|((t, (rec, subscription, offset, mut claim)), rows)| {
+            claim.complete();
             ScopeLoadResult {
                 key: t.key,
                 shape_id: rec.id,
@@ -1295,12 +1295,17 @@ async fn load_scope(
 /// Create (or renew) one validated changes-only feed and read its stream's tail offset: the first
 /// two steps of a load, shared by `/v1/scopes/load` and `/v1/subset-loads`. The offset is read after
 /// the feed exists and before any snapshot, so a client tailing from it misses nothing.
-async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String), AppError> {
+async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String, FeedClaimGuard), AppError> {
     let subscription = validate_new_subscription(f.subscription)?;
+    let fresh = match subscription.as_ref() {
+        Some(id) => engine.subscription_owner(id).await.is_none(),
+        None => true,
+    };
     let (rec, sub) = engine.create_shape_as(&f.table, f.where_, f.columns, true, true, subscription).await?;
+    let mut claim = FeedClaimGuard::new(engine, &rec, &sub, fresh);
     let offset = match engine.stream_tail(&rec.stream_path).await {
         Err(error) => {
-            let _ = engine.release_subscription_durable(&rec.id, Some(&sub)).await;
+            claim.rollback().await;
             return Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 msg: format!("read feed stream tail for {}: {error:#}", rec.table),
@@ -1309,7 +1314,7 @@ async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, S
         }
         Ok(Some(offset)) => offset,
         Ok(None) => {
-            let _ = engine.release_subscription_durable(&rec.id, Some(&sub)).await;
+            claim.rollback().await;
             return Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 msg: format!("feed stream for {} has no tail offset", rec.table),
@@ -1317,14 +1322,55 @@ async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, S
             });
         }
     };
-    Ok((rec, sub, offset))
+    Ok((rec, sub, offset, claim))
 }
 
-async fn release_feed_claims(engine: &Engine, feeds: &[(ShapeRecord, String, String)]) {
-    for (rec, subscription, _) in feeds {
-        if let Err(error) = engine.release_subscription_durable(&rec.id, Some(subscription)).await {
-            tracing::warn!(shape = %rec.id, subscription = %subscription, %error, "failed to compensate subset-load claim");
+struct FeedClaimGuard {
+    engine: Engine,
+    shape_id: String,
+    subscription: String,
+    armed: bool,
+}
+
+impl FeedClaimGuard {
+    fn new(engine: &Engine, rec: &ShapeRecord, subscription: &str, fresh: bool) -> Self {
+        Self { engine: engine.clone(), shape_id: rec.id.clone(), subscription: subscription.to_string(), armed: fresh }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+
+    async fn rollback(&mut self) {
+        if !std::mem::take(&mut self.armed) {
+            return;
         }
+        if let Err(error) = self.engine.release_subscription_durable(&self.shape_id, Some(&self.subscription)).await {
+            tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim");
+        }
+    }
+}
+
+impl Drop for FeedClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let engine = self.engine.clone();
+        let shape_id = self.shape_id.clone();
+        let subscription = self.subscription.clone();
+        let shutdown = engine.shutdown_token();
+        shutdown.spawn_background(async move {
+            if let Err(error) = engine.release_subscription_durable(&shape_id, Some(&subscription)).await {
+                tracing::warn!(shape = %shape_id, subscription = %subscription, %error, "failed to compensate cancelled subset-load claim");
+            }
+        });
+    }
+}
+
+async fn release_feed_claims(feeds: &mut [(ShapeRecord, String, String, FeedClaimGuard)]) {
+    for (_, _, _, claim) in feeds {
+        claim.rollback().await;
     }
 }
 
@@ -1440,10 +1486,8 @@ async fn subset_load(
         .await
         .map_err(|error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false })?;
 
-    let (rec, subscription, offset) = {
-        let _control = engine.admit_control()?;
-        open_feed(&engine, create).await?
-    };
+    let _control = engine.admit_control()?;
+    let (rec, subscription, offset, mut claim) = open_feed(&engine, create).await?;
     let page = match engine
         .query_subset(
             &req.table,
@@ -1457,7 +1501,7 @@ async fn subset_load(
     {
         Ok(page) => page,
         Err(error) => {
-            let _ = engine.release_subscription_durable(&rec.id, Some(&subscription)).await;
+            claim.rollback().await;
             return Err(AppError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 msg: format!("subset page failed after feed creation: {error:#}"),
@@ -1465,6 +1509,7 @@ async fn subset_load(
             });
         }
     };
+    claim.complete();
     Ok(Json(SubsetLoadResp {
         feed: ShapeResp::created(&engine, rec, subscription),
         offset,

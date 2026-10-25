@@ -2841,6 +2841,12 @@ impl Engine {
         Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
     }
 
+    /// Return the current owner of a subscription claim. HTTP compound-load admission holds the
+    /// control permit while using this to distinguish a new claim from a renewal.
+    pub(crate) async fn subscription_owner(&self, subscription: &str) -> Option<String> {
+        self.state.lock().await.subscription_owner(subscription).cloned()
+    }
+
     /// Validate a subset read without opening Postgres or changing engine state.
     ///
     /// HTTP compound loads use this before creating their changes-only feed so a malformed
