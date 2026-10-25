@@ -54,6 +54,7 @@ const CONFIGS: Config[] = ([
   { name: 'table load + mux + series', variant: 'series', design: 'table-load', slots: 8, live: 'mux' },
   { name: 'table load (gate per table)', variant: 'scoped', design: 'table-load-gated', slots: 8, live: 'per-stream' },
   { name: 'table load (gate per table) + mux', variant: 'scoped', design: 'table-load-gated', slots: 8, live: 'mux' },
+  { name: 'table load (gate per table) + series', variant: 'series', design: 'table-load-gated', slots: 8, live: 'per-stream' },
   { name: 'scope load', variant: 'scoped', design: 'scope-load', slots: 8, live: 'per-stream' },
   { name: 'scope load + mux', variant: 'scoped', design: 'scope-load', slots: 8, live: 'mux' },
   { name: 'scope load + mux + resume', variant: 'scoped', design: 'scope-load', slots: 8, live: 'mux', resume: true },
