@@ -1,0 +1,2705 @@
+{
+  "params": {
+    "RTT_MS": 100,
+    "DOWN_MBPS": 20,
+    "REPS": 3,
+    "OTHER_USERS": 30,
+    "HOLD_MS": 1500,
+    "PHONES": 1,
+    "DS_LONGPOLL_MS": 5000,
+    "STEADY": false
+  },
+  "seed": {
+    "user": 93,
+    "space": 93,
+    "space_member": 93,
+    "calendar": 103,
+    "external_account": 93,
+    "invite": 31,
+    "tag": 1360,
+    "file": 4793,
+    "feedback": 2140,
+    "assistant_state": 1837,
+    "activity": 20263,
+    "resource": 169,
+    "resource_fact": 338,
+    "graph_edge": 507,
+    "record": 12216,
+    "record_date_index": 13196,
+    "tagged_item": 1836,
+    "assignment": 2946,
+    "record_completed_index": 1233,
+    "record_assignee_index": 615,
+    "record_recurrence": 170,
+    "calendar_event": 6359,
+    "message": 3080,
+    "suggestion": 612,
+    "assistant_stream_event": 510
+  },
+  "results": [
+    {
+      "scenario": "cold launch",
+      "config": "today",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 2638,
+          "firstP90": 2638,
+          "firstTableMs": 983,
+          "allMs": 2638
+        }
+      },
+      "phoneRequests": 101,
+      "loadRequests": 96,
+      "bytesDown": 3976675,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 448,
+      "gatewayLagMax": 448,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 51,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 60,
+      "holdRequests": 16,
+      "holdDsCalls": 15
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 1451,
+          "firstP90": 1451,
+          "firstTableMs": 598,
+          "allMs": 3081
+        }
+      },
+      "phoneRequests": 101,
+      "loadRequests": 96,
+      "bytesDown": 3967045,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 102,
+      "gatewayLagMax": 102,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 23,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 958,
+          "firstP90": 958,
+          "firstTableMs": 404,
+          "allMs": 2047
+        }
+      },
+      "phoneRequests": 53,
+      "loadRequests": 48,
+      "bytesDown": 3953631,
+      "gatewayCpuMs": 692,
+      "gatewayLagP99": 104,
+      "gatewayLagMax": 104,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 40,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load (gate per table) + series",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 795,
+          "firstP90": 795,
+          "firstTableMs": 385,
+          "allMs": 2160
+        }
+      },
+      "phoneRequests": 57,
+      "loadRequests": 52,
+      "bytesDown": 3865529,
+      "gatewayCpuMs": 748,
+      "gatewayLagP99": 44,
+      "gatewayLagMax": 44,
+      "engineCpuMs": 50,
+      "pgStatements": 121,
+      "pgExecMs": 22,
+      "longPollsHeld": 26,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "chat open",
+      "config": "today",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 8297,
+          "firstP90": 8297,
+          "firstTableMs": 6990,
+          "allMs": 12143
+        }
+      },
+      "phoneRequests": 962,
+      "loadRequests": 926,
+      "bytesDown": 2129351,
+      "gatewayCpuMs": 11232,
+      "gatewayLagP99": 229,
+      "gatewayLagMax": 1769,
+      "engineCpuMs": 330,
+      "pgStatements": 1386,
+      "pgExecMs": 39,
+      "longPollsHeld": 231,
+      "holdGatewayCpuMs": 152,
+      "holdRequests": 39,
+      "holdDsCalls": 38
+    },
+    {
+      "scenario": "chat open",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 809,
+          "firstP90": 809,
+          "firstTableMs": 614,
+          "allMs": 1234
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 20,
+      "bytesDown": 1850887,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 8,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 568,
+          "firstP90": 568,
+          "firstTableMs": 278,
+          "allMs": 994
+        }
+      },
+      "phoneRequests": 15,
+      "loadRequests": 10,
+      "bytesDown": 1848112,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 20,
+      "gatewayLagMax": 20,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 14,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table) + series",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 994,
+          "firstP90": 994,
+          "firstTableMs": 272,
+          "allMs": 996
+        }
+      },
+      "phoneRequests": 15,
+      "loadRequests": 10,
+      "bytesDown": 1848125,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 39,
+      "gatewayLagMax": 39,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 17,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 40,
+      "holdRequests": 11,
+      "holdDsCalls": 10
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "today",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1760
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1803
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2686
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1656
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2913
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2660
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3165
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3162
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3147
+        },
+        "agenda": {
+          "firstMs": 2642,
+          "firstP90": 2642,
+          "firstTableMs": 1003,
+          "allMs": 2642
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2903
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3268
+        }
+      },
+      "phoneRequests": 388,
+      "loadRequests": 384,
+      "bytesDown": 9149900,
+      "gatewayCpuMs": 4608,
+      "gatewayLagP99": 179,
+      "gatewayLagMax": 179,
+      "engineCpuMs": 140,
+      "pgStatements": 485,
+      "pgExecMs": 97,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 863
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1315
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1832
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2259
+        },
+        "agenda": {
+          "firstMs": 1461,
+          "firstP90": 1461,
+          "firstTableMs": 939,
+          "allMs": 1461
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3444
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3795
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4188
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4595
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 5039
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 5662
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 6107
+        }
+      },
+      "phoneRequests": 432,
+      "loadRequests": 416,
+      "bytesDown": 9163100,
+      "gatewayCpuMs": 4800,
+      "gatewayLagP99": 116,
+      "gatewayLagMax": 138,
+      "engineCpuMs": 160,
+      "pgStatements": 486,
+      "pgExecMs": 87,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 96,
+      "holdRequests": 25,
+      "holdDsCalls": 24
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 663
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 743
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 929
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1197
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1452
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1708
+        },
+        "agenda": {
+          "firstMs": 735,
+          "firstP90": 735,
+          "firstTableMs": 610,
+          "allMs": 735
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2486
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2742
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2993
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3263
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3393
+        }
+      },
+      "phoneRequests": 224,
+      "loadRequests": 192,
+      "bytesDown": 9104996,
+      "gatewayCpuMs": 2816,
+      "gatewayLagP99": 108,
+      "gatewayLagMax": 151,
+      "engineCpuMs": 140,
+      "pgStatements": 485,
+      "pgExecMs": 100,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 160,
+      "holdRequests": 41,
+      "holdDsCalls": 40
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load (gate per table) + series",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 423
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 442
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 474
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 456
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 447
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 447
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 423
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 412
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 375
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 403
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 434
+        },
+        "agenda": {
+          "firstMs": 394,
+          "firstP90": 394,
+          "firstTableMs": 214,
+          "allMs": 394
+        }
+      },
+      "phoneRequests": 168,
+      "loadRequests": 168,
+      "bytesDown": 3326015,
+      "gatewayCpuMs": 2352,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 110,
+      "pgStatements": 437,
+      "pgExecMs": 34,
+      "longPollsHeld": 84,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "stack visit",
+      "config": "today",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 2945,
+          "firstP90": 2945,
+          "firstTableMs": 1815,
+          "allMs": 3525
+        }
+      },
+      "phoneRequests": 224,
+      "loadRequests": 224,
+      "bytesDown": 4075948,
+      "gatewayCpuMs": 2688,
+      "gatewayLagP99": 785,
+      "gatewayLagMax": 785,
+      "engineCpuMs": 100,
+      "pgStatements": 285,
+      "pgExecMs": 49,
+      "longPollsHeld": 56,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 1045,
+          "firstP90": 1045,
+          "firstTableMs": 517,
+          "allMs": 1045
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 1103694,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 22,
+      "gatewayLagMax": 22,
+      "engineCpuMs": 30,
+      "pgStatements": 45,
+      "pgExecMs": 11,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 805,
+          "firstP90": 805,
+          "firstTableMs": 356,
+          "allMs": 805
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 1099252,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 45,
+      "pgExecMs": 12,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load (gate per table) + series",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 577,
+          "firstP90": 577,
+          "firstTableMs": 328,
+          "allMs": 577
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 14,
+      "bytesDown": 616137,
+      "gatewayCpuMs": 196,
+      "gatewayLagP99": 59,
+      "gatewayLagMax": 59,
+      "engineCpuMs": 10,
+      "pgStatements": 41,
+      "pgExecMs": 13,
+      "longPollsHeld": 7,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "today",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 1201,
+          "firstP90": 1201,
+          "firstTableMs": 1105,
+          "allMs": 1201
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1888474,
+      "gatewayCpuMs": 264,
+      "gatewayLagP99": 33,
+      "gatewayLagMax": 33,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 5,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 36,
+      "holdRequests": 10,
+      "holdDsCalls": 9
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 830,
+          "firstP90": 830,
+          "firstTableMs": 635,
+          "allMs": 1256
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 20,
+      "bytesDown": 1841405,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 79,
+      "gatewayLagMax": 79,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 4,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 958,
+          "firstP90": 958,
+          "firstTableMs": 862,
+          "allMs": 962
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 10,
+      "bytesDown": 1885750,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 71,
+      "gatewayLagMax": 71,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 5,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 44,
+      "holdRequests": 12,
+      "holdDsCalls": 11
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load (gate per table) + series",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 970,
+          "firstP90": 970,
+          "firstTableMs": 253,
+          "allMs": 970
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 10,
+      "bytesDown": 1885782,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 36,
+      "gatewayLagMax": 36,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 5,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "today",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 681,
+          "firstP90": 681,
+          "firstTableMs": 549,
+          "allMs": 681
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 10,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 693,
+          "firstP90": 693,
+          "firstTableMs": 530,
+          "allMs": 693
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 37,
+      "pgExecMs": 0,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 360,
+          "firstP90": 360,
+          "firstTableMs": 345,
+          "allMs": 360
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 10,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load (gate per table) + series",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 347,
+          "firstP90": 347,
+          "firstTableMs": 303,
+          "allMs": 347
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 26,
+      "gatewayLagMax": 26,
+      "engineCpuMs": 10,
+      "pgStatements": 37,
+      "pgExecMs": 0,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "cold launch",
+      "config": "today",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1674,
+          "firstP90": 1674,
+          "firstTableMs": 832,
+          "allMs": 2529
+        }
+      },
+      "phoneRequests": 102,
+      "loadRequests": 96,
+      "bytesDown": 3977027,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 187,
+      "gatewayLagMax": 187,
+      "engineCpuMs": 50,
+      "pgStatements": 109,
+      "pgExecMs": 27,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1424,
+          "firstP90": 1424,
+          "firstTableMs": 546,
+          "allMs": 3001
+        }
+      },
+      "phoneRequests": 101,
+      "loadRequests": 96,
+      "bytesDown": 3977040,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 86,
+      "gatewayLagMax": 86,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 30,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load (gate per table)",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 813,
+          "firstP90": 813,
+          "firstTableMs": 390,
+          "allMs": 1979
+        }
+      },
+      "phoneRequests": 53,
+      "loadRequests": 48,
+      "bytesDown": 3953959,
+      "gatewayCpuMs": 692,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 40,
+      "pgStatements": 109,
+      "pgExecMs": 25,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load (gate per table) + series",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1040,
+          "firstP90": 1040,
+          "firstTableMs": 370,
+          "allMs": 2349
+        }
+      },
+      "phoneRequests": 57,
+      "loadRequests": 52,
+      "bytesDown": 3856212,
+      "gatewayCpuMs": 748,
+      "gatewayLagP99": 58,
+      "gatewayLagMax": 58,
+      "engineCpuMs": 50,
+      "pgStatements": 121,
+      "pgExecMs": 20,
+      "longPollsHeld": 26,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "chat open",
+      "config": "today",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 11259,
+          "firstP90": 11259,
+          "firstTableMs": 6898,
+          "allMs": 12227
+        }
+      },
+      "phoneRequests": 993,
+      "loadRequests": 936,
+      "bytesDown": 2137779,
+      "gatewayCpuMs": 11364,
+      "gatewayLagP99": 414,
+      "gatewayLagMax": 3375,
+      "engineCpuMs": 320,
+      "pgStatements": 1386,
+      "pgExecMs": 32,
+      "longPollsHeld": 231,
+      "holdGatewayCpuMs": 260,
+      "holdRequests": 66,
+      "holdDsCalls": 65
+    },
+    {
+      "scenario": "chat open",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 1222,
+          "firstP90": 1222,
+          "firstTableMs": 603,
+          "allMs": 1222
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 20,
+      "bytesDown": 1841568,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 20,
+      "pgStatements": 29,
+      "pgExecMs": 6,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table)",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 1002,
+          "firstP90": 1002,
+          "firstTableMs": 284,
+          "allMs": 1002
+        }
+      },
+      "phoneRequests": 15,
+      "loadRequests": 10,
+      "bytesDown": 1848464,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 20,
+      "pgStatements": 29,
+      "pgExecMs": 6,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table) + series",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 573,
+          "firstP90": 573,
+          "firstTableMs": 264,
+          "allMs": 996
+        }
+      },
+      "phoneRequests": 15,
+      "loadRequests": 10,
+      "bytesDown": 1838804,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 15,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "today",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1739
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2382
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2514
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2727
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3272
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3523
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4133
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3441
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3244
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3608
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4222
+        },
+        "agenda": {
+          "firstMs": 3225,
+          "firstP90": 3225,
+          "firstTableMs": 728,
+          "allMs": 3225
+        }
+      },
+      "phoneRequests": 392,
+      "loadRequests": 384,
+      "bytesDown": 9151100,
+      "gatewayCpuMs": 4640,
+      "gatewayLagP99": 160,
+      "gatewayLagMax": 172,
+      "engineCpuMs": 140,
+      "pgStatements": 485,
+      "pgExecMs": 79,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 96,
+      "holdRequests": 25,
+      "holdDsCalls": 24
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 893
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1255
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1676
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2206
+        },
+        "agenda": {
+          "firstMs": 1453,
+          "firstP90": 1453,
+          "firstTableMs": 940,
+          "allMs": 1454
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3359
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3861
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4428
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4947
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 5449
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 6027
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 6498
+        }
+      },
+      "phoneRequests": 440,
+      "loadRequests": 416,
+      "bytesDown": 9165500,
+      "gatewayCpuMs": 4832,
+      "gatewayLagP99": 110,
+      "gatewayLagMax": 119,
+      "engineCpuMs": 170,
+      "pgStatements": 486,
+      "pgExecMs": 75,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 128,
+      "holdRequests": 33,
+      "holdDsCalls": 32
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load (gate per table)",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 661
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 761
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1018
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1075
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1133
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1376
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1639
+        },
+        "agenda": {
+          "firstMs": 896,
+          "firstP90": 896,
+          "firstTableMs": 773,
+          "allMs": 897
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2400
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2654
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2920
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3174
+        }
+      },
+      "phoneRequests": 224,
+      "loadRequests": 192,
+      "bytesDown": 9104996,
+      "gatewayCpuMs": 2816,
+      "gatewayLagP99": 105,
+      "gatewayLagMax": 121,
+      "engineCpuMs": 140,
+      "pgStatements": 485,
+      "pgExecMs": 81,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 160,
+      "holdRequests": 41,
+      "holdDsCalls": 40
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load (gate per table) + series",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 435
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 448
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 459
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 425
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 427
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 440
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 423
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 381
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 395
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 421
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 452
+        },
+        "agenda": {
+          "firstMs": 416,
+          "firstP90": 416,
+          "firstTableMs": 300,
+          "allMs": 416
+        }
+      },
+      "phoneRequests": 168,
+      "loadRequests": 168,
+      "bytesDown": 3326015,
+      "gatewayCpuMs": 2352,
+      "gatewayLagP99": 58,
+      "gatewayLagMax": 58,
+      "engineCpuMs": 100,
+      "pgStatements": 437,
+      "pgExecMs": 26,
+      "longPollsHeld": 84,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "stack visit",
+      "config": "today",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 2538,
+          "firstP90": 2538,
+          "firstTableMs": 1103,
+          "allMs": 3224
+        }
+      },
+      "phoneRequests": 224,
+      "loadRequests": 224,
+      "bytesDown": 4075948,
+      "gatewayCpuMs": 2688,
+      "gatewayLagP99": 403,
+      "gatewayLagMax": 403,
+      "engineCpuMs": 90,
+      "pgStatements": 285,
+      "pgExecMs": 47,
+      "longPollsHeld": 56,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 1023,
+          "firstP90": 1023,
+          "firstTableMs": 486,
+          "allMs": 1023
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 1103694,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 37,
+      "gatewayLagMax": 37,
+      "engineCpuMs": 10,
+      "pgStatements": 45,
+      "pgExecMs": 8,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load (gate per table)",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 799,
+          "firstP90": 799,
+          "firstTableMs": 364,
+          "allMs": 800
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 1099252,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 108,
+      "gatewayLagMax": 108,
+      "engineCpuMs": 20,
+      "pgStatements": 44,
+      "pgExecMs": 9,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load (gate per table) + series",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 562,
+          "firstP90": 562,
+          "firstTableMs": 314,
+          "allMs": 562
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 14,
+      "bytesDown": 616137,
+      "gatewayCpuMs": 196,
+      "gatewayLagP99": 19,
+      "gatewayLagMax": 19,
+      "engineCpuMs": 10,
+      "pgStatements": 41,
+      "pgExecMs": 4,
+      "longPollsHeld": 7,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "today",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 831,
+          "firstP90": 831,
+          "firstTableMs": 735,
+          "allMs": 1255
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1888942,
+      "gatewayCpuMs": 264,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 7,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 807,
+          "firstP90": 807,
+          "firstTableMs": 471,
+          "allMs": 1226
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1888974,
+      "gatewayCpuMs": 264,
+      "gatewayLagP99": 36,
+      "gatewayLagMax": 36,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 5,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load (gate per table)",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 533,
+          "firstP90": 533,
+          "firstTableMs": 240,
+          "allMs": 962
+        }
+      },
+      "phoneRequests": 17,
+      "loadRequests": 10,
+      "bytesDown": 1895902,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 20,
+      "gatewayLagMax": 20,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 6,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load (gate per table) + series",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 956,
+          "firstP90": 956,
+          "firstTableMs": 340,
+          "allMs": 958
+        }
+      },
+      "phoneRequests": 17,
+      "loadRequests": 10,
+      "bytesDown": 1895935,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 33,
+      "gatewayLagMax": 33,
+      "engineCpuMs": 10,
+      "pgStatements": 26,
+      "pgExecMs": 9,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 44,
+      "holdRequests": 12,
+      "holdDsCalls": 11
+    },
+    {
+      "scenario": "record open",
+      "config": "today",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 669,
+          "firstP90": 669,
+          "firstTableMs": 518,
+          "allMs": 669
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 69,
+      "gatewayLagMax": 69,
+      "engineCpuMs": 30,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 708,
+          "firstP90": 708,
+          "firstTableMs": 575,
+          "allMs": 708
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 105,
+      "gatewayLagMax": 105,
+      "engineCpuMs": 10,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load (gate per table)",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 373,
+          "firstP90": 373,
+          "firstTableMs": 353,
+          "allMs": 373
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 10,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load (gate per table) + series",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 369,
+          "firstP90": 369,
+          "firstTableMs": 351,
+          "allMs": 369
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 36,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "cold launch",
+      "config": "today",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 2571,
+          "firstP90": 2571,
+          "firstTableMs": 1038,
+          "allMs": 2571
+        }
+      },
+      "phoneRequests": 102,
+      "loadRequests": 96,
+      "bytesDown": 3977379,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 440,
+      "gatewayLagMax": 440,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 48,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 108,
+      "holdRequests": 28,
+      "holdDsCalls": 27
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 1416,
+          "firstP90": 1416,
+          "firstTableMs": 526,
+          "allMs": 2983
+        }
+      },
+      "phoneRequests": 101,
+      "loadRequests": 96,
+      "bytesDown": 3967701,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 85,
+      "gatewayLagMax": 85,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 32,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load (gate per table)",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 810,
+          "firstP90": 810,
+          "firstTableMs": 387,
+          "allMs": 1996
+        }
+      },
+      "phoneRequests": 53,
+      "loadRequests": 48,
+      "bytesDown": 3954287,
+      "gatewayCpuMs": 692,
+      "gatewayLagP99": 89,
+      "gatewayLagMax": 89,
+      "engineCpuMs": 60,
+      "pgStatements": 109,
+      "pgExecMs": 38,
+      "longPollsHeld": 24,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load (gate per table) + series",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 935,
+          "firstP90": 935,
+          "firstTableMs": 375,
+          "allMs": 2139
+        }
+      },
+      "phoneRequests": 57,
+      "loadRequests": 52,
+      "bytesDown": 3866233,
+      "gatewayCpuMs": 748,
+      "gatewayLagP99": 59,
+      "gatewayLagMax": 59,
+      "engineCpuMs": 50,
+      "pgStatements": 121,
+      "pgExecMs": 17,
+      "longPollsHeld": 26,
+      "holdGatewayCpuMs": 76,
+      "holdRequests": 20,
+      "holdDsCalls": 19
+    },
+    {
+      "scenario": "chat open",
+      "config": "today",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 12524,
+          "firstP90": 12524,
+          "firstTableMs": 6378,
+          "allMs": 12528
+        }
+      },
+      "phoneRequests": 1020,
+      "loadRequests": 948,
+      "bytesDown": 2156201,
+      "gatewayCpuMs": 11460,
+      "gatewayLagP99": 639,
+      "gatewayLagMax": 4394,
+      "engineCpuMs": 380,
+      "pgStatements": 1386,
+      "pgExecMs": 32,
+      "longPollsHeld": 231,
+      "holdGatewayCpuMs": 312,
+      "holdRequests": 79,
+      "holdDsCalls": 78
+    },
+    {
+      "scenario": "chat open",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1237,
+          "firstP90": 1237,
+          "firstTableMs": 617,
+          "allMs": 1238
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1851591,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 23,
+      "gatewayLagMax": 23,
+      "engineCpuMs": 20,
+      "pgStatements": 29,
+      "pgExecMs": 6,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table)",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1009,
+          "firstP90": 1009,
+          "firstTableMs": 389,
+          "allMs": 1009
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 10,
+      "bytesDown": 1848816,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 37,
+      "gatewayLagMax": 37,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 18,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table) + series",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1007,
+          "firstP90": 1007,
+          "firstTableMs": 283,
+          "allMs": 1007
+        }
+      },
+      "phoneRequests": 15,
+      "loadRequests": 10,
+      "bytesDown": 1848829,
+      "gatewayCpuMs": 160,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 9,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "today",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1374
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1925
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2394
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2964
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3011
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2855
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3469
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3406
+        },
+        "agenda": {
+          "firstMs": 2343,
+          "firstP90": 2343,
+          "firstTableMs": 1261,
+          "allMs": 2343
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3408
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3276
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3028
+        }
+      },
+      "phoneRequests": 385,
+      "loadRequests": 384,
+      "bytesDown": 9149000,
+      "gatewayCpuMs": 4612,
+      "gatewayLagP99": 180,
+      "gatewayLagMax": 180,
+      "engineCpuMs": 160,
+      "pgStatements": 485,
+      "pgExecMs": 89,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 68,
+      "holdRequests": 18,
+      "holdDsCalls": 17
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 874
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1302
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1747
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2199
+        },
+        "agenda": {
+          "firstMs": 866,
+          "firstP90": 866,
+          "firstTableMs": 743,
+          "allMs": 866
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3340
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3802
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4216
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 4669
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 5038
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 5438
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 5908
+        }
+      },
+      "phoneRequests": 432,
+      "loadRequests": 416,
+      "bytesDown": 9163100,
+      "gatewayCpuMs": 4800,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 113,
+      "engineCpuMs": 170,
+      "pgStatements": 486,
+      "pgExecMs": 99,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 96,
+      "holdRequests": 25,
+      "holdDsCalls": 24
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load (gate per table)",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 652
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 783
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 853
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1066
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1134
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1369
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 1643
+        },
+        "agenda": {
+          "firstMs": 904,
+          "firstP90": 904,
+          "firstTableMs": 781,
+          "allMs": 904
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2414
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2667
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 2936
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 3065
+        }
+      },
+      "phoneRequests": 224,
+      "loadRequests": 192,
+      "bytesDown": 9104996,
+      "gatewayCpuMs": 2808,
+      "gatewayLagP99": 110,
+      "gatewayLagMax": 113,
+      "engineCpuMs": 140,
+      "pgStatements": 485,
+      "pgExecMs": 94,
+      "longPollsHeld": 96,
+      "holdGatewayCpuMs": 152,
+      "holdRequests": 39,
+      "holdDsCalls": 38
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load (gate per table) + series",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 412
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 479
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 490
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 478
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 468
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 464
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 433
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 463
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 476
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 403
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "firstP90": null,
+          "firstTableMs": null,
+          "allMs": 390
+        },
+        "agenda": {
+          "firstMs": 374,
+          "firstP90": 374,
+          "firstTableMs": 169,
+          "allMs": 374
+        }
+      },
+      "phoneRequests": 168,
+      "loadRequests": 168,
+      "bytesDown": 3326015,
+      "gatewayCpuMs": 2352,
+      "gatewayLagP99": 63,
+      "gatewayLagMax": 63,
+      "engineCpuMs": 120,
+      "pgStatements": 437,
+      "pgExecMs": 43,
+      "longPollsHeld": 84,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "stack visit",
+      "config": "today",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 2642,
+          "firstP90": 2642,
+          "firstTableMs": 1797,
+          "allMs": 3637
+        }
+      },
+      "phoneRequests": 224,
+      "loadRequests": 224,
+      "bytesDown": 4075948,
+      "gatewayCpuMs": 2688,
+      "gatewayLagP99": 740,
+      "gatewayLagMax": 740,
+      "engineCpuMs": 90,
+      "pgStatements": 285,
+      "pgExecMs": 43,
+      "longPollsHeld": 56,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 897,
+          "firstP90": 897,
+          "firstTableMs": 724,
+          "allMs": 897
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 1103694,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 40,
+      "gatewayLagMax": 40,
+      "engineCpuMs": 20,
+      "pgStatements": 45,
+      "pgExecMs": 9,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load (gate per table)",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 776,
+          "firstP90": 776,
+          "firstTableMs": 497,
+          "allMs": 776
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 1099252,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 45,
+      "pgExecMs": 9,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load (gate per table) + series",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 557,
+          "firstP90": 557,
+          "firstTableMs": 396,
+          "allMs": 557
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 14,
+      "bytesDown": 616137,
+      "gatewayCpuMs": 196,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 20,
+      "pgStatements": 41,
+      "pgExecMs": 4,
+      "longPollsHeld": 7,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "today",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 820,
+          "firstP90": 820,
+          "firstTableMs": 621,
+          "allMs": 1241
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1851745,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 61,
+      "gatewayLagMax": 61,
+      "engineCpuMs": 30,
+      "pgStatements": 26,
+      "pgExecMs": 9,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 780,
+          "firstP90": 780,
+          "firstTableMs": 682,
+          "allMs": 1205
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 20,
+      "bytesDown": 1851768,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 36,
+      "gatewayLagMax": 36,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 6,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 28,
+      "holdRequests": 8,
+      "holdDsCalls": 7
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load (gate per table)",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 961,
+          "firstP90": 961,
+          "firstTableMs": 242,
+          "allMs": 961
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 10,
+      "bytesDown": 1896394,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 33,
+      "gatewayLagMax": 33,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 6,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 36,
+      "holdRequests": 10,
+      "holdDsCalls": 9
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load (gate per table) + series",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 959,
+          "firstP90": 959,
+          "firstTableMs": 245,
+          "allMs": 959
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 10,
+      "bytesDown": 1886718,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 73,
+      "gatewayLagMax": 73,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 10,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 36,
+      "holdRequests": 10,
+      "holdDsCalls": 9
+    },
+    {
+      "scenario": "record open",
+      "config": "today",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 703,
+          "firstP90": 703,
+          "firstTableMs": 573,
+          "allMs": 703
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 79,
+      "gatewayLagMax": 79,
+      "engineCpuMs": 10,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 705,
+          "firstP90": 705,
+          "firstTableMs": 572,
+          "allMs": 705
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 100,
+      "gatewayLagMax": 100,
+      "engineCpuMs": 20,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load (gate per table)",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 371,
+          "firstP90": 371,
+          "firstTableMs": 360,
+          "allMs": 371
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 37,
+      "pgExecMs": 1,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load (gate per table) + series",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 392,
+          "firstP90": 392,
+          "firstTableMs": 383,
+          "allMs": 392
+        }
+      },
+      "phoneRequests": 16,
+      "loadRequests": 16,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 224,
+      "gatewayLagP99": 113,
+      "gatewayLagMax": 113,
+      "engineCpuMs": 20,
+      "pgStatements": 37,
+      "pgExecMs": 3,
+      "longPollsHeld": 8,
+      "holdGatewayCpuMs": 32,
+      "holdRequests": 9,
+      "holdDsCalls": 8
+    }
+  ]
+}

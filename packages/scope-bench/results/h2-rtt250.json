@@ -1,0 +1,2588 @@
+{
+  "params": {
+    "RTT_MS": 250,
+    "DOWN_MBPS": 20,
+    "REPS": 3,
+    "OTHER_USERS": 30,
+    "HOLD_MS": 2000
+  },
+  "seed": {
+    "user": 93,
+    "space": 93,
+    "space_member": 93,
+    "calendar": 103,
+    "external_account": 93,
+    "invite": 31,
+    "tag": 1360,
+    "file": 4793,
+    "feedback": 2140,
+    "assistant_state": 1837,
+    "activity": 20263,
+    "resource": 169,
+    "resource_fact": 338,
+    "graph_edge": 507,
+    "record": 12216,
+    "record_date_index": 13196,
+    "tagged_item": 1836,
+    "assignment": 2946,
+    "record_completed_index": 1233,
+    "record_assignee_index": 615,
+    "record_recurrence": 170,
+    "calendar_event": 6359,
+    "message": 3080,
+    "suggestion": 612,
+    "assistant_stream_event": 510
+  },
+  "results": [
+    {
+      "scenario": "cold launch",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 2053,
+          "allMs": 3912
+        }
+      },
+      "phoneRequests": 101,
+      "loadRequests": 96,
+      "bytesDown": 3986028,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 68,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 50,
+      "pgStatements": 111,
+      "pgExecMs": 21,
+      "longPollsHeld": 24
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load + mux",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 2405,
+          "allMs": 2405
+        }
+      },
+      "phoneRequests": 33,
+      "loadRequests": 27,
+      "bytesDown": 3974074,
+      "gatewayCpuMs": 516,
+      "gatewayLagP99": 442,
+      "gatewayLagMax": 442,
+      "engineCpuMs": 50,
+      "pgStatements": 111,
+      "pgExecMs": 38,
+      "longPollsHeld": 3
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load + mux + series",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 1798,
+          "allMs": 2380
+        }
+      },
+      "phoneRequests": 36,
+      "loadRequests": 30,
+      "bytesDown": 3875919,
+      "gatewayCpuMs": 556,
+      "gatewayLagP99": 460,
+      "gatewayLagMax": 460,
+      "engineCpuMs": 50,
+      "pgStatements": 123,
+      "pgExecMs": 32,
+      "longPollsHeld": 4
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 1084,
+          "allMs": 2179
+        }
+      },
+      "phoneRequests": 12,
+      "loadRequests": 6,
+      "bytesDown": 3965937,
+      "gatewayCpuMs": 344,
+      "gatewayLagP99": 165,
+      "gatewayLagMax": 165,
+      "engineCpuMs": 50,
+      "pgStatements": 49,
+      "pgExecMs": 18,
+      "longPollsHeld": 3
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scope load + mux + series",
+      "rep": 1,
+      "screens": {
+        "home": {
+          "firstMs": 1082,
+          "allMs": 2179
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 8,
+      "bytesDown": 3867833,
+      "gatewayCpuMs": 380,
+      "gatewayLagP99": 210,
+      "gatewayLagMax": 210,
+      "engineCpuMs": 50,
+      "pgStatements": 58,
+      "pgExecMs": 18,
+      "longPollsHeld": 4
+    },
+    {
+      "scenario": "chat open",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 1255,
+          "allMs": 1680
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1860255,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 39,
+      "gatewayLagMax": 39,
+      "engineCpuMs": 30,
+      "pgStatements": 31,
+      "pgExecMs": 7,
+      "longPollsHeld": 5
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load + mux",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 693,
+          "allMs": 1115
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1858527,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 43,
+      "gatewayLagMax": 43,
+      "engineCpuMs": 20,
+      "pgStatements": 32,
+      "pgExecMs": 17,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load + mux + series",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 695,
+          "allMs": 1119
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1858543,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 30,
+      "pgStatements": 31,
+      "pgExecMs": 10,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 658,
+          "allMs": 1083
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 4,
+      "bytesDown": 1857455,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 32,
+      "gatewayLagMax": 32,
+      "engineCpuMs": 20,
+      "pgStatements": 22,
+      "pgExecMs": 6,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "scope load + mux + series",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 660,
+          "allMs": 1084
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1866875,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 78,
+      "gatewayLagMax": 78,
+      "engineCpuMs": 10,
+      "pgStatements": 22,
+      "pgExecMs": 7,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 1328
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 2215
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 3286
+        },
+        "agenda": {
+          "firstMs": 2105,
+          "allMs": 2105
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 5137
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 5969
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 6822
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 7759
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 8693
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 9534
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 10443
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 11260
+        }
+      },
+      "phoneRequests": 480,
+      "loadRequests": 456,
+      "bytesDown": 9179900,
+      "gatewayCpuMs": 4992,
+      "gatewayLagP99": 73,
+      "gatewayLagMax": 100,
+      "engineCpuMs": 160,
+      "pgStatements": 489,
+      "pgExecMs": 72,
+      "longPollsHeld": 96
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load + mux",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 755
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 805
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 859
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 916
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 970
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 1020
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 1075
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 1120
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 1171
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 1228
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 1289
+        },
+        "agenda": {
+          "firstMs": 1343,
+          "allMs": 1343
+        }
+      },
+      "phoneRequests": 108,
+      "loadRequests": 108,
+      "bytesDown": 9096137,
+      "gatewayCpuMs": 1968,
+      "gatewayLagP99": 151,
+      "gatewayLagMax": 151,
+      "engineCpuMs": 120,
+      "pgStatements": 488,
+      "pgExecMs": 79,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load + mux + series",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 538
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 512
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 524
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 522
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 529
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 520
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 524
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 517
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 519
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 530
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 533
+        },
+        "agenda": {
+          "firstMs": 522,
+          "allMs": 522
+        }
+      },
+      "phoneRequests": 96,
+      "loadRequests": 96,
+      "bytesDown": 3326015,
+      "gatewayCpuMs": 1728,
+      "gatewayLagP99": 137,
+      "gatewayLagMax": 137,
+      "engineCpuMs": 90,
+      "pgStatements": 439,
+      "pgExecMs": 24,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 697
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 745
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 798
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 854
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 909
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 957
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 1008
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 1052
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 1106
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 1162
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 1221
+        },
+        "agenda": {
+          "firstMs": 1275,
+          "allMs": 1275
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 24,
+      "bytesDown": 9064709,
+      "gatewayCpuMs": 1296,
+      "gatewayLagP99": 106,
+      "gatewayLagMax": 106,
+      "engineCpuMs": 110,
+      "pgStatements": 235,
+      "pgExecMs": 68,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scope load + mux + series",
+      "rep": 1,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 484
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 464
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 468
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 481
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 468
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 463
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 468
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 465
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 472
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 477
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 478
+        },
+        "agenda": {
+          "firstMs": 473,
+          "allMs": 473
+        }
+      },
+      "phoneRequests": 24,
+      "loadRequests": 24,
+      "bytesDown": 3299111,
+      "gatewayCpuMs": 1152,
+      "gatewayLagP99": 93,
+      "gatewayLagMax": 93,
+      "engineCpuMs": 70,
+      "pgStatements": 224,
+      "pgExecMs": 21,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 1498,
+          "allMs": 1498
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 1103694,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 47,
+      "pgExecMs": 20,
+      "longPollsHeld": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load + mux",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 912,
+          "allMs": 912
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 1099252,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 110,
+      "gatewayLagMax": 110,
+      "engineCpuMs": 30,
+      "pgStatements": 47,
+      "pgExecMs": 12,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load + mux + series",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 690,
+          "allMs": 690
+        }
+      },
+      "phoneRequests": 8,
+      "loadRequests": 8,
+      "bytesDown": 616137,
+      "gatewayCpuMs": 144,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 20,
+      "pgStatements": 44,
+      "pgExecMs": 4,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 844,
+          "allMs": 844
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 1096633,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 104,
+      "gatewayLagMax": 104,
+      "engineCpuMs": 20,
+      "pgStatements": 27,
+      "pgExecMs": 6,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scope load + mux + series",
+      "rep": 1,
+      "screens": {
+        "stack": {
+          "firstMs": 629,
+          "allMs": 629
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 613895,
+      "gatewayCpuMs": 96,
+      "gatewayLagP99": 95,
+      "gatewayLagMax": 95,
+      "engineCpuMs": 10,
+      "pgStatements": 25,
+      "pgExecMs": 4,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 1266,
+          "allMs": 1688
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1860506,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 61,
+      "gatewayLagMax": 61,
+      "engineCpuMs": 40,
+      "pgStatements": 28,
+      "pgExecMs": 5,
+      "longPollsHeld": 5
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load + mux",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 666,
+          "allMs": 1091
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 7,
+      "bytesDown": 1906290,
+      "gatewayCpuMs": 132,
+      "gatewayLagP99": 73,
+      "gatewayLagMax": 73,
+      "engineCpuMs": 20,
+      "pgStatements": 28,
+      "pgExecMs": 7,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load + mux + series",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 1090,
+          "allMs": 1093
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1906326,
+      "gatewayCpuMs": 132,
+      "gatewayLagP99": 65,
+      "gatewayLagMax": 65,
+      "engineCpuMs": 20,
+      "pgStatements": 28,
+      "pgExecMs": 10,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 658,
+          "allMs": 1083
+        }
+      },
+      "phoneRequests": 11,
+      "loadRequests": 4,
+      "bytesDown": 1905258,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 39,
+      "gatewayLagMax": 39,
+      "engineCpuMs": 30,
+      "pgStatements": 19,
+      "pgExecMs": 7,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope load + mux + series",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 646,
+          "allMs": 1071
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1905294,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 43,
+      "gatewayLagMax": 43,
+      "engineCpuMs": 20,
+      "pgStatements": 19,
+      "pgExecMs": 4,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "record open",
+      "config": "scopes + gate",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 1134,
+          "allMs": 1134
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 102,
+      "gatewayLagMax": 102,
+      "engineCpuMs": 10,
+      "pgStatements": 40,
+      "pgExecMs": 1,
+      "longPollsHeld": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load + mux",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 471,
+          "allMs": 471
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 100,
+      "gatewayLagMax": 100,
+      "engineCpuMs": 20,
+      "pgStatements": 39,
+      "pgExecMs": 2,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "table load + mux + series",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 464,
+          "allMs": 464
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 23,
+      "gatewayLagMax": 23,
+      "engineCpuMs": 30,
+      "pgStatements": 40,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 384,
+          "allMs": 384
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 14026,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 104,
+      "gatewayLagMax": 104,
+      "engineCpuMs": 10,
+      "pgStatements": 18,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux + series",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 385,
+          "allMs": 385
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 14026,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 104,
+      "gatewayLagMax": 104,
+      "engineCpuMs": 10,
+      "pgStatements": 18,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 2102,
+          "allMs": 4095
+        }
+      },
+      "phoneRequests": 102,
+      "loadRequests": 96,
+      "bytesDown": 3996230,
+      "gatewayCpuMs": 1176,
+      "gatewayLagP99": 49,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 60,
+      "pgStatements": 112,
+      "pgExecMs": 34,
+      "longPollsHeld": 24
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load + mux",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1790,
+          "allMs": 2373
+        }
+      },
+      "phoneRequests": 33,
+      "loadRequests": 27,
+      "bytesDown": 3974192,
+      "gatewayCpuMs": 512,
+      "gatewayLagP99": 436,
+      "gatewayLagMax": 436,
+      "engineCpuMs": 50,
+      "pgStatements": 110,
+      "pgExecMs": 33,
+      "longPollsHeld": 3
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load + mux + series",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1805,
+          "allMs": 2389
+        }
+      },
+      "phoneRequests": 36,
+      "loadRequests": 30,
+      "bytesDown": 3876449,
+      "gatewayCpuMs": 556,
+      "gatewayLagP99": 480,
+      "gatewayLagMax": 480,
+      "engineCpuMs": 60,
+      "pgStatements": 124,
+      "pgExecMs": 38,
+      "longPollsHeld": 4
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1071,
+          "allMs": 2168
+        }
+      },
+      "phoneRequests": 12,
+      "loadRequests": 6,
+      "bytesDown": 3966467,
+      "gatewayCpuMs": 344,
+      "gatewayLagP99": 165,
+      "gatewayLagMax": 165,
+      "engineCpuMs": 30,
+      "pgStatements": 49,
+      "pgExecMs": 23,
+      "longPollsHeld": 3
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scope load + mux + series",
+      "rep": 2,
+      "screens": {
+        "home": {
+          "firstMs": 1079,
+          "allMs": 2173
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 8,
+      "bytesDown": 3868363,
+      "gatewayCpuMs": 380,
+      "gatewayLagP99": 210,
+      "gatewayLagMax": 210,
+      "engineCpuMs": 50,
+      "pgStatements": 58,
+      "pgExecMs": 17,
+      "longPollsHeld": 4
+    },
+    {
+      "scenario": "chat open",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 1183,
+          "allMs": 1607
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1870161,
+      "gatewayCpuMs": 264,
+      "gatewayLagP99": 67,
+      "gatewayLagMax": 67,
+      "engineCpuMs": 40,
+      "pgStatements": 31,
+      "pgExecMs": 10,
+      "longPollsHeld": 5
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load + mux",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 691,
+          "allMs": 1117
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1859057,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 70,
+      "gatewayLagMax": 70,
+      "engineCpuMs": 30,
+      "pgStatements": 32,
+      "pgExecMs": 11,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load + mux + series",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 700,
+          "allMs": 1126
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1859073,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 23,
+      "gatewayLagMax": 23,
+      "engineCpuMs": 30,
+      "pgStatements": 31,
+      "pgExecMs": 20,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 669,
+          "allMs": 1093
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1857985,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 20,
+      "pgStatements": 22,
+      "pgExecMs": 6,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "scope load + mux + series",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 663,
+          "allMs": 1087
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1858001,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 79,
+      "gatewayLagMax": 79,
+      "engineCpuMs": 30,
+      "pgStatements": 22,
+      "pgExecMs": 9,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 1338
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 2182
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 3050
+        },
+        "agenda": {
+          "firstMs": 2065,
+          "allMs": 2065
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 5177
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 6008
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 6832
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 7675
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 8503
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 9342
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 10164
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 10932
+        }
+      },
+      "phoneRequests": 472,
+      "loadRequests": 448,
+      "bytesDown": 9175100,
+      "gatewayCpuMs": 4960,
+      "gatewayLagP99": 82,
+      "gatewayLagMax": 125,
+      "engineCpuMs": 180,
+      "pgStatements": 488,
+      "pgExecMs": 74,
+      "longPollsHeld": 96
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load + mux",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 784
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 834
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 887
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 944
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 998
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 1051
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 1102
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 1150
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 1201
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 1259
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 1318
+        },
+        "agenda": {
+          "firstMs": 1371,
+          "allMs": 1371
+        }
+      },
+      "phoneRequests": 108,
+      "loadRequests": 108,
+      "bytesDown": 9096137,
+      "gatewayCpuMs": 1968,
+      "gatewayLagP99": 150,
+      "gatewayLagMax": 150,
+      "engineCpuMs": 130,
+      "pgStatements": 488,
+      "pgExecMs": 89,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load + mux + series",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 559
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 513
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 526
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 527
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 538
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 514
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 524
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 527
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 529
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 531
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 534
+        },
+        "agenda": {
+          "firstMs": 523,
+          "allMs": 523
+        }
+      },
+      "phoneRequests": 96,
+      "loadRequests": 96,
+      "bytesDown": 3326015,
+      "gatewayCpuMs": 1728,
+      "gatewayLagP99": 143,
+      "gatewayLagMax": 143,
+      "engineCpuMs": 100,
+      "pgStatements": 439,
+      "pgExecMs": 35,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 699
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 749
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 802
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 858
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 910
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 960
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 1011
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 1059
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 1108
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 1165
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 1223
+        },
+        "agenda": {
+          "firstMs": 1277,
+          "allMs": 1277
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 24,
+      "bytesDown": 9064709,
+      "gatewayCpuMs": 1296,
+      "gatewayLagP99": 105,
+      "gatewayLagMax": 105,
+      "engineCpuMs": 120,
+      "pgStatements": 235,
+      "pgExecMs": 73,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scope load + mux + series",
+      "rep": 2,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 480
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 463
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 468
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 475
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 473
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 463
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 464
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 463
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 465
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 474
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 477
+        },
+        "agenda": {
+          "firstMs": 469,
+          "allMs": 469
+        }
+      },
+      "phoneRequests": 24,
+      "loadRequests": 24,
+      "bytesDown": 3299111,
+      "gatewayCpuMs": 1152,
+      "gatewayLagP99": 93,
+      "gatewayLagMax": 93,
+      "engineCpuMs": 80,
+      "pgStatements": 224,
+      "pgExecMs": 19,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 1450,
+          "allMs": 1450
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 1103694,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 102,
+      "gatewayLagMax": 102,
+      "engineCpuMs": 30,
+      "pgStatements": 47,
+      "pgExecMs": 8,
+      "longPollsHeld": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load + mux",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 914,
+          "allMs": 914
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 1099252,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 148,
+      "gatewayLagMax": 148,
+      "engineCpuMs": 20,
+      "pgStatements": 48,
+      "pgExecMs": 11,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load + mux + series",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 677,
+          "allMs": 677
+        }
+      },
+      "phoneRequests": 8,
+      "loadRequests": 8,
+      "bytesDown": 616137,
+      "gatewayCpuMs": 144,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 20,
+      "pgStatements": 43,
+      "pgExecMs": 4,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 842,
+          "allMs": 842
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 1096633,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 105,
+      "gatewayLagMax": 105,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 7,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scope load + mux + series",
+      "rep": 2,
+      "screens": {
+        "stack": {
+          "firstMs": 625,
+          "allMs": 625
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 613895,
+      "gatewayCpuMs": 96,
+      "gatewayLagP99": 92,
+      "gatewayLagMax": 92,
+      "engineCpuMs": 10,
+      "pgStatements": 25,
+      "pgExecMs": 3,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 1645,
+          "allMs": 1645
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 20,
+      "bytesDown": 1861036,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 33,
+      "gatewayLagMax": 33,
+      "engineCpuMs": 20,
+      "pgStatements": 28,
+      "pgExecMs": 5,
+      "longPollsHeld": 5
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load + mux",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 662,
+          "allMs": 1088
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 7,
+      "bytesDown": 1906995,
+      "gatewayCpuMs": 132,
+      "gatewayLagP99": 60,
+      "gatewayLagMax": 60,
+      "engineCpuMs": 30,
+      "pgStatements": 29,
+      "pgExecMs": 4,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load + mux + series",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 1090,
+          "allMs": 1090
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1907031,
+      "gatewayCpuMs": 132,
+      "gatewayLagP99": 61,
+      "gatewayLagMax": 61,
+      "engineCpuMs": 30,
+      "pgStatements": 28,
+      "pgExecMs": 4,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 643,
+          "allMs": 1066
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1905963,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 36,
+      "gatewayLagMax": 36,
+      "engineCpuMs": 30,
+      "pgStatements": 19,
+      "pgExecMs": 7,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope load + mux + series",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 630,
+          "allMs": 1053
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1905999,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 5,
+      "gatewayLagMax": 5,
+      "engineCpuMs": 30,
+      "pgStatements": 19,
+      "pgExecMs": 4,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "record open",
+      "config": "scopes + gate",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 1141,
+          "allMs": 1141
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 40,
+      "pgExecMs": 0,
+      "longPollsHeld": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load + mux",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 477,
+          "allMs": 477
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 39,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "table load + mux + series",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 468,
+          "allMs": 468
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 20,
+      "pgStatements": 40,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 383,
+          "allMs": 383
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 14026,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 103,
+      "gatewayLagMax": 103,
+      "engineCpuMs": 10,
+      "pgStatements": 19,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux + series",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 387,
+          "allMs": 387
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 14026,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 104,
+      "gatewayLagMax": 104,
+      "engineCpuMs": 0,
+      "pgStatements": 18,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 2201,
+          "allMs": 4013
+        }
+      },
+      "phoneRequests": 102,
+      "loadRequests": 96,
+      "bytesDown": 3987088,
+      "gatewayCpuMs": 1172,
+      "gatewayLagP99": 48,
+      "gatewayLagMax": 100,
+      "engineCpuMs": 60,
+      "pgStatements": 111,
+      "pgExecMs": 25,
+      "longPollsHeld": 24
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load + mux",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 1613,
+          "allMs": 2387
+        }
+      },
+      "phoneRequests": 33,
+      "loadRequests": 27,
+      "bytesDown": 3974722,
+      "gatewayCpuMs": 512,
+      "gatewayLagP99": 435,
+      "gatewayLagMax": 435,
+      "engineCpuMs": 60,
+      "pgStatements": 112,
+      "pgExecMs": 23,
+      "longPollsHeld": 3
+    },
+    {
+      "scenario": "cold launch",
+      "config": "table load + mux + series",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 1454,
+          "allMs": 2380
+        }
+      },
+      "phoneRequests": 36,
+      "loadRequests": 30,
+      "bytesDown": 3876979,
+      "gatewayCpuMs": 556,
+      "gatewayLagP99": 479,
+      "gatewayLagMax": 479,
+      "engineCpuMs": 50,
+      "pgStatements": 124,
+      "pgExecMs": 36,
+      "longPollsHeld": 4
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scope load + mux",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 1101,
+          "allMs": 2197
+        }
+      },
+      "phoneRequests": 12,
+      "loadRequests": 6,
+      "bytesDown": 3966997,
+      "gatewayCpuMs": 344,
+      "gatewayLagP99": 165,
+      "gatewayLagMax": 165,
+      "engineCpuMs": 30,
+      "pgStatements": 49,
+      "pgExecMs": 22,
+      "longPollsHeld": 3
+    },
+    {
+      "scenario": "cold launch",
+      "config": "scope load + mux + series",
+      "rep": 3,
+      "screens": {
+        "home": {
+          "firstMs": 1078,
+          "allMs": 2174
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 8,
+      "bytesDown": 3868893,
+      "gatewayCpuMs": 380,
+      "gatewayLagP99": 210,
+      "gatewayLagMax": 210,
+      "engineCpuMs": 40,
+      "pgStatements": 58,
+      "pgExecMs": 20,
+      "longPollsHeld": 4
+    },
+    {
+      "scenario": "chat open",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1260,
+          "allMs": 1685
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1861315,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 30,
+      "pgStatements": 31,
+      "pgExecMs": 22,
+      "longPollsHeld": 5
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load + mux",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 715,
+          "allMs": 1137
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1859587,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 42,
+      "gatewayLagMax": 42,
+      "engineCpuMs": 30,
+      "pgStatements": 32,
+      "pgExecMs": 10,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load + mux + series",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1131,
+          "allMs": 1131
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1859603,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 38,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 40,
+      "pgStatements": 32,
+      "pgExecMs": 8,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "scope load + mux",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 660,
+          "allMs": 1085
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1858515,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 78,
+      "gatewayLagMax": 78,
+      "engineCpuMs": 30,
+      "pgStatements": 22,
+      "pgExecMs": 9,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat open",
+      "config": "scope load + mux + series",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 667,
+          "allMs": 1089
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1858531,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 79,
+      "gatewayLagMax": 79,
+      "engineCpuMs": 20,
+      "pgStatements": 22,
+      "pgExecMs": 5,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 1354
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 2177
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 2930
+        },
+        "agenda": {
+          "firstMs": 1704,
+          "allMs": 1704
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 4707
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 5525
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 6374
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 7220
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 8081
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 8956
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 9841
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 10724
+        }
+      },
+      "phoneRequests": 488,
+      "loadRequests": 456,
+      "bytesDown": 9179900,
+      "gatewayCpuMs": 4960,
+      "gatewayLagP99": 106,
+      "gatewayLagMax": 135,
+      "engineCpuMs": 170,
+      "pgStatements": 488,
+      "pgExecMs": 79,
+      "longPollsHeld": 96
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load + mux",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 775
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 826
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 879
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 938
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 991
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 1041
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 1094
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 1148
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 1194
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 1250
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 1311
+        },
+        "agenda": {
+          "firstMs": 1364,
+          "allMs": 1364
+        }
+      },
+      "phoneRequests": 108,
+      "loadRequests": 108,
+      "bytesDown": 9096137,
+      "gatewayCpuMs": 1968,
+      "gatewayLagP99": 152,
+      "gatewayLagMax": 152,
+      "engineCpuMs": 140,
+      "pgStatements": 487,
+      "pgExecMs": 89,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "table load + mux + series",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 537
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 513
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 527
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 556
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 522
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 515
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 517
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 513
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 515
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 523
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 536
+        },
+        "agenda": {
+          "firstMs": 525,
+          "allMs": 525
+        }
+      },
+      "phoneRequests": 96,
+      "loadRequests": 96,
+      "bytesDown": 3326015,
+      "gatewayCpuMs": 1728,
+      "gatewayLagP99": 102,
+      "gatewayLagMax": 102,
+      "engineCpuMs": 100,
+      "pgStatements": 440,
+      "pgExecMs": 31,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scope load + mux",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 696
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 747
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 800
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 853
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 907
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 956
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 1007
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 1056
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 1105
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 1160
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 1220
+        },
+        "agenda": {
+          "firstMs": 1273,
+          "allMs": 1273
+        }
+      },
+      "phoneRequests": 25,
+      "loadRequests": 24,
+      "bytesDown": 9064709,
+      "gatewayCpuMs": 1296,
+      "gatewayLagP99": 108,
+      "gatewayLagMax": 108,
+      "engineCpuMs": 100,
+      "pgStatements": 236,
+      "pgExecMs": 66,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "agenda fling",
+      "config": "scope load + mux + series",
+      "rep": 3,
+      "screens": {
+        "agenda-pass-0": {
+          "firstMs": null,
+          "allMs": 481
+        },
+        "agenda-pass-1": {
+          "firstMs": null,
+          "allMs": 463
+        },
+        "agenda-pass-2": {
+          "firstMs": null,
+          "allMs": 466
+        },
+        "agenda-pass-3": {
+          "firstMs": null,
+          "allMs": 472
+        },
+        "agenda-pass-4": {
+          "firstMs": null,
+          "allMs": 466
+        },
+        "agenda-pass-5": {
+          "firstMs": null,
+          "allMs": 460
+        },
+        "agenda-pass-6": {
+          "firstMs": null,
+          "allMs": 465
+        },
+        "agenda-pass-7": {
+          "firstMs": null,
+          "allMs": 460
+        },
+        "agenda-pass-8": {
+          "firstMs": null,
+          "allMs": 471
+        },
+        "agenda-pass-9": {
+          "firstMs": null,
+          "allMs": 474
+        },
+        "agenda-pass-10": {
+          "firstMs": null,
+          "allMs": 477
+        },
+        "agenda": {
+          "firstMs": 470,
+          "allMs": 470
+        }
+      },
+      "phoneRequests": 24,
+      "loadRequests": 24,
+      "bytesDown": 3299111,
+      "gatewayCpuMs": 1152,
+      "gatewayLagP99": 94,
+      "gatewayLagMax": 94,
+      "engineCpuMs": 60,
+      "pgStatements": 223,
+      "pgExecMs": 18,
+      "longPollsHeld": 12
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 1511,
+          "allMs": 1511
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 1103694,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 30,
+      "pgStatements": 48,
+      "pgExecMs": 9,
+      "longPollsHeld": 8
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load + mux",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 893,
+          "allMs": 893
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 1099252,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 101,
+      "gatewayLagMax": 101,
+      "engineCpuMs": 30,
+      "pgStatements": 47,
+      "pgExecMs": 9,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "table load + mux + series",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 686,
+          "allMs": 686
+        }
+      },
+      "phoneRequests": 8,
+      "loadRequests": 8,
+      "bytesDown": 616137,
+      "gatewayCpuMs": 144,
+      "gatewayLagP99": 80,
+      "gatewayLagMax": 80,
+      "engineCpuMs": 20,
+      "pgStatements": 44,
+      "pgExecMs": 4,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scope load + mux",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 859,
+          "allMs": 859
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 1096633,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 104,
+      "gatewayLagMax": 104,
+      "engineCpuMs": 20,
+      "pgStatements": 26,
+      "pgExecMs": 13,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "stack visit",
+      "config": "scope load + mux + series",
+      "rep": 3,
+      "screens": {
+        "stack": {
+          "firstMs": 634,
+          "allMs": 634
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 613895,
+      "gatewayCpuMs": 96,
+      "gatewayLagP99": 93,
+      "gatewayLagMax": 93,
+      "engineCpuMs": 20,
+      "pgStatements": 25,
+      "pgExecMs": 3,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1677,
+          "allMs": 1680
+        }
+      },
+      "phoneRequests": 26,
+      "loadRequests": 20,
+      "bytesDown": 1861566,
+      "gatewayCpuMs": 260,
+      "gatewayLagP99": 33,
+      "gatewayLagMax": 33,
+      "engineCpuMs": 30,
+      "pgStatements": 28,
+      "pgExecMs": 6,
+      "longPollsHeld": 5
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load + mux",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1095,
+          "allMs": 1095
+        }
+      },
+      "phoneRequests": 13,
+      "loadRequests": 7,
+      "bytesDown": 1859848,
+      "gatewayCpuMs": 128,
+      "gatewayLagP99": 61,
+      "gatewayLagMax": 61,
+      "engineCpuMs": 30,
+      "pgStatements": 28,
+      "pgExecMs": 5,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "table load + mux + series",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 1112,
+          "allMs": 1112
+        }
+      },
+      "phoneRequests": 14,
+      "loadRequests": 7,
+      "bytesDown": 1907736,
+      "gatewayCpuMs": 132,
+      "gatewayLagP99": 74,
+      "gatewayLagMax": 74,
+      "engineCpuMs": 20,
+      "pgStatements": 28,
+      "pgExecMs": 12,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope load + mux",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 644,
+          "allMs": 1070
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1906668,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 42,
+      "gatewayLagMax": 42,
+      "engineCpuMs": 30,
+      "pgStatements": 19,
+      "pgExecMs": 8,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope load + mux + series",
+      "rep": 3,
+      "screens": {
+        "chat": {
+          "firstMs": 640,
+          "allMs": 1065
+        }
+      },
+      "phoneRequests": 10,
+      "loadRequests": 4,
+      "bytesDown": 1858822,
+      "gatewayCpuMs": 104,
+      "gatewayLagP99": 60,
+      "gatewayLagMax": 60,
+      "engineCpuMs": 30,
+      "pgStatements": 19,
+      "pgExecMs": 4,
+      "longPollsHeld": 2
+    },
+    {
+      "scenario": "record open",
+      "config": "scopes + gate",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 1160,
+          "allMs": 1160
+        }
+      },
+      "phoneRequests": 32,
+      "loadRequests": 32,
+      "bytesDown": 21087,
+      "gatewayCpuMs": 384,
+      "gatewayLagP99": 103,
+      "gatewayLagMax": 103,
+      "engineCpuMs": 20,
+      "pgStatements": 40,
+      "pgExecMs": 1,
+      "longPollsHeld": 8
+    },
+    {
+      "scenario": "record open",
+      "config": "table load + mux",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 465,
+          "allMs": 465
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 22,
+      "gatewayLagMax": 22,
+      "engineCpuMs": 20,
+      "pgStatements": 40,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "table load + mux + series",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 479,
+          "allMs": 479
+        }
+      },
+      "phoneRequests": 9,
+      "loadRequests": 9,
+      "bytesDown": 16638,
+      "gatewayCpuMs": 164,
+      "gatewayLagP99": 100,
+      "gatewayLagMax": 100,
+      "engineCpuMs": 20,
+      "pgStatements": 39,
+      "pgExecMs": 3,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 394,
+          "allMs": 394
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 14026,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 106,
+      "gatewayLagMax": 106,
+      "engineCpuMs": 20,
+      "pgStatements": 18,
+      "pgExecMs": 1,
+      "longPollsHeld": 1
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux + series",
+      "rep": 3,
+      "screens": {
+        "record": {
+          "firstMs": 389,
+          "allMs": 389
+        }
+      },
+      "phoneRequests": 2,
+      "loadRequests": 2,
+      "bytesDown": 14026,
+      "gatewayCpuMs": 108,
+      "gatewayLagP99": 107,
+      "gatewayLagMax": 107,
+      "engineCpuMs": 10,
+      "pgStatements": 18,
+      "pgExecMs": 0,
+      "longPollsHeld": 1
+    }
+  ]
+}

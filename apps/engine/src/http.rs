@@ -17,6 +17,16 @@ use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 use crate::table_ref::TableRef;
 
+/// Keep compound prototype fan-in bounded before any feed claim or Postgres work begins.
+const MAX_BATCH_TABLES: usize = 64;
+
+// The lifecycle API currently returns only the shape and subscription, not whether the claim was
+// fresh. Serialize this route's owner check with its create so concurrent lost-response retries do
+// not both arm compensation for one shared claim. The engine's normal DELETE path remains safe via
+// the subscription identity and durable idempotent release.
+static COMPOUND_CLAIM_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 // These types are deliberately documentation-only. Runtime requests continue to use the
 // validated domain types below; keeping the OpenAPI projection separate means a schema change
 // cannot accidentally change parsing or engine behavior without a compiler/test failure.
@@ -277,6 +287,40 @@ fn openapi_subset_feed() {}
 
 #[utoipa::path(
     post,
+    path = "/v1/subset-loads",
+    request_body = SubsetLoadRequest,
+    responses(
+        (status = 200, description = "Changes-only feed and snapshot page", body = SubsetLoadResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 415, description = "Unsupported media type", body = ErrorResponse),
+        (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
+        (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_subset_load() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/subsets/query-batch",
+    request_body = serde_json::Value,
+    responses((status = 200, description = "Snapshot rows"), (status = 400, description = "Invalid request", body = ErrorResponse))
+)]
+#[allow(dead_code)]
+fn openapi_subset_query_batch() {}
+
+#[utoipa::path(
+    post,
+    path = "/v1/scopes/load",
+    request_body = serde_json::Value,
+    responses((status = 200, description = "Scope feeds and snapshot rows"), (status = 400, description = "Invalid request", body = ErrorResponse))
+)]
+#[allow(dead_code)]
+fn openapi_scope_load() {}
+
+#[utoipa::path(
+    post,
     path = "/v1/aggregates",
     request_body = AggregateRequest,
     responses(
@@ -317,6 +361,9 @@ fn openapi_deployment_promote() {}
         openapi_release_shape,
         openapi_subset_query,
         openapi_subset_feed,
+        openapi_subset_load,
+        openapi_subset_query_batch,
+        openapi_scope_load,
         openapi_aggregate,
         openapi_deployment_promote
     ),
@@ -334,6 +381,8 @@ fn openapi_deployment_promote() {}
         AggregateFunction,
         AggregateRequest,
         SubsetFeedRequest,
+        SubsetLoadRequest,
+        SubsetLoadResponse,
         DeploymentPromoteRequest,
         ErrorResponse
     ))
@@ -374,6 +423,9 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/shapes/{id}", get(get_shape).delete(release_shape))
         .route("/v1/subsets/query", post(query_subset))
         .route("/v1/subset-feeds", post(create_subset_feed))
+        .route("/v1/subsets/query-batch", post(query_subset_batch))
+        .route("/v1/scopes/load", post(load_scope))
+        .route("/v1/subset-loads", post(subset_load))
         .route("/v1/aggregates", post(create_aggregate))
         .route("/changes/position", get(changes_position))
         .route("/changes/{segment}", get(read_changes))
@@ -668,8 +720,16 @@ async fn normalize_extractor_rejection(request: axum::extract::Request, next: Ne
 }
 
 fn is_native_dto_path(path: &str) -> bool {
-    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/aggregates")
-        || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
+    matches!(
+        path,
+        "/v1/shapes"
+            | "/v1/subsets/query"
+            | "/v1/subset-feeds"
+            | "/v1/subset-loads"
+            | "/v1/subsets/query-batch"
+            | "/v1/scopes/load"
+            | "/v1/aggregates"
+    ) || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
 }
 
 /// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).
@@ -973,7 +1033,7 @@ struct DefineSchemaReq {
     schema: Schema,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SubsetOrderByReq {
     col: String,
     #[serde(default)]
@@ -1011,6 +1071,458 @@ async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -
     let order_by = req.order_by.map(|o| (o.col, o.desc));
     let page = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
     Ok(Json(QueryResp { rows: page.rows, lsn: page.lsn, snapshot: page.snapshot, horizon: page.horizon }))
+}
+
+#[derive(Deserialize)]
+struct QueryBatchEntry {
+    /// The caller's name for this read, echoed on its result.
+    key: String,
+    #[serde(flatten)]
+    query: QueryReq,
+}
+
+#[derive(Deserialize)]
+struct QueryBatchReq {
+    tables: Vec<QueryBatchEntry>,
+}
+
+#[derive(Serialize)]
+struct QueryBatchResult {
+    key: String,
+    rows: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct QueryBatchResp {
+    lsn: String,
+    snapshot: String,
+    horizon: String,
+    results: Vec<QueryBatchResult>,
+}
+
+fn batch_read(q: QueryReq) -> crate::engine::SubsetReadReq {
+    crate::engine::SubsetReadReq {
+        table: q.table,
+        where_: q.where_,
+        columns: q.columns,
+        order_by: q.order_by.map(|o| (o.col, o.desc)),
+        limit: q.limit,
+        offset: q.offset,
+    }
+}
+
+/// Prototype: several one-shot subset reads in one settled snapshot (`/v1/subsets/query` × N, one
+/// round trip, one transaction, one set of fences).
+async fn query_subset_batch(
+    State(engine): State<Engine>,
+    Json(req): Json<QueryBatchReq>,
+) -> Result<Json<QueryBatchResp>, AppError> {
+    engine.ensure_not_degraded()?;
+    if req.tables.is_empty() {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "tables must not be empty".into(),
+            retry_after: false,
+        });
+    }
+    if req.tables.len() > MAX_BATCH_TABLES {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("too many tables (maximum {MAX_BATCH_TABLES})"),
+            retry_after: false,
+        });
+    }
+    let keys: Vec<String> = req.tables.iter().map(|t| t.key.clone()).collect();
+    let page = engine.query_subset_batch(req.tables.into_iter().map(|t| batch_read(t.query)).collect()).await?;
+    let results = keys.into_iter().zip(page.pages).map(|(key, rows)| QueryBatchResult { key, rows }).collect();
+    Ok(Json(QueryBatchResp { lsn: page.lsn, snapshot: page.snapshot, horizon: page.horizon, results }))
+}
+
+#[derive(Deserialize)]
+struct ScopeLoadEntry {
+    key: String,
+    table: TableRef,
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    #[serde(default)]
+    subscription: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScopeLoadReq {
+    /// Prefix for entries that name no subscription of their own: `<prefix>:<key>`.
+    #[serde(default)]
+    subscription: Option<String>,
+    tables: Vec<ScopeLoadEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScopeLoadResult {
+    key: String,
+    shape_id: String,
+    stream_url: String,
+    stream_path: String,
+    subscription: String,
+    lease_seconds: u64,
+    /// The feed's tail offset, read after the feed exists and before the snapshot: the client tails
+    /// from here and drops a change its transaction was visible to `snapshot` for.
+    offset: String,
+    rows: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ScopeLoadResp {
+    lsn: String,
+    snapshot: String,
+    horizon: String,
+    results: Vec<ScopeLoadResult>,
+}
+
+/// Prototype: load a whole scope in one request. For every entry, create (or renew) its
+/// changes-only feed and read the feed's tail offset; then read every entry's rows in ONE settled
+/// snapshot. Same order as the client's create → HEAD → query today, so it stays gap-free: each
+/// offset is captured before the snapshot is taken.
+async fn load_scope(
+    State(engine): State<Engine>,
+    Json(req): Json<ScopeLoadReq>,
+) -> Result<Json<ScopeLoadResp>, AppError> {
+    engine.ensure_not_degraded()?;
+    if req.tables.is_empty() {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "tables must not be empty".into(),
+            retry_after: false,
+        });
+    }
+    if req.tables.len() > MAX_BATCH_TABLES {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: format!("too many tables (maximum {MAX_BATCH_TABLES})"),
+            retry_after: false,
+        });
+    }
+    let _control = engine.admit_control()?;
+    let mut feeds = Vec::with_capacity(req.tables.len());
+    let mut subscriptions = Vec::with_capacity(req.tables.len());
+    for t in &req.tables {
+        let create = CreateShapeReq {
+            table: t.table.clone(),
+            where_: t.where_.clone(),
+            columns: t.columns.clone(),
+            changes_only: true,
+            subscription: t
+                .subscription
+                .clone()
+                .or_else(|| req.subscription.as_ref().map(|p| format!("{p}:{}", t.key))),
+        };
+        validate_create_shape_request(&engine, &create).await?;
+        validate_new_subscription(create.subscription.clone())?;
+        engine
+            .validate_subset(&create.table, create.where_.clone(), create.columns.clone(), None, None, None)
+            .await
+            .map_err(|error| AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: format!("{error:#}"),
+                retry_after: false,
+            })?;
+        if let Some(subscription) = &create.subscription {
+            if subscriptions.iter().any(|seen: &String| seen == subscription) {
+                return Err(AppError {
+                    status: StatusCode::BAD_REQUEST,
+                    msg: format!("duplicate subscription '{subscription}' in scope load"),
+                    retry_after: false,
+                });
+            }
+            subscriptions.push(subscription.clone());
+        }
+        feeds.push(create);
+    }
+    // 1 + 2: create every feed and read its tail. Sequential admission keeps work bounded and
+    // makes the compensation list complete if a later feed or the page read fails.
+    let mut created: Vec<(ShapeRecord, String, String, FeedClaimGuard)> = Vec::with_capacity(feeds.len());
+    for f in feeds {
+        match open_feed(&engine, f).await {
+            Ok(feed) => created.push(feed),
+            Err(error) => {
+                release_feed_claims(&mut created).await;
+                return Err(error);
+            }
+        }
+    }
+    // 3: every entry's rows from one snapshot.
+    let reads = req
+        .tables
+        .iter()
+        .map(|t| crate::engine::SubsetReadReq {
+            table: t.table.clone(),
+            where_: t.where_.clone(),
+            columns: t.columns.clone(),
+            order_by: None,
+            limit: None,
+            offset: None,
+        })
+        .collect();
+    let page = match engine.query_subset_batch(reads).await {
+        Ok(page) => page,
+        Err(error) => {
+            release_feed_claims(&mut created).await;
+            let mut app_error = AppError::from(error);
+            app_error.msg = format!("scope page failed after feed creation: {}", app_error.msg);
+            return Err(app_error);
+        }
+    };
+    let lease_seconds = engine.lease_seconds();
+    let results = req
+        .tables
+        .into_iter()
+        .zip(created)
+        .zip(page.pages)
+        .map(|((t, (rec, subscription, offset, mut claim)), rows)| {
+            claim.complete();
+            ScopeLoadResult {
+                key: t.key,
+                shape_id: rec.id,
+                stream_url: engine.stream_url(&rec.stream_path),
+                stream_path: rec.stream_path,
+                subscription,
+                lease_seconds,
+                offset,
+                rows,
+            }
+        })
+        .collect();
+    Ok(Json(ScopeLoadResp { lsn: page.lsn, snapshot: page.snapshot, horizon: page.horizon, results }))
+}
+
+/// Create (or renew) one validated changes-only feed and read its stream's tail offset: the first
+/// two steps of a load, shared by `/v1/scopes/load` and `/v1/subset-loads`. The offset is read after
+/// the feed exists and before any snapshot, so a client tailing from it misses nothing.
+async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String, FeedClaimGuard), AppError> {
+    let _claim_lock = COMPOUND_CLAIM_LOCK.lock().await;
+    let subscription = validate_new_subscription(f.subscription)?;
+    let fresh = match subscription.as_ref() {
+        Some(id) => engine.subscription_owner(id).await.is_none(),
+        None => true,
+    };
+    let (rec, sub) = engine.create_shape_as(&f.table, f.where_, f.columns, true, true, subscription).await?;
+    let mut claim = FeedClaimGuard::new(engine, &rec, &sub, fresh);
+    let offset = match engine.stream_tail(&rec.stream_path).await {
+        Err(error) => {
+            claim.rollback().await;
+            return Err(AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                msg: format!("read feed stream tail for {}: {error:#}", rec.table),
+                retry_after: true,
+            });
+        }
+        Ok(Some(offset)) => offset,
+        Ok(None) => {
+            claim.rollback().await;
+            return Err(AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                msg: format!("feed stream for {} has no tail offset", rec.table),
+                retry_after: true,
+            });
+        }
+    };
+    Ok((rec, sub, offset, claim))
+}
+
+struct FeedClaimGuard {
+    engine: Engine,
+    shape_id: String,
+    subscription: String,
+    armed: bool,
+}
+
+impl FeedClaimGuard {
+    fn new(engine: &Engine, rec: &ShapeRecord, subscription: &str, fresh: bool) -> Self {
+        Self { engine: engine.clone(), shape_id: rec.id.clone(), subscription: subscription.to_string(), armed: fresh }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+
+    async fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.engine.release_subscription_durable(&self.shape_id, Some(&self.subscription)).await {
+            Ok(()) => self.armed = false,
+            Err(error) => tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim"),
+        }
+    }
+}
+
+impl Drop for FeedClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let engine = self.engine.clone();
+        let shape_id = self.shape_id.clone();
+        let subscription = self.subscription.clone();
+        let shutdown = engine.shutdown_token();
+        let _ = shutdown.spawn(async move {
+            if let Err(error) = engine.release_subscription_durable(&shape_id, Some(&subscription)).await {
+                tracing::warn!(shape = %shape_id, subscription = %subscription, %error, "failed to compensate cancelled subset-load claim");
+            }
+        });
+    }
+}
+
+async fn release_feed_claims(feeds: &mut [(ShapeRecord, String, String, FeedClaimGuard)]) {
+    for (_, _, _, claim) in feeds {
+        claim.rollback().await;
+    }
+}
+
+/// The page a subset load reads; omitted fields default to the feed's predicate, no order, no limit.
+#[derive(Clone, Deserialize, Default)]
+struct SubsetLoadQuery {
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(default, rename = "orderBy")]
+    order_by: Option<SubsetOrderByReq>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SubsetLoadReq {
+    table: TableRef,
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+    #[serde(default)]
+    subscription: Option<String>,
+    #[serde(default)]
+    query: Option<SubsetLoadQuery>,
+}
+
+/// Documentation-only projection of the one-table compound load request.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadRequest {
+    table: String,
+    #[serde(rename = "where")]
+    where_: Option<Predicate>,
+    columns: Option<Vec<String>>,
+    subscription: Option<String>,
+    query: Option<SubsetLoadQueryDoc>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadQueryDoc {
+    #[serde(rename = "where")]
+    where_: Option<Predicate>,
+    order_by: Option<SubsetOrderBy>,
+    limit: Option<i64>,
+}
+
+/// Documentation-only projection of the one-table compound load response.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadResponse {
+    shape_id: String,
+    table: String,
+    stream_path: String,
+    stream_url: String,
+    subscription: String,
+    lease_seconds: u64,
+    offset: String,
+    rows: Vec<serde_json::Value>,
+    lsn: String,
+    snapshot: String,
+    horizon: String,
+}
+
+#[derive(Serialize)]
+struct SubsetLoadResp {
+    #[serde(flatten)]
+    feed: ShapeResp,
+    /// The feed's tail offset, read before the snapshot: tail from here, and drop a change whose
+    /// transaction `snapshot` already saw.
+    offset: String,
+    rows: Vec<serde_json::Value>,
+    lsn: String,
+    snapshot: String,
+    horizon: String,
+}
+
+/// Prototype: one table in one round trip. Creates or renews the table's changes-only feed exactly
+/// as `/v1/subset-feeds` does, reads its tail offset as a stream `HEAD` would, then reads the page in
+/// its own settled snapshot exactly as `/v1/subsets/query` does — the client's create → HEAD →
+/// query, in the same order, in one request. A retry with the same subscription renews the feed.
+async fn subset_load(
+    State(engine): State<Engine>,
+    Json(req): Json<SubsetLoadReq>,
+) -> Result<Json<SubsetLoadResp>, AppError> {
+    engine.ensure_not_degraded()?;
+    let query = req.query.clone().unwrap_or_default();
+    let create = CreateShapeReq {
+        table: req.table.clone(),
+        where_: req.where_.clone(),
+        columns: req.columns.clone(),
+        changes_only: true,
+        subscription: req.subscription.clone(),
+    };
+    // Validate the complete compound body before admission or subscription resolution can mutate
+    // state. In particular, an invalid page orderBy must not leave a feed claim behind.
+    validate_new_subscription(req.subscription)?;
+    validate_create_shape_request(&engine, &create).await?;
+    engine
+        .validate_subset(&req.table, req.where_.clone(), req.columns.clone(), None, None, None)
+        .await
+        .map_err(|error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false })?;
+    engine
+        .validate_subset(
+            &req.table,
+            query.where_.clone().or_else(|| req.where_.clone()),
+            req.columns.clone(),
+            query.order_by.as_ref().map(|o| (o.col.clone(), o.desc)),
+            query.limit,
+            None,
+        )
+        .await
+        .map_err(|error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false })?;
+
+    let _control = engine.admit_control()?;
+    let (rec, subscription, offset, mut claim) = open_feed(&engine, create).await?;
+    let page = match engine
+        .query_subset(
+            &req.table,
+            query.where_.or(req.where_),
+            req.columns,
+            query.order_by.map(|o| (o.col, o.desc)),
+            query.limit,
+            None,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            claim.rollback().await;
+            let mut app_error = AppError::from(error);
+            app_error.msg = format!("subset page failed after feed creation: {}", app_error.msg);
+            return Err(app_error);
+        }
+    };
+    claim.complete();
+    Ok(Json(SubsetLoadResp {
+        feed: ShapeResp::created(&engine, rec, subscription),
+        offset,
+        rows: page.rows,
+        lsn: page.lsn,
+        snapshot: page.snapshot,
+        horizon: page.horizon,
+    }))
 }
 
 /// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized

@@ -1,0 +1,93 @@
+{
+  "params": {
+    "RTT_MS": 100,
+    "DOWN_MBPS": 20,
+    "REPS": 1,
+    "OTHER_USERS": 30,
+    "HOLD_MS": 300000,
+    "PHONES": 1,
+    "DS_LONGPOLL_MS": 30000,
+    "STEADY": true
+  },
+  "seed": {
+    "user": 93,
+    "space": 93,
+    "space_member": 93,
+    "calendar": 103,
+    "external_account": 93,
+    "invite": 31,
+    "tag": 1360,
+    "file": 4793,
+    "feedback": 2140,
+    "assistant_state": 1837,
+    "activity": 20263,
+    "resource": 169,
+    "resource_fact": 338,
+    "graph_edge": 507,
+    "record": 12216,
+    "record_date_index": 13196,
+    "tagged_item": 1836,
+    "assignment": 2946,
+    "record_completed_index": 1233,
+    "record_assignee_index": 615,
+    "record_recurrence": 170,
+    "calendar_event": 6359,
+    "message": 3080,
+    "suggestion": 612,
+    "assistant_stream_event": 510
+  },
+  "results": [
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table)",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 655,
+          "firstP90": 655,
+          "firstTableMs": 377,
+          "allMs": 1080
+        }
+      },
+      "phoneRequests": 1668,
+      "loadRequests": 10,
+      "bytesDown": 16772348,
+      "gatewayCpuMs": 6772,
+      "gatewayLagP99": 1,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 2000,
+      "pgStatements": 1554,
+      "pgExecMs": 39,
+      "longPollsHeld": 5,
+      "holdGatewayCpuMs": 6640,
+      "holdRequests": 1661,
+      "holdDsCalls": 1660
+    },
+    {
+      "scenario": "chat open",
+      "config": "table load (gate per table) + mux",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 722,
+          "firstP90": 722,
+          "firstTableMs": 336,
+          "allMs": 1150
+        }
+      },
+      "phoneRequests": 1638,
+      "loadRequests": 7,
+      "bytesDown": 17295659,
+      "gatewayCpuMs": 13716,
+      "gatewayLagP99": 1,
+      "gatewayLagMax": 38,
+      "engineCpuMs": 2190,
+      "pgStatements": 1558,
+      "pgExecMs": 26,
+      "longPollsHeld": 2,
+      "holdGatewayCpuMs": 13584,
+      "holdRequests": 1632,
+      "holdDsCalls": 3396
+    }
+  ]
+}
