@@ -1218,15 +1218,19 @@ async fn load_scope(
 async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String), AppError> {
     let subscription = validate_new_subscription(f.subscription)?;
     let (rec, sub) = engine.create_shape_as(&f.table, f.where_, f.columns, true, true, subscription).await?;
-    let offset = engine.stream_tail(&rec.stream_path).await.map_err(|error| AppError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        msg: format!("read feed stream tail for {}: {error:#}", rec.table),
-        retry_after: true,
-    })?.ok_or_else(|| AppError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        msg: format!("feed stream for {} has no tail offset", rec.table),
-        retry_after: true,
-    })?;
+    let offset = engine
+        .stream_tail(&rec.stream_path)
+        .await
+        .map_err(|error| AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: format!("read feed stream tail for {}: {error:#}", rec.table),
+            retry_after: true,
+        })?
+        .ok_or_else(|| AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            msg: format!("feed stream for {} has no tail offset", rec.table),
+            retry_after: true,
+        })?;
     Ok((rec, sub, offset))
 }
 
