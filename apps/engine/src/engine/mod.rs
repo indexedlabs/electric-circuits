@@ -484,6 +484,42 @@ pub struct SubsetPage {
     pub horizon: String,
 }
 
+/// One read of a [`Engine::query_subset_batch`].
+pub struct SubsetReadReq {
+    pub table: TableRef,
+    pub where_: Option<PredicateJson>,
+    pub columns: Option<Vec<String>>,
+    pub order_by: Option<(String, bool)>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// The pages of a batch, in request order, read in one snapshot whose fences they share.
+pub struct SubsetBatchPage {
+    pub pages: Vec<Vec<serde_json::Value>>,
+    pub lsn: String,
+    pub snapshot: String,
+    pub horizon: String,
+}
+
+struct SubsetPlan {
+    ts: TableSchema,
+    out_cols: Option<Arc<Vec<usize>>>,
+    where_sql: Option<(String, Vec<String>)>,
+    scope: crate::pg::SettleScope,
+    scope_tables: Vec<TableRef>,
+    order: Option<(usize, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl SubsetPlan {
+    fn project(&self, rows: &[crate::value::Row]) -> Vec<serde_json::Value> {
+        let proj = self.out_cols.as_deref().map(Vec::as_slice);
+        rows.iter().map(|r| self.ts.row_to_json_cols(r, proj)).collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
@@ -2740,6 +2776,11 @@ impl Engine {
         self.ds.stream_url(path)
     }
 
+    /// A stream's current tail offset (`stream-next-offset` of a `HEAD`); `None` if it is gone.
+    pub async fn stream_tail(&self, path: &str) -> Result<Option<String>> {
+        Ok(self.ds.head(path).await?.and_then(|h| h.next_offset))
+    }
+
     /// Define a library-mode schema. PostgreSQL mode configures schemas through introspection.
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
         // Reject at the engine boundary, before any storage/schema mutation or sequencer spawn.
@@ -2784,6 +2825,61 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SubsetPage> {
+        let plan = self.plan_subset(table, where_, columns, order_by, limit, offset).await?;
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+        let sq = crate::pg::query_subset_where(
+            &mut client,
+            &plan.ts,
+            plan.where_sql.clone(),
+            &plan.scope,
+            plan.order,
+            plan.limit,
+            plan.offset,
+        )
+        .await?;
+        let rows = plan.project(&sq.rows);
+        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
+    }
+
+    /// Several one-shot subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the
+    /// scope load). The snapshot settles against every table any read depends on, so the pages are
+    /// mutually consistent and share one set of fences.
+    pub async fn query_subset_batch(&self, reads: Vec<SubsetReadReq>) -> Result<SubsetBatchPage> {
+        anyhow::ensure!(!reads.is_empty(), "a batch needs at least one table");
+        let mut plans = Vec::with_capacity(reads.len());
+        for r in reads {
+            plans.push(self.plan_subset(&r.table, r.where_, r.columns, r.order_by, r.limit, r.offset).await?);
+        }
+        let mut scope = plans[0].scope.clone();
+        for p in &plans[1..] {
+            scope = scope.with(p.scope_tables.iter());
+        }
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+        let batch_reads: Vec<crate::pg::SubsetRead<'_>> = plans
+            .iter()
+            .map(|p| crate::pg::SubsetRead {
+                ts: &p.ts,
+                where_sql: p.where_sql.clone(),
+                order: p.order,
+                limit: p.limit,
+                offset: p.offset,
+            })
+            .collect();
+        let bq = crate::pg::query_subset_batch_where(&mut client, batch_reads, &scope).await?;
+        let pages = plans.iter().zip(bq.pages.iter()).map(|(p, rows)| p.project(rows)).collect();
+        Ok(SubsetBatchPage { pages, lsn: bq.lsn, snapshot: bq.snapshot, horizon: bq.horizon })
+    }
+
+    /// Validate a subset read and build its SQL, projection and settle scope without touching Postgres.
+    async fn plan_subset(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<SubsetPlan> {
         let (ts, schemas) = {
             let st = self.state.lock().await;
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
@@ -2829,11 +2925,10 @@ impl Engine {
         // the inner tables of any subquery in its predicate.
         let scope = crate::pg::SettleScope::request(table)
             .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
-        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
-        let sq = crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await?;
-        let proj = out_cols.as_deref().map(Vec::as_slice);
-        let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
-        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
+        let scope_tables: Vec<TableRef> = std::iter::once(table.clone())
+            .chain(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default())
+            .collect();
+        Ok(SubsetPlan { ts, out_cols, where_sql, scope, scope_tables, order, limit, offset })
     }
 
     /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the

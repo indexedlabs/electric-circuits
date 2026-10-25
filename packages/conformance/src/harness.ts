@@ -44,6 +44,8 @@ export function buildEngine(): void {
 let targetDirectory: string | undefined
 /** Cargo's configured target directory is workspace/toolchain state, never assumed to be `./target`. */
 export function engineBin(): string {
+  // Prototype bench/test runs may point at a prebuilt (e.g. release) binary.
+  if (process.env.ELECTRIC_CIRCUITS_ENGINE_BIN) return process.env.ELECTRIC_CIRCUITS_ENGINE_BIN
   if (!targetDirectory) {
     const metadata = JSON.parse(execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], { cwd: repoRoot(), encoding: 'utf8' })) as { target_directory: string }
     targetDirectory = metadata.target_directory
