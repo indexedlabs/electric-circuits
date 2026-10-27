@@ -861,25 +861,52 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
 }
 
 async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
+    f.client
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS public.circuits_source_fence; \
+             CREATE TABLE public.circuits_source_fence (source_commit_id uuid PRIMARY KEY); \
+             ALTER PUBLICATION \"{}_pub\" ADD TABLE public.circuits_source_fence",
+            f.slots[0]
+        ))
+        .await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, body) = post_group(&app, group_body(f, "group-receipt", false)).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
         let baseline = stream_events(f, &stream_path).await.len();
-        f.client.batch_execute(&format!("INSERT INTO public.{} (id) VALUES (2)", f.inner)).await?;
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id) VALUES (2); INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.inner, commit
+            ))
+            .await?;
+        let mut changed = f.ds.changed.subscribe();
+        let receipt = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(receipt) = engine.source_drain_receipt(&commit.to_string()) {
+                    return Ok::<_, anyhow::Error>(receipt);
+                }
+                changed.changed().await.context("source receipt observation channel closed")?;
+            }
+        })
+        .await
+        .context("waiting for source drain receipt")??;
+        ensure!(receipt.source_commit_id == commit.to_string(), "wrong source receipt: {receipt:?}");
         let events = wait_group_events(f, &stream_path, baseline + 1).await?;
-        ensure!(
-            events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")),
-            "group lane did not emit the source change: {events:?}"
-        );
-        // The source receipt is produced only after the sequencer has drained deferred work. A
-        // real PostgreSQL mutation plus the resulting group event is the observable fence here.
-        ensure!(engine.health_status() == "active", "engine was not active after source drain");
+        ensure!(events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")), "group lane did not emit before receipt: {events:?}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
+    let _ = f
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION \"{}_pub\" DROP TABLE IF EXISTS public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
+            f.slots[0]
+        ))
+        .await;
     result
 }
 
