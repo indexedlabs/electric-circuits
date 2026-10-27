@@ -867,7 +867,7 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
         let baseline = stream_events(f, &stream_path).await.len();
-        f.client.batch_execute(&format!("INSERT INTO public.{} (id) VALUES (3)", f.inner)).await?;
+        f.client.batch_execute(&format!("INSERT INTO public.{} (id) VALUES (2)", f.inner)).await?;
         let events = wait_group_events(f, &stream_path, baseline + 1).await?;
         ensure!(
             events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")),
