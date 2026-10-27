@@ -180,7 +180,6 @@ mod tests {
         drop(rx);
         let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: DegradeState::new() };
         pending.add(0x30);
-        pending.add(0x10);
         let envelope = serde_json::from_value(serde_json::json!({
             "type": "test", "key": "1", "headers": {"operation": "upsert"}
         }))
