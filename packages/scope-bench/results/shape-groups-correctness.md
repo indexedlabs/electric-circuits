@@ -2,7 +2,7 @@
 
 This branch starts at `c1d035e` (`prototype/shape-groups`). It adds the first
 correctness slice for a group with a plain member and an `IN (SELECT …)` member,
-plus an executable key-only semijoin model. Nothing here is merge-ready or a
+plus an executable key-only semijoin sketch. Nothing here is merge-ready or a
 PG18 qualification.
 
 ## Verdict
@@ -10,11 +10,10 @@ PG18 qualification.
 The group shape can be made safe enough to keep prototyping: claims are reserved
 atomically, the member list and one snapshot fence are durable, a group-wide
 transaction fence closes the delayed-subquery ordering hole, and bounded emission
-queues fail closed instead of losing membership effects. The semijoin model is
-materially cheaper state (about 0.46 MiB for 12,000 keys) and makes move-ins one
-batched read, so the recommendation is **both**: keep groups as the transport and
-lease abstraction, then use a key-only semijoin for companion membership once the
-runtime DBSP operator has a real engine contract.
+queues fail closed instead of losing membership effects. The semijoin remains
+unstarted as a real DBSP runtime operator, so no semijoin performance conclusion
+is included. Keep groups as the transport and lease abstraction, then compare a
+real key-only semijoin only after its engine state and restart behavior are measured.
 
 ## Correctness cases
 
@@ -43,26 +42,9 @@ it never drops a membership batch and reports a false drained receipt.
 
 ## Key-only semijoin
 
-`src/semijoin.ts` keeps only `(member, record_id)` keys and materializes companion
-rows by one entered-key pass. `NOT IN`/NULL-shaped predicates are explicitly
-rejected with `NullSemanticsError`; callers must express `NOT EXISTS` or an
-explicit null branch.
-
-The production-size model uses 12,000 Records and the proposal's companion
-cardinalities (101,900 assignments, 75,900 date-index rows, 6,100 recurrences,
-and three 300-row index tables). One run produced:
-
-| Model | Keys | Key state | Seed | Move-in materialization | RSS |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Key-only semijoin | 12,000 | 480,062 B (~0.46 MiB) | 5.3 ms | 26.6 ms / 184,800 rows | 118.6 MB |
-| Shape-group prototype baseline | member rows in Postgres; no key circuit | 37.7 MB engine RSS at 30 phones | not measured | 208/265 ms write-to-phone p50/p90 | see `shape-groups.md` |
-
-The semijoin numbers are a Node model, not DBSP state or a running engine. The
-scope-bench transport entry `scope semijoin` is present so the network workload
-can be run on the same phone/gateway harness, but it currently uses the group
-transport endpoint while the runtime template is being promoted into the engine.
-Restart seeding, DBSP spill/state bytes, and a real move-in receipt are therefore
-still unproven.
+`src/semijoin.ts` is a non-authoritative sketch only. It is not a DBSP runtime
+template, and no semijoin state bytes, reseed time, or move-in latency are evidence.
+`NOT IN`/NULL semantics are therefore also not an engine contract yet.
 
 ## What remains unproven
 

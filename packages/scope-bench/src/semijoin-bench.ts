@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks'
 
-import { KeyOnlySemijoin } from './semijoin.ts'
+import { KeyOnlySemijoin } from './semijoin.js'
 
 const records = Number(process.env.SEMIJOIN_RECORDS ?? 12_000)
 const scopes = Number(process.env.SEMIJOIN_SCOPES ?? 1)
