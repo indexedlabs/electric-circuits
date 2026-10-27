@@ -30,9 +30,12 @@ const HOLD_MS = Number(env('HOLD_MS', '3000'))
 const PHONES = Number(env('PHONES', '1'))
 // Durable Streams' long-poll timeout; production's is 30 s.
 const DS_LONGPOLL_MS = Number(env('DS_LONGPOLL_MS', '5000'))
+const COALESCE_LINGER_MS = Number(env('COALESCE_LINGER_MS', '50'))
+const STEADY_WRITE_MS = Number(env('STEADY_WRITE_MS', '500'))
 // STEADY=1: while held, a reply streams into the thread (20 events/s for 10 s) and a message lands
 // every 5 s, besides the Record edits; hold-only gateway cost is reported separately.
 const STEADY = process.env.STEADY === '1'
+const STEADY_CHAT = process.env.STEADY_CHAT !== '0'
 // DISTINCT_USERS=1: phone i signs in as u<i+2> (one of the lighter accounts) instead of all as u1.
 const DISTINCT_USERS = process.env.DISTINCT_USERS === '1'
 const phoneUser = (i: number) => (DISTINCT_USERS ? `u${i + 2}` : HEAVY)
@@ -46,6 +49,7 @@ interface Config {
   design: Design
   slots: number | null
   live: LiveMode
+  coalesceLingerMs?: number
   /** On a reopen, catch up from stored cursors instead of reloading. */
   resume?: boolean
 }
@@ -63,6 +67,10 @@ const CONFIGS: Config[] = ([
   { name: 'scope load + mux + resume', variant: 'scoped', design: 'scope-load', slots: 8, live: 'mux', resume: true },
   { name: 'scope load + mux + series', variant: 'series', design: 'scope-load', slots: 8, live: 'mux' },
   { name: 'scope group', variant: 'scoped', design: 'scope-group', slots: 8, live: 'per-stream' },
+  { name: 'scope group + coalesce 25ms', variant: 'scoped', design: 'scope-group', slots: 8, live: 'coalesce', coalesceLingerMs: 25 },
+  { name: 'scope group + coalesce 50ms', variant: 'scoped', design: 'scope-group', slots: 8, live: 'coalesce', coalesceLingerMs: 50 },
+  { name: 'scope group + coalesce 100ms', variant: 'scoped', design: 'scope-group', slots: 8, live: 'coalesce', coalesceLingerMs: 100 },
+  { name: 'scope group + streaming', variant: 'scoped', design: 'scope-group', slots: 8, live: 'streaming' },
   { name: 'scope group + resume', variant: 'scoped', design: 'scope-group', slots: 8, live: 'per-stream', resume: true },
 ] as Config[]).filter((c) => !ONLY_CONFIG || ONLY_CONFIG.split(',').includes(c.name))
 
@@ -171,6 +179,11 @@ interface RunResult {
   holdGatewayCpuMs?: number
   holdRequests?: number
   holdDsCalls?: number
+  /** Charged upstream reads: one open stream for streaming, DS reads otherwise. */
+  holdUpstreamReads?: number
+  holdDsDeliveredReads?: number
+  holdDsEmptyReads?: number
+  authorityRechecks?: number
   phoneRequests: number
   loadRequests: number
   bytesDown: number
@@ -203,7 +216,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       }
     }
   }
-  const opts = { gateway: srv.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live, onWake }
+  const opts = { gateway: srv.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live, coalesceLingerMs: cfg.coalesceLingerMs, onWake }
   const phones = Array.from({ length: PHONES }, (_, i) => new Phone({ ...opts, user: phoneUser(i) }))
   // Statements the engine ran against Postgres and their execution time, from pg_stat_statements
   // (the bench's own writes are excluded by text match).
@@ -288,13 +301,15 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     const gsLoad = (await (await fetch(`${srv.gateway}/gw/stats`)).json()) as any
     // Keep everything live for a while with writes landing on the heavy account.
     let n = 0
-    timers.push(
-      setInterval(() => {
-        admin
-          .query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, n++ % 50])
-          .catch(() => {})
-      }, 200),
-    )
+    if (!STEADY) {
+      timers.push(
+        setInterval(() => {
+          admin
+            .query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, n++ % 50])
+            .catch(() => {})
+        }, 200),
+      )
+    }
     if (STEADY) {
       let writeNo = 0
       let writeBusy = false
@@ -330,24 +345,26 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
         }
       }
       await steadyWrite()
-      timers.push(setInterval(() => void steadyWrite(), 500))
-      let k = 0
-      const thread = steadyThread
-      const reply = setInterval(() => {
-        if (k++ >= 200) return clearInterval(reply)
-        admin
-          .query(`insert into assistant_stream_event (id, user_id, thread_id, payload) values ($1, $2, $3, $4)`, [`steady-ase-${rep}-${cfg.name}-${k}`, HEAVY, thread, 'x'.repeat(300)])
-          .catch(() => {})
-      }, 50)
-      timers.push(reply)
-      let m = 0
-      timers.push(
-        setInterval(() => {
+      timers.push(setInterval(() => void steadyWrite(), STEADY_WRITE_MS))
+      if (STEADY_CHAT) {
+        let k = 0
+        const thread = steadyThread
+        const reply = setInterval(() => {
+          if (k++ >= 200) return clearInterval(reply)
           admin
-            .query(`insert into message (id, user_id, thread_id, record_id, created_at, payload) values ($1, $2, $3, null, $4, $5)`, [`steady-msg-${rep}-${cfg.name}-${m}`, HEAVY, thread, 100_000 + m++, 'y'.repeat(1900)])
+            .query(`insert into assistant_stream_event (id, user_id, thread_id, payload) values ($1, $2, $3, $4)`, [`steady-ase-${rep}-${cfg.name}-${k}`, HEAVY, thread, 'x'.repeat(300)])
             .catch(() => {})
-        }, 5000),
-      )
+        }, 50)
+        timers.push(reply)
+        let m = 0
+        timers.push(
+          setInterval(() => {
+            admin
+              .query(`insert into message (id, user_id, thread_id, record_id, created_at, payload) values ($1, $2, $3, null, $4, $5)`, [`steady-msg-${rep}-${cfg.name}-${m}`, HEAVY, thread, 100_000 + m++, 'y'.repeat(1900)])
+              .catch(() => {})
+          }, 5000),
+        )
+      }
     }
     await new Promise((r) => setTimeout(r, HOLD_MS))
     result.longPollsHeld = sum((p) => p.longPolls)
@@ -362,6 +379,12 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     result.holdGatewayCpuMs = Math.round(gs.burnedMs - gsLoad.burnedMs)
     result.holdRequests = gs.requests - gsLoad.requests
     result.holdDsCalls = gs.dsCalls - gsLoad.dsCalls
+    result.holdUpstreamReads = cfg.live === 'streaming'
+      ? gs.streamingOpens - gsLoad.streamingOpens + (gs.authorityRechecks - gsLoad.authorityRechecks)
+      : result.holdDsCalls
+    result.holdDsDeliveredReads = gs.dsDeliveredReads - gsLoad.dsDeliveredReads
+    result.holdDsEmptyReads = gs.dsEmptyReads - gsLoad.dsEmptyReads
+    result.authorityRechecks = gs.authorityRechecks - gsLoad.authorityRechecks
     result.engineCpuMs = Math.round(cpuMs(srv.enginePid) - cpu0)
     result.engineRssMb = Math.round(rssMb(srv.enginePid) * 10) / 10
     if (STEADY) {
@@ -437,12 +460,13 @@ async function main() {
           )
         }
     mkdirSync(dirname(OUT), { recursive: true })
-    writeFileSync(OUT, JSON.stringify({ params: { RTT_MS, DOWN_MBPS, REPS, OTHER_USERS, HOLD_MS, PHONES, DS_LONGPOLL_MS, STEADY }, seed: s.rows, results }, null, 2))
+    const version = String((await admin.query('select version()')).rows[0]?.version ?? '')
+    writeFileSync(OUT, JSON.stringify({ params: { RTT_MS, DOWN_MBPS, REPS, OTHER_USERS, HOLD_MS, PHONES, DS_LONGPOLL_MS, COALESCE_LINGER_MS, STEADY_WRITE_MS, STEADY, STEADY_CHAT, postgresVersion: version }, seed: s.rows, results }, null, 2))
 
     // Summary: medians over reps.
     console.log(`\nRTT ${RTT_MS} ms, downlink ${DOWN_MBPS} Mbps, ${PHONES} phone(s), ${REPS} reps (medians)\n`)
     console.log(
-      '| Scenario | Design | First content | First content p90 (phones) | First table | Everything | Load requests | Gateway CPU (load) | Gateway lag p99 | Hold: gateway CPU | Hold: requests | Hold: upstream reads | Long-polls held/streams | Engine RSS MB | Write p50/p90 | PG statements | MB down |',
+      '| Scenario | Design | First content | First content p90 (phones) | First table | Everything | Load requests | Gateway CPU (load) | Gateway lag p99 | Hold: gateway CPU | Hold: requests | Hold: upstream reads | Delivered / empty reads | Long-polls held/streams | Engine RSS MB | Write p50/p90 | PG statements | MB down |',
     )
     console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
     for (const name of names)
@@ -459,8 +483,8 @@ async function main() {
         console.log(
           `| ${name} | ${cfg.name} | ${m((r) => scr(r, 'firstMs'))} ms | ${m((r) => scr(r, 'firstP90'))} ms | ${m((r) => scr(r, 'firstTableMs'))} ms | ` +
             `${m((r) => scr(r, 'allMs'))} ms | ${m((r) => r.loadRequests)} | ${m((r) => r.gatewayCpuMs - (r.holdGatewayCpuMs ?? 0))} ms | ` +
-            `${m((r) => r.gatewayLagP99)} ms | ${m((r) => r.holdGatewayCpuMs ?? 0)} ms | ${m((r) => r.holdRequests ?? 0)} | ${m((r) => r.holdDsCalls ?? 0)} | ` +
-            `${m((r) => r.longPollsHeld)} | ${m((r) => r.engineRssMb ?? 0).toFixed(1)} | ${m((r) => r.steadyWriteP50 ?? 0)}/${m((r) => r.steadyWriteP90 ?? 0)} ms | ` +
+            `${m((r) => r.gatewayLagP99)} ms | ${m((r) => r.holdGatewayCpuMs ?? 0)} ms | ${m((r) => r.holdRequests ?? 0)} | ${m((r) => r.holdUpstreamReads ?? 0)} | ` +
+            `${m((r) => r.holdDsDeliveredReads ?? 0)} / ${m((r) => r.holdDsEmptyReads ?? 0)} | ${m((r) => r.longPollsHeld)} | ${m((r) => r.engineRssMb ?? 0).toFixed(1)} | ${m((r) => r.steadyWriteP50 ?? 0)}/${m((r) => r.steadyWriteP90 ?? 0)} ms | ` +
             `${m((r) => r.pgStatements)} | ${(m((r) => r.bytesDown) / 1e6).toFixed(2)} |`,
         )
       }

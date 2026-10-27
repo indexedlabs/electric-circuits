@@ -33,6 +33,10 @@ const stats = {
   burnedMs: 0,
   engineCalls: 0,
   dsCalls: 0,
+  dsDeliveredReads: 0,
+  dsEmptyReads: 0,
+  authorityRechecks: 0,
+  streamingOpens: 0,
   inFlight: 0,
   maxInFlight: 0,
   lagSamples: [] as number[],
@@ -104,8 +108,15 @@ async function dsRead(path: string, offset: string, live: boolean, signal?: Abor
   const url = `${DS}${path}${sep}offset=${encodeURIComponent(offset)}${live ? '&live=long-poll' : ''}`
   const r = await fetch(url, { signal })
   const text = await r.text()
-  return { status: r.status, next: r.headers.get('stream-next-offset') ?? offset, body: text }
+  const result = { status: r.status, next: r.headers.get('stream-next-offset') ?? offset, body: text }
+  if (live) {
+    if (r.status === 200 && text && text !== '[]') stats.dsDeliveredReads++
+    else stats.dsEmptyReads++
+  }
+  return result
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 function rewriteFeed(feed: any) {
   return { ...feed, streamUrl: `/stream${streamPath(feed.streamUrl)}` }
@@ -130,6 +141,10 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       burnedMs: 0,
       engineCalls: 0,
       dsCalls: 0,
+      dsDeliveredReads: 0,
+      dsEmptyReads: 0,
+      authorityRechecks: 0,
+      streamingOpens: 0,
       maxInFlight: stats.inFlight,
       lagSamples: [],
       maxLongPollsOpen: stats.longPollsOpen,
@@ -160,11 +175,40 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     if (live) stats.longPollsOpen++, (stats.maxLongPollsOpen = Math.max(stats.maxLongPollsOpen, stats.longPollsOpen))
     try {
       const r = await dsRead(path, url.searchParams.get('offset') ?? '-1', live)
+      const linger = Number(url.searchParams.get('linger') ?? 0)
+      if (live && linger > 0) await sleep(linger)
       res.writeHead(r.status, { 'stream-next-offset': r.next, 'content-type': 'application/json' })
       return res.end(r.body)
     } finally {
       if (live) stats.longPollsOpen--
     }
+  }
+  if (req.method === 'GET' && url.pathname === '/gw/streaming') {
+    stats.streamingOpens++
+    const path = url.searchParams.get('path') ?? ''
+    let offset = url.searchParams.get('offset') ?? '-1'
+    const recheckMs = Number(process.env.STREAM_RECHECK_MS ?? 30_000)
+    const started = performance.now()
+    let nextRecheck = started + recheckMs
+    res.writeHead(200, { 'content-type': 'application/x-ndjson', 'transfer-encoding': 'chunked' })
+    try {
+      while (!req.destroyed && !res.destroyed) {
+        if (performance.now() >= nextRecheck) {
+          burn(STREAM_MS)
+          stats.authorityRechecks++
+          nextRecheck += recheckMs
+        }
+        const r = await dsRead(path, offset, true)
+        offset = r.next
+        res.write(`${JSON.stringify({ next: r.next, body: r.status === 200 ? r.body : '' })}\n`)
+        if (r.status !== 200 || !r.body || r.body === '[]') await sleep(Number(process.env.DS_EMPTY_BACKOFF_MS ?? 25))
+      }
+    } catch {
+      // Client cancellation is the normal end of a held streaming response.
+    } finally {
+      res.end()
+    }
+    return
   }
   if (req.method === 'POST' && url.pathname === '/gw/fanin') {
     const b = await body(req)
