@@ -176,10 +176,11 @@ mod tests {
     #[test]
     fn a_closed_lane_undoes_only_its_own_origin() {
         let pending = Arc::new(PendingFlips::default());
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: DegradeState::new() };
         pending.add(0x30);
+        pending.add(0x10);
         let envelope = serde_json::from_value(serde_json::json!({
             "type": "test", "key": "1", "headers": {"operation": "upsert"}
         }))
