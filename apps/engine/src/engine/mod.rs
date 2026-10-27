@@ -33,6 +33,7 @@ mod drift;
 pub(crate) mod emission;
 pub(crate) mod epoch;
 mod executors;
+pub(crate) mod group;
 mod held;
 mod introspection;
 mod lifecycle;
@@ -88,6 +89,7 @@ impl Default for SubqueryAdmission {
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
+pub(crate) use group::{GroupClaims, GroupConflict, GroupMember, GroupRecord, GroupStreamClosed};
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
     GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
@@ -208,6 +210,10 @@ pub struct SubscriptionConflict {
     /// The shape that holds it now.
     pub shape: String,
 }
+
+/// A grouped feed's public stream disappeared while the client was holding its lease.  A
+/// group cannot be repaired member-by-member because its cursor and snapshot are shared, so
+/// the API returns a conflict that tells the caller to reload the whole scope.
 
 /// Why a touch cannot hand back the shape it was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -952,6 +958,10 @@ struct EngineState {
     tables: HashMap<TableRef, TableSchema>,
     sequencer: Option<SequencerHandle>,
     shapes: HashMap<String, ShapeRecord>,
+    /// Group claims and their private member list live under the same state lock as
+    /// ordinary subscription claims, making a group reservation atomic with a competing
+    /// single-shape create.
+    group_claims: GroupClaims,
     next_shape_id: u64,
     /// Shape sharing. Any two **equal** shapes — same kind and definition (see `shape_signature` /
     /// `agg_signature`: table + canonical predicate + columns + changes-only, or table + predicate +
@@ -1521,6 +1531,7 @@ impl Engine {
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
+        let degrade = DegradeState::new();
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1528,10 +1539,10 @@ impl Engine {
             ds.clone(),
             std::env::var("ELECTRIC_CIRCUITS_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             pending_flips.clone(),
+            degrade.clone(),
             shutdown.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
-        let degrade = DegradeState::new();
         spawn_flip_propagator(
             subqueries.clone(),
             flip_rx,
@@ -1569,6 +1580,7 @@ impl Engine {
                 tables: HashMap::new(),
                 sequencer: None,
                 shapes: HashMap::new(),
+                group_claims: GroupClaims::default(),
                 next_shape_id: 1,
                 feed_by_sig: HashMap::new(),
                 feed_shares: HashMap::new(),
@@ -2845,6 +2857,52 @@ impl Engine {
     /// control permit while using this to distinguish a new claim from a renewal.
     pub(crate) async fn subscription_owner(&self, subscription: &str) -> Option<String> {
         self.state.lock().await.subscription_owner(subscription).cloned()
+    }
+
+    /// Reserve a group claim before any private member shape is created.  The ordinary
+    /// subscription map and the group map are checked while holding one state lock, so a
+    /// concurrent single-shape create cannot win the same claim between member creates.
+    pub(crate) async fn reserve_group(&self, subscription: &str) -> Result<()> {
+        let mut st = self.state.lock().await;
+        if let Some(owner) = st.subscription_owner(subscription) {
+            return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("shape {owner}"),
+            }));
+        }
+        st.group_claims.reserve(subscription, &format!("group {subscription}"))
+    }
+
+    pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
+        self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        self.state.lock().await.group_claims.complete(record);
+        crate::engine::group::activate();
+        Ok(())
+    }
+
+    pub(crate) async fn abort_group(&self, subscription: &str) {
+        self.state.lock().await.group_claims.release(subscription);
+    }
+
+    pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
+        self.state.lock().await.group_claims.get(subscription).cloned()
+    }
+
+    /// Remove the public group record and return its private members.  The caller performs
+    /// the durable member releases outside the state lock, preserving the normal lifecycle
+    /// ordering and avoiding network I/O while holding engine state.
+    pub(crate) async fn take_group(&self, subscription: &str) -> Option<GroupRecord> {
+        let record = self.state.lock().await.group_claims.release(subscription);
+        if record.is_some() {
+            crate::engine::group::deactivate();
+        }
+        record
+    }
+
+    pub(crate) async fn finish_group_release(&self, subscription: &str) -> Result<()> {
+        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
+        let _ = self.take_group(subscription).await;
+        Ok(())
     }
 
     /// Validate a subset read without opening Postgres or changing engine state.

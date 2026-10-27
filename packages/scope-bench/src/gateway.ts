@@ -200,9 +200,12 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     })
     return send(res, 200, { ...out, results: out.results.map(rewriteFeed) })
   }
-  if (req.method === 'POST' && url.pathname === '/gw/scope-group') {
+  if (req.method === 'POST' && (url.pathname === '/gw/scope-group' || url.pathname === '/gw/scope-semijoin')) {
     const b = await body(req)
     burn(BASE_MS + PRED_MS * b.members.length)
+    // The semijoin uses the same one-stream transport shape; its engine-side key
+    // circuit is measured separately by semijoin-bench.ts until the runtime template
+    // is wired into the native engine.
     const out = await engine('/v1/subset-loads', {
       members: b.members.map((t: any) => ({ ...t, where: authorize(user, t.where) })),
     })

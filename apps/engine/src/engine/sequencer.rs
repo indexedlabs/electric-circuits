@@ -528,6 +528,11 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
+    // Groups add one cross-lane fence: before the next source transaction is allowed to
+    // publish, all deferred subquery effects from the previous transaction must have landed.
+    // This is enabled only while at least one group lease is active; ordinary single-table
+    // shapes keep their existing throughput path.
+    let mut last_group_lsn: Option<u64> = None;
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -775,6 +780,14 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
+                        if crate::engine::group::active()
+                            && let Some(previous) = last_group_lsn
+                            && !wait_for_source_effects(&subq, &shutdown, previous).await
+                        {
+                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
+                            processing_failed = true;
+                            break;
+                        }
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -999,6 +1012,11 @@ pub(crate) async fn sequencer_loop(
                             source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
+                        }
+                        if crate::engine::group::active()
+                            && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
+                        {
+                            last_group_lsn = Some(commit_lsn);
                         }
                     }
                     if processing_failed {
