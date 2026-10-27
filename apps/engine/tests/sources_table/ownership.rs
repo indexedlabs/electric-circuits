@@ -817,6 +817,43 @@ async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Re
     .context("waiting for group stream events")?
 }
 
+async fn install_source_fence(f: &Fixture) -> Result<()> {
+    f.client
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS public.circuits_source_fence; \
+             CREATE TABLE public.circuits_source_fence (source_commit_id uuid PRIMARY KEY); \
+             ALTER PUBLICATION \"{}_pub\" ADD TABLE public.circuits_source_fence",
+            f.slots[0]
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn remove_source_fence(f: &Fixture) {
+    let _ = f
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION \"{}_pub\" DROP TABLE IF EXISTS public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
+            f.slots[0]
+        ))
+        .await;
+}
+
+async fn wait_source_receipt(engine: &Engine, f: &Fixture, commit: uuid::Uuid) -> Result<()> {
+    let mut changed = f.ds.changed.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if engine.source_drain_receipt(&commit.to_string()).is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            changed.changed().await.context("source receipt observation channel closed")?;
+        }
+    })
+    .await
+    .context("waiting for source drain receipt")??;
+    Ok(())
+}
+
 fn event_key(event: &serde_json::Value) -> Option<String> {
     event
         .get("key")
@@ -830,16 +867,23 @@ fn event_operation(event: &serde_json::Value) -> Option<&str> {
 }
 
 async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, body) = post_group(&app, group_body(f, "group-delayed", false)).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
         let baseline = stream_events(f, &stream_path).await.len();
-        f.client.batch_execute(&format!("BEGIN; DELETE FROM public.{} WHERE id = 1; COMMIT", f.inner)).await?;
+        let t = uuid::Uuid::new_v4();
         f.client
-            .batch_execute(&format!("BEGIN; UPDATE public.{} SET body = 't+1' WHERE id = 2; COMMIT", f.outer))
+            .batch_execute(&format!("BEGIN; DELETE FROM public.{} WHERE id = 1; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.inner, t))
             .await?;
+        wait_source_receipt(&engine, f, t).await?;
+        let t1 = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!("BEGIN; UPDATE public.{} SET body = 't+1' WHERE id = 2; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.outer, t1))
+            .await?;
+        wait_source_receipt(&engine, f, t1).await?;
         let events = wait_group_events(f, &stream_path, baseline + 2).await?;
         let mut delete = None;
         let mut plain_update = None;
@@ -857,18 +901,12 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
     result
 }
 
 async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
-    f.client
-        .batch_execute(&format!(
-            "DROP TABLE IF EXISTS public.circuits_source_fence; \
-             CREATE TABLE public.circuits_source_fence (source_commit_id uuid PRIMARY KEY); \
-             ALTER PUBLICATION \"{}_pub\" ADD TABLE public.circuits_source_fence",
-            f.slots[0]
-        ))
-        .await?;
+    install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, body) = post_group(&app, group_body(f, "group-receipt", false)).await?;
@@ -882,17 +920,8 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
                 f.inner, commit
             ))
             .await?;
-        let mut changed = f.ds.changed.subscribe();
-        let receipt = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if let Some(receipt) = engine.source_drain_receipt(&commit.to_string()) {
-                    return Ok::<_, anyhow::Error>(receipt);
-                }
-                changed.changed().await.context("source receipt observation channel closed")?;
-            }
-        })
-        .await
-        .context("waiting for source drain receipt")??;
+        wait_source_receipt(&engine, f, commit).await?;
+        let receipt = engine.source_drain_receipt(&commit.to_string()).context("source receipt disappeared")?;
         ensure!(receipt.source_commit_id == commit.to_string(), "wrong source receipt: {receipt:?}");
         let events = wait_group_events(f, &stream_path, baseline + 1).await?;
         ensure!(events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")), "group lane did not emit before receipt: {events:?}");
@@ -900,29 +929,26 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    let _ = f
-        .client
-        .batch_execute(&format!(
-            "ALTER PUBLICATION \"{}_pub\" DROP TABLE IF EXISTS public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
-            f.slots[0]
-        ))
-        .await;
+    remove_source_fence(f).await;
     result
 }
 
 async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, body) = post_group(&app, group_body(f, "group-delete", false)).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
         let baseline = stream_events(f, &stream_path).await.len();
+        let commit = uuid::Uuid::new_v4();
         f.client
             .batch_execute(&format!(
-                "BEGIN; DELETE FROM public.{} WHERE id = 1; DELETE FROM public.{} WHERE id = 1; COMMIT",
-                f.outer, f.inner
+                "BEGIN; DELETE FROM public.{} WHERE id = 1; DELETE FROM public.{} WHERE id = 1; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.outer, f.inner, commit
             ))
             .await?;
+        wait_source_receipt(&engine, f, commit).await?;
         let events = wait_group_events(f, &stream_path, baseline + 2).await?;
         let deletes = events
             .iter()
@@ -934,6 +960,7 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
     result
 }
 
