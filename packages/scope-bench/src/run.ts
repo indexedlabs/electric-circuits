@@ -6,7 +6,7 @@
 //   RTT_MS=120 DOWN_MBPS=20 REPS=3 OTHER_USERS=30 ONLY=chat pnpm --filter … bench
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -62,6 +62,8 @@ const CONFIGS: Config[] = ([
   { name: 'scope load + mux', variant: 'scoped', design: 'scope-load', slots: 8, live: 'mux' },
   { name: 'scope load + mux + resume', variant: 'scoped', design: 'scope-load', slots: 8, live: 'mux', resume: true },
   { name: 'scope load + mux + series', variant: 'series', design: 'scope-load', slots: 8, live: 'mux' },
+  { name: 'scope group', variant: 'scoped', design: 'scope-group', slots: 8, live: 'per-stream' },
+  { name: 'scope group + resume', variant: 'scoped', design: 'scope-group', slots: 8, live: 'per-stream', resume: true },
 ] as Config[]).filter((c) => !ONLY_CONFIG || ONLY_CONFIG.split(',').includes(c.name))
 
 function repoRoot(): string {
@@ -73,6 +75,11 @@ function repoRoot(): string {
 function cpuMs(pid: number): number {
   const f = readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]!.split(' ')
   return ((Number(f[11]) + Number(f[12])) * 1000) / 100
+}
+
+function rssMb(pid: number): number {
+  const pages = Number(readFileSync(`/proc/${pid}/statm`, 'utf8').split(' ')[1] ?? 0)
+  return (pages * 4096) / 1e6
 }
 
 function waitFor(proc: ChildProcess, re: RegExp, what: string): Promise<string> {
@@ -174,13 +181,29 @@ interface RunResult {
   pgStatements: number
   pgExecMs: number
   longPollsHeld: number
+  streamCount?: number
+  engineRssMb?: number
+  steadyWriteP50?: number | null
+  steadyWriteP90?: number | null
   error?: string
 }
+
+let steadyRecordsByUser: Record<string, string> = {}
 
 async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Config, rep: number): Promise<RunResult> {
   const sc = scs[0]!
   const srv = await bootServers(pgUrl)
-  const opts = { gateway: srv.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live }
+  const writeStarted = new Map<string, number>()
+  const writeLatencies: number[] = []
+  const onWake = (body: string, at: number) => {
+    for (const [marker, started] of writeStarted) {
+      if (body.includes(marker)) {
+        writeLatencies.push(at - started)
+        writeStarted.delete(marker)
+      }
+    }
+  }
+  const opts = { gateway: srv.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live, onWake }
   const phones = Array.from({ length: PHONES }, (_, i) => new Phone({ ...opts, user: phoneUser(i) }))
   // Statements the engine ran against Postgres and their execution time, from pg_stat_statements
   // (the bench's own writes are excluded by text match).
@@ -273,6 +296,41 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       }, 200),
     )
     if (STEADY) {
+      let writeNo = 0
+      let writeBusy = false
+      const steadyWrite = async () => {
+        if (writeBusy) return
+        writeBusy = true
+        const no = writeNo++
+        try {
+          for (let i = 0; i < PHONES; i++) {
+            const user = phoneUser(i)
+            const recordId = steadyRecordsByUser[user] ?? steadyRecordsByUser[HEAVY]
+            if (!recordId) continue
+            const marker = `steady-${rep}-${cfg.name}-${no}-${i}`
+            writeStarted.set(marker, performance.now())
+            const assignmentId = `${marker}-assignment`
+            const taggedId = `${marker}-tag`
+            await admin.query('begin')
+            await admin.query(`update record set title = $1 where id = $2 and user_id = $3`, [marker, recordId, user])
+            await admin.query(
+              `insert into assignment (id, user_id, record_id, payload) values ($1, $2, $3, $4) on conflict (id) do update set payload = excluded.payload`,
+              [assignmentId, user, recordId, marker],
+            )
+            await admin.query(
+              `insert into tagged_item (id, user_id, record_id, tag_id) values ($1, $2, $3, $4) on conflict (id) do update set tag_id = excluded.tag_id`,
+              [taggedId, user, recordId, marker],
+            )
+            await admin.query('commit')
+          }
+        } catch {
+          await admin.query('rollback').catch(() => {})
+        } finally {
+          writeBusy = false
+        }
+      }
+      await steadyWrite()
+      timers.push(setInterval(() => void steadyWrite(), 500))
       let k = 0
       const thread = steadyThread
       const reply = setInterval(() => {
@@ -293,6 +351,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     }
     await new Promise((r) => setTimeout(r, HOLD_MS))
     result.longPollsHeld = sum((p) => p.longPolls)
+    result.streamCount = result.longPollsHeld
     for (const t of timers) clearInterval(t)
     const gs = (await (await fetch(`${srv.gateway}/gw/stats`)).json()) as any
     result.phoneRequests = sum((p) => p.requests)
@@ -304,6 +363,11 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     result.holdRequests = gs.requests - gsLoad.requests
     result.holdDsCalls = gs.dsCalls - gsLoad.dsCalls
     result.engineCpuMs = Math.round(cpuMs(srv.enginePid) - cpu0)
+    result.engineRssMb = Math.round(rssMb(srv.enginePid) * 10) / 10
+    if (STEADY) {
+      result.steadyWriteP50 = writeLatencies.length ? Math.round(median(writeLatencies)) : null
+      result.steadyWriteP90 = writeLatencies.length ? Math.round(quantile(writeLatencies, 0.9)) : null
+    }
     const x1 = await pgStats()
     result.pgStatements = x1.calls - x0.calls
     result.pgExecMs = Math.round(x1.ms - x0.ms)
@@ -339,6 +403,7 @@ async function main() {
     console.log(`seeded in ${Math.round(performance.now() - t)} ms:`, JSON.stringify(s.rows))
     reopenChanged = s.heavy.recordClientIds.slice(0, 5)
     steadyThread = s.heavy.threads[0]!
+    steadyRecordsByUser = Object.fromEntries(Object.entries(s.users).map(([u, ids]) => [u, ids.records[40] ?? ids.records[0]!]))
     const byVariant = { today: scenarios(s, 'today'), scoped: scenarios(s, 'scoped'), series: scenarios(s, 'series') }
     // Each phone's own copy of a scenario, built for its account.
     const perPhone = (variant: Config['variant'], name: string) =>
@@ -371,12 +436,13 @@ async function main() {
               (r.error ? ` ERROR ${r.error}` : ''),
           )
         }
+    mkdirSync(dirname(OUT), { recursive: true })
     writeFileSync(OUT, JSON.stringify({ params: { RTT_MS, DOWN_MBPS, REPS, OTHER_USERS, HOLD_MS, PHONES, DS_LONGPOLL_MS, STEADY }, seed: s.rows, results }, null, 2))
 
     // Summary: medians over reps.
     console.log(`\nRTT ${RTT_MS} ms, downlink ${DOWN_MBPS} Mbps, ${PHONES} phone(s), ${REPS} reps (medians)\n`)
     console.log(
-      '| Scenario | Design | First content | First content p90 (phones) | First table | Everything | Load requests | Gateway CPU (load) | Gateway lag p99 | Hold: gateway CPU | Hold: requests | Hold: upstream reads | Long-polls held | PG statements | MB down |',
+      '| Scenario | Design | First content | First content p90 (phones) | First table | Everything | Load requests | Gateway CPU (load) | Gateway lag p99 | Hold: gateway CPU | Hold: requests | Hold: upstream reads | Long-polls held/streams | Engine RSS MB | Write p50/p90 | PG statements | MB down |',
     )
     console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
     for (const name of names)
@@ -394,7 +460,8 @@ async function main() {
           `| ${name} | ${cfg.name} | ${m((r) => scr(r, 'firstMs'))} ms | ${m((r) => scr(r, 'firstP90'))} ms | ${m((r) => scr(r, 'firstTableMs'))} ms | ` +
             `${m((r) => scr(r, 'allMs'))} ms | ${m((r) => r.loadRequests)} | ${m((r) => r.gatewayCpuMs - (r.holdGatewayCpuMs ?? 0))} ms | ` +
             `${m((r) => r.gatewayLagP99)} ms | ${m((r) => r.holdGatewayCpuMs ?? 0)} ms | ${m((r) => r.holdRequests ?? 0)} | ${m((r) => r.holdDsCalls ?? 0)} | ` +
-            `${m((r) => r.longPollsHeld)} | ${m((r) => r.pgStatements)} | ${(m((r) => r.bytesDown) / 1e6).toFixed(2)} |`,
+            `${m((r) => r.longPollsHeld)} | ${m((r) => r.engineRssMb ?? 0).toFixed(1)} | ${m((r) => r.steadyWriteP50 ?? 0)}/${m((r) => r.steadyWriteP90 ?? 0)} ms | ` +
+            `${m((r) => r.pgStatements)} | ${(m((r) => r.bytesDown) / 1e6).toFixed(2)} |`,
         )
       }
   } finally {

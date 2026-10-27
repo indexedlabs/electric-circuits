@@ -1,0 +1,97 @@
+{
+  "params": {
+    "RTT_MS": 100,
+    "DOWN_MBPS": 20,
+    "REPS": 2,
+    "OTHER_USERS": 30,
+    "HOLD_MS": 300,
+    "PHONES": 1,
+    "DS_LONGPOLL_MS": 300,
+    "STEADY": false
+  },
+  "seed": {
+    "user": 93,
+    "space": 93,
+    "space_member": 93,
+    "calendar": 103,
+    "external_account": 93,
+    "invite": 31,
+    "tag": 1360,
+    "file": 4793,
+    "feedback": 2140,
+    "assistant_state": 1837,
+    "activity": 20263,
+    "resource": 169,
+    "resource_fact": 338,
+    "graph_edge": 507,
+    "record": 12216,
+    "record_date_index": 13196,
+    "tagged_item": 1836,
+    "assignment": 2946,
+    "record_completed_index": 1233,
+    "record_assignee_index": 615,
+    "record_recurrence": 170,
+    "calendar_event": 6359,
+    "message": 3080,
+    "suggestion": 612,
+    "assistant_stream_event": 510
+  },
+  "results": [
+    {
+      "scenario": "chat reopen",
+      "config": "scope group + resume",
+      "rep": 1,
+      "screens": {
+        "chat": {
+          "firstMs": 111,
+          "firstP90": 111,
+          "firstTableMs": 111,
+          "allMs": 112
+        }
+      },
+      "phoneRequests": 5,
+      "loadRequests": 4,
+      "bytesDown": 47586,
+      "gatewayCpuMs": 20,
+      "gatewayLagP99": 1,
+      "gatewayLagMax": 1,
+      "engineCpuMs": 0,
+      "pgStatements": 1,
+      "pgExecMs": 0,
+      "longPollsHeld": 2,
+      "streamCount": 2,
+      "holdGatewayCpuMs": 12,
+      "holdRequests": 4,
+      "holdDsCalls": 3,
+      "engineRssMb": 42
+    },
+    {
+      "scenario": "chat reopen",
+      "config": "scope group + resume",
+      "rep": 2,
+      "screens": {
+        "chat": {
+          "firstMs": 112,
+          "firstP90": 112,
+          "firstTableMs": 112,
+          "allMs": 112
+        }
+      },
+      "phoneRequests": 5,
+      "loadRequests": 4,
+      "bytesDown": 47592,
+      "gatewayCpuMs": 20,
+      "gatewayLagP99": 1,
+      "gatewayLagMax": 1,
+      "engineCpuMs": 0,
+      "pgStatements": 1,
+      "pgExecMs": 0,
+      "longPollsHeld": 2,
+      "streamCount": 2,
+      "holdGatewayCpuMs": 12,
+      "holdRequests": 4,
+      "holdDsCalls": 3,
+      "engineRssMb": 41.4
+    }
+  ]
+}

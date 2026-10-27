@@ -19,6 +19,7 @@ use crate::table_ref::TableRef;
 
 /// Keep compound prototype fan-in bounded before any feed claim or Postgres work begins.
 const MAX_BATCH_TABLES: usize = 64;
+static GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // The lifecycle API currently returns only the shape and subscription, not whether the claim was
 // fresh. Serialize this route's owner check with its create so concurrent lost-response retries do
@@ -1300,7 +1301,10 @@ async fn load_scope(
 /// Create (or renew) one validated changes-only feed and read its stream's tail offset: the first
 /// two steps of a load, shared by `/v1/scopes/load` and `/v1/subset-loads`. The offset is read after
 /// the feed exists and before any snapshot, so a client tailing from it misses nothing.
-async fn open_feed(engine: &Engine, f: CreateShapeReq) -> Result<(ShapeRecord, String, String, FeedClaimGuard), AppError> {
+async fn open_feed(
+    engine: &Engine,
+    f: CreateShapeReq,
+) -> Result<(ShapeRecord, String, String, FeedClaimGuard), AppError> {
     let _claim_lock = COMPOUND_CLAIM_LOCK.lock().await;
     let subscription = validate_new_subscription(f.subscription)?;
     let fresh = match subscription.as_ref() {
@@ -1353,7 +1357,9 @@ impl FeedClaimGuard {
         }
         match self.engine.release_subscription_durable(&self.shape_id, Some(&self.subscription)).await {
             Ok(()) => self.armed = false,
-            Err(error) => tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim"),
+            Err(error) => {
+                tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim")
+            }
         }
     }
 }
@@ -1394,7 +1400,8 @@ struct SubsetLoadQuery {
 
 #[derive(Deserialize)]
 struct SubsetLoadReq {
-    table: TableRef,
+    #[serde(default)]
+    table: Option<TableRef>,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
     #[serde(default)]
@@ -1403,6 +1410,8 @@ struct SubsetLoadReq {
     subscription: Option<String>,
     #[serde(default)]
     query: Option<SubsetLoadQuery>,
+    #[serde(default)]
+    members: Option<Vec<ScopeLoadEntry>>,
 }
 
 /// Documentation-only projection of the one-table compound load request.
@@ -1463,11 +1472,19 @@ struct SubsetLoadResp {
 async fn subset_load(
     State(engine): State<Engine>,
     Json(req): Json<SubsetLoadReq>,
-) -> Result<Json<SubsetLoadResp>, AppError> {
+) -> Result<Json<serde_json::Value>, AppError> {
     engine.ensure_not_degraded()?;
+    if let Some(members) = req.members {
+        return subset_load_group(&engine, req.subscription, members).await;
+    }
+    let table = req.table.ok_or_else(|| AppError {
+        status: StatusCode::BAD_REQUEST,
+        msg: "table or members is required".into(),
+        retry_after: false,
+    })?;
     let query = req.query.clone().unwrap_or_default();
     let create = CreateShapeReq {
-        table: req.table.clone(),
+        table: table.clone(),
         where_: req.where_.clone(),
         columns: req.columns.clone(),
         changes_only: true,
@@ -1478,12 +1495,12 @@ async fn subset_load(
     validate_new_subscription(req.subscription)?;
     validate_create_shape_request(&engine, &create).await?;
     engine
-        .validate_subset(&req.table, req.where_.clone(), req.columns.clone(), None, None, None)
+        .validate_subset(&table, req.where_.clone(), req.columns.clone(), None, None, None)
         .await
         .map_err(|error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false })?;
     engine
         .validate_subset(
-            &req.table,
+            &table,
             query.where_.clone().or_else(|| req.where_.clone()),
             req.columns.clone(),
             query.order_by.as_ref().map(|o| (o.col.clone(), o.desc)),
@@ -1497,7 +1514,7 @@ async fn subset_load(
     let (rec, subscription, offset, mut claim) = open_feed(&engine, create).await?;
     let page = match engine
         .query_subset(
-            &req.table,
+            &table,
             query.where_.or(req.where_),
             req.columns,
             query.order_by.map(|o| (o.col, o.desc)),
@@ -1515,14 +1532,121 @@ async fn subset_load(
         }
     };
     claim.complete();
-    Ok(Json(SubsetLoadResp {
-        feed: ShapeResp::created(&engine, rec, subscription),
-        offset,
-        rows: page.rows,
-        lsn: page.lsn,
-        snapshot: page.snapshot,
-        horizon: page.horizon,
-    }))
+    Ok(Json(
+        serde_json::to_value(SubsetLoadResp {
+            feed: ShapeResp::created(&engine, rec, subscription),
+            offset,
+            rows: page.rows,
+            lsn: page.lsn,
+            snapshot: page.snapshot,
+            horizon: page.horizon,
+        })
+        .expect("subset load response is serializable"),
+    ))
+}
+
+/// Prototype-only one-stream group form. Members use the existing plain and subquery shape paths,
+/// while a shared stream path and one settled page snapshot make the benchmark comparable. Group
+/// catalog/lifecycle, a cross-member transaction barrier and true one-claim retention are deferred.
+async fn subset_load_group(
+    engine: &Engine,
+    subscription: Option<String>,
+    members: Vec<ScopeLoadEntry>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if members.is_empty() || members.len() > MAX_BATCH_TABLES {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "members must contain 1..64 entries".into(),
+            retry_after: false,
+        });
+    }
+    validate_new_subscription(subscription.clone())?;
+    for member in &members {
+        let create = CreateShapeReq {
+            table: member.table.clone(),
+            where_: member.where_.clone(),
+            columns: member.columns.clone(),
+            changes_only: true,
+            subscription: None,
+        };
+        validate_create_shape_request(engine, &create).await?;
+        engine
+            .validate_subset(&member.table, member.where_.clone(), member.columns.clone(), None, None, None)
+            .await
+            .map_err(|error| AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: format!("{error:#}"),
+                retry_after: false,
+            })?;
+    }
+    let _control = engine.admit_control()?;
+    let group_path =
+        format!("shape/group-{}-{}", std::process::id(), GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let group_sub = engine.resolve_subscription(subscription).await;
+    let mut created = Vec::with_capacity(members.len());
+    for (i, member) in members.iter().enumerate() {
+        let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
+        match engine
+            .create_shape_as_on_stream(
+                &member.table,
+                member.where_.clone(),
+                member.columns.clone(),
+                true,
+                Some(sub.clone()),
+                group_path.clone(),
+            )
+            .await
+        {
+            Ok((rec, _)) => created.push((rec, sub)),
+            Err(error) => {
+                for (rec, sub) in &created {
+                    let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+                }
+                return Err(AppError::from(error));
+            }
+        }
+    }
+    let offset = engine.stream_tail(&group_path).await?.ok_or_else(|| AppError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        msg: "group stream has no tail offset".into(),
+        retry_after: true,
+    })?;
+    let reads = members
+        .iter()
+        .map(|m| crate::engine::SubsetReadReq {
+            table: m.table.clone(),
+            where_: m.where_.clone(),
+            columns: m.columns.clone(),
+            order_by: None,
+            limit: None,
+            offset: None,
+        })
+        .collect();
+    let page = match engine.query_subset_batch(reads).await {
+        Ok(page) => page,
+        Err(error) => {
+            for (rec, sub) in &created {
+                let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+            }
+            return Err(AppError::from(error));
+        }
+    };
+    // Keep one live caller claim for the prototype group. Member claims after the first are
+    // implementation handles only; releasing them leaves the ordinary retained shapes in place
+    // without pretending the existing catalog has group lifecycle semantics.
+    for (rec, sub) in created.iter().skip(1) {
+        let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+    }
+    let lease_seconds = engine.lease_seconds();
+    let results: Vec<serde_json::Value> = members.into_iter().zip(created.iter()).zip(page.pages).map(|((member, (rec, _)), rows)| serde_json::json!({
+        "key": member.key, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
+        "subscription": group_sub, "leaseSeconds": lease_seconds, "offset": offset, "rows": rows,
+    })).collect();
+    Ok(Json(serde_json::json!({
+        "groupId": created.first().map(|(rec, _)| rec.id.clone()).unwrap_or_default(), "subscription": group_sub,
+        "streamUrl": engine.stream_url(&group_path), "streamPath": group_path, "offset": offset,
+        "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
+    })))
 }
 
 /// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized

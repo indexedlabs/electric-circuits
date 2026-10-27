@@ -217,8 +217,43 @@ impl Engine {
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res = self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub).await;
+            let res =
+                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None).await;
             match retry_create(res, attempt, "shape", table) {
+                Ok(out) => return out.map(|rec| (rec, sub)),
+                Err(()) => redo_backoff().await,
+            }
+        }
+        unreachable!("retry_create returns the error on the last attempt")
+    }
+
+    /// Prototype-only variant used by the shape-group benchmark. Each member still has its own
+    /// ordinary shape record and circuit, but its output is directed to the caller's shared stream
+    /// path. Group creation intentionally owns the surrounding shortcut and is responsible for
+    /// releasing the member claims it does not expose to the client.
+    pub(crate) async fn create_shape_as_on_stream(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        changes_only: bool,
+        subscription: Option<String>,
+        stream_path: String,
+    ) -> Result<(ShapeRecord, String)> {
+        let sub = self.resolve_subscription(subscription).await;
+        for attempt in 1..=CREATE_RACE_ATTEMPTS {
+            let res = self
+                .create_shape_once(
+                    table,
+                    where_.clone(),
+                    columns.clone(),
+                    changes_only,
+                    false,
+                    &sub,
+                    Some(stream_path.clone()),
+                )
+                .await;
+            match retry_create(res, attempt, "shape group member", table) {
                 Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
             }
@@ -252,6 +287,7 @@ impl Engine {
         changes_only: bool,
         share: bool,
         sub: &str,
+        stream_path_override: Option<String>,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
         // so it refuses to make one rather than backfill from state it knows is wrong. This early
@@ -393,7 +429,7 @@ impl Engine {
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
-        let stream_path = format!("shape/{id}");
+        let stream_path = stream_path_override.unwrap_or_else(|| format!("shape/{id}"));
         // NOTE: the stream itself is created AFTER the state lock is released (per path below):
         // the PUT is a storage round-trip with a durability fsync, and holding the global lock
         // across it serializes concurrent shape creations.

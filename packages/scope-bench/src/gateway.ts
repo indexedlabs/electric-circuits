@@ -12,6 +12,8 @@
 //                                                    table's feed create, HEAD and query itself
 //   POST /gw/scope-load                              one call per scope, forwarded to the engine's
 //                                                    /v1/scopes/load (one snapshot for all tables)
+//   POST /gw/scope-group                             one call per scope, forwarded to the prototype
+//                                                    group form (one stream, rows tagged by member)
 //   GET  /gw/mux?s=<url>@<offset>&s=…                one long-poll covering several streams;
 //                                                    with catchup=1, one read of each from its offset
 //   GET  /gw/stats, POST /gw/stats/reset
@@ -197,6 +199,22 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       tables: b.tables.map((t: any) => ({ ...t, where: authorize(user, t.where) })),
     })
     return send(res, 200, { ...out, results: out.results.map(rewriteFeed) })
+  }
+  if (req.method === 'POST' && url.pathname === '/gw/scope-group') {
+    const b = await body(req)
+    burn(BASE_MS + PRED_MS * b.members.length)
+    const out = await engine('/v1/subset-loads', {
+      members: b.members.map((t: any) => ({ ...t, where: authorize(user, t.where) })),
+    })
+    // A group has one upstream stream HEAD, even though its member page was one engine call.
+    burn(STREAM_MS)
+    const offset = await dsHead(streamPath(out.streamUrl))
+    return send(res, 200, {
+      ...out,
+      offset,
+      streamUrl: out.streamUrl ? `/stream${streamPath(out.streamUrl)}` : out.streamUrl,
+      results: out.results.map((r: any) => ({ ...r, offset, streamUrl: `/stream${streamPath(r.streamUrl)}` })),
+    })
   }
   if (req.method === 'GET' && url.pathname === '/gw/mux') {
     // One long-poll for several streams: wait on all upstream long-polls, answer with whichever

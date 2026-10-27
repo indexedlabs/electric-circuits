@@ -7,13 +7,14 @@
 //   table-load  one gateway call per table, all in parallel, each one round trip
 //   fanin       one gateway call per scope; the gateway runs the per-table calls next to the engine
 //   scope-load  one gateway call per scope, one engine call, one Postgres snapshot
+//   scope-group one gateway call per scope, one shared engine stream, rows tagged by table
 // Live modes, i.e. how changes reach the phone afterwards:
 //   per-stream  one long-poll per table
 //   mux         one long-poll per scope (gateway /gw/mux)
 
 import type { Level, Scope } from './scenarios.js'
 
-export type Design = 'per-table' | 'table-load' | 'table-load-gated' | 'fanin' | 'scope-load'
+export type Design = 'per-table' | 'table-load' | 'table-load-gated' | 'fanin' | 'scope-load' | 'scope-group'
 export type LiveMode = 'per-stream' | 'mux'
 
 export interface PhoneOpts {
@@ -25,6 +26,8 @@ export interface PhoneOpts {
   live: LiveMode
   /** The signed-in account (default the heavy one). */
   user?: string
+  /** Optional benchmark hook for measuring a marker's write-to-stream latency. */
+  onWake?: (body: string, at: number) => void
 }
 
 export interface Held {
@@ -139,6 +142,17 @@ export class Phone {
         }),
       )
     }
+    if (this.o.design === 'scope-group') {
+      await this.gate.acquire(scope.level)
+      try {
+        const out = JSON.parse((await this.http('POST', '/gw/scope-group', { members: scope.tables })).text)
+        for (const t of scope.tables) this.arrived(scope, t.key)
+        const first = out.results[0]
+        return [{ key: '__group__', streamUrl: first.streamUrl, offset: first.offset }]
+      } finally {
+        this.gate.release()
+      }
+    }
     await this.gate.acquire(scope.level)
     try {
       if (this.o.design === 'table-load') {
@@ -191,11 +205,13 @@ export class Phone {
           if (this.o.live === 'mux' && streams.length > 1) {
             const qs = streams.map((s) => `s=${encodeURIComponent(`${s.streamUrl}@${s.offset}`)}`).join('&')
             const r = JSON.parse((await this.http('GET', `/gw/mux?${qs}`, undefined, ctl.signal)).text)
+            this.o.onWake?.(JSON.stringify(r), performance.now())
             r.forEach((x: any, i: number) => (streams[i]!.offset = x.next))
           } else {
             const s = streams[0]!
             const sep = s.streamUrl.includes('?') ? '&' : '?'
             const r = await this.http('GET', `${s.streamUrl}${sep}offset=${encodeURIComponent(s.offset)}&live=long-poll`, undefined, ctl.signal)
+            this.o.onWake?.(r.text, performance.now())
             s.offset = r.headers.get('stream-next-offset') ?? s.offset
           }
         } catch {

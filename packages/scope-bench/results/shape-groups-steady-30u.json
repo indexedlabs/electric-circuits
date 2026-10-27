@@ -1,0 +1,221 @@
+{
+  "params": {
+    "RTT_MS": 100,
+    "DOWN_MBPS": 20,
+    "REPS": 2,
+    "OTHER_USERS": 30,
+    "HOLD_MS": 5000,
+    "PHONES": 30,
+    "DS_LONGPOLL_MS": 500,
+    "STEADY": true
+  },
+  "seed": {
+    "user": 93,
+    "space": 93,
+    "space_member": 93,
+    "calendar": 103,
+    "external_account": 93,
+    "invite": 31,
+    "tag": 1360,
+    "file": 4793,
+    "feedback": 2140,
+    "assistant_state": 1837,
+    "activity": 20263,
+    "resource": 169,
+    "resource_fact": 338,
+    "graph_edge": 507,
+    "record": 12216,
+    "record_date_index": 13196,
+    "tagged_item": 1836,
+    "assignment": 2946,
+    "record_completed_index": 1233,
+    "record_assignee_index": 615,
+    "record_recurrence": 170,
+    "calendar_event": 6359,
+    "message": 3080,
+    "suggestion": 612,
+    "assistant_stream_event": 510
+  },
+  "results": [
+    {
+      "scenario": "record open",
+      "config": "scope load",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 3475,
+          "firstP90": 3509,
+          "firstTableMs": 3475,
+          "allMs": 3475
+        }
+      },
+      "phoneRequests": 1415,
+      "loadRequests": 270,
+      "bytesDown": 3767519,
+      "gatewayCpuMs": 8660,
+      "gatewayLagP99": 2995,
+      "gatewayLagMax": 2995,
+      "engineCpuMs": 180,
+      "pgStatements": 1557,
+      "pgExecMs": 14,
+      "longPollsHeld": 240,
+      "streamCount": 240,
+      "holdGatewayCpuMs": 5220,
+      "holdRequests": 1306,
+      "holdDsCalls": 1305,
+      "engineRssMb": 37.6,
+      "steadyWriteP50": 511,
+      "steadyWriteP90": 1451
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 3513,
+          "firstP90": 3517,
+          "firstTableMs": 3513,
+          "allMs": 3513
+        }
+      },
+      "phoneRequests": 180,
+      "loadRequests": 60,
+      "bytesDown": 3450176,
+      "gatewayCpuMs": 7920,
+      "gatewayLagP99": 2999,
+      "gatewayLagMax": 2999,
+      "engineCpuMs": 160,
+      "pgStatements": 1555,
+      "pgExecMs": 23,
+      "longPollsHeld": 30,
+      "streamCount": 30,
+      "holdGatewayCpuMs": 4800,
+      "holdRequests": 151,
+      "holdDsCalls": 1200,
+      "engineRssMb": 45.1,
+      "steadyWriteP50": 855,
+      "steadyWriteP90": 1357
+    },
+    {
+      "scenario": "record open",
+      "config": "scope group",
+      "rep": 1,
+      "screens": {
+        "record": {
+          "firstMs": 3505,
+          "firstP90": 3514,
+          "firstTableMs": 3505,
+          "allMs": 3505
+        }
+      },
+      "phoneRequests": 365,
+      "loadRequests": 60,
+      "bytesDown": 3711378,
+      "gatewayCpuMs": 4580,
+      "gatewayLagP99": 2479,
+      "gatewayLagMax": 2479,
+      "engineCpuMs": 150,
+      "pgStatements": 1555,
+      "pgExecMs": 15,
+      "longPollsHeld": 30,
+      "streamCount": 30,
+      "holdGatewayCpuMs": 1340,
+      "holdRequests": 336,
+      "holdDsCalls": 335,
+      "engineRssMb": 44.7,
+      "steadyWriteP50": 217,
+      "steadyWriteP90": 265
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 1890,
+          "firstP90": 3456,
+          "firstTableMs": 1890,
+          "allMs": 1890
+        }
+      },
+      "phoneRequests": 2148,
+      "loadRequests": 313,
+      "bytesDown": 4229027,
+      "gatewayCpuMs": 11592,
+      "gatewayLagP99": 785,
+      "gatewayLagMax": 785,
+      "engineCpuMs": 150,
+      "pgStatements": 1555,
+      "pgExecMs": 17,
+      "longPollsHeld": 240,
+      "streamCount": 240,
+      "holdGatewayCpuMs": 4736,
+      "holdRequests": 1185,
+      "holdDsCalls": 1184,
+      "engineRssMb": 37.4,
+      "steadyWriteP50": 613,
+      "steadyWriteP90": 869
+    },
+    {
+      "scenario": "record open",
+      "config": "scope load + mux",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 2048,
+          "firstP90": 4684,
+          "firstTableMs": 2048,
+          "allMs": 2048
+        }
+      },
+      "phoneRequests": 254,
+      "loadRequests": 94,
+      "bytesDown": 3913850,
+      "gatewayCpuMs": 10288,
+      "gatewayLagP99": 1547,
+      "gatewayLagMax": 1547,
+      "engineCpuMs": 150,
+      "pgStatements": 1557,
+      "pgExecMs": 19,
+      "longPollsHeld": 30,
+      "streamCount": 30,
+      "holdGatewayCpuMs": 5152,
+      "holdRequests": 162,
+      "holdDsCalls": 1288,
+      "engineRssMb": 37.3,
+      "steadyWriteP50": 732,
+      "steadyWriteP90": 1235
+    },
+    {
+      "scenario": "record open",
+      "config": "scope group",
+      "rep": 2,
+      "screens": {
+        "record": {
+          "firstMs": 2445,
+          "firstP90": 3632,
+          "firstTableMs": 2445,
+          "allMs": 2445
+        }
+      },
+      "phoneRequests": 398,
+      "loadRequests": 80,
+      "bytesDown": 3945338,
+      "gatewayCpuMs": 4712,
+      "gatewayLagP99": 132,
+      "gatewayLagMax": 1630,
+      "engineCpuMs": 150,
+      "pgStatements": 1554,
+      "pgExecMs": 19,
+      "longPollsHeld": 30,
+      "streamCount": 30,
+      "holdGatewayCpuMs": 1292,
+      "holdRequests": 324,
+      "holdDsCalls": 323,
+      "engineRssMb": 37.7,
+      "steadyWriteP50": 208,
+      "steadyWriteP90": 295
+    }
+  ]
+}
