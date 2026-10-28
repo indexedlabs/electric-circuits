@@ -235,12 +235,7 @@ impl GroupEmissionLanes {
             complete_origin_entry(&self.origins, &self.wake, &path, commit_lsn);
             return;
         }
-        if lane
-            .tx
-            .send(GroupBatch { commit_lsn, stream_path: path.clone(), envs })
-            .await
-            .is_err()
-        {
+        if lane.tx.send(GroupBatch { commit_lsn, stream_path: path.clone(), envs }).await.is_err() {
             self.pending.complete(commit_lsn);
             complete_origin_entry(&self.origins, &self.wake, &path, commit_lsn);
         }
@@ -353,5 +348,27 @@ mod tests {
         lanes.enqueue("shape/group", vec![envelope], 0x42).await;
         assert_eq!(pending.count(), 0);
         assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 0x42));
+    }
+
+    #[tokio::test]
+    async fn group_lane_capacity_waits_for_a_slot_and_preserves_batch_order() {
+        let (tx, mut rx) = mpsc::channel::<GroupBatch>(GROUP_LANE_CAPACITY);
+        for commit_lsn in 0..GROUP_LANE_CAPACITY as u64 {
+            tx.send(GroupBatch { commit_lsn, stream_path: "shape/group".into(), envs: Vec::new() })
+                .await
+                .unwrap();
+        }
+        let next = tx.send(GroupBatch { commit_lsn: 64, stream_path: "shape/group".into(), envs: Vec::new() });
+        tokio::pin!(next);
+        tokio::select! {
+            biased;
+            _ = &mut next => panic!("a full group lane accepted a batch without waiting"),
+            _ = tokio::task::yield_now() => {}
+        }
+        assert_eq!(rx.recv().await.unwrap().commit_lsn, 0);
+        next.await.unwrap();
+        for expected in 1..=GROUP_LANE_CAPACITY as u64 {
+            assert_eq!(rx.recv().await.unwrap().commit_lsn, expected);
+        }
     }
 }

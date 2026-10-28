@@ -3920,10 +3920,7 @@ mod cancellation_tests {
     async fn engine_with_group_claim() -> (Engine, GroupRecord) {
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         let now = crate::changelog::now_secs();
-        let members = [
-            ("member-0", "scope", "items-a"),
-            ("member-1", "scope:member:1", "items-b"),
-        ];
+        let members = [("member-0", "scope", "items-a"), ("member-1", "scope:member:1", "items-b")];
         let mut st = engine.state.lock().await;
         for (id, subscription, table) in members {
             st.shapes.insert(
@@ -3945,10 +3942,8 @@ mod cancellation_tests {
             );
             let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
             drop(ready_tx);
-            st.feed_shares.insert(
-                id.to_string(),
-                FeedShare { sig: format!("group-{id}"), subs: Default::default(), ready },
-            );
+            st.feed_shares
+                .insert(id.to_string(), FeedShare { sig: format!("group-{id}"), subs: Default::default(), ready });
             st.subscribe(id, subscription.to_string(), now - 20);
         }
         let group = GroupRecord {
