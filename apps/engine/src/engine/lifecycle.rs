@@ -1189,14 +1189,10 @@ impl Engine {
                 }));
             }
         } else if !internal_group && sub.is_none() {
-            let subscriptions = st
-                .feed_shares
-                .get(id)
-                .map(|share| share.subs.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let group_owned = subscriptions
-                .iter()
-                .any(|subscription| st.group_claims.owns_shape_claim(subscription, id));
+            let subscriptions =
+                st.feed_shares.get(id).map(|share| share.subs.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+            let group_owned =
+                subscriptions.iter().any(|subscription| st.group_claims.owns_shape_claim(subscription, id));
             if group_owned {
                 return Err(anyhow::Error::new(GroupConflict {
                     subscription: format!("shape:{id}"),

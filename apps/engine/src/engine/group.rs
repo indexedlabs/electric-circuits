@@ -137,10 +137,7 @@ impl GroupClaims {
     /// but their lease protection must last for the whole assembly window.
     pub(crate) fn in_active_reservation(&self, subscription: &str) -> bool {
         self.is_reserved(subscription)
-            || self
-                .private_members
-                .get(subscription)
-                .is_some_and(|group| self.is_reserved(group))
+            || self.private_members.get(subscription).is_some_and(|group| self.is_reserved(group))
     }
 
     pub(crate) fn private_owner(&self, subscription: &str) -> Option<&String> {

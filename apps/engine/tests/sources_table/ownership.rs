@@ -1469,7 +1469,10 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
         for member_shape in [group_id, member_id] {
             let (status, body) =
                 json(&app, Method::DELETE, &format!("/v1/shapes/{member_shape}"), Body::empty()).await?;
-            ensure!(status == StatusCode::CONFLICT, "anonymous member release escaped group ownership: {status} {body}");
+            ensure!(
+                status == StatusCode::CONFLICT,
+                "anonymous member release escaped group ownership: {status} {body}"
+            );
         }
         ensure!(
             engine.subscription_owner("group-one-sub").await.as_deref() == Some(group_id),
@@ -1548,12 +1551,18 @@ async fn group_retry_renews(f: &Fixture) -> Result<()> {
         // The two probes pass through; the third HEAD is the final stream-tail read after renewal.
         *f.ds.group_head_faults.lock().await = vec![None, None, Some(503)];
         let (status, headers, body) = post_group_response(&app, group_body(f, "group-retry-renews", true)).await?;
-        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "post-renew stream-tail outage was not retryable: {status} {body}");
+        ensure!(
+            status == StatusCode::SERVICE_UNAVAILABLE,
+            "post-renew stream-tail outage was not retryable: {status} {body}"
+        );
         ensure!(headers.get("retry-after").is_some(), "post-renew stream-tail outage omitted Retry-After");
         let (status, renewed) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
         ensure!(status == StatusCode::OK, "group did not survive post-renew outage: {status} {renewed}");
         ensure!(renewed["groupId"].as_str() == Some(old_id.as_str()), "post-renew outage recreated the group");
-        ensure!(renewed["streamPath"].as_str() == Some(old_path.as_str()), "post-renew outage changed the group stream");
+        ensure!(
+            renewed["streamPath"].as_str() == Some(old_path.as_str()),
+            "post-renew outage changed the group stream"
+        );
         let renewed_members = renewed["results"]
             .as_array()
             .context("post-renew members")?
