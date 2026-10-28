@@ -1,9 +1,10 @@
 # Key-only semijoin versus subquery members
 
-Work in progress, not for merge. Correctness is still being validated by CI; the first
-five-repetition PostgreSQL 18 benchmark completed on `48501cd`. The measurements below are
-prototype evidence, not release qualification. The first measured semijoin run uses more DBSP
-state and has slower delivery and higher engine CPU; restart cost remains unavailable.
+Work in progress, not for merge. Correctness is still being validated by CI; two independent
+five-repetition PostgreSQL 18 benchmarks completed on `48501cd` and the preserved production
+tree at `9086025`. The measurements below are prototype evidence, not release qualification.
+Both runs show higher semijoin DBSP state, slower delivery and higher engine CPU; restart cost
+remains unavailable.
 
 ## Pinned inputs and method
 
@@ -309,7 +310,7 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
-current candidate has passed. The follow-up `8a93697` adds completion durability compensation,
+current candidate has passed. The earlier heads `89a0b97` through `48501cd` add completion durability compensation,
 shutdown-owned retry coverage and cancellation-stage retry coverage. The c78804a run
 `40748888867` compiled and passed formatting, Rust, TypeScript and Node but its group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
@@ -325,9 +326,10 @@ downloaded independently; its four raw JSON files have SHA-256 hashes
 `a41a2c6295e859a45ce4cee76c09fdb688303c0efefb62d586e9e7f27e4c70c9`,
 `4434bff4111fca45dcd4df89534111db763e7a5e6f71f0e145731c0c70c7c7dd`, and
 `8d9e762ceb83bbd87faf93625bfaf7947c01569b0a5aff9a74f2157cb824667b`.
-The 9086025 production tree is preserved through 1d7bbbc and the docs-only `fc6c62a` head;
-1d7bbbc adds only test-barrier refactoring and evidence/docs updates, while fc6c62a changes
-documentation only. The exact-head test job `123071873230` for `fc6c62a` is currently running.
+The 9086025 production tree is preserved through 1d7bbbc, docs-only `fc6c62a`, and current
+docs-only head `3438aa8`; 1d7bbbc adds test-barrier refactoring and evidence/docs updates.
+The exact-head test job `123079445250` for `3438aa8` is still running; 1d7bbbc's identical
+production tree already has a fully green test job `123064316739`.
 
 The 9086025 artifact is a second, independent five-repetition measurement on the production
 tree. Its medians are: cold group load 12,923/13,094 ms, cold RSS 71/73 MiB, cold DBSP used
@@ -336,6 +338,13 @@ bytes 65,092/103,176, actual reads/change 2.667/2.694, delivery p50/p90 530/684 
 ms, engine CPU 2,000/3,070 ms, and gateway CPU 4,732/4,596 ms (subquery/semijoin). These
 replicate the direction of the first artifact but are not pooled because the runs are separate;
 the recommendation remains based on both measurements and the unavailable restart lane.
+
+| Replicate | Cold DBSP bytes (subquery / semijoin) | Steady DBSP bytes | Steady delivery p50/p90 (ms) | Engine CPU (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| 48501cd | 34,212 / 60,232 | 65,092 / 94,512 | 495/734 / 1,373/1,981 | 1,920 / 3,070 |
+| 9086025 | 34,212 / 60,232 | 65,092 / 103,176 | 530/684 / 1,282/2,035 | 2,000 / 3,070 |
+
+Values in each cell are subquery / semijoin; the runs are reported separately, not pooled.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
@@ -392,9 +401,10 @@ join-execution counter. Focused operator coverage includes distinct contributors
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
 The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
 corrections are implemented through `9cffab2`, while the page-handoff and cancellation
-corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the
-full test job and produced the benchmark artifact; head `8a93697` adds the slot-busy stabilization
-and second-barrier rollback contract, with its full exact-head qualification still running.
+corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the full test job and produced the first benchmark artifact; head
+`8a93697` adds the slot-busy stabilization and second-barrier rollback contract. The current
+merge/docs head `3438aa8` is docs-only over the identical production tree, and 1d7bbbc's fully
+green test job `123064316739` qualifies that tree.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
@@ -446,10 +456,10 @@ only the October 25 scope-load/read-scaling changes.
 
 ## Recommendation
 
-The first completed five-repetition run does not meet the decision threshold. Semijoin DBSP
-used bytes are about 76% higher cold and 45% higher steady, delivery p50/p90 is about 2.7–2.8×
-slower, and engine CPU is about 60% higher; process RSS is similar and restart cost is
-unavailable. Keep the accepted subquery-members decision in place. Revisit semijoin only with a
+Both completed five-repetition runs miss the decision threshold. Semijoin DBSP used bytes
+are about 76% higher cold and 45–59% higher steady; delivery is about 2.4–3.0× slower at
+p50/p90, and engine CPU is about 53–60% higher. Process RSS varies: semijoin is about 1 MiB
+higher in one steady run and 7 MiB lower in the other. Restart cost is unavailable. Keep the accepted subquery-members decision in place. Revisit semijoin only with a
 restart lane or a per-group scaling run that demonstrates lower DBSP memory and restart cost on
 the same target-version inputs. ec#44's documented lifecycle, cancellation and burst-pressure
 gaps also prevent treating either membership experiment as production-ready.
