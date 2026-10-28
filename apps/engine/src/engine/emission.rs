@@ -663,10 +663,7 @@ mod tests {
         for i in 0..GROUP_LANE_CAPACITY {
             second_producer.push(lanes.reserve("shape/group", vec![env(format!("y{i}"))], 1000 + i as u64).unwrap());
         }
-        let second_tasks = second_producer
-            .into_iter()
-            .map(|handle| tokio::spawn(handle.wait()))
-            .collect::<Vec<_>>();
+        let second_tasks = second_producer.into_iter().map(|handle| tokio::spawn(handle.wait())).collect::<Vec<_>>();
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
@@ -785,10 +782,8 @@ mod tests {
 
     #[tokio::test]
     async fn remove_wins_append_failure_before_failed_batch_is_parked() {
-        let store = Arc::new(crate::ds::ScriptedStore {
-            fail_append_path: Some("shape/group".into()),
-            ..Default::default()
-        });
+        let store =
+            Arc::new(crate::ds::ScriptedStore { fail_append_path: Some("shape/group".into()), ..Default::default() });
         let append_shutdown = crate::shutdown::ShutdownToken::new();
         let lane_shutdown = crate::shutdown::ShutdownToken::new();
         let gate = Arc::new(crate::ds::BodyGate::default());
@@ -816,10 +811,8 @@ mod tests {
 
     #[tokio::test]
     async fn parked_append_failure_is_released_by_remove() {
-        let store = Arc::new(crate::ds::ScriptedStore {
-            fail_append_path: Some("shape/group".into()),
-            ..Default::default()
-        });
+        let store =
+            Arc::new(crate::ds::ScriptedStore { fail_append_path: Some("shape/group".into()), ..Default::default() });
         let append_shutdown = crate::shutdown::ShutdownToken::new();
         let lane_shutdown = crate::shutdown::ShutdownToken::new();
         let gate = Arc::new(crate::ds::BodyGate::default());
