@@ -718,10 +718,11 @@ that source prefix.
 
 The page handoff records scoped live decisions in `page_decisions`, separate from
 ordinary query-back recency. A decision is ordered by its read LSN but its synthetic
-tombstone carries the triggering commit LSN. The page path pauses the sequencer,
-seeds the public page keys, and emits a table-qualified tombstone for a row deleted
-after the snapshot; that tombstone may trail newer events on the group stream and
-clients apply the LSN watermark before accepting it. On cancellation,
+tombstone carries the triggering commit LSN. The production page path uses the xid
+gate and the decision recency map to seed public page keys and emit a table-qualified
+tombstone for a row deleted after the snapshot; the PostgreSQL contract pauses the
+sequencer to make that race deterministic. The tombstone may trail newer events on
+the group stream and clients apply the LSN watermark before accepting it. On cancellation,
 `GroupReservationGuard` releases each private member claim before removing it from
 the compensation list, writes durable `GroupDropped` after a queued `GroupCreated`,
 then aborts the in-memory group claim. Engine close joins this cleanup task. The

@@ -1432,16 +1432,35 @@ impl GroupReservationGuard {
             return;
         }
         while let Some((shape_id, subscription)) = self.members.last().cloned() {
-            if let Err(error) = self.engine.release_subscription_durable(&shape_id, Some(&subscription)).await {
-                tracing::warn!(%shape_id, %subscription, %error, "failed to compensate cancelled group member");
+            let released = self
+                .engine
+                .release_subscription_durable(&shape_id, Some(&subscription))
+                .await;
+            if released.is_err() {
+                // The in-memory unsubscribe happens before the catalog await. Re-enqueue the
+                // idempotent Left so a transient writer failure cannot silently lose the
+                // compensation; retain the member until one durable append is acknowledged.
+                let retry = self
+                    .engine
+                    .retry_release_subscription_durable(&shape_id, &subscription)
+                    .await;
+                if let Err(error) = retry {
+                    tracing::warn!(%shape_id, %subscription, %error, "failed to compensate cancelled group member");
+                    break;
+                }
             }
-            if self.members.last().is_some_and(|member| member.0 == shape_id && member.1 == subscription) {
-                self.members.pop();
-            }
+            self.members.pop();
         }
         if self.group_created {
             if let Err(error) = self.engine.drop_group_durable(&self.subscription).await {
-                tracing::warn!(subscription = %self.subscription, %error, "failed to compensate cancelled group");
+                if let Err(retry_error) = self.engine.drop_group_durable(&self.subscription).await {
+                    tracing::warn!(
+                        subscription = %self.subscription,
+                        %error,
+                        %retry_error,
+                        "failed to compensate cancelled group"
+                    );
+                }
             }
         }
         self.engine.abort_group(&self.subscription).await;
@@ -1463,18 +1482,36 @@ impl Drop for GroupReservationGuard {
         let subscription = self.subscription.clone();
         let members = self.members.clone();
         let group_created = self.group_created;
-        engine.shutdown_token().spawn(async move {
+        let party = engine.shutdown_token().party("group reservation compensation");
+        tokio::spawn(async move {
             for (shape_id, member_subscription) in members {
-                if let Err(error) = engine.release_subscription_durable(&shape_id, Some(&member_subscription)).await {
-                    tracing::warn!(%shape_id, subscription = %member_subscription, %error, "failed to compensate cancelled group member");
+                if let Err(error) = engine
+                    .release_subscription_durable(&shape_id, Some(&member_subscription))
+                    .await
+                {
+                    if let Err(retry_error) = engine
+                        .retry_release_subscription_durable(&shape_id, &member_subscription)
+                        .await
+                    {
+                        tracing::warn!(
+                            %shape_id,
+                            subscription = %member_subscription,
+                            %error,
+                            %retry_error,
+                            "failed to compensate cancelled group member"
+                        );
+                    }
                 }
             }
             if group_created {
                 if let Err(error) = engine.drop_group_durable(&subscription).await {
-                    tracing::warn!(%subscription, %error, "failed to compensate cancelled group");
+                    if let Err(retry_error) = engine.drop_group_durable(&subscription).await {
+                        tracing::warn!(%subscription, %error, %retry_error, "failed to compensate cancelled group");
+                    }
                 }
             }
             engine.abort_group(&subscription).await;
+            drop(party);
         });
     }
 }

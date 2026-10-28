@@ -2917,6 +2917,24 @@ impl Engine {
         self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await
     }
 
+    /// Re-enqueue an idempotent member release after the in-memory unsubscribe already happened
+    /// but its first durable append failed. Group cancellation uses this to retain compensation
+    /// until the catalog has accepted a `Left`, rather than silently losing a private claim.
+    pub(crate) async fn retry_release_subscription_durable(
+        &self,
+        id: &str,
+        subscription: &str,
+    ) -> Result<()> {
+        self.catalog_tx
+            .send_durable(CatalogEvent::Left {
+                id: id.to_string(),
+                subscription: subscription.to_string(),
+                lapsed: false,
+            })
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn abort_group(&self, subscription: &str) {
         self.state.lock().await.group_claims.release(subscription);
     }

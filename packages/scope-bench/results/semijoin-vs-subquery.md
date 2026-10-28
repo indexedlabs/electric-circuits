@@ -234,9 +234,10 @@ The test bodies use distinct names from their isolated wrappers.
 
 The benchmark now captures `/memory` and `/debug/dbsp-profile` both after group load
 and at the end of the hold. The end profile checks the requested mode and requires
-`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch also
-updates an assignment companion every 200 ms to exercise that path; this makes cold
-launch a corrected workload rather than a byte-for-byte replay of perf2. `readsPerChange`
+`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch updates an assignment companion every 200 ms to exercise that path; steady
+writes also insert the eligible `record_date_index` companion for each phone so semijoin
+selection is exercised in both scenarios. These are corrected workloads rather than
+byte-for-byte replays of perf2. `readsPerChange`
 subtracts the benchmark writer's exact `BEGIN`/`COMMIT`/`ROLLBACK` utility statement
 count in addition to filtering its DML. The exact-head CI run `40717261548` (test job
 `122918228568`) reached the Rust and PostgreSQL lanes but failed before benchmark
@@ -248,20 +249,16 @@ Earlier exact jobs are retained: group contracts passed in both modes at `8c0c6f
 (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`); the Rust job remained red there on formatting and the unqualified
 tombstone assertion. At `8185b7b`, the subquery group loop passed its handoff contract
-but `ownership::group_page_cancellation_releases_queryback_window` failed during its
-cleanup with `the slot is held by walsender pid 17649`; the semijoin loop passed. The
-library then failed `subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback`
-at `group snapshot table disappeared`. `6a58456` split the cancellation cases, asserted
-clean engine shutdown, and installed the missing unit-test schema. `327653b` and `6a58456`
-passed the group contracts and Rust tests after those changes, but their formatting gates
-were red. `53dd7e3` is the first head where rustfmt, both membership-mode group contracts,
-the Rust engine tests, TypeScript typecheck, and the Node gate all passed; Vitest was still
-running when the run was observed. `9e9171e` added the reservation guard's member-release
-compensation, durable `GroupDropped` on cancellation after `GroupCreated`, and partial
-benchmark-boot cleanup. Its first exact run was red only in the formatting gate, so no
-benchmark artifact was produced. The complete-stage cancellation contract now uses an
-all-plain group, restarts before retrying, and requires recreation to prove that the
-durable drop removed the restored claim.
+but `ownership::group_page_cancellation_releases_queryback_window` failed because the
+engine reboot raced the still-held replication slot (`the slot is held by walsender pid
+17649`); the semijoin loop passed. The library then failed
+`subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback` at
+`group snapshot table disappeared`. `6a58456` split the cancellation cases, asserted clean
+engine shutdown, and installed the missing unit-test schema. `327653b` and `6a58456` passed
+the group contracts and Rust tests after those changes, but their formatting gates were red.
+`53dd7e3` is the first head where rustfmt, both membership-mode group contracts, the Rust
+engine tests, TypeScript typecheck, the Node gate, and Vitest all passed. Its benchmark job
+`122969188541` produced artifact `12836273892` (`semijoin-vs-subquery-01c25310dbb58993b7899198c6fe4920235838ca`). The cold-launch five-repetition files are usable; the steady semijoin file contains five errored repetitions because the workload did not reach an eligible selection (`selectionBatches=0`), so it is not a performance result. `9e9171e` added the reservation guard's member-release compensation, durable `GroupDropped` on cancellation after `GroupCreated`, and partial benchmark-boot cleanup. Its exact run `40730004632` (test job `122963430874`) failed in the group, Rust and Vitest lanes after the formatting step, and its Electric image also failed; no artifact was produced. `ccb02c6` then exposed a compile error in the new retry helper (test job `122975056498`), so its benchmark was skipped. The complete-stage cancellation contract now uses an all-plain group, clears the barrier before restart, and requires recreation to prove that the durable drop removed the restored claim.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

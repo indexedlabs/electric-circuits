@@ -279,6 +279,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
        where query not ilike '%pg_stat_statements%' and query not ilike 'update record set title%'
          and query not ilike 'insert into assistant_stream_event%' and query not ilike 'insert into message%'
          and query not ilike 'insert into assignment%' and query not ilike 'insert into tagged_item%'
+         and query not ilike 'insert into record_date_index%'
          and query not ilike 'update assignment%' and query not ilike 'update tagged_item%'`,
     )
     return { calls: Number(r.rows[0].calls), ms: Number(r.rows[0].ms) }
@@ -393,6 +394,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
             writeStarted.set(marker, performance.now())
             const assignmentId = `${marker}-assignment`
             const taggedId = `${marker}-tag`
+            const recordDateIndexId = `${marker}-record-date-index`
             await admin.query('begin')
             harnessUtilityStatements++
             await admin.query(`update record set title = $1 where id = $2 and user_id = $3`, [marker, recordId, user])
@@ -403,6 +405,13 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
             await admin.query(
               `insert into tagged_item (id, user_id, record_id, tag_id) values ($1, $2, $3, $4) on conflict (id) do update set tag_id = excluded.tag_id`,
               [taggedId, user, recordId, marker],
+            )
+            // Per-card groups use record_date_index as their eligible subquery member. Keep
+            // steady writes on that companion too, so the semijoin path is measured during the
+            // same 30-phone workload rather than only during cold-launch seeding.
+            await admin.query(
+              `insert into record_date_index (id, user_id, record_id, day) values ($1, $2, $3, $4)`,
+              [recordDateIndexId, user, recordId, 0],
             )
             await admin.query('commit')
             harnessUtilityStatements++

@@ -1231,17 +1231,21 @@ async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<(
             // Closing joins the cancellation compensation task and drains its durable catalog
             // write. Reboot before any retry so a stale GroupCreated cannot be hidden by a new
             // record under the same subscription key.
+            unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
             ensure!(
-                engine.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+                engine.close(Duration::from_secs(10)).await
+                    == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
                 "cancelled complete-stage group did not close cleanly"
             );
             let (restarted, restarted_app) = group_engine(f).await?;
-            let (status, body) = post_group(&restarted_app, group_body(f, &subscription, true)).await?;
-            ensure!(status == StatusCode::OK, "durable GroupDropped was not restored: {status} {body}");
+            let attempt = post_group(&restarted_app, group_body(f, &subscription, true)).await;
+            let close = restarted.close(Duration::from_secs(10)).await;
             ensure!(
-                restarted.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+                close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
                 "restarted cancellation contract engine did not close cleanly"
             );
+            let (status, body) = attempt?;
+            ensure!(status == StatusCode::OK, "cancelled group claim survived restart: {status} {body}");
             return Ok::<_, anyhow::Error>(());
         }
 
