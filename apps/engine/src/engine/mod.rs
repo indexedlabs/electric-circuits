@@ -3013,14 +3013,13 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "test-support")]
-    pub async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
+    pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }
 
-    #[cfg(not(feature = "test-support"))]
-    pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
-        self.state.lock().await.group_claims.get(subscription).cloned()
+    #[cfg(feature = "test-support")]
+    pub async fn has_group_record(&self, subscription: &str) -> bool {
+        self.state.lock().await.group_claims.get(subscription).is_some()
     }
 
     pub(crate) async fn begin_group_release(

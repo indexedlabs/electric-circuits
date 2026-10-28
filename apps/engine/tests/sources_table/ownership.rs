@@ -1594,7 +1594,7 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
             .context("group load did not reach GroupCreated durability")?;
         let graph = tokio::time::timeout(Duration::from_secs(10), engine.graph())
             .await
-            .context("group graph did not settle while assembly was held")??
+            .context("group graph did not settle while assembly was held")?
             .shapes;
         let member0 = graph
             .iter()
@@ -1639,7 +1639,7 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         ensure!(status == StatusCode::OK, "assembly completed without every claim: {status} {body}");
         tokio::time::timeout(Duration::from_secs(4), tokio::time::sleep(Duration::from_secs(3))).await.unwrap();
         ensure!(
-            engine.group_record("group-assembly-race").await.is_some(),
+            engine.has_group_record("group-assembly-race").await,
             "completed group was retired immediately after its assembly lease renewal"
         );
         ensure!(
