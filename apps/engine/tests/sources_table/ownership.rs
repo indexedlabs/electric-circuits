@@ -1435,6 +1435,7 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         })
         .await
         .context("waiting for rollback cancellation barrier")?;
+        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
         std::fs::write(format!("{base}.rollback.release"), b"1")?;
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
@@ -1448,12 +1449,17 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         .context("waiting for second rollback cancellation barrier")?;
         task.abort();
         ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
+        ensure!(
+            std::env::var_os("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE").is_none(),
+            "durable-release fault injection did not fire"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE") };
     let close = engine.close(Duration::from_secs(10)).await;
     let fence = remove_source_fence(f).await;
     let replacement = async {

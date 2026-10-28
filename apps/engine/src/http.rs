@@ -1405,6 +1405,16 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
     std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE").ok().as_deref() == Some(stage)
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn test_release_after_unsubscribe_once() -> bool {
+    if std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE").ok().as_deref() == Some("once") {
+        unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE") };
+        true
+    } else {
+        false
+    }
+}
+
 impl GroupSnapshotGuard {
     fn new(engine: &Engine, shape_ids: impl IntoIterator<Item = String>) -> Self {
         Self { engine: engine.clone(), shape_ids: shape_ids.into_iter().collect(), armed: true }

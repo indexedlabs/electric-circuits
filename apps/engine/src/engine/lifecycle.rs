@@ -1149,6 +1149,12 @@ impl Engine {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
         };
+        #[cfg(feature = "test-support")]
+        if durable && released.is_some() && crate::http::test_release_after_unsubscribe_once() {
+            drop(st);
+            self.touch_shape(id);
+            return Err(anyhow::anyhow!("test-injected durable release failure after unsubscribe"));
+        }
         let wait = released.and_then(|subscription| {
             let event = CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false };
             if durable {

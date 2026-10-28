@@ -1,0 +1,252 @@
+{
+  "schema": "semijoin-vs-subquery-medians/v1",
+  "extraction": {
+    "aggregation": "median over results[] for each mode/scenario file (five repetitions)",
+    "rss": "results[].engineRssMb (runner post-hold RSS field)",
+    "cold_dbsp": "results[].dbspProfileEnd.membership_circuit.total_used_bytes",
+    "steady_dbsp": "results[].dbspProfile.membership_circuit.total_used_bytes",
+    "other_metrics": "results[].groupLoadMs, engineCpuMs, gatewayCpuMs, steadyWriteP50, steadyWriteP90, readsPerChange"
+  },
+  "artifacts": [
+    {
+      "commit": "48501cd",
+      "run_id": "40747358562",
+      "benchmark_job_id": "123037684019",
+      "artifact_id": "12844722320",
+      "artifact_name": "semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44c",
+      "artifact_digest": "sha256:ef48795b0cba5f5366492f2b1f0926c9c96856e69f9e43eb812a29cdb8ed7768",
+      "raw_files": {
+        "semijoin-cold.json": "ff4a43cba7144ae8052286d743d6405fc679d6d14e79191be79401492eae3a55",
+        "semijoin-steady.json": "1e6f5e44ffd9ddc48e5d1bff48b0a5af5127c6301f801e9fe9a248b873c3fc03",
+        "subquery-cold.json": "a7132620790bd54ebb2c6b5e619e80ab89f38278392245f049e7d02e7e0c32cf",
+        "subquery-steady.json": "1b6f40c85c9d7c5708e5a769983b71c30a47a95bb0b927832f8fd99f40c78dcb"
+      },
+      "medians": {
+        "semijoin": {
+          "cold": {
+            "groupLoadMs": 13017,
+            "engineRssMb": 75.1,
+            "dbspUsedBytes": 60232,
+            "engineCpuMs": 2100,
+            "gatewayCpuMs": 11324,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 4209,
+            "engineRssMb": 75.9,
+            "dbspUsedBytes": 94512,
+            "engineCpuMs": 3070,
+            "gatewayCpuMs": 4588,
+            "steadyWriteP50": 1373,
+            "steadyWriteP90": 1981,
+            "readsPerChange": 2.6944444444444446
+          }
+        },
+        "subquery": {
+          "cold": {
+            "groupLoadMs": 13082,
+            "engineRssMb": 73.7,
+            "dbspUsedBytes": 34212,
+            "engineCpuMs": 1920,
+            "gatewayCpuMs": 11400,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 4340,
+            "engineRssMb": 76.8,
+            "dbspUsedBytes": 65092,
+            "engineCpuMs": 1920,
+            "gatewayCpuMs": 4864,
+            "steadyWriteP50": 495,
+            "steadyWriteP90": 734,
+            "readsPerChange": 2.6666666666666665
+          }
+        }
+      }
+    },
+    {
+      "commit": "9086025",
+      "run_id": "40754547033",
+      "benchmark_job_id": "123062180725",
+      "artifact_id": "12847482774",
+      "artifact_name": "semijoin-vs-subquery-5c4c91e515bf80de5e69ab809f0a84948abb1365",
+      "artifact_digest": "sha256:41f882ad7fcb59d76d433e794b5efe3095c0df1be2abfb169235056a733bb102",
+      "raw_files": {
+        "semijoin-cold.json": "6457f8cf1e5ff3f232dabacd0229e0392940a03c90b3cdc2ac8e9d7b0678e59e",
+        "semijoin-steady.json": "a41a2c6295e859a45ce4cee76c09fdb688303c0efefb62d586e9e7f27e4c70c9",
+        "subquery-cold.json": "4434bff4111fca45dcd4df89534111db763e7a5e6f71f0e145731c0c70c7c7dd",
+        "subquery-steady.json": "8d9e762ceb83bbd87faf93625bfaf7947c01569b0a5aff9a74f2157cb824667b"
+      },
+      "medians": {
+        "semijoin": {
+          "cold": {
+            "groupLoadMs": 13094,
+            "engineRssMb": 76.8,
+            "dbspUsedBytes": 60232,
+            "engineCpuMs": 2210,
+            "gatewayCpuMs": 11344,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 4358,
+            "engineRssMb": 75.9,
+            "dbspUsedBytes": 94512,
+            "engineCpuMs": 3070,
+            "gatewayCpuMs": 4596,
+            "steadyWriteP50": 1282,
+            "steadyWriteP90": 2035,
+            "readsPerChange": 2.6944444444444446
+          }
+        },
+        "subquery": {
+          "cold": {
+            "groupLoadMs": 12923,
+            "engineRssMb": 74.6,
+            "dbspUsedBytes": 34212,
+            "engineCpuMs": 1960,
+            "gatewayCpuMs": 11340,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 4349,
+            "engineRssMb": 77.6,
+            "dbspUsedBytes": 65092,
+            "engineCpuMs": 2000,
+            "gatewayCpuMs": 4732,
+            "steadyWriteP50": 530,
+            "steadyWriteP90": 684,
+            "readsPerChange": 2.6666666666666665
+          }
+        }
+      }
+    },
+    {
+      "commit": "8a93697",
+      "run_id": "40757521152",
+      "benchmark_job_id": "123073502747",
+      "artifact_id": "12849790738",
+      "artifact_name": "semijoin-vs-subquery-f83e7f42f2d6af3d861a2e5613da5dafef8ffbc6",
+      "artifact_digest": "sha256:e6bd10cfd726b96d1563b673491f077aa937d711f17d0290e40e30937e451853",
+      "raw_files": {
+        "semijoin-cold.json": "295f9477545f3b3f07aa2c2ddf515b603bc29ad0b3c94185379480eb0b1d8b3c",
+        "semijoin-steady.json": "d5dc026ab6c3cf25af3a2f706883d5a51793679e21b1f21367472caf1e23fcac",
+        "subquery-cold.json": "d0f2f92dcda653a6308f4689985e5ef1d91eade4787f69c8b4fa7c28de23ebed",
+        "subquery-steady.json": "412a215dfcb426a17cc0e79d3fd508c64daf259f8a870ecdd0597b1577990314"
+      },
+      "medians": {
+        "semijoin": {
+          "cold": {
+            "groupLoadMs": 12418,
+            "engineRssMb": 80.4,
+            "dbspUsedBytes": 60232,
+            "engineCpuMs": 1440,
+            "gatewayCpuMs": 11360,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 3953,
+            "engineRssMb": 77.7,
+            "dbspUsedBytes": 94512,
+            "engineCpuMs": 2230,
+            "gatewayCpuMs": 4652,
+            "steadyWriteP50": 936,
+            "steadyWriteP90": 1423,
+            "readsPerChange": 2.7222222222222223
+          }
+        },
+        "subquery": {
+          "cold": {
+            "groupLoadMs": 12404,
+            "engineRssMb": 78.2,
+            "dbspUsedBytes": 34212,
+            "engineCpuMs": 1320,
+            "gatewayCpuMs": 11304,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 3969,
+            "engineRssMb": 75.4,
+            "dbspUsedBytes": 65092,
+            "engineCpuMs": 1100,
+            "gatewayCpuMs": 4660,
+            "steadyWriteP50": 507,
+            "steadyWriteP90": 687,
+            "readsPerChange": 2.661111111111111
+          }
+        }
+      }
+    },
+    {
+      "commit": "1d7bbbc",
+      "run_id": "40758664517",
+      "benchmark_job_id": "123077258047",
+      "artifact_id": "12849249330",
+      "artifact_name": "semijoin-vs-subquery-5d5fcf586f5d0020249f2fbce608819ebe6398da",
+      "artifact_digest": "sha256:7fb5528954f2daa40746d2a28c1e5c1779e8a61eb38c042f24cbb9e7f813b713",
+      "raw_files": {
+        "semijoin-cold.json": "efa3ffa625dae2eac276b9c1e6fdadef12469831c3ce2d7201357cb26d0c1325",
+        "semijoin-steady.json": "e76542100079905b967295fc761fa01a22bb8366a25c7a3331f3f59946c71a37",
+        "subquery-cold.json": "20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324",
+        "subquery-steady.json": "0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796"
+      },
+      "medians": {
+        "semijoin": {
+          "cold": {
+            "groupLoadMs": 13175,
+            "engineRssMb": 63.3,
+            "dbspUsedBytes": 60232,
+            "engineCpuMs": 2260,
+            "gatewayCpuMs": 11376,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 4285,
+            "engineRssMb": 76.6,
+            "dbspUsedBytes": 94512,
+            "engineCpuMs": 3180,
+            "gatewayCpuMs": 4580,
+            "steadyWriteP50": 1282,
+            "steadyWriteP90": 2045,
+            "readsPerChange": 2.7
+          }
+        },
+        "subquery": {
+          "cold": {
+            "groupLoadMs": 13166,
+            "engineRssMb": 74.9,
+            "dbspUsedBytes": 34212,
+            "engineCpuMs": 2030,
+            "gatewayCpuMs": 11368,
+            "steadyWriteP50": null,
+            "steadyWriteP90": null,
+            "readsPerChange": null
+          },
+          "steady": {
+            "groupLoadMs": 4347,
+            "engineRssMb": 75.2,
+            "dbspUsedBytes": 65092,
+            "engineCpuMs": 2070,
+            "gatewayCpuMs": 4716,
+            "steadyWriteP50": 519,
+            "steadyWriteP90": 735,
+            "readsPerChange": 2.672222222222222
+          }
+        }
+      }
+    }
+  ]
+}
