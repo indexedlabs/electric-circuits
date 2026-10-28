@@ -1406,6 +1406,8 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 }
 
 #[cfg(feature = "test-support")]
+// Each ignored ownership contract runs in a fresh child process; the latch is intentionally
+// process-local so a once-only fault cannot fire twice inside one rollback trace.
 static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]

@@ -31,11 +31,6 @@ def dbsp_median(results, field):
     return statistics.median(values) if values else None
 
 
-def dbsp_median(results, field):
-    values = [dbsp(row[field]) for row in results if row.get(field)]
-    return statistics.median(values) if values else None
-
-
 def extract(path):
     output = {}
     for mode in ("subquery", "semijoin"):
