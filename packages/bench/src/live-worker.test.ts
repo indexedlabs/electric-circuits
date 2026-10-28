@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { describe, expect, it } from 'vitest'
 
 import { LIVE_WORKER_JS } from './live-worker.js'
+import { createLiveReadinessGate } from './live-readiness.js'
 
 interface ListenerRun {
   requests: URL[]
@@ -14,6 +15,7 @@ interface ListenerRun {
   stderr: string
   firstRequest: Promise<URL>
   secondRequest: Promise<URL>
+  thirdRequest: Promise<URL>
 }
 
 function deferred<T>() {
@@ -29,6 +31,7 @@ function summaryOf(stdout: string): {
   reconnects: number
   maxHeld: number
   maxInFlight: number
+  readySubscriptions: number
   deliveries: number
   deliveryP50Ms: number | null
   deliveryP90Ms: number | null
@@ -52,11 +55,12 @@ async function within<T>(promise: Promise<T>, label: string): Promise<T> {
   }
 }
 
-async function startListener(mode: string | undefined): Promise<ListenerRun> {
+async function startListener(mode: string | undefined, expectedSubscriptions = 0): Promise<ListenerRun> {
   const server = createServer()
   const requests: URL[] = []
   const first = deferred<URL>()
   const second = deferred<URL>()
+  const third = deferred<URL>()
   const markerPrefix = 'bench-test-'
   const writtenAt = Date.now() - 25
   const secondWrittenAt = Date.now() - 35
@@ -85,12 +89,14 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
       }
       return
     }
-    second.resolve(request)
+    if (requests.length === 2) second.resolve(request)
+    if (requests.length >= 3) third.resolve(request)
+    if (requests.length >= 3) return
     if (mode === 'sse') {
       res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
-      res.end('event: control\ndata: {"streamNextOffset":"next-1","upToDate":true}\n\n')
+      res.end('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
     } else {
-      res.writeHead(200, { 'stream-next-offset': 'next-1', 'stream-up-to-date': 'true' })
+      res.writeHead(200, { 'stream-next-offset': 'next-1' })
       res.end(`${markerPrefix}${writtenAt} ${markerPrefix}${secondWrittenAt}`)
     }
   })
@@ -99,14 +105,18 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('missing listener address')
   base = `http://127.0.0.1:${address.port}`
-  const env: NodeJS.ProcessEnv = { ...process.env, WORKER_WRITE_MARKER_PREFIX: markerPrefix }
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    WORKER_WRITE_MARKER_PREFIX: markerPrefix,
+    WORKER_EXPECTED_SUBSCRIPTIONS: String(expectedSubscriptions),
+  }
   delete env.WORKER_LIVE_MODE
   if (mode !== undefined) env.WORKER_LIVE_MODE = mode
   const worker = spawn(process.execPath, ['-e', LIVE_WORKER_JS], {
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
   })
-  const run = { requests, worker, server, stdout: '', stderr: '', firstRequest: first.promise, secondRequest: second.promise }
+  const run = { requests, worker, server, stdout: '', stderr: '', firstRequest: first.promise, secondRequest: second.promise, thirdRequest: third.promise }
   worker.stdout!.on('data', (d: Buffer) => { run.stdout += d.toString() })
   worker.stderr!.on('data', (d: Buffer) => { run.stderr += d.toString() })
   worker.stdin.end(`${base}/v1/stream/shape/test\n`)
@@ -121,6 +131,19 @@ async function stopListener(run: ListenerRun): Promise<void> {
 }
 
 describe('per-table bench live mode', () => {
+  it('counts parent readiness lines and rejects a readiness timeout', async () => {
+    const gate = createLiveReadinessGate(2, 20)
+    gate.observe(1)
+    expect(gate.count()).toBe(1)
+    gate.observe(1)
+    await expect(gate.ready).resolves.toEqual(expect.objectContaining({ elapsedMs: expect.any(Number) }))
+    gate.dispose()
+
+    const timedOut = createLiveReadinessGate(1, 10)
+    await expect(timedOut.ready).rejects.toThrow('live readiness timed out: 0 of 1 subscriptions ready')
+    timedOut.dispose()
+  })
+
   it('emits a syntactically valid worker script', async () => {
     const worker = spawn(process.execPath, ['--check', '-'], {
       stdio: ['pipe', 'ignore', 'pipe'],
@@ -153,6 +176,22 @@ describe('per-table bench live mode', () => {
     expect(summary.deliveries).toBeGreaterThanOrEqual(2)
     expect(summary.deliveryP50Ms).not.toBeNull()
     expect(summary.deliveryP90Ms).not.toBeNull()
+  })
+
+  it('starts measurement counters after the readiness fence', async () => {
+    const run = await startListener('sse', 1)
+    try {
+      await within(run.firstRequest, 'readiness SSE request')
+      await within(run.secondRequest, 'post-readiness SSE request')
+      await within(run.thirdRequest, 'held SSE request')
+    } finally {
+      await stopListener(run)
+    }
+    const summary = summaryOf(run.stdout)
+    expect(run.stdout).toContain('READY 0 ')
+    expect(summary.readySubscriptions).toBe(1)
+    expect(summary.reads).toBe(1)
+    expect(summary.reconnects).toBe(1)
   })
 
   it.each([undefined, 'long-poll'] as const)('keeps long-poll for mode %s', async (mode) => {

@@ -31,6 +31,7 @@ import pgpkg from 'pg'
 
 import { postgres18Tools } from '../../../scripts/postgres18.js'
 import { LIVE_WORKER_JS } from './live-worker.js'
+import { createLiveReadinessGate } from './live-readiness.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
@@ -56,6 +57,7 @@ const LIVE_PROCS = numEnv('SCALE_LIVE_PROCS', 8)
 const LIVE_WRITES = numEnv('SCALE_LIVE_WRITES', 0)
 const LIVE_WRITE_INTERVAL_MS = numEnv('SCALE_LIVE_WRITE_INTERVAL_MS', 500)
 const LIVE_HOLD_MS = numEnv('SCALE_LIVE_HOLD_MS', 120000)
+const LIVE_READY_TIMEOUT_MS = numEnv('SCALE_LIVE_READY_TIMEOUT_MS', 120000)
 const WRITE_MARKER_PREFIX = `bench-${process.pid}-${Date.now()}-`
 type LiveMode = 'sse' | 'long-poll'
 function parseLiveMode(value: string): LiveMode {
@@ -80,6 +82,7 @@ const MAX_USERS = Math.max(...USER_MILESTONES)
 const SLOT = 'electric_circuits_shapescale'
 const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled']
 const MIB = 1024 * 1024
+let activeCleanup: (() => Promise<void>) | undefined
 
 // --- infra (same shapes as shape-mem-matrix) ---------------------------------------------------
 
@@ -283,16 +286,13 @@ async function runWorkers(
   env: Record<string, string>,
   feeds: string[][],
   waitExit: boolean,
+  waitReady = false,
 ): Promise<{ procs: ChildProcess[]; stdout: string[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[]; ready: Promise<{ elapsedMs: number }> }> {
   const procs: ChildProcess[] = []
   const closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] = []
   const outs: string[] = []
-  const readyExpected = feeds.reduce((n, feed) => n + feed.length, 0)
-  const readyStartedAt = Date.now()
-  let readyCount = 0
-  let resolveReady!: (value: { elapsedMs: number }) => void
-  const ready = new Promise<{ elapsedMs: number }>((resolve) => { resolveReady = resolve })
-  if (readyExpected === 0) resolveReady({ elapsedMs: 0 })
+  const readyExpected = waitReady ? feeds.reduce((n, feed) => n + feed.length, 0) : 0
+  const readinessGate = createLiveReadinessGate(readyExpected, LIVE_READY_TIMEOUT_MS)
   const readySeen: number[] = []
   for (const feed of feeds) {
     const p = spawn(process.execPath, ['-e', js], {
@@ -303,15 +303,17 @@ async function runWorkers(
     const idx = outs.push('') - 1
     readySeen[idx] = 0
     const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
-      p.once('close', (code, signal) => resolve({ code, signal })))
+      p.once('close', (code, signal) => {
+        if (readinessGate.count() < readyExpected) readinessGate.closed()
+        resolve({ code, signal })
+      }))
     closes.push(close)
     // Consume stdout LIVE — a full pipe buffer would block the worker.
     p.stdout!.on('data', (d: Buffer) => {
       outs[idx] += d.toString()
       const seen = (outs[idx]!.match(/^READY /gm) ?? []).length
-      readyCount += seen - readySeen[idx]!
+      readinessGate.observe(seen - readySeen[idx]!)
       readySeen[idx] = seen
-      if (readyCount >= readyExpected) resolveReady({ elapsedMs: Date.now() - readyStartedAt })
     })
     for (const line of feed) p.stdin!.write(line + '\n')
     p.stdin!.end()
@@ -319,9 +321,22 @@ async function runWorkers(
   if (waitExit) {
     const results = await Promise.all(closes)
     const failed = results.find(({ code }) => code !== 0)
-    if (failed) throw new Error(`worker exited ${failed.code ?? failed.signal}`)
+    if (failed) {
+      await stopWorkers({ procs, closes })
+      throw new Error(`worker exited ${failed.code ?? failed.signal}`)
+    }
   }
-  return { procs, stdout: outs, closes }
+  const readiness = (async () => {
+    try {
+      return await readinessGate.ready
+    } catch (error) {
+      await stopWorkers({ procs, closes })
+      throw error
+    } finally {
+      readinessGate.dispose()
+    }
+  })()
+  return { procs, stdout: outs, closes, ready: readiness }
 }
 
 async function stopWorkers(run: { procs: ChildProcess[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] }): Promise<void> {
@@ -357,6 +372,7 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   inFlightConnections: number
   reconnectsPerMinute: number
   reconnectsPerSubscriptionMinute: number
+  readinessSpreadMs: number | null
   deliveryP50Ms: number | null
   deliveryP90Ms: number | null
   deliveries: number
@@ -386,6 +402,7 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
   const workerMinutes = summaries.reduce((n, s) => n + s.elapsedMs / 60000, 0)
   const subscriptionMinutes = summaries.reduce((n, s) => n + (s.subscriptions ?? 1) * s.elapsedMs / 60000, 0)
+  const readyTimes = summaries.map((s) => s.readyAt).filter((value): value is number => typeof value === 'number')
   const deliveries = summaries.flatMap((s) => s.deliveryMs ?? [])
   return {
     reads,
@@ -394,6 +411,7 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
     inFlightConnections,
     reconnectsPerMinute: workerMinutes ? reconnects / workerMinutes : 0,
     reconnectsPerSubscriptionMinute: subscriptionMinutes ? reconnects / subscriptionMinutes : 0,
+    readinessSpreadMs: readyTimes.length > 1 ? Math.max(...readyTimes) - Math.min(...readyTimes) : readyTimes.length ? 0 : null,
     deliveryP50Ms: percentile(deliveries, 0.5),
     deliveryP90Ms: percentile(deliveries, 0.9),
     deliveries: deliveries.length,
@@ -428,6 +446,27 @@ async function main() {
 
   const engine = await spawnEngine(dsUrl, pg.pgUrl)
   await sleep(1500)
+
+  let liveProcs: ChildProcess[] = []
+  const liveRuns: Array<{
+    procs: ChildProcess[]
+    stdout: string[]
+    closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[]
+    ready: Promise<{ elapsedMs: number }>
+  }> = []
+  let cleaned = false
+  const cleanup = async () => {
+    if (cleaned) return
+    cleaned = true
+    for (const run of liveRuns) await stopWorkers(run)
+    for (const p of liveProcs) if (p.exitCode === null && p.signalCode === null) p.kill('SIGKILL')
+    engine.proc.kill('SIGKILL')
+    await client.end()
+    try { execFileSync(postgres18Tools().pgCtl, ['-D', join(pg.dir, 'data'), '-m', 'immediate', 'stop'], { stdio: 'ignore' }) } catch {}
+    rmSync(pg.dir, { recursive: true, force: true })
+    await ds.stop()
+  }
+  activeCleanup = cleanup
 
   type Row = { label: string; liveMode: LiveMode; users: number; requested: number; engineShapes: number; engineRssMib: number; engineFpMib: number; dsRssMib: number; card: Record<string, number> }
   const rows: Row[] = []
@@ -483,13 +522,7 @@ async function main() {
   const LIVE_RAMP = process.env.SCALE_LIVE_RAMP
     ? process.env.SCALE_LIVE_RAMP.split(',').map(Number)
     : LIVE_SUBS > 0 ? [LIVE_SUBS] : []
-  let liveProcs: ChildProcess[] = []
   const readinessWindowsMs: number[] = []
-  const liveRuns: Array<{
-    procs: ChildProcess[]
-    stdout: string[]
-    closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[]
-  }> = []
   let held = 0
   for (const level of LIVE_RAMP) {
     if (!streamUrls.length) break
@@ -501,6 +534,7 @@ async function main() {
         { WORKER_LIVE_MODE: LIVE_MODE, WORKER_WRITE_MARKER_PREFIX: WRITE_MARKER_PREFIX },
         chunks(targets, LIVE_PROCS),
         false,
+        true,
       )
       liveRuns.push(run)
       liveProcs.push(...run.procs)
@@ -540,14 +574,14 @@ async function main() {
   if (LIVE_RAMP.some((level) => level > 0) && live.failedReads * 2 >= Math.max(1, live.reads)) {
     throw new Error(`live workers had too many failed reads: ${live.failedReads}/${live.reads}`)
   }
-  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spread=${live.readinessSpreadMs ?? 'n/a'}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
 
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spread=${live.readinessSpreadMs ?? 'n/a'} ms, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
@@ -560,13 +594,12 @@ async function main() {
   }
   writeFileSync(OUT, md.join('\n') + '\n')
   console.log(`wrote ${OUT}`)
-
-  for (const p of liveProcs) if (p.exitCode === null && p.signalCode === null) p.kill('SIGKILL')
-  engine.proc.kill('SIGKILL')
-  await client.end()
-  try { execFileSync(postgres18Tools().pgCtl, ['-D', join(pg.dir, 'data'), '-m', 'immediate', 'stop'], { stdio: 'ignore' }) } catch {}
-  rmSync(pg.dir, { recursive: true, force: true })
-  await ds.stop()
+  await cleanup()
+  activeCleanup = undefined
 }
 
-main().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1) })
+main().then(() => process.exit(0)).catch(async (e) => {
+  console.error(e)
+  await activeCleanup?.()
+  process.exit(1)
+})

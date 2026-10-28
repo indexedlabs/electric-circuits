@@ -38,12 +38,6 @@ function reportReady(subscriptionId) {
   readySubscriptions++;
   const now = Date.now();
   readyAt = now;
-  if (expectedSubscriptions > 0 && readySubscriptions >= expectedSubscriptions && measurementStartedAt === null) {
-    measurementStartedAt = now;
-    measurementReadsAtStart = reads;
-    measurementFailedReadsAtStart = failedReads;
-    measurementReconnectsAtStart = reconnects;
-  }
   process.stdout.write('READY ' + subscriptionId + ' ' + now + '\\n');
 }
 
@@ -143,6 +137,12 @@ async function hold(url) {
         ? await readSse(r, offset, subscriptionId)
         : await readLongPoll(r, offset, subscriptionId);
       reads++;
+      if (expectedSubscriptions > 0 && readySubscriptions >= expectedSubscriptions && measurementStartedAt === null) {
+        measurementStartedAt = Date.now();
+        measurementReadsAtStart = reads;
+        measurementFailedReadsAtStart = failedReads;
+        measurementReconnectsAtStart = reconnects;
+      }
       reconnectPending = true;
     } catch {
       if (!stopping) {
@@ -180,7 +180,7 @@ process.on('SIGTERM', () => {
     readySubscriptions,
     readyAt,
     elapsedMs,
-    reconnectsPerMinute: reconnects * 60000 / elapsedMs,
+    reconnectsPerMinute: (reconnects - measurementReconnectsAtStart) * 60000 / elapsedMs,
     deliveries: deliveryMs.length,
     deliveryMs,
     deliveryP50Ms: percentile(deliveryMs, 0.5),
