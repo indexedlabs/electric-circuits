@@ -132,8 +132,31 @@ impl GroupClaims {
         self.reserved.contains_key(subscription)
     }
 
+    /// True for the public reservation and every private member reservation belonging to it.
+    /// Member claims are recorded separately so a group can create ordinary shapes atomically,
+    /// but their lease protection must last for the whole assembly window.
+    pub(crate) fn in_active_reservation(&self, subscription: &str) -> bool {
+        self.is_reserved(subscription)
+            || self
+                .private_members
+                .get(subscription)
+                .is_some_and(|group| self.is_reserved(group))
+    }
+
     pub(crate) fn private_owner(&self, subscription: &str) -> Option<&String> {
         self.private_members.get(subscription)
+    }
+
+    /// Whether a subscription on `shape_id` is owned by a group reservation or record.  The
+    /// anonymous native release path uses this before selecting a claim, so it cannot bypass the
+    /// public group's reservation/ownership guards by omitting `?subscription=`.
+    pub(crate) fn owns_shape_claim(&self, subscription: &str, shape_id: &str) -> bool {
+        self.in_active_reservation(subscription)
+            || self.private_owner(subscription).is_some()
+            || self
+                .records
+                .get(subscription)
+                .is_some_and(|group| group.members.iter().any(|member| member.shape_id == shape_id))
     }
 
     pub(crate) fn reserve_private_members(&mut self, group: &str, members: impl IntoIterator<Item = String>) {

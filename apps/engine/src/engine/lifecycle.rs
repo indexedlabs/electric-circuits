@@ -1188,6 +1188,21 @@ impl Engine {
                     owner: format!("group {owner}"),
                 }));
             }
+        } else if !internal_group && sub.is_none() {
+            let subscriptions = st
+                .feed_shares
+                .get(id)
+                .map(|share| share.subs.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let group_owned = subscriptions
+                .iter()
+                .any(|subscription| st.group_claims.owns_shape_claim(subscription, id));
+            if group_owned {
+                return Err(anyhow::Error::new(GroupConflict {
+                    subscription: format!("shape:{id}"),
+                    owner: "group claim".to_string(),
+                }));
+            }
         }
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
@@ -2120,7 +2135,7 @@ impl Engine {
             let expired = st
                 .lapsed_subscriptions(cfg.subscription_lease_timeout, now)
                 .into_iter()
-                .filter(|(_, sub)| !st.group_claims.is_reserved(sub))
+                .filter(|(_, sub)| !st.group_claims.in_active_reservation(sub))
                 .collect::<Vec<_>>();
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);

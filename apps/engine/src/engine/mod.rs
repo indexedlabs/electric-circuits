@@ -2910,6 +2910,12 @@ impl Engine {
 
     /// Return the current owner of a subscription claim. HTTP compound-load admission holds the
     /// control permit while using this to distinguish a new claim from a renewal.
+    #[cfg(feature = "test-support")]
+    pub async fn subscription_owner(&self, subscription: &str) -> Option<String> {
+        self.state.lock().await.subscription_owner(subscription).cloned()
+    }
+
+    #[cfg(not(feature = "test-support"))]
     pub(crate) async fn subscription_owner(&self, subscription: &str) -> Option<String> {
         self.state.lock().await.subscription_owner(subscription).cloned()
     }

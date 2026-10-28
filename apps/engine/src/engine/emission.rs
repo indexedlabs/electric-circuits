@@ -668,7 +668,7 @@ mod tests {
         }
         let first_waiters = first_producer.split_off(GROUP_LANE_CAPACITY);
         for handle in first_producer {
-            handle.wait().await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait()).await.unwrap();
         }
         let mut second_producer = Vec::new();
         for i in 0..GROUP_LANE_CAPACITY {
@@ -680,12 +680,12 @@ mod tests {
         }
         let first_task = tokio::spawn(async move {
             for handle in first_waiters {
-                handle.wait().await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), handle.wait()).await.unwrap();
             }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), first_task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), first_task).await.unwrap().unwrap();
         for task in second_tasks {
-            task.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), task).await.unwrap().unwrap();
         }
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -741,9 +741,13 @@ mod tests {
 
         let first = lanes.reserve("shape/group", vec![env(0)], 0).unwrap();
         let first_wait = tokio::spawn(first.wait());
-        while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         let mut producers = Vec::new();
         for key in 1..=130u64 {
@@ -769,7 +773,7 @@ mod tests {
         }
 
         gate.released.notify_one();
-        first_wait.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), first_wait).await.unwrap().unwrap();
         for task in producers {
             tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap();
         }
@@ -829,12 +833,13 @@ mod tests {
         let lanes = GroupEmissionLanes::new(ds, lane_shutdown, pending.clone());
         lanes.register("shape/group");
         lanes.set_failure_gate("shape/group", gate.clone());
-        lanes.enqueue("shape/group", vec![failure_test_envelope()], 7).await;
+        let enqueue = tokio::spawn(lanes.enqueue("shape/group", vec![failure_test_envelope()], 7));
         append_shutdown.begin();
         tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
         assert_eq!(pending.count(), 1);
         lanes.remove("shape/group");
         gate.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), enqueue).await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while pending.count() != 0 {
                 tokio::task::yield_now().await;
@@ -858,7 +863,7 @@ mod tests {
         let lanes = GroupEmissionLanes::new(ds, lane_shutdown, pending.clone());
         lanes.register("shape/group");
         lanes.set_failure_gate("shape/group", gate.clone());
-        lanes.enqueue("shape/group", vec![failure_test_envelope()], 8).await;
+        let enqueue = tokio::spawn(lanes.enqueue("shape/group", vec![failure_test_envelope()], 8));
         append_shutdown.begin();
         tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
         gate.released.notify_one();
@@ -875,6 +880,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending.count(), 1);
         lanes.remove("shape/group");
+        tokio::time::timeout(std::time::Duration::from_secs(10), enqueue).await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while pending.count() != 0 {
                 tokio::task::yield_now().await;
@@ -913,10 +919,14 @@ mod tests {
                 last: None,
             },
         };
-        lanes.enqueue("shape/group", vec![env("in-flight")], 1).await;
-        while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
+        let enqueue = tokio::spawn(lanes.enqueue("shape/group", vec![env("in-flight")], 1));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         let worker_done = lane.worker_done.notified();
         tokio::pin!(worker_done);
         worker_done.as_mut().enable();
@@ -926,6 +936,7 @@ mod tests {
         lanes.remove("shape/group");
         assert_eq!(pending.count(), 1);
         gate.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(10), enqueue).await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while pending.count() != 0 {
                 tokio::task::yield_now().await;
@@ -963,12 +974,21 @@ mod tests {
                 last: None,
             },
         };
-        lanes.enqueue("shape/group", vec![env(0)], 0).await;
-        while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
+        let first = tokio::spawn(lanes.enqueue("shape/group", vec![env(0)], 0));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         for commit_lsn in 1..=GROUP_LANE_CAPACITY as u64 {
-            lanes.enqueue("shape/group", vec![env(commit_lsn)], commit_lsn).await;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                lanes.enqueue("shape/group", vec![env(commit_lsn)], commit_lsn),
+            )
+            .await
+            .unwrap();
         }
         let next = tokio::spawn({
             let lanes = lanes.clone();
@@ -984,12 +1004,17 @@ mod tests {
             *store.append_fault.lock().unwrap() =
                 Some(("shape/group".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
             gate.released.notify_one();
-            while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == before {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
         }
         gate.released.notify_one();
-        next.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), next).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), first).await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if store.appended.lock().unwrap().len() == GROUP_LANE_CAPACITY + 2 {

@@ -26,7 +26,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             .env("ELECTRIC_CIRCUITS_SUBQ_STORAGE", "1")
             .env_remove("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR")
             .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0");
-        if matches!(case, Case::GroupLapse | Case::GroupRestoreExpired) {
+        if matches!(case, Case::GroupLapse | Case::GroupRestoreExpired | Case::GroupReleaseDuringAssembly) {
             command
                 .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "5")
                 .env("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1");
@@ -253,7 +253,10 @@ struct ObservedDs {
     delete_gates: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     fail_group_head_after_put: Arc<Mutex<bool>>,
     fail_next_group_head: Arc<Mutex<bool>>,
-    group_head_faults: Arc<Mutex<Vec<u16>>>,
+    /// Queued HEAD outcomes: `Some(status)` returns that status, while `None` passes through
+    /// to the real store.  The latter lets a test target the post-renew probe without turning
+    /// the pre-renew probe into a malformed 200 response.
+    group_head_faults: Arc<Mutex<Vec<Option<u16>>>>,
     hold_group_catalog: Arc<Mutex<bool>>,
     group_catalog_arrived: Arc<Notify>,
     group_catalog_release: Arc<Notify>,
@@ -262,6 +265,7 @@ struct ObservedDs {
 async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let mut request = request;
     let closing = method == Method::POST && request.headers().contains_key("stream-closed");
     let group_path = path.contains("shape/group-");
     if method == Method::PUT && group_path {
@@ -272,7 +276,7 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         }
     }
     if method == Method::HEAD && group_path {
-        if let Some(status) = {
+        if let Some(Some(status)) = {
             let mut faults = ds.group_head_faults.lock().await;
             (!faults.is_empty()).then(|| faults.remove(0))
         } {
@@ -285,16 +289,25 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         }
     }
     if method == Method::POST && path.ends_with("meta/catalog") {
-        let hold = {
+        // Inspect the catalog batch so the gate holds the actual GroupCreated durability point,
+        // after every member claim exists, rather than an earlier member Created append.
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, 64 * 1024 * 1024).await.unwrap_or_default();
+        let is_group_created = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
+            .is_ok_and(|events| events.iter().any(|event| event["t"] == "groupCreated"));
+        let hold = if is_group_created {
             let mut armed = ds.hold_group_catalog.lock().await;
             let hold = *armed;
             *armed = false;
             hold
+        } else {
+            false
         };
         if hold {
             ds.group_catalog_arrived.notify_one();
             ds.group_catalog_release.notified().await;
         }
+        request = AxumRequest::from_parts(parts, Body::from(bytes));
     }
     let delete_gate = if method == Method::DELETE {
         ds.delete_gates
@@ -1453,6 +1466,19 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
         let members = group["results"].as_array().context("group results")?;
         let group_id = members[0]["shapeId"].as_str().context("group member id")?;
         let member_id = members[1]["shapeId"].as_str().context("private member id")?;
+        for member_shape in [group_id, member_id] {
+            let (status, body) =
+                json(&app, Method::DELETE, &format!("/v1/shapes/{member_shape}"), Body::empty()).await?;
+            ensure!(status == StatusCode::CONFLICT, "anonymous member release escaped group ownership: {status} {body}");
+        }
+        ensure!(
+            engine.subscription_owner("group-one-sub").await.as_deref() == Some(group_id),
+            "anonymous release removed the public group claim"
+        );
+        ensure!(
+            engine.subscription_owner("group-one-sub:member:1").await.as_deref() == Some(member_id),
+            "anonymous release removed the private member claim"
+        );
         let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
         ensure!(status == StatusCode::CONFLICT, "plain create bypassed group claim: {status} {conflict}");
         let private_body = serde_json::json!({
@@ -1503,7 +1529,7 @@ async fn group_retry_renews(f: &Fixture) -> Result<()> {
             .map(|member| member["shapeId"].as_str().map(ToOwned::to_owned).context("member shape id"))
             .collect::<Result<Vec<_>>>()?;
         drop(first);
-        f.ds.group_head_faults.lock().await.push(503);
+        f.ds.group_head_faults.lock().await.push(Some(503));
         let (status, headers, second) = post_group_response(&app, group_body(f, "group-retry-renews", true)).await?;
         ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "HEAD outage was not retryable: {status} {second}");
         ensure!(headers.get("retry-after").is_some(), "HEAD outage omitted Retry-After: {headers:?}");
@@ -1519,15 +1545,27 @@ async fn group_retry_renews(f: &Fixture) -> Result<()> {
             .collect::<Vec<_>>();
         ensure!(new_members == old_members, "HEAD outage lost a member claim: {second}");
 
-        // The post-renew health probe is also protected: the first 200 is the pre-renew probe,
-        // the following 503 is the probe after every member lease was touched.
-        *f.ds.group_head_faults.lock().await = vec![200, 503];
+        // The two probes pass through; the third HEAD is the final stream-tail read after renewal.
+        *f.ds.group_head_faults.lock().await = vec![None, None, Some(503)];
         let (status, headers, body) = post_group_response(&app, group_body(f, "group-retry-renews", true)).await?;
-        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "post-renew HEAD outage was not retryable: {status} {body}");
-        ensure!(headers.get("retry-after").is_some(), "post-renew outage omitted Retry-After");
+        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "post-renew stream-tail outage was not retryable: {status} {body}");
+        ensure!(headers.get("retry-after").is_some(), "post-renew stream-tail outage omitted Retry-After");
         let (status, renewed) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
         ensure!(status == StatusCode::OK, "group did not survive post-renew outage: {status} {renewed}");
         ensure!(renewed["groupId"].as_str() == Some(old_id.as_str()), "post-renew outage recreated the group");
+        ensure!(renewed["streamPath"].as_str() == Some(old_path.as_str()), "post-renew outage changed the group stream");
+        let renewed_members = renewed["results"]
+            .as_array()
+            .context("post-renew members")?
+            .iter()
+            .map(|member| member["shapeId"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        ensure!(renewed_members == old_members, "post-renew outage changed member shape ids: {renewed}");
+        let retired = f.ds.retired.lock().await;
+        ensure!(
+            !retired.iter().any(|(method, path)| *method == Method::DELETE && path.ends_with(&old_path)),
+            "post-renew HEAD outage deleted the healthy group stream: {retired:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -1553,6 +1591,15 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
             .find(|shape| shape.stream_path.contains("shape/group-"))
             .context("member shape was not installed before GroupCreated")?
             .id;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        ensure!(
+            engine.subscription_owner("group-assembly-race").await.as_deref() == Some(member_id.as_str()),
+            "public reservation lease lapsed while group assembly was held"
+        );
+        ensure!(
+            engine.subscription_owner("group-assembly-race:member:1").await.is_some(),
+            "private reservation lease lapsed while group assembly was held"
+        );
         let (status, body) = json(
             &app,
             Method::DELETE,
@@ -1564,7 +1611,8 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         f.ds.group_catalog_release.notify_one();
         let (status, body) = tokio::time::timeout(Duration::from_secs(15), load)
             .await
-            .context("group load did not complete after catalog release")??;
+            .context("group load did not complete after catalog release")?
+            .context("group load task failed")??;
         ensure!(status == StatusCode::OK, "assembly completed without every claim: {status} {body}");
         let public_body = serde_json::json!({
             "table": format!("public.{}", f.outer),
@@ -1573,13 +1621,11 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         });
         let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(public_body.to_string())).await?;
         ensure!(status == StatusCode::CONFLICT, "completed group lost its public claim: {status} {conflict}");
-        let private_body = serde_json::json!({
-            "table": format!("public.{}", f.inner),
-            "changesOnly": true,
-            "subscription": "group-assembly-race:member:1",
-        });
-        let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(private_body.to_string())).await?;
-        ensure!(status == StatusCode::CONFLICT, "completed group lost its private claim: {status} {conflict}");
+        let member_owner = engine.subscription_owner("group-assembly-race:member:1").await;
+        ensure!(
+            member_owner.as_deref() == Some(member_id.as_str()),
+            "completed group lost its private claim: owner={member_owner:?}, member={member_id}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
