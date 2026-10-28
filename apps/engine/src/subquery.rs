@@ -311,7 +311,10 @@ impl HeapSize for SubqueryShape {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PageDecision {
+    /// Observation stamp used to compare this decision with the public page snapshot.
     pub(crate) stamp: (u64, Option<u64>),
+    /// Source commit LSN used for the synthetic tombstone's wire header and append ordering.
+    pub(crate) commit_lsn: u64,
     pub(crate) member: bool,
     pub(crate) delete_delivered: bool,
 }
@@ -787,7 +790,7 @@ impl SubqueryRegistry {
                     // already been delivered.  Otherwise the public page is the only client
                     // copy, so append the missing tombstone after the handoff.
                     if !decision.delete_delivered && !self.feed_sets.remove(feed_id, pk_id) {
-                        tombstones.entry(decision.stamp.0).or_default().push(pk);
+                        tombstones.entry(decision.commit_lsn).or_default().push(pk);
                     }
                     continue;
                 }
@@ -2101,7 +2104,12 @@ impl SubqueryRegistry {
                         stamp.0 > old.stamp.0 || (stamp.0 == old.stamp.0 && old.stamp.1.is_none() && stamp.1.is_some())
                     });
                     if replace {
-                        shape.page_decisions.insert(pk_id, PageDecision { stamp, member, delete_delivered });
+                    let delete_delivered = delete_delivered
+                        || shape.page_decisions.get(&pk_id).is_some_and(|old| !member && old.delete_delivered);
+                    shape.page_decisions.insert(
+                        pk_id,
+                        PageDecision { stamp, commit_lsn, member, delete_delivered },
+                    );
                     }
                 }
             }
@@ -2487,7 +2495,7 @@ async fn move_shape_for_value(
     commit_lsn: u64,
 ) -> Result<Option<(TableRef, i64)>> {
     // Brief lock: snapshot what the query-back needs.
-    let (ts, pg_url, group_member) = {
+    let (ts, pg_url) = {
         let mut reg = registry.lock().await;
         // A shape whose create is still in flight has edges (phase A) but no installed shape to
         // move: the flip waits on its pending entry and runs at install, instead of falling through
@@ -2499,7 +2507,7 @@ async fn move_shape_for_value(
             return Ok(None);
         }
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_pool.clone(), shape.group_member);
+        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_pool.clone());
         // In flight from here until the evaluation below: live decisions taken in that window are
         // stamped on the shape and beat whatever this read returns.
         reg.begin_queryback(shape_id);
@@ -2508,26 +2516,13 @@ async fn move_shape_for_value(
     // Every exit from here on must decrement — including the read's error path — or the shape
     // would keep recording recency (and dropping candidates) forever. There is no guard object
     // that can do it: the registry mutex is async and cannot be taken in `Drop`.
-    let (mut rows, mut gate) = match query_candidates(&pg_url, &ts, connecting_col, value).await {
+    let (rows, gate) = match query_candidates(&pg_url, &ts, connecting_col, value).await {
         Ok(r) => r,
         Err(e) => {
             registry.lock().await.end_queryback(shape_id);
             return Err(e);
         }
     };
-    // An inner flip can race a value-specific read all the way to an empty result.  For a group
-    // member, reconcile the whole outer table in that case so a page-visible row gets an absolute
-    // negative decision recorded for the handoff.  Ordinary shapes keep the cheaper empty result:
-    // their stream has no public page seam to fence.
-    if rows.is_empty() && group_member {
-        match query_all(&pg_url, &ts).await {
-            Ok(all) => (rows, gate) = all,
-            Err(error) => {
-                registry.lock().await.end_queryback(shape_id);
-                return Err(error);
-            }
-        }
-    }
     if rows.is_empty() {
         registry.lock().await.end_queryback(shape_id);
         return Ok(None);
