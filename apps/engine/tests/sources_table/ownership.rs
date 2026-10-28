@@ -63,7 +63,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupEqualKeyDelete => group_equal_key_delete(&fixture).await,
             Case::GroupConflict => group_claim_overlap_is_atomic(&fixture).await,
             Case::GroupFence => group_uses_one_snapshot_fence(&fixture).await,
-            Case::GroupRetirement => group_retirement_reloads_and_closed_stream_is_conflict(&fixture).await,
+            Case::GroupRetirement => group_retirement_recreates_after_close(&fixture).await,
             Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
             Case::GroupRestoreExpired => group_restore_drops_expired_group_before_first_sweep(&fixture).await,
             Case::GroupClosedReload => group_closed_reload_waits_for_release(&fixture).await,
@@ -1174,7 +1174,7 @@ async fn group_uses_one_snapshot_fence(f: &Fixture) -> Result<()> {
     result
 }
 
-async fn group_retirement_reloads_and_closed_stream_is_recreated(f: &Fixture) -> Result<()> {
+async fn group_retirement_recreates_after_close(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, body) = post_group(&app, group_body(f, "group-retire", false)).await?;

@@ -2540,8 +2540,14 @@ impl Engine {
         // the caller's create rollback (which reaches the registry via `abort_create`), so there is
         // exactly one undo path whether the create failed or was cancelled.
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
-        let finished =
-            self.subqueries.lock().await.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
+        let (finished, staged_group_emissions) = {
+            let mut registry = self.subqueries.lock().await;
+            let finished = registry.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
+            (finished, registry.take_group_emissions())
+        };
+        for (path, envs, commit_lsn) in staged_group_emissions {
+            self.group_lanes.enqueue(&path, envs, commit_lsn).await;
+        }
         tracing::info!(
             target: "electric_circuits_engine::shape_create",
             shape_id = id,
@@ -3909,6 +3915,119 @@ mod cancellation_tests {
 
     async fn refcount(engine: &Engine, id: &str) -> usize {
         engine.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
+    }
+
+    async fn engine_with_group_claim() -> (Engine, GroupRecord) {
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let now = crate::changelog::now_secs();
+        let members = [
+            ("member-0", "scope", "items-a"),
+            ("member-1", "scope:member:1", "items-b"),
+        ];
+        let mut st = engine.state.lock().await;
+        for (id, subscription, table) in members {
+            st.shapes.insert(
+                id.to_string(),
+                ShapeRecord {
+                    id: id.to_string(),
+                    table: table.to_string(),
+                    stream_path: format!("shape/{id}"),
+                    changes_only: true,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
+                },
+            );
+            let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+            drop(ready_tx);
+            st.feed_shares.insert(
+                id.to_string(),
+                FeedShare { sig: format!("group-{id}"), subs: Default::default(), ready },
+            );
+            st.subscribe(id, subscription.to_string(), now - 20);
+        }
+        let group = GroupRecord {
+            id: "shape/group-test".into(),
+            stream_path: "shape/group-test".into(),
+            subscription: "scope".into(),
+            members: vec![
+                GroupMember {
+                    key: "one".into(),
+                    shape_id: "member-0".into(),
+                    table: "items-a".into(),
+                    where_: None,
+                    columns: None,
+                    subscription: "scope".into(),
+                    is_subquery: false,
+                },
+                GroupMember {
+                    key: "two".into(),
+                    shape_id: "member-1".into(),
+                    table: "items-b".into(),
+                    where_: None,
+                    columns: None,
+                    subscription: "scope:member:1".into(),
+                    is_subquery: false,
+                },
+            ],
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        st.group_claims.reserve("scope", "group:scope").unwrap();
+        st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+        st.group_claims.complete(group.clone());
+        drop(st);
+        (engine, group)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewing_a_group_moves_every_member_lease() {
+        let (engine, group) = engine_with_group_claim().await;
+        let before = {
+            let st = engine.state.lock().await;
+            group
+                .members
+                .iter()
+                .map(|member| st.feed_shares[&member.shape_id].subs[&member.subscription])
+                .collect::<Vec<_>>()
+        };
+        assert!(engine.renew_group_claim(&group).await.unwrap());
+        let after = {
+            let st = engine.state.lock().await;
+            group
+                .members
+                .iter()
+                .map(|member| st.feed_shares[&member.shape_id].subs[&member.subscription])
+                .collect::<Vec<_>>()
+        };
+        assert!(after.iter().zip(before).all(|(new, old)| *new > old), "renew must move every member lease");
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_member_lease_lapse_releases_the_whole_group() {
+        let (engine, group) = engine_with_group_claim().await;
+        {
+            let mut st = engine.state.lock().await;
+            st.subscribe("member-0", "scope".into(), crate::changelog::now_secs());
+        }
+        let cfg = crate::retention::RetentionConfig {
+            subscription_lease_timeout: std::time::Duration::from_secs(5),
+            ..crate::retention::RetentionConfig::default()
+        };
+        engine.sweep_leases(&cfg).await;
+        assert!(engine.group_record("scope").await.is_none(), "private lapse must release the group record");
+        assert!(engine.subscription_owner("scope").await.is_none());
+        assert!(engine.subscription_owner("scope:member:1").await.is_none());
+        engine.close(std::time::Duration::from_secs(1)).await;
+        let _ = group;
     }
 
     /// Park until the joiner has actually joined (its refcount is taken) and is waiting on the

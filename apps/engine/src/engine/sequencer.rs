@@ -970,7 +970,7 @@ pub(crate) async fn sequencer_loop(
                         let direct_group_paths: HashSet<String> = group_paths.iter().cloned().collect();
                         for path in group_paths {
                             if let Some(envs) = txn_pending.remove(&path) {
-                                subq.group_lanes.enqueue(&path, envs, group_lsn);
+                                subq.group_lanes.enqueue(&path, envs, group_lsn).await;
                             }
                         }
                         // Transaction boundary: every append of this commit lands before the next
@@ -2176,6 +2176,7 @@ pub(crate) async fn process_envelope(
     {
         let mut work = std::collections::VecDeque::new();
         let mut group_paths = HashSet::new();
+        let mut staged_group_emissions = Vec::new();
         {
             let mut reg = subq.registry.lock().await;
             if reg.touches(&ts.table) {
@@ -2197,6 +2198,10 @@ pub(crate) async fn process_envelope(
                     hops.extend(sq);
                 }
             }
+            staged_group_emissions = reg.take_group_emissions();
+        }
+        for (path, envs, commit_lsn) in staged_group_emissions {
+            subq.group_lanes.enqueue(&path, envs, commit_lsn).await;
         }
         if !work.is_empty() {
             subq.pending_flips.add(lsn_u64);

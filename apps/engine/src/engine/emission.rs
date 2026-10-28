@@ -102,9 +102,9 @@ struct GroupBatch {
 }
 
 struct GroupLane {
-    queue: std::sync::Mutex<std::collections::VecDeque<GroupBatch>>,
-    wake: tokio::sync::Notify,
+    tx: mpsc::Sender<GroupBatch>,
     closed: std::sync::atomic::AtomicBool,
+    closed_notify: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -136,82 +136,46 @@ impl GroupEmissionLanes {
         }
         let (tx, mut rx) = mpsc::channel(GROUP_LANE_CAPACITY);
         let lane = Arc::new(GroupLane {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
-            wake: tokio::sync::Notify::new(),
+            tx,
             closed: std::sync::atomic::AtomicBool::new(false),
+            closed_notify: tokio::sync::Notify::new(),
         });
-        let dispatcher_lane = lane.clone();
-        let dispatcher_pending = self.pending.clone();
-        let dispatcher_origins = self.origins.clone();
-        let dispatcher_wake = self.wake.clone();
-        let dispatcher_shutdown = self.shutdown.clone();
-        let dispatcher = async move {
-            loop {
-                tokio::select! {
-                    _ = dispatcher_lane.wake.notified() => {}
-                    _ = dispatcher_shutdown.wait() => {
-                        dispatcher_lane.closed.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                }
-                loop {
-                    let batch = dispatcher_lane.queue.lock().unwrap().pop_front();
-                    let Some(batch) = batch else { break };
-                    if dispatcher_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
-                        let mut queue = dispatcher_lane.queue.lock().unwrap();
-                        let mut dropped = std::collections::VecDeque::new();
-                        std::mem::swap(&mut *queue, &mut dropped);
-                        drop(queue);
-                        for batch in std::iter::once(batch).chain(dropped) {
-                            dispatcher_pending.complete(batch.commit_lsn);
-                            complete_origin_entry(
-                                &dispatcher_origins,
-                                &dispatcher_wake,
-                                &batch.stream_path,
-                                batch.commit_lsn,
-                            );
-                        }
-                        return;
-                    }
-                    if let Err(tokio::sync::mpsc::error::SendError(batch)) = tx.send(batch).await {
-                        let mut queue = dispatcher_lane.queue.lock().unwrap();
-                        let mut dropped = std::collections::VecDeque::new();
-                        std::mem::swap(&mut *queue, &mut dropped);
-                        drop(queue);
-                        for batch in std::iter::once(batch).chain(dropped) {
-                            dispatcher_pending.complete(batch.commit_lsn);
-                            complete_origin_entry(
-                                &dispatcher_origins,
-                                &dispatcher_wake,
-                                &batch.stream_path,
-                                batch.commit_lsn,
-                            );
-                        }
-                        return;
-                    }
-                }
-                if dispatcher_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
-                    return;
-                }
-            }
-        };
-        self.shutdown.clone().spawn_background(dispatcher);
-
         let worker_lane = lane.clone();
         let worker_ds = self.ds.clone();
         let worker_pending = self.pending.clone();
         let worker_origins = self.origins.clone();
         let worker_wake = self.wake.clone();
         self.shutdown.clone().spawn_background(async move {
-            while let Some(batch) = rx.recv().await {
-                if worker_ds.append_reliable(&batch.stream_path, &batch.envs).await.is_err() {
-                    // Keep the pending count and origin held: a failed reliable append means the
-                    // effect did not land, so a source receipt must never advance past it.
-                    return;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = worker_lane.closed_notify.notified() => {
+                        while let Ok(batch) = rx.try_recv() {
+                            worker_pending.complete(batch.commit_lsn);
+                            complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
+                        }
+                        return;
+                    }
+                    batch = rx.recv() => {
+                        let Some(batch) = batch else {
+                            worker_lane.closed.store(true, std::sync::atomic::Ordering::Release);
+                            return;
+                        };
+                        if worker_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
+                            worker_pending.complete(batch.commit_lsn);
+                            complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
+                            continue;
+                        }
+                        if worker_ds.append_reliable(&batch.stream_path, &batch.envs).await.is_err() {
+                            // Keep the pending count and origin held: a failed reliable append means the
+                            // effect did not land, so a source receipt must never advance past it.
+                            return;
+                        }
+                        worker_pending.complete(batch.commit_lsn);
+                        complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
+                    }
                 }
-                worker_pending.complete(batch.commit_lsn);
-                complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
             }
-            worker_lane.closed.store(true, std::sync::atomic::Ordering::Release);
         });
         lanes.insert(path.to_string(), lane.clone());
         lane
@@ -251,10 +215,10 @@ impl GroupEmissionLanes {
         self.wake.clone()
     }
 
-    /// Queue one complete group batch. The producer-side queue is unbounded for now; its bounded
-    /// saturation/backpressure contract is deferred to OTTO-10306. The enqueue remains outside
-    /// the subquery registry mutex so one group's queue cannot block unrelated shapes.
-    pub(crate) fn enqueue(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
+    /// Queue one complete group batch. The producer-facing channel holds at most
+    /// [`GROUP_LANE_CAPACITY`] batches; a full group waits for its own writer without holding the
+    /// subquery registry mutex. Ordinary shape lanes use their existing unbounded path.
+    pub(crate) async fn enqueue(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if envs.is_empty() {
             return;
         }
@@ -264,36 +228,29 @@ impl GroupEmissionLanes {
             // not resurrect a writer task for a stream that no longer has a group owner.
             return;
         };
-        self.enqueue_existing_lane(lane, path, envs, commit_lsn);
-    }
-
-    fn enqueue_existing_lane(&self, lane: Arc<GroupLane>, path: String, envs: Vec<Envelope>, commit_lsn: u64) {
         self.pending.add(commit_lsn);
         self.begin_origin(&path, commit_lsn);
-        let mut queue = lane.queue.lock().unwrap();
         if lane.closed.load(std::sync::atomic::Ordering::Acquire) {
-            drop(queue);
             self.pending.complete(commit_lsn);
             complete_origin_entry(&self.origins, &self.wake, &path, commit_lsn);
             return;
         }
-        queue.push_back(GroupBatch { commit_lsn, stream_path: path, envs });
-        drop(queue);
-        lane.wake.notify_one();
+        if lane
+            .tx
+            .send(GroupBatch { commit_lsn, stream_path: path.clone(), envs })
+            .await
+            .is_err()
+        {
+            self.pending.complete(commit_lsn);
+            complete_origin_entry(&self.origins, &self.wake, &path, commit_lsn);
+        }
     }
 
     pub(crate) fn remove(&self, path: &str) {
         let lane = self.lanes.lock().unwrap().remove(path);
         if let Some(lane) = lane {
             lane.closed.store(true, std::sync::atomic::Ordering::Release);
-            let mut queue = lane.queue.lock().unwrap();
-            let dropped = std::mem::take(&mut *queue);
-            drop(queue);
-            for batch in dropped {
-                self.pending.complete(batch.commit_lsn);
-                complete_origin_entry(&self.origins, &self.wake, &batch.stream_path, batch.commit_lsn);
-            }
-            lane.wake.notify_one();
+            lane.closed_notify.notify_waiters();
         }
     }
 }
@@ -387,13 +344,13 @@ mod tests {
             crate::shutdown::ShutdownToken::new(),
             pending.clone(),
         );
-        let lane = lanes.lane("shape/group");
+        let _lane = lanes.lane("shape/group");
         lanes.remove("shape/group");
         let envelope: Envelope = serde_json::from_value(serde_json::json!({
             "type": "shape/group", "key": "1", "headers": {"operation": "upsert"}
         }))
         .unwrap();
-        lanes.enqueue_existing_lane(lane, "shape/group".into(), vec![envelope], 0x42);
+        lanes.enqueue("shape/group", vec![envelope], 0x42).await;
         assert_eq!(pending.count(), 0);
         assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 0x42));
     }

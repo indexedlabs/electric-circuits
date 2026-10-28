@@ -575,6 +575,9 @@ pub struct SubqueryRegistry {
     /// falls back to a direct reliable append.
     lanes: Option<crate::engine::emission::EmissionLanes>,
     group_lanes: Option<crate::engine::emission::GroupEmissionLanes>,
+    /// Group batches evaluated under this registry lock. Callers drain this immediately after
+    /// releasing the lock and await the bounded lane send outside the critical section.
+    staged_group_emissions: Vec<(String, Vec<Envelope>, u64)>,
 }
 
 impl HeapSize for SubqueryRegistry {
@@ -644,6 +647,7 @@ impl SubqueryRegistry {
             schemas: Arc::new(HashMap::new()),
             lanes: None,
             group_lanes: None,
+            staged_group_emissions: Vec::new(),
         }
     }
 
@@ -743,10 +747,10 @@ impl SubqueryRegistry {
     /// stream's emission lane while the caller holds this registry's lock (per-stream FIFO ⇒
     /// append order = eval order — the "data in the right place" invariant). Without lanes
     /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
-    async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
+    async fn deliver(&mut self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
         if stream_path.starts_with("shape/group-") {
-            if let Some(lanes) = &self.group_lanes {
-                lanes.enqueue(stream_path, envs, commit_lsn);
+            if self.group_lanes.is_some() {
+                self.staged_group_emissions.push((stream_path.to_string(), envs, commit_lsn));
                 return Ok(());
             }
         }
@@ -757,6 +761,10 @@ impl SubqueryRegistry {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn take_group_emissions(&mut self) -> Vec<(String, Vec<Envelope>, u64)> {
+        std::mem::take(&mut self.staged_group_emissions)
     }
 
     pub fn set_schemas(&mut self, schemas: SchemaMap) {
@@ -2402,17 +2410,21 @@ async fn move_shape_for_value(
     // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
     // (candidates from a query-back all still exist), filtered against the live decisions taken
     // since `gate`'s snapshot.
-    let mut reg = registry.lock().await;
-    let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-    let emitted = reg
-        .emit_for_shapes(
-            &ts,
-            vec![(shape_id.to_string(), candidates)],
-            txid,
-            EmissionSource::QueryBack { gate: &gate, commit_lsn },
-        )
-        .await;
-    reg.end_queryback(shape_id);
+    let (emitted, staged) = {
+        let mut reg = registry.lock().await;
+        let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+        let emitted = reg
+            .emit_for_shapes(
+                &ts,
+                vec![(shape_id.to_string(), candidates)],
+                txid,
+                EmissionSource::QueryBack { gate: &gate, commit_lsn },
+            )
+            .await;
+        reg.end_queryback(shape_id);
+        (emitted, reg.take_group_emissions())
+    };
+    enqueue_staged_group_emissions(registry, staged).await;
     Ok(match emitted?.first() {
         Some((_, true, net)) => Some((ts.table.clone(), *net)),
         _ => None,
@@ -2531,17 +2543,21 @@ async fn rederive_shape(
     };
     // Full re-derive: every row is a candidate; the ONE emission tail decides — except for pks a
     // live commit decided after this read's snapshot, which it drops.
-    let mut reg = registry.lock().await;
-    let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-    let emitted = reg
-        .emit_for_shapes(
-            &ts,
-            vec![(shape_id.to_string(), candidates)],
-            txid,
-            EmissionSource::QueryBack { gate: &gate, commit_lsn },
-        )
-        .await;
-    reg.end_queryback(shape_id);
+    let (emitted, staged) = {
+        let mut reg = registry.lock().await;
+        let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+        let emitted = reg
+            .emit_for_shapes(
+                &ts,
+                vec![(shape_id.to_string(), candidates)],
+                txid,
+                EmissionSource::QueryBack { gate: &gate, commit_lsn },
+            )
+            .await;
+        reg.end_queryback(shape_id);
+        (emitted, reg.take_group_emissions())
+    };
+    enqueue_staged_group_emissions(registry, staged).await;
     emitted?;
     Ok(())
 }
@@ -2549,6 +2565,21 @@ async fn rederive_shape(
 // Candidate-row resolution (arrangement snapshot → pooled Postgres fallback) is the shared
 // membership kernel's — one implementation for this registry and for circuit cohort serving.
 use crate::engine::membership::{query_rows_all as query_all, query_rows_by_col as query_candidates};
+
+async fn enqueue_staged_group_emissions(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    staged: Vec<(String, Vec<Envelope>, u64)>,
+) {
+    if staged.is_empty() {
+        return;
+    }
+    let lanes = registry.lock().await.group_lanes.clone();
+    if let Some(lanes) = lanes {
+        for (path, envs, commit_lsn) in staged {
+            lanes.enqueue(&path, envs, commit_lsn).await;
+        }
+    }
+}
 
 /// Net membership change carried by a batch of parent-node flips (enters +1, leaves −1), for the
 /// trace dot's label/colour.
