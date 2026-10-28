@@ -3014,7 +3014,8 @@ impl Engine {
         let mut events = Vec::with_capacity(group.members.len());
         {
             let mut st = self.state.lock().await;
-            if let Some(release) = self.group_releases.lock().unwrap().get(&group.id).cloned() {
+            let in_flight = self.group_releases.lock().unwrap().get(&group.id).cloned();
+            if let Some(release) = in_flight {
                 drop(st);
                 release.wait().await?;
                 return Ok(false);

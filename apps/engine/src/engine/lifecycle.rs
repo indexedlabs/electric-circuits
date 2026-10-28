@@ -2103,17 +2103,22 @@ impl Engine {
     /// it. `subscription_lease_timeout == 0` disables lease expiry; dormancy is controlled
     /// independently by `idle_timeout`.
     async fn sweep_leases(&self, cfg: &crate::retention::RetentionConfig) {
-        let lapsed = {
+        let (lapsed, lapsed_groups) = {
             let mut st = self.state.lock().await;
             let now = crate::changelog::now_secs();
             let expired = st.lapsed_subscriptions(cfg.subscription_lease_timeout, now);
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }
+            let groups = expired
+                .iter()
+                .filter_map(|(_, subscription)| {
+                    st.group_claims.get(subscription).map(|group| (subscription.clone(), group.id.clone()))
+                })
+                .collect::<Vec<_>>();
             st.publish_subscription_gauge(&self.metrics);
-            expired
+            (expired, groups)
         };
-        let mut lapsed_groups = Vec::new();
         for (shape, subscription) in lapsed {
             tracing::debug!(
                 "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
@@ -2121,9 +2126,6 @@ impl Engine {
             );
             self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription: subscription.clone(), lapsed: true });
             self.metrics.subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
-            if let Some(group) = self.group_record(&subscription).await {
-                lapsed_groups.push((subscription, group.id));
-            }
         }
         for (subscription, group_id) in lapsed_groups {
             if let Err(error) = self.release_group_claim(&subscription, &group_id).await {
