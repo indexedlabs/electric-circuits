@@ -44,6 +44,7 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
   const second = deferred<URL>()
   const markerPrefix = 'bench-test-'
   const writtenAt = Date.now() - 25
+  const secondWrittenAt = Date.now() - 35
   let base = ''
   server.on('request', (req: IncomingMessage, res: ServerResponse) => {
     const request = new URL(req.url ?? '/', base)
@@ -52,13 +53,20 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
       first.resolve(request)
       if (mode === 'sse') {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+        res.flushHeaders()
         res.write(`event: data\ndata: {"value":"${markerPrefix}`)
-        setImmediate(() => {
-          res.write(`${writtenAt}"}\n\n`)
-          res.write('event: control\ndata: {}\n\n')
-          res.write('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
-          res.end()
-        })
+        setTimeout(() => {
+          res.write(`${writtenAt} and ${markerPrefix}${secondWrittenAt}"}\n`)
+          setTimeout(() => {
+            res.write('\n')
+            res.write('event: control\ndata: {}\n\n')
+            res.write('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
+            res.end()
+          }, 10)
+        }, 10)
+      } else {
+        res.writeHead(200, { 'stream-next-offset': 'next-1' })
+        res.end(`${markerPrefix}${writtenAt} ${markerPrefix}${secondWrittenAt}`)
       }
       return
     }
@@ -70,7 +78,7 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('missing listener address')
   base = `http://127.0.0.1:${address.port}`
-  const env = { ...process.env, WORKER_WRITE_MARKER_PREFIX: markerPrefix }
+  const env: NodeJS.ProcessEnv = { ...process.env, WORKER_WRITE_MARKER_PREFIX: markerPrefix }
   delete env.WORKER_LIVE_MODE
   if (mode !== undefined) env.WORKER_LIVE_MODE = mode
   const worker = spawn(process.execPath, ['-e', LIVE_WORKER_JS], {
@@ -116,7 +124,7 @@ describe('per-table bench live mode', () => {
     expect(summary.reads).toBeGreaterThanOrEqual(2)
     expect(summary.reconnects).toBeGreaterThanOrEqual(1)
     expect(summary.maxHeld).toBe(1)
-    expect(summary.deliveries).toBeGreaterThanOrEqual(1)
+    expect(summary.deliveries).toBeGreaterThanOrEqual(2)
     expect(summary.deliveryP50Ms).not.toBeNull()
     expect(summary.deliveryP90Ms).not.toBeNull()
   })
@@ -124,13 +132,29 @@ describe('per-table bench live mode', () => {
   it.each([undefined, 'long-poll'] as const)('keeps long-poll for mode %s', async (mode) => {
     const run = await startListener(mode)
     try {
-      const request = await within(run.firstRequest, 'long-poll request')
-      expect(request.searchParams.get('offset')).toBe('-1')
-      expect(request.searchParams.get('live')).toBe('long-poll')
-      expect(run.requests).toHaveLength(1)
+      const first = await within(run.firstRequest, 'long-poll request')
+      const second = await within(run.secondRequest, 'resumed long-poll request')
+      expect(first.searchParams.get('offset')).toBe('-1')
+      expect(first.searchParams.get('live')).toBe('long-poll')
+      expect(second.searchParams.get('offset')).toBe('next-1')
+      expect(second.searchParams.get('live')).toBe('long-poll')
     } finally {
       await stopListener(run)
     }
+    const summary = JSON.parse(run.stdout.trim()) as {
+      reads: number
+      reconnects: number
+      maxHeld: number
+      deliveries: number
+      deliveryP50Ms: number | null
+      deliveryP90Ms: number | null
+    }
+    expect(summary.reads).toBeGreaterThanOrEqual(2)
+    expect(summary.reconnects).toBeGreaterThanOrEqual(1)
+    expect(summary.maxHeld).toBe(1)
+    expect(summary.deliveries).toBeGreaterThanOrEqual(2)
+    expect(summary.deliveryP50Ms).not.toBeNull()
+    expect(summary.deliveryP90Ms).not.toBeNull()
   })
 
   it('rejects an unknown mode instead of silently measuring long-poll', async () => {

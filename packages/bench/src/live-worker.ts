@@ -24,15 +24,20 @@ let nextSubscriptionId = 0;
 
 function observeData(text, subscriptionId) {
   if (!markerPrefix) return;
-  const at = text.indexOf(markerPrefix);
-  if (at < 0) return;
-  const match = text.slice(at + markerPrefix.length).match(/^\\d+/);
-  if (!match) return;
-  const writtenAt = Number(match[0]);
-  const key = subscriptionId + ':' + writtenAt;
-  if (Number.isFinite(writtenAt) && !seenWrites.has(key)) {
-    seenWrites.add(key);
-    deliveryMs.push(Math.max(0, Date.now() - writtenAt));
+  let from = 0;
+  while (true) {
+    const at = text.indexOf(markerPrefix, from);
+    if (at < 0) return;
+    const match = text.slice(at + markerPrefix.length).match(/^\\d+/);
+    if (match) {
+      const writtenAt = Number(match[0]);
+      const key = subscriptionId + ':' + writtenAt;
+      if (Number.isFinite(writtenAt) && !seenWrites.has(key)) {
+        seenWrites.add(key);
+        deliveryMs.push(Math.max(0, Date.now() - writtenAt));
+      }
+    }
+    from = at + markerPrefix.length;
   }
 }
 
@@ -90,31 +95,35 @@ async function readLongPoll(response, offset, subscriptionId) {
 async function hold(url) {
   const subscriptionId = String(nextSubscriptionId++);
   let offset = '-1';
-  let opened = false;
+  let responseEnded = false;
   while (!stopping) {
     const ctl = new AbortController();
     controllers.add(ctl);
+    held++;
+    maxHeld = Math.max(maxHeld, held);
     reads++;
-    if (opened) reconnects++;
-    opened = true;
-    let responseHeld = false;
+    let countedHeld = true;
+    if (responseEnded) reconnects++;
+    responseEnded = false;
     try {
       const live = liveMode === 'sse' ? 'sse' : 'long-poll';
       const r = await fetch(url + '?offset=' + encodeURIComponent(offset) + '&live=' + live, { signal: ctl.signal });
       if (!r.ok) {
-        failedReads++;
         throw new Error('live response was ' + r.status);
       }
-      held++;
-      maxHeld = Math.max(maxHeld, held);
-      responseHeld = true;
       offset = liveMode === 'sse'
         ? await readSse(r, offset, subscriptionId)
         : await readLongPoll(r, offset, subscriptionId);
+      responseEnded = true;
     } catch {
-      if (!stopping) await new Promise((res) => setTimeout(res, 1000));
+      if (!stopping) {
+        failedReads++;
+        held--;
+        countedHeld = false;
+        await new Promise((res) => setTimeout(res, 1000));
+      }
     } finally {
-      if (responseHeld) held--;
+      if (countedHeld) held--;
       controllers.delete(ctl);
     }
   }
