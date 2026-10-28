@@ -2692,6 +2692,8 @@ mod tests {
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
         pub(crate) head_status: u16,
+        /// Return a transport error from HEAD instead of a response (health outage cut).
+        pub(crate) head_error: bool,
     }
 
     #[derive(Default)]
@@ -3052,6 +3054,9 @@ mod tests {
 
         fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
+                if self.head_error {
+                    return Err(anyhow::anyhow!("scripted HEAD transport failure"));
+                }
                 self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
                 if let Some(streams) = &self.streams {

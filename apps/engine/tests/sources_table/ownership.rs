@@ -71,6 +71,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupLapse => group_lapse_reloads_same_subscription(&fixture).await,
             Case::GroupOneSubscription => group_one_subscription_claims(&fixture).await,
             Case::GroupRetryRenews => group_retry_renews(&fixture).await,
+            Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
@@ -104,6 +105,7 @@ enum Case {
     GroupLapse,
     GroupOneSubscription,
     GroupRetryRenews,
+    GroupReleaseDuringAssembly,
     GroupMembersMax,
 }
 
@@ -229,6 +231,15 @@ fn group_retry_renews_after_a_dropped_response() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_release_during_assembly_is_rejected_and_claims_survive() -> Result<()> {
+    isolated(
+        "ownership::group_release_during_assembly_is_rejected_and_claims_survive",
+        Case::GroupReleaseDuringAssembly,
+    )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_rejects_more_than_eight_members_without_partial_state() -> Result<()> {
     isolated("ownership::group_rejects_more_than_eight_members_without_partial_state", Case::GroupMembersMax)
 }
@@ -242,6 +253,10 @@ struct ObservedDs {
     delete_gates: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     fail_group_head_after_put: Arc<Mutex<bool>>,
     fail_next_group_head: Arc<Mutex<bool>>,
+    group_head_faults: Arc<Mutex<Vec<u16>>>,
+    hold_group_catalog: Arc<Mutex<bool>>,
+    group_catalog_arrived: Arc<Notify>,
+    group_catalog_release: Arc<Notify>,
 }
 
 async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Response {
@@ -257,10 +272,28 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         }
     }
     if method == Method::HEAD && group_path {
+        if let Some(status) = {
+            let mut faults = ds.group_head_faults.lock().await;
+            (!faults.is_empty()).then(|| faults.remove(0))
+        } {
+            return StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE).into_response();
+        }
         let mut fail = ds.fail_next_group_head.lock().await;
         if *fail {
             *fail = false;
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    if method == Method::POST && path.ends_with("meta/catalog") {
+        let hold = {
+            let mut armed = ds.hold_group_catalog.lock().await;
+            let hold = *armed;
+            *armed = false;
+            hold
+        };
+        if hold {
+            ds.group_catalog_arrived.notify_one();
+            ds.group_catalog_release.notified().await;
         }
     }
     let delete_gate = if method == Method::DELETE {
@@ -381,6 +414,10 @@ impl Fixture {
             delete_gates: Arc::new(Mutex::new(HashMap::new())),
             fail_group_head_after_put: Arc::new(Mutex::new(false)),
             fail_next_group_head: Arc::new(Mutex::new(false)),
+            group_head_faults: Arc::new(Mutex::new(Vec::new())),
+            hold_group_catalog: Arc::new(Mutex::new(false)),
+            group_catalog_arrived: Arc::new(Notify::new()),
+            group_catalog_release: Arc::new(Notify::new()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let ds_url = format!("http://{}", listener.local_addr()?);
@@ -879,6 +916,14 @@ fn group_body(f: &Fixture, subscription: &str, plain_only: bool) -> serde_json::
 }
 
 async fn post_group(app: &Router, body: serde_json::Value) -> Result<(StatusCode, serde_json::Value)> {
+    let (status, _, body) = post_group_response(app, body).await?;
+    Ok((status, body))
+}
+
+async fn post_group_response(
+    app: &Router,
+    body: serde_json::Value,
+) -> Result<(StatusCode, axum::http::HeaderMap, serde_json::Value)> {
     let response = app
         .clone()
         .oneshot(
@@ -889,10 +934,11 @@ async fn post_group(app: &Router, body: serde_json::Value) -> Result<(StatusCode
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
     let body = serde_json::from_slice(&bytes)
         .with_context(|| format!("group response {status}: {}", String::from_utf8_lossy(&bytes)))?;
-    Ok((status, body))
+    Ok((status, headers, body))
 }
 
 async fn group_engine(f: &Fixture) -> Result<(Engine, Router)> {
@@ -1449,10 +1495,91 @@ async fn group_retry_renews(f: &Fixture) -> Result<()> {
         let (status, first) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
         ensure!(status == StatusCode::OK, "initial group load failed: {status} {first}");
         let old_path = first["streamPath"].as_str().context("initial group stream path")?.to_owned();
+        let old_id = first["groupId"].as_str().context("initial group id")?.to_owned();
+        let old_members = first["results"]
+            .as_array()
+            .context("initial group members")?
+            .iter()
+            .map(|member| member["shapeId"].as_str().map(ToOwned::to_owned).context("member shape id"))
+            .collect::<Result<Vec<_>>>()?;
         drop(first);
+        f.ds.group_head_faults.lock().await.push(503);
+        let (status, headers, second) = post_group_response(&app, group_body(f, "group-retry-renews", true)).await?;
+        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "HEAD outage was not retryable: {status} {second}");
+        ensure!(headers.get("retry-after").is_some(), "HEAD outage omitted Retry-After: {headers:?}");
         let (status, second) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
         ensure!(status == StatusCode::OK, "retry did not renew: {status} {second}");
+        ensure!(second["groupId"].as_str() == Some(old_id.as_str()), "HEAD outage recreated the group: {second}");
         ensure!(second["streamPath"].as_str() == Some(old_path.as_str()), "retry created a second group stream");
+        let new_members = second["results"]
+            .as_array()
+            .context("renewed group members")?
+            .iter()
+            .map(|member| member["shapeId"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+        ensure!(new_members == old_members, "HEAD outage lost a member claim: {second}");
+
+        // The post-renew health probe is also protected: the first 200 is the pre-renew probe,
+        // the following 503 is the probe after every member lease was touched.
+        *f.ds.group_head_faults.lock().await = vec![200, 503];
+        let (status, headers, body) = post_group_response(&app, group_body(f, "group-retry-renews", true)).await?;
+        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "post-renew HEAD outage was not retryable: {status} {body}");
+        ensure!(headers.get("retry-after").is_some(), "post-renew outage omitted Retry-After");
+        let (status, renewed) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
+        ensure!(status == StatusCode::OK, "group did not survive post-renew outage: {status} {renewed}");
+        ensure!(renewed["groupId"].as_str() == Some(old_id.as_str()), "post-renew outage recreated the group");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        *f.ds.hold_group_catalog.lock().await = true;
+        let load_app = app.clone();
+        let load_body = group_body(f, "group-assembly-race", true);
+        let load = tokio::spawn(async move { post_group(&load_app, load_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+            .await
+            .context("group load did not reach GroupCreated durability")?;
+        let member_id = engine
+            .graph()
+            .await
+            .shapes
+            .into_iter()
+            .find(|shape| shape.stream_path.contains("shape/group-"))
+            .context("member shape was not installed before GroupCreated")?
+            .id;
+        let (status, body) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{member_id}?subscription=group-assembly-race"),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(status == StatusCode::CONFLICT, "public release escaped the assembly reservation: {status} {body}");
+        f.ds.group_catalog_release.notify_one();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), load)
+            .await
+            .context("group load did not complete after catalog release")??;
+        ensure!(status == StatusCode::OK, "assembly completed without every claim: {status} {body}");
+        let public_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "changesOnly": true,
+            "subscription": "group-assembly-race",
+        });
+        let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(public_body.to_string())).await?;
+        ensure!(status == StatusCode::CONFLICT, "completed group lost its public claim: {status} {conflict}");
+        let private_body = serde_json::json!({
+            "table": format!("public.{}", f.inner),
+            "changesOnly": true,
+            "subscription": "group-assembly-race:member:1",
+        });
+        let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(private_body.to_string())).await?;
+        ensure!(status == StatusCode::CONFLICT, "completed group lost its private claim: {status} {conflict}");
         Ok::<_, anyhow::Error>(())
     }
     .await;

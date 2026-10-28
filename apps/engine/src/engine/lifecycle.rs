@@ -3942,7 +3942,11 @@ mod cancellation_tests {
     }
 
     async fn engine_with_group_claim() -> (Engine, GroupRecord) {
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine_with_group_claim_ds(DsClient::new_for_in_process_test("http://127.0.0.1:1")).await
+    }
+
+    async fn engine_with_group_claim_ds(ds: DsClient) -> (Engine, GroupRecord) {
+        let engine = Engine::new_for_in_process_test(ds);
         let now = crate::changelog::now_secs();
         let members = [("member-0", "scope", "items-a"), ("member-1", "scope:member:1", "items-b")];
         let mut st = engine.state.lock().await;
@@ -4004,6 +4008,42 @@ mod cancellation_tests {
         st.group_claims.complete(group.clone());
         drop(st);
         (engine, group)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_group_head_failure_preserves_claim_for_retry() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_error: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://group-health".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let error = engine.group_is_healthy(&group).await.unwrap_err();
+        assert!(error.downcast_ref::<crate::engine::GroupStreamUnavailable>().is_some());
+        assert!(engine.group_record(&group.subscription).await.is_some());
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_group_rejects_a_missing_member_claim() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-invalid-completion".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let mut invalid = group.clone();
+        invalid.subscription = "scope-invalid".into();
+        invalid.id = "shape/group-invalid".into();
+        invalid.stream_path = invalid.id.clone();
+        invalid.members[0].subscription = "scope-invalid".into();
+        invalid.members[1].subscription = "scope-invalid:member:1".into();
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope-invalid", "group scope-invalid").unwrap();
+            st.group_claims.reserve_private_members("scope-invalid", ["scope-invalid:member:1".into()]);
+            st.subscribe("member-0", "scope-invalid".into(), crate::changelog::now_secs());
+            st.subscribe("member-1", "scope-invalid:member:1".into(), crate::changelog::now_secs());
+            st.unsubscribe("member-1", "scope-invalid:member:1");
+        }
+        assert!(engine.complete_group(invalid).await.is_err());
+        assert!(engine.group_record("scope-invalid").await.is_none());
+        engine.close(std::time::Duration::from_secs(1)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
