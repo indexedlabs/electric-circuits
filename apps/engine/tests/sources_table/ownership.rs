@@ -259,7 +259,6 @@ struct ObservedDs {
     group_head_faults: Arc<Mutex<Vec<Option<u16>>>>,
     hold_group_catalog: Arc<Mutex<bool>>,
     hold_group_drop_id: Arc<Mutex<Option<String>>>,
-    group_created_holds: Arc<std::sync::atomic::AtomicUsize>,
     group_catalog_arrived: Arc<Notify>,
     group_catalog_release: Arc<Notify>,
 }
@@ -309,9 +308,6 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
             let mut armed = ds.hold_group_catalog.lock().await;
             let hold = *armed;
             *armed = false;
-            if hold {
-                ds.group_created_holds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
             hold
         } else {
             false
@@ -443,7 +439,6 @@ impl Fixture {
             group_head_faults: Arc::new(Mutex::new(Vec::new())),
             hold_group_catalog: Arc::new(Mutex::new(false)),
             hold_group_drop_id: Arc::new(Mutex::new(None)),
-            group_created_holds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             group_catalog_arrived: Arc::new(Notify::new()),
             group_catalog_release: Arc::new(Notify::new()),
         };
@@ -1359,6 +1354,17 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
             status == StatusCode::CONFLICT,
             "plain create claimed a group subscription during release: {status} {conflict}"
         );
+        let aggregate_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "fn": "count",
+            "subscription": "group-closed-reload",
+        });
+        let (status, conflict) =
+            json(&app, Method::POST, "/v1/aggregates", Body::from(aggregate_body.to_string())).await?;
+        ensure!(
+            status == StatusCode::CONFLICT,
+            "aggregate claimed a group subscription during release: {status} {conflict}"
+        );
         ensure!(
             tokio::time::timeout(Duration::from_millis(250), &mut reload_task).await.is_err(),
             "same-members load renewed a group while GroupDropped was still in flight"
@@ -1664,6 +1670,13 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
             .context("private member shape was not installed before GroupCreated")?
             .id
             .clone();
+        let aggregate_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "fn": "count",
+            "subscription": "group-assembly-race",
+        });
+        let (status, body) = json(&app, Method::POST, "/v1/aggregates", Body::from(aggregate_body.to_string())).await?;
+        ensure!(status == StatusCode::CONFLICT, "aggregate escaped the group reservation: {status} {body}");
         let (status, body) = json(&app, Method::DELETE, &format!("/v1/shapes/{member0}"), Body::empty()).await?;
         ensure!(status == StatusCode::CONFLICT, "anonymous reservation release escaped the guard: {status} {body}");
         tokio::time::sleep(Duration::from_secs(6)).await;

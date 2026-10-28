@@ -358,26 +358,7 @@ impl Engine {
                     // One subscription id belongs to one shape (ADR-0008). Reusing it for a
                     // different predicate is refused rather than silently accepted: the caller
                     // would hold one name for two shapes and could release neither unambiguously.
-                    if stream_path_override.is_none() && st.group_claims.is_reserved(sub) {
-                        return Err(anyhow::Error::new(GroupConflict {
-                            subscription: sub.to_string(),
-                            owner: format!("group {sub}"),
-                        }));
-                    }
-                    if stream_path_override.is_none()
-                        && let Some(owner) = st.group_claims.private_owner(sub)
-                    {
-                        return Err(anyhow::Error::new(GroupConflict {
-                            subscription: sub.to_string(),
-                            owner: format!("group {owner}"),
-                        }));
-                    }
-                    if stream_path_override.is_none() && st.group_claims.get(sub).is_some() {
-                        return Err(anyhow::Error::new(GroupConflict {
-                            subscription: sub.to_string(),
-                            owner: format!("group {sub}"),
-                        }));
-                    }
+                    ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
                     ensure_subscription_free(&st, sub, &existing_id)?;
                     // A join and a RENEWAL are the same call: `subscribe` returns false when the
                     // shape already holds this id, in which case nothing is claimed and only the
@@ -454,26 +435,7 @@ impl Engine {
         }
         // Nothing to join: this create is about to mint a shape, so the id must be free of any
         // OTHER shape as well (the join path checked it against the one it was joining).
-        if stream_path_override.is_none() && st.group_claims.is_reserved(sub) {
-            return Err(anyhow::Error::new(GroupConflict {
-                subscription: sub.to_string(),
-                owner: format!("group {sub}"),
-            }));
-        }
-        if stream_path_override.is_none()
-            && let Some(owner) = st.group_claims.private_owner(sub)
-        {
-            return Err(anyhow::Error::new(GroupConflict {
-                subscription: sub.to_string(),
-                owner: format!("group {owner}"),
-            }));
-        }
-        if stream_path_override.is_none() && st.group_claims.get(sub).is_some() {
-            return Err(anyhow::Error::new(GroupConflict {
-                subscription: sub.to_string(),
-                owner: format!("group {sub}"),
-            }));
-        }
+        ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
         ensure_subscription_free(&st, sub, "")?;
 
         let num_id = st.next_shape_id;
@@ -858,6 +820,7 @@ impl Engine {
                 // Refuse before taking the claim — see the row-shape join path. Re-checked against
                 // the `gens` captured with `ts`, so a drift inside the `HEAD` window refuses the join.
                 self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+                ensure_group_subscription_available(&st, sub, false)?;
                 ensure_subscription_free(&st, sub, &existing_id)?;
                 let now = crate::changelog::now_secs();
                 let fresh = st.subscribe(&existing_id, sub.to_string(), now);
@@ -896,6 +859,7 @@ impl Engine {
                 return Ok(rec);
             }
         }
+        ensure_group_subscription_available(&st, sub, false)?;
         ensure_subscription_free(&st, sub, "")?;
 
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
@@ -2725,6 +2689,34 @@ fn ensure_subscription_free(st: &EngineState, sub: &str, shape: &str) -> Result<
         }
         _ => Ok(()),
     }
+}
+
+/// Refuse native claims that collide with a group's public reservation, record, or private member
+/// claim. Group member creation passes `internal_group_member` so its own claims can be installed
+/// atomically under the reservation capability; all other shape and aggregate paths pass `false`.
+fn ensure_group_subscription_available(st: &EngineState, sub: &str, internal_group_member: bool) -> Result<()> {
+    if internal_group_member {
+        return Ok(());
+    }
+    if st.group_claims.is_reserved(sub) {
+        return Err(anyhow::Error::new(GroupConflict {
+            subscription: sub.to_string(),
+            owner: format!("group {sub}"),
+        }));
+    }
+    if let Some(owner) = st.group_claims.private_owner(sub) {
+        return Err(anyhow::Error::new(GroupConflict {
+            subscription: sub.to_string(),
+            owner: format!("group {owner}"),
+        }));
+    }
+    if st.group_claims.get(sub).is_some() {
+        return Err(anyhow::Error::new(GroupConflict {
+            subscription: sub.to_string(),
+            owner: format!("group {sub}"),
+        }));
+    }
+    Ok(())
 }
 
 /// Everything a JOIN claimed before its first await, given back if it never reaches its own end —
