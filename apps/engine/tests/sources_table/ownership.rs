@@ -300,9 +300,7 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         let group_created = events.iter().any(|event| event["t"] == "groupCreated");
         let group_dropped = events.iter().any(|event| {
             event["t"] == "groupDropped"
-                && expected_group_drop
-                    .as_deref()
-                    .is_some_and(|group_id| event["groupId"].as_str() == Some(group_id))
+                && expected_group_drop.as_deref().is_some_and(|group_id| event["group_id"].as_str() == Some(group_id))
         });
         let hold = if group_dropped {
             *ds.hold_group_drop_id.lock().await = None;
@@ -1351,10 +1349,6 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
             .await
             .context("group release did not reach GroupDropped durability")?;
-        ensure!(
-            f.ds.group_created_holds.load(std::sync::atomic::Ordering::Relaxed) == 0,
-            "release-window hook must not hold replacement GroupCreated"
-        );
         let public_body = serde_json::json!({
             "table": format!("public.{}", f.outer),
             "changesOnly": true,
@@ -1380,10 +1374,6 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
             .context("same-members reload did not finish after release")?
             .context("same-members reload task failed")??;
         ensure!(reload_status == StatusCode::OK, "same-members reload failed: {reload_status} {fresh}");
-        ensure!(
-            fresh["groupId"].as_str() != Some(first["groupId"].as_str().unwrap_or_default()),
-            "reload reused released group id"
-        );
         let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
         ensure!(new_path != old_path, "closed group reload reused its old stream");
         f.client

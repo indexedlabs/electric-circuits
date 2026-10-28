@@ -2715,6 +2715,17 @@ mod tests {
         value
     }
 
+    #[test]
+    fn group_dropped_wire_key_is_snake_case() {
+        let value = serde_json::to_value(CatalogEvent::GroupDropped {
+            subscription: "s".into(),
+            group_id: Some("g".into()),
+        })
+        .unwrap();
+        assert_eq!(value["t"], "groupDropped");
+        assert_eq!(value["group_id"], "g");
+    }
+
     fn paged_catalog_fixture() -> Vec<serde_json::Value> {
         let mut created = created_event("public.users");
         created["eid"] = serde_json::json!("created");
