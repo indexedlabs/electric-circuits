@@ -1728,7 +1728,14 @@ async fn subset_load_group(
         }
     };
     #[cfg(feature = "test-support")]
-    test_group_page_barrier("private").await.map_err(AppError::from)?;
+    if let Err(error) = test_group_page_barrier("private").await {
+        snapshot_guard.finish().await;
+        for (rec, sub) in &created {
+            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+        }
+        engine.abort_group(&group_sub).await;
+        return Err(AppError::from(error));
+    }
     let reads = members
         .iter()
         .map(|m| crate::engine::SubsetReadReq {
@@ -1752,7 +1759,14 @@ async fn subset_load_group(
         }
     };
     #[cfg(feature = "test-support")]
-    test_group_page_barrier("page").await.map_err(AppError::from)?;
+    if let Err(error) = test_group_page_barrier("page").await {
+        snapshot_guard.finish().await;
+        for (rec, sub) in &created {
+            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+        }
+        engine.abort_group(&group_sub).await;
+        return Err(AppError::from(error));
+    }
     // The public page is read after the private member seeds. Add its actual keys to each
     // subquery member's delete gate before the group becomes durable; a later move-out can then
     // retract a row that was visible only in this shared page.

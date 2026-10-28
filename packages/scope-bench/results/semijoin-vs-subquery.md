@@ -224,6 +224,25 @@ at 1 Mbps, and byte accounting must precede delivery. Its first CI execution was
 genuinely red at t=125 ms; the working tree now applies the shared downlink model
 before delivery.
 
+### Current exact-head correction
+
+Head `87076ff` adds the missing real PostgreSQL page-handoff controls. The test-only
+sequencer pause keeps the source reader behind the page; an outer-row delete committed
+after the page is visible but unsequenced, so the live path cannot seed the member's
+FeedSet. Only the page-key handoff can emit the table-qualified tombstone, and the
+assertion checks the delete's source commit LSN. A second contract aborts the group
+request at both handoff barriers and checks that `inflight_querybacks` returns to zero.
+The test bodies use distinct names from their isolated wrappers.
+
+The benchmark now captures `/memory` and `/debug/dbsp-profile` both after group load
+and at the end of the hold. The end profile checks the requested mode and requires
+`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch also
+updates an assignment companion every 200 ms to exercise that path; this makes cold
+launch a corrected workload rather than a byte-for-byte replay of perf2. `readsPerChange`
+subtracts the benchmark writer's exact `BEGIN`/`COMMIT`/`ROLLBACK` utility statement
+count in addition to filtering its DML. The exact-head CI and five-repetition artifacts
+remain pending; no measurement is claimed until that run completes.
+
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
 the triggering commit LSN for synthetic tombstone headers. The handoff guard balances its state
@@ -275,9 +294,10 @@ contracts are unchanged. An additional PostgreSQL contract reparents one compani
 key out/in/out after separate source receipts and checks the diagnostic mode and
 join-execution counter. Focused operator coverage includes distinct contributors,
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
-The join and reparenting controls passed at `7cbda3f`; the delete-gate and
-shared-worker corrections still await CI. Existing claim/lease, public snapshot
-query, group stream and commit fence code is unchanged.
+The join and reparenting controls passed at `7cbda3f`; the delete-gate, shared-worker,
+page-handoff and cancellation corrections are implemented on `87076ff` and await its
+exact-head CI run. Existing claim/lease, public snapshot query, group stream and
+commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's
@@ -299,8 +319,8 @@ as the experiment progresses.
 | Thousands of groups plus held-log replay | Peak RSS against configured memory budget, rebuild + reload time | Pending |
 | Many groups and held SSE responses | Engine/DS/gateway fds and connections; release after close | Pending; native gateway/SSE topology absent from this checkout |
 | 30-phone reconnect burst | Seed columns, conflicts/timeouts, racing and retried claims | Pending; baseline rejects a repeated group claim with 409 |
-| Snapshot-only move-out and wire LSN | Exact delete after receipt and LSN on each membership event | Both green in both modes at `7cbda3f`; preserved through correction |
-| Companion reparenting | Table-qualified delete/upsert/delete after individual source receipts | Passed both modes at `7cbda3f`, including mode-execution diagnostic |
+| Snapshot-only move-out and wire LSN | Exact delete after receipt and LSN on each membership event | Both green in both modes at `7cbda3f`; exact-head rerun pending |
+| Companion reparenting | Table-qualified delete/upsert/delete after individual source receipts | Passed both modes at `7cbda3f`; exact-head rerun pending |
 | Snapshot/LSN boundary through Swift/GRDB | Same source prefix materialized across the real client stack | Unavailable in this repository alone |
 | Slot/WAL retention | No extra slots per group, lag and cleanup after drop/restart | Pending |
 | Five-second authority rechecks | Measured recheck load under peak held streams | Pending; perf2 has a modeled gateway |

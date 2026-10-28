@@ -64,8 +64,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupReparent => group_companion_reparenting(&fixture).await,
             Case::GroupNeverMember => group_never_member_writes_are_silent(&fixture).await,
             Case::GroupSibling => group_disjoint_sibling_survives_inner_move_out(&fixture).await,
-            Case::GroupPageHandoff => group_page_handoff_preserves_newer_move_out(&fixture).await,
-            Case::GroupPageCancellation => group_page_cancellation_releases_queryback_window(&fixture).await,
+            Case::GroupPageHandoff => page_handoff_tombstone_contract(&fixture).await,
+            Case::GroupPageCancellation => page_cancellation_contract(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -1053,8 +1053,8 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
 
 // Hold the real group request twice so a source transaction can be placed on each side of the
 // page/feed handoff: the new row is committed after the private changes-only seed but before the
-// public page, then its inner key is removed after the page and before page keys are installed.
-async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> {
+// public page, then its outer row is deleted after the page and before page keys are installed.
+async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
     install_source_fence(f).await?;
     let barrier = f.root.join("group-page-handoff");
     let base = barrier.to_string_lossy().into_owned();
@@ -1103,7 +1103,7 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
             .batch_execute(&format!(
                 "BEGIN; DELETE FROM public.{} WHERE id = 3; \
                  INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
-                f.inner, left
+                f.outer, left
             ))
             .await?;
         engine.resume_reads_for_test().await?;
@@ -1138,7 +1138,7 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
     result
 }
 
-async fn group_page_cancellation_releases_queryback_window(f: &Fixture) -> Result<()> {
+async fn page_cancellation_contract(f: &Fixture) -> Result<()> {
     install_source_fence(f).await?;
     for (index, cancel_stage) in ["private", "page"].into_iter().enumerate() {
         let barrier = f.root.join(format!("group-page-cancel-{index}"));

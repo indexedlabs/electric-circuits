@@ -337,6 +337,9 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     // Keep everything live for a while with writes landing on the heavy account.
     let n = 0
     let steadyWrites = 0
+    // `pg_stat_statements.track_utility` counts the benchmark writer's explicit transaction
+    // commands. Keep an exact count so readsPerChange contains engine/query-back statements only.
+    let harnessUtilityStatements = 0
     if (!STEADY) {
       timers.push(
         setInterval(() => {
@@ -367,6 +370,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
             writeStarted.set(marker, performance.now())
             const assignmentId = `${marker}-assignment`
             const taggedId = `${marker}-tag`
+            harnessUtilityStatements++
             await admin.query('begin')
             await admin.query(`update record set title = $1 where id = $2 and user_id = $3`, [marker, recordId, user])
             await admin.query(
@@ -377,10 +381,12 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
               `insert into tagged_item (id, user_id, record_id, tag_id) values ($1, $2, $3, $4) on conflict (id) do update set tag_id = excluded.tag_id`,
               [taggedId, user, recordId, marker],
             )
+            harnessUtilityStatements++
             await admin.query('commit')
             steadyWrites++
           }
         } catch {
+          harnessUtilityStatements++
           await admin.query('rollback').catch(() => {})
         } finally {
           writeBusy = false
@@ -449,7 +455,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       result.steadyWriteP90 = writeLatencies.length ? Math.round(quantile(writeLatencies, 0.9)) : null
     }
     const x1 = await pgStats()
-    result.pgStatements = x1.calls - x0.calls
+    result.pgStatements = Math.max(0, x1.calls - x0.calls - harnessUtilityStatements)
     result.pgExecMs = Math.round(x1.ms - x0.ms)
     result.steadyWrites = steadyWrites
     result.readsPerChange = steadyWrites ? result.pgStatements / steadyWrites : null
