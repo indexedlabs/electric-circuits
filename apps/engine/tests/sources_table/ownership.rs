@@ -59,6 +59,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupFence => group_uses_one_snapshot_fence(&fixture).await,
             Case::GroupRetirement => group_retirement_reloads_and_closed_stream_is_conflict(&fixture).await,
             Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
+            Case::GroupSnapshotMoveOut => group_snapshot_only_member_moves_out(&fixture).await,
+            Case::GroupMemberLsn => group_member_events_have_lsn(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -85,6 +87,8 @@ enum Case {
     GroupFence,
     GroupRetirement,
     GroupRestart,
+    GroupSnapshotMoveOut,
+    GroupMemberLsn,
 }
 
 #[test]
@@ -169,6 +173,18 @@ fn group_retirement_reloads_and_closed_stream_is_409() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_restart_restores_plain_and_drops_mixed_groups() -> Result<()> {
     isolated("ownership::group_restart_restores_plain_and_drops_mixed_groups", Case::GroupRestart)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_snapshot_only_member_emits_move_out() -> Result<()> {
+    isolated("ownership::group_snapshot_only_member_emits_move_out", Case::GroupSnapshotMoveOut)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_membership_events_carry_commit_lsn() -> Result<()> {
+    isolated("ownership::group_membership_events_carry_commit_lsn", Case::GroupMemberLsn)
 }
 
 #[derive(Clone)]
@@ -926,6 +942,81 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
         ensure!(receipt.source_commit_id == commit.to_string(), "wrong source receipt: {receipt:?}");
         let events = wait_group_events(f, &stream_path, baseline + 1).await?;
         ensure!(events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")), "group lane did not emit before receipt: {events:?}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+// The only source mutation removes a row from the inner set. The outer row came from
+// the returned group snapshot and has never had a live upsert. After the source receipt,
+// the stream must contain the delete needed to remove that snapshot row from a client.
+// Do not wait for a delete here: a missing effect is an assertion failure, not a timeout.
+async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-snapshot-move-out", false)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let rows = body["results"][1]["rows"].as_array().context("companion snapshot rows")?;
+        ensure!(rows.len() == 1, "expected the one snapshot-only companion row: {body}");
+        let path = body["streamPath"].as_str().context("group stream path")?;
+        let baseline = stream_events(f, path).await.len();
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; DELETE FROM public.{} WHERE id = 1; \
+                 INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.inner, commit
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, commit).await?;
+        let events = stream_events(f, path).await;
+        let expected_type = format!("public.{}", f.outer);
+        ensure!(
+            events.iter().skip(baseline).any(|event| {
+                event_key(event).as_deref() == Some("1")
+                    && event_operation(event) == Some("delete")
+                    && event["type"].as_str() == Some(expected_type.as_str())
+            }),
+            "snapshot-only companion remained after its source receipt: {events:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-member-lsn", false)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let path = body["streamPath"].as_str().context("group stream path")?;
+        let baseline = stream_events(f, path).await.len();
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id) VALUES (2); \
+                 INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.inner, commit
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, commit).await?;
+        let events = stream_events(f, path).await;
+        let delivered: Vec<_> = events.iter().skip(baseline).collect();
+        ensure!(!delivered.is_empty(), "move-in produced no member event after source receipt");
+        for event in delivered {
+            ensure!(
+                event["headers"]["lsn"].as_str().is_some_and(|lsn| !lsn.is_empty()),
+                "membership event lacks the wire LSN required by the client: {event}"
+            );
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
