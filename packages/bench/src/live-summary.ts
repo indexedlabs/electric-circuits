@@ -26,7 +26,7 @@ export interface LiveSummary {
   heldConnections: number
   inFlightConnections: number
   totalReconnectsPerMinute: number[]
-  finalTotalReconnectsPerMinute: number
+  estimatedFinalLevelReconnectsPerMinute: number
   reconnectsPerSubscriptionMinute: number
   readinessSpreadsMs: Array<number | null>
   deliveryP50Ms: number | null
@@ -74,7 +74,7 @@ export function summarizeLiveRuns(runs: LiveSummaryRun[]): LiveSummary {
     heldConnections,
     inFlightConnections,
     totalReconnectsPerMinute,
-    finalTotalReconnectsPerMinute: totalReconnectsPerMinute.reduce((n, rate) => n + rate, 0),
+    estimatedFinalLevelReconnectsPerMinute: totalReconnectsPerMinute.reduce((n, rate) => n + rate, 0),
     reconnectsPerSubscriptionMinute: subscriptionMinutes ? reconnects / subscriptionMinutes : 0,
     readinessSpreadsMs,
     deliveryP50Ms: percentile(deliveries, 0.5),

@@ -54,8 +54,10 @@ MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=10,25,50,100 MATRIX_PROJECTS=20 \
 transport. `SCALE_LIVE_MODE=long-poll` is the default; set `SCALE_LIVE_MODE=sse` for a real
 `text/event-stream` read. The SSE worker advances only from `control` events' `streamNextOffset`
 and reconnects from that opaque cursor when the server ends a response. Both modes report upstream
-read count, peak held connections, total reconnects per ramp increment and the cumulative final-level
-total, reconnects per subscription minute and write-to-delivery p50/p90 when writes are enabled.
+read count, peak held connections, total reconnects per ramp increment and an estimated final-level
+rate (the sum of per-increment rates), reconnects per subscription minute and write-to-delivery p50/p90
+when writes are enabled. For gateway sizing at the peak, run one level at the peak subscription count
+without a ramp; that single-level total reconnects/min is measured over one common observation window.
 
 ```bash
 SCALE_LIVE_MODE=sse SCALE_LIVE_SUBS=100 SCALE_LIVE_WRITES=20 \
