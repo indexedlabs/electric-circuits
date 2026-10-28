@@ -848,9 +848,13 @@ async fn wait_group_stream_retired(f: &Fixture, stream_path: &str) -> Result<()>
     let mut changed = f.ds.changed.subscribe();
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if f.ds.retired.lock().await.iter().any(|(method, path)| {
-                *method == Method::POST && path.ends_with(stream_path)
-            }) {
+            if f.ds
+                .retired
+                .lock()
+                .await
+                .iter()
+                .any(|(method, path)| *method == Method::POST && path.ends_with(stream_path))
+            {
                 return Ok::<_, anyhow::Error>(());
             }
             changed.changed().await.context("group retirement observation channel closed")?;
@@ -1111,17 +1115,8 @@ async fn group_release_reloads_same_subscription(f: &Fixture) -> Result<()> {
         ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release}");
         wait_group_stream_retired(f, &old_path).await?;
         for shape_id in &old_shapes {
-            let (status, _) = json(
-                &app,
-                Method::GET,
-                &format!("/v1/shapes/{shape_id}"),
-                Body::empty(),
-            )
-            .await?;
-            ensure!(
-                status == StatusCode::NOT_FOUND,
-                "released member {shape_id} still exists: {status}"
-            );
+            let (status, _) = json(&app, Method::GET, &format!("/v1/shapes/{shape_id}"), Body::empty()).await?;
+            ensure!(status == StatusCode::NOT_FOUND, "released member {shape_id} still exists: {status}");
         }
         let (reload_status, second) = post_group(&app, group_body(f, "group-release-reload", true)).await?;
         ensure!(reload_status == StatusCode::OK, "same-subscription reload failed: {reload_status} {second}");
@@ -1134,9 +1129,7 @@ async fn group_release_reloads_same_subscription(f: &Fixture) -> Result<()> {
             .map(|member| member["shapeId"].as_str().map(ToOwned::to_owned).context("reloaded member shape id"))
             .collect::<Result<_>>()?;
         ensure!(new_shapes.iter().all(|id| !old_shapes.contains(id)), "reload reused released member shapes");
-        f.client
-            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (3, 'reload')", f.outer))
-            .await?;
+        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (3, 'reload')", f.outer)).await?;
         let events = wait_group_events(f, new_path, 1).await?;
         ensure!(
             events.iter().any(|event| event_key(event).as_deref() == Some("3")),
@@ -1160,9 +1153,7 @@ async fn group_lapse_reloads_same_subscription(f: &Fixture) -> Result<()> {
         ensure!(reload_status == StatusCode::OK, "lapsed group did not reload: {reload_status} {second}");
         let new_path = second["streamPath"].as_str().context("new group stream path")?;
         ensure!(new_path != old_path, "lapsed group reused old stream {old_path}");
-        f.client
-            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (4, 'lapse')", f.outer))
-            .await?;
+        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (4, 'lapse')", f.outer)).await?;
         let events = wait_group_events(f, new_path, 1).await?;
         ensure!(
             events.iter().any(|event| event_key(event).as_deref() == Some("4")),
@@ -1187,15 +1178,10 @@ async fn group_restart_restores_plain_and_drops_mixed(f: &Fixture) -> Result<()>
         let (status, duplicate_plain) = post_group(&restarted_app, group_body(f, "group-plain-restart", true)).await?;
         ensure!(status == StatusCode::OK, "plain group did not renew after restart: {status} {duplicate_plain}");
         ensure!(duplicate_plain["streamPath"] == plain["streamPath"], "restored plain group changed stream path");
-        f.client
-            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (5, 'restart')", f.outer))
-            .await?;
-        let restart_events = wait_group_events(
-            f,
-            duplicate_plain["streamPath"].as_str().context("restored plain stream path")?,
-            1,
-        )
-        .await?;
+        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (5, 'restart')", f.outer)).await?;
+        let restart_events =
+            wait_group_events(f, duplicate_plain["streamPath"].as_str().context("restored plain stream path")?, 1)
+                .await?;
         ensure!(
             restart_events.iter().any(|event| event_key(event).as_deref() == Some("5")),
             "restored group missed live output: {restart_events:?}"
