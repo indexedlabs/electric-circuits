@@ -3369,6 +3369,39 @@ impl Engine {
 mod cancellation_tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_create_refuses_a_recorded_group_subscription_during_teardown() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-admission-guard".into(), store);
+        let (engine, _) = engine_with_subquery_tables_ds(ds).await;
+        let group = GroupRecord {
+            id: "shape/group-teardown".into(),
+            stream_path: "shape/group-teardown".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: String::new(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+            st.group_claims.complete(group);
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.create_shape_as(&"outer_t".into(), None, None, false, true, Some("scope".into())),
+        )
+        .await
+        .expect("plain create admission guard must not hang");
+        let error = result.expect_err("a recorded group subscription must remain unavailable to plain create");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
+            .await
+            .expect("plain create admission guard engine close must complete");
+    }
+
     #[tokio::test]
     async fn create_replay_keeps_each_commit_separately_pending() {
         use crate::subquery::{DeferredNodeWork, DeferredShapeWork, FinishedCreate, Flip, FlipDir};
@@ -3442,7 +3475,11 @@ mod cancellation_tests {
     /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream
     /// DELETE fails and is ignored, which leaves exactly the in-memory state these tests assert on.
     async fn engine_with_subquery_tables() -> (Engine, PredicateJson) {
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine_with_subquery_tables_ds(DsClient::new_for_in_process_test("http://127.0.0.1:1")).await
+    }
+
+    async fn engine_with_subquery_tables_ds(ds: DsClient) -> (Engine, PredicateJson) {
+        let engine = Engine::new_for_in_process_test(ds);
         let schema: Schema = serde_json::from_value(serde_json::json!({
             "tables": {
                 "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },

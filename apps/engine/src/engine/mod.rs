@@ -3123,13 +3123,13 @@ impl Engine {
     }
 
     pub(crate) async fn finish_group_release(&self, subscription: &str, group_id: &str) -> Result<()> {
-        let _ = self.take_group(subscription, group_id).await;
         self.catalog_tx
             .send_durable(CatalogEvent::GroupDropped {
                 subscription: subscription.to_string(),
                 group_id: Some(group_id.to_string()),
             })
             .await?;
+        let _ = self.take_group(subscription, group_id).await;
         Ok(())
     }
 

@@ -289,13 +289,14 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         }
     }
     if method == Method::POST && path.ends_with("meta/catalog") {
-        // Inspect the catalog batch so the gate holds the actual GroupCreated durability point,
+        // Inspect the catalog batch so the gate holds the actual group lifecycle durability point,
         // after every member claim exists, rather than an earlier member Created append.
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(body, 64 * 1024 * 1024).await.unwrap_or_default();
-        let is_group_created = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes)
-            .is_ok_and(|events| events.iter().any(|event| event["t"] == "groupCreated"));
-        let hold = if is_group_created {
+        let is_group_lifecycle = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).is_ok_and(|events| {
+            events.iter().any(|event| matches!(event["t"].as_str(), Some("groupCreated") | Some("groupDropped")))
+        });
+        let hold = if is_group_lifecycle {
             let mut armed = ds.hold_group_catalog.lock().await;
             let hold = *armed;
             *armed = false;
@@ -1325,6 +1326,14 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
         });
         wait_group_stream_closed(f, &old_path).await?;
 
+        *f.ds.hold_group_catalog.lock().await = true;
+        let reload_app = app.clone();
+        let reload_body = group_body(f, "group-closed-reload", true);
+        let mut reload_task = tokio::spawn(async move { post_group(&reload_app, reload_body).await });
+        release_group_delete(f, &old_path, gate).await;
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+            .await
+            .context("group release did not reach GroupDropped durability")?;
         let public_body = serde_json::json!({
             "table": format!("public.{}", f.outer),
             "changesOnly": true,
@@ -1335,30 +1344,16 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
             status == StatusCode::CONFLICT,
             "plain create claimed a group subscription during release: {status} {conflict}"
         );
-
-        release_group_delete(f, &old_path, gate).await;
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(250), &mut reload_task).await.is_err(),
+            "same-members load renewed a group while GroupDropped was still in flight"
+        );
+        f.ds.group_catalog_release.notify_one();
         let (release_status, release_body) = tokio::time::timeout(Duration::from_secs(15), release_task)
             .await
             .context("group release did not finish after stream retirement was released")?
             .context("group release task failed")??;
         ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release_body}");
-        let (status, recreated) = json(&app, Method::POST, "/v1/shapes", Body::from(public_body.to_string())).await?;
-        ensure!(
-            status == StatusCode::OK,
-            "plain create could not claim the released group subscription: {status} {recreated}"
-        );
-        let recreated_id = recreated["shapeId"].as_str().context("recreated standalone shape")?;
-        let (status, released) = json(
-            &app,
-            Method::DELETE,
-            &format!("/v1/shapes/{recreated_id}?subscription=group-closed-reload"),
-            Body::empty(),
-        )
-        .await?;
-        ensure!(status == StatusCode::OK, "standalone claim release failed: {status} {released}");
-        let reload_app = app.clone();
-        let reload_body = group_body(f, "group-closed-reload", true);
-        let reload_task = tokio::spawn(async move { post_group(&reload_app, reload_body).await });
         let (reload_status, fresh) = tokio::time::timeout(Duration::from_secs(15), reload_task)
             .await
             .context("same-members reload did not finish after release")?
