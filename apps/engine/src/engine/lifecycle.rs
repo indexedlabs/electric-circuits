@@ -2134,11 +2134,34 @@ impl Engine {
 
     pub(crate) async fn release_group_claim(&self, subscription: &str) -> Result<()> {
         let Some(group) = self.group_record(subscription).await else { return Ok(()) };
+        let (release, joined_existing) = {
+            let mut releases = self.group_releases.lock().unwrap();
+            if let Some(existing) = releases.get(&group.id) {
+                (existing.clone(), true)
+            } else {
+                let release = crate::engine::GroupRelease::new();
+                releases.insert(group.id.clone(), release.clone());
+                (release, false)
+            }
+        };
+        if joined_existing {
+            return release.wait().await;
+        }
         self.group_lanes.remove(&group.stream_path);
         let engine = self.clone();
         let subscription = subscription.to_string();
+        let group_id = group.id.clone();
+        let task_release = release.clone();
         let done =
-            self.shutdown_token().spawn(async move { engine.release_group_claim_owned(&subscription, group).await });
+            self.shutdown_token().spawn(async move {
+                let result = engine.release_group_claim_owned(&subscription, group).await;
+                task_release.complete(&result);
+                let mut releases = engine.group_releases.lock().unwrap();
+                if releases.get(&group_id).is_some_and(|current| std::sync::Arc::ptr_eq(current, &task_release)) {
+                    releases.remove(&group_id);
+                }
+                result
+            });
         done.await.map_err(|_| anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN))?
     }
 
@@ -2161,7 +2184,7 @@ impl Engine {
         }
         // The public claim is dropped last, after every private member release and purge has
         // completed. A cancelled request leaves this engine-owned task running to completion.
-        if let Err(error) = self.finish_group_release(subscription).await {
+        if let Err(error) = self.finish_group_release(subscription, &group.id).await {
             first_error.get_or_insert(error);
         }
         if let Some(error) = first_error { Err(error) } else { Ok(()) }

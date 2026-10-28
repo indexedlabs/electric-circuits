@@ -110,6 +110,16 @@ impl GroupClaims {
         self.records.remove(subscription)
     }
 
+    pub(crate) fn release_if_matches(&mut self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
+        if self.records.get(subscription).is_some_and(|record| record.id == group_id) {
+            self.reserved.remove(subscription);
+            self.private_members.retain(|_, owner| owner != subscription);
+            self.records.remove(subscription)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn get(&self, subscription: &str) -> Option<&GroupRecord> {
         self.records.get(subscription)
     }
@@ -129,6 +139,36 @@ impl GroupClaims {
     pub(crate) fn reserve_private_members(&mut self, group: &str, members: impl IntoIterator<Item = String>) {
         for member in members {
             self.private_members.insert(member, group.to_string());
+        }
+    }
+}
+
+/// Completion shared by callers that race a group release. The release task is engine-owned, so
+/// cancelling one HTTP request cannot strand another caller waiting for the same teardown.
+pub(crate) struct GroupRelease {
+    done: tokio::sync::Notify,
+    result: std::sync::Mutex<Option<std::result::Result<(), String>>>,
+}
+
+impl GroupRelease {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self { done: tokio::sync::Notify::new(), result: std::sync::Mutex::new(None) })
+    }
+
+    pub(crate) fn complete(&self, result: &anyhow::Result<()>) {
+        let result = result.as_ref().map(|_| ()).map_err(|error| format!("{error:#}"));
+        *self.result.lock().unwrap() = Some(result);
+        self.done.notify_waiters();
+    }
+
+    pub(crate) async fn wait(&self) -> anyhow::Result<()> {
+        loop {
+            let notified = self.done.notified();
+            notified.enable();
+            if let Some(result) = self.result.lock().unwrap().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            notified.await;
         }
     }
 }

@@ -1107,7 +1107,20 @@ async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> 
         })
         .await
         .context("waiting for group stream retirement")??;
-        let (status, closed) = post_group(&app, group_body(f, "group-retire-closed", false)).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let (status, closed) = loop {
+            let (status, body) = post_group(&app, group_body(f, "group-retire-closed", false)).await?;
+            if status == StatusCode::OK {
+                break (status, body);
+            }
+            ensure!(
+                status == StatusCode::INTERNAL_SERVER_ERROR
+                    && body["error"].as_str().is_some_and(|message| message.contains("being resolved")),
+                "a fresh group must reload after retirement: {status} {body}"
+            );
+            ensure!(tokio::time::Instant::now() < deadline, "schema resolution did not settle before reload");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         ensure!(status == StatusCode::OK, "a fresh group must reload after retirement: {status} {closed}");
         Ok::<_, anyhow::Error>(())
     }
@@ -1178,6 +1191,12 @@ async fn group_lapse_reloads_same_subscription(f: &Fixture) -> Result<()> {
         ensure!(reload_status == StatusCode::OK, "lapsed group did not reload: {reload_status} {second}");
         let new_path = second["streamPath"].as_str().context("new group stream path")?;
         ensure!(new_path != old_path, "lapsed group reused old stream {old_path}");
+        let (renew_status, renewed) = post_group(&app, group_body(f, "group-lapse-reload", true)).await?;
+        ensure!(
+            renew_status == StatusCode::OK,
+            "reloaded lapsed group could not renew before its live wait: {renew_status} {renewed}"
+        );
+        ensure!(renewed["streamPath"].as_str() == Some(new_path), "renewal changed the reloaded group stream");
         f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (4, 'lapse')", f.outer)).await?;
         let events = wait_group_events(f, new_path, 1).await?;
         ensure!(

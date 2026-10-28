@@ -1211,7 +1211,7 @@ async fn subset_load_group(
                 retry_after: false,
             });
         }
-        if !engine.group_is_healthy(&existing).await {
+        if engine.group_release_in_flight(&existing.id).is_some() || !engine.group_is_healthy(&existing).await {
             engine.release_group_claim(&group_sub).await.map_err(AppError::from)?;
         } else {
             engine.renew_group_claim(&existing).await.map_err(AppError::from)?;

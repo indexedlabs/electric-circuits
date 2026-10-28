@@ -89,7 +89,9 @@ impl Default for SubqueryAdmission {
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
-pub(crate) use group::{GroupClaims, GroupConflict, GroupFence, GroupMember, GroupRecord, GroupStreamClosed};
+pub(crate) use group::{
+    GroupClaims, GroupConflict, GroupFence, GroupMember, GroupRecord, GroupRelease, GroupStreamClosed,
+};
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
     GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
@@ -593,6 +595,9 @@ pub struct Engine {
     /// Per-engine group transaction fence. It must never be process-global.
     group_fence: GroupFence,
     group_lanes: crate::engine::emission::GroupEmissionLanes,
+    /// Group teardowns keyed by group identity. A reload waits for an in-flight release instead of
+    /// renewing the dying record or allowing a stale task to drop a replacement under the same name.
+    group_releases: Arc<std::sync::Mutex<HashMap<String, Arc<GroupRelease>>>>,
     /// Latched when live replay cannot continue: a missing segment or unrecoverable body-cap breach.
     pub(crate) sequencer_read_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Table schemas shared with the sequencer task and the replication ingestor — the set of
@@ -1645,6 +1650,7 @@ impl Engine {
             degrade,
             group_fence,
             group_lanes,
+            group_releases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
@@ -2942,7 +2948,10 @@ impl Engine {
         if !valid {
             let _ = self
                 .catalog_tx
-                .send_durable(CatalogEvent::GroupDropped { subscription: record.subscription.clone() })
+                .send_durable(CatalogEvent::GroupDropped {
+                    subscription: record.subscription.clone(),
+                    group_id: Some(record.id.clone()),
+                })
                 .await;
             return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
         }
@@ -2953,12 +2962,18 @@ impl Engine {
 
     pub(crate) async fn abort_group(&self, subscription: &str) -> Result<()> {
         self.state.lock().await.group_claims.release(subscription);
-        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
+        self.catalog_tx
+            .send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string(), group_id: None })
+            .await?;
         Ok(())
     }
 
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
         self.state.lock().await.group_claims.get(subscription).cloned()
+    }
+
+    pub(crate) fn group_release_in_flight(&self, group_id: &str) -> Option<Arc<GroupRelease>> {
+        self.group_releases.lock().unwrap().get(group_id).cloned()
     }
 
     pub(crate) fn register_group_lane(&self, stream_path: &str) {
@@ -3018,17 +3033,22 @@ impl Engine {
     /// Remove the public group record and return its private members.  The caller performs
     /// the durable member releases outside the state lock, preserving the normal lifecycle
     /// ordering and avoiding network I/O while holding engine state.
-    pub(crate) async fn take_group(&self, subscription: &str) -> Option<GroupRecord> {
-        let record = self.state.lock().await.group_claims.release(subscription);
+    pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
+        let record = self.state.lock().await.group_claims.release_if_matches(subscription, group_id);
         if record.is_some() {
             self.group_fence.deactivate();
         }
         record
     }
 
-    pub(crate) async fn finish_group_release(&self, subscription: &str) -> Result<()> {
-        let _ = self.take_group(subscription).await;
-        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
+    pub(crate) async fn finish_group_release(&self, subscription: &str, group_id: &str) -> Result<()> {
+        let _ = self.take_group(subscription, group_id).await;
+        self.catalog_tx
+            .send_durable(CatalogEvent::GroupDropped {
+                subscription: subscription.to_string(),
+                group_id: Some(group_id.to_string()),
+            })
+            .await?;
         Ok(())
     }
 

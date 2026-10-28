@@ -61,6 +61,10 @@ pub(crate) enum CatalogEvent {
     },
     GroupDropped {
         subscription: String,
+        /// New events identify the group instance being retired. Old catalog records omitted this
+        /// field, so `None` remains a name-only drop for backward-compatible replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
     },
     /// A subscription joined a shared feed, or RENEWED its lease (ADR-0008): the same subscription
     /// id twice is one claim, and the second one only moves `at`. The fold keeps a SET, so a
@@ -1065,8 +1069,12 @@ impl CatalogFold {
             CatalogEvent::GroupCreated { group } => {
                 self.groups.insert(group.subscription.clone(), group);
             }
-            CatalogEvent::GroupDropped { subscription } => {
-                self.groups.remove(&subscription);
+            CatalogEvent::GroupDropped { subscription, group_id } => {
+                if group_id.is_none()
+                    || self.groups.get(&subscription).is_some_and(|group| Some(&group.id) == group_id.as_ref())
+                {
+                    self.groups.remove(&subscription);
+                }
             }
             CatalogEvent::Created { rec, sig, subscription, at } => {
                 // Every create moves the id high-water mark, and nothing ever moves it back (see
@@ -1727,7 +1735,10 @@ impl Engine {
                     self.group_fence.activate();
                 } else {
                     tracing::info!(%subscription, "restore: dropping group with a non-restorable subquery member");
-                    self.catalog_tx.send(CatalogEvent::GroupDropped { subscription });
+                    self.catalog_tx.send(CatalogEvent::GroupDropped {
+                        subscription,
+                        group_id: Some(group.id.clone()),
+                    });
                     for member in &group.members {
                         if let Some(rec) = st.shapes.remove(&member.shape_id) {
                             st.forget_subscriptions(&member.shape_id);
