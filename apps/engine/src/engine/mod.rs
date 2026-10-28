@@ -2945,6 +2945,7 @@ impl Engine {
             let valid = record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id));
             if valid {
                 st.group_claims.complete(record.clone());
+                self.group_fence.activate();
             }
             valid
         };
@@ -2958,7 +2959,6 @@ impl Engine {
                 .await;
             return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
         }
-        self.group_fence.activate();
         Ok(())
     }
 
@@ -3069,7 +3069,8 @@ impl Engine {
     /// the durable member releases outside the state lock, preserving the normal lifecycle
     /// ordering and avoiding network I/O while holding engine state.
     pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
-        let record = self.state.lock().await.group_claims.release_if_matches(subscription, group_id);
+        let mut st = self.state.lock().await;
+        let record = st.group_claims.release_if_matches(subscription, group_id);
         if record.is_some() {
             self.group_fence.deactivate();
         }

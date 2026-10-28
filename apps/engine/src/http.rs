@@ -1268,9 +1268,10 @@ async fn subset_load_group(
                         "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
                     })));
                 }
-                // The member claim can lapse between the health probe and the renewal lock.
-                // Treat that as an unhealthy existing group, release its durable record, and
-                // let this request reserve a fresh group rather than returning a conflict.
+                // A member claim can lapse between the health probe and the renewal lock, or the
+                // renewal can succeed while its stream closes. Treat either outcome as an
+                // unhealthy existing group, release its durable record, and let this request
+                // reserve a fresh group rather than returning a conflict.
                 engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
             }
         }

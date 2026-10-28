@@ -1174,7 +1174,7 @@ async fn group_uses_one_snapshot_fence(f: &Fixture) -> Result<()> {
     result
 }
 
-async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> Result<()> {
+async fn group_retirement_reloads_and_closed_stream_is_recreated(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, body) = post_group(&app, group_body(f, "group-retire", false)).await?;
@@ -1199,8 +1199,8 @@ async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> 
         .await
         .context("waiting for group stream retirement")??;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let (status, closed) = loop {
-            let (status, body) = post_group(&app, group_body(f, "group-retire-closed", false)).await?;
+        let (status, fresh) = loop {
+            let (status, body) = post_group(&app, group_body(f, "group-retire", false)).await?;
             if status == StatusCode::OK {
                 break (status, body);
             }
@@ -1212,7 +1212,11 @@ async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> 
             ensure!(tokio::time::Instant::now() < deadline, "schema resolution did not settle before reload");
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        ensure!(status == StatusCode::OK, "a fresh group must reload after retirement: {status} {closed}");
+        ensure!(status == StatusCode::OK, "a fresh group must reload after retirement: {status} {fresh}");
+        ensure!(
+            fresh["streamPath"].as_str().is_some_and(|path| path != stream_path),
+            "a fresh group must not reuse retired stream path: {fresh}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
