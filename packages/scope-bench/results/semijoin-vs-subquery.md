@@ -224,7 +224,7 @@ before delivery.
 
 ### Current exact-head correction
 
-Head `8185b7b` adds the missing real PostgreSQL page-handoff controls. The test-only
+Head `6a58456` adds the missing real PostgreSQL page-handoff controls. The test-only
 sequencer pause keeps the source reader behind the page; an outer-row delete committed
 after the page is visible but unsequenced, so the live path cannot seed the member's
 FeedSet. Only the page-key handoff can emit the table-qualified tombstone, and the
@@ -251,8 +251,9 @@ tombstone assertion. At `8185b7b`, the subquery group loop passed its handoff co
 but `ownership::group_page_cancellation_releases_queryback_window` failed during its
 cleanup with `the slot is held by walsender pid 17649`; the semijoin loop passed. The
 library then failed `subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback`
-at `group snapshot table disappeared`. `327653b` fixes the split cancellation cases and
-installs the missing unit-test schema; this head also applies the pinned rustfmt output.
+at `group snapshot table disappeared`. `6a58456` splits the cancellation cases, asserts clean engine shutdown, and installs
+the missing unit-test schema; the current head fixes its two wrapper-format diffs and
+adds member cleanup for cancellation during group creation.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

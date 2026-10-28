@@ -217,9 +217,34 @@ interface RunResult {
 
 let steadyRecordsByUser: Record<string, string> = {}
 
+function baseRunResult(sc: Scenario, cfg: Config, rep: number): RunResult {
+  return {
+    membershipMode: MEMBERSHIP_MODE,
+    scenario: sc.name,
+    config: cfg.name,
+    rep,
+    screens: {},
+    phoneRequests: 0,
+    loadRequests: 0,
+    bytesDown: 0,
+    gatewayCpuMs: 0,
+    gatewayLagP99: 0,
+    gatewayLagMax: 0,
+    engineCpuMs: 0,
+    pgStatements: 0,
+    pgExecMs: 0,
+    longPollsHeld: 0,
+  }
+}
+
 async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Config, rep: number): Promise<RunResult> {
   const sc = scs[0]!
-  const srv = await bootServers(pgUrl)
+  let srv: Awaited<ReturnType<typeof bootServers>>
+  try {
+    srv = await bootServers(pgUrl)
+  } catch (error) {
+    return { ...baseRunResult(sc, cfg, rep), error: `boot failed: ${String((error as Error).message ?? error)}` }
+  }
   const writeStarted = new Map<string, number>()
   const writeLatencies: number[] = []
   const onWake = (body: string, at: number) => {
@@ -244,23 +269,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     )
     return { calls: Number(r.rows[0].calls), ms: Number(r.rows[0].ms) }
   }
-  const result: RunResult = {
-    membershipMode: MEMBERSHIP_MODE,
-    scenario: sc.name,
-    config: cfg.name,
-    rep,
-    screens: {},
-    phoneRequests: 0,
-    loadRequests: 0,
-    bytesDown: 0,
-    gatewayCpuMs: 0,
-    gatewayLagP99: 0,
-    gatewayLagMax: 0,
-    engineCpuMs: 0,
-    pgStatements: 0,
-    pgExecMs: 0,
-    longPollsHeld: 0,
-  }
+  const result = baseRunResult(sc, cfg, rep)
   const timers: NodeJS.Timeout[] = []
   const sum = (f: (p: Phone) => number) => phones.reduce((a, p) => a + f(p), 0)
   try {

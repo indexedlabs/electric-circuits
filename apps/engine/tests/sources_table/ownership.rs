@@ -124,19 +124,13 @@ fn group_page_handoff_outer_delete_emits_tombstone() -> Result<()> {
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_page_private_cancellation_releases_queryback_window() -> Result<()> {
-    isolated(
-        "ownership::group_page_private_cancellation_releases_queryback_window",
-        Case::GroupPagePrivateCancellation,
-    )
+    isolated("ownership::group_page_private_cancellation_releases_queryback_window", Case::GroupPagePrivateCancellation)
 }
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_page_page_cancellation_releases_queryback_window() -> Result<()> {
-    isolated(
-        "ownership::group_page_page_cancellation_releases_queryback_window",
-        Case::GroupPagePageCancellation,
-    )
+    isolated("ownership::group_page_page_cancellation_releases_queryback_window", Case::GroupPagePageCancellation)
 }
 
 #[test]
@@ -1212,7 +1206,10 @@ async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<(
     .await
     .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
-    engine.close(Duration::from_secs(10)).await;
+    ensure!(
+        engine.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+        "cancelled group {cancel_stage} did not close cleanly and may have retained its replication slot"
+    );
     remove_source_fence(f).await;
     Ok(())
 }

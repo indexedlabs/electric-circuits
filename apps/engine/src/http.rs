@@ -1344,6 +1344,7 @@ struct FeedClaimGuard {
 struct GroupReservationGuard {
     engine: Engine,
     subscription: String,
+    members: Vec<(String, String)>,
     armed: bool,
 }
 
@@ -1402,7 +1403,29 @@ impl Drop for GroupSnapshotGuard {
 
 impl GroupReservationGuard {
     fn new(engine: &Engine, subscription: &str) -> Self {
-        Self { engine: engine.clone(), subscription: subscription.to_string(), armed: true }
+        Self { engine: engine.clone(), subscription: subscription.to_string(), members: Vec::new(), armed: true }
+    }
+
+    fn add_member(&mut self, shape_id: &str, subscription: &str) {
+        self.members.push((shape_id.to_string(), subscription.to_string()));
+    }
+
+    fn retain_members(&mut self, keep: impl Fn(&(String, String)) -> bool) {
+        self.members.retain(keep);
+    }
+
+    async fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let members = std::mem::take(&mut self.members);
+        for (shape_id, subscription) in members {
+            if let Err(error) = self.engine.release_subscription_durable(&shape_id, Some(&subscription)).await {
+                tracing::warn!(%shape_id, %subscription, %error, "failed to compensate cancelled group member");
+            }
+        }
+        self.engine.abort_group(&self.subscription).await;
+        self.armed = false;
     }
 
     fn complete(&mut self) {
@@ -1417,7 +1440,13 @@ impl Drop for GroupReservationGuard {
         }
         let engine = self.engine.clone();
         let subscription = self.subscription.clone();
+        let members = self.members.clone();
         engine.shutdown_token().spawn(async move {
+            for (shape_id, member_subscription) in members {
+                if let Err(error) = engine.release_subscription_durable(&shape_id, Some(&member_subscription)).await {
+                    tracing::warn!(%shape_id, subscription = %member_subscription, %error, "failed to compensate cancelled group member");
+                }
+            }
             engine.abort_group(&subscription).await;
         });
     }
@@ -1684,12 +1713,12 @@ async fn subset_load_group(
             )
             .await
         {
-            Ok((rec, _)) => created.push((rec, sub)),
+            Ok((rec, _)) => {
+                reservation.add_member(&rec.id, &sub);
+                created.push((rec, sub));
+            }
             Err(error) => {
-                for (rec, sub) in &created {
-                    let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-                }
-                engine.abort_group(&group_sub).await;
+                reservation.rollback().await;
                 return Err(AppError::from(error));
             }
         }
@@ -1710,30 +1739,21 @@ async fn subset_load_group(
         Ok(Some(offset)) => offset,
         Ok(None) => {
             snapshot_guard.finish().await;
-            for (rec, sub) in &created {
-                let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-            }
-            engine.abort_group(&group_sub).await;
+            reservation.rollback().await;
             return Err(AppError::from(anyhow::Error::new(crate::engine::GroupStreamClosed {
                 stream_path: group_path,
             })));
         }
         Err(error) => {
             snapshot_guard.finish().await;
-            for (rec, sub) in &created {
-                let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-            }
-            engine.abort_group(&group_sub).await;
+            reservation.rollback().await;
             return Err(AppError::from(error));
         }
     };
     #[cfg(feature = "test-support")]
     if let Err(error) = test_group_page_barrier("private").await {
         snapshot_guard.finish().await;
-        for (rec, sub) in &created {
-            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-        }
-        engine.abort_group(&group_sub).await;
+        reservation.rollback().await;
         return Err(AppError::from(error));
     }
     let reads = members
@@ -1751,20 +1771,14 @@ async fn subset_load_group(
         Ok(page) => page,
         Err(error) => {
             snapshot_guard.finish().await;
-            for (rec, sub) in &created {
-                let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-            }
-            engine.abort_group(&group_sub).await;
+            reservation.rollback().await;
             return Err(AppError::from(error));
         }
     };
     #[cfg(feature = "test-support")]
     if let Err(error) = test_group_page_barrier("page").await {
         snapshot_guard.finish().await;
-        for (rec, sub) in &created {
-            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-        }
-        engine.abort_group(&group_sub).await;
+        reservation.rollback().await;
         return Err(AppError::from(error));
     }
     // The public page is read after the private member seeds. Add its actual keys to each
@@ -1782,14 +1796,12 @@ async fn subset_load_group(
     let seed_result = engine.seed_group_snapshot_keys(snapshot_keys, &page_gate).await;
     snapshot_guard.finish().await;
     if let Err(error) = seed_result {
-        for (rec, sub) in &created {
-            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-        }
-        engine.abort_group(&group_sub).await;
+        reservation.rollback().await;
         return Err(AppError::from(error));
     }
     // Keep one live caller claim for the group. Member claims after the first are private
     // implementation handles and are released once the group record has captured them.
+    reservation.retain_members(|(_, sub)| sub == &group_sub);
     for (rec, sub) in created.iter().skip(1) {
         let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
     }
@@ -1816,10 +1828,7 @@ async fn subset_load_group(
         replay_fence: offset.clone(),
     };
     if let Err(error) = engine.complete_group(group_record).await {
-        for (rec, sub) in &created {
-            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-        }
-        engine.abort_group(&group_sub).await;
+        reservation.rollback().await;
         return Err(AppError::from(error));
     }
     reservation.complete();
