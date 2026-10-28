@@ -211,10 +211,6 @@ pub struct SubscriptionConflict {
     pub shape: String,
 }
 
-/// A grouped feed's public stream disappeared while the client was holding its lease.  A
-/// group cannot be repaired member-by-member because its cursor and snapshot are shared, so
-/// the API returns a conflict that tells the caller to reload the whole scope.
-
 /// Why a touch cannot hand back the shape it was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecreateReason {
