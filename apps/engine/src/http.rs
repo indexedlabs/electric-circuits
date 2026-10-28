@@ -1386,6 +1386,11 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "test-support")]
+pub(crate) fn test_group_page_failure(stage: &str) -> bool {
+    std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE").ok().as_deref() == Some(stage)
+}
+
 impl GroupSnapshotGuard {
     fn new(engine: &Engine, shape_ids: impl IntoIterator<Item = String>) -> Self {
         Self { engine: engine.clone(), shape_ids: shape_ids.into_iter().collect(), armed: true }
@@ -1480,6 +1485,10 @@ impl GroupReservationGuard {
         while index > 0 {
             index -= 1;
             let (shape_id, subscription) = self.members[index].clone();
+            #[cfg(feature = "test-support")]
+            if let Err(error) = test_group_page_barrier("rollback").await {
+                tracing::warn!(%error, %shape_id, %subscription, "group rollback test barrier failed");
+            }
             if Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
                 self.members.remove(index);
             }

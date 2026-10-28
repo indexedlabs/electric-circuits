@@ -2885,6 +2885,10 @@ impl Engine {
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         #[cfg(feature = "test-support")]
+        if crate::http::test_group_page_failure("complete") {
+            return Err(anyhow::anyhow!("test-injected group completion failure"));
+        }
+        #[cfg(feature = "test-support")]
         crate::http::test_group_page_barrier("complete").await?;
         let valid = {
             let st = self.state.lock().await;

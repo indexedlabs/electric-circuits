@@ -67,6 +67,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupPageHandoff => page_handoff_tombstone_contract(&fixture).await,
             Case::GroupPageCancellation => page_cancellation_contract(&fixture).await,
             Case::GroupConcurrentPageCancellation => concurrent_page_cancellation_contract(&fixture).await,
+            Case::GroupRollbackCancellation => rollback_cancellation_contract(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -101,6 +102,7 @@ enum Case {
     GroupPageHandoff,
     GroupPageCancellation,
     GroupConcurrentPageCancellation,
+    GroupRollbackCancellation,
 }
 
 #[test]
@@ -134,6 +136,12 @@ fn concurrent_group_cancellations_preserve_both_durable_drops() -> Result<()> {
         "ownership::concurrent_group_cancellations_preserve_both_durable_drops",
         Case::GroupConcurrentPageCancellation,
     )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_canceled_rollback_retains_unreleased_group_members() -> Result<()> {
+    isolated("ownership::group_canceled_rollback_retains_unreleased_group_members", Case::GroupRollbackCancellation)
 }
 
 #[test]
@@ -1380,6 +1388,91 @@ async fn concurrent_page_cancellation_contract(f: &Fixture) -> Result<()> {
     }
     if let Err(error) = replacement {
         errors.push(format!("retry after concurrent cancellation: {error:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
+}
+
+async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let barrier = f.root.join("group-rollback-cancel");
+    let base = barrier.to_string_lossy().into_owned();
+    let subscription = "group-rollback-cancel";
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "complete") };
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move { post_group(&app, group_body(f, subscription, true)).await }
+        });
+        let ready = PathBuf::from(format!("{base}.rollback.ready"));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if ready.exists() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("waiting for rollback cancellation barrier")?;
+        task.abort();
+        ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
+    let close = engine.close(Duration::from_secs(10)).await;
+    let fence = remove_source_fence(f).await;
+    let replacement = async {
+        let (replacement, replacement_app) = group_engine(f).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut retry_body = None;
+        loop {
+            let attempt = post_group(&replacement_app, group_body(f, subscription, true)).await?;
+            if attempt.0 == StatusCode::OK {
+                retry_body = Some(attempt);
+                break;
+            }
+            ensure!(
+                attempt.0 == StatusCode::CONFLICT,
+                "retry after rollback cancellation failed: {} {}",
+                attempt.0,
+                attempt.1
+            );
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("retry after rollback cancellation did not release the group claim: {} {}", attempt.0, attempt.1);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let replacement_close = replacement.close(Duration::from_secs(10)).await;
+        ensure!(retry_body.is_some(), "successful rollback retry was not recorded");
+        ensure!(
+            replacement_close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+            "replacement engine after rollback cancellation did not close cleanly"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let mut errors = Vec::new();
+    if close != electric_circuits_engine::shutdown::ShutdownOutcome::Complete {
+        errors.push(format!("rollback cancellation engine did not close cleanly: {close:?}"));
+    }
+    if let Err(error) = result {
+        errors.push(format!("rollback cancellation: {error:#}"));
+    }
+    if let Err(error) = replacement {
+        errors.push(format!("retry after rollback cancellation: {error:#}"));
+    }
+    if let Err(error) = fence {
+        errors.push(format!("remove source fence after rollback cancellation: {error:#}"));
     }
     if errors.is_empty() {
         Ok(())

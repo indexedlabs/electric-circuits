@@ -739,9 +739,8 @@ the catalog writer remains available and failing closed when the writer is gone.
 party, so engine close waits for every concurrent compensation before draining the catalog; a
 clean close within the grace period cannot resurrect an all-plain group whose create never
 returned. A crash, forced close, or catalog-writer loss can still leave a queued `GroupCreated`
-for replay. These page-handoff
-rules are part of the not-for-merge PR #45 experiment and require exact-head CI evidence; they
-do not qualify the gateway or native client seams.
+for replay. These page-handoff rules are part of the not-for-merge PR #45 experiment and require
+exact-head CI evidence; they do not qualify the gateway or native client seams.
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:
