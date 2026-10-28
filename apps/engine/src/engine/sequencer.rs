@@ -2199,11 +2199,11 @@ pub(crate) async fn process_envelope(
                         hops.extend(sq);
                     }
                 } else {
-                    work = VecDeque::new();
+                    work = std::collections::VecDeque::new();
                 }
                 result
             } else {
-                Ok(VecDeque::new())
+                Ok(std::collections::VecDeque::new())
             };
             (result, reg.take_group_emissions())
         };
