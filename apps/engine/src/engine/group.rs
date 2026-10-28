@@ -186,4 +186,22 @@ mod tests {
         assert!(error.downcast_ref::<GroupConflict>().is_some());
         assert!(claims.is_reserved("scope-1"));
     }
+
+    #[test]
+    fn a_stale_release_cannot_take_a_replacement_group() {
+        let mut claims = GroupClaims::default();
+        claims.reserve("scope-1", "group:scope-1").unwrap();
+        claims.complete(GroupRecord {
+            id: "stream/one".into(),
+            stream_path: "stream/one".into(),
+            subscription: "scope-1".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        });
+        assert!(claims.release_if_matches("scope-1", "stream/two").is_none());
+        assert_eq!(claims.get("scope-1").map(|group| group.id.as_str()), Some("stream/one"));
+    }
 }
