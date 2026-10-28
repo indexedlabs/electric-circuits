@@ -1417,12 +1417,15 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "member_retry") };
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "member_release") };
+    let fired = format!("{base}.rollback.release-fired");
+    // Set the fault-cut variables before starting the engine.  The engine owns worker threads
+    // that may call native libc environment readers while this contract is running; adding
+    // variables after those threads start can race glibc's environ reallocation.
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER", &fired) };
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let request = group_body(f, subscription, true);
-        let fired = format!("{base}.rollback.release-fired");
-        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
-        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER", &fired) };
         let task = tokio::spawn({
             let app = app.clone();
             async move { post_group(&app, request).await }
