@@ -458,11 +458,13 @@ The exact group-contract runs for `20582bd` (`40775680484`), `df1726c` (`4077657
 job `123141177393`), `ee7667a` (`40781440354`, job `123143837823`) and `21be5d6`
 (`40782847956`, job `123148605838`) were also red; `ee7667a` moved the fault-cut variables
 before engine startup, which ruled out the environment-ordering hypothesis, and `21be5d6` moved
-cleanup after shutdown. The current head is `15950a2`; it disarms the retry barrier before the
-shutdown drain, while its predecessor's group-contract lane remains red. The benchmark production
-tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path still
-requires its own green test job.
-Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged;
+cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compile-red because
+the integration hook was private. The current head is `ccc29b2`; it exposes that hook and has
+rustfmt-green but group-contract-red exact-head job `123160613419`. The benchmark production tree
+remains the one preserved by `1d7bbbc`, while this candidate's compensation path still requires
+its own green test job.
+Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
+apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
 already absent from in-memory state.
 
