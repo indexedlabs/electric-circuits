@@ -2994,6 +2994,10 @@ impl Engine {
             }
             st.publish_subscription_gauge(&self.metrics);
         }
+        // Restored groups and groups renewed after a transient lane teardown must have a live
+        // writer before the next sequencer batch arrives. Registration is idempotent and does not
+        // perform I/O, so it is safe after the claim checks and outside the state lock.
+        self.group_lanes.register(&group.stream_path);
         for event in events {
             self.catalog_tx.send(event);
         }

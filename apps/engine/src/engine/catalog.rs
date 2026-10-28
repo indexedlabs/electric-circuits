@@ -1722,6 +1722,7 @@ impl Engine {
                     .iter()
                     .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
                 if restorable {
+                    self.group_lanes.register(&group.stream_path);
                     st.group_claims.complete(group);
                     self.group_fence.activate();
                 } else {

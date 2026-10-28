@@ -329,10 +329,12 @@ impl Engine {
         // *outer* shape here collapses identical subquery shapes fully.
         let feed_sig = if share {
             Some(shape_signature(table, &where_, &out_cols, changes_only))
-        } else if stream_path_override.is_some() {
+        } else if let Some(stream_path) = stream_path_override.as_deref() {
             // Group members are private shapes, but their claims must still be represented in
             // the normal lease index so lapse/release can remove every member with the group.
-            Some(format!("group-member:{sub}"))
+            // Include the group's stream path so a later group with the same subscription cannot
+            // join the released group's dormant member shape and route live output to its old stream.
+            Some(format!("group-member:{stream_path}:{sub}"))
         } else {
             None
         };
