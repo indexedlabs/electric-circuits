@@ -454,13 +454,14 @@ rustfmt; `dafba36`'s release count made the second barrier pass instead of holdi
 Head `6c71df7` changed the production compensation path to report whether a claim was removed,
 re-enqueue `Left` for an already-removed claim, and add a deterministic retry-window barrier.
 The exact group-contract runs for `20582bd` (`40775680484`), `df1726c` (`40776574751`, job
-`123127320414`), `a5a439b` (`40780645453`, job `123141177393`), `ee7667a` (`40781440354`,
-job `123143837823`) and `21be5d6` (`40782847956`, job `123148605838`) were also red;
-`ee7667a` moved the fault-cut variables before engine startup, which ruled out the
-environment-ordering hypothesis, and `21be5d6` moved cleanup after shutdown. The current head
-is `21be5d6`; its group-contract lane remains red. The benchmark production tree remains the
-one preserved by `1d7bbbc`, while this candidate's compensation path still requires its own
-green test job.
+`123127320414`), `3a46632` (`40778231901`, job `123132971902`), `a5a439b` (`40780645453`,
+job `123141177393`), `ee7667a` (`40781440354`, job `123143837823`) and `21be5d6`
+(`40782847956`, job `123148605838`) were also red; `ee7667a` moved the fault-cut variables
+before engine startup, which ruled out the environment-ordering hypothesis, and `21be5d6` moved
+cleanup after shutdown. The current head is `15950a2`; it disarms the retry barrier before the
+shutdown drain, while its predecessor's group-contract lane remains red. The benchmark production
+tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path still
+requires its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
 already absent from in-memory state.

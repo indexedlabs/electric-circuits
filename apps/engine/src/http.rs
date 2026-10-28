@@ -1414,11 +1414,12 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
-static TEST_GROUP_PAGE_BARRIER_DISABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// Each ignored ownership contract runs in a fresh child process, so this process-local switch
+// is reset for every contract and cannot leak a disabled barrier into another case.
+static TEST_GROUP_PAGE_BARRIER_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
-pub(crate) fn test_disable_group_page_barrier() {
+pub fn test_disable_group_page_barrier() {
     TEST_GROUP_PAGE_BARRIER_DISABLED.store(true, std::sync::atomic::Ordering::Release);
 }
 
