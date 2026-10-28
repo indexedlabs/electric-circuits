@@ -376,7 +376,7 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   failedReads: number
   heldConnections: number
   inFlightConnections: number
-  reconnectsPerMinute: number
+  totalReconnectsPerMinute: number
   reconnectsPerSubscriptionMinute: number
   readinessSpreadsMs: Array<number | null>
   deliveryP50Ms: number | null
@@ -408,7 +408,7 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   const heldConnections = summaries.reduce((n, s) => n + s.maxHeld, 0)
   const inFlightConnections = summaries.reduce((n, s) => n + (s.maxInFlight ?? s.maxHeld), 0)
   const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
-  const workerMinutes = summaries.reduce((n, s) => n + (s.elapsedMs ?? 0) / 60000, 0)
+  const measurementWindowMs = Math.max(...summaries.map((s) => s.elapsedMs ?? 0), 0)
   const subscriptionMinutes = summaries.reduce((n, s) => n + (s.subscriptions ?? 1) * (s.elapsedMs ?? 0) / 60000, 0)
   const readinessSpreadsMs = runs.map((run) => {
     const times = run.stdout.flatMap((output) => output.split('\n')).flatMap((line) => {
@@ -427,7 +427,7 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
     failedReads,
     heldConnections,
     inFlightConnections,
-    reconnectsPerMinute: workerMinutes ? reconnects / workerMinutes : 0,
+    totalReconnectsPerMinute: measurementWindowMs ? reconnects * 60000 / measurementWindowMs : 0,
     reconnectsPerSubscriptionMinute: subscriptionMinutes ? reconnects / subscriptionMinutes : 0,
     readinessSpreadsMs,
     deliveryP50Ms: percentile(deliveries, 0.5),
@@ -593,14 +593,14 @@ async function main() {
     throw new Error(`live workers had too many failed reads: ${live.failedReads}/${live.reads}`)
   }
   const readinessSpreads = live.readinessSpreadsMs.map((value) => value ?? 'n/a').join(',') || 'n/a'
-  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spreads=${readinessSpreads}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} total-reconnects/observation-window/min=${live.totalReconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spreads=${readinessSpreads}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
 
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spreads=${readinessSpreads} ms per ramp level, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, total reconnects/observation-window/min=${live.totalReconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spreads=${readinessSpreads} ms per ramp level, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
