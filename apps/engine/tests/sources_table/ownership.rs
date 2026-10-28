@@ -1264,9 +1264,7 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
 
         let reload_app = app.clone();
         let reload_body = group_body(f, "group-closed-reload", true);
-        let mut reload_task = tokio::spawn(async move {
-            post_group(&reload_app, reload_body).await
-        });
+        let mut reload_task = tokio::spawn(async move { post_group(&reload_app, reload_body).await });
         ensure!(
             tokio::time::timeout(Duration::from_millis(250), &mut reload_task).await.is_err(),
             "same-members load renewed a group while its close/release was still in flight"
@@ -1278,9 +1276,14 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
         ensure!(reload_status == StatusCode::OK, "same-members reload failed: {reload_status} {fresh}");
         let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
         ensure!(new_path != old_path, "closed group reload reused its old stream");
-        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (6, 'closed-reload')", f.outer)).await?;
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (6, 'closed-reload')", f.outer))
+            .await?;
         let events = wait_group_events(f, new_path, 1).await?;
-        ensure!(events.iter().any(|event| event_key(event).as_deref() == Some("6")), "reloaded group missed live output: {events:?}");
+        ensure!(
+            events.iter().any(|event| event_key(event).as_deref() == Some("6")),
+            "reloaded group missed live output: {events:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
