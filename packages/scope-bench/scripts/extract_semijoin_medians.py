@@ -3,8 +3,8 @@
 
 Each directory must contain semijoin-cold.json, semijoin-steady.json,
 subquery-cold.json, and subquery-steady.json. The output is intentionally a
-small, auditable JSON object; the checked-in manifest adds artifact metadata
-and raw-file hashes around the same values.
+small, auditable per-directory JSON object; the checked-in manifest wraps the
+same values with commit, artifact, and raw-file metadata.
 """
 
 import argparse
@@ -20,7 +20,15 @@ def median(results, field):
 
 
 def dbsp(profile):
-    return profile["membership_circuit"]["total_used_bytes"]
+    if not profile:
+        return None
+    membership = profile.get("membership_circuit")
+    return membership.get("total_used_bytes") if membership else None
+
+
+def dbsp_median(results, field):
+    values = [value for row in results if (value := dbsp(row.get(field))) is not None]
+    return statistics.median(values) if values else None
 
 
 def extract(path):
@@ -36,12 +44,8 @@ def extract(path):
                 "raw_sha256": hashlib.sha256(raw).hexdigest(),
                 "groupLoadMs": median(rows, "groupLoadMs"),
                 "engineRssMb": median(rows, "engineRssMb"),
-                "dbspLoadUsedBytes": statistics.median(
-                    dbsp(row["dbspProfile"]) for row in rows
-                ),
-                "dbspHoldEndUsedBytes": statistics.median(
-                    dbsp(row["dbspProfileEnd"]) for row in rows
-                ),
+                "dbspUsedBytes": dbsp_median(rows, "dbspProfile"),
+                "dbspHoldEndUsedBytes": dbsp_median(rows, "dbspProfileEnd"),
                 "engineCpuMs": median(rows, "engineCpuMs"),
                 "gatewayCpuMs": median(rows, "gatewayCpuMs"),
                 "steadyWriteP50": median(rows, "steadyWriteP50"),

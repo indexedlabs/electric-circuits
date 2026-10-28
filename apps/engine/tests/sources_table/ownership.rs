@@ -1438,9 +1438,10 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
         let fired = format!("{base}.rollback.release-fired");
         unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER", &fired) };
-        // Let the retry pass the second rollback barrier deterministically after the injected
-        // post-unsubscribe failure; the test still waits for that barrier before cancellation.
-        std::fs::write(format!("{base}.rollback.release"), b"2")?;
+        // Release only the first rollback barrier. The second member remains held while the
+        // request is cancelled, exercising compensation after the injected post-unsubscribe
+        // failure without allowing the handler to complete first.
+        std::fs::write(format!("{base}.rollback.release"), b"1")?;
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 2 {

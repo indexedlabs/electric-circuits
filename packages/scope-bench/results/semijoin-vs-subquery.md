@@ -372,9 +372,10 @@ downloaded; its four raw JSON files have SHA-256 hashes
 `20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324`, and
 `0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796`.
 
-Commits `67b4dc7`, `41d97b0` and `df69d57` corrected earlier transcription errors by re-extracting every
-median from the downloaded JSON files. The extraction and its source-file SHA-256 keys are
-recorded in [`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it uses
+Commits `67b4dc7` and `47037ed` corrected earlier transcription errors by re-extracting every
+median from the downloaded JSON files. The extraction script emits per-directory medians; the
+checked-in manifest wraps those values with commit/artifact metadata and source-file SHA-256 keys
+in [`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it uses
 the load-time DBSP profile for both scenarios and retains hold-end values separately. It
 confirms the `1d7bbbc` cold semijoin RSS at 63.3 MiB. The replicate table and recommendation
 below use the load-time extraction.
@@ -446,11 +447,13 @@ corrections are implemented through `9cffab2`, while the page-handoff and cancel
 corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the full
 test job and produced the first benchmark artifact; head `8a93697` adds the slot-busy
 stabilization and second-barrier rollback contract. Head `41d97b0` adds test-support-only
-durable-release fault injection and its rollback contract, and `dafba36` advances the second
-rollback barrier after the injected retry. Its first exact-head run `40770165734` (test job
-`123104894370`) was red because the barrier was not advanced; the current candidate reruns
-that contract with the deterministic release count. The production build remains identical to
-1d7bbbc, whose fully green test job `123064316739` qualifies the production tree.
+durable-release fault injection and its rollback contract. The exact runs `40770165734`
+(`123104894370`) and `40772536994` (`123113244094`) were red: the former exposed the
+fault-cut contract failure and the latter also had the split static declaration flagged by
+rustfmt; `dafba36`'s release count made the second barrier pass instead of holding cancellation.
+The current candidate restores the blocked barrier, uses rustfmt's canonical declaration, and
+queues the retry before its first await; exact-head CI is pending. The production build remains
+identical to 1d7bbbc, whose fully green test job `123064316739` qualifies the production tree.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 

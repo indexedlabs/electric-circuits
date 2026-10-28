@@ -1406,8 +1406,7 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 }
 
 #[cfg(feature = "test-support")]
-static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
 pub(crate) fn test_release_after_unsubscribe_once() -> bool {
@@ -1479,10 +1478,9 @@ impl GroupReservationGuard {
     async fn release_member_durable(engine: &Engine, shape_id: &str, subscription: &str) -> bool {
         if let Err(error) = engine.release_subscription_durable(shape_id, Some(subscription)).await {
             tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
-            // A durable release can fail after its in-memory mutation when shutdown has already
-            // started. Re-enqueue the idempotent Left once while the catalog writer may still be
-            // draining. A second writer-loss error is terminal for this engine instance.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // A durable release can fail after its in-memory mutation. Re-enqueue the idempotent
+            // Left immediately: enqueue happens before the await, so cancellation cannot leave
+            // the member unsubscribed in memory while its durable release is still absent.
             return match engine.retry_subscription_release_durable(shape_id, subscription).await {
                 Ok(()) => true,
                 Err(retry_error) => {
