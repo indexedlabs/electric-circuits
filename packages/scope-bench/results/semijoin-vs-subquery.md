@@ -1,9 +1,10 @@
 # Key-only semijoin versus subquery members
 
 Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes for the reproduced hosted-review regressions are being validated by CI; no performance
-results are claimed until the five-repetition PostgreSQL 18 benchmark job completes. The
-experiment must finish before this report can support changing the membership decision.
+fixes for the reproduced hosted-review regressions are being validated by CI. The corrected
+five-repetition PostgreSQL 18 benchmark completed on `48501cd`; its measurements below are
+characterization evidence for DBSP 0.318, not target-version or production qualification.
+The experiment must finish before this report can support changing the membership decision.
 
 ## Pinned inputs and method
 
@@ -34,12 +35,17 @@ experiment must finish before this report can support changing the membership de
 
 | Metric | Subquery members | Key-only semijoin | Evidence status |
 | --- | --- | --- | --- |
-| Total / incremental per-group memory | Pending | Pending | No new measurement |
-| Restart peak RSS and ready + group reload time | Pending | Pending | No new measurement |
-| New-group seed time | Pending | Pending | No new measurement |
-| Actual reads per change | Pending | Pending | No new measurement |
-| Delivery p50 / p90 | Pending | Pending | No new measurement |
-| Engine / gateway CPU | Pending | Pending | No new measurement |
+| Cold group load / boot / RSS | 13082 ms / 151 ms / 73.7 MB | 13017 ms / 149 ms / 75.1 MB | Median, benchmark job `123037684019` |
+| Steady group load / RSS | 4340 ms / 76.8 MB | 4209 ms / 75.9 MB | Median, benchmark job `123037684019` |
+| Actual reads per change | 2.667 | 2.694 | Median, benchmark job `123037684019` |
+| Steady writes p50 / p90 | 495 / 734 ms | 1373 / 1981 ms | Median, benchmark job `123037684019` |
+| Semijoin selection batches, cold / steady | 0 / 0 | 390 / 3600 | Profile counter; subquery is the control |
+| Engine / gateway CPU | Pending | Pending | Not emitted by this artifact |
+
+The completed characterization is run `40747358562`, benchmark job `123037684019`, artifact
+`semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44c` (artifact ID `12844722320`,
+SHA-256 `ef48795b0cba5f5366492f2b1f0926c9c96856e69f9e43eb812a29cdb8ed7768`). The benchmark
+ran both modes and both cold/steady scenarios for five repetitions; it completed successfully.
 
 `engineBootMs` is a cold process boot plus catalog/shape reload measurement for this harness;
 it is not a SIGTERM restart or a persisted durable-stream restore. `groupLoadMs` is the
@@ -192,8 +198,8 @@ public group page into each subquery member's FeedSet before the group claim bec
 durable, closing the page/live handoff that could otherwise leave a snapshot row without
 a delete gate. The private key seed and this public-page seed both retain only keys; the
 extra bounded reads and feed entries belong in both modes' measurements. Its focused
-phone regression was genuinely red before that correction; the exact-head benchmark
-artifact is still pending.
+phone regression was genuinely red before that correction; the benchmark artifact was
+still pending at that earlier head and is recorded below from the completed `48501cd` run.
 
 
 
@@ -289,26 +295,29 @@ follow-up `c9ccae9` applied the barrier wiring and workload corrections; its exa
 invalid PostgreSQL publication syntax, while formatting, TypeScript and Node gates were green;
 no benchmark result was produced. The subsequent `fb6c7ae` run `40746277581` was red only in the formatting gate; its group,
 Rust, TypeScript and Node steps passed. `48501cd` then made compensation single-shot after
-writer loss, retained failed members in the guard, and collected concurrent-contract errors;
-its test run `40747358562` passed formatting and both membership-mode group contracts while
-Rust and benchmark lanes were still pending when reviewed. The current candidate keeps the
-valid plain table cleanup, preserves the one re-enqueue attempt during clean shutdown, and
-retains each member in place until its release succeeds.
+writer loss, retained failed members in the guard, and collected concurrent-contract errors.
+Its test run `40747358562` (job `123024579773`) passed formatting, both membership-mode group
+contracts, Rust engine tests, TypeScript, Node and Vitest. Its benchmark job `123037684019`
+also completed successfully; the characterization artifact and medians are recorded above.
+The current candidate keeps the valid plain table cleanup, preserves the one re-enqueue attempt
+during clean shutdown, and retains each member in place until its release succeeds.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
-current candidate has passed; the five-repetition benchmark remains pending. The follow-up adds completion durability compensation, shutdown-owned retry coverage and
-cancellation-stage retry coverage. `48501cd` then passed formatting, both group contracts, Rust
-engine tests, TypeScript, Node and Vitest (run `40747358562`, test job `123024579773`); its
-benchmark was still pending when reviewed. The c78804a run `40748888867` compiled and passed
+current candidate has passed. The follow-up adds completion durability compensation, shutdown-owned retry coverage and
+cancellation-stage retry coverage. The c78804a run `40748888867` compiled and passed
 formatting, Rust, TypeScript and Node but its group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
-walsender pid 5267` during replacement restart. Heads `82f2cd2` and `9c5b821` then exposed
-compile/format failures in the new rollback contract. Current head `9c5b821` adds the corrected
-rollback-cancellation contract; its exact-head rerun is pending, so no current-head result or
-benchmark measurement is claimed.
+walsender pid 5267` during replacement restart; the current harness waits for
+`pg_replication_slots.active_pid` to clear before replacing an engine. Heads `82f2cd2` and
+`9c5b821` then exposed compile/format failures in the new rollback contract. Head `9086025`
+fixed those blockers and passed formatting and both group modes; its exact test job was still
+finishing when reviewed. Current head `fe5fe74443e3eb95e2746f32b90ac1f44393fcfa` adds the
+bounded slot-release wait and moves rollback cancellation to the second member-release window,
+after the first private member has been durably released. No current-head performance claim is
+made; the completed benchmark is the `48501cd` characterization above.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
@@ -367,8 +376,9 @@ scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chu
 The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
 corrections are implemented through `9cffab2`, while the page-handoff and cancellation
 corrections are carried through `53dd7e3` and `9e9171e`; the working-tree follow-up adds
-the all-plain restart check, pinned formatting cleanup, and partial-boot slot cleanup. It
-still awaits a fresh exact-candidate CI run. Existing claim/lease, public snapshot query,
+the all-plain restart check, pinned formatting cleanup, and partial-boot slot cleanup. The
+exact candidate `fe5fe74443e3eb95e2746f32b90ac1f44393fcfa` still awaits its fresh CI run.
+Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
