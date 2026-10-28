@@ -1166,6 +1166,17 @@ async fn group_release_reloads_same_subscription(f: &Fixture) -> Result<()> {
             .map(|member| member["shapeId"].as_str().map(ToOwned::to_owned).context("reloaded member shape id"))
             .collect::<Result<_>>()?;
         ensure!(new_shapes.iter().all(|id| !old_shapes.contains(id)), "reload reused released member shapes");
+        let (stale_status, stale_body) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{}?subscription=group-release-reload", old_shapes[0]),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(
+            stale_status == StatusCode::OK,
+            "stale member release was not idempotent: {stale_status} {stale_body}"
+        );
         f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (3, 'reload')", f.outer)).await?;
         let events = wait_group_events(f, new_path, 1).await?;
         ensure!(

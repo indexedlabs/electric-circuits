@@ -2975,6 +2975,25 @@ impl Engine {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }
 
+    pub(crate) async fn begin_group_release(
+        &self,
+        subscription: &str,
+        expected_id: &str,
+    ) -> Option<(GroupRecord, Arc<GroupRelease>, bool)> {
+        let st = self.state.lock().await;
+        let group = st.group_claims.get(subscription).cloned()?;
+        if group.id != expected_id {
+            return None;
+        }
+        let mut releases = self.group_releases.lock().unwrap();
+        if let Some(existing) = releases.get(&group.id) {
+            return Some((group, existing.clone(), true));
+        }
+        let release = GroupRelease::new();
+        releases.insert(group.id.clone(), release.clone());
+        Some((group, release, false))
+    }
+
     pub(crate) fn group_release_in_flight(&self, group_id: &str) -> Option<Arc<GroupRelease>> {
         self.group_releases.lock().unwrap().get(group_id).cloned()
     }
@@ -2990,11 +3009,16 @@ impl Engine {
     /// Renew the public group lease and every private member claim together. A retried load is
     /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
     /// to the same wall-clock instant.
-    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<()> {
+    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
         let now = crate::changelog::now_secs();
         let mut events = Vec::with_capacity(group.members.len());
         {
             let mut st = self.state.lock().await;
+            if let Some(release) = self.group_releases.lock().unwrap().get(&group.id).cloned() {
+                drop(st);
+                release.wait().await?;
+                return Ok(false);
+            }
             for member in &group.members {
                 anyhow::ensure!(
                     st.shapes.contains_key(&member.shape_id)
@@ -3010,16 +3034,16 @@ impl Engine {
                     at: now,
                 });
             }
+            // Registration is part of the same state-locked admission as the claim check. A
+            // release that wins this lock removes the lane after the renew; a release already in
+            // flight makes this branch return before it can recreate the dying lane.
+            self.group_lanes.register(&group.stream_path);
             st.publish_subscription_gauge(&self.metrics);
         }
-        // Restored groups and groups renewed after a transient lane teardown must have a live
-        // writer before the next sequencer batch arrives. Registration is idempotent and does not
-        // perform I/O, so it is safe after the claim checks and outside the state lock.
-        self.group_lanes.register(&group.stream_path);
         for event in events {
             self.catalog_tx.send(event);
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> bool {

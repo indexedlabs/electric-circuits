@@ -1212,51 +1212,63 @@ async fn subset_load_group(
             });
         }
         if engine.group_release_in_flight(&existing.id).is_some() || !engine.group_is_healthy(&existing).await {
-            engine.release_group_claim(&group_sub).await.map_err(AppError::from)?;
+            engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         } else {
-            engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
-            let offset =
-                engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| AppError {
-                    status: StatusCode::CONFLICT,
-                    msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
-                    retry_after: false,
-                })?;
-            let reads = existing
-                .members
-                .iter()
-                .map(|m| crate::engine::SubsetReadReq {
-                    table: TableRef::parse(&m.table).expect("validated table reference"),
-                    where_: m.where_.clone(),
-                    columns: m.columns.clone(),
-                    order_by: None,
-                    limit: None,
-                    offset: None,
-                })
-                .collect();
-            let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
-            let results = existing
-                .members
-                .iter()
-                .zip(page.pages)
-                .map(|(member, rows)| {
-                    serde_json::json!({
-                        "key": member.key,
-                        "table": member.table,
-                        "shapeId": member.shape_id,
-                        "streamUrl": engine.stream_url(&existing.stream_path),
-                        "streamPath": existing.stream_path,
-                        "subscription": group_sub,
-                        "leaseSeconds": engine.lease_seconds(),
-                        "offset": offset,
-                        "rows": rows,
-                    })
-                })
-                .collect::<Vec<_>>();
-            return Ok(Json(serde_json::json!({
-                "groupId": existing.id, "subscription": group_sub,
-                "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
-                "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
-            })));
+            // Re-check after the health probe: a release can begin between that probe and the
+            // renewal. Waiting here closes the race without re-registering the dying lane; the
+            // create path below then reserves a fresh group after teardown completes.
+            if let Some(release) = engine.group_release_in_flight(&existing.id) {
+                release.wait().await.map_err(AppError::from)?;
+            } else {
+                let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
+                if renewed {
+                    let offset = engine
+                        .stream_tail(&existing.stream_path)
+                        .await
+                        .map_err(AppError::from)?
+                        .ok_or_else(|| AppError {
+                            status: StatusCode::CONFLICT,
+                            msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
+                            retry_after: false,
+                        })?;
+                    let reads = existing
+                        .members
+                        .iter()
+                        .map(|m| crate::engine::SubsetReadReq {
+                            table: TableRef::parse(&m.table).expect("validated table reference"),
+                            where_: m.where_.clone(),
+                            columns: m.columns.clone(),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                        })
+                        .collect();
+                    let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
+                    let results = existing
+                        .members
+                        .iter()
+                        .zip(page.pages)
+                        .map(|(member, rows)| {
+                            serde_json::json!({
+                                "key": member.key,
+                                "table": member.table,
+                                "shapeId": member.shape_id,
+                                "streamUrl": engine.stream_url(&existing.stream_path),
+                                "streamPath": existing.stream_path,
+                                "subscription": group_sub,
+                                "leaseSeconds": engine.lease_seconds(),
+                                "offset": offset,
+                                "rows": rows,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(Json(serde_json::json!({
+                        "groupId": existing.id, "subscription": group_sub,
+                        "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
+                        "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
+                    })));
+                }
+            }
         }
     }
     let group_path = engine.group_stream_path();
@@ -1831,7 +1843,7 @@ async fn release_shape(
             // The group claim is the only public lease.  Its private member claims are
             // released together and each durable release is idempotent, so a cancelled or
             // retried DELETE cannot leave a hidden member alive.
-            engine.release_group_claim(subscription).await?;
+            engine.release_group_claim(subscription, &group.id).await?;
         } else {
             engine.release_subscription_durable(&id, subscription.as_deref()).await?;
         }

@@ -1235,15 +1235,15 @@ impl Engine {
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
-        let group_subscription = st
+        let group_release = st
             .group_claims
             .records_iter()
             .find(|group| group.members.iter().any(|member| member.shape_id == id))
-            .map(|group| group.subscription.clone());
+            .map(|group| (group.subscription.clone(), group.id.clone()));
         drop(st);
         self.purge_shape_member(id, durable).await?;
-        if let Some(subscription) = group_subscription {
-            if let Err(error) = self.release_group_claim(&subscription).await {
+        if let Some((subscription, group_id)) = group_release {
+            if let Err(error) = self.release_group_claim(&subscription, &group_id).await {
                 tracing::warn!(%error, %subscription, "purge: failed to durably release group claim; continuing shape retirement");
             }
         }
@@ -2121,28 +2121,20 @@ impl Engine {
             );
             self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription: subscription.clone(), lapsed: true });
             self.metrics.subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
-            if self.group_record(&subscription).await.is_some() {
-                lapsed_groups.push(subscription);
+            if let Some(group) = self.group_record(&subscription).await {
+                lapsed_groups.push((subscription, group.id));
             }
         }
-        for subscription in lapsed_groups {
-            if let Err(error) = self.release_group_claim(&subscription).await {
+        for (subscription, group_id) in lapsed_groups {
+            if let Err(error) = self.release_group_claim(&subscription, &group_id).await {
                 tracing::warn!(%subscription, %error, "retention: failed to retire lapsed group claim");
             }
         }
     }
 
-    pub(crate) async fn release_group_claim(&self, subscription: &str) -> Result<()> {
-        let Some(group) = self.group_record(subscription).await else { return Ok(()) };
-        let (release, joined_existing) = {
-            let mut releases = self.group_releases.lock().unwrap();
-            if let Some(existing) = releases.get(&group.id) {
-                (existing.clone(), true)
-            } else {
-                let release = crate::engine::GroupRelease::new();
-                releases.insert(group.id.clone(), release.clone());
-                (release, false)
-            }
+    pub(crate) async fn release_group_claim(&self, subscription: &str, expected_id: &str) -> Result<()> {
+        let Some((group, release, joined_existing)) = self.begin_group_release(subscription, expected_id).await else {
+            return Ok(())
         };
         if joined_existing {
             return release.wait().await;
@@ -3100,7 +3092,7 @@ impl Engine {
         // Only shape streams are reconciled: the change log uses `append`/`append_checked`, which
         // never come through here, and anything else is not the engine's to retire.
         let Some(id) = path.strip_prefix("shape/") else { return GoneVerdict::Discard };
-        let (shape_id, group_subscription) = {
+        let (shape_id, group_release) = {
             let st = self.state.lock().await;
             if st.shapes.get(id).is_some_and(|rec| rec.stream_path == path) {
                 (Some(id.to_string()), None)
@@ -3109,11 +3101,11 @@ impl Engine {
                     .group_claims
                     .records_iter()
                     .find(|group| group.stream_path == path)
-                    .map(|group| group.subscription.clone());
+                    .map(|group| (group.subscription.clone(), group.id.clone()));
                 (None, group)
             }
         };
-        if shape_id.is_none() && group_subscription.is_none() {
+        if shape_id.is_none() && group_release.is_none() {
             return GoneVerdict::Discard;
         }
         if self.shutdown.is_shutting_down() {
@@ -3126,11 +3118,11 @@ impl Engine {
             // Closed or absent: storage really has retired this stream under a live shape. Retire
             // the shape for real so nothing keeps serving it.
             Ok(_) => {
-                if let Some(group) = group_subscription {
+                if let Some((group, group_id)) = group_release {
                     tracing::error!(%group, "group stream '{path}' is gone from storage; releasing the group claim");
                     let engine = self.clone();
                     self.shutdown.spawn(async move {
-                        let _ = engine.release_group_claim(&group).await;
+                        let _ = engine.release_group_claim(&group, &group_id).await;
                     });
                 } else if let Some(id) = shape_id {
                     tracing::error!(
