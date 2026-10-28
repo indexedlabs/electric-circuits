@@ -181,8 +181,8 @@ fn group_members_share_one_snapshot_horizon_and_replay_fence() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_retirement_reloads_and_closed_stream_is_409() -> Result<()> {
-    isolated("ownership::group_retirement_reloads_and_closed_stream_is_409", Case::GroupRetirement)
+fn group_retirement_reloads_and_closed_stream_is_recreated() -> Result<()> {
+    isolated("ownership::group_retirement_reloads_and_closed_stream_is_recreated", Case::GroupRetirement)
 }
 
 #[test]

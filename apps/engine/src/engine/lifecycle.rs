@@ -2115,8 +2115,7 @@ impl Engine {
                 if let Some(group) = st.group_claims.records_iter().find(|group| {
                     group.subscription == *subscription
                         || group.members.iter().any(|member| member.subscription == *subscription)
-                })
-                {
+                }) {
                     groups.insert(group.id.clone(), (group.subscription.clone(), group.id.clone()));
                 }
             }

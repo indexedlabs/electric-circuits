@@ -2941,9 +2941,12 @@ impl Engine {
         self.group_lanes.register(&record.stream_path);
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         let valid = {
-            let st = self.state.lock().await;
-            st.shapes.contains_key(&record.members[0].shape_id)
-                && record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id))
+            let mut st = self.state.lock().await;
+            let valid = record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id));
+            if valid {
+                st.group_claims.complete(record.clone());
+            }
+            valid
         };
         if !valid {
             let _ = self
@@ -2955,7 +2958,6 @@ impl Engine {
                 .await;
             return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
         }
-        self.state.lock().await.group_claims.complete(record);
         self.group_fence.activate();
         Ok(())
     }
