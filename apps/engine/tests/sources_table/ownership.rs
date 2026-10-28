@@ -940,11 +940,17 @@ async fn install_source_fence(f: &Fixture) -> Result<()> {
 async fn remove_source_fence(f: &Fixture) -> Result<()> {
     f.client
         .batch_execute(&format!(
-            "ALTER PUBLICATION \"{}_pub\" DROP TABLE IF EXISTS public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
+            "ALTER PUBLICATION \"{}_pub\" DROP TABLE public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
             f.slots[0]
         ))
         .await?;
     Ok(())
+}
+
+async fn finish_source_fenced_group(f: &Fixture, engine: Engine, result: Result<()>) -> Result<()> {
+    engine.close(Duration::from_secs(10)).await;
+    let fence = remove_source_fence(f).await;
+    result.and(fence)
 }
 
 async fn wait_source_receipt(engine: &Engine, f: &Fixture, commit: uuid::Uuid) -> Result<()> {
@@ -1004,9 +1010,7 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
@@ -1032,9 +1036,7 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 // The only source mutation removes a row from the inner set. The outer row came from
@@ -1081,9 +1083,7 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 // Hold the real group request twice so a source transaction can be placed on each side of the
@@ -1178,9 +1178,7 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
     }
     .await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 async fn page_cancellation_contract(f: &Fixture) -> Result<()> {
@@ -1421,9 +1419,7 @@ async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 // A stable companion primary key moves between a Record in the scope and one
@@ -1480,9 +1476,7 @@ async fn group_companion_reparenting(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 async fn group_never_member_writes_are_silent(f: &Fixture) -> Result<()> {
@@ -1510,9 +1504,7 @@ async fn group_never_member_writes_are_silent(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 async fn group_disjoint_sibling_survives_inner_move_out(f: &Fixture) -> Result<()> {
@@ -1556,9 +1548,7 @@ async fn group_disjoint_sibling_survives_inner_move_out(f: &Fixture) -> Result<(
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
@@ -1594,9 +1584,7 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await?;
-    result
+    finish_source_fenced_group(f, engine, result).await
 }
 
 async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {

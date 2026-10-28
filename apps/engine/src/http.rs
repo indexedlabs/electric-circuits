@@ -1440,68 +1440,67 @@ impl GroupReservationGuard {
     }
 
     async fn release_member_durable(engine: &Engine, shape_id: &str, subscription: &str) -> bool {
-        let mut first = true;
-        let mut backoff = std::time::Duration::from_millis(100);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let result = if first {
-                engine.release_subscription_durable(shape_id, Some(subscription)).await
-            } else {
-                engine.retry_subscription_release_durable(shape_id, subscription).await
-            };
-            match result {
-                Ok(()) => return true,
-                Err(error) => {
-                    tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
-                    if engine.shutdown_token().is_shutting_down() || tokio::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    first = false;
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+        if let Err(error) = engine.release_subscription_durable(shape_id, Some(subscription)).await {
+            tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
+            // A durable release can fail after its in-memory mutation when shutdown has already
+            // started. Re-enqueue the idempotent Left once while the catalog writer may still be
+            // draining. A second writer-loss error is terminal for this engine instance.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            return match engine.retry_subscription_release_durable(shape_id, subscription).await {
+                Ok(()) => true,
+                Err(retry_error) => {
+                    tracing::warn!(
+                        %shape_id,
+                        %subscription,
+                        %retry_error,
+                        "catalog writer unavailable for cancelled group member"
+                    );
+                    false
                 }
-            }
+            };
         }
+        true
     }
 
     async fn drop_group_durable(engine: &Engine, subscription: &str) -> bool {
-        let mut backoff = std::time::Duration::from_millis(100);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            match engine.drop_group_durable(subscription).await {
-                Ok(()) => return true,
-                Err(error) => {
-                    tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
-                    if engine.shutdown_token().is_shutting_down() || tokio::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+        if let Err(error) = engine.drop_group_durable(subscription).await {
+            tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            return match engine.drop_group_durable(subscription).await {
+                Ok(()) => true,
+                Err(retry_error) => {
+                    tracing::warn!(%subscription, %retry_error, "catalog writer unavailable for cancelled group");
+                    false
                 }
-            }
+            };
         }
+        true
     }
 
     async fn rollback(&mut self) {
         if !self.armed {
             return;
         }
+        let mut failed_members = Vec::new();
         while let Some((shape_id, subscription)) = self.members.last().cloned() {
+            self.members.pop();
             if !Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
-                return;
-            }
-            if self.members.last().is_some_and(|member| member.0 == shape_id && member.1 == subscription) {
-                self.members.pop();
+                failed_members.push((shape_id, subscription));
             }
         }
+        failed_members.reverse();
+        self.members = failed_members;
         if self.group_created {
             if !Self::drop_group_durable(&self.engine, &self.subscription).await {
-                return;
+                tracing::warn!(subscription = %self.subscription, "cancelled group compensation could not append GroupDropped");
+            } else {
+                self.group_created = false;
             }
-            self.group_created = false;
         }
         self.engine.abort_group(&self.subscription).await;
-        self.armed = false;
+        if self.members.is_empty() && !self.group_created {
+            self.armed = false;
+        }
     }
 
     fn complete(&mut self) {
@@ -1523,14 +1522,16 @@ impl Drop for GroupReservationGuard {
         engine.shutdown_token().spawn(async move {
             for (shape_id, member_subscription) in members {
                 if !GroupReservationGuard::release_member_durable(&engine, &shape_id, &member_subscription).await {
-                    drop(party);
-                    return;
+                    tracing::warn!(
+                        %shape_id,
+                        subscription = %member_subscription,
+                        "continuing cancelled group compensation after member release failure"
+                    );
                 }
             }
             if group_created {
                 if !GroupReservationGuard::drop_group_durable(&engine, &subscription).await {
-                    drop(party);
-                    return;
+                    tracing::warn!(%subscription, "cancelled group compensation could not append GroupDropped");
                 }
             }
             engine.abort_group(&subscription).await;

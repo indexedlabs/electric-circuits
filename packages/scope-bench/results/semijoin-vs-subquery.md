@@ -282,11 +282,16 @@ job `122975057785` failed. The subsequent `89a0b97` head added a shutdown party 
 compensation, a one-shot member-release re-enqueue, and the steady companion touch, but
 retained the same `drop_group_durable` type mismatch. Its test job `122988431056` failed at
 that compile error, its scope benchmark `122993623042` was skipped, and its engine image job
-`122988431228` failed. The reconciled follow-up adds the missing `?; Ok(())`, counts duplicate
-shutdown-party names, bounds writer-loss retries, fixes the four-stage barrier wiring and
-returns the source-fence cleanup to `Result<()>`. Its exact run `40741829458` (test job
-`123005145542`) was still compile/red while this report was reconciled; no benchmark result
-is claimed.
+`122988431228` failed. Head `dba8b19` added the missing `?; Ok(())` and counted
+shutdown-party names, but its exact run `40741829458` (test job `123005145542`) was red in
+formatting, group compilation and Rust compilation; no benchmark result is claimed. Head
+`c9ccae9` then bounded writer-loss retries, fixed the four-stage barrier wiring, returned
+source-fence cleanup to `Result<()>`, and corrected the workload drift. Its exact run
+`40743452180` (test job `123010867174`) was still in progress when the hosted review inspected
+it; no benchmark result is claimed. The current follow-up additionally preserves the one
+re-enqueue attempt during clean shutdown, continues through remaining member claims and
+`GroupDropped`, and keeps the body error ahead of cleanup errors; it awaits a fresh exact-head
+run.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
@@ -294,8 +299,8 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
 current candidate has passed; the five-repetition benchmark remains pending. The follow-up
 adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
-retry coverage. Merge head `d7cd60c` is pushed for a fresh exact-head CI run; no result from
-that run is claimed here yet.
+retry coverage. The current source-fence and compensation corrections are unqualified until
+their exact-head CI run completes.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

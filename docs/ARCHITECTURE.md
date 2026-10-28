@@ -733,7 +733,9 @@ decision map and xid gate; the PostgreSQL contract test additionally pauses the 
 place its delete after the page snapshot. The bounded decision map is cleared on successful
 handoff and on cancellation. An aborted group request releases every private member claim and
 its query-back window before the group reservation is dropped, retaining failed releases until
-a durable `Left` is confirmed and re-enqueuing that event after a lost writer response. Once
+a durable `Left` is confirmed and retrying that event once while the writer drains. If the writer
+is gone, the engine fails closed and the compensation task still attempts every remaining member
+and `GroupDropped` before it exits. Once
 `GroupCreated` is queued, cancellation releases private member claims, queues a durable
 `GroupDropped`, and only then aborts the public reservation. The guard owns a counted shutdown
 party, so engine close waits for every concurrent compensation before draining the catalog; a
