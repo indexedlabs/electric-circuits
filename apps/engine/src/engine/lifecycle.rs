@@ -1233,13 +1233,20 @@ impl Engine {
     }
 
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
+        self.purge_shape_inner_with_group(id, durable, true).await
+    }
+
+    async fn purge_shape_inner_with_group(&self, id: &str, durable: bool, release_group: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
-        let group_subscription = st
-            .group_claims
-            .records_iter()
-            .find(|group| group.members.iter().any(|member| member.shape_id == id))
-            .map(|group| group.subscription.clone());
+        let group_subscription = release_group
+            .then(|| {
+                st.group_claims
+                    .records_iter()
+                    .find(|group| group.members.iter().any(|member| member.shape_id == id))
+                    .map(|group| group.subscription.clone())
+            })
+            .flatten();
         self.lives.lock().unwrap().remove(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
@@ -2125,15 +2132,25 @@ impl Engine {
     pub(crate) async fn release_group_claim(&self, subscription: &str) -> Result<()> {
         let Some(group) = self.group_record(subscription).await else { return Ok(()) };
         self.group_lanes.remove(&group.stream_path);
-        let mut first_error = None;
+        // Remove the public record first. Member purges below must not re-enter this method
+        // through `purge_shape_inner`; the group claim is already gone, so each member can be
+        // retired independently without recursion.
+        let mut first_error = self.finish_group_release(subscription).await.err();
         for member in &group.members {
             if let Err(error) = self.release_group_member_durable(&member.shape_id, &member.subscription).await {
                 tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member release failed");
                 first_error.get_or_insert(error);
             }
+            if let Err(error) = self.purge_shape_inner_with_group(&member.shape_id, true, false).await {
+                tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member purge failed");
+                first_error.get_or_insert(error);
+            }
         }
-        let group_error = self.finish_group_release(subscription).await.err();
-        if let Some(error) = first_error.or(group_error) { Err(error) } else { Ok(()) }
+        if let Err(error) = self.ds.retire_stream(&group.stream_path).await {
+            tracing::warn!(%error, stream_path = %group.stream_path, "group stream retirement failed; queued");
+            self.retirements.enqueue(&group.stream_path, None);
+        }
+        if let Some(error) = first_error { Err(error) } else { Ok(()) }
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the

@@ -203,7 +203,11 @@ impl GroupEmissionLanes {
         let worker_wake = self.wake.clone();
         self.shutdown.clone().spawn_background(async move {
             while let Some(batch) = rx.recv().await {
-                let _ = worker_ds.append_reliable(&batch.stream_path, &batch.envs).await;
+                if worker_ds.append_reliable(&batch.stream_path, &batch.envs).await.is_err() {
+                    // Keep the pending count and origin held: a failed reliable append means the
+                    // effect did not land, so a source receipt must never advance past it.
+                    return;
+                }
                 worker_pending.complete(batch.commit_lsn);
                 complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
             }

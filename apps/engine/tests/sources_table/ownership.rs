@@ -21,12 +21,18 @@ const RESTARTS: i64 = 50;
 // Re-exec the test binary, not Cargo: the parent's herdr-heavy lock covers the entire run.
 fn isolated(name: &str, case: Case) -> Result<()> {
     if isolated_contract(name, |command| {
-        command
+        let command = command
             .env("ELECTRIC_HANDLE_TTL", "1")
             .env("ELECTRIC_CIRCUITS_SUBQ_STORAGE", "1")
             .env_remove("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR")
-            .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "0")
             .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0");
+        if matches!(case, Case::GroupLapse) {
+            command
+                .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1")
+                .env("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1")
+        } else {
+            command.env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "0")
+        }
     })? {
         return Ok(());
     }
@@ -59,6 +65,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupFence => group_uses_one_snapshot_fence(&fixture).await,
             Case::GroupRetirement => group_retirement_reloads_and_closed_stream_is_conflict(&fixture).await,
             Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
+            Case::GroupRelease => group_release_reloads_same_subscription(&fixture).await,
+            Case::GroupLapse => group_lapse_reloads_same_subscription(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -85,6 +93,8 @@ enum Case {
     GroupFence,
     GroupRetirement,
     GroupRestart,
+    GroupRelease,
+    GroupLapse,
 }
 
 #[test]
@@ -169,6 +179,18 @@ fn group_retirement_reloads_and_closed_stream_is_409() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_restart_restores_plain_and_drops_mixed_groups() -> Result<()> {
     isolated("ownership::group_restart_restores_plain_and_drops_mixed_groups", Case::GroupRestart)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_release_reloads_same_subscription_on_a_new_stream() -> Result<()> {
+    isolated("ownership::group_release_reloads_same_subscription_on_a_new_stream", Case::GroupRelease)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_lapse_reloads_same_subscription_on_a_new_stream() -> Result<()> {
+    isolated("ownership::group_lapse_reloads_same_subscription_on_a_new_stream", Case::GroupLapse)
 }
 
 #[derive(Clone)]
@@ -822,6 +844,23 @@ async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Re
     }
 }
 
+async fn wait_group_stream_retired(f: &Fixture, stream_path: &str) -> Result<()> {
+    let mut changed = f.ds.changed.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if f.ds.retired.lock().await.iter().any(|(method, path)| {
+                *method == Method::POST && path.ends_with(stream_path)
+            }) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            changed.changed().await.context("group retirement observation channel closed")?;
+        }
+    })
+    .await
+    .context("waiting for group stream retirement")??;
+    Ok(())
+}
+
 async fn install_source_fence(f: &Fixture) -> Result<()> {
     f.client
         .batch_execute(&format!(
@@ -1049,6 +1088,93 @@ async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> 
     result
 }
 
+async fn group_release_reloads_same_subscription(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-release-reload", true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("old group stream path")?.to_owned();
+        let old_shapes: Vec<String> = first["results"]
+            .as_array()
+            .context("group results")?
+            .iter()
+            .map(|member| member["shapeId"].as_str().map(ToOwned::to_owned).context("member shape id"))
+            .collect::<Result<_>>()?;
+        let first_shape = old_shapes.first().context("group has no members")?;
+        let (release_status, release) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{first_shape}?subscription=group-release-reload"),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release}");
+        wait_group_stream_retired(f, &old_path).await?;
+        for shape_id in &old_shapes {
+            let (status, _) = json(
+                &app,
+                Method::GET,
+                &format!("/v1/shapes/{shape_id}"),
+                Body::empty(),
+            )
+            .await?;
+            ensure!(
+                status == StatusCode::NOT_FOUND,
+                "released member {shape_id} still exists: {status}"
+            );
+        }
+        let (reload_status, second) = post_group(&app, group_body(f, "group-release-reload", true)).await?;
+        ensure!(reload_status == StatusCode::OK, "same-subscription reload failed: {reload_status} {second}");
+        let new_path = second["streamPath"].as_str().context("new group stream path")?;
+        ensure!(new_path != old_path, "reload reused released group stream {old_path}");
+        let new_shapes: Vec<String> = second["results"]
+            .as_array()
+            .context("reloaded group results")?
+            .iter()
+            .map(|member| member["shapeId"].as_str().map(ToOwned::to_owned).context("reloaded member shape id"))
+            .collect::<Result<_>>()?;
+        ensure!(new_shapes.iter().all(|id| !old_shapes.contains(id)), "reload reused released member shapes");
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (3, 'reload')", f.outer))
+            .await?;
+        let events = wait_group_events(f, new_path, 1).await?;
+        ensure!(
+            events.iter().any(|event| event_key(event).as_deref() == Some("3")),
+            "new group missed live output: {events:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_lapse_reloads_same_subscription(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-lapse-reload", true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("old group stream path")?.to_owned();
+        wait_group_stream_retired(f, &old_path).await?;
+        let (reload_status, second) = post_group(&app, group_body(f, "group-lapse-reload", true)).await?;
+        ensure!(reload_status == StatusCode::OK, "lapsed group did not reload: {reload_status} {second}");
+        let new_path = second["streamPath"].as_str().context("new group stream path")?;
+        ensure!(new_path != old_path, "lapsed group reused old stream {old_path}");
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (4, 'lapse')", f.outer))
+            .await?;
+        let events = wait_group_events(f, new_path, 1).await?;
+        ensure!(
+            events.iter().any(|event| event_key(event).as_deref() == Some("4")),
+            "reloaded lapsed group missed live output: {events:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
 async fn group_restart_restores_plain_and_drops_mixed(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
@@ -1060,11 +1186,27 @@ async fn group_restart_restores_plain_and_drops_mixed(f: &Fixture) -> Result<()>
         let (restarted, restarted_app) = group_engine(f).await?;
         let (status, duplicate_plain) = post_group(&restarted_app, group_body(f, "group-plain-restart", true)).await?;
         ensure!(status == StatusCode::OK, "plain group did not renew after restart: {status} {duplicate_plain}");
+        ensure!(duplicate_plain["streamPath"] == plain["streamPath"], "restored plain group changed stream path");
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (5, 'restart')", f.outer))
+            .await?;
+        let restart_events = wait_group_events(
+            f,
+            duplicate_plain["streamPath"].as_str().context("restored plain stream path")?,
+            1,
+        )
+        .await?;
+        ensure!(
+            restart_events.iter().any(|event| event_key(event).as_deref() == Some("5")),
+            "restored group missed live output: {restart_events:?}"
+        );
+        let old_mixed_path = mixed["streamPath"].as_str().context("mixed group stream path")?;
         let (status, recreated_mixed) = post_group(&restarted_app, group_body(f, "group-mixed-restart", false)).await?;
         ensure!(
             status == StatusCode::OK,
             "mixed group was not dropped as a unit on restart: {status} {recreated_mixed}"
         );
+        ensure!(recreated_mixed["streamPath"].as_str() != Some(old_mixed_path), "new group reused dropped stream path");
         restarted.close(Duration::from_secs(10)).await;
         Ok::<_, anyhow::Error>(())
     }
