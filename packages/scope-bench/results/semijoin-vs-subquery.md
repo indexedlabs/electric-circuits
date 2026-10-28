@@ -309,19 +309,33 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
-current candidate has passed. The follow-up adds completion durability compensation, shutdown-owned retry coverage and
-cancellation-stage retry coverage. The c78804a run `40748888867` compiled and passed
-formatting, Rust, TypeScript and Node but its group step failed in
+current candidate has passed. The follow-up `8a93697` adds completion durability compensation,
+shutdown-owned retry coverage and cancellation-stage retry coverage. The c78804a run
+`40748888867` compiled and passed formatting, Rust, TypeScript and Node but its group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
 walsender pid 5267` during replacement restart; the restart helper now retries that transient
 `SlotBusy` state. Heads `82f2cd2` and `9c5b821` then exposed compile/format failures in the new
-rollback contract. Head `9086025` fixed those blockers. Reviewed head `8a93697` added the bounded slot-busy retry and the second member-release
-cancellation barrier. Head `9086025` passed formatting, both group modes, Rust engine tests,
-TypeScript, Node and Vitest (run `40754547033`, test job `123049856807`); its benchmark job
-`123062180725` was still building when reviewed. Merge head `1d7bbbc` preserves that production
-tree apart from test-only barrier refactoring and the evidence/docs updates; its test job
-`123064316739` is still running. No performance claim beyond the completed `48501cd`
-characterization is needed for the decision.
+rollback contract. Head `9086025` fixed those blockers and passed formatting, both group modes,
+Rust engine tests, TypeScript, Node and Vitest (run `40754547033`, test job `123049856807`). Its
+benchmark job `123062180725` also passed with artifact `12847482774`, named
+`semijoin-vs-subquery-5c4c91e515bf80de5e69ab809f0a84948abb1365` and digest
+`sha256:41f882ad7fcb59d76d433e794b5efe3095c0df1be2abfb169235056a733bb102`. The artifact was
+downloaded independently; its four raw JSON files have SHA-256 hashes
+`6457f8cf1e5ff3f232dabacd0229e0392940a03c90b3cdc2ac8e9d7b0678e59e`,
+`a41a2c6295e859a45ce4cee76c09fdb688303c0efefb62d586e9e7f27e4c70c9`,
+`4434bff4111fca45dcd4df89534111db763e7a5e6f71f0e145731c0c70c7c7dd`, and
+`8d9e762ceb83bbd87faf93625bfaf7947c01569b0a5aff9a74f2157cb824667b`.
+The 9086025 production tree is preserved through 1d7bbbc and the docs-only `fc6c62a` head;
+1d7bbbc adds only test-barrier refactoring and evidence/docs updates, while fc6c62a changes
+documentation only. The exact-head test job `123071873230` for `fc6c62a` is currently running.
+
+The 9086025 artifact is a second, independent five-repetition measurement on the production
+tree. Its medians are: cold group load 12,923/13,094 ms, cold RSS 71/73 MiB, cold DBSP used
+bytes 34,212/60,232, steady group load 4,349/4,358 ms, steady RSS 73/66 MiB, steady DBSP used
+bytes 65,092/103,176, actual reads/change 2.667/2.694, delivery p50/p90 530/684 and 1,282/2,035
+ms, engine CPU 2,000/3,070 ms, and gateway CPU 4,732/4,596 ms (subquery/semijoin). These
+replicate the direction of the first artifact but are not pooled because the runs are separate;
+the recommendation remains based on both measurements and the unavailable restart lane.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

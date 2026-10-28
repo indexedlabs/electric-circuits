@@ -736,13 +736,14 @@ its query-back window before the group reservation is dropped, retrying a failed
 the catalog writer remains available and failing closed when the writer is gone. Once
 `GroupCreated` is queued, cancellation releases private member claims and tries to queue a durable
 `GroupDropped` before aborting the public reservation. If the catalog writer is already gone, the
-reservation aborts in memory while the guard retains the compensation state for its shutdown-owned
-retry. The guard owns a counted shutdown party, so engine close waits for every concurrent
-compensation before draining the catalog; a clean close within the grace period cannot
-resurrect an all-plain group whose create never
-returned. A crash, forced close, or catalog-writer loss can still leave a queued `GroupCreated`
-for replay. These page-handoff rules are part of the not-for-merge PR #45 experiment and require
-exact-head CI evidence; they do not qualify the gateway or native client seams.
+reservation aborts in memory while the guard retains the compensation state. Its shutdown-owned
+retry can succeed only while the catalog writer is still alive and draining; after writer loss it
+fails closed. The guard owns a counted shutdown party, so engine close waits for every concurrent
+compensation before draining the catalog. A clean close within the grace period cannot resurrect an
+all-plain group whose create never returned. A crash, forced close, or catalog-writer loss can still
+leave a queued `GroupCreated` for replay. These page-handoff rules are part of the not-for-merge
+PR #45 experiment and require exact-head CI evidence; they do not qualify the gateway or native
+client seams.
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:
