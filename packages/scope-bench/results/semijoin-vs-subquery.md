@@ -247,7 +247,12 @@ No measurement is claimed from it.
 Earlier exact jobs are retained: group contracts passed in both modes at `8c0c6f0`
 (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`); the Rust job remained red there on formatting and the unqualified
-tombstone assertion.
+tombstone assertion. At `8185b7b`, the subquery group loop passed its handoff contract
+but `ownership::group_page_cancellation_releases_queryback_window` failed during its
+cleanup with `the slot is held by walsender pid 17649`; the semijoin loop passed. The
+library then failed `subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback`
+at `group snapshot table disappeared`. `327653b` fixes the split cancellation cases and
+installs the missing unit-test schema; this head also applies the pinned rustfmt output.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

@@ -65,7 +65,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupNeverMember => group_never_member_writes_are_silent(&fixture).await,
             Case::GroupSibling => group_disjoint_sibling_survives_inner_move_out(&fixture).await,
             Case::GroupPageHandoff => page_handoff_tombstone_contract(&fixture).await,
-            Case::GroupPageCancellation => page_cancellation_contract(&fixture).await,
+            Case::GroupPagePrivateCancellation => page_cancellation_contract(&fixture, "private").await,
+            Case::GroupPagePageCancellation => page_cancellation_contract(&fixture, "page").await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -98,7 +99,8 @@ enum Case {
     GroupNeverMember,
     GroupSibling,
     GroupPageHandoff,
-    GroupPageCancellation,
+    GroupPagePrivateCancellation,
+    GroupPagePageCancellation,
 }
 
 #[test]
@@ -121,8 +123,20 @@ fn group_page_handoff_outer_delete_emits_tombstone() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_page_cancellation_releases_queryback_window() -> Result<()> {
-    isolated("ownership::group_page_cancellation_releases_queryback_window", Case::GroupPageCancellation)
+fn group_page_private_cancellation_releases_queryback_window() -> Result<()> {
+    isolated(
+        "ownership::group_page_private_cancellation_releases_queryback_window",
+        Case::GroupPagePrivateCancellation,
+    )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_page_page_cancellation_releases_queryback_window() -> Result<()> {
+    isolated(
+        "ownership::group_page_page_cancellation_releases_queryback_window",
+        Case::GroupPagePageCancellation,
+    )
 }
 
 #[test]
@@ -1120,7 +1134,7 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
         let path = body["streamPath"].as_str().context("group stream path")?;
         let table = format!("public.{}", f.outer);
         let mut changed = f.ds.changed.subscribe();
-        let events = tokio::time::timeout(Duration::from_secs(15), async {
+        match tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let events = stream_events(f, path).await;
                 if events.iter().any(|event| {
@@ -1135,7 +1149,17 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
             }
         })
         .await
-        .context("waiting for the fenced page tombstone")??;
+        {
+            Ok(result) => {
+                result?;
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "waiting for the fenced page tombstone timed out: {:?}",
+                    stream_events(f, path).await
+                ));
+            }
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -1145,52 +1169,50 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
     result
 }
 
-async fn page_cancellation_contract(f: &Fixture) -> Result<()> {
+async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<()> {
     install_source_fence(f).await?;
-    for (index, cancel_stage) in ["private", "page"].into_iter().enumerate() {
-        let barrier = f.root.join(format!("group-page-cancel-{index}"));
-        let base = barrier.to_string_lossy().into_owned();
-        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
-        let (engine, app) = group_engine(f).await?;
-        let request = membership_group_body(f, &format!("group-page-cancel-{index}"));
-        let task = tokio::spawn({
-            let app = app.clone();
-            async move { post_group(&app, request).await }
-        });
-        async fn wait_ready(base: &str, stage: &str) -> Result<()> {
-            let path = PathBuf::from(format!("{base}.{stage}.ready"));
-            tokio::time::timeout(Duration::from_secs(15), async {
-                loop {
-                    if path.exists() {
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .context(format!("waiting for cancelled group {stage} barrier"))??;
-            Ok(())
-        }
-        wait_ready(&base, "private").await?;
-        if cancel_stage == "page" {
-            std::fs::write(format!("{base}.private.release"), b"release")?;
-            wait_ready(&base, "page").await?;
-        }
-        task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(5), async {
+    let barrier = f.root.join(format!("group-page-cancel-{cancel_stage}"));
+    let base = barrier.to_string_lossy().into_owned();
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+    let (engine, app) = group_engine(f).await?;
+    let request = membership_group_body(f, &format!("group-page-cancel-{cancel_stage}"));
+    let task = tokio::spawn({
+        let app = app.clone();
+        async move { post_group(&app, request).await }
+    });
+    async fn wait_ready(base: &str, stage: &str) -> Result<()> {
+        let path = PathBuf::from(format!("{base}.{stage}.ready"));
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if engine.subquery_inflight_querybacks_for_test().await == 0 {
-                    return;
+                if path.exists() {
+                    return Ok::<_, anyhow::Error>(());
                 }
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
-        unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
-        engine.close(Duration::from_secs(10)).await;
+        .context(format!("waiting for cancelled group {stage} barrier"))??;
+        Ok(())
     }
+    wait_ready(&base, "private").await?;
+    if cancel_stage == "page" {
+        std::fs::write(format!("{base}.private.release"), b"release")?;
+        wait_ready(&base, "page").await?;
+    }
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if engine.subquery_inflight_querybacks_for_test().await == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+    engine.close(Duration::from_secs(10)).await;
     remove_source_fence(f).await;
     Ok(())
 }

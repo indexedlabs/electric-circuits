@@ -1990,11 +1990,9 @@ impl SubqueryRegistry {
             let page_stamp = if shape.group_member && shape.inflight_querybacks > 0 {
                 match &source {
                     EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => Some((*lsn, *xid)),
-                    EmissionSource::QueryBack { gate, commit_lsn } => {
-                        (gate.lsn != 0)
-                            .then_some((gate.lsn, None))
-                            .or_else(|| (*commit_lsn != 0).then_some((*commit_lsn, None)))
-                    }
+                    EmissionSource::QueryBack { gate, commit_lsn } => (gate.lsn != 0)
+                        .then_some((gate.lsn, None))
+                        .or_else(|| (*commit_lsn != 0).then_some((*commit_lsn, None))),
                 }
             } else {
                 None
@@ -2108,10 +2106,9 @@ impl SubqueryRegistry {
                     if replace {
                         let delete_delivered = delete_delivered
                             || shape.page_decisions.get(&pk_id).is_some_and(|old| !member && old.delete_delivered);
-                        shape.page_decisions.insert(
-                            pk_id,
-                            PageDecision { stamp, commit_lsn, member, delete_delivered },
-                        );
+                        shape
+                            .page_decisions
+                            .insert(pk_id, PageDecision { stamp, commit_lsn, member, delete_delivered });
                     }
                 }
             }
@@ -4135,6 +4132,7 @@ mod tests {
         let ts = issues_ts();
         let (ds_url, _store) = spawn_fake_ds().await;
         let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts.clone())].into_iter().collect()));
         insert_outer_shape(&mut reg, "s1", "issues", CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
         reg.shapes.get_mut("s1").unwrap().group_member = true;
         reg.begin_queryback("s1");
@@ -4149,9 +4147,8 @@ mod tests {
         .unwrap();
 
         let page = crate::pg::SnapshotGate::parse("40:45:", "0/150");
-        let pending = reg
-            .seed_group_snapshot_keys("s1", &[serde_json::json!({"id": 1, "project_id": 100})], &page)
-            .unwrap();
+        let pending =
+            reg.seed_group_snapshot_keys("s1", &[serde_json::json!({"id": 1, "project_id": 100})], &page).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].2[0].headers.operation, "delete");
         assert_eq!(pending[0].2[0].type_, "public.issues");
