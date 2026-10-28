@@ -206,7 +206,8 @@ describe('per-table bench live mode', () => {
     const summary = summaryOf(run.stdout)
     expect(run.stdout).toContain('READY 0 ')
     expect(summary.readySubscriptions).toBe(1)
-    expect(summary.reads).toBe(1)
+    // The readiness response closes inside the measured window, and the next response is counted too.
+    expect(summary.reads).toBe(2)
     expect(summary.reconnects).toBe(1)
   })
 
@@ -242,6 +243,7 @@ describe('per-table bench live mode', () => {
     const summary = summaryOf(run.stdout)
     expect(summary.measurementReady).toBe(true)
     expect(summary.readySubscriptions).toBe(1)
+    // The readiness response closes inside the measured window, so it and the resumed response count.
     expect(summary.reads).toBeGreaterThanOrEqual(2)
   })
 

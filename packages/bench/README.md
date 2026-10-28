@@ -67,7 +67,7 @@ The default observation hold is 120 s so an SSE response that the server closes 
 be observed reconnecting; override `SCALE_LIVE_HOLD_MS` only when the observation window is part of
 the recorded comparison. Before that hold begins, every subscription must report its stream
 up-to-date fence. `SCALE_LIVE_READY_TIMEOUT_MS` defaults to 120 s (20k long-poll subscriptions
-may need more time for catch-up), and a run that does not reach the fence is reported as not ready.
+may need more time for catch-up). A run that misses the fence exits 1 and does not write a results file.
 Run the same command with `SCALE_LIVE_MODE=long-poll` and the same seed, shape and write settings
 to compare direct engine/Durable Streams behavior. This bench does not model gateway CPU or pool
 limits; those measurements require the real Indexed dev load balancer.
