@@ -2542,12 +2542,21 @@ impl Engine {
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
         let (finished, staged_group_emissions) = {
             let mut registry = self.subqueries.lock().await;
-            let finished = registry.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
+            let finished = registry.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await;
             (finished, registry.take_group_emissions())
         };
-        for (path, envs, commit_lsn) in staged_group_emissions {
-            self.group_lanes.enqueue(&path, envs, commit_lsn).await;
-        }
+        let finished = match finished {
+            Ok(finished) => {
+                for handle in staged_group_emissions {
+                    handle.wait().await;
+                }
+                finished
+            }
+            Err(error) => {
+                drop(staged_group_emissions);
+                return Err(error);
+            }
+        };
         tracing::info!(
             target: "electric_circuits_engine::shape_create",
             shape_id = id,
@@ -3927,7 +3936,7 @@ mod cancellation_tests {
                 id.to_string(),
                 ShapeRecord {
                     id: id.to_string(),
-                    table: table.to_string(),
+                    table: crate::table_ref::TableRef::parse(table).unwrap(),
                     stream_path: format!("shape/{id}"),
                     changes_only: true,
                     where_json: None,

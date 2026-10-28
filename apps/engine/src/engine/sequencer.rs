@@ -2176,33 +2176,49 @@ pub(crate) async fn process_envelope(
     {
         let mut work = std::collections::VecDeque::new();
         let mut group_paths = HashSet::new();
-        let mut staged_group_emissions = Vec::new();
-        {
+        let (result, staged_group_emissions) = {
             let mut reg = subq.registry.lock().await;
-            if reg.touches(&ts.table) {
+            let result = if reg.touches(&ts.table) {
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
-                work = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
-                group_paths = reg.group_paths_for_work(&work);
-                for path in &group_paths {
-                    subq.group_lanes.begin_origin(path, lsn_u64);
-                }
-                if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
-                    for h in &sq {
-                        if h.outcome == "passed"
-                            && let Some(sid) = h.node.strip_prefix("shape:")
-                            && !ids.iter().any(|i| i == sid)
-                        {
-                            ids.push(sid.to_string());
-                        }
+                let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
+                if let Ok(result_work) = result.as_ref() {
+                    work = result_work.clone();
+                    group_paths = reg.group_paths_for_work(&work);
+                    for path in &group_paths {
+                        subq.group_lanes.begin_origin(path, lsn_u64);
                     }
-                    hops.extend(sq);
+                    if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
+                        for h in &sq {
+                            if h.outcome == "passed"
+                                && let Some(sid) = h.node.strip_prefix("shape:")
+                                && !ids.iter().any(|i| i == sid)
+                            {
+                                ids.push(sid.to_string());
+                            }
+                        }
+                        hops.extend(sq);
+                    }
+                } else {
+                    work = VecDeque::new();
                 }
+                result
+            } else {
+                Ok(VecDeque::new())
+            };
+            (result, reg.take_group_emissions())
+        };
+        work = match result {
+            Ok(work) => {
+                for handle in staged_group_emissions {
+                    handle.wait().await;
+                }
+                work
             }
-            staged_group_emissions = reg.take_group_emissions();
-        }
-        for (path, envs, commit_lsn) in staged_group_emissions {
-            subq.group_lanes.enqueue(&path, envs, commit_lsn).await;
-        }
+            Err(error) => {
+                drop(staged_group_emissions);
+                return Err(error);
+            }
+        };
         if !work.is_empty() {
             subq.pending_flips.add(lsn_u64);
             if subq
