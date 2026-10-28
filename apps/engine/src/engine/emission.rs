@@ -394,7 +394,7 @@ impl GroupEmissionLanes {
 }
 
 impl GroupBatchHandle {
-    pub(crate) async fn wait(self) {
+    pub(crate) async fn wait(mut self) {
         loop {
             let notified = self.lane.wake.notified();
             tokio::pin!(notified);
@@ -425,17 +425,12 @@ impl GroupBatchHandle {
                         && state.admitted.len() < GROUP_LANE_CAPACITY
                         && self.ticket.seq < state.taken.saturating_add(GROUP_LANE_CAPACITY as u64) =>
                     {
-                        if let Some(batch) = self.batch.take() {
-                            *self.ticket.entry.envs.lock().unwrap() = Some(batch);
-                            state.waiting.pop_front();
-                            self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);
-                            state.admitted.push_back(self.ticket.clone());
-                            Admission::Admitted
-                        } else {
-                            state.waiting.pop_front();
-                            self.ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
-                            Admission::Cancelled
-                        }
+                        let batch = self.batch.take().expect("a waiting handle owns its batch");
+                        *self.ticket.entry.envs.lock().unwrap() = Some(batch);
+                        state.waiting.pop_front();
+                        self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);
+                        state.admitted.push_back(self.ticket.clone());
+                        Admission::Admitted
                     }
                     _ => Admission::Waiting,
                 }
