@@ -205,12 +205,7 @@ impl GroupEmissionLanes {
             while let Some(batch) = rx.recv().await {
                 let _ = worker_ds.append_reliable(&batch.stream_path, &batch.envs).await;
                 worker_pending.complete(batch.commit_lsn);
-                complete_origin_entry(
-                    &worker_origins,
-                    &worker_wake,
-                    &batch.stream_path,
-                    batch.commit_lsn,
-                );
+                complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
             }
             worker_lane.closed.store(true, std::sync::atomic::Ordering::Release);
         });

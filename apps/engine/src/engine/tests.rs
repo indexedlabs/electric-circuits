@@ -2154,7 +2154,6 @@ async fn emission_lanes_order_and_barrier() {
         ds,
         4,
         pending.clone(),
-        DegradeState::new(),
         crate::shutdown::ShutdownToken::new(),
     );
 
