@@ -2912,7 +2912,10 @@ impl Engine {
     ) -> Result<()> {
         let mut registry = self.subqueries.lock().await;
         for (shape_id, rows) in members {
-            registry.seed_group_snapshot_keys(shape_id, rows, gate)?;
+            let pending = registry.seed_group_snapshot_keys(shape_id, rows, gate)?;
+            for (stream_path, lsn, envs) in pending {
+                registry.deliver(&stream_path, envs, lsn).await?;
+            }
         }
         Ok(())
     }
