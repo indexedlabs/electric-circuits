@@ -7,15 +7,11 @@ prototype and nothing here is merge-ready.
 
 ## Verdict
 
-The group correctness slice is green in CI. Keep groups as the transport and
-lease abstraction for the next round, but do not enable them for production:
-the gateway/SDK route, capability re-authorization, and closed-stream client
-reload contract are still unproven. The key-only semijoin was not started as a
-DBSP runtime, so this round gives no semijoin performance conclusion.
+The tests are green in CI, but the hosted review found lifecycle and backpressure gaps that make the current group implementation incorrect under lease lapse, cancellation, and high fan-out. Treat the CI rows as regression coverage only; do not recommend groups for production until those gaps are fixed. The key-only semijoin was not started as a DBSP runtime, so this round gives no semijoin performance conclusion.
 
 ## CI evidence
 
-The genuine-red run is [40605454944](https://github.com/indexedlabs/electric-circuits/actions/runs/40605454944), where the delayed-flip and equal-key-delete contracts timed out with the group stream containing only one member envelope. The green run is [40607189616](https://github.com/indexedlabs/electric-circuits/actions/runs/40607189616); its Rust job ran all 19 ignored source-table contracts against PostgreSQL 18, followed by typecheck and the Node gate.
+The genuine-red run is [40605454944](https://github.com/indexedlabs/electric-circuits/actions/runs/40605454944), where the delayed-flip and equal-key-delete contracts timed out with the group stream containing only one member envelope. The green code run is [40607189616](https://github.com/indexedlabs/electric-circuits/actions/runs/40607189616); the final report head also passed in [40610470515](https://github.com/indexedlabs/electric-circuits/actions/runs/40610470515). These runs compiled the engine, ran all 19 ignored source-table contracts against PostgreSQL 18, typecheck, the Node gate, and Vitest.
 
 ## Correctness cases
 
@@ -46,6 +42,12 @@ Not started. `packages/scope-bench/src/semijoin.ts` is only a rejected-
 `NOT IN`/NULL sketch; it is not a DBSP runtime template. There are no engine
 state bytes, RSS, reseed-time, move-in-latency, or production-size measurements.
 
+## Hosted review findings
+
+The hosted static review ([5676655751](https://github.com/indexedlabs/electric-circuits/pull/44#pullrequestreview-5676655751)) identified five implementation gaps that supersede the optimistic table results: group claims do not renew or release on lease lapse/retirement, the bounded emission lane degrades on ordinary burst pressure, group reservation and completion are not cancellation-safe, completion lacks a post-durability generation check, and group stream paths can be re-minted after restart. The delayed-flip test also used a source receipt between T and T+1, so it did not prove the new fence. These are accepted as prototype blockers, not waived correctness risks.
+
+The benchmark semijoin result artifact and config have been removed; the semijoin remains explicitly not started.
+
 ## What remains unproven
 
 - Gateway `subsets/load` to a real routed batch, SDK envelope `type` routing,
@@ -58,7 +60,4 @@ state bytes, RSS, reseed-time, move-in-latency, or production-size measurements.
 
 ## Recommendation
 
-Continue with groups as the shared transport and lease layer. Build the real
-semijoin runtime next and compare its measured state/reseed/move-in/write costs
-against groups-with-subquery-members before choosing the membership strategy.
-Do not publish or merge either path from this prototype.
+Do not recommend or publish the current group implementation. First fix the hosted-review lifecycle, cancellation, per-engine fencing, and backpressure findings and rerun the red/green contracts without an intermediate receipt. Then build the real semijoin runtime and compare measured state/reseed/move-in/write costs against corrected groups before choosing the membership strategy.

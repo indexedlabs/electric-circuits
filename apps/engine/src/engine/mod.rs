@@ -90,6 +90,8 @@ pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub(crate) use group::{GroupClaims, GroupConflict, GroupMember, GroupRecord, GroupStreamClosed};
+
+static GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
     GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
@@ -1367,6 +1369,9 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
+    pub(crate) fn group_stream_path(&self) -> String {
+        format!("shape/group-{}-{}", self.sub_nonce, GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
@@ -2875,6 +2880,18 @@ impl Engine {
 
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        let valid = {
+            let st = self.state.lock().await;
+            st.shapes.contains_key(&record.members[0].shape_id)
+                && record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id))
+        };
+        if !valid {
+            let _ = self
+                .catalog_tx
+                .send_durable(CatalogEvent::GroupDropped { subscription: record.subscription.clone() })
+                .await;
+            return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
+        }
         self.state.lock().await.group_claims.complete(record);
         crate::engine::group::activate();
         Ok(())

@@ -2036,14 +2036,31 @@ impl Engine {
             st.publish_subscription_gauge(&self.metrics);
             expired
         };
+        let mut lapsed_groups = Vec::new();
         for (shape, subscription) in lapsed {
             tracing::debug!(
                 "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
                 cfg.subscription_lease_timeout
             );
-            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
+            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription: subscription.clone(), lapsed: true });
             self.metrics.subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
+            if self.group_record(&subscription).await.is_some() {
+                lapsed_groups.push(subscription);
+            }
         }
+        for subscription in lapsed_groups {
+            if let Err(error) = self.release_group_claim(&subscription).await {
+                tracing::warn!(%subscription, %error, "retention: failed to retire lapsed group claim");
+            }
+        }
+    }
+
+    async fn release_group_claim(&self, subscription: &str) -> Result<()> {
+        let Some(group) = self.group_record(subscription).await else { return Ok(()) };
+        for member in &group.members {
+            self.release_subscription(&member.shape_id, Some(&member.subscription)).await;
+        }
+        self.finish_group_release(subscription).await
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the

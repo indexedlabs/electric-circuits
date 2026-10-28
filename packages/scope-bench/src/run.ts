@@ -64,7 +64,6 @@ const CONFIGS: Config[] = ([
   { name: 'scope load + mux + series', variant: 'series', design: 'scope-load', slots: 8, live: 'mux' },
   { name: 'scope group', variant: 'scoped', design: 'scope-group', slots: 8, live: 'per-stream' },
   { name: 'scope group + resume', variant: 'scoped', design: 'scope-group', slots: 8, live: 'per-stream', resume: true },
-  { name: 'scope semijoin', variant: 'scoped', design: 'scope-semijoin', slots: 8, live: 'per-stream' },
 ] as Config[]).filter((c) => !ONLY_CONFIG || ONLY_CONFIG.split(',').includes(c.name))
 
 function repoRoot(): string {

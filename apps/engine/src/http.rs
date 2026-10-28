@@ -19,7 +19,6 @@ use crate::table_ref::TableRef;
 
 /// Keep compound prototype fan-in bounded before any feed claim or Postgres work begins.
 const MAX_BATCH_TABLES: usize = 64;
-static GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // The lifecycle API currently returns only the shape and subscription, not whether the claim was
 // fresh. Serialize this route's owner check with its create so concurrent lost-response retries do
@@ -1342,6 +1341,35 @@ struct FeedClaimGuard {
     armed: bool,
 }
 
+struct GroupReservationGuard {
+    engine: Engine,
+    subscription: String,
+    armed: bool,
+}
+
+impl GroupReservationGuard {
+    fn new(engine: &Engine, subscription: &str) -> Self {
+        Self { engine: engine.clone(), subscription: subscription.to_string(), armed: true }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let engine = self.engine.clone();
+        let subscription = self.subscription.clone();
+        engine.shutdown_token().spawn(async move {
+            engine.abort_group(&subscription).await;
+        });
+    }
+}
+
 impl FeedClaimGuard {
     fn new(engine: &Engine, rec: &ShapeRecord, subscription: &str, fresh: bool) -> Self {
         Self { engine: engine.clone(), shape_id: rec.id.clone(), subscription: subscription.to_string(), armed: fresh }
@@ -1554,7 +1582,7 @@ async fn subset_load_group(
     subscription: Option<String>,
     members: Vec<ScopeLoadEntry>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    const MAX_GROUP_MEMBERS: usize = 8;
+    const MAX_GROUP_MEMBERS: usize = 16;
     if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
@@ -1582,13 +1610,13 @@ async fn subset_load_group(
             })?;
     }
     let _control = engine.admit_control()?;
-    let group_path =
-        format!("shape/group-{}-{}", std::process::id(), GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let group_path = engine.group_stream_path();
     let group_sub = engine.resolve_subscription(subscription).await;
     // Reserve the one public claim before the first member create.  This check is made
     // under the same engine state lock as ordinary shape subscriptions, so a competing
     // single-shape create cannot win the name between member creates.
     engine.reserve_group(&group_sub).await?;
+    let mut reservation = GroupReservationGuard::new(engine, &group_sub);
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
@@ -1687,6 +1715,7 @@ async fn subset_load_group(
         engine.abort_group(&group_sub).await;
         return Err(AppError::from(error));
     }
+    reservation.complete();
     let results: Vec<serde_json::Value> = members.into_iter().zip(created.iter()).zip(page.pages).map(|((member, (rec, _)), rows)| serde_json::json!({
         "key": member.key, "table": member.table, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
         "subscription": group_sub, "leaseSeconds": lease_seconds, "offset": offset, "rows": rows,

@@ -883,7 +883,6 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
         f.client
             .batch_execute(&format!("BEGIN; INSERT INTO public.{} (id) VALUES (2); INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.inner, t))
             .await?;
-        wait_source_receipt(&engine, f, t).await?;
         let t1 = uuid::Uuid::new_v4();
         f.client
             .batch_execute(&format!("BEGIN; UPDATE public.{} SET body = 't+1' WHERE id = 2; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.outer, t1))
@@ -958,6 +957,13 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
             .filter(|event| event_key(event).as_deref() == Some("1") && event_operation(event) == Some("delete"))
             .count();
         ensure!(deletes >= 2, "equal-key delete lost a member-table delete: {events:?}");
+        let delete_types: std::collections::BTreeSet<_> = events
+            .iter()
+            .skip(baseline)
+            .filter(|event| event_key(event).as_deref() == Some("1") && event_operation(event) == Some("delete"))
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        ensure!(delete_types.len() >= 2, "equal-key deletes did not retain table identity: {events:?}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
