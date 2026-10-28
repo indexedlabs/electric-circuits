@@ -67,6 +67,9 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
             Case::GroupRelease => group_release_reloads_same_subscription(&fixture).await,
             Case::GroupLapse => group_lapse_reloads_same_subscription(&fixture).await,
+            Case::GroupOneSubscription => group_one_subscription_claims(&fixture).await,
+            Case::GroupRetryRenews => group_retry_renews(&fixture).await,
+            Case::GroupMembersMax => group_members_max(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -95,6 +98,9 @@ enum Case {
     GroupRestart,
     GroupRelease,
     GroupLapse,
+    GroupOneSubscription,
+    GroupRetryRenews,
+    GroupMembersMax,
 }
 
 #[test]
@@ -191,6 +197,24 @@ fn group_release_reloads_same_subscription_on_a_new_stream() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_lapse_reloads_same_subscription_on_a_new_stream() -> Result<()> {
     isolated("ownership::group_lapse_reloads_same_subscription_on_a_new_stream", Case::GroupLapse)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_owns_one_subscription_across_every_member() -> Result<()> {
+    isolated("ownership::group_owns_one_subscription_across_every_member", Case::GroupOneSubscription)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_retry_renews_after_a_dropped_response() -> Result<()> {
+    isolated("ownership::group_retry_renews_after_a_dropped_response", Case::GroupRetryRenews)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_rejects_more_than_eight_members_without_partial_state() -> Result<()> {
+    isolated("ownership::group_rejects_more_than_eight_members_without_partial_state", Case::GroupMembersMax)
 }
 
 #[derive(Clone)]
@@ -1159,6 +1183,148 @@ async fn group_lapse_reloads_same_subscription(f: &Fixture) -> Result<()> {
             events.iter().any(|event| event_key(event).as_deref() == Some("4")),
             "reloaded lapsed group missed live output: {events:?}"
         );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let plain_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "changesOnly": true,
+            "subscription": "group-one-sub",
+        });
+        let (status, plain) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
+        ensure!(status == StatusCode::OK, "pre-existing shape failed: {status} {plain}");
+        let (status, conflict) = post_group(&app, group_body(f, "group-one-sub", true)).await?;
+        ensure!(status == StatusCode::CONFLICT, "group did not reject an occupied subscription: {status} {conflict}");
+        let plain_id = plain["shapeId"].as_str().context("pre-existing shape id")?;
+        let (status, _) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{plain_id}?subscription=group-one-sub"),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(status == StatusCode::OK, "pre-existing shape release failed: {status}");
+
+        let (status, group) = post_group(&app, group_body(f, "group-one-sub", true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {group}");
+        let members = group["results"].as_array().context("group results")?;
+        let group_id = members[0]["shapeId"].as_str().context("group member id")?;
+        let member_id = members[1]["shapeId"].as_str().context("private member id")?;
+        let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
+        ensure!(status == StatusCode::CONFLICT, "plain create bypassed group claim: {status} {conflict}");
+        let private_body = serde_json::json!({
+            "table": format!("public.{}", f.inner),
+            "changesOnly": true,
+            "subscription": "group-one-sub:member:1",
+        });
+        let (status, conflict) = json(
+            &app,
+            Method::POST,
+            "/v1/shapes",
+            Body::from(private_body.to_string()),
+        )
+        .await?;
+        ensure!(status == StatusCode::CONFLICT, "private create bypassed group claim: {status} {conflict}");
+        let (status, conflict) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{member_id}?subscription=group-one-sub:member:1"),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(status == StatusCode::CONFLICT, "private member release was not refused: {status} {conflict}");
+        let (status, renewed) = post_group(&app, group_body(f, "group-one-sub", true)).await?;
+        ensure!(status == StatusCode::OK, "same group renewal failed: {status} {renewed}");
+        ensure!(renewed["streamPath"] == group["streamPath"], "renewal changed the group stream");
+        let (status, released) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{group_id}?subscription=group-one-sub"),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(status == StatusCode::OK, "group release failed: {status} {released}");
+        let (status, after) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
+        ensure!(status == StatusCode::OK, "public subscription was not freed: {status} {after}");
+        let (status, after_private) = json(
+            &app,
+            Method::POST,
+            "/v1/shapes",
+            Body::from(private_body.to_string()),
+        )
+        .await?;
+        ensure!(status == StatusCode::OK, "private subscription was not freed: {status} {after_private}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_retry_renews(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group load failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("initial group stream path")?.to_owned();
+        drop(first);
+        let (status, second) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
+        ensure!(status == StatusCode::OK, "retry did not renew: {status} {second}");
+        ensure!(second["streamPath"].as_str() == Some(old_path.as_str()), "retry created a second group stream");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_members_max(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let members = (0..9)
+            .map(|i| {
+                serde_json::json!({
+                    "key": format!("member-{i}"),
+                    "table": if i % 2 == 0 { format!("public.{}", f.outer) } else { format!("public.{}", f.inner) },
+                })
+            })
+            .collect::<Vec<_>>();
+        let too_many = serde_json::json!({ "subscription": "group-too-many", "members": members });
+        let (status, body) = post_group(&app, too_many).await?;
+        ensure!(status == StatusCode::BAD_REQUEST, "ninth member was accepted: {status} {body}");
+        let (status, body) = post_group(&app, group_body(f, "group-too-many", true)).await?;
+        ensure!(status == StatusCode::OK, "failed ninth-member request left a reservation: {status} {body}");
+
+        let duplicate = serde_json::json!({
+            "subscription": "group-duplicate-table",
+            "members": [
+                { "key": "one", "table": format!("public.{}", f.outer) },
+                { "key": "two", "table": format!("public.{}", f.outer) },
+            ],
+        });
+        let (status, body) = post_group(&app, duplicate).await?;
+        ensure!(status == StatusCode::BAD_REQUEST, "duplicate table was accepted: {status} {body}");
+        let (status, body) = post_group(&app, group_body(f, "group-duplicate-table", true)).await?;
+        ensure!(status == StatusCode::OK, "duplicate-table rejection left a reservation: {status} {body}");
+
+        let refused = serde_json::json!({
+            "subscription": "group-refused-member",
+            "members": [
+                { "key": "one", "table": format!("public.{}", f.outer) },
+                { "key": "two", "table": "public.no_such_group_table" },
+            ],
+        });
+        let (status, body) = post_group(&app, refused).await?;
+        ensure!(status == StatusCode::BAD_REQUEST, "refused member was accepted: {status} {body}");
+        let (status, body) = post_group(&app, group_body(f, "group-refused-member", true)).await?;
+        ensure!(status == StatusCode::OK, "member validation failure left a reservation: {status} {body}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
