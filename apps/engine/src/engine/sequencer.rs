@@ -967,6 +967,7 @@ pub(crate) async fn sequencer_loop(
                             .filter(|path| path.starts_with("shape/group-"))
                             .cloned()
                             .collect();
+                        let direct_group_paths: HashSet<String> = group_paths.iter().cloned().collect();
                         for path in group_paths {
                             if let Some(envs) = txn_pending.remove(&path) {
                                 subq.group_lanes.enqueue(&path, envs, group_lsn);
@@ -976,6 +977,20 @@ pub(crate) async fn sequencer_loop(
                         // commit is processed.
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
                             tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
+                            highwater = txn_highwater;
+                            processing_failed = true;
+                            break;
+                        }
+                        if !direct_group_paths.is_empty()
+                            && !wait_for_group_effects(
+                                &subq.group_lanes,
+                                &direct_group_paths,
+                                &shutdown,
+                                group_lsn,
+                            )
+                            .await
+                        {
+                            tracing::error!(group_lsn, "group output could not land before advancing the processed position");
                             highwater = txn_highwater;
                             processing_failed = true;
                             break;

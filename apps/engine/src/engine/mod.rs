@@ -2961,6 +2961,14 @@ impl Engine {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }
 
+    pub(crate) fn register_group_lane(&self, stream_path: &str) {
+        self.group_lanes.register(stream_path);
+    }
+
+    pub(crate) fn remove_group_lane(&self, stream_path: &str) {
+        self.group_lanes.remove(stream_path);
+    }
+
     /// Renew the public group lease and every private member claim together. A retried load is
     /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
     /// to the same wall-clock instant.

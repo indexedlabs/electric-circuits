@@ -1074,7 +1074,7 @@ impl GroupReservationGuard {
             return;
         }
         self.armed = false;
-        self.engine.group_lanes.remove(&self.stream_path);
+        self.engine.remove_group_lane(&self.stream_path);
         for (shape_id, subscription) in self.created.drain(..) {
             if let Err(error) = self.engine.release_group_member_durable(&shape_id, &subscription).await {
                 tracing::warn!(%error, %shape_id, %subscription, "failed to compensate group member claim");
@@ -1097,7 +1097,7 @@ impl Drop for GroupReservationGuard {
         let created = std::mem::take(&mut self.created);
         self.armed = false;
         engine.shutdown_token().spawn(async move {
-            engine.group_lanes.remove(&stream_path);
+            engine.remove_group_lane(&stream_path);
             for (shape_id, member_subscription) in created {
                 if let Err(error) = engine.release_group_member_durable(&shape_id, &member_subscription).await {
                     tracing::warn!(%error, %shape_id, %member_subscription, "failed to compensate cancelled group member claim");
@@ -1270,7 +1270,7 @@ async fn subset_load_group(
     let member_subscriptions: Vec<String> =
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     engine.reserve_group(&group_sub, &member_subscriptions).await?;
-    engine.group_lanes.register(&group_path);
+    engine.register_group_lane(&group_path);
     let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
