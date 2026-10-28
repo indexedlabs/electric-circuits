@@ -518,14 +518,14 @@ async function main() {
   assertLiveMeasurements(live, LIVE_RAMP.some((level) => level > 0))
   const totalReconnects = live.totalReconnectsPerMinute.map((value) => value.toFixed(2)).join(',') || 'n/a'
   const readinessSpreads = live.readinessSpreadsMs.map((value) => value ?? 'n/a').join(',') || 'n/a'
-  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} total-reconnects/observation-window/min=${totalReconnects} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spreads=${readinessSpreads}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} per-ramp-increment-total-reconnects/min=${totalReconnects} final-level-total-reconnects/min=${live.finalTotalReconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spreads=${readinessSpreads}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
 
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, total reconnects/observation-window/min=${totalReconnects}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spreads=${readinessSpreads} ms per ramp level, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, per-ramp-increment total reconnects/min=${totalReconnects}, final-level total reconnects/min=${live.finalTotalReconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spreads=${readinessSpreads} ms per ramp level, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
