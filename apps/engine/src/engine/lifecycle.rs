@@ -1175,9 +1175,7 @@ impl Engine {
         internal_group: bool,
     ) -> Result<()> {
         let mut st = self.state.lock().await;
-        if !internal_group
-            && let Some(subscription) = sub
-        {
+        if !internal_group && let Some(subscription) = sub {
             if st.group_claims.is_reserved(subscription) {
                 return Err(anyhow::Error::new(GroupConflict {
                     subscription: subscription.to_string(),
@@ -1242,11 +1240,7 @@ impl Engine {
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
-        if st
-            .subs_by_id
-            .iter()
-            .any(|(subscription, owner)| owner == id && st.group_claims.is_reserved(subscription))
-        {
+        if st.subs_by_id.iter().any(|(subscription, owner)| owner == id && st.group_claims.is_reserved(subscription)) {
             return Err(anyhow::Error::new(GroupConflict {
                 subscription: "group reservation".to_string(),
                 owner: format!("shape {id}"),
