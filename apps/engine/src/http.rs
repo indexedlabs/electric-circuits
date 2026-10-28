@@ -1370,7 +1370,7 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     // a member-create or catalog-completion barrier does not accidentally block earlier stages.
     match std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") {
         Ok(selected) if selected != stage => return Ok(()),
-        Err(_) if matches!(stage, "member" | "complete") => return Ok(()),
+        Err(_) if matches!(stage, "member" | "complete" | "rollback") => return Ok(()),
         _ => {}
     }
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
@@ -1900,6 +1900,11 @@ async fn subset_load_group(
     // Keep one live caller claim for the group. Member claims after the first are private
     // implementation handles and are released once the group record has captured them.
     for (rec, sub) in created.iter().skip(1) {
+        #[cfg(feature = "test-support")]
+        if test_group_page_failure("member_release") {
+            reservation.rollback().await;
+            return Err(AppError::from(anyhow::anyhow!("test-injected member release failure")));
+        }
         if let Err(error) = engine.release_subscription_durable(&rec.id, Some(sub)).await {
             reservation.rollback().await;
             return Err(AppError::from(error));

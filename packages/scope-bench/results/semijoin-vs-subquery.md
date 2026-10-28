@@ -299,12 +299,15 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
-current candidate has passed; the five-repetition benchmark remains pending. The follow-up
-adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
-retry coverage. `48501cd` then passed formatting, both group contracts, Rust engine tests, TypeScript and
-Node (run `40747358562`, test job `123024579773`); Vitest and the benchmark were still pending
-when reviewed. Current head `82f2cd2` retains members in place across rollback awaits and adds the
-rollback-cancellation contract; its exact-head run is pending, so no current-head result or
+current candidate has passed; the five-repetition benchmark remains pending. The follow-up adds completion durability compensation, shutdown-owned retry coverage and
+cancellation-stage retry coverage. `48501cd` then passed formatting, both group contracts, Rust
+engine tests, TypeScript, Node and Vitest (run `40747358562`, test job `123024579773`); its
+benchmark was still pending when reviewed. The c78804a run `40748888867` compiled and passed
+formatting, Rust, TypeScript and Node but its group step failed in
+`concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
+walsender pid 5267` during replacement restart. Heads `82f2cd2` and `9c5b821` then exposed
+compile/format failures in the new rollback contract. Current head `9c5b821` adds the corrected
+rollback-cancellation contract; its exact-head rerun is pending, so no current-head result or
 benchmark measurement is claimed.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
