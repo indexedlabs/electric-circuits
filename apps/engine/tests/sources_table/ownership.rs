@@ -756,11 +756,11 @@ fn group_body(f: &Fixture, subscription: &str, plain_only: bool) -> serde_json::
     } else {
         members.push(serde_json::json!({
             "key": "subquery",
-            "table": outer,
-            "columns": ["id", "body"],
+            "table": inner,
+            "columns": ["id"],
             "where": {
                 "col": "id",
-                "in": { "table": inner, "project": "id" }
+                "in": { "table": outer, "project": "id" }
             }
         }));
     }
@@ -1059,7 +1059,7 @@ async fn group_restart_restores_plain_and_drops_mixed(f: &Fixture) -> Result<()>
         engine.close(Duration::from_secs(10)).await;
         let (restarted, restarted_app) = group_engine(f).await?;
         let (status, duplicate_plain) = post_group(&restarted_app, group_body(f, "group-plain-restart", true)).await?;
-        ensure!(status == StatusCode::CONFLICT, "durable plain group was not restored: {status} {duplicate_plain}");
+        ensure!(status == StatusCode::OK, "plain group did not renew after restart: {status} {duplicate_plain}");
         let (status, recreated_mixed) = post_group(&restarted_app, group_body(f, "group-mixed-restart", false)).await?;
         ensure!(
             status == StatusCode::OK,

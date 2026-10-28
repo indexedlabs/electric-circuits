@@ -83,6 +83,7 @@ pub(crate) struct GroupStreamClosed {
 pub(crate) struct GroupClaims {
     reserved: HashMap<String, String>,
     records: HashMap<String, GroupRecord>,
+    private_members: HashMap<String, String>,
 }
 
 impl GroupClaims {
@@ -99,11 +100,17 @@ impl GroupClaims {
 
     pub(crate) fn complete(&mut self, record: GroupRecord) {
         self.reserved.remove(&record.subscription);
+        for member in &record.members {
+            if member.subscription != record.subscription {
+                self.private_members.insert(member.subscription.clone(), record.subscription.clone());
+            }
+        }
         self.records.insert(record.subscription.clone(), record);
     }
 
     pub(crate) fn release(&mut self, subscription: &str) -> Option<GroupRecord> {
         self.reserved.remove(subscription);
+        self.private_members.retain(|_, owner| owner != subscription);
         self.records.remove(subscription)
     }
 
@@ -111,8 +118,22 @@ impl GroupClaims {
         self.records.get(subscription)
     }
 
+    pub(crate) fn records_iter(&self) -> impl Iterator<Item = &GroupRecord> {
+        self.records.values()
+    }
+
     pub(crate) fn is_reserved(&self, subscription: &str) -> bool {
         self.reserved.contains_key(subscription)
+    }
+
+    pub(crate) fn private_owner(&self, subscription: &str) -> Option<&String> {
+        self.private_members.get(subscription)
+    }
+
+    pub(crate) fn reserve_private_members(&mut self, group: &str, members: impl IntoIterator<Item = String>) {
+        for member in members {
+            self.private_members.insert(member, group.to_string());
+        }
     }
 }
 

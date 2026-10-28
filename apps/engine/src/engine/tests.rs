@@ -302,21 +302,23 @@ fn standalone_index_candidates() {
 
 /// A SubqueryHandle over a fresh registry, with a live propagator task (tests run in tokio).
 fn test_subq() -> SubqueryHandle {
-    let registry =
-        Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new_for_in_process_test("http://127.0.0.1:1"), None)));
+    let ds = DsClient::new_for_in_process_test("http://127.0.0.1:1");
+    let registry = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None)));
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(PendingFlips::default());
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
+    let shutdown = crate::shutdown::ShutdownToken::new();
+    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
     spawn_flip_propagator(
         registry.clone(),
         flip_rx,
         pending_flips.clone(),
         degrade.clone(),
         trace_tx,
-        crate::shutdown::ShutdownToken::new(),
+        shutdown,
     );
-    SubqueryHandle { registry, flip_tx, pending_flips, degrade }
+    SubqueryHandle { registry, flip_tx, pending_flips, degrade, group_lanes }
 }
 
 fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {

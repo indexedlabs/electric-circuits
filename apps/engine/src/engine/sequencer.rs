@@ -1264,8 +1264,9 @@ async fn wait_for_group_effects(
         if !lanes.has_origin_at_or_before(marker_lsn) {
             return true;
         }
+        let wake = lanes.wake();
         tokio::select! {
-            _ = lanes.wake().notified() => {}
+            _ = wake.notified() => {}
             _ = shutdown.wait() => return false,
         }
     }
@@ -2546,6 +2547,7 @@ mod source_fence_tests {
             Default::default(),
             Default::default(),
             engine.subquery_handle(),
+            engine.group_fence.clone(),
             engine.trace_tx.clone(),
             None,
             HashMap::new(),
@@ -2595,14 +2597,14 @@ mod source_fence_tests {
         for _ in 0..pending {
             pending_flips.add(0);
         }
+        let ds = DsClient::new_for_in_process_test("http://127.0.0.1:1");
+        let shutdown = crate::shutdown::ShutdownToken::new();
         SubqueryHandle {
-            registry: Arc::new(Mutex::new(SubqueryRegistry::new(
-                DsClient::new_for_in_process_test("http://127.0.0.1:1"),
-                None,
-            ))),
+            registry: Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None))),
             flip_tx,
             pending_flips,
             degrade: DegradeState::new(),
+            group_lanes: crate::engine::emission::GroupEmissionLanes::new(ds, shutdown, pending_flips.clone()),
         }
     }
 
@@ -2966,6 +2968,7 @@ mod held_spill_tests {
                 Default::default(),
                 Default::default(),
                 engine.subquery_handle(),
+                engine.group_fence.clone(),
                 engine.trace_tx.clone(),
                 None,
                 HashMap::new(),

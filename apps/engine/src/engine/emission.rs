@@ -172,7 +172,7 @@ impl GroupEmissionLanes {
                         }
                         return;
                     }
-                    if let Err(batch) = tx.send(batch).await {
+                    if let Err(tokio::sync::mpsc::error::SendError(batch)) = tx.send(batch).await {
                         let mut queue = dispatcher_lane.queue.lock().unwrap();
                         let mut dropped = std::collections::VecDeque::new();
                         std::mem::swap(&mut *queue, &mut dropped);

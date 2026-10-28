@@ -2962,11 +2962,20 @@ impl Engine {
         // Only shape streams are reconciled: the change log uses `append`/`append_checked`, which
         // never come through here, and anything else is not the engine's to retire.
         let Some(id) = path.strip_prefix("shape/") else { return GoneVerdict::Discard };
-        let registered = {
+        let (shape_id, group_subscription) = {
             let st = self.state.lock().await;
-            st.shapes.get(id).is_some_and(|rec| rec.stream_path == path)
+            if st.shapes.get(id).is_some_and(|rec| rec.stream_path == path) {
+                (Some(id.to_string()), None)
+            } else {
+                let group = st
+                    .group_claims
+                    .records_iter()
+                    .find(|group| group.stream_path == path)
+                    .map(|group| group.subscription.clone());
+                (None, group)
+            }
         };
-        if !registered {
+        if shape_id.is_none() && group_subscription.is_none() {
             return GoneVerdict::Discard;
         }
         if self.shutdown.is_shutting_down() {
@@ -2979,18 +2988,26 @@ impl Engine {
             // Closed or absent: storage really has retired this stream under a live shape. Retire
             // the shape for real so nothing keeps serving it.
             Ok(_) => {
-                tracing::error!(
-                    "shape {id}: its stream '{path}' is gone from storage while the shape was live; \
-                     retiring the shape so its subscribers re-subscribe"
-                );
-                let (engine, id) = (self.clone(), id.to_string());
-                self.shutdown.spawn(async move {
-                    let _ = engine.purge_shape(&id).await;
-                });
+                if let Some(group) = group_subscription {
+                    tracing::error!(%group, "group stream '{path}' is gone from storage; releasing the group claim");
+                    let engine = self.clone();
+                    self.shutdown.spawn(async move {
+                        let _ = engine.release_group_claim(&group).await;
+                    });
+                } else if let Some(id) = shape_id {
+                    tracing::error!(
+                        "shape {id}: its stream '{path}' is gone from storage while the shape was live; \
+                         retiring the shape so its subscribers re-subscribe"
+                    );
+                    let (engine, id) = (self.clone(), id.to_string());
+                    self.shutdown.spawn(async move {
+                        let _ = engine.purge_shape(&id).await;
+                    });
+                }
                 GoneVerdict::Discard
             }
             Err(e) => {
-                tracing::warn!("shape {id}: HEAD {path} failed ({e:#}) after a terminal append; retrying the append");
+                tracing::warn!("stream {path}: HEAD failed ({e:#}) after a terminal append; retrying the append");
                 GoneVerdict::Retry
             }
         }
