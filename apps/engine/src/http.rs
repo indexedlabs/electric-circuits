@@ -12,14 +12,13 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::engine::{Engine, ShapeRecord, TableSchemaInfo, TableStats};
+use crate::engine::{Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 use crate::table_ref::TableRef;
 
 /// Keep compound prototype fan-in bounded before any feed claim or Postgres work begins.
 const MAX_BATCH_TABLES: usize = 64;
-static GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // The lifecycle API currently returns only the shape and subscription, not whether the claim was
 // fresh. Serialize this route's owner check with its create so concurrent lost-response retries do
@@ -1342,6 +1341,35 @@ struct FeedClaimGuard {
     armed: bool,
 }
 
+struct GroupReservationGuard {
+    engine: Engine,
+    subscription: String,
+    armed: bool,
+}
+
+impl GroupReservationGuard {
+    fn new(engine: &Engine, subscription: &str) -> Self {
+        Self { engine: engine.clone(), subscription: subscription.to_string(), armed: true }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let engine = self.engine.clone();
+        let subscription = self.subscription.clone();
+        engine.shutdown_token().spawn(async move {
+            engine.abort_group(&subscription).await;
+        });
+    }
+}
+
 impl FeedClaimGuard {
     fn new(engine: &Engine, rec: &ShapeRecord, subscription: &str, fresh: bool) -> Self {
         Self { engine: engine.clone(), shape_id: rec.id.clone(), subscription: subscription.to_string(), armed: fresh }
@@ -1545,18 +1573,20 @@ async fn subset_load(
     ))
 }
 
-/// Prototype-only one-stream group form. Members use the existing plain and subquery shape paths,
-/// while a shared stream path and one settled page snapshot make the benchmark comparable. Group
-/// catalog/lifecycle, a cross-member transaction barrier and true one-claim retention are deferred.
+/// One-stream group form. Members still use the existing plain and subquery shape paths, while a
+/// shared stream path and one settled page snapshot make the members comparable. The group claim
+/// and member list are durable as one catalog event; the sequencer's active-group fence orders
+/// delayed subquery emissions before the next source transaction.
 async fn subset_load_group(
     engine: &Engine,
     subscription: Option<String>,
     members: Vec<ScopeLoadEntry>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    if members.is_empty() || members.len() > MAX_BATCH_TABLES {
+    const MAX_GROUP_MEMBERS: usize = 16;
+    if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
-            msg: "members must contain 1..64 entries".into(),
+            msg: "members must contain 1..8 entries".into(),
             retry_after: false,
         });
     }
@@ -1580,9 +1610,13 @@ async fn subset_load_group(
             })?;
     }
     let _control = engine.admit_control()?;
-    let group_path =
-        format!("shape/group-{}-{}", std::process::id(), GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let group_path = engine.group_stream_path();
     let group_sub = engine.resolve_subscription(subscription).await;
+    // Reserve the one public claim before the first member create.  This check is made
+    // under the same engine state lock as ordinary shape subscriptions, so a competing
+    // single-shape create cannot win the name between member creates.
+    engine.reserve_group(&group_sub).await?;
+    let mut reservation = GroupReservationGuard::new(engine, &group_sub);
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
@@ -1602,15 +1636,30 @@ async fn subset_load_group(
                 for (rec, sub) in &created {
                     let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
                 }
+                engine.abort_group(&group_sub).await;
                 return Err(AppError::from(error));
             }
         }
     }
-    let offset = engine.stream_tail(&group_path).await?.ok_or_else(|| AppError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        msg: "group stream has no tail offset".into(),
-        retry_after: true,
-    })?;
+    let offset = match engine.stream_tail(&group_path).await {
+        Ok(Some(offset)) => offset,
+        Ok(None) => {
+            for (rec, sub) in &created {
+                let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+            }
+            engine.abort_group(&group_sub).await;
+            return Err(AppError::from(anyhow::Error::new(crate::engine::GroupStreamClosed {
+                stream_path: group_path,
+            })));
+        }
+        Err(error) => {
+            for (rec, sub) in &created {
+                let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+            }
+            engine.abort_group(&group_sub).await;
+            return Err(AppError::from(error));
+        }
+    };
     let reads = members
         .iter()
         .map(|m| crate::engine::SubsetReadReq {
@@ -1628,22 +1677,51 @@ async fn subset_load_group(
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
+            engine.abort_group(&group_sub).await;
             return Err(AppError::from(error));
         }
     };
-    // Keep one live caller claim for the prototype group. Member claims after the first are
-    // implementation handles only; releasing them leaves the ordinary retained shapes in place
-    // without pretending the existing catalog has group lifecycle semantics.
+    // Keep one live caller claim for the group. Member claims after the first are private
+    // implementation handles and are released once the group record has captured them.
     for (rec, sub) in created.iter().skip(1) {
         let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
     }
     let lease_seconds = engine.lease_seconds();
+    let group_id = group_path.clone();
+    let group_record = GroupRecord {
+        id: group_id.clone(),
+        stream_path: group_path.clone(),
+        subscription: group_sub.clone(),
+        members: members
+            .iter()
+            .zip(created.iter())
+            .map(|(member, (rec, sub))| GroupMember {
+                key: member.key.clone(),
+                shape_id: rec.id.clone(),
+                table: member.table.to_string(),
+                subscription: sub.clone(),
+                is_subquery: member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery),
+            })
+            .collect(),
+        lsn: page.lsn.clone(),
+        snapshot: page.snapshot.clone(),
+        horizon: page.horizon.clone(),
+        replay_fence: offset.clone(),
+    };
+    if let Err(error) = engine.complete_group(group_record).await {
+        for (rec, sub) in &created {
+            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+        }
+        engine.abort_group(&group_sub).await;
+        return Err(AppError::from(error));
+    }
+    reservation.complete();
     let results: Vec<serde_json::Value> = members.into_iter().zip(created.iter()).zip(page.pages).map(|((member, (rec, _)), rows)| serde_json::json!({
-        "key": member.key, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
+        "key": member.key, "table": member.table, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
         "subscription": group_sub, "leaseSeconds": lease_seconds, "offset": offset, "rows": rows,
     })).collect();
     Ok(Json(serde_json::json!({
-        "groupId": created.first().map(|(rec, _)| rec.id.clone()).unwrap_or_default(), "subscription": group_sub,
+        "groupId": group_id, "subscription": group_sub,
         "streamUrl": engine.stream_url(&group_path), "streamPath": group_path, "offset": offset,
         "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
     })))
@@ -2110,7 +2188,19 @@ async fn release_shape(
         engine.purge_shape_durable(&id).await?;
     } else {
         let subscription = validate_subscription(q.subscription)?;
-        engine.release_subscription_durable(&id, subscription.as_deref()).await?;
+        if let Some(subscription) = subscription.as_deref()
+            && let Some(group) = engine.group_record(subscription).await
+        {
+            // The group claim is the only public lease.  Its private member claims are
+            // released together and each durable release is idempotent, so a cancelled or
+            // retried DELETE cannot leave a hidden member alive.
+            for member in group.members {
+                engine.release_subscription_durable(&member.shape_id, Some(&member.subscription)).await?;
+            }
+            engine.finish_group_release(subscription).await?;
+        } else {
+            engine.release_subscription_durable(&id, subscription.as_deref()).await?;
+        }
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2417,6 +2507,8 @@ impl From<anyhow::Error> for AppError {
         // A subscription id that already names another shape is the caller's conflict to resolve,
         // not a server fault and not something a retry changes (ADR-0008).
         } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+            || e.downcast_ref::<crate::engine::GroupConflict>().is_some()
+            || e.downcast_ref::<crate::engine::GroupStreamClosed>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Conflict))
         {
             StatusCode::CONFLICT

@@ -5,7 +5,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bench": "tsx src/run.ts"
+    "bench": "tsx src/run.ts",
+    "semijoin": "tsx src/semijoin-bench.ts"
   },
   "dependencies": {
     "@electric-circuits/ds-rust": "workspace:*",

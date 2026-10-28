@@ -14,7 +14,7 @@
 
 import type { Level, Scope } from './scenarios.js'
 
-export type Design = 'per-table' | 'table-load' | 'table-load-gated' | 'fanin' | 'scope-load' | 'scope-group'
+export type Design = 'per-table' | 'table-load' | 'table-load-gated' | 'fanin' | 'scope-load' | 'scope-group' | 'scope-semijoin'
 export type LiveMode = 'per-stream' | 'mux'
 
 export interface PhoneOpts {
@@ -142,10 +142,11 @@ export class Phone {
         }),
       )
     }
-    if (this.o.design === 'scope-group') {
+    if (this.o.design === 'scope-group' || this.o.design === 'scope-semijoin') {
       await this.gate.acquire(scope.level)
       try {
-        const out = JSON.parse((await this.http('POST', '/gw/scope-group', { members: scope.tables })).text)
+        const path = this.o.design === 'scope-semijoin' ? '/gw/scope-semijoin' : '/gw/scope-group'
+        const out = JSON.parse((await this.http('POST', path, { members: scope.tables })).text)
         for (const t of scope.tables) this.arrived(scope, t.key)
         const first = out.results[0]
         return [{ key: '__group__', streamUrl: first.streamUrl, offset: first.offset }]

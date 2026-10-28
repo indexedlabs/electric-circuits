@@ -34,8 +34,9 @@ struct Batch {
 /// Hash-sharded, per-stream-ordered append lanes. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct EmissionLanes {
-    lanes: Arc<Vec<mpsc::UnboundedSender<Batch>>>,
+    lanes: Arc<Vec<mpsc::Sender<Batch>>>,
     pending: Arc<PendingFlips>,
+    degrade: Arc<DegradeState>,
 }
 
 impl EmissionLanes {
@@ -45,28 +46,42 @@ impl EmissionLanes {
         ds: DsClient,
         n: usize,
         pending: Arc<PendingFlips>,
+        degrade: Arc<DegradeState>,
         shutdown: crate::shutdown::ShutdownToken,
     ) -> EmissionLanes {
         let n = n.max(1);
+        let capacity = std::env::var("ELECTRIC_CIRCUITS_EMIT_QUEUE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1024)
+            .clamp(1, 1_000_000);
         let mut lanes = Vec::with_capacity(n);
         for _ in 0..n {
-            let (tx, mut rx) = mpsc::unbounded_channel::<Batch>();
+            let (tx, mut rx) = mpsc::channel::<Batch>(capacity);
             let ds = ds.clone();
             let pending = pending.clone();
+            let degrade = degrade.clone();
             shutdown.spawn_background(async move {
                 while let Some(b) = rx.recv().await {
                     // Reliable: a dropped subquery envelope is permanent divergence for the
                     // shape's subscribers. A retired stream (shape dropped/evicted mid-flight)
                     // discards, correctly.
-                    if ds.append_reliable(&b.stream_path, &b.envs).await.is_err() {
-                        return;
+                    match ds.append_reliable(&b.stream_path, &b.envs).await {
+                        Ok(true) | Ok(false) => pending.complete(b.commit_lsn),
+                        Err(error) => {
+                            tracing::error!(stream_path = %b.stream_path, %error, "group emission lane stopped on append failure");
+                            degrade.mark();
+                            // Keep the origin held: a receipt must never pass a batch that did
+                            // not land.  The degraded engine refuses further membership reads.
+                            return;
+                        }
                     }
-                    pending.complete(b.commit_lsn);
                 }
             });
             lanes.push(tx);
         }
-        EmissionLanes { lanes: Arc::new(lanes), pending }
+        tracing::info!(lanes = n, queue_capacity = capacity, "subquery emission lanes started");
+        EmissionLanes { lanes: Arc::new(lanes), pending, degrade }
     }
 
     /// Which lane serves `path` (stable: one stream always drains through one FIFO).
@@ -78,17 +93,33 @@ impl EmissionLanes {
     }
 
     /// Enqueue one batch for ordered delivery. Call while holding the registry lock so that
-    /// per-stream enqueue order is evaluation order. Never blocks (unbounded lane queues —
-    /// backpressure is the PG pool bounding how fast evals can produce batches).
+    /// per-stream enqueue order is evaluation order. A full bounded queue fails closed by
+    /// degrading the engine; silently dropping a membership batch would be permanent divergence.
     pub(crate) fn enqueue(&self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if envs.is_empty() {
             return;
         }
         self.pending.add(commit_lsn);
         let lane = self.lane_for(stream_path);
-        if self.lanes[lane].send(Batch { commit_lsn, stream_path: stream_path.to_string(), envs }).is_err() {
-            // Writer gone (engine teardown): don't leave the barrier stuck.
-            self.pending.complete(commit_lsn);
+        match self.lanes[lane].try_send(Batch { commit_lsn, stream_path: stream_path.to_string(), envs }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // A bounded queue is part of the correctness contract. Dropping a membership
+                // batch would leave the stream permanently stale, so fail closed and keep the
+                // receipt barrier held rather than silently losing the effect. The degraded
+                // engine refuses future membership reads until restart.
+                tracing::error!(
+                    stream_path,
+                    lanes = self.lanes.len(),
+                    "subquery emission queue full; degrading engine"
+                );
+                self.degrade.mark();
+                self.pending.complete(commit_lsn);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Writer gone (engine teardown): don't leave the barrier stuck.
+                self.pending.complete(commit_lsn);
+            }
         }
     }
 }
@@ -100,8 +131,8 @@ mod tests {
     #[test]
     fn a_worker_hands_its_commit_to_every_append_before_completing() {
         let pending = Arc::new(PendingFlips::default());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
+        let (tx, mut rx) = mpsc::channel(8);
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: DegradeState::new() };
         let envelope: Envelope = serde_json::from_value(serde_json::json!({
             "type": "test", "key": "1", "headers": {"operation": "upsert"}
         }))
@@ -127,11 +158,27 @@ mod tests {
     }
 
     #[test]
+    fn a_full_bounded_lane_degrades_instead_of_dropping_membership_silently() {
+        let pending = Arc::new(PendingFlips::default());
+        let degrade = DegradeState::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: degrade.clone() };
+        let envelope: Envelope = serde_json::from_value(serde_json::json!({
+            "type": "public.items", "key": "1", "headers": {"operation": "upsert"}
+        }))
+        .unwrap();
+        lanes.enqueue("shape/group-1", vec![envelope.clone()], 0x10);
+        lanes.enqueue("shape/group-1", vec![envelope], 0x20);
+        assert!(degrade.degraded.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(pending.count(), 1, "the rejected batch releases only its own barrier permit");
+    }
+
+    #[test]
     fn a_closed_lane_undoes_only_its_own_origin() {
         let pending = Arc::new(PendingFlips::default());
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: DegradeState::new() };
         pending.add(0x30);
         let envelope = serde_json::from_value(serde_json::json!({
             "type": "test", "key": "1", "headers": {"operation": "upsert"}

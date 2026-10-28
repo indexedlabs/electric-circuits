@@ -1372,6 +1372,16 @@ fn translate_output_stamps_commit_lsn() {
     assert_eq!(envs[0].headers.lsn, None);
 }
 
+#[test]
+fn grouped_deletes_keep_table_identity_when_keys_collide() {
+    let ts = users();
+    let deletes = delete_envelopes(&ts, vec!["same-key".into()], Some("tx".into()));
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].key, "same-key");
+    assert_eq!(deletes[0].type_, ts.table.to_string());
+    assert_eq!(deletes[0].headers.operation, "delete");
+}
+
 /// **Absolute emission**: in library mode an envelope with no before-image decides membership per
 /// pk from the row's CURRENT value — matches now → `upsert`, otherwise → `delete <key>`. This is the
 /// rule that lets a delete/predicate-leaving update retract at all when there is nothing to retract
@@ -2140,7 +2150,13 @@ async fn emission_lanes_order_and_barrier() {
 
     let ds = crate::ds::DsClient::new_for_in_process_test(&format!("http://{addr}"));
     let pending = Arc::new(PendingFlips::default());
-    let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone(), crate::shutdown::ShutdownToken::new());
+    let lanes = emission::EmissionLanes::spawn(
+        ds,
+        4,
+        pending.clone(),
+        DegradeState::new(),
+        crate::shutdown::ShutdownToken::new(),
+    );
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
     assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));

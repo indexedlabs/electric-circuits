@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::ensure;
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::{Engine, PostgresSetup};
+use electric_circuits_engine::http::router_with_introspection;
 use electric_circuits_engine::table_ref::TableSelector;
 use tokio::sync::watch;
 
@@ -51,6 +52,13 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::ReaderSnapshots => reader_snapshots(&fixture).await,
             Case::Eviction => every_live_engine_evicts(&fixture).await,
             Case::Single => single_engine_controls(&fixture).await,
+            Case::GroupDelayedFlip => group_delayed_subquery_flip(&fixture).await,
+            Case::GroupDrainReceipt => group_source_drain_receipt(&fixture).await,
+            Case::GroupEqualKeyDelete => group_equal_key_delete(&fixture).await,
+            Case::GroupConflict => group_claim_overlap_is_atomic(&fixture).await,
+            Case::GroupFence => group_uses_one_snapshot_fence(&fixture).await,
+            Case::GroupRetirement => group_retirement_reloads_and_closed_stream_is_conflict(&fixture).await,
+            Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -70,6 +78,13 @@ enum Case {
     ReaderSnapshots,
     Eviction,
     Single,
+    GroupDelayedFlip,
+    GroupDrainReceipt,
+    GroupEqualKeyDelete,
+    GroupConflict,
+    GroupFence,
+    GroupRetirement,
+    GroupRestart,
 }
 
 #[test]
@@ -112,6 +127,48 @@ fn single_engine_keeps_eviction_and_degrade_reaping() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn failed_source_retries_on_poll_without_row_change_or_refresh() -> Result<()> {
     isolated("ownership::failed_source_retries_on_poll_without_row_change_or_refresh", Case::FailedRetry)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_delayed_subquery_flip_is_ordered_after_plain_output() -> Result<()> {
+    isolated("ownership::group_delayed_subquery_flip_is_ordered_after_plain_output", Case::GroupDelayedFlip)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_source_drain_receipt_covers_deferred_lane() -> Result<()> {
+    isolated("ownership::group_source_drain_receipt_covers_deferred_lane", Case::GroupDrainReceipt)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_delete_names_table_for_equal_keys() -> Result<()> {
+    isolated("ownership::group_delete_names_table_for_equal_keys", Case::GroupEqualKeyDelete)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_claim_overlap_is_atomic_and_returns_409() -> Result<()> {
+    isolated("ownership::group_claim_overlap_is_atomic_and_returns_409", Case::GroupConflict)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_members_share_one_snapshot_horizon_and_replay_fence() -> Result<()> {
+    isolated("ownership::group_members_share_one_snapshot_horizon_and_replay_fence", Case::GroupFence)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_retirement_reloads_and_closed_stream_is_409() -> Result<()> {
+    isolated("ownership::group_retirement_reloads_and_closed_stream_is_409", Case::GroupRetirement)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_restart_restores_plain_and_drops_mixed_groups() -> Result<()> {
+    isolated("ownership::group_restart_restores_plain_and_drops_mixed_groups", Case::GroupRestart)
 }
 
 #[derive(Clone)]
@@ -679,6 +736,341 @@ async fn single_engine_controls(f: &Fixture) -> Result<()> {
         engine.close(Duration::from_secs(25)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
         "single Engine did not close cleanly"
     );
+    result
+}
+
+fn group_body(f: &Fixture, subscription: &str, plain_only: bool) -> serde_json::Value {
+    let outer = format!("public.{}", f.outer);
+    let inner = format!("public.{}", f.inner);
+    let mut members = vec![serde_json::json!({
+        "key": "plain",
+        "table": outer,
+        "columns": ["id", "body"]
+    })];
+    if plain_only {
+        members.push(serde_json::json!({
+            "key": "inner",
+            "table": inner,
+            "columns": ["id"]
+        }));
+    } else {
+        members.push(serde_json::json!({
+            "key": "subquery",
+            "table": outer,
+            "columns": ["id", "body"],
+            "where": {
+                "col": "id",
+                "in": { "table": inner, "project": "id" }
+            }
+        }));
+    }
+    serde_json::json!({ "subscription": subscription, "members": members })
+}
+
+async fn post_group(app: &Router, body: serde_json::Value) -> Result<(StatusCode, serde_json::Value)> {
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::post("/v1/subset-loads")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))?,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
+    let body = serde_json::from_slice(&bytes)
+        .with_context(|| format!("group response {status}: {}", String::from_utf8_lossy(&bytes)))?;
+    Ok((status, body))
+}
+
+async fn group_engine(f: &Fixture) -> Result<(Engine, Router)> {
+    let engine = Engine::new_pg_for_in_process_test_with_setup(
+        DsClient::new_for_in_process_test(&f.ds_url),
+        f.pg_url.clone(),
+        PostgresSetup::ExternallyManaged,
+    );
+    let tables =
+        [TableSelector::parse(&format!("public.{}", f.outer))?, TableSelector::parse(&format!("public.{}", f.inner))?];
+    engine.setup_postgres(&tables, &f.slots[0]).await?;
+    let app = router_with_introspection(engine.clone(), false);
+    Ok((engine, app))
+}
+
+async fn stream_events(f: &Fixture, stream_path: &str) -> Vec<serde_json::Value> {
+    let streams = f.ds.store.streams.lock().await;
+    streams.iter().find(|(path, _)| path.ends_with(stream_path)).map(|(_, events)| events.clone()).unwrap_or_default()
+}
+
+async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Result<Vec<serde_json::Value>> {
+    let mut changed = f.ds.changed.subscribe();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let events = stream_events(f, stream_path).await;
+            if events.len() >= minimum {
+                return Ok(events);
+            }
+            changed.changed().await.context("group stream observation channel closed")?;
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            Err(anyhow::anyhow!("waiting for group stream events timed out: {:?}", stream_events(f, stream_path).await))
+        }
+    }
+}
+
+async fn install_source_fence(f: &Fixture) -> Result<()> {
+    f.client
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS public.circuits_source_fence; \
+             CREATE TABLE public.circuits_source_fence (source_commit_id uuid PRIMARY KEY); \
+             ALTER PUBLICATION \"{}_pub\" ADD TABLE public.circuits_source_fence",
+            f.slots[0]
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn remove_source_fence(f: &Fixture) {
+    let _ = f
+        .client
+        .batch_execute(&format!(
+            "ALTER PUBLICATION \"{}_pub\" DROP TABLE IF EXISTS public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
+            f.slots[0]
+        ))
+        .await;
+}
+
+async fn wait_source_receipt(engine: &Engine, f: &Fixture, commit: uuid::Uuid) -> Result<()> {
+    let mut changed = f.ds.changed.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if engine.source_drain_receipt(&commit.to_string()).is_some() {
+                return Ok::<_, anyhow::Error>(());
+            }
+            changed.changed().await.context("source receipt observation channel closed")?;
+        }
+    })
+    .await
+    .context("waiting for source drain receipt")??;
+    Ok(())
+}
+
+fn event_key(event: &serde_json::Value) -> Option<String> {
+    event
+        .get("key")
+        .and_then(|key| key.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| event.get("value").and_then(|value| value.get("id")).map(|id| id.to_string()))
+}
+
+fn event_operation(event: &serde_json::Value) -> Option<&str> {
+    event.get("headers").and_then(|headers| headers.get("operation")).and_then(|op| op.as_str())
+}
+
+async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-delayed", false)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
+        let baseline = stream_events(f, &stream_path).await.len();
+        let t = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!("BEGIN; INSERT INTO public.{} (id) VALUES (2); INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.inner, t))
+            .await?;
+        let t1 = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!("BEGIN; UPDATE public.{} SET body = 't+1' WHERE id = 2; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.outer, t1))
+            .await?;
+        wait_source_receipt(&engine, f, t1).await?;
+        let events = wait_group_events(f, &stream_path, baseline + 2).await?;
+        let flips: Vec<_> = events
+            .iter()
+            .skip(baseline)
+            .filter(|event| event_key(event).as_deref() == Some("2") && event_operation(event) == Some("upsert"))
+            .collect();
+        ensure!(flips.len() >= 2, "missing T and T+1 member outputs: {events:?}");
+        let first_txid: u64 = flips[0]["headers"]["txid"].as_str().unwrap_or_default().parse().unwrap_or(0);
+        let last_txid: u64 = flips.last().and_then(|event| event["headers"]["txid"].as_str()).unwrap_or_default().parse().unwrap_or(0);
+        ensure!(first_txid > 0 && first_txid < last_txid, "T+1 output crossed the T fence: {events:?}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-receipt", false)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
+        let baseline = stream_events(f, &stream_path).await.len();
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id) VALUES (2); INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.inner, commit
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, commit).await?;
+        let receipt = engine.source_drain_receipt(&commit.to_string()).context("source receipt disappeared")?;
+        ensure!(receipt.source_commit_id == commit.to_string(), "wrong source receipt: {receipt:?}");
+        let events = wait_group_events(f, &stream_path, baseline + 1).await?;
+        ensure!(events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")), "group lane did not emit before receipt: {events:?}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-delete", true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
+        let baseline = stream_events(f, &stream_path).await.len();
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; DELETE FROM public.{} WHERE id = 1; DELETE FROM public.{} WHERE id = 1; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.outer, f.inner, commit
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, commit).await?;
+        let events = wait_group_events(f, &stream_path, baseline + 2).await?;
+        let deletes = events
+            .iter()
+            .skip(baseline)
+            .filter(|event| event_key(event).as_deref() == Some("1") && event_operation(event) == Some("delete"))
+            .count();
+        ensure!(deletes >= 2, "equal-key delete lost a member-table delete: {events:?}");
+        let delete_types: std::collections::BTreeSet<_> = events
+            .iter()
+            .skip(baseline)
+            .filter(|event| event_key(event).as_deref() == Some("1") && event_operation(event) == Some("delete"))
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        ensure!(delete_types.len() >= 2, "equal-key deletes did not retain table identity: {events:?}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-overlap", false)).await?;
+        ensure!(status == StatusCode::OK, "first group create failed: {status} {first}");
+        let (status, second) = post_group(&app, group_body(f, "group-overlap", true)).await?;
+        ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second}");
+        let (status, third) = post_group(&app, group_body(f, "group-overlap-2", true)).await?;
+        ensure!(status == StatusCode::OK, "failed group left reservation behind: {status} {third}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_uses_one_snapshot_fence(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-fence", false)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        ensure!(
+            body["lsn"].is_string()
+                && body["snapshot"].is_string()
+                && body["horizon"].is_string()
+                && body["offset"].is_string(),
+            "group fence is incomplete: {body}"
+        );
+        ensure!(
+            body["results"].as_array().is_some_and(|results| results.len() == 2),
+            "group did not return both member pages: {body}"
+        );
+        let sql_count: i64 = f.client.query_one(&format!("SELECT count(*) FROM public.{}", f.outer), &[]).await?.get(0);
+        ensure!(
+            body["results"][0]["rows"].as_array().map_or(0, Vec::len) as i64 == sql_count,
+            "plain page crossed snapshot fence: {body}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-retire", false)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
+        f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
+        let mut changed = f.ds.changed.subscribe();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if f.ds
+                    .retired
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|(method, path)| *method == Method::POST && path.ends_with(&stream_path))
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                changed.changed().await.context("retirement observation channel closed")?;
+            }
+        })
+        .await
+        .context("waiting for group stream retirement")??;
+        let (status, closed) = post_group(&app, group_body(f, "group-retire-closed", false)).await?;
+        ensure!(status == StatusCode::OK, "a fresh group must reload after retirement: {status} {closed}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_restart_restores_plain_and_drops_mixed(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, plain) = post_group(&app, group_body(f, "group-plain-restart", true)).await?;
+        ensure!(status == StatusCode::OK, "plain group create failed: {status} {plain}");
+        let (status, mixed) = post_group(&app, group_body(f, "group-mixed-restart", false)).await?;
+        ensure!(status == StatusCode::OK, "mixed group create failed: {status} {mixed}");
+        engine.close(Duration::from_secs(10)).await;
+        let (restarted, restarted_app) = group_engine(f).await?;
+        let (status, duplicate_plain) = post_group(&restarted_app, group_body(f, "group-plain-restart", true)).await?;
+        ensure!(status == StatusCode::CONFLICT, "durable plain group was not restored: {status} {duplicate_plain}");
+        let (status, recreated_mixed) = post_group(&restarted_app, group_body(f, "group-mixed-restart", false)).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "mixed group was not dropped as a unit on restart: {status} {recreated_mixed}"
+        );
+        restarted.close(Duration::from_secs(10)).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    // The restart case closes both engines inside the body; this is idempotent cleanup for the
+    // failure path before the explicit restart.
     result
 }
 
