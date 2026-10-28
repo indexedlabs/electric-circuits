@@ -3255,16 +3255,9 @@ mod cancellation_tests {
                 .map(|commit_lsn| ("parent".to_string(), DeferredNodeWork::Full { commit_lsn }))
                 .collect(),
         };
-        enqueue_finished_create_work_parts(
-            &engine.subqueries,
-            &engine.group_lanes,
-            &pending,
-            &tx,
-            "s1",
-            finished,
-        )
-        .await
-        .unwrap();
+        enqueue_finished_create_work_parts(&engine.subqueries, &engine.group_lanes, &pending, &tx, "s1", finished)
+            .await
+            .unwrap();
         assert_eq!(pending.count(), 6);
         let mut earlier = 0;
         while let Ok(batch) = rx.try_recv() {
@@ -3306,8 +3299,8 @@ mod cancellation_tests {
             "s1",
             finished,
         )
-            .await
-            .expect_err("a closed propagator cannot acknowledge deferred create work");
+        .await
+        .expect_err("a closed propagator cannot acknowledge deferred create work");
         assert_eq!(err.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
         assert_eq!(pending_flips.count(), 0, "failed handoff must not hold the barrier");
     }
