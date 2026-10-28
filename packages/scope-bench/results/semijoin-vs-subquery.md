@@ -451,9 +451,11 @@ durable-release fault injection and its rollback contract. The exact runs `40770
 (`123104894370`) and `40772536994` (`123113244094`) were red: the former exposed the
 fault-cut contract failure and the latter also had the split static declaration flagged by
 rustfmt; `dafba36`'s release count made the second barrier pass instead of holding cancellation.
-The current candidate restores the blocked barrier, uses rustfmt's canonical declaration, and
-queues the retry before its first await; exact-head CI is pending. The production build remains
-identical to 1d7bbbc, whose fully green test job `123064316739` qualifies the production tree.
+Head `6c71df7` changed the production compensation path to report whether a claim was removed,
+re-enqueue `Left` for an already-removed claim, and add a deterministic retry-window barrier.
+The current candidate removes the impossible second-barrier wait and uses rustfmt's canonical
+declaration; exact-head CI is pending. The benchmark production tree remains the one preserved
+by `1d7bbbc`, while this candidate's compensation path still requires its own green test job.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 

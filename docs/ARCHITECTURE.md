@@ -743,7 +743,10 @@ compensation before draining the catalog. A clean close within the grace period 
 all-plain group whose create never returned. A crash, forced close, or catalog-writer loss can still
 leave a queued `GroupCreated` for replay. These page-handoff rules are part of the not-for-merge
 PR #45 experiment and require exact-head CI evidence; they do not qualify the gateway or native
-client seams.
+client seams. A compensation retry that finds the named claim already removed from
+in-memory state queues the idempotent `Left` directly, so cancellation between the
+first failed release and its retry cannot leave a durable `Joined` without a matching
+release intent.
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:

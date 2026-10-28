@@ -1123,7 +1123,7 @@ impl Engine {
     /// plus the record, both of which happen BEFORE the wait, and nothing runs after it. A client
     /// that times out and drops this future therefore loses only its answer — the `Left` is the
     /// writer's from the moment it was enqueued, and lands regardless.
-    pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) -> Result<()> {
+    pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) -> Result<bool> {
         self.release_subscription_inner(id, sub, true).await
     }
 
@@ -1143,14 +1143,15 @@ impl Engine {
         Ok(())
     }
 
-    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) -> Result<()> {
+    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) -> Result<bool> {
         let mut st = self.state.lock().await;
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
         };
+        let had_release = released.is_some();
         #[cfg(feature = "test-support")]
-        if durable && released.is_some() && crate::http::test_release_after_unsubscribe_once() {
+        if durable && had_release && crate::http::test_release_after_unsubscribe_once() {
             drop(st);
             self.touch_shape(id);
             return Err(anyhow::anyhow!("test-injected durable release failure after unsubscribe"));
@@ -1172,7 +1173,7 @@ impl Engine {
         } else if needs_barrier {
             self.catalog_tx.wait_durable().await?;
         }
-        Ok(())
+        Ok(had_release)
     }
 
     /// Force-drop a shape NOW, bypassing the retention lifecycle: full teardown (record, share
