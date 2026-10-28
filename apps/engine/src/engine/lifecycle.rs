@@ -4195,6 +4195,38 @@ mod subscription_tests {
         assert_eq!(refcount(&engine, "s1").await, 1);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn renewing_an_in_flight_group_release_waits_without_holding_the_release_lock() {
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let group = GroupRecord {
+            id: "shape/group-1".into(),
+            stream_path: "shape/group-1".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+            st.group_claims.complete(group.clone());
+        }
+        let release = crate::engine::GroupRelease::new();
+        engine.group_releases.lock().unwrap().insert(group.id.clone(), release.clone());
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.renew_group_claim(&group).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "renew must wait for the engine-owned release");
+        let completed: anyhow::Result<()> = Ok(());
+        release.complete(&completed);
+        assert!(!waiting.await.unwrap().unwrap(), "a waiter must hand control to fresh group creation");
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
     /// A join that is abandoned mid-wait (the client disconnected while storage was slow) gives its
     /// claim back. The compensation names the join's OWN subscription, so it can neither
     /// double-release nor take another subscriber's claim — the two hazards that made a
