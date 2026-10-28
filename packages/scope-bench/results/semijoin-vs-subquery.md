@@ -114,6 +114,24 @@ tests await genuine-red execution before the behavior fixes. CI runs both
 membership modes even if one fails, and separately runs library tests so the
 fault regression is not hidden behind the PostgreSQL failures.
 
+The `b83da4e` run
+[40663786869](https://github.com/indexedlabs/electric-circuits/actions/runs/40663786869)
+also stopped at rustfmt (the fault-command enum layout and one fixture call).
+It supplies no runtime or genuine-red evidence for the new regressions. Both
+hosted reviews accepted the regression designs while retaining the open behavior
+findings. The next checkpoint applies rustfmt's exact output and fixes the
+reviewed fail-fast issue: Cargo uses `--no-fail-fast`, each Rust command records
+its status independently, and typecheck/Node/Vitest run when their setup succeeds
+even after a Rust failure. Formatting and every failed test still fail the job;
+no test is disabled or treated as an expected pass.
+
+The perf2 `gateway.ts`, `phone.ts`, and `run.ts` harness files have now been
+imported directly from the pinned perf2 commit, without its older engine code.
+The old Node sketch is explicitly named `semijoin:model` in package scripts.
+This import supplies the starting harness only; mode comparison, resource/restart
+instrumentation, five-repetition CI execution and resulting numbers are still
+pending. Its modeled streaming charges must not be mistaken for provider reads.
+
 Planned correction: preserve the per-feed delete gate and seed group companion
 keys with an xid-fenced read before the member becomes live, reusing the existing
 atomic seed/replay path. Merely adding keys from the later group snapshot can

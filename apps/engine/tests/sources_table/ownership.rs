@@ -1169,9 +1169,7 @@ async fn group_never_member_writes_are_silent(f: &Fixture) -> Result<()> {
 }
 
 async fn group_disjoint_sibling_survives_inner_move_out(f: &Fixture) -> Result<()> {
-    f.client
-        .batch_execute(&format!("ALTER TABLE public.{} ADD COLUMN parent_id integer DEFAULT 1", f.outer))
-        .await?;
+    f.client.batch_execute(&format!("ALTER TABLE public.{} ADD COLUMN parent_id integer DEFAULT 1", f.outer)).await?;
     install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {

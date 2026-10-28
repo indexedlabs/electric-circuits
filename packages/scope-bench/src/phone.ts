@@ -14,8 +14,8 @@
 
 import type { Level, Scope } from './scenarios.js'
 
-export type Design = 'per-table' | 'table-load' | 'table-load-gated' | 'fanin' | 'scope-load' | 'scope-group' | 'scope-semijoin'
-export type LiveMode = 'per-stream' | 'mux'
+export type Design = 'per-table' | 'table-load' | 'table-load-gated' | 'fanin' | 'scope-load' | 'scope-group'
+export type LiveMode = 'per-stream' | 'mux' | 'coalesce' | 'streaming'
 
 export interface PhoneOpts {
   gateway: string
@@ -28,6 +28,8 @@ export interface PhoneOpts {
   user?: string
   /** Optional benchmark hook for measuring a marker's write-to-stream latency. */
   onWake?: (body: string, at: number) => void
+  /** Linger after a wake before the next poll, allowing several appends to share a response. */
+  coalesceLingerMs?: number
 }
 
 export interface Held {
@@ -99,6 +101,17 @@ export class Phone {
     return { status: r.status, headers: r.headers, text: buf.toString() }
   }
 
+  private async stream(path: string, signal: AbortSignal) {
+    this.requests++
+    await sleep(this.o.rttMs / 2)
+    const r = await fetch(`${this.o.gateway}${path}`, {
+      signal,
+      headers: { 'x-user': this.o.user ?? 'u1' },
+    })
+    if (!r.ok || !r.body) throw new Error(`GET ${path} ${r.status}`)
+    return r.body
+  }
+
   /** When each table's rows reached the phone, by scope name and table key. */
   readonly arrivals: { scope: string; level: Level; key: string; at: number }[] = []
   arrived(scope: Scope, key: string) {
@@ -142,11 +155,10 @@ export class Phone {
         }),
       )
     }
-    if (this.o.design === 'scope-group' || this.o.design === 'scope-semijoin') {
+    if (this.o.design === 'scope-group') {
       await this.gate.acquire(scope.level)
       try {
-        const path = this.o.design === 'scope-semijoin' ? '/gw/scope-semijoin' : '/gw/scope-group'
-        const out = JSON.parse((await this.http('POST', path, { members: scope.tables })).text)
+        const out = JSON.parse((await this.http('POST', '/gw/scope-group', { members: scope.tables })).text)
         for (const t of scope.tables) this.arrived(scope, t.key)
         const first = out.results[0]
         return [{ key: '__group__', streamUrl: first.streamUrl, offset: first.offset }]
@@ -203,7 +215,28 @@ export class Phone {
         const ctl = new AbortController()
         this.aborts.add(ctl)
         try {
-          if (this.o.live === 'mux' && streams.length > 1) {
+          if (this.o.live === 'streaming') {
+            const s = streams[0]!
+            const streamUrl = new URL(s.streamUrl, 'http://stream')
+            const dsPath = streamUrl.pathname.slice('/stream'.length) + streamUrl.search
+            const body = await this.stream(`/gw/streaming?path=${encodeURIComponent(dsPath)}&offset=${encodeURIComponent(s.offset)}`, ctl.signal)
+            const reader = body.getReader()
+            const decoder = new TextDecoder()
+            let buffered = ''
+            while (true) {
+              const chunk = await reader.read()
+              if (chunk.done) break
+              buffered += decoder.decode(chunk.value, { stream: true })
+              const lines = buffered.split('\n')
+              buffered = lines.pop() ?? ''
+              for (const line of lines) {
+                if (!line) continue
+                const x = JSON.parse(line)
+                this.o.onWake?.(x.body ?? '', performance.now())
+                s.offset = x.next
+              }
+            }
+          } else if (this.o.live === 'mux' && streams.length > 1) {
             const qs = streams.map((s) => `s=${encodeURIComponent(`${s.streamUrl}@${s.offset}`)}`).join('&')
             const r = JSON.parse((await this.http('GET', `/gw/mux?${qs}`, undefined, ctl.signal)).text)
             this.o.onWake?.(JSON.stringify(r), performance.now())
@@ -211,7 +244,8 @@ export class Phone {
           } else {
             const s = streams[0]!
             const sep = s.streamUrl.includes('?') ? '&' : '?'
-            const r = await this.http('GET', `${s.streamUrl}${sep}offset=${encodeURIComponent(s.offset)}&live=long-poll`, undefined, ctl.signal)
+            const linger = this.o.live === 'coalesce' ? `&linger=${this.o.coalesceLingerMs ?? 50}` : ''
+            const r = await this.http('GET', `${s.streamUrl}${sep}offset=${encodeURIComponent(s.offset)}&live=long-poll${linger}`, undefined, ctl.signal)
             this.o.onWake?.(r.text, performance.now())
             s.offset = r.headers.get('stream-next-offset') ?? s.offset
           }

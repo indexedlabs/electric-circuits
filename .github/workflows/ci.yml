@@ -31,6 +31,7 @@ jobs:
 
       - name: Start isolated PostgreSQL 18 for Rust ownership tests
         id: pg18
+        if: ${{ !cancelled() }}
         run: |
           # Pin the ephemeral logical-replication harness to PostgreSQL 18; do not let the
           # runner's preinstalled major select the test boundary implicitly.
@@ -53,6 +54,7 @@ jobs:
           echo 'ELECTRIC_CIRCUITS_TEST_PG_URL=postgres://postgres@127.0.0.1:55432/postgres' >> "$GITHUB_ENV"
 
       - name: Group contracts in both membership modes
+        if: ${{ !cancelled() && steps.pg18.outcome == 'success' }}
         run: |
           # Run both even when one mode fails: retain each first divergence.
           result=0
@@ -63,33 +65,44 @@ jobs:
           exit "$result"
 
       - name: Rust engine tests
-        if: ${{ !cancelled() && steps.format.outcome == 'success' && steps.pg18.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.pg18.outcome == 'success' }}
         run: |
-          cargo test -p electric-circuits-engine --features test-support
-          cargo test -p electric-circuits-engine --test deployment_ownership -- --ignored
-          cargo test -p electric-circuits-engine --features test-support --test sources_table -- --ignored
+          # Preserve all results at red checkpoints. No failed command is waived:
+          # the step still fails after every target has had a chance to execute.
+          result=0
+          cargo test -p electric-circuits-engine --features test-support --no-fail-fast || result=1
+          cargo test -p electric-circuits-engine --test deployment_ownership -- --ignored || result=1
+          cargo test -p electric-circuits-engine --features test-support --test sources_table -- --ignored || result=1
           # Projection restart/backfill and live INSERT/UPDATE/DELETE against a SQL oracle.
-          cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored
+          cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored || result=1
+          exit "$result"
 
       - uses: pnpm/action-setup@v4
+        if: ${{ !cancelled() }}
       - uses: actions/setup-node@v4
+        if: ${{ !cancelled() }}
         with:
           node-version: 22
           cache: pnpm
 
       - name: Install JS dependencies
+        id: js
+        if: ${{ !cancelled() }}
         run: pnpm install --frozen-lockfile
 
       # Fail fast: the vitest lane is esbuild (transpile-only) and sees no type errors at all.
       - name: Typecheck
+        if: ${{ !cancelled() && steps.js.outcome == 'success' }}
         run: pnpm typecheck
 
       # `test:readiness-plan` is an explicit non-gating planner/provenance audit with a known-red
       # stale fixture. Do not silently fold it into this product gate or omit its classification.
       - name: Supported product Node test gate (including PostgreSQL 18 resolver)
+        if: ${{ !cancelled() && steps.js.outcome == 'success' && steps.pg18.outcome == 'success' }}
         run: pnpm test:node
 
       - name: Full Vitest suite (including conformance)
+        if: ${{ !cancelled() && steps.js.outcome == 'success' && steps.pg18.outcome == 'success' }}
         run: pnpm exec vitest run
         env:
           NODE_EXTRA_CA_CERTS: packages/conformance/test-pki/ca.pem

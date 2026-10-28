@@ -687,6 +687,13 @@ the baseline contributor state and does not implement a persistent companion
 arrangement. Consequently it must not be described as eliminating all existing
 membership state or avoiding query-backs.
 
+**Known defects at the `b83da4e` test checkpoint:** the unconditional group
+delete path described below bypasses the never-member gate and can delete a
+disjoint same-table sibling. A probe error stops the shared worker without
+necessarily degrading the engine; standalone consumers can then use frozen
+membership. Regression tests are pending execution. These are accepted
+correctness defects, not supported failure semantics or benchmarkable behavior.
+
 Probe commands use the existing bounded worker channel and at most 1024 key/ordinal
 tuples per command (an item bound, not a byte cap on arbitrary SQL key values).
 The registry lock spans selection to preserve one membership snapshot; this adds

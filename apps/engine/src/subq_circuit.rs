@@ -222,7 +222,9 @@ fn process_alive(pid: u32) -> bool {
 enum Cmd {
     /// Test-only fault at the same error boundary as a failed probe transaction.
     #[cfg(test)]
-    FailNextSelect { resp: oneshot::Sender<()> },
+    FailNextSelect {
+        resp: oneshot::Sender<()>,
+    },
     Batch {
         asserts: Assertions,
         resp: oneshot::Sender<Vec<MemberDelta>>,
