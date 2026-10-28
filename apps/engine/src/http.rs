@@ -1076,11 +1076,12 @@ impl GroupReservationGuard {
         self.armed = false;
         let engine = self.engine.clone();
         let subscription = self.subscription.clone();
+        let task_subscription = subscription.clone();
         let stream_path = self.stream_path.clone();
         let created = std::mem::take(&mut self.created);
         let done = engine
             .shutdown_token()
-            .spawn(async move { engine.cleanup_group_reservation(&subscription, &stream_path, created).await });
+            .spawn(async move { engine.cleanup_group_reservation(&task_subscription, &stream_path, created).await });
         if let Ok(Err(error)) = done.await {
             tracing::warn!(%error, %subscription, "failed to compensate group reservation");
         }
