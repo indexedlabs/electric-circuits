@@ -1681,6 +1681,22 @@ async fn subset_load_group(
             return Err(AppError::from(error));
         }
     };
+    // The public page is read after the private member seeds. Add its actual keys to each
+    // subquery member's delete gate before the group becomes durable; a later move-out can then
+    // retract a row that was visible only in this shared page.
+    let snapshot_keys = created
+        .iter()
+        .zip(page.pages.iter())
+        .zip(members.iter())
+        .filter(|((_, _), member)| member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery))
+        .map(|((rec, rows), _)| (rec.id.as_str(), rows.as_slice()));
+    if let Err(error) = engine.seed_group_snapshot_keys(snapshot_keys).await {
+        for (rec, sub) in &created {
+            let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+        }
+        engine.abort_group(&group_sub).await;
+        return Err(AppError::from(error));
+    }
     // Keep one live caller claim for the group. Member claims after the first are private
     // implementation handles and are released once the group record has captured them.
     for (rec, sub) in created.iter().skip(1) {

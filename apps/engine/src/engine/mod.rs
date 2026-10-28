@@ -2905,6 +2905,17 @@ impl Engine {
         self.state.lock().await.group_claims.release(subscription);
     }
 
+    pub(crate) async fn seed_group_snapshot_keys(
+        &self,
+        members: impl IntoIterator<Item = (&str, &[serde_json::Value])>,
+    ) -> Result<()> {
+        let mut registry = self.subqueries.lock().await;
+        for (shape_id, rows) in members {
+            registry.seed_group_snapshot_keys(shape_id, rows)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }

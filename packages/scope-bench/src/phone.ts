@@ -101,6 +101,15 @@ export class Phone {
     return { status: r.status, headers: r.headers, text: buf.toString() }
   }
 
+  /** Account a streamed response chunk on the same shared downlink as ordinary HTTP replies. */
+  private async receiveChunk(bytes: number) {
+    this.bytesDown += bytes
+    const now = performance.now()
+    const start = Math.max(now + this.o.rttMs / 2, this.downFreeAt)
+    this.downFreeAt = start + (bytes * 8) / (this.o.downMbps * 1000)
+    await sleep(this.downFreeAt - now)
+  }
+
   private async stream(path: string, signal: AbortSignal) {
     this.requests++
     await sleep(this.o.rttMs / 2)
@@ -226,6 +235,9 @@ export class Phone {
             while (true) {
               const chunk = await reader.read()
               if (chunk.done) break
+              // The provider chunk has arrived locally, but the phone observes it only
+              // after the return half-RTT and its share of the serialized downlink.
+              await this.receiveChunk(chunk.value.byteLength)
               buffered += decoder.decode(chunk.value, { stream: true })
               const lines = buffered.split('\n')
               buffered = lines.pop() ?? ''

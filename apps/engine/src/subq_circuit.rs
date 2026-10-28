@@ -225,6 +225,11 @@ enum Cmd {
     FailNextSelect {
         resp: oneshot::Sender<()>,
     },
+    /// Test-only fault at the contributor transaction error boundary.
+    #[cfg(test)]
+    FailNextBatch {
+        resp: oneshot::Sender<()>,
+    },
     Batch {
         asserts: Assertions,
         resp: oneshot::Sender<Result<Vec<MemberDelta>, String>>,
@@ -691,11 +696,18 @@ fn circuit_thread(
     let mut failure = WorkerFailureGuard(Some(on_failure));
     #[cfg(test)]
     let mut fail_next_select = false;
+    #[cfg(test)]
+    let mut fail_next_batch = false;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             #[cfg(test)]
             Cmd::FailNextSelect { resp } => {
                 fail_next_select = true;
+                let _ = resp.send(());
+            }
+            #[cfg(test)]
+            Cmd::FailNextBatch { resp } => {
+                fail_next_batch = true;
                 let _ = resp.send(());
             }
             Cmd::Select { keys, resp } => {
@@ -730,7 +742,12 @@ fn circuit_thread(
                 for Tup2(k, upd) in asserts.contributors {
                     contrib_in.push(k, upd);
                 }
-                match dbsp.transaction() {
+                let result = (|| -> Result<()> {
+                    #[cfg(test)]
+                    anyhow::ensure!(!std::mem::take(&mut fail_next_batch), "injected membership transaction failure");
+                    dbsp.transaction().map_err(|e| anyhow::anyhow!("membership transaction failed: {e}"))
+                })();
+                match result {
                     Ok(()) => {
                         let mut flips = Vec::new();
                         drain_flips(&flips_out, &mut flips);
@@ -738,7 +755,7 @@ fn circuit_thread(
                     }
                     Err(e) => {
                         failure.fail();
-                        let _ = resp.send(Err(format!("membership transaction failed: {e}")));
+                        let _ = resp.send(Err(format!("{e:#}")));
                         break;
                     }
                 }
@@ -773,6 +790,48 @@ fn circuit_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn contributor_failure_notifies_owner_and_refuses_batches_in_both_modes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for semijoin in [false, true] {
+            let failures = Arc::new(AtomicUsize::new(0));
+            let owner = failures.clone();
+            let circuit = MembershipCircuit::start_with_failure(
+                None,
+                semijoin,
+                Arc::new(move || {
+                    owner.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+            circuit.apply(contrib(1, 1, Some(Value::Int(7)))).await.unwrap();
+            let (resp, received) = oneshot::channel();
+            circuit.tx.send(Cmd::FailNextBatch { resp }).await.unwrap();
+            received.await.unwrap();
+            let error = circuit.apply(contrib(1, 1, Some(Value::Int(8)))).await.unwrap_err();
+            assert!(format!("{error:#}").contains("injected membership transaction failure"));
+            assert_eq!(failures.load(Ordering::SeqCst), 1, "failure owner runs before the error response");
+            assert!(circuit.apply(contrib(1, 1, None)).await.is_err());
+            circuit.shutdown().await;
+            assert_eq!(failures.load(Ordering::SeqCst), 1, "shutdown must not report a second failure");
+        }
+    }
+
+    #[test]
+    fn worker_unwind_notifies_failure_owner_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let failures = Arc::new(AtomicUsize::new(0));
+        let owner = failures.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = WorkerFailureGuard(Some(Arc::new(move || {
+                owner.fetch_add(1, Ordering::SeqCst);
+            })));
+            panic!("controlled worker unwind");
+        });
+        assert!(result.is_err());
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+    }
 
     #[tokio::test]
     async fn worker_failure_is_owned_after_select_receiver_disappears() {

@@ -263,9 +263,9 @@ pub struct SubqueryShape {
     /// contained is structurally a no-op — the wake-storm gate (PR #30) with no filter to keep
     /// in sync.
     pub(crate) feed_id: i64,
-    /// The group snapshot is read after feed creation, outside this registry. Its rows
-    /// therefore cannot be inferred from the live feed's delete gate. Group membership
-    /// emits absolute deletes, including for snapshot-only rows, and stamps source LSNs.
+    /// Group companions seed their delete gate before becoming live, retain gated deletes,
+    /// and stamp source LSNs. The later public snapshot needs its own safe key handoff;
+    /// the prototype's snapshot/catch-up regression tracks that remaining gap.
     pub(crate) group_member: bool,
     /// **Per-pk recency, for the duration of a query-back only** — `pk_dict` id → the commit
     /// stamp `(lsn, xid)` of the LIVE outer-row decision most recently applied to this shape's
@@ -727,6 +727,30 @@ impl SubqueryRegistry {
     #[cfg(test)]
     pub(crate) async fn assert_seed_row_for_test(&mut self, sig: &SubquerySig, pk: &str, value: Value) {
         self.apply_node_evals(sig, vec![(pk.to_string(), Some(value))]).await.unwrap();
+    }
+
+    /// Add the keys from the actual public group page to a subquery member's delete gate.
+    /// The page is projected, so only its primary-key columns are needed; missing non-key
+    /// columns decode as NULL and are never used. This runs while the member is already
+    /// registered but before the group claim is durable, closing the page/feed handoff.
+    pub(crate) fn seed_group_snapshot_keys(
+        &mut self,
+        shape_id: &str,
+        rows: &[serde_json::Value],
+    ) -> Result<()> {
+        let (feed_id, ts) = {
+            let shape = self.shapes.get(shape_id).context("group snapshot shape disappeared")?;
+            let ts = self.schemas.get(&shape.outer_table).cloned().context("group snapshot table disappeared")?;
+            (shape.feed_id, ts)
+        };
+        for value in rows {
+            let object = value.as_object().context("group snapshot row is not an object")?;
+            let row = ts.row_from_json(object)?;
+            let pk = ts.key_string(&row)?;
+            let pk_id = self.pk_dict.get_or_insert(&pk);
+            self.feed_sets.insert(feed_id, pk_id);
+        }
+        Ok(())
     }
 
     /// The node's current distinct-value count, read from the circuit snapshot.
@@ -1836,12 +1860,11 @@ impl SubqueryRegistry {
     /// membership snapshot, transition the host-side per-feed key set ([`crate::subq_feed::FeedSet`])
     /// in the same synchronous step, and deliver — **upserts for every matching candidate** (an
     /// update to a continuing member must flow; upserts are always safe for readers), **deletes
-    /// only where the feed actually retracts** for standalone feeds (`FeedSet::remove` returns true — a "not a member"
+    /// only where the feed actually retracts** (`FeedSet::remove` returns true — a "not a member"
     /// verdict for a pk the stream never contained gates to nothing, so the spurious delete that
-    /// used to wake idle long-polls is structurally impossible). Group members additionally emit
-    /// deletes for snapshot-only rows: their separate snapshot is not represented by FeedSet.
-    /// Emission is absolute per pk, so
-    /// deferred flip propagation converges regardless of timing.
+    /// used to wake idle long-polls is structurally impossible). Group feeds seed keys before
+    /// becoming live and use the same gate. Emission is absolute per pk, so deferred flip
+    /// propagation converges regardless of timing.
     ///
     /// Callers hold the registry lock for the whole call (eval + FeedSet mutation + lane enqueue),
     /// which is what keeps per-stream append order = evaluation order AND makes each emission

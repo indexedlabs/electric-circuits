@@ -1,9 +1,9 @@
 # Key-only semijoin versus subquery members
 
 Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes are implemented; corrections for the reproduced hosted-review regressions
-await CI. No performance results are claimed. The experiment
-must finish before this report can support changing the membership decision.
+fixes for the reproduced hosted-review regressions are green in CI; the streaming
+model correction is now in the working tree awaiting its next CI run. No performance
+results are claimed. The experiment must finish before this report can support changing the membership decision.
 
 ## Pinned inputs and method
 
@@ -159,6 +159,26 @@ review defects; no regression assertion is changed in the correction.
 
 ### Correction candidate (awaiting CI)
 
+The `9cffab2` CI run later supplied the intended green engine evidence: both
+membership-mode group loops passed all 12 selected group contracts, including the
+never-member, disjoint-sibling, snapshot-only move-out, LSN and reparenting cases;
+the library passed 743 tests with 3 ignored. The full ignored source-table lane
+passed 24 tests, and the existing integration lanes passed. Full Vitest then ran
+80 files / 358 tests with exactly one failure: the new streaming phone regression
+at its first timing assertion (`onWake` occurred at t=125 ms). This is the genuine
+red for the remaining benchmark-model defect, not an engine failure. The same run
+also confirms TypeScript, the supported Node gate and image builds passed.
+
+The next candidate routes each received streaming chunk through the shared return
+half-RTT/downlink queue and increments `bytesDown`; CI must turn that one test green.
+It also seeds keys from the actual public group page into each subquery member's
+FeedSet before the group claim becomes durable, closing the page/feed handoff that
+could otherwise leave a snapshot row without a delete gate. The private key seed
+and this public-page seed both retain only keys; the extra bounded reads and feed
+entries belong in both modes' measurements.
+
+
+
 Group companion creates now seed their FeedSet through the existing streamed
 outer backfill and phase-C seed/replay handoff before becoming live. For these
 changes-only members the backfill retains only primary keys and appends no public
@@ -183,9 +203,9 @@ worker, and checks that its owner was notified and subsequent Batch calls fail.
 
 The new `phone.test.ts` regression exercises production `Phone.hold` with a
 controlled streaming chunk and virtual time: return propagation, serialization
-at 1 Mbps, and byte accounting must precede delivery. Its first CI execution is
-pending; the streaming implementation is deliberately unchanged until genuine red
-is recorded for the hosted benchmark finding.
+at 1 Mbps, and byte accounting must precede delivery. Its first CI execution was
+genuinely red at t=125 ms; the working tree now applies the shared downlink model
+before delivery.
 
 The perf2 `gateway.ts`, `phone.ts`, and `run.ts` harness files have now been
 imported directly from the pinned perf2 commit, without its older engine code.
