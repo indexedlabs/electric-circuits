@@ -977,7 +977,7 @@ async fn pause_group_delete(f: &Fixture, stream_path: &str) -> Arc<Notify> {
 
 async fn release_group_delete(f: &Fixture, stream_path: &str, gate: Arc<Notify>) {
     f.ds.delete_gates.lock().await.remove(stream_path);
-    gate.notify_waiters();
+    gate.notify_one();
 }
 
 async fn install_source_fence(f: &Fixture) -> Result<()> {
