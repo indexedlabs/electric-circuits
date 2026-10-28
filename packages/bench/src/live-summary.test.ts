@@ -27,7 +27,7 @@ describe('live summary aggregation', () => {
       { expected: 1, summaries: [worker({ reconnects: 1, subscriptions: 1, readyAt: 500, elapsedMs: 20000 })] },
     ])
     expect(summary.totalReconnectsPerMinute).toEqual([3, 3])
-    expect(summary.finalTotalReconnectsPerMinute).toBeCloseTo(4)
+    expect(summary.finalTotalReconnectsPerMinute).toBeCloseTo(6)
     expect(summary.readinessSpreadsMs).toEqual([20, 0])
     expect(summary.reconnectsPerSubscriptionMinute).toBeCloseTo(12 / 13)
   })

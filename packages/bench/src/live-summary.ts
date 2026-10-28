@@ -59,7 +59,6 @@ export function summarizeLiveRuns(runs: LiveSummaryRun[]): LiveSummary {
     return measurementWindowMs ? reconnects * 60000 / measurementWindowMs : 0
   })
   const reconnects = summaries.reduce((n, summary) => n + summary.reconnects, 0)
-  const finalMeasurementWindowMs = Math.max(...summaries.map((summary) => summary.elapsedMs ?? 0), 0)
   const subscriptionMinutes = summaries.reduce((n, summary) =>
     n + (summary.subscriptions ?? 1) * (summary.elapsedMs ?? 0) / 60000, 0)
   const readinessSpreadsMs = runs.map((run) => {
@@ -75,7 +74,7 @@ export function summarizeLiveRuns(runs: LiveSummaryRun[]): LiveSummary {
     heldConnections,
     inFlightConnections,
     totalReconnectsPerMinute,
-    finalTotalReconnectsPerMinute: finalMeasurementWindowMs ? reconnects * 60000 / finalMeasurementWindowMs : 0,
+    finalTotalReconnectsPerMinute: totalReconnectsPerMinute.reduce((n, rate) => n + rate, 0),
     reconnectsPerSubscriptionMinute: subscriptionMinutes ? reconnects / subscriptionMinutes : 0,
     readinessSpreadsMs,
     deliveryP50Ms: percentile(deliveries, 0.5),
