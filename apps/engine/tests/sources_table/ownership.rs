@@ -65,9 +65,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupNeverMember => group_never_member_writes_are_silent(&fixture).await,
             Case::GroupSibling => group_disjoint_sibling_survives_inner_move_out(&fixture).await,
             Case::GroupPageHandoff => page_handoff_tombstone_contract(&fixture).await,
-            Case::GroupPagePrivateCancellation => page_cancellation_contract(&fixture, "private").await,
-            Case::GroupPagePageCancellation => page_cancellation_contract(&fixture, "page").await,
-            Case::GroupPageCompleteCancellation => page_cancellation_contract(&fixture, "complete").await,
+            Case::GroupPageCancellation => page_cancellation_contract(&fixture).await,
+            Case::GroupConcurrentPageCancellation => concurrent_page_cancellation_contract(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -100,9 +99,8 @@ enum Case {
     GroupNeverMember,
     GroupSibling,
     GroupPageHandoff,
-    GroupPagePrivateCancellation,
-    GroupPagePageCancellation,
-    GroupPageCompleteCancellation,
+    GroupPageCancellation,
+    GroupConcurrentPageCancellation,
 }
 
 #[test]
@@ -119,26 +117,23 @@ fn group_disjoint_same_table_sibling_survives_move_out() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_page_handoff_outer_delete_emits_tombstone() -> Result<()> {
-    isolated("ownership::group_page_handoff_outer_delete_emits_tombstone", Case::GroupPageHandoff)
+fn group_page_handoff_preserves_newer_move_out() -> Result<()> {
+    isolated("ownership::group_page_handoff_preserves_newer_move_out", Case::GroupPageHandoff)
 }
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_page_private_cancellation_releases_queryback_window() -> Result<()> {
-    isolated("ownership::group_page_private_cancellation_releases_queryback_window", Case::GroupPagePrivateCancellation)
+fn group_page_cancellation_releases_queryback_window() -> Result<()> {
+    isolated("ownership::group_page_cancellation_releases_queryback_window", Case::GroupPageCancellation)
 }
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_page_page_cancellation_releases_queryback_window() -> Result<()> {
-    isolated("ownership::group_page_page_cancellation_releases_queryback_window", Case::GroupPagePageCancellation)
-}
-
-#[test]
-#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_page_complete_cancellation_releases_group_claim() -> Result<()> {
-    isolated("ownership::group_page_complete_cancellation_releases_group_claim", Case::GroupPageCompleteCancellation)
+fn concurrent_group_cancellations_preserve_both_durable_drops() -> Result<()> {
+    isolated(
+        "ownership::concurrent_group_cancellations_preserve_both_durable_drops",
+        Case::GroupConcurrentPageCancellation,
+    )
 }
 
 #[test]
@@ -906,6 +901,30 @@ async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Re
     }
 }
 
+async fn wait_group_event<F>(f: &Fixture, stream_path: &str, mut matches: F) -> Result<Vec<serde_json::Value>>
+where
+    F: FnMut(&serde_json::Value) -> bool,
+{
+    let mut changed = f.ds.changed.subscribe();
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let events = stream_events(f, stream_path).await;
+            if events.iter().any(&mut matches) {
+                return Ok(events);
+            }
+            changed.changed().await.context("group stream observation channel closed")?;
+        }
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "waiting for expected group stream event timed out: {:?}",
+            stream_events(f, stream_path).await
+        )),
+    }
+}
+
 async fn install_source_fence(f: &Fixture) -> Result<()> {
     f.client
         .batch_execute(&format!(
@@ -1103,6 +1122,9 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
         }
         wait_ready(&base, "private").await?;
         let entered = uuid::Uuid::new_v4();
+        // Keep the outer insert before the inner insert deliberately. T's first envelope is
+        // processed before the inner key makes the subquery member eligible; reversing these
+        // statements would turn this into an ordinary move-in/delete path.
         f.client
             .batch_execute(&format!(
                 "BEGIN; INSERT INTO public.{} (id, body) VALUES (3, 'entered between seeds'); \
@@ -1135,33 +1157,23 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
         );
         let path = body["streamPath"].as_str().context("group stream path")?;
         let table = format!("public.{}", f.outer);
-        let mut changed = f.ds.changed.subscribe();
-        match tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let events = stream_events(f, path).await;
-                if events.iter().any(|event| {
-                    event_key(event).as_deref() == Some("3")
-                        && event_operation(event) == Some("delete")
-                        && event["type"].as_str() == Some(table.as_str())
-                        && event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str())
-                }) {
-                    return Ok::<_, anyhow::Error>(events);
-                }
-                changed.changed().await.context("group stream observation channel closed")?;
-            }
+        let expected_lsn = receipt.commit_lsn.clone();
+        let events = wait_group_event(f, path, |event| {
+            event_key(event).as_deref() == Some("3")
+                && event_operation(event) == Some("delete")
+                && event["type"].as_str() == Some(table.as_str())
+                && event["headers"]["lsn"].as_str() == Some(expected_lsn.as_str())
         })
-        .await
-        {
-            Ok(result) => {
-                result?;
-            }
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "waiting for the fenced page tombstone timed out: {:?}",
-                    stream_events(f, path).await
-                ));
-            }
-        }
+        .await?;
+        ensure!(
+            events.iter().any(|event| {
+                event_key(event).as_deref() == Some("3")
+                    && event_operation(event) == Some("delete")
+                    && event["type"].as_str() == Some(table.as_str())
+                    && event["headers"]["lsn"].as_str() == Some(expected_lsn.as_str())
+            }),
+            "page-visible row moved out before key handoff without a fenced tombstone: {events:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -1171,108 +1183,214 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
     result
 }
 
-async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<()> {
-    install_source_fence(f).await?;
-    let barrier = f.root.join(format!("group-page-cancel-{cancel_stage}"));
-    let base = barrier.to_string_lossy().into_owned();
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
-    let (engine, app) = group_engine(f).await?;
-    let result = async {
-        let subscription = format!("group-page-cancel-{cancel_stage}");
-        // The complete-stage case uses an all-plain group so a restart can observe whether the
-        // cancellation compensation persisted GroupDropped. Mixed groups are intentionally
-        // discarded during restore and cannot prove that durable record.
-        let request = if cancel_stage == "complete" {
-            group_body(f, &subscription, true)
-        } else {
-            membership_group_body(f, &subscription)
-        };
-        let task = tokio::spawn({
-            let app = app.clone();
-            async move { post_group(&app, request).await }
-        });
-        async fn wait_ready(base: &str, stage: &str) -> Result<()> {
-            let path = PathBuf::from(format!("{base}.{stage}.ready"));
-            tokio::time::timeout(Duration::from_secs(15), async {
-                loop {
-                    if path.exists() {
-                        return Ok::<_, anyhow::Error>(());
+async fn page_cancellation_contract(f: &Fixture) -> Result<()> {
+    for (index, cancel_stage) in ["member", "private", "page", "complete"].into_iter().enumerate() {
+        install_source_fence(f).await?;
+        let barrier = f.root.join(format!("group-page-cancel-{index}"));
+        let base = barrier.to_string_lossy().into_owned();
+        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", cancel_stage) };
+        let (engine, app) = group_engine(f).await?;
+        let subscription = format!("group-page-cancel-{index}");
+        let case_result = async {
+            let request = if cancel_stage == "complete" {
+                group_body(f, &subscription, true)
+            } else {
+                membership_group_body(f, &subscription)
+            };
+            let task = tokio::spawn({
+                let app = app.clone();
+                async move { post_group(&app, request).await }
+            });
+            async fn wait_ready(base: &str, stage: &str) -> Result<()> {
+                let path = PathBuf::from(format!("{base}.{stage}.ready"));
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if path.exists() {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
+                })
+                .await
+                .context(format!("waiting for cancelled group {stage} barrier"))??;
+                Ok(())
+            }
+            let stage_result = match cancel_stage {
+                "member" => wait_ready(&base, "member").await,
+                "private" => wait_ready(&base, "private").await,
+                "page" => {
+                    match wait_ready(&base, "private").await {
+                        Ok(()) => match std::fs::write(format!("{base}.private.release"), b"release") {
+                            Ok(()) => wait_ready(&base, "page").await,
+                            Err(error) => Err(error.into()),
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+                "complete" => wait_ready(&base, "complete").await,
+                _ => unreachable!("unknown group cancellation stage"),
+            };
+            task.abort();
+            let _ = task.await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if engine.subquery_inflight_querybacks_for_test().await == 0 {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
                 }
             })
             .await
-            .context(format!("waiting for cancelled group {stage} barrier"))??;
-            Ok(())
+            .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
+            stage_result?;
+            Ok::<_, anyhow::Error>(())
         }
-        wait_ready(&base, "private").await?;
-        if cancel_stage == "page" || cancel_stage == "complete" {
-            std::fs::write(format!("{base}.private.release"), b"release")?;
-            wait_ready(&base, "page").await?;
-        }
-        if cancel_stage == "complete" {
-            std::fs::write(format!("{base}.page.release"), b"release")?;
-            wait_ready(&base, "complete").await?;
-        }
-        task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if engine.subquery_inflight_querybacks_for_test().await == 0 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
-
-        if cancel_stage == "complete" {
-            // Closing joins the cancellation compensation task and drains its durable catalog
-            // write. Reboot before any retry so a stale GroupCreated cannot be hidden by a new
-            // record under the same subscription key.
-            unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
-            ensure!(
-                engine.close(Duration::from_secs(10)).await
-                    == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
-                "cancelled complete-stage group did not close cleanly"
-            );
-            let (restarted, restarted_app) = group_engine(f).await?;
-            let attempt = post_group(&restarted_app, group_body(f, &subscription, true)).await;
-            let close = restarted.close(Duration::from_secs(10)).await;
-            ensure!(
-                close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
-                "restarted cancellation contract engine did not close cleanly"
-            );
-            let (status, body) = attempt?;
-            ensure!(status == StatusCode::OK, "cancelled group claim survived restart: {status} {body}");
-            return Ok::<_, anyhow::Error>(());
-        }
-
+        .await;
         unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
-        let retry_body = membership_group_body(f, &subscription);
-        tokio::time::timeout(Duration::from_secs(15), async {
+        unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
+        let close_outcome = engine.close(Duration::from_secs(10)).await;
+        let fence_result = remove_source_fence(f).await;
+        let replacement_result = async {
+            let (replacement, replacement_app) = match group_engine(f).await {
+                Ok(value) => value,
+                Err(error) => return Err(error),
+            };
+            // Reusing the exact public claim is the observable proof that every private member
+            // claim was released. A durable GroupCreated from the completion window must also be
+            // canceled before this replacement engine can accept the same group subscription.
+            let retry_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            let mut retry_body = None;
+            let retry_result = async {
+                loop {
+                    let request = if cancel_stage == "complete" {
+                        group_body(f, &subscription, true)
+                    } else {
+                        membership_group_body(f, &subscription)
+                    };
+                    let attempt = post_group(&replacement_app, request).await?;
+                    if attempt.0 == StatusCode::OK {
+                        retry_body = Some(attempt);
+                        break;
+                    }
+                    ensure!(
+                        attempt.0 == StatusCode::CONFLICT,
+                        "retry of canceled group failed: {} {}",
+                        attempt.0,
+                        attempt.1
+                    );
+                    if tokio::time::Instant::now() >= retry_deadline {
+                        ensure!(false, "retry of canceled group {cancel_stage} failed: {} {}", attempt.0, attempt.1);
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            let replacement_close = replacement.close(Duration::from_secs(10)).await;
+            retry_result?;
+            let retry_body = retry_body.expect("successful group retry recorded");
+            ensure!(
+                retry_body.0 == StatusCode::OK,
+                "retry of canceled group {cancel_stage} failed: {} {}",
+                retry_body.0,
+                retry_body.1
+            );
+            ensure!(
+                replacement_close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+                "replacement engine after canceled group {cancel_stage} did not close cleanly"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let mut errors = Vec::new();
+        if close_outcome != electric_circuits_engine::shutdown::ShutdownOutcome::Complete {
+            errors.push(format!("cancelled group {cancel_stage} did not close cleanly: {close_outcome:?}"));
+        }
+        if let Err(error) = case_result {
+            errors.push(format!("cancelled group {cancel_stage}: {error:#}"));
+        }
+        if let Err(error) = replacement_result {
+            errors.push(format!("retry after cancelled group {cancel_stage}: {error:#}"));
+        }
+        if let Err(error) = fence_result {
+            errors.push(format!("remove source fence after cancelled group {cancel_stage}: {error:#}"));
+        }
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("\n"));
+        }
+    }
+    Ok(())
+}
+
+async fn concurrent_page_cancellation_contract(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let barrier = f.root.join("group-page-cancel-concurrent");
+    let base = barrier.to_string_lossy().into_owned();
+    let subscriptions = [
+        "group-page-cancel-concurrent-a".to_string(),
+        "group-page-cancel-concurrent-b".to_string(),
+    ];
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "complete") };
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let mut tasks = Vec::new();
+        for subscription in &subscriptions {
+            let app = app.clone();
+            let request = group_body(f, subscription, true);
+            tasks.push(tokio::spawn(async move { post_group(&app, request).await }));
+        }
+        let ready = PathBuf::from(format!("{base}.complete.ready"));
+        let ready_result = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let (status, body) = post_group(&app, retry_body.clone()).await?;
-                if status == StatusCode::OK {
+                let count = std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count());
+                if count >= subscriptions.len() {
                     return Ok::<_, anyhow::Error>(());
                 }
-                ensure!(status == StatusCode::CONFLICT, "retry after cancellation failed: {status} {body}");
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .context(format!("cancelled group {cancel_stage} could not be recreated"))??;
+        .context("waiting for both cancelled groups to reach complete barrier")?;
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        ready_result?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    remove_source_fence(f).await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
+    let close = engine.close(Duration::from_secs(10)).await;
+    let fence = remove_source_fence(f).await;
+    let replacement = async {
+        let (replacement, replacement_app) = group_engine(f).await?;
+        let retry = async {
+            for subscription in &subscriptions {
+                let (status, body) = post_group(&replacement_app, group_body(f, subscription, true)).await?;
+                ensure!(status == StatusCode::OK, "cancelled group claim survived restart: {status} {body}");
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        let replacement_close = replacement.close(Duration::from_secs(10)).await;
+        retry?;
+        ensure!(
+            replacement_close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+            "replacement engine after concurrent cancellation did not close cleanly"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
     ensure!(
-        engine.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
-        "cancelled group {cancel_stage} did not close cleanly and may have retained its replication slot"
+        close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+        "concurrent cancellation engine did not close cleanly"
     );
-    result
+    fence?;
+    result?;
+    replacement
 }
 
 async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {

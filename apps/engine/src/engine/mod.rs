@@ -705,20 +705,6 @@ pub enum PostgresSetup {
     ExternallyManaged,
 }
 
-#[cfg(feature = "test-support")]
-async fn test_group_complete_barrier() -> Result<()> {
-    let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return Ok(()) };
-    let ready = std::path::PathBuf::from(format!("{base}.complete.ready"));
-    let release = std::path::PathBuf::from(format!("{base}.complete.release"));
-    let _ = std::fs::OpenOptions::new().create(true).write(true).open(&ready);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !release.exists() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    anyhow::ensure!(release.exists(), "test group complete barrier timed out");
-    Ok(())
-}
-
 pub(crate) struct PurgeBarrier {
     dropped_durable: std::sync::atomic::AtomicBool,
     dropped_failed: std::sync::atomic::AtomicBool,
@@ -2899,7 +2885,7 @@ impl Engine {
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         #[cfg(feature = "test-support")]
-        test_group_complete_barrier().await?;
+        crate::http::test_group_page_barrier("complete").await?;
         let valid = {
             let st = self.state.lock().await;
             st.shapes.contains_key(&record.members[0].shape_id)
@@ -2914,24 +2900,7 @@ impl Engine {
     }
 
     pub(crate) async fn drop_group_durable(&self, subscription: &str) -> Result<()> {
-        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await
-    }
-
-    /// Re-enqueue an idempotent member release after the in-memory unsubscribe already happened
-    /// but its first durable append failed. Group cancellation uses this to retain compensation
-    /// until the catalog has accepted a `Left`, rather than silently losing a private claim.
-    pub(crate) async fn retry_release_subscription_durable(
-        &self,
-        id: &str,
-        subscription: &str,
-    ) -> Result<()> {
-        self.catalog_tx
-            .send_durable(CatalogEvent::Left {
-                id: id.to_string(),
-                subscription: subscription.to_string(),
-                lapsed: false,
-            })
-            .await?;
+        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
         Ok(())
     }
 

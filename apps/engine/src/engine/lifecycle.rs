@@ -1127,6 +1127,22 @@ impl Engine {
         self.release_subscription_inner(id, sub, true).await
     }
 
+    /// Re-enqueue a release whose in-memory mutation already happened but whose first catalog
+    /// append did not become durable. Compensation callers use this after
+    /// [`Self::release_subscription_durable`] has returned `CatalogWriterGone`; the ordinary
+    /// idempotent release would otherwise find no claim and wait on the failed writer without
+    /// putting a new `Left` back in the catalog queue.
+    pub(crate) async fn retry_subscription_release_durable(&self, id: &str, subscription: &str) -> Result<()> {
+        self.catalog_tx
+            .send_durable(CatalogEvent::Left {
+                id: id.to_string(),
+                subscription: subscription.to_string(),
+                lapsed: false,
+            })
+            .await?;
+        Ok(())
+    }
+
     async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         let released = match sub {

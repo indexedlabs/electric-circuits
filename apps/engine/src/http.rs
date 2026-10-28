@@ -1346,6 +1346,7 @@ struct GroupReservationGuard {
     subscription: String,
     members: Vec<(String, String)>,
     group_created: bool,
+    compensation_party: Option<crate::shutdown::ShutdownParty>,
     armed: bool,
 }
 
@@ -1362,11 +1363,21 @@ struct GroupSnapshotGuard {
 /// process sets a unique base path, then releases the private-seed and page-read windows after
 /// applying a source transaction. Production builds never inspect this environment variable.
 #[cfg(feature = "test-support")]
-async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
+pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return Ok(()) };
+    // A caller can select one precise cancellation window.  The handoff contract leaves this
+    // unset and therefore exercises both private and page barriers; cancellation tests set it so
+    // a member-create or catalog-completion barrier does not accidentally block earlier stages.
+    match std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") {
+        Ok(selected) if selected != stage => return Ok(()),
+        Err(_) if matches!(stage, "member" | "complete") => return Ok(()),
+        _ => {}
+    }
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
     let release = std::path::PathBuf::from(format!("{base}.{stage}.release"));
-    let _ = std::fs::OpenOptions::new().create(true).write(true).open(&ready);
+    use std::io::Write;
+    let mut ready_file = std::fs::OpenOptions::new().create(true).append(true).open(&ready)?;
+    writeln!(ready_file, "ready")?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
     while !release.exists() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1409,6 +1420,7 @@ impl GroupReservationGuard {
             subscription: subscription.to_string(),
             members: Vec::new(),
             group_created: false,
+            compensation_party: Some(engine.shutdown_token().party("group reservation compensation")),
             armed: true,
         }
     }
@@ -1427,41 +1439,54 @@ impl GroupReservationGuard {
         self.group_created = true;
     }
 
+    async fn release_member_durable(engine: &Engine, shape_id: &str, subscription: &str) {
+        let mut first = true;
+        let mut backoff = std::time::Duration::from_millis(100);
+        loop {
+            let result = if first {
+                engine.release_subscription_durable(shape_id, Some(subscription)).await
+            } else {
+                engine.retry_subscription_release_durable(shape_id, subscription).await
+            };
+            match result {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
+                    first = false;
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    async fn drop_group_durable(engine: &Engine, subscription: &str) {
+        let mut backoff = std::time::Duration::from_millis(100);
+        loop {
+            match engine.drop_group_durable(subscription).await {
+                Ok(()) => return,
+                Err(error) => {
+                    tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
     async fn rollback(&mut self) {
         if !self.armed {
             return;
         }
         while let Some((shape_id, subscription)) = self.members.last().cloned() {
-            let released = self
-                .engine
-                .release_subscription_durable(&shape_id, Some(&subscription))
-                .await;
-            if released.is_err() {
-                // The in-memory unsubscribe happens before the catalog await. Re-enqueue the
-                // idempotent Left so a transient writer failure cannot silently lose the
-                // compensation; retain the member until one durable append is acknowledged.
-                let retry = self
-                    .engine
-                    .retry_release_subscription_durable(&shape_id, &subscription)
-                    .await;
-                if let Err(error) = retry {
-                    tracing::warn!(%shape_id, %subscription, %error, "failed to compensate cancelled group member");
-                    break;
-                }
+            Self::release_member_durable(&self.engine, &shape_id, &subscription).await;
+            if self.members.last().is_some_and(|member| member.0 == shape_id && member.1 == subscription) {
+                self.members.pop();
             }
-            self.members.pop();
         }
         if self.group_created {
-            if let Err(error) = self.engine.drop_group_durable(&self.subscription).await {
-                if let Err(retry_error) = self.engine.drop_group_durable(&self.subscription).await {
-                    tracing::warn!(
-                        subscription = %self.subscription,
-                        %error,
-                        %retry_error,
-                        "failed to compensate cancelled group"
-                    );
-                }
-            }
+            Self::drop_group_durable(&self.engine, &self.subscription).await;
+            self.group_created = false;
         }
         self.engine.abort_group(&self.subscription).await;
         self.armed = false;
@@ -1482,33 +1507,13 @@ impl Drop for GroupReservationGuard {
         let subscription = self.subscription.clone();
         let members = self.members.clone();
         let group_created = self.group_created;
-        let party = engine.shutdown_token().party("group reservation compensation");
-        tokio::spawn(async move {
+        let party = self.compensation_party.take();
+        engine.shutdown_token().spawn(async move {
             for (shape_id, member_subscription) in members {
-                if let Err(error) = engine
-                    .release_subscription_durable(&shape_id, Some(&member_subscription))
-                    .await
-                {
-                    if let Err(retry_error) = engine
-                        .retry_release_subscription_durable(&shape_id, &member_subscription)
-                        .await
-                    {
-                        tracing::warn!(
-                            %shape_id,
-                            subscription = %member_subscription,
-                            %error,
-                            %retry_error,
-                            "failed to compensate cancelled group member"
-                        );
-                    }
-                }
+                GroupReservationGuard::release_member_durable(&engine, &shape_id, &member_subscription).await;
             }
             if group_created {
-                if let Err(error) = engine.drop_group_durable(&subscription).await {
-                    if let Err(retry_error) = engine.drop_group_durable(&subscription).await {
-                        tracing::warn!(%subscription, %error, %retry_error, "failed to compensate cancelled group");
-                    }
-                }
+                GroupReservationGuard::drop_group_durable(&engine, &subscription).await;
             }
             engine.abort_group(&subscription).await;
             drop(party);
@@ -1782,6 +1787,13 @@ async fn subset_load_group(
                 created.push((rec, sub));
             }
             Err(error) => {
+                reservation.rollback().await;
+                return Err(AppError::from(error));
+            }
+        }
+        #[cfg(feature = "test-support")]
+        if i == 0 {
+            if let Err(error) = test_group_page_barrier("member").await {
                 reservation.rollback().await;
                 return Err(AppError::from(error));
             }

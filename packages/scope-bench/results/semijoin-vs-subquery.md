@@ -186,11 +186,14 @@ at its first timing assertion (`onWake` occurred at t=125 ms). This is the genui
 red for the remaining benchmark-model defect, not an engine failure. The same run
 also confirms TypeScript, the supported Node gate and image builds passed.
 
-The streaming fix routes each received chunk through the shared return half-RTT/downlink
-queue and increments `bytesDown`. The implementation also seeds keys from the actual
+Commit `aa3c90b` routes each received streaming chunk through the shared return
+half-RTT/downlink queue and increments `bytesDown`. It also seeds keys from the actual
 public group page into each subquery member's FeedSet before the group claim becomes
-durable. The private key seed and this public-page seed both retain only keys; the extra
-bounded reads and feed entries belong in both modes' measurements.
+durable, closing the page/live handoff that could otherwise leave a snapshot row without
+a delete gate. The private key seed and this public-page seed both retain only keys; the
+extra bounded reads and feed entries belong in both modes' measurements. Its focused
+phone regression was genuinely red before that correction; the exact-head benchmark
+artifact is still pending.
 
 
 
@@ -224,48 +227,80 @@ before delivery.
 
 ### Current exact-head correction
 
-Head `8185b7b` adds the missing real PostgreSQL page-handoff controls. The test-only
+Head `8185b7b` carries the real PostgreSQL page-handoff controls. The test-only
 sequencer pause keeps the source reader behind the page; an outer-row delete committed
 after the page is visible but unsequenced, so the live path cannot seed the member's
 FeedSet. Only the page-key handoff can emit the table-qualified tombstone, and the
 assertion checks the delete's source commit LSN. A second contract aborts the group
 request at both handoff barriers and checks that `inflight_querybacks` returns to zero.
-The test bodies use distinct names from their isolated wrappers.
+Head `6a58456` makes the event wait deterministic, installs the missing library-test schema,
+and applies the pinned formatting. Head `53dd7e3` adds a clean-close/slot-reuse assertion,
+member-claim compensation on canceled creates, and failed-boot result capture.
+Head `9e9171e` makes the member releases durable across cancellation, records a durable
+`GroupDropped` after `GroupCreated` is queued, and adds a catalog-completion cancellation
+barrier. The working tree extends that completion case to an all-plain group, closes the
+original engine, boots a replacement on the same slot/store, and retries the same claim only
+after restore; this is the restart assertion for the durable drop path.
+The handoff wrapper keeps the established `group_page_handoff_preserves_newer_move_out`
+name so the CI `group_` filter remains stable, while its body uses a deterministic outer-row
+delete. The event wait subscribes before observing the stream and waits for the exact
+table-qualified delete/key/LSN tuple.
 
 The benchmark now captures `/memory` and `/debug/dbsp-profile` both after group load
 and at the end of the hold. The end profile checks the requested mode and requires
-`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch updates an assignment companion every 200 ms to exercise that path; steady
-writes also insert the eligible `record_date_index` companion for each phone so semijoin
-selection is exercised in both scenarios. These are corrected workloads rather than
-byte-for-byte replays of perf2. `readsPerChange`
-subtracts the benchmark writer's exact `BEGIN`/`COMMIT`/`ROLLBACK` utility statement
-count in addition to filtering its DML. The exact-head CI run `40717261548` (test job
-`122918228568`) reached the Rust and PostgreSQL lanes but failed before benchmark
-artifacts: rustfmt failed, the library tombstone assertion used an unqualified table
-name, and one new page contract failed before its event wait was made deterministic.
-No measurement is claimed from it.
+`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch and steady
+workloads update the `record_date_index` companion every 200 ms / write so the chat-open
+transcript groups exercise that path too; this makes the workload a corrected run rather
+than a byte-for-byte replay of perf2. `readsPerChange`
+uses a per-process benchmark writer role and excludes that role's DML and transaction
+utility statements by `userid`; defensive text filters remain for SQL issued through the
+admin session. The exact-head `327653b` run `40720275270` (test job `122928965091`) ran
+the group contracts successfully in both modes, but its Rust library lane failed in
+`subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback` with
+`group snapshot table disappeared`; rustfmt also failed on the three pinned `subquery.rs`
+formatting hunks. The `6a58456` run `40723397869` (test job `122940089900`) passed the
+group contracts in both modes and the Rust library lane but failed rustfmt on the two
+cancellation-wrapper hunks; no benchmark artifact or measurement is claimed from either
+head. The `53dd7e3` run `40726852161` (test job `122952317914`) passed every test-job step,
+including Vitest, but its scope benchmark job `122969188541` failed all five semijoin
+`chat open` repetitions with `selectionBatches: 0`: that scenario mutated assignment/tagged
+items while its eligible companion was `record_date_index`. The partial artifact is
+`12836273892` (SHA-256 `b55b35af476e2606de62afe6e955099becf926dbc3397e850cae7702ac4a0953`),
+so no performance result is claimed. The `9e9171e` run `40730004632`
+(test job `122963430874`) failed the new cancellation-compensation compile at
+`apps/engine/src/engine/mod.rs:2917` (`expected Result<(), anyhow::Error>, found
+Result<(), CatalogWriterGone>`); its rustfmt step was also red on the new rollback hunk.
+The same compile failure made the group and Rust lanes red and caused Vitest setup to fail;
+the Electric image job `122963429315` was red as well, so no benchmark artifact was produced.
 
-Earlier exact jobs are retained: group contracts passed in both modes at `8c0c6f0`
-(job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
-(`122838729992`); the Rust job remained red there on formatting and the unqualified
-tombstone assertion. At `8185b7b`, the subquery group loop passed its handoff contract
-but `ownership::group_page_cancellation_releases_queryback_window` failed because the
-engine reboot raced the still-held replication slot (`the slot is held by walsender pid
-17649`); the semijoin loop passed. The library then failed
-`subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback` at
-`group snapshot table disappeared`. `6a58456` split the cancellation cases, asserted clean
-engine shutdown, and installed the missing unit-test schema. `327653b` and `6a58456` passed
-the group contracts and Rust tests after those changes, but their formatting gates were red.
-`53dd7e3` is the first head where rustfmt, both membership-mode group contracts, the Rust
-engine tests, TypeScript typecheck, the Node gate, and Vitest all passed. Its benchmark job
-`122969188541` produced artifact `12836273892` (`semijoin-vs-subquery-01c25310dbb58993b7899198c6fe4920235838ca`). The cold-launch five-repetition files are usable; the steady semijoin file contains five errored repetitions because the workload did not reach an eligible selection (`selectionBatches=0`), so it is not a performance result. `9e9171e` added the reservation guard's member-release compensation, durable `GroupDropped` on cancellation after `GroupCreated`, and partial benchmark-boot cleanup. Its exact run `40730004632` (test job `122963430874`) failed in the group, Rust and Vitest lanes after the formatting step, and its Electric image also failed; no artifact was produced. `ccb02c6` then exposed a compile error in the new retry helper (test job `122975056498`), so its benchmark was skipped. The complete-stage cancellation contract now uses an all-plain group, clears the barrier before restart, and requires recreation to prove that the durable drop removed the restored claim.
+The follow-up `ccb02c6` run `40733299001` (test job `122975056498`) repeated the
+`drop_group_durable` type mismatch at `apps/engine/src/engine/mod.rs:2917`
+(`expected Result<(), anyhow::Error>, found Result<(), CatalogWriterGone>`) before running
+the cancellation contracts; its benchmark `122977296090` was skipped and the Electric image
+job `122975057785` failed. The subsequent `89a0b97` head added a shutdown party around detached
+compensation, a one-shot member-release re-enqueue, and the steady `record_date_index` touch,
+but retained the same `drop_group_durable` type mismatch. Its test job `122988431056` failed at
+that compile error, its scope benchmark `122993623042` was skipped, and its engine image job
+`122988431228` failed. This checkout applies the missing `?; Ok(())`, counts duplicate
+shutdown-party names, and retries compensation until each durable `Left` and `GroupDropped`
+acknowledges; it still needs a fresh exact-head run.
+
+Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
+`8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
+(`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
+`87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
+current candidate has passed; the five-repetition benchmark remains pending. The working-tree
+follow-up adds completion durability compensation, shutdown-owned retry coverage and
+cancellation-stage retry coverage; it still needs a new exact-candidate run.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
 the triggering commit LSN for synthetic tombstone headers. The handoff guard balances its state
 on request cancellation, and tombstones are delivered in commit-LSN order. Empty inner-flip
 query-backs do not scan the whole companion table; they remain a no-op unless a scoped decision
-exists.
+exists. The cancellation contract now also aborts two all-plain group creates at the completion
+barrier, closes the engine, and retries both subscriptions after restore; the counted shutdown
+party is therefore exercised by concurrent compensation rather than only by a unit check.
 
 The perf2 `gateway.ts`, `phone.ts`, and `run.ts` harness files have now been
 imported directly from the pinned perf2 commit, without its older engine code.
@@ -312,8 +347,11 @@ key out/in/out after separate source receipts and checks the diagnostic mode and
 join-execution counter. Focused operator coverage includes distinct contributors,
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
 The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
-corrections are covered by the subsequent green group/Rust runs above. Existing
-claim/lease, public snapshot query, group stream and commit fence code is unchanged.
+corrections are implemented through `9cffab2`, while the page-handoff and cancellation
+corrections are carried through `53dd7e3` and `9e9171e`; the working-tree follow-up adds
+the all-plain restart check, pinned formatting cleanup, and partial-boot slot cleanup. It
+still awaits a fresh exact-candidate CI run. Existing claim/lease, public snapshot query,
+group stream and commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's
@@ -335,8 +373,8 @@ as the experiment progresses.
 | Thousands of groups plus held-log replay | Peak RSS against configured memory budget, rebuild + reload time | Pending |
 | Many groups and held SSE responses | Engine/DS/gateway fds and connections; release after close | Pending; native gateway/SSE topology absent from this checkout |
 | 30-phone reconnect burst | Seed columns, conflicts/timeouts, racing and retried claims | Pending; baseline rejects a repeated group claim with 409 |
-| Snapshot-only move-out and wire LSN | Exact delete after receipt and LSN on each membership event | Both green in both modes at `7cbda3f`; exact-head rerun pending |
-| Companion reparenting | Table-qualified delete/upsert/delete after individual source receipts | Passed both modes at `7cbda3f`; exact-head rerun pending |
+| Snapshot-only move-out and wire LSN | Exact delete after receipt and LSN on each membership event | Both green in both modes at `327653b` (run `40720275270`); `53dd7e3` green, `9e9171e` fmt-red |
+| Companion reparenting | Table-qualified delete/upsert/delete after individual source receipts | Passed both modes at `327653b` (run `40720275270`); `53dd7e3` green, `9e9171e` fmt-red |
 | Snapshot/LSN boundary through Swift/GRDB | Same source prefix materialized across the real client stack | Unavailable in this repository alone |
 | Slot/WAL retention | No extra slots per group, lag and cleanup after drop/restart | Pending |
 | Five-second authority rechecks | Measured recheck load under peak held streams | Pending; perf2 has a modeled gateway |

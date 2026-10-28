@@ -37,6 +37,9 @@ const STEADY_WRITE_MS = Number(env('STEADY_WRITE_MS', '500'))
 const STEADY = process.env.STEADY === '1'
 const STEADY_CHAT = process.env.STEADY_CHAT !== '0'
 const MEMBERSHIP_MODE = env('ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP', 'subquery')
+// Workload mutations run under a separate role so pg_stat_statements can exclude their DML and
+// transaction utility calls by userid, while retaining the engine's statements for readsPerChange.
+const BENCH_WRITER_ROLE = `scope_bench_writer_${process.pid}`
 // DISTINCT_USERS=1: phone i signs in as u<i+2> (one of the lighter accounts) instead of all as u1.
 const DISTINCT_USERS = process.env.DISTINCT_USERS === '1'
 const phoneUser = (i: number) => (DISTINCT_USERS ? `u${i + 2}` : HEAVY)
@@ -169,8 +172,8 @@ async function bootServers(pgUrl: string) {
     })
     const gateway = await waitFor(gw, /GATEWAY_LISTENING (\S+)/, 'gateway')
     const stop = async (admin: pg.Client) => {
-      gw!.kill('SIGKILL')
-      engine!.kill('SIGKILL')
+      gw?.kill('SIGKILL')
+      engine?.kill('SIGKILL')
       await new Promise((r) => setTimeout(r, 300))
       await admin.query('select pg_drop_replication_slot($1)', [slot]).catch(() => {})
       await ds.stop().catch(() => {})
@@ -180,6 +183,8 @@ async function bootServers(pgUrl: string) {
     gw?.kill('SIGKILL')
     engine?.kill('SIGKILL')
     await new Promise((r) => setTimeout(r, 300))
+    // The engine may have created its logical slot before the gateway failed or timed out. Drop
+    // it here so a failed repetition cannot keep polling Postgres and contaminate later reps.
     const cleanup = new pg.Client({ connectionString: pgUrl })
     await cleanup.connect().catch(() => {})
     await cleanup.query('select pg_drop_replication_slot($1)', [slot]).catch(() => {})
@@ -231,8 +236,36 @@ interface RunResult {
 
 let steadyRecordsByUser: Record<string, string> = {}
 
-function baseRunResult(sc: Scenario, cfg: Config, rep: number): RunResult {
-  return {
+async function runOnce(admin: pg.Client, writer: pg.Client, pgUrl: string, scs: Scenario[], cfg: Config, rep: number): Promise<RunResult> {
+  const sc = scs[0]!
+  let srv: Awaited<ReturnType<typeof bootServers>> | undefined
+  const writeStarted = new Map<string, number>()
+  const writeLatencies: number[] = []
+  const onWake = (body: string, at: number) => {
+    for (const [marker, started] of writeStarted) {
+      if (body.includes(marker)) {
+        writeLatencies.push(at - started)
+        writeStarted.delete(marker)
+      }
+    }
+  }
+  // Statements the engine ran against Postgres and their execution time, from pg_stat_statements.
+  // The workload writer has a separate userid, so its DML and BEGIN/COMMIT/ROLLBACK calls cannot
+  // contaminate readsPerChange; the text filters remain a defensive guard for harness SQL issued
+  // through the admin session.
+  const pgStats = async () => {
+    const r = await admin.query(
+      `select coalesce(sum(calls),0)::float8 as calls, coalesce(sum(total_exec_time),0)::float8 as ms from pg_stat_statements
+       where userid <> (select oid from pg_roles where rolname = $1)
+         and query not ilike '%pg_stat_statements%' and query not ilike 'update record set title%'
+         and query not ilike 'insert into assistant_stream_event%' and query not ilike 'insert into message%'
+         and query not ilike 'insert into assignment%' and query not ilike 'insert into tagged_item%'
+         and query not ilike 'update assignment%' and query not ilike 'update tagged_item%'`,
+      [BENCH_WRITER_ROLE],
+    )
+    return { calls: Number(r.rows[0].calls), ms: Number(r.rows[0].ms) }
+  }
+  const result: RunResult = {
     membershipMode: MEMBERSHIP_MODE,
     scenario: sc.name,
     config: cfg.name,
@@ -249,45 +282,14 @@ function baseRunResult(sc: Scenario, cfg: Config, rep: number): RunResult {
     pgExecMs: 0,
     longPollsHeld: 0,
   }
-}
-
-async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Config, rep: number): Promise<RunResult> {
-  const sc = scs[0]!
-  let srv: Awaited<ReturnType<typeof bootServers>>
-  try {
-    srv = await bootServers(pgUrl)
-  } catch (error) {
-    return { ...baseRunResult(sc, cfg, rep), error: `boot failed: ${String((error as Error).message ?? error)}` }
-  }
-  const writeStarted = new Map<string, number>()
-  const writeLatencies: number[] = []
-  const onWake = (body: string, at: number) => {
-    for (const [marker, started] of writeStarted) {
-      if (body.includes(marker)) {
-        writeLatencies.push(at - started)
-        writeStarted.delete(marker)
-      }
-    }
-  }
-  const opts = { gateway: srv.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live, coalesceLingerMs: cfg.coalesceLingerMs, onWake }
-  const phones = Array.from({ length: PHONES }, (_, i) => new Phone({ ...opts, user: phoneUser(i) }))
-  // Statements the engine ran against Postgres and their execution time, from pg_stat_statements
-  // (the bench's own writes are excluded by text match).
-  const pgStats = async () => {
-    const r = await admin.query(
-      `select coalesce(sum(calls),0)::float8 as calls, coalesce(sum(total_exec_time),0)::float8 as ms from pg_stat_statements
-       where query not ilike '%pg_stat_statements%' and query not ilike 'update record set title%'
-         and query not ilike 'insert into assistant_stream_event%' and query not ilike 'insert into message%'
-         and query not ilike 'insert into assignment%' and query not ilike 'insert into tagged_item%'
-         and query not ilike 'insert into record_date_index%'
-         and query not ilike 'update assignment%' and query not ilike 'update tagged_item%'`,
-    )
-    return { calls: Number(r.rows[0].calls), ms: Number(r.rows[0].ms) }
-  }
-  const result = baseRunResult(sc, cfg, rep)
   const timers: NodeJS.Timeout[] = []
+  let phones: Phone[] = []
   const sum = (f: (p: Phone) => number) => phones.reduce((a, p) => a + f(p), 0)
   try {
+    const server = await bootServers(pgUrl)
+    srv = server
+    const opts = { gateway: server.gateway, rttMs: RTT_MS, downMbps: DOWN_MBPS, slots: cfg.slots, design: cfg.design, live: cfg.live, coalesceLingerMs: cfg.coalesceLingerMs, onWake }
+    phones = Array.from({ length: PHONES }, (_, i) => new Phone({ ...opts, user: phoneUser(i) }))
     // A reopen first opens the screens once, unmeasured, keeps their cursors, leaves, and lets
     // some of the screen's rows change before coming back.
     const stored = new Map<string, Held[]>()
@@ -295,10 +297,10 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       const before = new Phone({ ...opts, slots: null })
       for (const ev of sc.events) for (const scope of ev.scopes) stored.set(scope.name, await before.load(scope))
       await before.stop()
-      await admin.query(`update record set title = title || '!' where client_id = any($1)`, [reopenChanged])
+      await writer.query(`update record set title = title || '!' where client_id = any($1)`, [reopenChanged])
     }
-    await fetch(`${srv.gateway}/gw/stats/reset`)
-    const cpu0 = cpuMs(srv.enginePid)
+    await fetch(`${server.gateway}/gw/stats/reset`)
+    const cpu0 = cpuMs(server.enginePid)
     const x0 = await pgStats()
     // Per phone and screen: when its first-level tables were all in, and the first of them.
     const perScreen = new Map<string, { first: number | null; firstTable: number | null; all: number }[]>()
@@ -329,16 +331,16 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
         ),
       ),
     )
-    result.engineBootMs = srv.engineBootMs
+    result.engineBootMs = server.engineBootMs
     if (cfg.design === 'scope-group') result.groupLoadMs = Math.round(performance.now() - loadStarted)
     if (cfg.design === 'scope-group') {
-      const memoryResponse = await fetch(`${srv.engineUrl}/memory`)
+      const memoryResponse = await fetch(`${server.engineUrl}/memory`)
       if (!memoryResponse.ok) throw new Error(`GET /memory ${memoryResponse.status}`)
       result.engineMemory = await memoryResponse.json()
       // `/memory` intentionally excludes the DBSP join's profiler-only arrangements. Keep the
       // complete diagnostic response with every group run so the artifact proves the selected
       // mode, positive semijoin execution, and the circuit's used/storage bytes.
-      const profileResponse = await fetch(`${srv.engineUrl}/debug/dbsp-profile`)
+      const profileResponse = await fetch(`${server.engineUrl}/debug/dbsp-profile`)
       if (!profileResponse.ok) throw new Error(`GET /debug/dbsp-profile ${profileResponse.status}`)
       result.dbspProfile = await profileResponse.json()
       const diagnostics = (result.dbspProfile as any)?.group_membership
@@ -357,22 +359,19 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       }
     }
     result.loadRequests = sum((p) => p.requests)
-    const gsLoad = (await (await fetch(`${srv.gateway}/gw/stats`)).json()) as any
+    const gsLoad = (await (await fetch(`${server.gateway}/gw/stats`)).json()) as any
     // Keep everything live for a while with writes landing on the heavy account.
     let n = 0
     let steadyWrites = 0
-    // `pg_stat_statements.track_utility` counts the benchmark writer's explicit transaction
-    // commands. Keep an exact count so readsPerChange contains engine/query-back statements only.
-    let harnessUtilityStatements = 0
     if (!STEADY) {
       timers.push(
         setInterval(() => {
           const offset = n++ % 50
           Promise.all([
-            admin.query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
+            writer.query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
             // Touch an eligible companion as well as the plain Record member so the cold-launch
             // run proves that the semijoin selection path executes before its profile snapshot.
-            admin.query(`update assignment set payload = payload || '.' where user_id = $1 and id in (select id from assignment where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
+            writer.query(`update record_date_index set day = day + 1 where user_id = $1 and id in (select id from record_date_index where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
           ])
             .catch(() => {})
         }, 200),
@@ -394,34 +393,25 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
             writeStarted.set(marker, performance.now())
             const assignmentId = `${marker}-assignment`
             const taggedId = `${marker}-tag`
-            const recordDateIndexId = `${marker}-record-date-index`
-            await admin.query('begin')
-            harnessUtilityStatements++
-            await admin.query(`update record set title = $1 where id = $2 and user_id = $3`, [marker, recordId, user])
-            await admin.query(
+            await writer.query('begin')
+            await writer.query(`update record set title = $1 where id = $2 and user_id = $3`, [marker, recordId, user])
+            // Chat-open transcript groups select record_date_index through the same positive IN
+            // predicate; touch that companion so the semijoin profile records a real selection
+            // in both the cold-launch and steady workloads.
+            await writer.query(`update record_date_index set day = day + 1 where user_id = $1 and record_id = $2`, [user, recordId])
+            await writer.query(
               `insert into assignment (id, user_id, record_id, payload) values ($1, $2, $3, $4) on conflict (id) do update set payload = excluded.payload`,
               [assignmentId, user, recordId, marker],
             )
-            await admin.query(
+            await writer.query(
               `insert into tagged_item (id, user_id, record_id, tag_id) values ($1, $2, $3, $4) on conflict (id) do update set tag_id = excluded.tag_id`,
               [taggedId, user, recordId, marker],
             )
-            // Per-card groups use record_date_index as their eligible subquery member. Keep
-            // steady writes on that companion too, so the semijoin path is measured during the
-            // same 30-phone workload rather than only during cold-launch seeding.
-            await admin.query(
-              `insert into record_date_index (id, user_id, record_id, day) values ($1, $2, $3, $4)`,
-              [recordDateIndexId, user, recordId, 0],
-            )
-            await admin.query('commit')
-            harnessUtilityStatements++
+            await writer.query('commit')
             steadyWrites++
           }
         } catch {
-          try {
-            await admin.query('rollback')
-            harnessUtilityStatements++
-          } catch {}
+          await writer.query('rollback').catch(() => {})
         } finally {
           writeBusy = false
         }
@@ -433,7 +423,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
         const thread = steadyThread
         const reply = setInterval(() => {
           if (k++ >= 200) return clearInterval(reply)
-          admin
+          writer
             .query(`insert into assistant_stream_event (id, user_id, thread_id, payload) values ($1, $2, $3, $4)`, [`steady-ase-${rep}-${cfg.name}-${k}`, HEAVY, thread, 'x'.repeat(300)])
             .catch(() => {})
         }, 50)
@@ -441,7 +431,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
         let m = 0
         timers.push(
           setInterval(() => {
-            admin
+            writer
               .query(`insert into message (id, user_id, thread_id, record_id, created_at, payload) values ($1, $2, $3, null, $4, $5)`, [`steady-msg-${rep}-${cfg.name}-${m}`, HEAVY, thread, 100_000 + m++, 'y'.repeat(1900)])
               .catch(() => {})
           }, 5000),
@@ -452,7 +442,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     result.longPollsHeld = sum((p) => p.longPolls)
     result.streamCount = result.longPollsHeld
     for (const t of timers) clearInterval(t)
-    const gs = (await (await fetch(`${srv.gateway}/gw/stats`)).json()) as any
+    const gs = (await (await fetch(`${server.gateway}/gw/stats`)).json()) as any
     result.phoneRequests = sum((p) => p.requests)
     result.bytesDown = sum((p) => p.bytesDown)
     result.gatewayCpuMs = Math.round(gs.burnedMs)
@@ -467,13 +457,13 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     result.holdDsDeliveredReads = gs.dsDeliveredReads - gsLoad.dsDeliveredReads
     result.holdDsEmptyReads = gs.dsEmptyReads - gsLoad.dsEmptyReads
     result.authorityRechecks = gs.authorityRechecks - gsLoad.authorityRechecks
-    result.engineCpuMs = Math.round(cpuMs(srv.enginePid) - cpu0)
-    result.engineRssMb = Math.round(rssMb(srv.enginePid) * 10) / 10
+    result.engineCpuMs = Math.round(cpuMs(server.enginePid) - cpu0)
+    result.engineRssMb = Math.round(rssMb(server.enginePid) * 10) / 10
     if (cfg.design === 'scope-group') {
-      const memoryEndResponse = await fetch(`${srv.engineUrl}/memory`)
+      const memoryEndResponse = await fetch(`${server.engineUrl}/memory`)
       if (!memoryEndResponse.ok) throw new Error(`GET /memory (end) ${memoryEndResponse.status}`)
       result.engineMemoryEnd = await memoryEndResponse.json()
-      const profileEndResponse = await fetch(`${srv.engineUrl}/debug/dbsp-profile`)
+      const profileEndResponse = await fetch(`${server.engineUrl}/debug/dbsp-profile`)
       if (!profileEndResponse.ok) throw new Error(`GET /debug/dbsp-profile (end) ${profileEndResponse.status}`)
       result.dbspProfileEnd = await profileEndResponse.json()
       const diagnostics = (result.dbspProfileEnd as any)?.group_membership
@@ -489,7 +479,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       result.steadyWriteP90 = writeLatencies.length ? Math.round(quantile(writeLatencies, 0.9)) : null
     }
     const x1 = await pgStats()
-    result.pgStatements = Math.max(0, x1.calls - x0.calls - harnessUtilityStatements)
+    result.pgStatements = x1.calls - x0.calls
     result.pgExecMs = Math.round(x1.ms - x0.ms)
     result.steadyWrites = steadyWrites
     result.readsPerChange = steadyWrites ? result.pgStatements / steadyWrites : null
@@ -498,7 +488,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
   } finally {
     for (const t of timers) clearInterval(t)
     await Promise.all(phones.map((p) => p.stop()))
-    await srv.stop(admin)
+    await srv?.stop(admin)
   }
   return result
 }
@@ -516,10 +506,20 @@ async function main() {
   const pgs = await bootPostgres()
   const admin = new pg.Client({ connectionString: pgs.url })
   await admin.connect()
+  let writer: pg.Client | undefined
   try {
     await admin.query('create extension pg_stat_statements')
     await admin.query(ddl())
     for (const ix of INDEXES) await admin.query(ix)
+    await admin.query(`create role ${BENCH_WRITER_ROLE} login`)
+    await admin.query(`grant usage on schema public to ${BENCH_WRITER_ROLE}`)
+    await admin.query(`grant all privileges on all tables in schema public to ${BENCH_WRITER_ROLE}`)
+    await admin.query(`grant all privileges on all sequences in schema public to ${BENCH_WRITER_ROLE}`)
+    const writerUrl = new URL(pgs.url)
+    writerUrl.username = BENCH_WRITER_ROLE
+    const writerClient = new pg.Client({ connectionString: writerUrl.toString() })
+    writer = writerClient
+    await writerClient.connect()
     const t = performance.now()
     const s: SeedSummary = await seed(admin, OTHER_USERS)
     console.log(`seeded in ${Math.round(performance.now() - t)} ms:`, JSON.stringify(s.rows))
@@ -536,7 +536,7 @@ async function main() {
     for (const name of names) {
       const sc = byVariant.scoped.find((x) => x.name === name)!
       void sc
-      await runOnce(admin, pgs.url, perPhone('scoped', name), { name: 'warm', variant: 'scoped', design: 'scope-load', slots: null, live: 'per-stream' }, 0)
+      await runOnce(admin, writerClient, pgs.url, perPhone('scoped', name), { name: 'warm', variant: 'scoped', design: 'scope-load', slots: null, live: 'per-stream' }, 0)
     }
 
     const results: RunResult[] = []
@@ -545,7 +545,7 @@ async function main() {
         for (const cfg of CONFIGS) {
           const sc = byVariant[cfg.variant].find((x) => x.name === name)!
           if (cfg.resume && !sc.reopen) continue
-          const r = await runOnce(admin, pgs.url, perPhone(cfg.variant, name), cfg, rep)
+          const r = await runOnce(admin, writerClient, pgs.url, perPhone(cfg.variant, name), cfg, rep)
           results.push(r)
           console.log(
             `[${rep}] ${name.padEnd(14)} ${cfg.name.padEnd(17)} ` +
@@ -593,6 +593,8 @@ async function main() {
         )
       }
   } finally {
+    await writer?.end().catch(() => {})
+    await admin.query(`drop role if exists ${BENCH_WRITER_ROLE}`).catch(() => {})
     await admin.end().catch(() => {})
     pgs.stop()
   }

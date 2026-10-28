@@ -689,8 +689,8 @@ membership state or avoiding query-backs.
 
 The `7cbda3f` PostgreSQL regressions reproduced ungated deletes for never-member
 rows and disjoint same-table siblings, plus a focused create-replay shared-worker
-failure. The prototype report records the genuine-red run and the later green
-correction runs. This experiment is not release qualification.
+failure. The corrections below await CI; see the prototype report for exact red
+evidence. This experiment is not release qualification.
 
 Probe commands use the existing bounded worker channel and at most 1024 key/ordinal
 tuples per command (an item bound, not a byte cap on arbitrary SQL key values).
@@ -716,18 +716,30 @@ Group events carry their triggering source commit LSN. That origin identifies
 deferred work; it is not a claim that a later Postgres query-back read precisely
 that source prefix.
 
-The page handoff records scoped live decisions in `page_decisions`, separate from
-ordinary query-back recency. A decision is ordered by its read LSN but its synthetic
-tombstone carries the triggering commit LSN. The production page path uses the xid
-gate and the decision recency map to seed public page keys and emit a table-qualified
-tombstone for a row deleted after the snapshot; the PostgreSQL contract pauses the
-sequencer to make that race deterministic. The tombstone may trail newer events on
-the group stream and clients apply the LSN watermark before accepting it. On cancellation,
-`GroupReservationGuard` releases each private member claim before removing it from
-the compensation list, writes durable `GroupDropped` after a queued `GroupCreated`,
-then aborts the in-memory group claim. Engine close joins this cleanup task. The
-all-plain restart contract in PR #45 checks that this durable drop prevents a
-cancelled group from being restored as an active claim.
+The prototype group page/live handoff has a separate bounded `page_decisions` map for each
+subquery member. The map is armed before the public page snapshot and records the page-read
+LSN/xid together with the triggering commit LSN and whether the row was a member. After the
+page is read, the actual page primary keys are installed into the member's `FeedSet` through
+the same `SnapshotGate` visibility rule used by backfills. A newer negative decision that was
+not already delivered removes the key if present and emits a synthetic, table-qualified
+`delete` tombstone carrying the triggering commit LSN; this is what prevents a row returned by
+the page from being resurrected when its live move-out crossed the handoff.
+
+The synthetic tombstone is queued after the page and any intervening group events, so it may
+trail newer events on the shared stream even though its header carries an earlier triggering
+commit LSN. Consumers must fold the durable stream in offset order and treat the LSN as event
+origin metadata, not as a total ordering of envelopes. The production handoff relies on the
+decision map and xid gate; the PostgreSQL contract test additionally pauses the source reader to
+place its delete after the page snapshot. The bounded decision map is cleared on successful
+handoff and on cancellation. An aborted group request releases every private member claim and
+its query-back window before the group reservation is dropped, retaining failed releases until
+a durable `Left` is confirmed and re-enqueuing that event after a lost writer response. Once
+`GroupCreated` is queued, cancellation releases private member claims, queues a durable
+`GroupDropped`, and only then aborts the public reservation. The guard owns a counted shutdown
+party, so engine close waits for every concurrent compensation before draining the catalog; a
+restart cannot resurrect an all-plain group whose create never returned. These page-handoff
+rules are part of the not-for-merge PR #45 experiment and require exact-head CI evidence; they
+do not qualify the gateway or native client seams.
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:
