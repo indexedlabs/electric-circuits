@@ -5,6 +5,8 @@ five-repetition PostgreSQL 18 benchmarks completed on the preserved production t
 `48501cd`, `9086025`, `8a93697` and `1d7bbbc`. The measurements below are prototype evidence,
 not release qualification. All four runs show higher semijoin DBSP state, slower delivery and
 higher engine CPU; restart cost remains unavailable.
+The `48501cd` benchmark predates the later in-place rollback correction, but this workload does
+not cancel groups, so that path is not exercised by its measurements.
 
 ## Pinned inputs and method
 
@@ -312,8 +314,8 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
 current candidate has passed. The earlier heads `89a0b97` through `48501cd` add completion
 durability compensation, shutdown-owned retry coverage and cancellation-stage retry coverage.
-The c78804a run
-`40748888867` compiled and passed formatting, Rust, TypeScript and Node but its group step failed in
+The c78804a run `40748888867` compiled and passed formatting, Rust, TypeScript and Node but its
+group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
 walsender pid 5267` during replacement restart; the restart helper now retries that transient
 `SlotBusy` state. Heads `82f2cd2` and `9c5b821` then exposed compile/format failures in the new
@@ -485,9 +487,10 @@ only the October 25 scope-load/read-scaling changes.
 
 All four completed five-repetition runs miss the decision threshold. Semijoin DBSP used bytes
 are about 76% higher cold and 45–59% higher steady; delivery is about 1.8–3.0× slower at
-p50/p90, and engine CPU is about 53–103% higher. Process RSS is noisy across runs: semijoin
-ranges from 11.6 MiB lower to 2.2 MiB higher cold, and from 1.7 MiB lower to 2.3 MiB higher
-steady. That variation does not offset the consistently higher DBSP state, latency and CPU.
+p50/p90, and engine CPU is about 53–103% higher. Process RSS is noisy across runs: semijoin is
+1.4–2.2 MiB higher cold in three runs and 11.6 MiB lower in one, while steady RSS ranges from
+1.7 MiB lower to 2.3 MiB higher. That variation does not offset the consistently higher DBSP
+state, latency and CPU.
 Restart cost is unavailable. Keep the accepted subquery-members decision in place. Revisit
 semijoin only with a restart lane or a per-group scaling run that demonstrates lower DBSP memory
 and restart cost on the same target-version inputs. ec#44's documented lifecycle, cancellation
