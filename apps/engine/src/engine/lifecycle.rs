@@ -1175,19 +1175,14 @@ impl Engine {
         internal_group: bool,
     ) -> Result<()> {
         let mut st = self.state.lock().await;
-        if !internal_group && let Some(subscription) = sub {
-            if st.group_claims.is_reserved(subscription) {
-                return Err(anyhow::Error::new(GroupConflict {
-                    subscription: subscription.to_string(),
-                    owner: format!("group {subscription}"),
-                }));
-            }
-            if let Some(owner) = st.group_claims.private_owner(subscription) {
-                return Err(anyhow::Error::new(GroupConflict {
-                    subscription: subscription.to_string(),
-                    owner: format!("group {owner}"),
-                }));
-            }
+        if !internal_group
+            && let Some(subscription) = sub
+            && let Some(owner) = st.group_claims.private_owner(subscription)
+        {
+            return Err(anyhow::Error::new(GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("group {owner}"),
+            }));
         }
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
@@ -1240,12 +1235,6 @@ impl Engine {
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
-        if st.subs_by_id.iter().any(|(subscription, owner)| owner == id && st.group_claims.is_reserved(subscription)) {
-            return Err(anyhow::Error::new(GroupConflict {
-                subscription: "group reservation".to_string(),
-                owner: format!("shape {id}"),
-            }));
-        }
         let group_release = st
             .group_claims
             .records_iter()
@@ -2117,11 +2106,7 @@ impl Engine {
         let (lapsed, lapsed_groups) = {
             let mut st = self.state.lock().await;
             let now = crate::changelog::now_secs();
-            let expired = st
-                .lapsed_subscriptions(cfg.subscription_lease_timeout, now)
-                .into_iter()
-                .filter(|(_, sub)| !st.group_claims.is_reserved(sub))
-                .collect::<Vec<_>>();
+            let expired = st.lapsed_subscriptions(cfg.subscription_lease_timeout, now);
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }

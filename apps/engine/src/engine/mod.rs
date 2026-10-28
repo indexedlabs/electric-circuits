@@ -294,19 +294,6 @@ impl std::fmt::Display for ReplayHeadUnavailable {
 
 impl std::error::Error for ReplayHeadUnavailable {}
 
-/// A group health probe could not reach Durable Streams. The group remains owned and callers
-/// should retry rather than tearing down a healthy claim on an inconclusive HEAD.
-#[derive(Debug)]
-pub(crate) struct GroupStreamUnavailable;
-
-impl std::fmt::Display for GroupStreamUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("group stream health is temporarily unavailable; retrying preserves the group claim")
-    }
-}
-
-impl std::error::Error for GroupStreamUnavailable {}
-
 impl ReactivationRecreate {
     pub(crate) fn over_budget(shape: impl Into<String>) -> Self {
         Self { shape: shape.into(), reason: RecreateReason::OverBudget }
@@ -2955,10 +2942,7 @@ impl Engine {
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         let valid = {
             let mut st = self.state.lock().await;
-            let valid = record.members.iter().all(|member| {
-                st.shapes.contains_key(&member.shape_id)
-                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
-            });
+            let valid = record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id));
             if valid {
                 st.group_claims.complete(record.clone());
                 self.group_fence.activate();
@@ -3063,7 +3047,7 @@ impl Engine {
         Ok(true)
     }
 
-    pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> Result<bool> {
+    pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> bool {
         let members_healthy = {
             let st = self.state.lock().await;
             group.members.iter().all(|member| {
@@ -3071,14 +3055,14 @@ impl Engine {
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
             })
         };
-        if !members_healthy {
-            return Ok(false);
-        }
-        match self.ds.head(&group.stream_path).await {
-            Ok(Some(head)) => Ok(!head.closed && head.next_offset.is_some()),
-            Ok(None) => Ok(false),
-            Err(error) => Err(anyhow::Error::new(GroupStreamUnavailable).context(error)),
-        }
+        members_healthy
+            && self
+                .ds
+                .head(&group.stream_path)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|head| !head.closed && head.next_offset.is_some())
     }
 
     /// Remove the public group record and return its private members.  The caller performs
