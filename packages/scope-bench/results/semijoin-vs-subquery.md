@@ -448,9 +448,10 @@ test job and produced the first benchmark artifact; head `8a93697` adds the slot
 stabilization and second-barrier rollback contract. Head `41d97b0` adds test-support-only
 durable-release fault injection and its rollback contract, and `dafba36` advances the second
 rollback barrier after the injected retry. Its first exact-head run `40770165734` (test job
-`123104894370`) was red because the barrier was not advanced; the current candidate reruns
-that contract with the deterministic release count. The production build remains identical to
-1d7bbbc, whose fully green test job `123064316739` qualifies the production tree.
+`123104894370`) was red because the barrier was not advanced. Head `6c71df7` keeps the
+second barrier blocked, re-enqueues `Left` when cancellation observes an already-removed claim,
+and adds a deterministic retry-window barrier; its exact-head result is pending. The production
+build remains identical to `1d7bbbc`, whose fully green test job `123064316739` qualifies the production tree.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
