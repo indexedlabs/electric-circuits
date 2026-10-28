@@ -2699,10 +2699,7 @@ fn ensure_group_subscription_available(st: &EngineState, sub: &str, internal_gro
         return Ok(());
     }
     if st.group_claims.is_reserved(sub) {
-        return Err(anyhow::Error::new(GroupConflict {
-            subscription: sub.to_string(),
-            owner: format!("group {sub}"),
-        }));
+        return Err(anyhow::Error::new(GroupConflict { subscription: sub.to_string(), owner: format!("group {sub}") }));
     }
     if let Some(owner) = st.group_claims.private_owner(sub) {
         return Err(anyhow::Error::new(GroupConflict {
@@ -2711,10 +2708,7 @@ fn ensure_group_subscription_available(st: &EngineState, sub: &str, internal_gro
         }));
     }
     if st.group_claims.get(sub).is_some() {
-        return Err(anyhow::Error::new(GroupConflict {
-            subscription: sub.to_string(),
-            owner: format!("group {sub}"),
-        }));
+        return Err(anyhow::Error::new(GroupConflict { subscription: sub.to_string(), owner: format!("group {sub}") }));
     }
     Ok(())
 }
@@ -3392,6 +3386,50 @@ mod cancellation_tests {
         tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
             .await
             .expect("plain create admission guard engine close must complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aggregate_create_refuses_group_subscription_during_reservation_and_teardown() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://aggregate-group-admission-guard".into(), store);
+        let (engine, _) = engine_with_subquery_tables_ds(ds).await;
+        let group = GroupRecord {
+            id: "shape/group-teardown".into(),
+            stream_path: "shape/group-teardown".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: String::new(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.create_aggregate_as(&"outer_t".into(), None, AggFn::Count, None, Some("scope".into())),
+        )
+        .await
+        .expect("aggregate create reservation guard must not hang");
+        let error = result.expect_err("a reserved group subscription must remain unavailable to aggregate create");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.complete(group);
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.create_aggregate_as(&"outer_t".into(), None, AggFn::Count, None, Some("scope".into())),
+        )
+        .await
+        .expect("aggregate create teardown guard must not hang");
+        let error = result.expect_err("a recorded group subscription must remain unavailable to aggregate create");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
+            .await
+            .expect("aggregate create admission guard engine close must complete");
     }
 
     #[tokio::test]
