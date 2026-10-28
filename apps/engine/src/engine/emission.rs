@@ -230,11 +230,7 @@ impl GroupEmissionLanes {
     }
 
     pub(crate) fn has_origin_at_or_before(&self, paths: &HashSet<String>, marker_lsn: u64) -> bool {
-        self.origins
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
+        self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
     }
 
     pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {

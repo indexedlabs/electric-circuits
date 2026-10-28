@@ -830,9 +830,9 @@ impl FlipWork {
 
     fn group_paths(&self) -> &[String] {
         match self {
-            Self::Walk { group_paths, .. } | Self::Deferred { group_paths, .. } | Self::DeferredNode { group_paths, .. } => {
-                group_paths
-            }
+            Self::Walk { group_paths, .. }
+            | Self::Deferred { group_paths, .. }
+            | Self::DeferredNode { group_paths, .. } => group_paths,
         }
     }
 }

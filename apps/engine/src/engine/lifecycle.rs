@@ -2131,11 +2131,7 @@ impl Engine {
             }
         }
         let group_error = self.finish_group_release(subscription).await.err();
-        if let Some(error) = first_error.or(group_error) {
-            Err(error)
-        } else {
-            Ok(())
-        }
+        if let Some(error) = first_error.or(group_error) { Err(error) } else { Ok(()) }
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the

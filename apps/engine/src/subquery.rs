@@ -916,10 +916,7 @@ impl SubqueryRegistry {
     /// Return group stream paths reachable from a set of node flips. This is evaluated while the
     /// registry lock is held, before the flip work is handed to a worker, so the source fence can
     /// cover the entire in-flight walk rather than only the append it eventually produces.
-    pub(crate) fn group_paths_for_work(
-        &self,
-        work: &VecDeque<(SubquerySig, Flip)>,
-    ) -> HashSet<String> {
+    pub(crate) fn group_paths_for_work(&self, work: &VecDeque<(SubquerySig, Flip)>) -> HashSet<String> {
         let mut pending = work.iter().map(|(sig, _)| sig.clone()).collect::<VecDeque<_>>();
         let mut visited = HashSet::new();
         let mut paths = HashSet::new();
