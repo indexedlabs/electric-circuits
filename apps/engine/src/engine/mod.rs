@@ -3003,13 +3003,13 @@ impl Engine {
     }
 
     pub(crate) async fn abort_group(&self, subscription: &str, group_id: &str) -> Result<()> {
-        self.state.lock().await.group_claims.release(subscription);
         self.catalog_tx
             .send_durable(CatalogEvent::GroupDropped {
                 subscription: subscription.to_string(),
                 group_id: Some(group_id.to_string()),
             })
             .await?;
+        self.state.lock().await.group_claims.release(subscription);
         Ok(())
     }
 
@@ -3110,9 +3110,8 @@ impl Engine {
         }
     }
 
-    /// Remove the public group record and return its private members.  The caller performs
-    /// the durable member releases outside the state lock, preserving the normal lifecycle
-    /// ordering and avoiding network I/O while holding engine state.
+    /// Remove the public group record after its members have been released and its GroupDropped
+    /// catalog event is durable. The caller performs member releases outside the state lock.
     pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         let mut st = self.state.lock().await;
         let record = st.group_claims.release_if_matches(subscription, group_id);

@@ -258,6 +258,8 @@ struct ObservedDs {
     /// the pre-renew probe into a malformed 200 response.
     group_head_faults: Arc<Mutex<Vec<Option<u16>>>>,
     hold_group_catalog: Arc<Mutex<bool>>,
+    hold_group_drop_id: Arc<Mutex<Option<String>>>,
+    group_created_holds: Arc<std::sync::atomic::AtomicUsize>,
     group_catalog_arrived: Arc<Notify>,
     group_catalog_release: Arc<Notify>,
 }
@@ -293,13 +295,25 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         // after every member claim exists, rather than an earlier member Created append.
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(body, 64 * 1024 * 1024).await.unwrap_or_default();
-        let is_group_lifecycle = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).is_ok_and(|events| {
-            events.iter().any(|event| matches!(event["t"].as_str(), Some("groupCreated") | Some("groupDropped")))
+        let expected_group_drop = ds.hold_group_drop_id.lock().await.clone();
+        let events = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default();
+        let group_created = events.iter().any(|event| event["t"] == "groupCreated");
+        let group_dropped = events.iter().any(|event| {
+            event["t"] == "groupDropped"
+                && expected_group_drop
+                    .as_deref()
+                    .is_some_and(|group_id| event["groupId"].as_str() == Some(group_id))
         });
-        let hold = if is_group_lifecycle {
+        let hold = if group_dropped {
+            *ds.hold_group_drop_id.lock().await = None;
+            true
+        } else if group_created {
             let mut armed = ds.hold_group_catalog.lock().await;
             let hold = *armed;
             *armed = false;
+            if hold {
+                ds.group_created_holds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             hold
         } else {
             false
@@ -430,6 +444,8 @@ impl Fixture {
             fail_next_group_head: Arc::new(Mutex::new(false)),
             group_head_faults: Arc::new(Mutex::new(Vec::new())),
             hold_group_catalog: Arc::new(Mutex::new(false)),
+            hold_group_drop_id: Arc::new(Mutex::new(None)),
+            group_created_holds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             group_catalog_arrived: Arc::new(Notify::new()),
             group_catalog_release: Arc::new(Notify::new()),
         };
@@ -1311,6 +1327,7 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
     let result = async {
         let (status, first) = post_group(&app, group_body(f, "group-closed-reload", true)).await?;
         ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        let old_group_id = first["groupId"].as_str().context("closed group id")?.to_owned();
         let old_path = first["streamPath"].as_str().context("closed group stream path")?.to_owned();
         let first_shape = first["results"][0]["shapeId"].as_str().context("first group member")?.to_owned();
         let gate = pause_group_delete(f, &old_path).await;
@@ -1326,7 +1343,7 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
         });
         wait_group_stream_closed(f, &old_path).await?;
 
-        *f.ds.hold_group_catalog.lock().await = true;
+        *f.ds.hold_group_drop_id.lock().await = Some(old_group_id);
         let reload_app = app.clone();
         let reload_body = group_body(f, "group-closed-reload", true);
         let mut reload_task = tokio::spawn(async move { post_group(&reload_app, reload_body).await });
@@ -1334,6 +1351,10 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
             .await
             .context("group release did not reach GroupDropped durability")?;
+        ensure!(
+            f.ds.group_created_holds.load(std::sync::atomic::Ordering::Relaxed) == 0,
+            "release-window hook must not hold replacement GroupCreated"
+        );
         let public_body = serde_json::json!({
             "table": format!("public.{}", f.outer),
             "changesOnly": true,
@@ -1359,6 +1380,10 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
             .context("same-members reload did not finish after release")?
             .context("same-members reload task failed")??;
         ensure!(reload_status == StatusCode::OK, "same-members reload failed: {reload_status} {fresh}");
+        ensure!(
+            fresh["groupId"].as_str() != Some(first["groupId"].as_str().unwrap_or_default()),
+            "reload reused released group id"
+        );
         let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
         ensure!(new_path != old_path, "closed group reload reused its old stream");
         f.client
