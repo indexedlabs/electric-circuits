@@ -98,6 +98,8 @@ const GROUP_LANE_CAPACITY: usize = 64;
 struct GroupLane {
     state: std::sync::Mutex<GroupLaneState>,
     wake: tokio::sync::Notify,
+    worker_wake: tokio::sync::Notify,
+    worker_done: tokio::sync::Notify,
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     origin_wake: Arc<tokio::sync::Notify>,
@@ -106,9 +108,8 @@ struct GroupLane {
 }
 
 struct GroupLaneState {
-    /// Reservation tickets are deliberately lightweight: the envelope vector remains owned by
-    /// its producer until the ticket is admitted, so a stalled lane does not build an unbounded
-    /// queue of full payloads.
+    /// Waiting tickets contain only admission and accounting metadata. Their producers retain the
+    /// envelope vectors until admission, so the lane owns payloads only after it admits them.
     waiting: std::collections::VecDeque<Arc<GroupTicket>>,
     /// At most GROUP_LANE_CAPACITY payloads are admitted ahead of the writer. The in-flight append
     /// is tracked separately, as it was with the old producer-side permit.
@@ -138,6 +139,7 @@ struct GroupTicket {
 pub(crate) struct GroupBatchHandle {
     lane: Arc<GroupLane>,
     ticket: Arc<GroupTicket>,
+    batch: Option<Vec<Envelope>>,
 }
 
 const TICKET_WAITING: u8 = 0;
@@ -182,6 +184,8 @@ impl GroupEmissionLanes {
                 closed: false,
             }),
             wake: tokio::sync::Notify::new(),
+            worker_wake: tokio::sync::Notify::new(),
+            worker_done: tokio::sync::Notify::new(),
             pending: self.pending.clone(),
             origins: self.origins.clone(),
             origin_wake: self.wake.clone(),
@@ -192,7 +196,7 @@ impl GroupEmissionLanes {
         let worker_ds = self.ds.clone();
         self.shutdown.clone().spawn_background(async move {
             loop {
-                let notified = worker_lane.wake.notified();
+                let notified = worker_lane.worker_wake.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
                 let ticket = {
@@ -203,6 +207,7 @@ impl GroupEmissionLanes {
                         && state.in_flight.is_none()
                         && state.held_failed.is_none()
                     {
+                        worker_lane.worker_done.notify_waiters();
                         return;
                     }
                     let ticket = state.admitted.pop_front();
@@ -233,7 +238,9 @@ impl GroupEmissionLanes {
                 let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs).await;
                 if append.is_err() {
                     #[cfg(test)]
-                    if let Some(gate) = worker_lane.failure_gate.lock().unwrap().clone() {
+                    let failure_gate = worker_lane.failure_gate.lock().unwrap().clone();
+                    #[cfg(test)]
+                    if let Some(gate) = failure_gate {
                         gate.arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         gate.entered.notify_one();
                         gate.released.notified().await;
@@ -332,7 +339,7 @@ impl GroupEmissionLanes {
         let entry = Arc::new(GroupBatchEntry {
             commit_lsn,
             stream_path: path.to_string(),
-            envs: std::sync::Mutex::new(Some(envs)),
+            envs: std::sync::Mutex::new(None),
             accounted: std::sync::atomic::AtomicBool::new(false),
         });
         let mut state = lane.state.lock().unwrap();
@@ -349,8 +356,7 @@ impl GroupEmissionLanes {
         state.next_seq = state.next_seq.saturating_add(1);
         state.waiting.push_back(ticket.clone());
         drop(state);
-        lane.wake.notify_one();
-        Some(GroupBatchHandle { lane, ticket })
+        Some(GroupBatchHandle { lane, ticket, batch: Some(envs) })
     }
 
     /// Queue one complete group batch and await its queue-position admission. The queue entry is
@@ -373,9 +379,6 @@ impl GroupEmissionLanes {
                     dropped.push(ticket);
                 }
                 dropped.extend(state.admitted.drain(..));
-                if let Some(ticket) = state.in_flight.take() {
-                    dropped.push(ticket);
-                }
                 if let Some(ticket) = state.held_failed.take() {
                     dropped.push(ticket);
                 }
@@ -385,6 +388,7 @@ impl GroupEmissionLanes {
                 complete_group_entry(&lane, &ticket.entry);
             }
             lane.wake.notify_waiters();
+            lane.worker_wake.notify_one();
         }
     }
 }
@@ -421,17 +425,24 @@ impl GroupBatchHandle {
                         && state.admitted.len() < GROUP_LANE_CAPACITY
                         && self.ticket.seq < state.taken.saturating_add(GROUP_LANE_CAPACITY as u64) =>
                     {
-                        state.waiting.pop_front();
-                        self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);
-                        state.admitted.push_back(self.ticket.clone());
-                        Admission::Admitted
+                        if let Some(batch) = self.batch.take() {
+                            *self.ticket.entry.envs.lock().unwrap() = Some(batch);
+                            state.waiting.pop_front();
+                            self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);
+                            state.admitted.push_back(self.ticket.clone());
+                            Admission::Admitted
+                        } else {
+                            state.waiting.pop_front();
+                            self.ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                            Admission::Cancelled
+                        }
                     }
                     _ => Admission::Waiting,
                 }
             };
             match admission {
                 Admission::Admitted => {
-                    self.lane.wake.notify_one();
+                    self.lane.worker_wake.notify_one();
                     return;
                 }
                 Admission::Cancelled => {
@@ -602,9 +613,14 @@ mod tests {
         };
         let old = lanes.reserve("shape/group", vec![env("old")], 1).unwrap();
         let new = lanes.reserve("shape/group", vec![env("new")], 2).unwrap();
-        new.wait().await;
+        let mut new_wait = tokio::spawn(new.wait());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut new_wait).await.is_err(),
+            "a later reservation was admitted before the front ticket"
+        );
         assert!(store.appended.lock().unwrap().is_empty());
-        old.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), old.wait()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), new_wait).await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if store.appended.lock().unwrap().len() == 2 {
@@ -686,6 +702,21 @@ mod tests {
         })
         .await
         .unwrap();
+        let keys = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, body)| {
+                serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let mut expected = (0..=128u64).map(|i| format!("x{i}")).collect::<Vec<_>>();
+        expected.extend((0..GROUP_LANE_CAPACITY).map(|i| format!("y{i}")));
+        assert_eq!(keys, expected);
     }
 
     #[tokio::test]
@@ -700,10 +731,11 @@ mod tests {
             Arc::new(PendingFlips::default()),
         );
         lanes.register("shape/group");
+        let lane = lanes.existing_lane("shape/group").unwrap();
         let env = |key: u64| Envelope {
             type_: "shape/group".into(),
             key: key.to_string(),
-            value: None,
+            value: Some(serde_json::json!({ "payload": "x".repeat(4096) })),
             old: None,
             headers: EnvelopeHeaders {
                 operation: "upsert".into(),
@@ -738,6 +770,14 @@ mod tests {
         .unwrap();
         assert!(!producers[GROUP_LANE_CAPACITY].is_finished(), "the 65th admitted batch bypassed capacity");
         assert_eq!(store.appended.lock().unwrap().len(), 0);
+        {
+            let state = lane.state.lock().unwrap();
+            assert!(state.admitted.len() + usize::from(state.in_flight.is_some()) <= GROUP_LANE_CAPACITY + 1);
+            assert!(state
+                .waiting
+                .iter()
+                .all(|ticket| ticket.entry.envs.lock().unwrap().is_none()));
+        }
 
         gate.released.notify_one();
         first_wait.await.unwrap();
@@ -869,6 +909,7 @@ mod tests {
             pending.clone(),
         );
         lanes.register("shape/group");
+        let lane = lanes.existing_lane("shape/group").unwrap();
         let env = |key: &str| Envelope {
             type_: "shape/group".into(),
             key: key.into(),
@@ -887,8 +928,11 @@ mod tests {
         while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
+        let worker_done = lane.worker_done.notified();
+        tokio::pin!(worker_done);
+        worker_done.as_mut().enable();
         let queued = lanes.reserve("shape/group", vec![env("queued")], 2).unwrap();
-        queued.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), queued.wait()).await.unwrap();
         assert_eq!(pending.count(), 2);
         lanes.remove("shape/group");
         assert_eq!(pending.count(), 1);
@@ -900,6 +944,7 @@ mod tests {
         })
         .await
         .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), worker_done).await.unwrap();
         assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 2));
     }
 
