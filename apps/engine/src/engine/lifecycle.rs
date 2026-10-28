@@ -429,6 +429,7 @@ impl Engine {
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
+        let group_member = stream_path_override.is_some();
         let stream_path = stream_path_override.unwrap_or_else(|| format!("shape/{id}"));
         // NOTE: the stream itself is created AFTER the state lock is released (per path below):
         // the PUT is a storage round-trip with a durability fsync, and holding the global lock
@@ -512,6 +513,7 @@ impl Engine {
                     &where_json,
                     out_cols,
                     changes_only,
+                    group_member,
                     admission_started.elapsed(),
                     creating.admission.as_mut().expect("subquery admission acquired"),
                 )
@@ -2252,6 +2254,7 @@ impl Engine {
         where_json: &PredicateJson,
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
+        group_member: bool,
         admission_wait: std::time::Duration,
         admission: &mut SubqueryPermit,
     ) -> Result<()> {
@@ -2283,7 +2286,11 @@ impl Engine {
                     continue;
                 }
             }
-            break registry.begin_create(id, table, stream_path, where_json, out_cols.clone(), changes_only)?;
+            let begin = registry.begin_create(id, table, stream_path, where_json, out_cols.clone(), changes_only)?;
+            if group_member {
+                registry.mark_group_member(id)?;
+            }
+            break begin;
         };
         // Phase A pins reused nodes by refcount. They already have complete membership, so
         // their dependents need not wait for this shape's outer backfill. Keep ownership only

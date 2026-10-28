@@ -263,6 +263,10 @@ pub struct SubqueryShape {
     /// contained is structurally a no-op — the wake-storm gate (PR #30) with no filter to keep
     /// in sync.
     pub(crate) feed_id: i64,
+    /// The group snapshot is read after feed creation, outside this registry. Its rows
+    /// therefore cannot be inferred from the live feed's delete gate. Group membership
+    /// emits absolute deletes, including for snapshot-only rows, and stamps source LSNs.
+    pub(crate) group_member: bool,
     /// **Per-pk recency, for the duration of a query-back only** — `pk_dict` id → the commit
     /// stamp `(lsn, xid)` of the LIVE outer-row decision most recently applied to this shape's
     /// stream for that pk.
@@ -456,6 +460,7 @@ pub struct PendingSubqueryShape {
     pub pred: Arc<CompiledPredicate>,
     pub out_cols: Option<Arc<Vec<usize>>>,
     pub changes_only: bool,
+    group_member: bool,
     /// This create's node-refcount log (for exact rollback on failure).
     collect_log: Vec<SubquerySig>,
     /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install,
@@ -836,6 +841,14 @@ impl SubqueryRegistry {
         self.circuit.profile_dump().await
     }
 
+    pub(crate) fn group_membership_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "mode": if self.circuit.semijoin_enabled() { "semijoin" } else { "subquery" },
+            "selectionBatches": self.circuit.selection_batches(),
+            "eligibleMembers": self.shapes.values().filter(|s| s.group_member && key_semijoin_leaf(&s.pred).is_some()).count(),
+        })
+    }
+
     /// Estimated owned heap of the host-side per-feed key sets (`bytes_feed_sets` in `GET /memory`)
     /// — the delete gate's Roaring bitmaps, moved out of the membership circuit in Task 2.2
     /// (dbsp-ds-dh6). A lower-bound owned floor (serialized bitmap payloads + the outer HashMap
@@ -1006,11 +1019,20 @@ impl SubqueryRegistry {
             pred,
             out_cols,
             changes_only,
+            group_member: false,
             collect_log: log,
             buffer: Vec::new(),
             deferred: VecDeque::new(),
         });
         Ok(BeginCreate { seeds, schemas: self.schemas.clone() })
+    }
+
+    /// Called in the same registry critical section as `begin_create`, before any
+    /// seed I/O or buffered-delta replay. Cancellation uses the ordinary pending rollback.
+    pub(crate) fn mark_group_member(&mut self, shape_id: &str) -> Result<()> {
+        let pending = self.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id).context("pending group member")?;
+        pending.group_member = true;
+        Ok(())
     }
 
     /// Queue propagation work for a shape that is still being created, if it is one. Returns
@@ -1204,6 +1226,7 @@ impl SubqueryRegistry {
             gate: outer_gate,
             emitted: std::sync::atomic::AtomicU64::new(seeded),
             feed_id,
+            group_member: pending.group_member,
             recent: HashMap::new(),
             inflight_querybacks: 0,
         });
@@ -1812,14 +1835,17 @@ impl SubqueryRegistry {
     /// membership snapshot, transition the host-side per-feed key set ([`crate::subq_feed::FeedSet`])
     /// in the same synchronous step, and deliver — **upserts for every matching candidate** (an
     /// update to a continuing member must flow; upserts are always safe for readers), **deletes
-    /// only where the feed actually retracts** (`FeedSet::remove` returns true — a "not a member"
+    /// only where the feed actually retracts** for standalone feeds (`FeedSet::remove` returns true — a "not a member"
     /// verdict for a pk the stream never contained gates to nothing, so the spurious delete that
-    /// used to wake idle long-polls is structurally impossible). Emission is absolute per pk, so
+    /// used to wake idle long-polls is structurally impossible). Group members additionally emit
+    /// deletes for snapshot-only rows: their separate snapshot is not represented by FeedSet.
+    /// Emission is absolute per pk, so
     /// deferred flip propagation converges regardless of timing.
     ///
     /// Callers hold the registry lock for the whole call (eval + FeedSet mutation + lane enqueue),
     /// which is what keeps per-stream append order = evaluation order AND makes each emission
-    /// decision atomic with its bitmap transition (borrow-checker-enforced — no `.await` between).
+    /// decision atomic with its bitmap transition. Semijoin selection awaits the bounded local
+    /// DBSP worker under this same lock; no registry mutation can interleave with it.
     /// `candidates` are each shape's touched rows: `(latest row, still-exists)`.
     /// Returns per shape whether anything was delivered (trace hops).
     ///
@@ -1841,12 +1867,13 @@ impl SubqueryRegistry {
         source: EmissionSource<'_>,
     ) -> Result<Vec<(String, bool, i64)>> {
         // Phase 1: evaluate each candidate against the current membership snapshot and, in the
-        // SAME synchronous step (no `.await`), transition the host-side FeedSet — building the
+        // SAME critical section, transition the host-side FeedSet — building the
         // member upserts and the gated deletes. A delete is emitted for a shape's pk **iff**
-        // `feed_sets.remove` returns true (the pk was actually in the feed): the check-and-set IS
+        // `feed_sets.remove` returns true for standalone feeds (the pk was actually in the feed): the check-and-set IS
         // the emission decision, in one indivisible expression under the registry lock, so the
         // spurious delete that used to wake idle long-polls is structurally impossible (the
-        // wake-storm gate, PR #30). Upserts are delivered for every current member unconditionally.
+        // wake-storm gate, PR #30). Groups also delete snapshot-only rows. Upserts are delivered
+        // for every current member unconditionally.
         let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
         let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
         // Receipt accounting follows the triggering commit even when candidates came from a
@@ -1897,14 +1924,38 @@ impl SubqueryRegistry {
                     candidates
                 }
             };
+            // Use a DBSP join for the positive-IN companion template. More general
+            // Record predicates (OR, NOT IN, multiple independent subqueries) retain
+            // their existing evaluator; NULL never enters a positive-IN probe.
+            let selected = if shape.group_member && self.circuit.semijoin_enabled() {
+                if let Some((col, sig)) = key_semijoin_leaf(&pred) {
+                    let node = self.nodes.get(sig).context("semijoin membership node disappeared")?;
+                    let values: Vec<_> = candidates
+                        .iter()
+                        .map(|(row, exists)| {
+                            if *exists && semijoin_residual_matches(&pred, row) {
+                                row.0.get(col).cloned()
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    Some(self.circuit.select_keys(node.node_id, &values).await?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let mut members: Vec<Row> = Vec::new();
             let mut evaluated: Vec<u32> = Vec::new();
-            for (row, exists) in candidates {
+            for (ordinal, (row, exists)) in candidates.into_iter().enumerate() {
                 let pk = match ts.key_string(&row) {
                     Ok(pk) => pk,
                     Err(_) => continue,
                 };
-                if exists && pred.matches_ctx(&row, self) {
+                let matches = selected.as_ref().map_or_else(|| exists && pred.matches_ctx(&row, self), |s| s[ordinal]);
+                if matches {
                     // Current member: deliver the upsert and record presence in the feed.
                     let pk_id = self.pk_dict.get_or_insert(&pk);
                     self.feed_sets.insert(feed_id, pk_id);
@@ -1912,6 +1963,17 @@ impl SubqueryRegistry {
                         evaluated.push(pk_id);
                     }
                     members.push(row);
+                } else if shape.group_member {
+                    // This row may exist solely in the group's separately returned snapshot.
+                    // Absence from FeedSet cannot prove absence from that client snapshot.
+                    // An absolute delete is idempotent even if the client never saw the row.
+                    if let Some(pk_id) = self.pk_dict.get(&pk) {
+                        self.feed_sets.remove(feed_id, pk_id);
+                    }
+                    deletes.entry(shape_id.clone()).or_default().push(pk.clone());
+                    if record_recency {
+                        evaluated.push(self.pk_dict.get_or_insert(&pk));
+                    }
                 } else {
                     // Non-member. The delete is emitted only if the pk was actually in the feed;
                     // the dictionary is probed WITHOUT minting — a never-interned pk can never
@@ -1956,6 +2018,15 @@ impl SubqueryRegistry {
                 shape.out_cols.as_deref().map(Vec::as_slice),
             );
             envs.extend(crate::engine::delete_envelopes(ts, dels, txid.clone()));
+            if shape.group_member && commit_lsn != 0 {
+                // This is the source transaction that caused the membership decision,
+                // shared with plain member events and the source-drain receipt. The
+                // query-back visibility/recency gate remains separate from this stamp.
+                let lsn = format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xffff_ffff);
+                for envelope in &mut envs {
+                    envelope.headers.lsn = Some(lsn.clone());
+                }
+            }
             if envs.is_empty() {
                 results.push((shape_id, false, 0));
                 continue;
@@ -2643,6 +2714,34 @@ impl SubqueryEval for SubqueryRegistry {
     }
     fn has_null(&self, sig: &SubquerySig) -> bool {
         self.nodes.get(sig).is_some_and(|n| self.circuit.contains(n.node_id, &Value::Null))
+    }
+}
+
+/// Exactly one positive IN under conjunctions. Local predicates may have arbitrary
+/// Boolean structure. Other subquery forms use the established evaluator, including
+/// NOT IN's three-valued NULL semantics.
+fn key_semijoin_leaf(pred: &CompiledPredicate) -> Option<(usize, &SubquerySig)> {
+    fn visit<'a>(p: &'a CompiledPredicate, leaf: &mut Option<(usize, &'a SubquerySig)>) -> bool {
+        match p {
+            CompiledPredicate::And(parts) => parts.iter().all(|p| visit(p, leaf)),
+            CompiledPredicate::InSubquery { col, sig, negated: false } if leaf.is_none() => {
+                *leaf = Some((*col, sig));
+                true
+            }
+            _ => collect_in_leaves(p).is_empty(),
+        }
+    }
+    let mut leaf = None;
+    visit(pred, &mut leaf).then_some(leaf).flatten()
+}
+
+/// Called only after `key_semijoin_leaf` proved all subqueries are the single
+/// positive conjunct evaluated by DBSP. No membership lookup occurs here.
+fn semijoin_residual_matches(pred: &CompiledPredicate, row: &Row) -> bool {
+    match pred {
+        CompiledPredicate::And(parts) => parts.iter().all(|p| semijoin_residual_matches(p, row)),
+        CompiledPredicate::InSubquery { .. } => true,
+        _ => pred.matches(row),
     }
 }
 
@@ -3580,6 +3679,7 @@ mod tests {
             gate: crate::pg::SnapshotGate::passthrough(),
             emitted: std::sync::atomic::AtomicU64::new(0),
             feed_id,
+            group_member: false,
             recent: HashMap::new(),
             inflight_querybacks: 0,
         });

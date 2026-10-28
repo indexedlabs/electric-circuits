@@ -61,6 +61,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
             Case::GroupSnapshotMoveOut => group_snapshot_only_member_moves_out(&fixture).await,
             Case::GroupMemberLsn => group_member_events_have_lsn(&fixture).await,
+            Case::GroupReparent => group_companion_reparenting(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -89,6 +90,13 @@ enum Case {
     GroupRestart,
     GroupSnapshotMoveOut,
     GroupMemberLsn,
+    GroupReparent,
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_companion_reparenting_uses_selected_membership_mode() -> Result<()> {
+    isolated("ownership::group_companion_reparenting_uses_selected_membership_mode", Case::GroupReparent)
 }
 
 #[test]
@@ -1045,6 +1053,65 @@ async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {
                 event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str()),
                 "move-in event LSN differs from source commit {}: {event}",
                 receipt.commit_lsn
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+// A stable companion primary key moves between a Record in the scope and one
+// outside it. Observe the public stream after each source receipt, including a
+// return to the original Record; an ordinal left in DBSP must not mask a delete.
+async fn group_companion_reparenting(f: &Fixture) -> Result<()> {
+    f.client
+        .batch_execute(&format!(
+            "ALTER TABLE public.{} ADD COLUMN parent_id integer; \
+             UPDATE public.{} SET parent_id = id",
+            f.outer, f.outer
+        ))
+        .await?;
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let mut request = membership_group_body(f, "group-reparent");
+        request["members"][1]["where"]["col"] = serde_json::json!("parent_id");
+        let (status, body) = post_group(&app, request).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let path = body["streamPath"].as_str().context("group stream path")?;
+        let table = format!("public.{}", f.outer);
+        for (parent, operation) in [(2, "delete"), (1, "upsert"), (2, "delete")] {
+            let baseline = stream_events(f, path).await.len();
+            let commit = uuid::Uuid::new_v4();
+            f.client
+                .batch_execute(&format!(
+                    "BEGIN; UPDATE public.{} SET parent_id = {} WHERE id = 1; \
+                     INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                    f.outer, parent, commit
+                ))
+                .await?;
+            wait_source_receipt(&engine, f, commit).await?;
+            let events = stream_events(f, path).await;
+            let latest = events.iter().skip(baseline).rev().find(|event| {
+                event["type"].as_str() == Some(table.as_str()) && event_key(event).as_deref() == Some("1")
+            });
+            ensure!(
+                latest.and_then(event_operation) == Some(operation),
+                "reparent to {parent} expected {operation} after receipt: {events:?}"
+            );
+        }
+        // Diagnostic coverage, separate from the public correctness oracle above:
+        // neither CI nor the benchmark may silently compare the baseline to itself.
+        let profile = engine.dbsp_profile_dump().await;
+        let expected = std::env::var("ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP").unwrap_or_else(|_| "subquery".into());
+        ensure!(profile["group_membership"]["mode"].as_str() == Some(expected.as_str()), "wrong mode: {profile}");
+        if expected == "semijoin" {
+            ensure!(
+                profile["group_membership"]["selectionBatches"].as_u64().unwrap_or(0) > 0,
+                "semijoin did not select any candidates: {profile}"
             );
         }
         Ok::<_, anyhow::Error>(())

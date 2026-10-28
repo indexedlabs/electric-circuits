@@ -673,6 +673,38 @@ subscriber, and a restart keeps restored shapes on their existing streams
 
 (Cost model: internals doc §3.3.)
 
+**Not-for-merge group experiment (PR #45).** The default
+`ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=subquery` retains the existing evaluator.
+`semijoin` adds one DBSP incremental join to the existing shared membership
+circuit: distinct `(node_id, Record key)` values join transient companion
+`(node_id, foreign key, ordinal)` probes. The selected ordinals decide emission;
+companion payloads remain outside DBSP. Scope ids are data, not circuit structure.
+Only a single positive `IN` under conjunctions is eligible; local residuals are
+evaluated before the join, while other subquery forms retain the evaluator.
+The same Postgres query-backs, xid gates, recency checks, group transaction fence,
+claim/lease and stream lifecycle operate in both modes. This candidate retains
+the baseline contributor state and does not implement a persistent companion
+arrangement. Consequently it must not be described as eliminating all existing
+membership state or avoiding query-backs.
+
+Probe commands use the existing bounded worker channel and at most 1024 key/ordinal
+tuples per command (an item bound, not a byte cap on arbitrary SQL key values).
+The registry lock spans selection to preserve one membership snapshot; this adds
+two DBSP transactions per chunk, one to insert probes and one to retract them.
+The worker clears probes even if its response receiver disappears. A DBSP probe
+failure stops the worker and propagates to the existing emission error owner;
+it cannot continue with uncleared probes. Engine close joins that same worker.
+`GET /debug/dbsp-profile` reports `group_membership.mode`, `selectionBatches` and
+`eligibleMembers` alongside DBSP's complete operator profile. Use that profile
+and RSS when measuring: `/memory`'s published-snapshot counters omit join state.
+
+Both modes mark group members before seed I/O. Their live emission includes
+absolute nonmember deletes even for rows known only to the separately returned
+group snapshot, and stamps membership events with the triggering source commit
+LSN. That origin identifies deferred work; it is not a claim that a later
+Postgres query-back read precisely that source prefix. Standalone subquery feeds
+retain their existing FeedSet delete gate.
+
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:
 

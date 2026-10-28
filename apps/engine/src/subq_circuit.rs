@@ -32,12 +32,12 @@
 
 use std::sync::{Arc, RwLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dbsp::circuit::CircuitConfig;
 use dbsp::dynamic::DowncastTrait;
 use dbsp::trace::{BatchReader as DynBatchReaderTrait, Cursor};
-use dbsp::typed_batch::{BatchReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
-use dbsp::{MapHandle, OutputHandle, Runtime};
+use dbsp::typed_batch::{BatchReader, IndexedZSetReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
+use dbsp::{IndexedZSetHandle, MapHandle, OutputHandle, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
 use feldera_macros::IsNone;
@@ -103,6 +103,7 @@ pub struct StorageSettings {
     owned_root: Option<std::path::PathBuf>,
     min_storage_bytes: usize,
     cache_mib: usize,
+    group_membership: Option<String>,
 }
 
 impl StorageSettings {
@@ -116,6 +117,7 @@ impl StorageSettings {
                 .unwrap_or(128)
                 .saturating_mul(1024),
             cache_mib: storage_cache_mib(g("ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB").as_deref()),
+            group_membership: g("ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP"),
         }
     }
 
@@ -222,6 +224,12 @@ enum Cmd {
         asserts: Assertions,
         resp: oneshot::Sender<Vec<MemberDelta>>,
     },
+    /// Bounded, transient companion keys. The worker retracts every probe before
+    /// replying, including when the requester has been cancelled.
+    Select {
+        keys: Vec<(Row, i64)>,
+        resp: oneshot::Sender<Result<Vec<i64>, String>>,
+    },
     /// Diagnostic: totals plus the full per-operator profile as dbsp's own JSON
     /// (`DbspProfile::as_json` — worker profiles with per-node `used_memory_bytes` etc., plus
     /// the named operator graph). Heavy; on-demand only (`GET /debug/dbsp-profile`).
@@ -279,21 +287,40 @@ pub struct MembershipCircuit {
     tx: mpsc::Sender<Cmd>,
     members: Slot<MemberSnapshot>,
     contributors: Slot<MapSnapshot>,
+    semijoin: bool,
+    selections: Arc<std::sync::atomic::AtomicU64>,
 }
+
+fn group_semijoin_mode(value: Option<&str>) -> Result<bool> {
+    match value {
+        None | Some("subquery") => Ok(false),
+        Some("semijoin") => Ok(true),
+        Some(other) => anyhow::bail!("invalid ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP={other}; use subquery or semijoin"),
+    }
+}
+
+type SelectionOutput = OutputHandle<SpineSnapshot<OrdZSet<i64>>>;
+type SelectionHandles = (IndexedZSetHandle<Row, i64>, SelectionOutput);
 
 impl MembershipCircuit {
     /// Build the circuit and start its thread. State is in-memory only — nodes reseed from
     /// Postgres on registration.
     pub fn start() -> Result<MembershipCircuit> {
-        Self::start_full(spill_config_from_env()?)
+        let mode = group_semijoin_mode(std::env::var("ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP").ok().as_deref())?;
+        Self::start_full_mode(spill_config_from_env()?, mode)
     }
 
     pub(crate) fn start_config(settings: &StorageSettings) -> Result<MembershipCircuit> {
-        Self::start_full(settings.spill())
+        Self::start_full_mode(settings.spill(), group_semijoin_mode(settings.group_membership.as_deref())?)
     }
 
     /// [`start`], with everything explicit (tests).
+    #[cfg(test)]
     fn start_full(spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
+        Self::start_full_mode(spill, false)
+    }
+
+    fn start_full_mode(spill: Option<SpillConfig>, semijoin: bool) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
         let (m_slot, c_slot) = (members.clone(), contributors.clone());
@@ -324,7 +351,7 @@ impl MembershipCircuit {
                 sp.cache_mib
             );
         }
-        let (dbsp, (contrib_in, flips_out)) = Runtime::init_circuit(config, move |circuit| {
+        let (dbsp, (contrib_in, flips_out, selection)) = Runtime::init_circuit(config, move |circuit| {
             // Contributors are a key→value upsert MAP (the projected value is carried). The
             // upsert patch function is unused (we only Insert/Delete, never Update), but the
             // API requires one; assignment is the natural no-surprise choice.
@@ -335,14 +362,28 @@ impl MembershipCircuit {
             member_counts.integrate_trace().apply(move |spine| {
                 *m_slot.write().expect("members slot") = Some(spine.ro_snapshot());
             });
-            let flips_out = member_counts.distinct().accumulate_output();
+            let keys = member_counts.distinct();
+            let flips_out = keys.accumulate_output();
+            // Positive semijoin: the right relation has exactly one tuple per
+            // (scope node, Record key), so joining returns each candidate once.
+            // Scope ids are data, never circuit structure. The left side contains
+            // only a key and a batch-local ordinal, never a companion row payload.
+            let selection = if semijoin {
+                let (probes, input) = circuit.add_input_indexed_zset::<Row, i64>();
+                let indexed_keys = keys.map_index(|key| (key.clone(), ()));
+                let selected =
+                    probes.join_generic::<_, _, OrdZSet<i64>, _>(&indexed_keys, |_, ordinal, _| Some((*ordinal, ())));
+                Some((input, selected.accumulate_output()))
+            } else {
+                None
+            };
 
             // The contributor relation publishes its own integral for prefix enumeration (the
             // node drop path).
             contrib_stream.integrate_trace().apply(move |spine| {
                 *c_slot.write().expect("contributors slot") = Some(spine.ro_snapshot());
             });
-            Ok((contrib_in, flips_out))
+            Ok((contrib_in, flips_out, selection))
         })
         .map_err(|e| anyhow::anyhow!("membership circuit: init_circuit: {e}"))?;
 
@@ -350,7 +391,7 @@ impl MembershipCircuit {
         let thread = std::thread::Builder::new()
             .name("dbsp-subq".into())
             .spawn(move || {
-                circuit_thread(dbsp, contrib_in, flips_out, rx);
+                circuit_thread(dbsp, contrib_in, flips_out, selection, rx);
                 // Membership storage is a disposable per-Engine cache. The thread removes it
                 // after dbsp has stopped; shutdown joins this cleanup too.
                 if let Some(dir) = cleanup_dir {
@@ -359,7 +400,55 @@ impl MembershipCircuit {
             })
             .map_err(|e| anyhow::anyhow!("spawning dbsp-subq thread: {e}"))?;
 
-        Ok(MembershipCircuit { tx, members, contributors, thread: Arc::new(tokio::sync::Mutex::new(Some(thread))) })
+        Ok(MembershipCircuit {
+            tx,
+            members,
+            contributors,
+            semijoin,
+            selections: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            thread: Arc::new(tokio::sync::Mutex::new(Some(thread))),
+        })
+    }
+
+    pub(crate) fn semijoin_enabled(&self) -> bool {
+        self.semijoin
+    }
+
+    pub(crate) fn selection_batches(&self) -> u64 {
+        self.selections.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Select companion candidates using the real DBSP incremental join. Callers
+    /// hold the registry lock, so key updates cannot interleave with a probe batch.
+    /// At most 1024 key/ordinal tuples enter the bounded worker channel at once.
+    /// NULL and locally excluded rows have no probe, matching SQL positive-IN semantics.
+    pub(crate) async fn select_keys(&self, node: i64, values: &[Option<Value>]) -> Result<Vec<bool>> {
+        anyhow::ensure!(self.semijoin, "semijoin circuit is disabled");
+        let mut selected = vec![false; values.len()];
+        for (chunk, values) in values.chunks(1024).enumerate() {
+            let keys: Vec<_> = values
+                .iter()
+                .enumerate()
+                .filter_map(|(i, value)| {
+                    value
+                        .as_ref()
+                        .filter(|v| **v != Value::Null)
+                        .map(|v| (Row(vec![Value::Int(node), v.clone()]), (chunk * 1024 + i) as i64))
+                })
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            self.tx.send(Cmd::Select { keys, resp: tx }).await.context("semijoin worker stopped")?;
+            let ordinals = rx.await.context("semijoin worker response lost")?.map_err(anyhow::Error::msg)?;
+            for ordinal in ordinals {
+                let slot = selected.get_mut(usize::try_from(ordinal)?).context("invalid semijoin ordinal")?;
+                *slot = true;
+            }
+            self.selections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(selected)
     }
 
     /// Assert, step, and return the step's membership flips. After this returns, snapshot reads
@@ -544,10 +633,33 @@ fn circuit_thread(
     mut dbsp: dbsp::DBSPHandle,
     contrib_in: MapHandle<PkKey, Value, Value>,
     flips_out: OutputHandle<SpineSnapshot<OrdZSet<Row>>>,
+    selection: Option<SelectionHandles>,
     mut rx: mpsc::Receiver<Cmd>,
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            Cmd::Select { keys, resp } => {
+                let result = (|| -> Result<Vec<i64>> {
+                    let (input, output) = selection.as_ref().context("semijoin circuit disabled")?;
+                    for (key, ordinal) in &keys {
+                        input.push(key.clone(), (*ordinal, 1));
+                    }
+                    dbsp.transaction().map_err(|e| anyhow::anyhow!("semijoin insert: {e}"))?;
+                    let selected = output.concat().iter().filter(|(_, _, w)| *w > 0).map(|(i, _, _)| i).collect();
+                    for (key, ordinal) in keys {
+                        input.push(key, (ordinal, -1));
+                    }
+                    dbsp.transaction().map_err(|e| anyhow::anyhow!("semijoin retract: {e}"))?;
+                    let _ = output.concat();
+                    Ok(selected)
+                })();
+                let failed = result.is_err();
+                let _ = resp.send(result.map_err(|e| format!("{e:#}")));
+                if failed {
+                    // Never evaluate later rows against a half-cleared probe relation.
+                    break;
+                }
+            }
             Cmd::Batch { asserts, resp } => {
                 for Tup2(k, upd) in asserts.contributors {
                     contrib_in.push(k, upd);
@@ -587,6 +699,39 @@ fn circuit_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn key_semijoin_tracks_scope_moves_and_clears_companion_probes() {
+        let circuit = MembershipCircuit::start_full_mode(None, true).unwrap();
+        circuit.apply(contrib(1, 1, Some(Value::Int(7)))).await;
+        circuit.apply(contrib(1, 2, Some(Value::Int(7)))).await;
+        circuit.apply(contrib(2, 1, Some(Value::Int(9)))).await;
+        let candidates = vec![Some(Value::Int(7)), Some(Value::Int(9)), Some(Value::Null), None];
+        assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [true, false, false, false]);
+        assert_eq!(circuit.select_keys(2, &candidates).await.unwrap(), [false, true, false, false]);
+        // Reparenting a contributor changes only its old/new scope membership.
+        circuit.apply(contrib(1, 1, Some(Value::Int(9)))).await;
+        assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [true, true, false, false]);
+        circuit.apply(contrib(1, 2, None)).await;
+        assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [false, true, false, false]);
+        circuit.apply(contrib(1, 1, None)).await;
+        assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [false, false, false, false]);
+        // Reused ordinals must not leave old probes behind. Cross the RPC chunk boundary.
+        let many = vec![Some(Value::Int(9)); 2050];
+        assert!(circuit.select_keys(2, &many).await.unwrap().iter().all(|v| *v));
+        circuit.apply(contrib(2, 1, None)).await;
+        assert!(circuit.select_keys(2, &many).await.unwrap().iter().all(|v| !*v));
+        assert!(circuit.selection_batches() >= 6);
+        circuit.shutdown().await;
+    }
+
+    #[test]
+    fn group_membership_setting_rejects_unknown_modes() {
+        assert!(!group_semijoin_mode(None).unwrap());
+        assert!(!group_semijoin_mode(Some("subquery")).unwrap());
+        assert!(group_semijoin_mode(Some("semijoin")).unwrap());
+        assert!(group_semijoin_mode(Some("semijon")).is_err());
+    }
 
     /// Pins the default: `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` unset (or unparseable) bounds the
     /// cache at [`DEFAULT_STORAGE_CACHE_MIB`] (64 MiB TOTAL) rather than falling through to

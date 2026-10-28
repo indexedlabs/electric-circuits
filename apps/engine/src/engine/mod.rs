@@ -3283,10 +3283,10 @@ impl Engine {
                     .unwrap_or(serde_json::Value::String(json)),
             })
         }
-        let membership = {
+        let (membership, group_membership) = {
             let reg = self.subqueries.lock().await;
             let (used, stored, json) = reg.circuit_profile_dump().await;
-            entry(used, stored, json)
+            (entry(used, stored, json), reg.group_membership_diagnostics())
         };
         let arr = self.arrangements.lock().unwrap().clone();
         let counts = match arr {
@@ -3296,7 +3296,11 @@ impl Engine {
             }
             None => serde_json::Value::Null,
         };
-        serde_json::json!({ "membership_circuit": membership, "counts_circuit": counts })
+        serde_json::json!({
+            "membership_circuit": membership,
+            "counts_circuit": counts,
+            "group_membership": group_membership,
+        })
     }
 
     /// On-demand byte-level self-accounting (Phase 0 of the memory-reduction effort): a

@@ -55,6 +55,9 @@ jobs:
           cargo test -p electric-circuits-engine --features test-support
           cargo test -p electric-circuits-engine --test deployment_ownership -- --ignored
           cargo test -p electric-circuits-engine --features test-support --test sources_table -- --ignored
+          # Same group contracts and binary; only membership selection changes.
+          ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=semijoin \
+            cargo test -p electric-circuits-engine --features test-support --test sources_table group_ -- --ignored
           # Projection restart/backfill and live INSERT/UPDATE/DELETE against a SQL oracle.
           cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored
 
