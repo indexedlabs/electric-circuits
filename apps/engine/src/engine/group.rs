@@ -8,8 +8,8 @@
 //! the sequencer and the HTTP adapter can use it without importing each other's types.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ds::Envelope;
 

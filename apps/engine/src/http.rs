@@ -1637,23 +1637,46 @@ async fn subset_load_group(
             });
         }
         engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
-        let offset = engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| {
-            AppError { status: StatusCode::SERVICE_UNAVAILABLE, msg: "group stream has no tail offset".into(), retry_after: true }
-        })?;
-        let reads = existing.members.iter().map(|m| crate::engine::SubsetReadReq {
-            table: TableRef::parse(&m.table).expect("validated table reference"),
-            where_: m.where_.clone(),
-            columns: m.columns.clone(),
-            order_by: None,
-            limit: None,
-            offset: None,
-        }).collect();
+        let offset = engine
+            .stream_tail(&existing.stream_path)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(|| AppError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                msg: "group stream has no tail offset".into(),
+                retry_after: true,
+            })?;
+        let reads = existing
+            .members
+            .iter()
+            .map(|m| crate::engine::SubsetReadReq {
+                table: TableRef::parse(&m.table).expect("validated table reference"),
+                where_: m.where_.clone(),
+                columns: m.columns.clone(),
+                order_by: None,
+                limit: None,
+                offset: None,
+            })
+            .collect();
         let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
-        let results = existing.members.iter().zip(page.pages).map(|(member, rows)| serde_json::json!({
-            "key": member.key, "table": member.table, "shapeId": member.shape_id,
-            "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
-            "subscription": group_sub, "leaseSeconds": engine.lease_seconds(), "offset": offset, "rows": rows,
-        })).collect::<Vec<_>>();
+        let results = existing
+            .members
+            .iter()
+            .zip(page.pages)
+            .map(|(member, rows)| {
+                serde_json::json!({
+                    "key": member.key,
+                    "table": member.table,
+                    "shapeId": member.shape_id,
+                    "streamUrl": engine.stream_url(&existing.stream_path),
+                    "streamPath": existing.stream_path,
+                    "subscription": group_sub,
+                    "leaseSeconds": engine.lease_seconds(),
+                    "offset": offset,
+                    "rows": rows,
+                })
+            })
+            .collect::<Vec<_>>();
         return Ok(Json(serde_json::json!({
             "groupId": existing.id, "subscription": group_sub,
             "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,

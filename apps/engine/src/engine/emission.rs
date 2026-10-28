@@ -88,9 +88,13 @@ impl EmissionLanes {
         }
         self.pending.add(commit_lsn);
         let lane = self.lane_for(stream_path);
-        if self.lanes[lane].send(Batch { commit_lsn, stream_path: stream_path.to_string(), envs }).is_err() {
-                // Writer gone (engine teardown): don't leave the barrier stuck.
-                self.pending.complete(commit_lsn);
+        if self
+            .lanes[lane]
+            .send(Batch { commit_lsn, stream_path: stream_path.to_string(), envs })
+            .is_err()
+        {
+            // Writer gone (engine teardown): don't leave the barrier stuck.
+            self.pending.complete(commit_lsn);
         }
     }
 }
