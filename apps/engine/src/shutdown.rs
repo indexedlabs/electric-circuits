@@ -35,7 +35,7 @@
 //! period stops waiting and exits non-zero. Streams are never closed or retired on shutdown: a
 //! restored shape continues its stream, exactly as after a crash.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,7 +84,7 @@ struct Inner {
     tx: tokio::sync::watch::Sender<bool>,
     /// Parties registered and not yet finished, by name — so a shutdown that runs out of grace can
     /// say **who** it was waiting for.
-    outstanding: std::sync::Mutex<BTreeSet<&'static str>>,
+    outstanding: std::sync::Mutex<BTreeMap<&'static str, usize>>,
     /// When the token flipped. The grace period is measured from HERE, not from when the HTTP
     /// server finally stopped, so the readiness-drain window comes out of the same budget.
     began_at: std::sync::Mutex<Option<std::time::Instant>>,
@@ -126,7 +126,7 @@ impl ShutdownToken {
             inner: Arc::new(Inner {
                 metrics,
                 tx: tokio::sync::watch::channel(false).0,
-                outstanding: std::sync::Mutex::new(BTreeSet::new()),
+                outstanding: std::sync::Mutex::new(BTreeMap::new()),
                 began_at: std::sync::Mutex::new(None),
                 tasks: std::sync::Mutex::new(Some(tokio::task::JoinSet::new())),
                 restart_notify,
@@ -246,13 +246,13 @@ impl ShutdownToken {
     /// Register a component Engine close must wait for. The returned guard removes it
     /// on drop, so a party that returns — or panics — never wedges the shutdown.
     pub fn party(&self, name: &'static str) -> ShutdownParty {
-        self.inner.outstanding.lock().unwrap().insert(name);
+        *self.inner.outstanding.lock().unwrap().entry(name).or_default() += 1;
         ShutdownParty { inner: self.inner.clone(), name }
     }
 
     /// Parties registered and not finished, right now.
     pub fn outstanding(&self) -> Vec<&'static str> {
-        self.inner.outstanding.lock().unwrap().iter().copied().collect()
+        self.inner.outstanding.lock().unwrap().keys().copied().collect()
     }
 
     /// Wait until every registered party has finished, or `timeout` elapses. Returns whether they
@@ -304,7 +304,13 @@ pub struct ShutdownParty {
 
 impl Drop for ShutdownParty {
     fn drop(&mut self) {
-        self.inner.outstanding.lock().unwrap().remove(self.name);
+        let mut outstanding = self.inner.outstanding.lock().unwrap();
+        if let Some(count) = outstanding.get_mut(self.name) {
+            *count -= 1;
+            if *count == 0 {
+                outstanding.remove(self.name);
+            }
+        }
     }
 }
 
@@ -406,6 +412,17 @@ mod tests {
         assert!(!t.wait_for_parties(Duration::from_millis(30)).await, "an outstanding party must block");
         drop(p);
         assert!(t.outstanding().is_empty());
+        assert!(t.wait_for_parties(Duration::from_millis(30)).await);
+    }
+
+    #[tokio::test]
+    async fn duplicate_party_names_are_counted_independently() {
+        let t = ShutdownToken::new();
+        let first = t.party("group reservation compensation");
+        let second = t.party("group reservation compensation");
+        drop(first);
+        assert!(!t.wait_for_parties(Duration::from_millis(30)).await);
+        drop(second);
         assert!(t.wait_for_parties(Duration::from_millis(30)).await);
     }
 

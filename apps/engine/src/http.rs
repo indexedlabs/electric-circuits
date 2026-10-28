@@ -1446,21 +1446,15 @@ impl GroupReservationGuard {
                     .await;
                 if let Err(error) = retry {
                     tracing::warn!(%shape_id, %subscription, %error, "failed to compensate cancelled group member");
-                    break;
+                    return;
                 }
             }
             self.members.pop();
         }
         if self.group_created {
             if let Err(error) = self.engine.drop_group_durable(&self.subscription).await {
-                if let Err(retry_error) = self.engine.drop_group_durable(&self.subscription).await {
-                    tracing::warn!(
-                        subscription = %self.subscription,
-                        %error,
-                        %retry_error,
-                        "failed to compensate cancelled group"
-                    );
-                }
+                tracing::warn!(subscription = %self.subscription, %error, "failed to compensate cancelled group");
+                return;
             }
         }
         self.engine.abort_group(&self.subscription).await;
@@ -1485,28 +1479,41 @@ impl Drop for GroupReservationGuard {
         let party = engine.shutdown_token().party("group reservation compensation");
         tokio::spawn(async move {
             for (shape_id, member_subscription) in members {
-                if let Err(error) = engine
-                    .release_subscription_durable(&shape_id, Some(&member_subscription))
-                    .await
-                {
-                    if let Err(retry_error) = engine
-                        .retry_release_subscription_durable(&shape_id, &member_subscription)
+                loop {
+                    match engine
+                        .release_subscription_durable(&shape_id, Some(&member_subscription))
                         .await
                     {
-                        tracing::warn!(
-                            %shape_id,
-                            subscription = %member_subscription,
-                            %error,
-                            %retry_error,
-                            "failed to compensate cancelled group member"
-                        );
+                        Ok(()) => break,
+                        Err(error) => {
+                            match engine
+                                .retry_release_subscription_durable(&shape_id, &member_subscription)
+                                .await
+                            {
+                                Ok(()) => break,
+                                Err(retry_error) => {
+                                    tracing::warn!(
+                                        %shape_id,
+                                        subscription = %member_subscription,
+                                        %error,
+                                        %retry_error,
+                                        "retrying cancelled group member compensation"
+                                    );
+                                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                }
+                            }
+                        }
                     }
                 }
             }
             if group_created {
-                if let Err(error) = engine.drop_group_durable(&subscription).await {
-                    if let Err(retry_error) = engine.drop_group_durable(&subscription).await {
-                        tracing::warn!(%subscription, %error, %retry_error, "failed to compensate cancelled group");
+                loop {
+                    match engine.drop_group_durable(&subscription).await {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
                     }
                 }
             }

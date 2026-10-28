@@ -2914,7 +2914,10 @@ impl Engine {
     }
 
     pub(crate) async fn drop_group_durable(&self, subscription: &str) -> Result<()> {
-        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await
+        self.catalog_tx
+            .send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() })
+            .await?;
+        Ok(())
     }
 
     /// Re-enqueue an idempotent member release after the in-memory unsubscribe already happened
