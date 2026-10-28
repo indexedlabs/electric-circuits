@@ -688,14 +688,8 @@ async fn normalize_extractor_rejection(request: axum::extract::Request, next: Ne
 }
 
 fn is_native_dto_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/shapes"
-            | "/v1/subsets/query"
-            | "/v1/subset-feeds"
-            | "/v1/subsets/load"
-            | "/v1/aggregates"
-    ) || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
+    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/subsets/load" | "/v1/aggregates")
+        || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
 }
 
 /// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).
@@ -1230,11 +1224,8 @@ async fn subset_load_group(
     // Reserve the one public claim before the first member create.  This check is made
     // under the same engine state lock as ordinary shape subscriptions, so a competing
     // single-shape create cannot win the name between member creates.
-    let member_subscriptions: Vec<String> = members
-        .iter()
-        .enumerate()
-        .filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}")))
-        .collect();
+    let member_subscriptions: Vec<String> =
+        members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     engine.reserve_group(&group_sub, &member_subscriptions).await?;
     let mut reservation = GroupReservationGuard::new(engine, &group_sub);
     let mut created = Vec::with_capacity(members.len());

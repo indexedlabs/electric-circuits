@@ -310,14 +310,7 @@ fn test_subq() -> SubqueryHandle {
     let degrade = DegradeState::new();
     let shutdown = crate::shutdown::ShutdownToken::new();
     let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
-    spawn_flip_propagator(
-        registry.clone(),
-        flip_rx,
-        pending_flips.clone(),
-        degrade.clone(),
-        trace_tx,
-        shutdown,
-    );
+    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), degrade.clone(), trace_tx, shutdown);
     SubqueryHandle { registry, flip_tx, pending_flips, degrade, group_lanes }
 }
 
