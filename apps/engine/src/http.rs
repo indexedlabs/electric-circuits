@@ -1829,7 +1829,7 @@ async fn release_shape(
     } else {
         let subscription = validate_subscription(q.subscription)?;
         if let Some(subscription) = subscription.as_deref()
-            && let Some(group) = engine.group_record(subscription).await
+            && engine.group_record(subscription).await.is_some()
         {
             // The group claim is the only public lease.  Its private member claims are
             // released together and each durable release is idempotent, so a cancelled or

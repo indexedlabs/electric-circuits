@@ -2202,7 +2202,12 @@ pub(crate) async fn process_envelope(
             subq.pending_flips.add(lsn_u64);
             if subq
                 .flip_tx
-                .send(FlipWork::Walk { work, txid: txid.clone(), lsn: lsn.clone(), group_paths: group_paths.clone() })
+                .send(FlipWork::Walk {
+                    work,
+                    txid: txid.clone(),
+                    lsn: lsn.clone(),
+                    group_paths: group_paths.iter().cloned().collect(),
+                })
                 .is_err()
             {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
