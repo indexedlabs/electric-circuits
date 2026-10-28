@@ -2212,7 +2212,7 @@ impl Engine {
             self.retirements.enqueue(stream_path, None);
             first_error.get_or_insert(error);
         }
-        if let Err(error) = self.abort_group(subscription).await {
+        if let Err(error) = self.abort_group(subscription, stream_path).await {
             first_error.get_or_insert(error);
         }
         if let Some(error) = first_error { Err(error) } else { Ok(()) }

@@ -2960,10 +2960,13 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn abort_group(&self, subscription: &str) -> Result<()> {
+    pub(crate) async fn abort_group(&self, subscription: &str, group_id: &str) -> Result<()> {
         self.state.lock().await.group_claims.release(subscription);
         self.catalog_tx
-            .send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string(), group_id: None })
+            .send_durable(CatalogEvent::GroupDropped {
+                subscription: subscription.to_string(),
+                group_id: Some(group_id.to_string()),
+            })
             .await?;
         Ok(())
     }
