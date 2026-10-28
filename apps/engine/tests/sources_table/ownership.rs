@@ -2,7 +2,7 @@
 //! adapter caches its TTL in process statics. The parent serializes children and owns fixture cleanup.
 
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::{Engine, PostgresSetup};
 use electric_circuits_engine::http::router_with_introspection;
 use electric_circuits_engine::table_ref::TableSelector;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 #[path = "observability.rs"]
 mod observability;
@@ -26,7 +26,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             .env("ELECTRIC_CIRCUITS_SUBQ_STORAGE", "1")
             .env_remove("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR")
             .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0");
-        if matches!(case, Case::GroupLapse) {
+        if matches!(case, Case::GroupLapse | Case::GroupRestoreExpired) {
             command
                 .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "5")
                 .env("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1");
@@ -65,6 +65,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupFence => group_uses_one_snapshot_fence(&fixture).await,
             Case::GroupRetirement => group_retirement_reloads_and_closed_stream_is_conflict(&fixture).await,
             Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
+            Case::GroupRestoreExpired => group_restore_drops_expired_group_before_first_sweep(&fixture).await,
+            Case::GroupClosedReload => group_closed_reload_waits_for_release(&fixture).await,
             Case::GroupRelease => group_release_reloads_same_subscription(&fixture).await,
             Case::GroupLapse => group_lapse_reloads_same_subscription(&fixture).await,
             Case::GroupOneSubscription => group_one_subscription_claims(&fixture).await,
@@ -96,6 +98,8 @@ enum Case {
     GroupFence,
     GroupRetirement,
     GroupRestart,
+    GroupRestoreExpired,
+    GroupClosedReload,
     GroupRelease,
     GroupLapse,
     GroupOneSubscription,
@@ -189,6 +193,18 @@ fn group_restart_restores_plain_and_drops_mixed_groups() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_restore_drops_expired_lease_before_first_sweep() -> Result<()> {
+    isolated("ownership::group_restore_drops_expired_lease_before_first_sweep", Case::GroupRestoreExpired)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_closed_stream_reload_waits_for_release() -> Result<()> {
+    isolated("ownership::group_closed_stream_reload_waits_for_release", Case::GroupClosedReload)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_release_reloads_same_subscription_on_a_new_stream() -> Result<()> {
     isolated("ownership::group_release_reloads_same_subscription_on_a_new_stream", Case::GroupRelease)
 }
@@ -222,18 +238,63 @@ struct ObservedDs {
     store: FeedDs,
     changed: watch::Sender<u64>,
     retired: Arc<Mutex<Vec<(Method, String)>>>,
+    closed: Arc<Mutex<HashSet<String>>>,
+    delete_gates: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    fail_group_head_after_put: Arc<Mutex<bool>>,
+    fail_next_group_head: Arc<Mutex<bool>>,
 }
 
 async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let closing = method == Method::POST && request.headers().contains_key("stream-closed");
-    let response = feed_ds_handler(State(ds.store.clone()), request).await;
-    if closing || method == Method::DELETE {
-        ds.retired.lock().await.push((method.clone(), path));
+    let group_path = path.contains("shape/group-");
+    if method == Method::PUT && group_path {
+        let mut armed = ds.fail_group_head_after_put.lock().await;
+        if *armed {
+            *armed = false;
+            *ds.fail_next_group_head.lock().await = true;
+        }
+    }
+    if method == Method::HEAD && group_path {
+        let mut fail = ds.fail_next_group_head.lock().await;
+        if *fail {
+            *fail = false;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    let delete_gate = if method == Method::DELETE {
+        ds.delete_gates
+            .lock()
+            .await
+            .iter()
+            .find(|(suffix, _)| path.ends_with(suffix.as_str()))
+            .map(|(_, gate)| gate.clone())
+    } else {
+        None
+    };
+    if let Some(gate) = delete_gate.as_ref() {
+        ds.retired.lock().await.push((method.clone(), path.clone()));
+        ds.changed.send_modify(|revision| *revision += 1);
+        gate.notified().await;
+    }
+    let mut response = feed_ds_handler(State(ds.store.clone()), request).await;
+    if closing {
+        ds.closed.lock().await.insert(path.clone());
+    }
+    if method == Method::HEAD && ds.closed.lock().await.contains(&path) {
+        response.headers_mut().insert("stream-closed", "true".parse().unwrap());
+    }
+    if closing || (method == Method::DELETE && delete_gate.is_none()) {
+        ds.retired.lock().await.push((method.clone(), path.clone()));
+    }
+    if method == Method::DELETE {
+        ds.closed.lock().await.remove(&path);
     }
     if method == Method::POST || method == Method::DELETE {
-        ds.changed.send_modify(|revision| *revision += 1);
+        if delete_gate.is_none() {
+            ds.changed.send_modify(|revision| *revision += 1);
+        }
     }
     response
 }
@@ -316,6 +377,10 @@ impl Fixture {
             store: FeedDs::default(),
             changed: watch::channel(0).0,
             retired: Arc::new(Mutex::new(Vec::new())),
+            closed: Arc::new(Mutex::new(HashSet::new())),
+            delete_gates: Arc::new(Mutex::new(HashMap::new())),
+            fail_group_head_after_put: Arc::new(Mutex::new(false)),
+            fail_next_group_head: Arc::new(Mutex::new(false)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let ds_url = format!("http://{}", listener.local_addr()?);
@@ -889,6 +954,32 @@ async fn wait_group_stream_retired(f: &Fixture, stream_path: &str) -> Result<()>
     Ok(())
 }
 
+async fn wait_group_stream_closed(f: &Fixture, stream_path: &str) -> Result<()> {
+    let mut changed = f.ds.changed.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if f.ds.closed.lock().await.iter().any(|path| path.ends_with(stream_path)) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            changed.changed().await.context("group close observation channel closed")?;
+        }
+    })
+    .await
+    .context("waiting for group stream close")??;
+    Ok(())
+}
+
+async fn pause_group_delete(f: &Fixture, stream_path: &str) -> Arc<Notify> {
+    let gate = Arc::new(Notify::new());
+    f.ds.delete_gates.lock().await.insert(stream_path.to_string(), gate.clone());
+    gate
+}
+
+async fn release_group_delete(f: &Fixture, stream_path: &str, gate: Arc<Notify>) {
+    f.ds.delete_gates.lock().await.remove(stream_path);
+    gate.notify_waiters();
+}
+
 async fn install_source_fence(f: &Fixture) -> Result<()> {
     f.client
         .batch_execute(&format!(
@@ -1129,6 +1220,74 @@ async fn group_retirement_reloads_and_closed_stream_is_conflict(f: &Fixture) -> 
     result
 }
 
+async fn group_restore_drops_expired_group_before_first_sweep(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-restore-expired", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("expired group stream path")?.to_owned();
+        engine.close(Duration::from_secs(10)).await;
+
+        // The lease is five seconds in this isolated contract. The replacement starts after the
+        // persisted claim is definitely stale, before its first retention sweep can run.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let (restarted, restarted_app) = group_engine(f).await?;
+        let (status, fresh) = post_group(&restarted_app, group_body(f, "group-restore-expired", true)).await?;
+        ensure!(status == StatusCode::OK, "expired group was not recreated on restart: {status} {fresh}");
+        ensure!(fresh["streamPath"].as_str() != Some(old_path.as_str()), "expired group reused its old stream");
+        restarted.close(Duration::from_secs(10)).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    result
+}
+
+async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-closed-reload", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("closed group stream path")?.to_owned();
+        let first_shape = first["results"][0]["shapeId"].as_str().context("first group member")?.to_owned();
+        let gate = pause_group_delete(f, &old_path).await;
+        let release_app = app.clone();
+        let release_task = tokio::spawn(async move {
+            json(
+                &release_app,
+                Method::DELETE,
+                &format!("/v1/shapes/{first_shape}?subscription=group-closed-reload"),
+                Body::empty(),
+            )
+            .await
+        });
+        wait_group_stream_closed(f, &old_path).await?;
+
+        let reload_app = app.clone();
+        let reload_body = group_body(f, "group-closed-reload", true);
+        let mut reload_task = tokio::spawn(async move {
+            post_group(&reload_app, reload_body).await
+        });
+        ensure!(
+            tokio::time::timeout(Duration::from_millis(250), &mut reload_task).await.is_err(),
+            "same-members load renewed a group while its close/release was still in flight"
+        );
+        release_group_delete(f, &old_path, gate).await;
+        let (release_status, release_body) = release_task.await??;
+        ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release_body}");
+        let (reload_status, fresh) = reload_task.await??;
+        ensure!(reload_status == StatusCode::OK, "same-members reload failed: {reload_status} {fresh}");
+        let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
+        ensure!(new_path != old_path, "closed group reload reused its old stream");
+        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (6, 'closed-reload')", f.outer)).await?;
+        let events = wait_group_events(f, new_path, 1).await?;
+        ensure!(events.iter().any(|event| event_key(event).as_deref() == Some("6")), "reloaded group missed live output: {events:?}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
 async fn group_release_reloads_same_subscription(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
@@ -1334,6 +1493,20 @@ async fn group_members_max(f: &Fixture) -> Result<()> {
         ensure!(status == StatusCode::BAD_REQUEST, "refused member was accepted: {status} {body}");
         let (status, body) = post_group(&app, group_body(f, "group-refused-member", true)).await?;
         ensure!(status == StatusCode::OK, "member validation failure left a reservation: {status} {body}");
+
+        // Make the second member's stream preflight fail after the first member has registered.
+        // This reaches the reservation guard's compensation path rather than only validation.
+        let before_shapes: HashSet<String> = engine.graph().await.shapes.into_iter().map(|shape| shape.id).collect();
+        *f.ds.fail_group_head_after_put.lock().await = true;
+        let (status, body) = post_group(&app, group_body(f, "group-partial-rollback", true)).await?;
+        ensure!(status.is_server_error(), "partial member failure unexpectedly succeeded: {status} {body}");
+        let after_shapes: HashSet<String> = engine.graph().await.shapes.into_iter().map(|shape| shape.id).collect();
+        ensure!(
+            after_shapes == before_shapes,
+            "partial group failure left member shapes behind: before={before_shapes:?}, after={after_shapes:?}"
+        );
+        let (status, body) = post_group(&app, group_body(f, "group-partial-rollback", true)).await?;
+        ensure!(status == StatusCode::OK, "partial rollback left a claim behind: {status} {body}");
         Ok::<_, anyhow::Error>(())
     }
     .await;

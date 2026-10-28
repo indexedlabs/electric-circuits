@@ -251,9 +251,9 @@ impl GroupEmissionLanes {
         self.wake.clone()
     }
 
-    /// Queue one complete group batch. The bounded send is awaited by an engine-owned task rather
-    /// than while the subquery registry mutex is held; a full group waits for its own lane and
-    /// cannot drop, split, reorder or degrade unrelated shapes.
+    /// Queue one complete group batch. The producer-side queue is unbounded for now; its bounded
+    /// saturation/backpressure contract is deferred to OTTO-10306. The enqueue remains outside
+    /// the subquery registry mutex so one group's queue cannot block unrelated shapes.
     pub(crate) fn enqueue(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if envs.is_empty() {
             return;

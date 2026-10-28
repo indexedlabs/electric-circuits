@@ -3021,13 +3021,11 @@ impl Engine {
                 return Ok(false);
             }
             for member in &group.members {
-                anyhow::ensure!(
-                    st.shapes.contains_key(&member.shape_id)
-                        && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id),
-                    "group '{}' member '{}' no longer holds its claim",
-                    group.subscription,
-                    member.subscription
-                );
+                if !(st.shapes.contains_key(&member.shape_id)
+                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id))
+                {
+                    return Ok(false);
+                }
                 st.subscribe(&member.shape_id, member.subscription.clone(), now);
                 events.push(CatalogEvent::Joined {
                     id: member.shape_id.clone(),
@@ -3056,9 +3054,13 @@ impl Engine {
             })
         };
         members_healthy
-            && self.ds.head(&group.stream_path).await.ok().flatten().is_some_and(|head| {
-                !head.closed && head.next_offset.is_some()
-            })
+            && self
+                .ds
+                .head(&group.stream_path)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|head| !head.closed && head.next_offset.is_some())
     }
 
     /// Remove the public group record and return its private members.  The caller performs
