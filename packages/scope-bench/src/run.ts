@@ -36,10 +36,12 @@ const STEADY_WRITE_MS = Number(env('STEADY_WRITE_MS', '500'))
 // every 5 s, besides the Record edits; hold-only gateway cost is reported separately.
 const STEADY = process.env.STEADY === '1'
 const STEADY_CHAT = process.env.STEADY_CHAT !== '0'
+const MEMBERSHIP_MODE = env('ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP', 'subquery')
 // DISTINCT_USERS=1: phone i signs in as u<i+2> (one of the lighter accounts) instead of all as u1.
 const DISTINCT_USERS = process.env.DISTINCT_USERS === '1'
 const phoneUser = (i: number) => (DISTINCT_USERS ? `u${i + 2}` : HEAVY)
 const ONLY = process.env.ONLY
+const ONLY_NAMES = ONLY?.split(',').map((name) => name.trim()).filter(Boolean)
 const ONLY_CONFIG = process.env.ONLY_CONFIG
 const OUT = env('OUT', join(process.cwd(), 'scope-bench-results.json'))
 
@@ -139,6 +141,7 @@ async function bootServers(pgUrl: string) {
   const dsRaw = await ds.start()
   const dsUrl = `http://127.0.0.1:${new URL(dsRaw).port}`
   const slot = `scope_bench_${process.pid}_${++slotSeq}`
+  const bootStarted = performance.now()
   const engine = spawn(process.env.ENGINE_BIN ?? join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
     env: {
       ...process.env,
@@ -156,6 +159,7 @@ async function bootServers(pgUrl: string) {
     stdio: ['ignore', 'pipe', 'inherit'],
   })
   const engineUrl = await waitFor(engine, /ENGINE_LISTENING (\S+)/, 'engine')
+  const engineBootMs = Math.round(performance.now() - bootStarted)
   const gw = spawn(process.execPath, ['--import', 'tsx', join(dirname(fileURLToPath(import.meta.url)), 'gateway.ts')], {
     env: { ...process.env, ENGINE_URL: engineUrl, DS_URL: dsUrl },
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -168,10 +172,11 @@ async function bootServers(pgUrl: string) {
     await admin.query('select pg_drop_replication_slot($1)', [slot]).catch(() => {})
     await ds.stop().catch(() => {})
   }
-  return { gateway, enginePid: engine.pid!, gwPid: gw.pid!, stop }
+  return { gateway, engineUrl, engineBootMs, enginePid: engine.pid!, gwPid: gw.pid!, stop }
 }
 
 interface RunResult {
+  membershipMode: string
   scenario: string
   config: string
   rep: number
@@ -199,6 +204,11 @@ interface RunResult {
   steadyWriteP50?: number | null
   steadyWriteP90?: number | null
   error?: string
+  engineBootMs?: number
+  groupLoadMs?: number
+  engineMemory?: unknown
+  steadyWrites?: number
+  readsPerChange?: number | null
 }
 
 let steadyRecordsByUser: Record<string, string> = {}
@@ -229,6 +239,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     return { calls: Number(r.rows[0].calls), ms: Number(r.rows[0].ms) }
   }
   const result: RunResult = {
+    membershipMode: MEMBERSHIP_MODE,
     scenario: sc.name,
     config: cfg.name,
     rep,
@@ -261,6 +272,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     const x0 = await pgStats()
     // Per phone and screen: when its first-level tables were all in, and the first of them.
     const perScreen = new Map<string, { first: number | null; firstTable: number | null; all: number }[]>()
+    const loadStarted = performance.now()
     await Promise.all(
       phones.map((phone, pi) =>
         Promise.all(
@@ -287,6 +299,11 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
         ),
       ),
     )
+    result.engineBootMs = srv.engineBootMs
+    if (cfg.design === 'scope-group') result.groupLoadMs = Math.round(performance.now() - loadStarted)
+    if (cfg.design === 'scope-group') {
+      result.engineMemory = await fetch(`${srv.engineUrl}/memory`).then((r) => r.json()).catch(() => undefined)
+    }
     for (const [screen, rows] of perScreen) {
       const fs = rows.map((r) => r.first).filter((x): x is number => x != null)
       const ft = rows.map((r) => r.firstTable).filter((x): x is number => x != null)
@@ -301,6 +318,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     const gsLoad = (await (await fetch(`${srv.gateway}/gw/stats`)).json()) as any
     // Keep everything live for a while with writes landing on the heavy account.
     let n = 0
+    let steadyWrites = 0
     if (!STEADY) {
       timers.push(
         setInterval(() => {
@@ -337,6 +355,7 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
               [taggedId, user, recordId, marker],
             )
             await admin.query('commit')
+            steadyWrites++
           }
         } catch {
           await admin.query('rollback').catch(() => {})
@@ -394,6 +413,8 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     const x1 = await pgStats()
     result.pgStatements = x1.calls - x0.calls
     result.pgExecMs = Math.round(x1.ms - x0.ms)
+    result.steadyWrites = steadyWrites
+    result.readsPerChange = steadyWrites ? result.pgStatements / steadyWrites : null
   } catch (e) {
     result.error = String((e as Error).message ?? e)
   } finally {
@@ -431,7 +452,7 @@ async function main() {
     // Each phone's own copy of a scenario, built for its account.
     const perPhone = (variant: Config['variant'], name: string) =>
       Array.from({ length: PHONES }, (_, i) => scenarios(s, variant, phoneUser(i)).find((x) => x.name === name)!)
-    const names = byVariant.scoped.map((x) => x.name).filter((n) => !ONLY || n.includes(ONLY))
+    const names = byVariant.scoped.map((x) => x.name).filter((n) => !ONLY_NAMES?.length || ONLY_NAMES.some((name) => n.includes(name)))
 
     // Warm Postgres' buffer cache with one discarded pass so no design pays for a cold cache.
     for (const name of names) {
@@ -461,7 +482,7 @@ async function main() {
         }
     mkdirSync(dirname(OUT), { recursive: true })
     const version = String((await admin.query('select version()')).rows[0]?.version ?? '')
-    writeFileSync(OUT, JSON.stringify({ params: { RTT_MS, DOWN_MBPS, REPS, OTHER_USERS, HOLD_MS, PHONES, DS_LONGPOLL_MS, COALESCE_LINGER_MS, STEADY_WRITE_MS, STEADY, STEADY_CHAT, postgresVersion: version }, seed: s.rows, results }, null, 2))
+    writeFileSync(OUT, JSON.stringify({ params: { RTT_MS, DOWN_MBPS, REPS, OTHER_USERS, HOLD_MS, PHONES, DS_LONGPOLL_MS, COALESCE_LINGER_MS, STEADY_WRITE_MS, STEADY, STEADY_CHAT, membershipMode: MEMBERSHIP_MODE, postgresVersion: version }, seed: s.rows, results }, null, 2))
 
     // Summary: medians over reps.
     console.log(`\nRTT ${RTT_MS} ms, downlink ${DOWN_MBPS} Mbps, ${PHONES} phone(s), ${REPS} reps (medians)\n`)

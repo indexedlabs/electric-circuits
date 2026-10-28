@@ -106,3 +106,58 @@ jobs:
         run: pnpm exec vitest run
         env:
           NODE_EXTRA_CA_CERTS: packages/conformance/test-pki/ca.pem
+
+  # The prototype's only performance evidence: both membership implementations use the same
+  # harness, seed, PostgreSQL 18 tools and five repetitions.  This is intentionally separate from
+  # the correctness job so a benchmark failure cannot hide a regression result.  The JSON files
+  # are the immutable inputs for the checked-in comparison report; modeled gateway charges remain
+  # separate from the engine's provider-read counters.
+  scope-benchmark:
+    needs: test
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Install PostgreSQL 18 tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg postgresql-18 postgresql-client-18
+          echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install JS dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build benchmark engine
+        run: cargo build --release -p electric-circuits-engine --features test-support
+      - name: Run cold launch and steady-write repetitions
+        env:
+          REPS: 5
+          PHONES: 30
+          OTHER_USERS: 40
+          HOLD_MS: 3000
+          ONLY_CONFIG: 'scope group'
+          ENGINE_BIN: ${{ github.workspace }}/target/release/electric-circuits-engine
+        run: |
+          set -euo pipefail
+          mkdir -p packages/scope-bench/results/ci
+          for mode in subquery semijoin; do
+            ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
+              ONLY='cold launch' STEADY=0 \
+              OUT="packages/scope-bench/results/ci/${mode}-cold.json" \
+              pnpm --filter @electric-circuits/scope-bench bench
+            ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
+              ONLY='chat open' STEADY=1 STEADY_WRITE_MS=500 \
+              OUT="packages/scope-bench/results/ci/${mode}-steady.json" \
+              pnpm --filter @electric-circuits/scope-bench bench
+          done
+      - name: Upload benchmark measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: semijoin-vs-subquery-${{ github.sha }}
+          path: packages/scope-bench/results/ci/*.json
+          if-no-files-found: error

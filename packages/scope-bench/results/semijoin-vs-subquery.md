@@ -1,9 +1,9 @@
 # Key-only semijoin versus subquery members
 
 Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes for the reproduced hosted-review regressions are green in CI; the streaming
-model correction is now in the working tree awaiting its next CI run. No performance
-results are claimed. The experiment must finish before this report can support changing the membership decision.
+fixes for the reproduced hosted-review regressions are being validated by CI; no performance
+results are claimed until the five-repetition PostgreSQL 18 benchmark job completes. The
+experiment must finish before this report can support changing the membership decision.
 
 ## Pinned inputs and method
 
@@ -15,6 +15,13 @@ results are claimed. The experiment must finish before this report can support c
   **0.318 in both modes**. Its results will not establish performance on 0.365.
 - Planned workload: roughly 12,000 Records, five independent repetitions of each
   mode, 30-phone steady writes and cold launch on real PostgreSQL 18 in CI.
+- The CI benchmark runs the same `scope-bench` command twice per mode: `ONLY_CONFIG='scope
+  group'`, `PHONES=30`, `OTHER_USERS=40` (about 12k Records), `REPS=5`, once for
+  `ONLY='cold launch'` and once for `ONLY='chat open' STEADY=1`. Each run records the
+  membership mode, engine boot time, group load time, `/memory` RSS/cardinality/owned-byte
+  snapshot, actual `pg_stat_statements` calls, provider delivered/empty reads, gateway CPU,
+  engine CPU, downlink bytes and steady write p50/p90. The uploaded JSON is the raw evidence;
+  this Markdown table is updated only from those artifacts.
 - Keep group claim, lease, stream and commit order identical between modes. Record
   total engine RSS and its peak during restart, DBSP-reported state and spill bytes,
   incremental bytes per group, seed and reload times, actual reads per change,
@@ -33,6 +40,16 @@ results are claimed. The experiment must finish before this report can support c
 | Actual reads per change | Pending | Pending | No new measurement |
 | Delivery p50 / p90 | Pending | Pending | No new measurement |
 | Engine / gateway CPU | Pending | Pending | No new measurement |
+
+`engineBootMs` is a cold process boot plus catalog/shape reload measurement for this harness;
+it is not a SIGTERM restart or a persisted durable-stream restore. `groupLoadMs` is the
+end-to-end group request through the simulated gateway, including the public page and private
+member seed. `/memory`'s process RSS is total engine memory; its `cardinalities` byte fields are
+owned lower bounds, and per-group memory is estimated as a change divided by the number of
+simultaneous groups. A provider read is a Durable Streams read counted by the gateway; the
+gateway's modeled request/RTT/downlink charges are reported separately. `readsPerChange` is
+`pg_stat_statements` calls divided by committed steady writes and includes query-backs and seed
+work, so it is not a wire-level read count.
 
 ## Correctness contract before implementation
 
@@ -157,7 +174,7 @@ queries”. The original snapshot-only move-out and wire-LSN contracts, and the
 new reparenting control, pass in both modes. This is genuine-red evidence for the
 review defects; no regression assertion is changed in the correction.
 
-### Correction candidate (awaiting CI)
+### Correction candidate and current handoff implementation
 
 The `9cffab2` CI run later supplied the intended green engine evidence: both
 membership-mode group loops passed all 12 selected group contracts, including the
@@ -206,6 +223,13 @@ controlled streaming chunk and virtual time: return propagation, serialization
 at 1 Mbps, and byte accounting must precede delivery. Its first CI execution was
 genuinely red at t=125 ms; the working tree now applies the shared downlink model
 before delivery.
+
+The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
+`page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
+the triggering commit LSN for synthetic tombstone headers. The handoff guard balances its state
+on request cancellation, and tombstones are delivered in commit-LSN order. Empty inner-flip
+query-backs do not scan the whole companion table; they remain a no-op unless a scoped decision
+exists.
 
 The perf2 `gateway.ts`, `phone.ts`, and `run.ts` harness files have now been
 imported directly from the pinned perf2 commit, without its older engine code.
