@@ -163,7 +163,8 @@ impl GroupRelease {
 
     pub(crate) async fn wait(&self) -> anyhow::Result<()> {
         loop {
-            let mut notified = std::pin::pin!(self.done.notified());
+            let notified = self.done.notified();
+            tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(result) = self.result.lock().unwrap().clone() {
                 return result.map_err(anyhow::Error::msg);
