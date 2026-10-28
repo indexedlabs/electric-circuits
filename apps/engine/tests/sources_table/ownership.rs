@@ -804,7 +804,7 @@ async fn stream_events(f: &Fixture, stream_path: &str) -> Vec<serde_json::Value>
 
 async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Result<Vec<serde_json::Value>> {
     let mut changed = f.ds.changed.subscribe();
-    tokio::time::timeout(Duration::from_secs(15), async {
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let events = stream_events(f, stream_path).await;
             if events.len() >= minimum {
@@ -813,8 +813,13 @@ async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Re
             changed.changed().await.context("group stream observation channel closed")?;
         }
     })
-    .await
-    .context("waiting for group stream events")?
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            Err(anyhow::anyhow!("waiting for group stream events timed out: {:?}", stream_events(f, stream_path).await))
+        }
+    }
 }
 
 async fn install_source_fence(f: &Fixture) -> Result<()> {
