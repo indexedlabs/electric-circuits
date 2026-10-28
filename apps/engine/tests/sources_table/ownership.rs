@@ -1203,13 +1203,9 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
         let (status, conflict) = post_group(&app, group_body(f, "group-one-sub", true)).await?;
         ensure!(status == StatusCode::CONFLICT, "group did not reject an occupied subscription: {status} {conflict}");
         let plain_id = plain["shapeId"].as_str().context("pre-existing shape id")?;
-        let (status, _) = json(
-            &app,
-            Method::DELETE,
-            &format!("/v1/shapes/{plain_id}?subscription=group-one-sub"),
-            Body::empty(),
-        )
-        .await?;
+        let (status, _) =
+            json(&app, Method::DELETE, &format!("/v1/shapes/{plain_id}?subscription=group-one-sub"), Body::empty())
+                .await?;
         ensure!(status == StatusCode::OK, "pre-existing shape release failed: {status}");
 
         let (status, group) = post_group(&app, group_body(f, "group-one-sub", true)).await?;
@@ -1224,13 +1220,7 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
             "changesOnly": true,
             "subscription": "group-one-sub:member:1",
         });
-        let (status, conflict) = json(
-            &app,
-            Method::POST,
-            "/v1/shapes",
-            Body::from(private_body.to_string()),
-        )
-        .await?;
+        let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(private_body.to_string())).await?;
         ensure!(status == StatusCode::CONFLICT, "private create bypassed group claim: {status} {conflict}");
         let (status, conflict) = json(
             &app,
@@ -1243,23 +1233,14 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
         let (status, renewed) = post_group(&app, group_body(f, "group-one-sub", true)).await?;
         ensure!(status == StatusCode::OK, "same group renewal failed: {status} {renewed}");
         ensure!(renewed["streamPath"] == group["streamPath"], "renewal changed the group stream");
-        let (status, released) = json(
-            &app,
-            Method::DELETE,
-            &format!("/v1/shapes/{group_id}?subscription=group-one-sub"),
-            Body::empty(),
-        )
-        .await?;
+        let (status, released) =
+            json(&app, Method::DELETE, &format!("/v1/shapes/{group_id}?subscription=group-one-sub"), Body::empty())
+                .await?;
         ensure!(status == StatusCode::OK, "group release failed: {status} {released}");
         let (status, after) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
         ensure!(status == StatusCode::OK, "public subscription was not freed: {status} {after}");
-        let (status, after_private) = json(
-            &app,
-            Method::POST,
-            "/v1/shapes",
-            Body::from(private_body.to_string()),
-        )
-        .await?;
+        let (status, after_private) =
+            json(&app, Method::POST, "/v1/shapes", Body::from(private_body.to_string())).await?;
         ensure!(status == StatusCode::OK, "private subscription was not freed: {status} {after_private}");
         Ok::<_, anyhow::Error>(())
     }
