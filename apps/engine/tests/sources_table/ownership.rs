@@ -1614,7 +1614,7 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
             .clone();
         let (status, body) = json(&app, Method::DELETE, &format!("/v1/shapes/{member0}"), Body::empty()).await?;
         ensure!(status == StatusCode::CONFLICT, "anonymous reservation release escaped the guard: {status} {body}");
-        tokio::time::timeout(Duration::from_secs(7), tokio::time::sleep(Duration::from_secs(6))).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
         ensure!(
             engine.subscription_owner("group-assembly-race").await.as_deref() == Some(member0.as_str()),
             "public reservation lease lapsed while group assembly was held"
@@ -1637,7 +1637,7 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
             .context("group load did not complete after catalog release")?
             .context("group load task failed")??;
         ensure!(status == StatusCode::OK, "assembly completed without every claim: {status} {body}");
-        tokio::time::timeout(Duration::from_secs(4), tokio::time::sleep(Duration::from_secs(3))).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
         ensure!(
             engine.has_group_record("group-assembly-race").await,
             "completed group was retired immediately after its assembly lease renewal"
