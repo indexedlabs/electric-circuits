@@ -1233,20 +1233,28 @@ impl Engine {
     }
 
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
-        self.purge_shape_inner_with_group(id, durable, true).await
+        let st = self.state.lock().await;
+        self.cancel_reactivation_scan(id);
+        let group_subscription = st
+            .group_claims
+            .records_iter()
+            .find(|group| group.members.iter().any(|member| member.shape_id == id))
+            .map(|group| group.subscription.clone());
+        drop(st);
+        self.purge_shape_member(id, durable).await?;
+        if let Some(subscription) = group_subscription {
+            if let Err(error) = self.release_group_claim(&subscription).await {
+                tracing::warn!(%error, %subscription, "purge: failed to durably release group claim; continuing shape retirement");
+            }
+        }
+        Ok(())
     }
 
-    async fn purge_shape_inner_with_group(&self, id: &str, durable: bool, release_group: bool) -> Result<()> {
+    /// Purge one shape without consulting or releasing a group claim. Group teardown calls this
+    /// helper for each private member, so it cannot recurse back into `release_group_claim`.
+    async fn purge_shape_member(&self, id: &str, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
-        let group_subscription = release_group
-            .then(|| {
-                st.group_claims
-                    .records_iter()
-                    .find(|group| group.members.iter().any(|member| member.shape_id == id))
-                    .map(|group| group.subscription.clone())
-            })
-            .flatten();
         self.lives.lock().unwrap().remove(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
@@ -1279,11 +1287,6 @@ impl Engine {
             None
         };
         drop(st);
-        if let Some(subscription) = group_subscription {
-            if let Err(error) = self.release_group_claim(&subscription).await {
-                tracing::warn!(%error, %subscription, "purge: failed to durably release group claim; continuing shape retirement");
-            }
-        }
         #[cfg(test)]
         if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
             self.purge_test_hook.removed.notify_one();
@@ -2132,16 +2135,22 @@ impl Engine {
     pub(crate) async fn release_group_claim(&self, subscription: &str) -> Result<()> {
         let Some(group) = self.group_record(subscription).await else { return Ok(()) };
         self.group_lanes.remove(&group.stream_path);
-        // Remove the public record first. Member purges below must not re-enter this method
-        // through `purge_shape_inner`; the group claim is already gone, so each member can be
-        // retired independently without recursion.
-        let mut first_error = self.finish_group_release(subscription).await.err();
+        let engine = self.clone();
+        let subscription = subscription.to_string();
+        let done = self.shutdown_token().spawn(async move {
+            engine.release_group_claim_owned(&subscription, group).await
+        });
+        done.await.map_err(|_| anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN))?
+    }
+
+    async fn release_group_claim_owned(&self, subscription: &str, group: GroupRecord) -> Result<()> {
+        let mut first_error = None;
         for member in &group.members {
             if let Err(error) = self.release_group_member_durable(&member.shape_id, &member.subscription).await {
                 tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member release failed");
                 first_error.get_or_insert(error);
             }
-            if let Err(error) = self.purge_shape_inner_with_group(&member.shape_id, true, false).await {
+            if let Err(error) = self.purge_shape_member(&member.shape_id, true).await {
                 tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member purge failed");
                 first_error.get_or_insert(error);
             }
@@ -2149,6 +2158,41 @@ impl Engine {
         if let Err(error) = self.ds.retire_stream(&group.stream_path).await {
             tracing::warn!(%error, stream_path = %group.stream_path, "group stream retirement failed; queued");
             self.retirements.enqueue(&group.stream_path, None);
+            first_error.get_or_insert(error);
+        }
+        // The public claim is dropped last, after every private member release and purge has
+        // completed. A cancelled request leaves this engine-owned task running to completion.
+        if let Err(error) = self.finish_group_release(subscription).await {
+            first_error.get_or_insert(error);
+        }
+        if let Some(error) = first_error { Err(error) } else { Ok(()) }
+    }
+
+    pub(crate) async fn cleanup_group_reservation(
+        &self,
+        subscription: &str,
+        stream_path: &str,
+        created: Vec<(String, String)>,
+    ) -> Result<()> {
+        self.remove_group_lane(stream_path);
+        let mut first_error = None;
+        for (shape_id, member_subscription) in created {
+            if let Err(error) = self.release_group_member_durable(&shape_id, &member_subscription).await {
+                tracing::warn!(%error, %shape_id, %member_subscription, "group member release failed during rollback");
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = self.purge_shape_member(&shape_id, true).await {
+                tracing::warn!(%error, %shape_id, %member_subscription, "group member purge failed during rollback");
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.ds.retire_stream(stream_path).await {
+            tracing::warn!(%error, %stream_path, "group reservation stream retirement failed; queued");
+            self.retirements.enqueue(stream_path, None);
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = self.abort_group(subscription).await {
+            first_error.get_or_insert(error);
         }
         if let Some(error) = first_error { Err(error) } else { Ok(()) }
     }

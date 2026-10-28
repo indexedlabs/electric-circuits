@@ -1074,14 +1074,15 @@ impl GroupReservationGuard {
             return;
         }
         self.armed = false;
-        self.engine.remove_group_lane(&self.stream_path);
-        for (shape_id, subscription) in self.created.drain(..) {
-            if let Err(error) = self.engine.release_group_member_durable(&shape_id, &subscription).await {
-                tracing::warn!(%error, %shape_id, %subscription, "failed to compensate group member claim");
-            }
-        }
-        if let Err(error) = self.engine.abort_group(&self.subscription).await {
-            tracing::warn!(%error, subscription = %self.subscription, "failed to compensate group reservation");
+        let engine = self.engine.clone();
+        let subscription = self.subscription.clone();
+        let stream_path = self.stream_path.clone();
+        let created = std::mem::take(&mut self.created);
+        let done = engine.shutdown_token().spawn(async move {
+            engine.cleanup_group_reservation(&subscription, &stream_path, created).await
+        });
+        if let Ok(Err(error)) = done.await {
+            tracing::warn!(%error, %subscription, "failed to compensate group reservation");
         }
     }
 }
@@ -1097,14 +1098,8 @@ impl Drop for GroupReservationGuard {
         let created = std::mem::take(&mut self.created);
         self.armed = false;
         engine.shutdown_token().spawn(async move {
-            engine.remove_group_lane(&stream_path);
-            for (shape_id, member_subscription) in created {
-                if let Err(error) = engine.release_group_member_durable(&shape_id, &member_subscription).await {
-                    tracing::warn!(%error, %shape_id, %member_subscription, "failed to compensate cancelled group member claim");
-                }
-            }
-            if let Err(error) = engine.abort_group(&subscription).await {
-                tracing::warn!(%error, subscription = %subscription, "failed to compensate cancelled group reservation");
+            if let Err(error) = engine.cleanup_group_reservation(&subscription, &stream_path, created).await {
+                tracing::warn!(%error, %subscription, "failed to compensate group reservation");
             }
         });
     }
@@ -1829,7 +1824,8 @@ async fn release_shape(
     } else {
         let subscription = validate_subscription(q.subscription)?;
         if let Some(subscription) = subscription.as_deref()
-            && engine.group_record(subscription).await.is_some()
+            && let Some(group) = engine.group_record(subscription).await
+            && group.members.iter().any(|member| member.shape_id == id)
         {
             // The group claim is the only public lease.  Its private member claims are
             // released together and each durable release is idempotent, so a cancelled or
