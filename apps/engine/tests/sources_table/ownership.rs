@@ -1402,15 +1402,16 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     let base = barrier.to_string_lossy().into_owned();
     let subscription = "group-rollback-cancel";
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback") };
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "complete") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback-release") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "page") };
     let (engine, app) = group_engine(f).await?;
     let result = async {
+        let request = group_body(f, subscription, true);
         let task = tokio::spawn({
             let app = app.clone();
-            async move { post_group(&app, group_body(f, subscription, true)).await }
+            async move { post_group(&app, request).await }
         });
-        let ready = PathBuf::from(format!("{base}.rollback.ready"));
+        let ready = PathBuf::from(format!("{base}.rollback-release.ready"));
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if ready.exists() {
@@ -1420,16 +1421,17 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
             }
         })
         .await
-        .context("waiting for rollback cancellation barrier")?;
+        .context("waiting for rollback release cancellation barrier")?;
         task.abort();
         ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
+        std::fs::write(format!("{base}.rollback-release.release"), b"release")?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    let close = engine.close(Duration::from_secs(10)).await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
-    let close = engine.close(Duration::from_secs(10)).await;
     let fence = remove_source_fence(f).await;
     let replacement = async {
         let (replacement, replacement_app) = group_engine(f).await?;
@@ -1448,7 +1450,11 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
                 attempt.1
             );
             if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("retry after rollback cancellation did not release the group claim: {} {}", attempt.0, attempt.1);
+                anyhow::bail!(
+                    "retry after rollback cancellation did not release the group claim: {} {}",
+                    attempt.0,
+                    attempt.1
+                );
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

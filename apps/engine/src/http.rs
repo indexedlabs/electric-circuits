@@ -1370,7 +1370,7 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     // a member-create or catalog-completion barrier does not accidentally block earlier stages.
     match std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") {
         Ok(selected) if selected != stage => return Ok(()),
-        Err(_) if matches!(stage, "member" | "complete") => return Ok(()),
+        Err(_) if matches!(stage, "member" | "complete" | "rollback") => return Ok(()),
         _ => {}
     }
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
@@ -1485,10 +1485,6 @@ impl GroupReservationGuard {
         while index > 0 {
             index -= 1;
             let (shape_id, subscription) = self.members[index].clone();
-            #[cfg(feature = "test-support")]
-            if let Err(error) = test_group_page_barrier("rollback").await {
-                tracing::warn!(%error, %shape_id, %subscription, "group rollback test barrier failed");
-            }
             if Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
                 self.members.remove(index);
             }
@@ -1878,6 +1874,12 @@ async fn subset_load_group(
         snapshot_guard.finish().await;
         reservation.rollback().await;
         return Err(AppError::from(error));
+    }
+    #[cfg(feature = "test-support")]
+    if test_group_page_failure("page") {
+        snapshot_guard.finish().await;
+        reservation.rollback().await;
+        return Err(AppError::from(anyhow::anyhow!("test-injected group page failure")));
     }
     // The public page is read after the private member seeds. Add its actual keys to each
     // subquery member's delete gate before the group becomes durable; a later move-out can then
