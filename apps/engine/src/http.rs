@@ -1211,7 +1211,8 @@ async fn subset_load_group(
                 retry_after: false,
             });
         }
-        if engine.group_release_in_flight(&existing.id).is_some() || !engine.group_is_healthy(&existing).await {
+        let healthy = engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
+        if engine.group_release_in_flight(&existing.id).is_some() || !healthy {
             engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         } else {
             // Re-check after the health probe: a release can begin between that probe and the
@@ -1221,7 +1222,7 @@ async fn subset_load_group(
                 release.wait().await.map_err(AppError::from)?;
             } else {
                 let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
-                let renewed_healthy = renewed && engine.group_is_healthy(&existing).await;
+                let renewed_healthy = renewed && engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
                 if renewed_healthy {
                     let offset =
                         engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| {
@@ -2144,6 +2145,7 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
+            || e.downcast_ref::<crate::engine::GroupStreamUnavailable>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
