@@ -2602,7 +2602,7 @@ mod source_fence_tests {
         SubqueryHandle {
             registry: Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None))),
             flip_tx,
-            pending_flips,
+            pending_flips: pending_flips.clone(),
             degrade: DegradeState::new(),
             group_lanes: crate::engine::emission::GroupEmissionLanes::new(ds, shutdown, pending_flips.clone()),
         }
