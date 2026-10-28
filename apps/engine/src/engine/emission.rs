@@ -149,7 +149,9 @@ impl GroupEmissionLanes {
             loop {
                 tokio::select! {
                     _ = dispatcher_lane.wake.notified() => {}
-                    _ = dispatcher_shutdown.wait() => dispatcher_lane.closed.store(true, std::sync::atomic::Ordering::Release),
+                    _ = dispatcher_shutdown.wait() => {
+                        dispatcher_lane.closed.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 loop {
                     let batch = dispatcher_lane.queue.lock().unwrap().pop_front();
@@ -161,7 +163,12 @@ impl GroupEmissionLanes {
                         drop(queue);
                         for batch in std::iter::once(batch).chain(dropped) {
                             dispatcher_pending.complete(batch.commit_lsn);
-                            complete_origin_entry(&dispatcher_origins, &dispatcher_wake, &batch.stream_path, batch.commit_lsn);
+                            complete_origin_entry(
+                                &dispatcher_origins,
+                                &dispatcher_wake,
+                                &batch.stream_path,
+                                batch.commit_lsn,
+                            );
                         }
                         return;
                     }
@@ -172,7 +179,12 @@ impl GroupEmissionLanes {
                         drop(queue);
                         for batch in std::iter::once(batch).chain(dropped) {
                             dispatcher_pending.complete(batch.commit_lsn);
-                            complete_origin_entry(&dispatcher_origins, &dispatcher_wake, &batch.stream_path, batch.commit_lsn);
+                            complete_origin_entry(
+                                &dispatcher_origins,
+                                &dispatcher_wake,
+                                &batch.stream_path,
+                                batch.commit_lsn,
+                            );
                         }
                         return;
                     }
@@ -193,7 +205,12 @@ impl GroupEmissionLanes {
             while let Some(batch) = rx.recv().await {
                 let _ = worker_ds.append_reliable(&batch.stream_path, &batch.envs).await;
                 worker_pending.complete(batch.commit_lsn);
-                complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
+                complete_origin_entry(
+                    &worker_origins,
+                    &worker_wake,
+                    &batch.stream_path,
+                    batch.commit_lsn,
+                );
             }
             worker_lane.closed.store(true, std::sync::atomic::Ordering::Release);
         });
