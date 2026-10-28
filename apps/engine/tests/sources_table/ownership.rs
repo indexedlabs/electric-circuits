@@ -10,6 +10,7 @@ use anyhow::ensure;
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::{Engine, PostgresSetup};
 use electric_circuits_engine::http::router_with_introspection;
+use electric_circuits_engine::replication::Refused;
 use electric_circuits_engine::table_ref::TableSelector;
 use tokio::sync::watch;
 
@@ -879,7 +880,19 @@ async fn group_engine(f: &Fixture) -> Result<(Engine, Router)> {
     );
     let tables =
         [TableSelector::parse(&format!("public.{}", f.outer))?, TableSelector::parse(&format!("public.{}", f.inner))?];
-    engine.setup_postgres(&tables, &f.slots[0]).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match engine.setup_postgres(&tables, &f.slots[0]).await {
+            Ok(()) => break,
+            Err(error)
+                if error.downcast_ref::<Refused>().is_some_and(|refused| matches!(refused, Refused::SlotBusy(_)))
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let app = router_with_introspection(engine.clone(), false);
     Ok((engine, app))
 }
@@ -1414,7 +1427,7 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         let ready = PathBuf::from(format!("{base}.rollback.ready"));
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if ready.exists() {
+                if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 1 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1422,6 +1435,17 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         })
         .await
         .context("waiting for rollback cancellation barrier")?;
+        std::fs::write(format!("{base}.rollback.release"), b"1")?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("waiting for second rollback cancellation barrier")?;
         task.abort();
         ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
         Ok::<_, anyhow::Error>(())

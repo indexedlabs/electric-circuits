@@ -1378,11 +1378,31 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     use std::io::Write;
     let mut ready_file = std::fs::OpenOptions::new().create(true).append(true).open(&ready)?;
     writeln!(ready_file, "ready")?;
+    let ready_count = std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !release.exists() && tokio::time::Instant::now() < deadline {
+    while tokio::time::Instant::now() < deadline {
+        let released = if stage == "rollback" {
+            std::fs::read_to_string(&release)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<usize>().ok())
+                .is_some_and(|count| count >= ready_count)
+        } else {
+            release.exists()
+        };
+        if released {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    anyhow::ensure!(release.exists(), "test group {stage} barrier timed out");
+    let released = if stage == "rollback" {
+        std::fs::read_to_string(&release)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<usize>().ok())
+            .is_some_and(|count| count >= ready_count)
+    } else {
+        release.exists()
+    };
+    anyhow::ensure!(released, "test group {stage} barrier timed out");
     Ok(())
 }
 

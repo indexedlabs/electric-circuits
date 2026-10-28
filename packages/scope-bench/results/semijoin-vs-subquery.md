@@ -1,9 +1,8 @@
 # Key-only semijoin versus subquery members
 
-Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes for the reproduced hosted-review regressions are being validated by CI; no performance
-results are claimed until the five-repetition PostgreSQL 18 benchmark job completes. The
-experiment must finish before this report can support changing the membership decision.
+Work in progress, not for merge. Correctness is still being validated by CI; the first
+five-repetition PostgreSQL 18 benchmark completed on 48501cd. The measurements below are
+prototype evidence, not release qualification.
 
 ## Pinned inputs and method
 
@@ -32,17 +31,26 @@ experiment must finish before this report can support changing the membership de
   charged read count is not a measurement of native Durable Streams SSE. Preserve
   actual provider reads separately; do not use that model for fd qualification.
 
-| Metric | Subquery members | Key-only semijoin | Evidence status |
-| --- | --- | --- | --- |
-| Total / incremental per-group memory | Pending | Pending | No new measurement |
-| Restart peak RSS and ready + group reload time | Pending | Pending | No new measurement |
-| New-group seed time | Pending | Pending | No new measurement |
-| Actual reads per change | Pending | Pending | No new measurement |
-| Delivery p50 / p90 | Pending | Pending | No new measurement |
-| Engine / gateway CPU | Pending | Pending | No new measurement |
+| Metric (5-rep median) | Subquery members | Key-only semijoin | Evidence |
+| --- | ---: | ---: | --- |
+| Cold group load (ms) | 13,082 | 13,017 | Measured; artifact 12844722320 |
+| Cold engine RSS (MiB) | 73.7 | 75.1 | Measured process RSS |
+| Cold DBSP used bytes | 34,212 | 60,232 | Measured profile; semijoin arrangement state |
+| Steady group load (ms) | 4,340 | 4,209 | Measured; artifact 12844722320 |
+| Steady engine RSS (MiB) | 76.8 | 75.9 | Measured process RSS |
+| Steady DBSP used bytes | 65,092 | 94,512 | Measured profile |
+| Actual reads/change | 2.667 | 2.694 | Measured pg_stat_statements calls / 180 writes |
+| Delivery p50 / p90 (ms) | 495 / 734 | 1,373 / 1,981 | Measured steady writes |
+| Engine CPU (ms) | 1,920 | 3,070 | Measured steady hold |
+| Gateway CPU (ms) | 4,864 | 4,588 | Measured steady hold |
+| Restart peak RSS / reload time | Unavailable | Unavailable | Harness boots fresh process; no persisted restart lane |
+| New-group seed time | Included in group load | Included in group load | No separate seed timer |
 
-`engineBootMs` is a cold process boot plus catalog/shape reload measurement for this harness;
-it is not a SIGTERM restart or a persisted durable-stream restore. `groupLoadMs` is the
+The measured benchmark is run 40747358562, job 123024579773, artifact
+`12844722320` (`semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44`). It ran
+five repetitions for each mode and both scenarios with PostgreSQL 18.6. `engineBootMs` is a
+cold process boot plus catalog/shape reload measurement for this harness; it is not a SIGTERM
+restart or a persisted durable-stream restore. `groupLoadMs` is the
 end-to-end group request through the simulated gateway, including the public page and private
 member seed. `/memory`'s process RSS is total engine memory; its `cardinalities` byte fields are
 owned lower bounds, and per-group memory is estimated as a change divided by the number of
@@ -326,10 +334,9 @@ Their source blobs are respectively `ec9699db0c3393d55601a5996ec4e27fe4e69af9`,
 `81251167803ff4bb307f1d0913afe721381c11cc`, and
 `d5dfd0aa57372b90b820ba39f0ef0982468e6b88`. The subsequent `run.ts` change
 repairs its Markdown table delimiter to match the 18 header/row cells.
-The old Node sketch is explicitly named `semijoin:model` in package scripts.
-This import supplies the starting harness only; mode comparison, resource/restart
-instrumentation, five-repetition CI execution and resulting numbers are still
-pending. Its modeled streaming charges must not be mistaken for provider reads.
+The old Node sketch is explicitly named `semijoin:model` in package scripts. The corrected
+five-repetition mode comparison is now measured in artifact 12844722320. Its modeled
+streaming charges must not be mistaken for provider reads.
 
 Set `ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=subquery|semijoin` when starting the
 engine; the default is `subquery`. The baseline already keeps shared scope keys
@@ -366,9 +373,9 @@ join-execution counter. Focused operator coverage includes distinct contributors
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
 The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
 corrections are implemented through `9cffab2`, while the page-handoff and cancellation
-corrections are carried through `53dd7e3` and `9e9171e`; the working-tree follow-up adds
-the all-plain restart check, pinned formatting cleanup, and partial-boot slot cleanup. It
-still awaits a fresh exact-candidate CI run. Existing claim/lease, public snapshot query,
+corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the
+full test job and produced the benchmark artifact; head `9086025` adds the rollback-cancellation
+contract and is still running its full exact-head qualification. Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
