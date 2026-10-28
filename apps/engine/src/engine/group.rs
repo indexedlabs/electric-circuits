@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-
 /// Per-engine group activity.  This is deliberately owned by the Engine rather than a
 /// process-global counter: two engines may share a process during a handoff and their
 /// transaction fences must not affect one another.
