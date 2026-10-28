@@ -2137,9 +2137,8 @@ impl Engine {
         self.group_lanes.remove(&group.stream_path);
         let engine = self.clone();
         let subscription = subscription.to_string();
-        let done = self.shutdown_token().spawn(async move {
-            engine.release_group_claim_owned(&subscription, group).await
-        });
+        let done =
+            self.shutdown_token().spawn(async move { engine.release_group_claim_owned(&subscription, group).await });
         done.await.map_err(|_| anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN))?
     }
 
