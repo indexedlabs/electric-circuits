@@ -913,6 +913,52 @@ impl SubqueryRegistry {
         self.edges.get(sig).cloned().unwrap_or_default()
     }
 
+    /// Return group stream paths reachable from a set of node flips. This is evaluated while the
+    /// registry lock is held, before the flip work is handed to a worker, so the source fence can
+    /// cover the entire in-flight walk rather than only the append it eventually produces.
+    pub(crate) fn group_paths_for_work(
+        &self,
+        work: &VecDeque<(SubquerySig, Flip)>,
+    ) -> HashSet<String> {
+        let mut pending = work.iter().map(|(sig, _)| sig.clone()).collect::<VecDeque<_>>();
+        let mut visited = HashSet::new();
+        let mut paths = HashSet::new();
+        while let Some(sig) = pending.pop_front() {
+            if !visited.insert(sig.clone()) {
+                continue;
+            }
+            for edge in self.edges_of(&sig) {
+                match edge.dependent {
+                    Dependent::Shape(id) => {
+                        if let Some(shape) = self.shapes.get(&id)
+                            && shape.stream_path.starts_with("shape/group-")
+                        {
+                            paths.insert(shape.stream_path.clone());
+                        }
+                    }
+                    Dependent::Node(parent) => pending.push_back(parent),
+                }
+            }
+        }
+        paths
+    }
+
+    pub(crate) fn group_paths_for_shape(&self, shape_id: &str) -> HashSet<String> {
+        self.shapes
+            .get(shape_id)
+            .filter(|shape| shape.stream_path.starts_with("shape/group-"))
+            .map(|shape| std::iter::once(shape.stream_path.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn all_group_paths(&self) -> HashSet<String> {
+        self.shapes
+            .values()
+            .filter(|shape| shape.stream_path.starts_with("shape/group-"))
+            .map(|shape| shape.stream_path.clone())
+            .collect()
+    }
+
     /// Every edge in the registry (introspection only — hot paths use [`edges_of`]).
     pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
         self.edges.values().flatten()

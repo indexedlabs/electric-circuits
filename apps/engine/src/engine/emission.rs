@@ -213,8 +213,38 @@ impl GroupEmissionLanes {
         lane
     }
 
-    pub(crate) fn has_origin_at_or_before(&self, marker_lsn: u64) -> bool {
-        self.origins.lock().unwrap().iter().any(|((_, lsn), _)| *lsn <= marker_lsn)
+    pub(crate) fn register(&self, path: &str) {
+        let _ = self.lane(path);
+    }
+
+    fn existing_lane(&self, path: &str) -> Option<Arc<GroupLane>> {
+        self.lanes.lock().unwrap().get(path).cloned()
+    }
+
+    pub(crate) fn begin_origin(&self, path: &str, commit_lsn: u64) {
+        *self.origins.lock().unwrap().entry((path.to_string(), commit_lsn)).or_default() += 1;
+    }
+
+    pub(crate) fn complete_origin(&self, path: &str, commit_lsn: u64) {
+        complete_origin_entry(&self.origins, &self.wake, path, commit_lsn);
+    }
+
+    pub(crate) fn has_origin_at_or_before(&self, paths: &HashSet<String>, marker_lsn: u64) -> bool {
+        self.origins
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
+    }
+
+    pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {
+        self.origins
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((_, lsn), _)| *lsn <= marker_lsn)
+            .map(|((path, _), _)| path.clone())
+            .collect()
     }
 
     pub(crate) fn wake(&self) -> Arc<tokio::sync::Notify> {
@@ -228,10 +258,14 @@ impl GroupEmissionLanes {
         if envs.is_empty() {
             return;
         }
-        self.pending.add(commit_lsn);
         let path = path.to_string();
-        *self.origins.lock().unwrap().entry((path.clone(), commit_lsn)).or_default() += 1;
-        let lane = self.lane(&path);
+        let Some(lane) = self.existing_lane(&path) else {
+            // A member can remain live briefly after its group is released. Its late output must
+            // not resurrect a writer task for a stream that no longer has a group owner.
+            return;
+        };
+        self.pending.add(commit_lsn);
+        self.begin_origin(&path, commit_lsn);
         lane.queue.lock().unwrap().push_back(GroupBatch { commit_lsn, stream_path: path, envs });
         lane.wake.notify_one();
     }

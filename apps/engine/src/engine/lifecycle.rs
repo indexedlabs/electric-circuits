@@ -1271,7 +1271,9 @@ impl Engine {
         };
         drop(st);
         if let Some(subscription) = group_subscription {
-            self.release_group_claim(&subscription).await?;
+            if let Err(error) = self.release_group_claim(&subscription).await {
+                tracing::warn!(%error, %subscription, "purge: failed to durably release group claim; continuing shape retirement");
+            }
         }
         #[cfg(test)]
         if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
@@ -2118,13 +2120,22 @@ impl Engine {
         }
     }
 
-    async fn release_group_claim(&self, subscription: &str) -> Result<()> {
+    pub(crate) async fn release_group_claim(&self, subscription: &str) -> Result<()> {
         let Some(group) = self.group_record(subscription).await else { return Ok(()) };
         self.group_lanes.remove(&group.stream_path);
+        let mut first_error = None;
         for member in &group.members {
-            self.release_group_member_durable(&member.shape_id, &member.subscription).await?;
+            if let Err(error) = self.release_group_member_durable(&member.shape_id, &member.subscription).await {
+                tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member release failed");
+                first_error.get_or_insert(error);
+            }
         }
-        self.finish_group_release(subscription).await
+        let group_error = self.finish_group_release(subscription).await.err();
+        if let Some(error) = first_error.or(group_error) {
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the
@@ -2462,7 +2473,7 @@ impl Engine {
             seeded,
             "subquery shape create finished"
         );
-        enqueue_finished_create_work(&self.flip_tx, &self.pending_flips, id, finished)?;
+        enqueue_finished_create_work(self, id, finished).await?;
         Ok(())
     }
 }
@@ -2472,9 +2483,8 @@ impl Engine {
 /// Each non-empty batch is counted before sending so the convergence barrier cannot observe a
 /// partially delivered create. The sender is unbounded, but it still closes during shutdown; a
 /// failed send releases its count and refuses the create so its guard can roll back the install.
-fn enqueue_finished_create_work(
-    flip_tx: &mpsc::UnboundedSender<FlipWork>,
-    pending_flips: &PendingFlips,
+async fn enqueue_finished_create_work(
+    engine: &Engine,
     id: &str,
     finished: crate::subquery::FinishedCreate,
 ) -> Result<()> {
@@ -2496,26 +2506,55 @@ fn enqueue_finished_create_work(
     }
     let batches: Vec<_> = nodes
         .into_iter()
-        .map(|(commit_lsn, work)| FlipWork::DeferredNode { commit_lsn, work })
+        .map(|(commit_lsn, work)| FlipWork::DeferredNode { commit_lsn, work, group_paths: Vec::new() })
         .chain(walks.into_iter().map(|(commit_lsn, work)| FlipWork::Walk {
             work,
             txid: None,
             lsn: Some(format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xffff_ffff)),
+            group_paths: Vec::new(),
         }))
         .chain(shapes.into_iter().map(|(commit_lsn, work)| FlipWork::Deferred {
             commit_lsn,
             shape_id: id.to_string(),
             work,
+            group_paths: Vec::new(),
         }))
         .collect();
-    pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
+    let mut batches = batches;
+    let registry = engine.subqueries.lock().await;
+    for batch in &mut batches {
+        let paths = match batch {
+            FlipWork::Walk { work, .. } => registry.group_paths_for_work(work),
+            FlipWork::Deferred { shape_id, .. } => registry.group_paths_for_shape(shape_id),
+            FlipWork::DeferredNode { .. } => registry.all_group_paths(),
+        };
+        match batch {
+            FlipWork::Walk { group_paths, .. }
+            | FlipWork::Deferred { group_paths, .. }
+            | FlipWork::DeferredNode { group_paths, .. } => *group_paths = paths.into_iter().collect(),
+        }
+    }
+    drop(registry);
+    for batch in &batches {
+        for path in batch.group_paths() {
+            engine.group_lanes.begin_origin(path, batch.commit_lsn());
+        }
+    }
+    engine.pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
     let mut batches = batches.into_iter();
     while let Some(batch) = batches.next() {
         let commit_lsn = batch.commit_lsn();
-        if flip_tx.send(batch).is_err() {
-            pending_flips.complete(commit_lsn);
+        if let Err(error) = engine.flip_tx.send(batch) {
+            let batch = error.0;
+            engine.pending_flips.complete(commit_lsn);
+            for path in batch.group_paths() {
+                engine.group_lanes.complete_origin(path, commit_lsn);
+            }
             for unsent in batches {
-                pending_flips.complete(unsent.commit_lsn());
+                engine.pending_flips.complete(unsent.commit_lsn());
+                for path in unsent.group_paths() {
+                    engine.group_lanes.complete_origin(path, unsent.commit_lsn());
+                }
             }
             return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
         }

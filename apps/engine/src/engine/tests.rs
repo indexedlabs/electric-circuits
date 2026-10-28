@@ -310,7 +310,15 @@ fn test_subq() -> SubqueryHandle {
     let degrade = DegradeState::new();
     let shutdown = crate::shutdown::ShutdownToken::new();
     let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
-    spawn_flip_propagator(registry.clone(), flip_rx, pending_flips.clone(), degrade.clone(), trace_tx, shutdown);
+    spawn_flip_propagator(
+        registry.clone(),
+        flip_rx,
+        pending_flips.clone(),
+        degrade.clone(),
+        trace_tx,
+        group_lanes.clone(),
+        shutdown,
+    );
     SubqueryHandle { registry, flip_tx, pending_flips, degrade, group_lanes }
 }
 
@@ -2323,7 +2331,10 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     assert_eq!(work.len(), 1, "the delete flips gid 7 out of the inner set");
 
     engine.pending_flips.add(0x10);
-    engine.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: Some("0/10".into()) }).expect("propagator alive");
+    engine
+        .flip_tx
+        .send(FlipWork::Walk { work, txid: None, lsn: Some("0/10".into()), group_paths: Vec::new() })
+        .expect("propagator alive");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !engine.degraded() {

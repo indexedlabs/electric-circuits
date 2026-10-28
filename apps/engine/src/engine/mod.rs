@@ -796,11 +796,19 @@ pub(crate) enum FlipWork {
         /// propagation — letting the activity log group them as one write (see
         /// `subquery::emit_flip_trace`).
         lsn: Option<String>,
+        /// Group stream paths reachable from this walk. Registered before the work is sent so a
+        /// following source transaction cannot pass the group fence while this walk is in flight.
+        group_paths: Vec<String>,
     },
     /// Work that reached a shape while it was still being created, run against that one shape now
     /// that it is installed (see `SubqueryRegistry::finish_create`). Its dependency walk already
     /// happened, so there is nothing left to walk.
-    Deferred { commit_lsn: u64, shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
+    Deferred {
+        commit_lsn: u64,
+        shape_id: String,
+        work: std::collections::VecDeque<crate::subquery::DeferredShapeWork>,
+        group_paths: Vec<String>,
+    },
     /// Work that reached a fresh parent NODE while a create was still seeding it, re-derived now
     /// that its set is installed (see `SubqueryRegistry::finish_create`). Unlike `Deferred`, this
     /// one DOES walk: reconciling the node produces flips, and the dependents below it — the
@@ -808,6 +816,7 @@ pub(crate) enum FlipWork {
     DeferredNode {
         commit_lsn: u64,
         work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::DeferredNodeWork)>,
+        group_paths: Vec<String>,
     },
 }
 
@@ -816,6 +825,14 @@ impl FlipWork {
         match self {
             Self::Walk { lsn, .. } => lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0),
             Self::Deferred { commit_lsn, .. } | Self::DeferredNode { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+
+    fn group_paths(&self) -> &[String] {
+        match self {
+            Self::Walk { group_paths, .. } | Self::Deferred { group_paths, .. } | Self::DeferredNode { group_paths, .. } => {
+                group_paths
+            }
         }
     }
 }
@@ -889,6 +906,7 @@ fn spawn_flip_propagator(
     pending: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+    group_lanes: crate::engine::emission::GroupEmissionLanes,
     shutdown: crate::shutdown::ShutdownToken,
 ) {
     let workers: usize =
@@ -901,12 +919,14 @@ fn spawn_flip_propagator(
             let pending = pending.clone();
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
+            let group_lanes = group_lanes.clone();
             shutdown.spawn_background(async move {
                 let commit_lsn = fw.commit_lsn();
+                let group_paths = fw.group_paths().to_vec();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
                 // is treated exactly like a live one, because its effects are just as lost.
                 let failed = match fw {
-                    FlipWork::Walk { mut work, txid, lsn } => {
+                    FlipWork::Walk { mut work, txid, lsn, .. } => {
                         crate::subquery::propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx)
                             .await
                             .err()
@@ -945,6 +965,9 @@ fn spawn_flip_propagator(
                         unfinished
                     );
                     degrade.mark();
+                    for path in &group_paths {
+                        group_lanes.complete_origin(path, commit_lsn);
+                    }
                     drop(permit);
                     return;
                 }
@@ -952,6 +975,9 @@ fn spawn_flip_propagator(
                 // batch — each batch carries its own pending increment until it lands, so
                 // the barrier never reads zero with effects in flight.
                 pending.complete(commit_lsn);
+                for path in &group_paths {
+                    group_lanes.complete_origin(path, commit_lsn);
+                }
                 drop(permit);
             });
         }
@@ -1558,6 +1584,7 @@ impl Engine {
             pending_flips.clone(),
             degrade.clone(),
             trace_tx.clone(),
+            group_lanes.clone(),
             shutdown.clone(),
         );
         // Created before the writer so the writer can register a shutdown party while it is
@@ -2909,6 +2936,7 @@ impl Engine {
     }
 
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
+        self.group_lanes.register(&record.stream_path);
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         let valid = {
             let st = self.state.lock().await;
@@ -2927,8 +2955,10 @@ impl Engine {
         Ok(())
     }
 
-    pub(crate) async fn abort_group(&self, subscription: &str) {
+    pub(crate) async fn abort_group(&self, subscription: &str) -> Result<()> {
         self.state.lock().await.group_claims.release(subscription);
+        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
+        Ok(())
     }
 
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
@@ -2944,14 +2974,19 @@ impl Engine {
         {
             let mut st = self.state.lock().await;
             for member in &group.members {
-                if st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id) {
-                    st.subscribe(&member.shape_id, member.subscription.clone(), now);
-                    events.push(CatalogEvent::Joined {
-                        id: member.shape_id.clone(),
-                        subscription: member.subscription.clone(),
-                        at: now,
-                    });
-                }
+                anyhow::ensure!(
+                    st.shapes.contains_key(&member.shape_id)
+                        && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id),
+                    "group '{}' member '{}' no longer holds its claim",
+                    group.subscription,
+                    member.subscription
+                );
+                st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                events.push(CatalogEvent::Joined {
+                    id: member.shape_id.clone(),
+                    subscription: member.subscription.clone(),
+                    at: now,
+                });
             }
             st.publish_subscription_gauge(&self.metrics);
         }
@@ -2959,6 +2994,17 @@ impl Engine {
             self.catalog_tx.send(event);
         }
         Ok(())
+    }
+
+    pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> bool {
+        let members_healthy = {
+            let st = self.state.lock().await;
+            group.members.iter().all(|member| {
+                st.shapes.contains_key(&member.shape_id)
+                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
+            })
+        };
+        members_healthy && self.stream_tail(&group.stream_path).await.ok().flatten().is_some()
     }
 
     /// Remove the public group record and return its private members.  The caller performs
@@ -2973,8 +3019,8 @@ impl Engine {
     }
 
     pub(crate) async fn finish_group_release(&self, subscription: &str) -> Result<()> {
-        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
         let _ = self.take_group(subscription).await;
+        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
         Ok(())
     }
 

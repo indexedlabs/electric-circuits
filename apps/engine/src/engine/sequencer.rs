@@ -536,6 +536,7 @@ pub(crate) async fn sequencer_loop(
     // This is enabled only while at least one group lease is active; ordinary single-table
     // shapes keep their existing throughput path.
     let mut last_group_lsn: Option<u64> = None;
+    let mut last_group_paths = HashSet::new();
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -785,7 +786,7 @@ pub(crate) async fn sequencer_loop(
                     for mut transaction in page.ready {
                         if group_fence.active()
                             && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &shutdown, previous).await
+                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
                         {
                             tracing::error!(previous, "group transaction barrier could not drain before the next commit");
                             processing_failed = true;
@@ -1034,7 +1035,14 @@ pub(crate) async fn sequencer_loop(
                         if group_fence.active()
                             && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
                         {
-                            last_group_lsn = Some(commit_lsn);
+                            let paths = subq.group_lanes.paths_at_or_before(commit_lsn);
+                            if !paths.is_empty() {
+                                last_group_lsn = Some(commit_lsn);
+                                last_group_paths = paths;
+                            } else {
+                                last_group_lsn = None;
+                                last_group_paths.clear();
+                            }
                         }
                     }
                     if processing_failed {
@@ -1254,6 +1262,7 @@ async fn wait_for_source_effects(
 
 async fn wait_for_group_effects(
     lanes: &crate::engine::emission::GroupEmissionLanes,
+    paths: &HashSet<String>,
     shutdown: &crate::shutdown::ShutdownToken,
     marker_lsn: u64,
 ) -> bool {
@@ -1261,12 +1270,15 @@ async fn wait_for_group_effects(
         if shutdown.is_shutting_down() {
             return false;
         }
-        if !lanes.has_origin_at_or_before(marker_lsn) {
+        let wake = lanes.wake();
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !lanes.has_origin_at_or_before(paths, marker_lsn) {
             return true;
         }
-        let wake = lanes.wake();
         tokio::select! {
-            _ = wake.notified() => {}
+            _ = notified => {}
             _ = shutdown.wait() => return false,
         }
     }
@@ -2148,11 +2160,16 @@ pub(crate) async fn process_envelope(
     // (`pending_flips == 0`).
     {
         let mut work = std::collections::VecDeque::new();
+        let mut group_paths = HashSet::new();
         {
             let mut reg = subq.registry.lock().await;
             if reg.touches(&ts.table) {
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 work = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
+                group_paths = reg.group_paths_for_work(&work);
+                for path in &group_paths {
+                    subq.group_lanes.begin_origin(path, lsn_u64);
+                }
                 if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
                     for h in &sq {
                         if h.outcome == "passed"
@@ -2168,9 +2185,16 @@ pub(crate) async fn process_envelope(
         }
         if !work.is_empty() {
             subq.pending_flips.add(lsn_u64);
-            if subq.flip_tx.send(FlipWork::Walk { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
+            if subq
+                .flip_tx
+                .send(FlipWork::Walk { work, txid: txid.clone(), lsn: lsn.clone(), group_paths: group_paths.clone() })
+                .is_err()
+            {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
                 subq.pending_flips.complete(lsn_u64);
+                for path in &group_paths {
+                    subq.group_lanes.complete_origin(path, lsn_u64);
+                }
             }
         }
     }

@@ -1045,16 +1045,44 @@ struct GroupMemberReq {
 struct GroupReservationGuard {
     engine: Engine,
     subscription: String,
+    stream_path: String,
+    created: Vec<(String, String)>,
     armed: bool,
 }
 
 impl GroupReservationGuard {
-    fn new(engine: &Engine, subscription: &str) -> Self {
-        Self { engine: engine.clone(), subscription: subscription.to_string(), armed: true }
+    fn new(engine: &Engine, subscription: &str, stream_path: &str) -> Self {
+        Self {
+            engine: engine.clone(),
+            subscription: subscription.to_string(),
+            stream_path: stream_path.to_string(),
+            created: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn member_created(&mut self, shape_id: &str, subscription: &str) {
+        self.created.push((shape_id.to_string(), subscription.to_string()));
     }
 
     fn complete(&mut self) {
         self.armed = false;
+    }
+
+    async fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        self.engine.group_lanes.remove(&self.stream_path);
+        for (shape_id, subscription) in self.created.drain(..) {
+            if let Err(error) = self.engine.release_group_member_durable(&shape_id, &subscription).await {
+                tracing::warn!(%error, %shape_id, %subscription, "failed to compensate group member claim");
+            }
+        }
+        if let Err(error) = self.engine.abort_group(&self.subscription).await {
+            tracing::warn!(%error, subscription = %self.subscription, "failed to compensate group reservation");
+        }
     }
 }
 
@@ -1065,8 +1093,19 @@ impl Drop for GroupReservationGuard {
         }
         let engine = self.engine.clone();
         let subscription = self.subscription.clone();
+        let stream_path = self.stream_path.clone();
+        let created = std::mem::take(&mut self.created);
+        self.armed = false;
         engine.shutdown_token().spawn(async move {
-            engine.abort_group(&subscription).await;
+            engine.group_lanes.remove(&stream_path);
+            for (shape_id, member_subscription) in created {
+                if let Err(error) = engine.release_group_member_durable(&shape_id, &member_subscription).await {
+                    tracing::warn!(%error, %shape_id, %member_subscription, "failed to compensate cancelled group member claim");
+                }
+            }
+            if let Err(error) = engine.abort_group(&subscription).await {
+                tracing::warn!(%error, subscription = %subscription, "failed to compensate cancelled group reservation");
+            }
         });
     }
 }
@@ -1176,49 +1215,53 @@ async fn subset_load_group(
                 retry_after: false,
             });
         }
-        engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
-        let offset =
-            engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| AppError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                msg: "group stream has no tail offset".into(),
-                retry_after: true,
-            })?;
-        let reads = existing
-            .members
-            .iter()
-            .map(|m| crate::engine::SubsetReadReq {
-                table: TableRef::parse(&m.table).expect("validated table reference"),
-                where_: m.where_.clone(),
-                columns: m.columns.clone(),
-                order_by: None,
-                limit: None,
-                offset: None,
-            })
-            .collect();
-        let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
-        let results = existing
-            .members
-            .iter()
-            .zip(page.pages)
-            .map(|(member, rows)| {
-                serde_json::json!({
-                    "key": member.key,
-                    "table": member.table,
-                    "shapeId": member.shape_id,
-                    "streamUrl": engine.stream_url(&existing.stream_path),
-                    "streamPath": existing.stream_path,
-                    "subscription": group_sub,
-                    "leaseSeconds": engine.lease_seconds(),
-                    "offset": offset,
-                    "rows": rows,
+        if !engine.group_is_healthy(&existing).await {
+            engine.release_group_claim(&group_sub).await.map_err(AppError::from)?;
+        } else {
+            engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
+            let offset =
+                engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| AppError {
+                    status: StatusCode::CONFLICT,
+                    msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
+                    retry_after: false,
+                })?;
+            let reads = existing
+                .members
+                .iter()
+                .map(|m| crate::engine::SubsetReadReq {
+                    table: TableRef::parse(&m.table).expect("validated table reference"),
+                    where_: m.where_.clone(),
+                    columns: m.columns.clone(),
+                    order_by: None,
+                    limit: None,
+                    offset: None,
                 })
-            })
-            .collect::<Vec<_>>();
-        return Ok(Json(serde_json::json!({
-            "groupId": existing.id, "subscription": group_sub,
-            "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
-            "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
-        })));
+                .collect();
+            let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
+            let results = existing
+                .members
+                .iter()
+                .zip(page.pages)
+                .map(|(member, rows)| {
+                    serde_json::json!({
+                        "key": member.key,
+                        "table": member.table,
+                        "shapeId": member.shape_id,
+                        "streamUrl": engine.stream_url(&existing.stream_path),
+                        "streamPath": existing.stream_path,
+                        "subscription": group_sub,
+                        "leaseSeconds": engine.lease_seconds(),
+                        "offset": offset,
+                        "rows": rows,
+                    })
+                })
+                .collect::<Vec<_>>();
+            return Ok(Json(serde_json::json!({
+                "groupId": existing.id, "subscription": group_sub,
+                "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
+                "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
+            })));
+        }
     }
     let group_path = engine.group_stream_path();
     // Reserve the one public claim before the first member create.  This check is made
@@ -1227,7 +1270,8 @@ async fn subset_load_group(
     let member_subscriptions: Vec<String> =
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     engine.reserve_group(&group_sub, &member_subscriptions).await?;
-    let mut reservation = GroupReservationGuard::new(engine, &group_sub);
+    engine.group_lanes.register(&group_path);
+    let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
@@ -1242,12 +1286,12 @@ async fn subset_load_group(
             )
             .await
         {
-            Ok((rec, _)) => created.push((rec, sub)),
+            Ok((rec, _)) => {
+                reservation.member_created(&rec.id, &sub);
+                created.push((rec, sub));
+            }
             Err(error) => {
-                for (rec, sub) in &created {
-                    let _ = engine.release_group_member_durable(&rec.id, sub).await;
-                }
-                engine.abort_group(&group_sub).await;
+                reservation.rollback().await;
                 return Err(AppError::from(error));
             }
         }
@@ -1255,19 +1299,13 @@ async fn subset_load_group(
     let offset = match engine.stream_tail(&group_path).await {
         Ok(Some(offset)) => offset,
         Ok(None) => {
-            for (rec, sub) in &created {
-                let _ = engine.release_group_member_durable(&rec.id, sub).await;
-            }
-            engine.abort_group(&group_sub).await;
+            reservation.rollback().await;
             return Err(AppError::from(anyhow::Error::new(crate::engine::GroupStreamClosed {
                 stream_path: group_path,
             })));
         }
         Err(error) => {
-            for (rec, sub) in &created {
-                let _ = engine.release_group_member_durable(&rec.id, sub).await;
-            }
-            engine.abort_group(&group_sub).await;
+            reservation.rollback().await;
             return Err(AppError::from(error));
         }
     };
@@ -1285,10 +1323,7 @@ async fn subset_load_group(
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {
-            for (rec, sub) in &created {
-                let _ = engine.release_group_member_durable(&rec.id, sub).await;
-            }
-            engine.abort_group(&group_sub).await;
+            reservation.rollback().await;
             return Err(AppError::from(error));
         }
     };
@@ -1317,10 +1352,7 @@ async fn subset_load_group(
         replay_fence: offset.clone(),
     };
     if let Err(error) = engine.complete_group(group_record).await {
-        for (rec, sub) in &created {
-            let _ = engine.release_group_member_durable(&rec.id, sub).await;
-        }
-        engine.abort_group(&group_sub).await;
+        reservation.rollback().await;
         return Err(AppError::from(error));
     }
     reservation.complete();
@@ -1802,10 +1834,7 @@ async fn release_shape(
             // The group claim is the only public lease.  Its private member claims are
             // released together and each durable release is idempotent, so a cancelled or
             // retried DELETE cannot leave a hidden member alive.
-            for member in group.members {
-                engine.release_group_member_durable(&member.shape_id, &member.subscription).await?;
-            }
-            engine.finish_group_release(subscription).await?;
+            engine.release_group_claim(subscription).await?;
         } else {
             engine.release_subscription_durable(&id, subscription.as_deref()).await?;
         }
