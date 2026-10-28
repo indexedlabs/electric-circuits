@@ -224,7 +224,7 @@ before delivery.
 
 ### Current exact-head correction
 
-Head `6a58456` adds the missing real PostgreSQL page-handoff controls. The test-only
+Head `8185b7b` adds the missing real PostgreSQL page-handoff controls. The test-only
 sequencer pause keeps the source reader behind the page; an outer-row delete committed
 after the page is visible but unsequenced, so the live path cannot seed the member's
 FeedSet. Only the page-key handoff can emit the table-qualified tombstone, and the
@@ -251,9 +251,17 @@ tombstone assertion. At `8185b7b`, the subquery group loop passed its handoff co
 but `ownership::group_page_cancellation_releases_queryback_window` failed during its
 cleanup with `the slot is held by walsender pid 17649`; the semijoin loop passed. The
 library then failed `subquery::tests::page_handoff_emits_tombstone_for_newer_negative_queryback`
-at `group snapshot table disappeared`. `6a58456` splits the cancellation cases, asserts clean engine shutdown, and installs
-the missing unit-test schema; the current head fixes its two wrapper-format diffs and
-adds member cleanup for cancellation during group creation.
+at `group snapshot table disappeared`. `6a58456` split the cancellation cases, asserted
+clean engine shutdown, and installed the missing unit-test schema. `327653b` and `6a58456`
+passed the group contracts and Rust tests after those changes, but their formatting gates
+were red. `53dd7e3` is the first head where rustfmt, both membership-mode group contracts,
+the Rust engine tests, TypeScript typecheck, and the Node gate all passed; Vitest was still
+running when the run was observed. `9e9171e` added the reservation guard's member-release
+compensation, durable `GroupDropped` on cancellation after `GroupCreated`, and partial
+benchmark-boot cleanup. Its first exact run was red only in the formatting gate, so no
+benchmark artifact was produced. The complete-stage cancellation contract now uses an
+all-plain group, restarts before retrying, and requires recreation to prove that the
+durable drop removed the restored claim.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
@@ -306,10 +314,9 @@ contracts are unchanged. An additional PostgreSQL contract reparents one compani
 key out/in/out after separate source receipts and checks the diagnostic mode and
 join-execution counter. Focused operator coverage includes distinct contributors,
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
-The join and reparenting controls passed at `7cbda3f`; the delete-gate, shared-worker,
-page-handoff and cancellation corrections are implemented on `8185b7b` and the latest
-fix is pending CI. Existing claim/lease, public snapshot query, group stream and
-commit fence code is unchanged.
+The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
+corrections are covered by the subsequent green group/Rust runs above. Existing
+claim/lease, public snapshot query, group stream and commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's

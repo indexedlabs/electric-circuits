@@ -1440,11 +1440,7 @@ impl GroupReservationGuard {
             }
         }
         if self.group_created {
-            if let Err(error) = self
-                .engine
-                .drop_group_durable(&self.subscription)
-                .await
-            {
+            if let Err(error) = self.engine.drop_group_durable(&self.subscription).await {
                 tracing::warn!(subscription = %self.subscription, %error, "failed to compensate cancelled group");
             }
         }
@@ -1474,8 +1470,7 @@ impl Drop for GroupReservationGuard {
                 }
             }
             if group_created {
-                if let Err(error) = engine.drop_group_durable(&subscription).await
-                {
+                if let Err(error) = engine.drop_group_durable(&subscription).await {
                     tracing::warn!(%subscription, %error, "failed to compensate cancelled group");
                 }
             }
@@ -1834,7 +1829,10 @@ async fn subset_load_group(
     // Keep one live caller claim for the group. Member claims after the first are private
     // implementation handles and are released once the group record has captured them.
     for (rec, sub) in created.iter().skip(1) {
-        engine.release_subscription_durable(&rec.id, Some(sub)).await?;
+        if let Err(error) = engine.release_subscription_durable(&rec.id, Some(sub)).await {
+            reservation.rollback().await;
+            return Err(AppError::from(error));
+        }
         reservation.remove_member(&rec.id, sub);
     }
     let lease_seconds = engine.lease_seconds();

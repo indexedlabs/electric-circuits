@@ -1177,66 +1177,98 @@ async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<(
     let base = barrier.to_string_lossy().into_owned();
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
     let (engine, app) = group_engine(f).await?;
-    let request = membership_group_body(f, &format!("group-page-cancel-{cancel_stage}"));
-    let task = tokio::spawn({
-        let app = app.clone();
-        async move { post_group(&app, request).await }
-    });
-    async fn wait_ready(base: &str, stage: &str) -> Result<()> {
-        let path = PathBuf::from(format!("{base}.{stage}.ready"));
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if path.exists() {
-                    return Ok::<_, anyhow::Error>(());
+    let result = async {
+        let subscription = format!("group-page-cancel-{cancel_stage}");
+        // The complete-stage case uses an all-plain group so a restart can observe whether the
+        // cancellation compensation persisted GroupDropped. Mixed groups are intentionally
+        // discarded during restore and cannot prove that durable record.
+        let request = if cancel_stage == "complete" {
+            group_body(f, &subscription, true)
+        } else {
+            membership_group_body(f, &subscription)
+        };
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move { post_group(&app, request).await }
+        });
+        async fn wait_ready(base: &str, stage: &str) -> Result<()> {
+            let path = PathBuf::from(format!("{base}.{stage}.ready"));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if path.exists() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            })
+            .await
+            .context(format!("waiting for cancelled group {stage} barrier"))??;
+            Ok(())
+        }
+        wait_ready(&base, "private").await?;
+        if cancel_stage == "page" || cancel_stage == "complete" {
+            std::fs::write(format!("{base}.private.release"), b"release")?;
+            wait_ready(&base, "page").await?;
+        }
+        if cancel_stage == "complete" {
+            std::fs::write(format!("{base}.page.release"), b"release")?;
+            wait_ready(&base, "complete").await?;
+        }
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if engine.subquery_inflight_querybacks_for_test().await == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
         })
         .await
-        .context(format!("waiting for cancelled group {stage} barrier"))??;
-        Ok(())
-    }
-    wait_ready(&base, "private").await?;
-    if cancel_stage == "page" || cancel_stage == "complete" {
-        std::fs::write(format!("{base}.private.release"), b"release")?;
-        wait_ready(&base, "page").await?;
-    }
-    if cancel_stage == "complete" {
-        std::fs::write(format!("{base}.page.release"), b"release")?;
-        wait_ready(&base, "complete").await?;
-    }
-    task.abort();
-    let _ = task.await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if engine.subquery_inflight_querybacks_for_test().await == 0 {
-                return;
-            }
-            tokio::task::yield_now().await;
+        .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
+
+        if cancel_stage == "complete" {
+            // Closing joins the cancellation compensation task and drains its durable catalog
+            // write. Reboot before any retry so a stale GroupCreated cannot be hidden by a new
+            // record under the same subscription key.
+            ensure!(
+                engine.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+                "cancelled complete-stage group did not close cleanly"
+            );
+            let (restarted, restarted_app) = group_engine(f).await?;
+            let (status, body) = post_group(&restarted_app, group_body(f, &subscription, true)).await?;
+            ensure!(status == StatusCode::OK, "durable GroupDropped was not restored: {status} {body}");
+            ensure!(
+                restarted.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+                "restarted cancellation contract engine did not close cleanly"
+            );
+            return Ok::<_, anyhow::Error>(());
         }
-    })
-    .await
-    .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
+
+        unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+        let retry_body = membership_group_body(f, &subscription);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let (status, body) = post_group(&app, retry_body.clone()).await?;
+                if status == StatusCode::OK {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                ensure!(status == StatusCode::CONFLICT, "retry after cancellation failed: {status} {body}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context(format!("cancelled group {cancel_stage} could not be recreated"))??;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    remove_source_fence(f).await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
-    let retry_body = membership_group_body(f, &format!("group-page-cancel-{cancel_stage}"));
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let (status, body) = post_group(&app, retry_body.clone()).await?;
-            if status == StatusCode::OK {
-                return Ok::<_, anyhow::Error>(());
-            }
-            ensure!(status == StatusCode::CONFLICT, "retry after cancellation failed: {status} {body}");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .context(format!("cancelled group {cancel_stage} could not be recreated"))??;
     ensure!(
         engine.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
         "cancelled group {cancel_stage} did not close cleanly and may have retained its replication slot"
     );
-    remove_source_fence(f).await;
-    Ok(())
+    result
 }
 
 async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {

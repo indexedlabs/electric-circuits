@@ -689,8 +689,8 @@ membership state or avoiding query-backs.
 
 The `7cbda3f` PostgreSQL regressions reproduced ungated deletes for never-member
 rows and disjoint same-table siblings, plus a focused create-replay shared-worker
-failure. The corrections below await CI; see the prototype report for exact red
-evidence. This experiment is not release qualification.
+failure. The prototype report records the genuine-red run and the later green
+correction runs. This experiment is not release qualification.
 
 Probe commands use the existing bounded worker channel and at most 1024 key/ordinal
 tuples per command (an item bound, not a byte cap on arbitrary SQL key values).
@@ -715,6 +715,18 @@ that work. Group and standalone deletes require actual prior FeedSet membership.
 Group events carry their triggering source commit LSN. That origin identifies
 deferred work; it is not a claim that a later Postgres query-back read precisely
 that source prefix.
+
+The page handoff records scoped live decisions in `page_decisions`, separate from
+ordinary query-back recency. A decision is ordered by its read LSN but its synthetic
+tombstone carries the triggering commit LSN. The page path pauses the sequencer,
+seeds the public page keys, and emits a table-qualified tombstone for a row deleted
+after the snapshot; that tombstone may trail newer events on the group stream and
+clients apply the LSN watermark before accepting it. On cancellation,
+`GroupReservationGuard` releases each private member claim before removing it from
+the compensation list, writes durable `GroupDropped` after a queued `GroupCreated`,
+then aborts the in-memory group claim. Engine close joins this cleanup task. The
+all-plain restart contract in PR #45 checks that this durable drop prevents a
+cancelled group from being restored as an active claim.
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:
