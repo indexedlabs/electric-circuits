@@ -726,9 +726,16 @@ mod tests {
             let handle = lanes.reserve("shape/group", vec![env(key)], key).unwrap();
             producers.push(tokio::spawn(handle.wait()));
         }
-        for task in producers.iter_mut().take(GROUP_LANE_CAPACITY) {
-            tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap().unwrap();
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if producers.iter().take(GROUP_LANE_CAPACITY).all(tokio::task::JoinHandle::is_finished) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(!producers[GROUP_LANE_CAPACITY].is_finished(), "the 65th admitted batch bypassed capacity");
         assert_eq!(store.appended.lock().unwrap().len(), 0);
 
