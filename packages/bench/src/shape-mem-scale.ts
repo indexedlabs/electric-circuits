@@ -55,7 +55,7 @@ const LIVE_SUBS = numEnv('SCALE_LIVE_SUBS', 20000)
 const LIVE_PROCS = numEnv('SCALE_LIVE_PROCS', 8)
 const LIVE_WRITES = numEnv('SCALE_LIVE_WRITES', 0)
 const LIVE_WRITE_INTERVAL_MS = numEnv('SCALE_LIVE_WRITE_INTERVAL_MS', 500)
-const LIVE_HOLD_MS = numEnv('SCALE_LIVE_HOLD_MS', 15000)
+const LIVE_HOLD_MS = numEnv('SCALE_LIVE_HOLD_MS', 120000)
 const WRITE_MARKER_PREFIX = `bench-${process.pid}-${Date.now()}-`
 type LiveMode = 'sse' | 'long-poll'
 function parseLiveMode(value: string): LiveMode {
@@ -283,39 +283,43 @@ async function runWorkers(
   env: Record<string, string>,
   feeds: string[][],
   waitExit: boolean,
-): Promise<{ procs: ChildProcess[]; stdout: string[] }> {
+): Promise<{ procs: ChildProcess[]; stdout: string[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] }> {
   const procs: ChildProcess[] = []
-  const exits: Promise<void>[] = []
+  const closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] = []
   const outs: string[] = []
   for (const feed of feeds) {
     const p = spawn(process.execPath, ['-e', js], { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'inherit'] })
     procs.push(p)
     const idx = outs.push('') - 1
+    const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
+      p.once('close', (code, signal) => resolve({ code, signal })))
+    closes.push(close)
     // Consume stdout LIVE — a full pipe buffer would block the worker.
     p.stdout!.on('data', (d: Buffer) => { outs[idx] += d.toString() })
     for (const line of feed) p.stdin!.write(line + '\n')
     p.stdin!.end()
-    if (waitExit) exits.push(new Promise((res, rej) => p.on('exit', (c) => (c ? rej(new Error(`worker exited ${c}`)) : res()))))
   }
-  if (waitExit) await Promise.all(exits)
-  return { procs, stdout: outs }
+  if (waitExit) {
+    const results = await Promise.all(closes)
+    const failed = results.find(({ code }) => code !== 0)
+    if (failed) throw new Error(`worker exited ${failed.code ?? failed.signal}`)
+  }
+  return { procs, stdout: outs, closes }
 }
 
-async function stopWorkers(run: { procs: ChildProcess[] }): Promise<void> {
-  const exits = run.procs.map((p) => {
-    if (p.exitCode !== null || p.signalCode !== null) return Promise.resolve()
-    const exited = new Promise<void>((resolve) => p.once('exit', () => resolve()))
-    p.kill('SIGTERM')
-    return exited
+async function stopWorkers(run: { procs: ChildProcess[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] }): Promise<void> {
+  run.procs.forEach((p) => {
+    if (p.exitCode === null && p.signalCode === null) p.kill('SIGTERM')
   })
-  await Promise.all(exits)
+  await Promise.all(run.closes)
 }
 
 interface LiveWorkerSummary {
   liveMode: LiveMode
   reads: number
+  failedReads?: number
   reconnects: number
-  maxActive: number
+  maxHeld: number
   elapsedMs: number
   deliveryMs?: number[]
 }
@@ -325,8 +329,9 @@ function percentile(values: number[], p: number): number | null {
   return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]! : null
 }
 
-function liveSummary(runs: Array<{ stdout: string[] }>): {
+function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): {
   reads: number
+  failedReads: number
   heldConnections: number
   reconnectsPerMinute: number
   deliveryP50Ms: number | null
@@ -347,13 +352,19 @@ function liveSummary(runs: Array<{ stdout: string[] }>): {
       }
     }
   }
+  const expected = runs.reduce((n, run) => n + run.procs.length, 0)
+  if (summaries.length !== expected) {
+    throw new Error(`live worker summaries missing: received ${summaries.length}, expected ${expected}`)
+  }
   const reads = summaries.reduce((n, s) => n + s.reads, 0)
-  const heldConnections = summaries.reduce((n, s) => n + s.maxActive, 0)
+  const failedReads = summaries.reduce((n, s) => n + (s.failedReads ?? 0), 0)
+  const heldConnections = summaries.reduce((n, s) => n + s.maxHeld, 0)
   const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
   const elapsedMs = Math.max(1, ...summaries.map((s) => s.elapsedMs))
   const deliveries = summaries.flatMap((s) => s.deliveryMs ?? [])
   return {
     reads,
+    failedReads,
     heldConnections,
     reconnectsPerMinute: reconnects * 60000 / elapsedMs,
     deliveryP50Ms: percentile(deliveries, 0.5),
@@ -446,7 +457,11 @@ async function main() {
     ? process.env.SCALE_LIVE_RAMP.split(',').map(Number)
     : LIVE_SUBS > 0 ? [LIVE_SUBS] : []
   let liveProcs: ChildProcess[] = []
-  const liveRuns: Array<{ procs: ChildProcess[]; stdout: string[] }> = []
+  const liveRuns: Array<{
+    procs: ChildProcess[]
+    stdout: string[]
+    closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[]
+  }> = []
   let held = 0
   for (const level of LIVE_RAMP) {
     if (!streamUrls.length) break
@@ -488,14 +503,17 @@ async function main() {
   }
   for (const run of liveRuns) await stopWorkers(run)
   const live = liveSummary(liveRuns)
-  console.log(`live ${LIVE_MODE}: reads=${live.reads} held=${live.heldConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+  if (LIVE_RAMP.some((level) => level > 0) && live.reads === 0) {
+    throw new Error('live workers produced zero reads for requested subscriptions')
+  }
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} held=${live.heldConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
 
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, peak held connections=${live.heldConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, peak held connections=${live.heldConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +

@@ -11,29 +11,32 @@ if (liveMode !== 'sse' && liveMode !== 'long-poll') {
 let buf = '';
 let stopping = false;
 let reads = 0;
+let failedReads = 0;
 let reconnects = 0;
-let active = 0;
-let maxActive = 0;
+let held = 0;
+let maxHeld = 0;
 const controllers = new Set();
 const startedAt = Date.now();
 const deliveryMs = [];
 const seenWrites = new Set();
 const markerPrefix = process.env.WORKER_WRITE_MARKER_PREFIX;
+let nextSubscriptionId = 0;
 
-function observeData(text) {
+function observeData(text, subscriptionId) {
   if (!markerPrefix) return;
   const at = text.indexOf(markerPrefix);
   if (at < 0) return;
-  const match = text.slice(at + markerPrefix.length).match(/^\d+/);
+  const match = text.slice(at + markerPrefix.length).match(/^\\d+/);
   if (!match) return;
   const writtenAt = Number(match[0]);
-  if (Number.isFinite(writtenAt) && !seenWrites.has(writtenAt)) {
-    seenWrites.add(writtenAt);
+  const key = subscriptionId + ':' + writtenAt;
+  if (Number.isFinite(writtenAt) && !seenWrites.has(key)) {
+    seenWrites.add(key);
     deliveryMs.push(Math.max(0, Date.now() - writtenAt));
   }
 }
 
-function applySseEvent(block, offset) {
+function applySseEvent(block, offset, subscriptionId) {
   let kind = 'message';
   const data = [];
   for (const raw of block.split('\\n')) {
@@ -51,12 +54,12 @@ function applySseEvent(block, offset) {
       // authoritative; the response is otherwise allowed to end and retry from the last token.
     }
   } else if (kind !== 'control') {
-    observeData(payload);
+    observeData(payload, subscriptionId);
   }
   return offset;
 }
 
-async function readSse(response, offset) {
+async function readSse(response, offset, subscriptionId) {
   const contentType = response.headers.get('content-type') ?? '';
   if (!contentType.toLowerCase().startsWith('text/event-stream')) {
     throw new Error('SSE response was ' + contentType);
@@ -67,8 +70,8 @@ async function readSse(response, offset) {
   for await (const chunk of response.body) {
     pending += decoder.decode(chunk, { stream: true });
     let boundary;
-    while ((boundary = pending.match(/\r?\n\r?\n/)) !== null) {
-      offset = applySseEvent(pending.slice(0, boundary.index), offset);
+    while ((boundary = pending.match(/\\r?\\n\\r?\\n/)) !== null) {
+      offset = applySseEvent(pending.slice(0, boundary.index), offset, subscriptionId);
       pending = pending.slice(boundary.index + boundary[0].length);
     }
   }
@@ -78,32 +81,41 @@ async function readSse(response, offset) {
   return offset;
 }
 
-async function readLongPoll(response, offset) {
+async function readLongPoll(response, offset, subscriptionId) {
   const next = response.headers.get('stream-next-offset');
-  if (response.body) observeData(await response.text());
+  if (response.body) observeData(await response.text(), subscriptionId);
   return next || offset;
 }
 
 async function hold(url) {
+  const subscriptionId = String(nextSubscriptionId++);
   let offset = '-1';
   let opened = false;
   while (!stopping) {
     const ctl = new AbortController();
-    active++;
     controllers.add(ctl);
-    maxActive = Math.max(maxActive, active);
     reads++;
     if (opened) reconnects++;
     opened = true;
+    let responseHeld = false;
     try {
       const live = liveMode === 'sse' ? 'sse' : 'long-poll';
       const r = await fetch(url + '?offset=' + encodeURIComponent(offset) + '&live=' + live, { signal: ctl.signal });
-      offset = liveMode === 'sse' ? await readSse(r, offset) : await readLongPoll(r, offset);
+      if (!r.ok) {
+        failedReads++;
+        throw new Error('live response was ' + r.status);
+      }
+      held++;
+      maxHeld = Math.max(maxHeld, held);
+      responseHeld = true;
+      offset = liveMode === 'sse'
+        ? await readSse(r, offset, subscriptionId)
+        : await readLongPoll(r, offset, subscriptionId);
     } catch {
       if (!stopping) await new Promise((res) => setTimeout(res, 1000));
     } finally {
+      if (responseHeld) held--;
       controllers.delete(ctl);
-      active--;
     }
   }
 }
@@ -121,8 +133,9 @@ process.on('SIGTERM', () => {
   const summary = {
     liveMode,
     reads,
+    failedReads,
     reconnects,
-    maxActive,
+    maxHeld,
     elapsedMs,
     reconnectsPerMinute: reconnects * 60000 / elapsedMs,
     deliveries: deliveryMs.length,

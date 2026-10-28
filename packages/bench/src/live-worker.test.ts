@@ -10,6 +10,8 @@ interface ListenerRun {
   requests: URL[]
   worker: ReturnType<typeof spawn>
   server: ReturnType<typeof createServer>
+  stdout: string
+  stderr: string
   firstRequest: Promise<URL>
   secondRequest: Promise<URL>
 }
@@ -40,6 +42,8 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
   const requests: URL[] = []
   const first = deferred<URL>()
   const second = deferred<URL>()
+  const markerPrefix = 'bench-test-'
+  const writtenAt = Date.now() - 25
   let base = ''
   server.on('request', (req: IncomingMessage, res: ServerResponse) => {
     const request = new URL(req.url ?? '/', base)
@@ -48,10 +52,13 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
       first.resolve(request)
       if (mode === 'sse') {
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
-        res.write('event: data\ndata: {"value":"first"}\n\n')
-        res.write('event: control\ndata: {}\n\n')
-        res.write('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
-        res.end()
+        res.write(`event: data\ndata: {"value":"${markerPrefix}`)
+        setImmediate(() => {
+          res.write(`${writtenAt}"}\n\n`)
+          res.write('event: control\ndata: {}\n\n')
+          res.write('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
+          res.end()
+        })
       }
       return
     }
@@ -63,20 +70,23 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
   const address = server.address()
   if (address === null || typeof address === 'string') throw new Error('missing listener address')
   base = `http://127.0.0.1:${address.port}`
-  const env = { ...process.env }
+  const env = { ...process.env, WORKER_WRITE_MARKER_PREFIX: markerPrefix }
   delete env.WORKER_LIVE_MODE
   if (mode !== undefined) env.WORKER_LIVE_MODE = mode
   const worker = spawn(process.execPath, ['-e', LIVE_WORKER_JS], {
     env,
-    stdio: ['pipe', 'ignore', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
   })
+  const run = { requests, worker, server, stdout: '', stderr: '', firstRequest: first.promise, secondRequest: second.promise }
+  worker.stdout!.on('data', (d: Buffer) => { run.stdout += d.toString() })
+  worker.stderr!.on('data', (d: Buffer) => { run.stderr += d.toString() })
   worker.stdin.end(`${base}/v1/stream/shape/test\n`)
-  return { requests, worker, server, firstRequest: first.promise, secondRequest: second.promise }
+  return run
 }
 
 async function stopListener(run: ListenerRun): Promise<void> {
-  run.worker.kill('SIGKILL')
-  await once(run.worker, 'exit')
+  if (run.worker.exitCode === null && run.worker.signalCode === null) run.worker.kill('SIGTERM')
+  await once(run.worker, 'close')
   run.server.closeAllConnections()
   await new Promise<void>((resolve, reject) => run.server.close((error) => error ? reject(error) : resolve()))
 }
@@ -95,6 +105,20 @@ describe('per-table bench live mode', () => {
     } finally {
       await stopListener(run)
     }
+    const summary = JSON.parse(run.stdout.trim()) as {
+      reads: number
+      reconnects: number
+      maxHeld: number
+      deliveries: number
+      deliveryP50Ms: number | null
+      deliveryP90Ms: number | null
+    }
+    expect(summary.reads).toBeGreaterThanOrEqual(2)
+    expect(summary.reconnects).toBeGreaterThanOrEqual(1)
+    expect(summary.maxHeld).toBe(1)
+    expect(summary.deliveries).toBeGreaterThanOrEqual(1)
+    expect(summary.deliveryP50Ms).not.toBeNull()
+    expect(summary.deliveryP90Ms).not.toBeNull()
   })
 
   it.each([undefined, 'long-poll'] as const)('keeps long-poll for mode %s', async (mode) => {
@@ -114,7 +138,10 @@ describe('per-table bench live mode', () => {
       env: { ...process.env, WORKER_LIVE_MODE: 'SSE' },
       stdio: ['pipe', 'ignore', 'pipe'],
     })
-    const [code] = await once(worker, 'exit')
-    expect(code).not.toBe(0)
+    let stderr = ''
+    worker.stderr!.on('data', (d: Buffer) => { stderr += d.toString() })
+    const [code] = await once(worker, 'close')
+    expect(code).toBe(2)
+    expect(stderr).toContain('unknown WORKER_LIVE_MODE=SSE')
   })
 })

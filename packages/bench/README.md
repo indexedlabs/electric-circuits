@@ -59,11 +59,13 @@ are enabled.
 
 ```bash
 SCALE_LIVE_MODE=sse SCALE_LIVE_SUBS=100 SCALE_LIVE_WRITES=20 \
-  SCALE_LIVE_WRITE_INTERVAL_MS=500 SCALE_OUT=docs/bench/per-table-sse.md \
+  SCALE_LIVE_WRITE_INTERVAL_MS=500 SCALE_OUT=../../docs/bench/per-table-sse.md \
   pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-scale.ts
 ```
 
-Run the same command with `SCALE_LIVE_MODE=long-poll` and the same seed, shape and write settings
+The default observation hold is 120 s so an SSE response that the server closes at about 60 s can
+be observed reconnecting; override `SCALE_LIVE_HOLD_MS` only when the observation window is part of
+the recorded comparison. Run the same command with `SCALE_LIVE_MODE=long-poll` and the same seed, shape and write settings
 to compare direct engine/Durable Streams behavior. This bench does not model gateway CPU or pool
 limits; those measurements require the real Indexed dev load balancer.
 
