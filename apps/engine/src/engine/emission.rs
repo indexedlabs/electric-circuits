@@ -708,10 +708,7 @@ mod tests {
             .unwrap()
             .iter()
             .map(|(_, _, body)| {
-                serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"]
-                    .as_str()
-                    .unwrap()
-                    .to_string()
+                serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"].as_str().unwrap().to_string()
             })
             .collect::<Vec<_>>();
         let mut expected = (0..=128u64).map(|i| format!("x{i}")).collect::<Vec<_>>();
@@ -773,10 +770,7 @@ mod tests {
         {
             let state = lane.state.lock().unwrap();
             assert!(state.admitted.len() + usize::from(state.in_flight.is_some()) <= GROUP_LANE_CAPACITY + 1);
-            assert!(state
-                .waiting
-                .iter()
-                .all(|ticket| ticket.entry.envs.lock().unwrap().is_none()));
+            assert!(state.waiting.iter().all(|ticket| ticket.entry.envs.lock().unwrap().is_none()));
         }
 
         gate.released.notify_one();
