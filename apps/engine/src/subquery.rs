@@ -4098,9 +4098,7 @@ mod tests {
     async fn an_older_queryback_stamp_cannot_replace_a_newer_live_stamp() {
         let (ts, store, mut reg) = recency_fixture().await;
         reg.begin_queryback("s1");
-        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x200, Some(50), None, None)
-            .await
-            .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x200, Some(50), None, None).await.unwrap();
 
         // This query-back was triggered by an older flip, but its read snapshot already saw the
         // live xid.  It may apply, but it must not write its older triggering LSN into `recent`.
@@ -4152,15 +4150,11 @@ mod tests {
 
         let page = crate::pg::SnapshotGate::parse("40:45:", "0/150");
         let pending = reg
-            .seed_group_snapshot_keys(
-                "s1",
-                &[serde_json::json!({"id": 1, "project_id": 100})],
-                &page,
-            )
+            .seed_group_snapshot_keys("s1", &[serde_json::json!({"id": 1, "project_id": 100})], &page)
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].2[0].headers.operation, "delete");
-        assert_eq!(pending[0].2[0].type_, "issues");
+        assert_eq!(pending[0].2[0].type_, "public.issues");
         reg.end_queryback("s1");
     }
 

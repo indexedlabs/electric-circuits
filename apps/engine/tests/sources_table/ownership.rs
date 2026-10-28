@@ -115,8 +115,8 @@ fn group_disjoint_same_table_sibling_survives_move_out() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_page_handoff_preserves_newer_move_out() -> Result<()> {
-    isolated("ownership::group_page_handoff_preserves_newer_move_out", Case::GroupPageHandoff)
+fn group_page_handoff_outer_delete_emits_tombstone() -> Result<()> {
+    isolated("ownership::group_page_handoff_outer_delete_emits_tombstone", Case::GroupPageHandoff)
 }
 
 #[test]
@@ -1118,17 +1118,24 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
             "page did not observe the row inserted between private seed and page: {body}"
         );
         let path = body["streamPath"].as_str().context("group stream path")?;
-        let events = wait_group_events(f, path, 1).await?;
         let table = format!("public.{}", f.outer);
-        ensure!(
-            events.iter().any(|event| {
-                event_key(event).as_deref() == Some("3")
-                    && event_operation(event) == Some("delete")
-                    && event["type"].as_str() == Some(table.as_str())
-                    && event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str())
-            }),
-            "page-visible row moved out before key handoff without a fenced tombstone: {events:?}"
-        );
+        let mut changed = f.ds.changed.subscribe();
+        let events = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let events = stream_events(f, path).await;
+                if events.iter().any(|event| {
+                    event_key(event).as_deref() == Some("3")
+                        && event_operation(event) == Some("delete")
+                        && event["type"].as_str() == Some(table.as_str())
+                        && event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str())
+                }) {
+                    return Ok::<_, anyhow::Error>(events);
+                }
+                changed.changed().await.context("group stream observation channel closed")?;
+            }
+        })
+        .await
+        .context("waiting for the fenced page tombstone")??;
         Ok::<_, anyhow::Error>(())
     }
     .await;

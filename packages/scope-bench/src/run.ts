@@ -370,8 +370,8 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
             writeStarted.set(marker, performance.now())
             const assignmentId = `${marker}-assignment`
             const taggedId = `${marker}-tag`
-            harnessUtilityStatements++
             await admin.query('begin')
+            harnessUtilityStatements++
             await admin.query(`update record set title = $1 where id = $2 and user_id = $3`, [marker, recordId, user])
             await admin.query(
               `insert into assignment (id, user_id, record_id, payload) values ($1, $2, $3, $4) on conflict (id) do update set payload = excluded.payload`,
@@ -381,13 +381,15 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
               `insert into tagged_item (id, user_id, record_id, tag_id) values ($1, $2, $3, $4) on conflict (id) do update set tag_id = excluded.tag_id`,
               [taggedId, user, recordId, marker],
             )
-            harnessUtilityStatements++
             await admin.query('commit')
+            harnessUtilityStatements++
             steadyWrites++
           }
         } catch {
-          harnessUtilityStatements++
-          await admin.query('rollback').catch(() => {})
+          try {
+            await admin.query('rollback')
+            harnessUtilityStatements++
+          } catch {}
         } finally {
           writeBusy = false
         }

@@ -186,13 +186,11 @@ at its first timing assertion (`onWake` occurred at t=125 ms). This is the genui
 red for the remaining benchmark-model defect, not an engine failure. The same run
 also confirms TypeScript, the supported Node gate and image builds passed.
 
-The next candidate routes each received streaming chunk through the shared return
-half-RTT/downlink queue and increments `bytesDown`; CI must turn that one test green.
-It also seeds keys from the actual public group page into each subquery member's
-FeedSet before the group claim becomes durable, closing the page/feed handoff that
-could otherwise leave a snapshot row without a delete gate. The private key seed
-and this public-page seed both retain only keys; the extra bounded reads and feed
-entries belong in both modes' measurements.
+The streaming fix routes each received chunk through the shared return half-RTT/downlink
+queue and increments `bytesDown`. The implementation also seeds keys from the actual
+public group page into each subquery member's FeedSet before the group claim becomes
+durable. The private key seed and this public-page seed both retain only keys; the extra
+bounded reads and feed entries belong in both modes' measurements.
 
 
 
@@ -226,7 +224,7 @@ before delivery.
 
 ### Current exact-head correction
 
-Head `87076ff` adds the missing real PostgreSQL page-handoff controls. The test-only
+Head `8185b7b` adds the missing real PostgreSQL page-handoff controls. The test-only
 sequencer pause keeps the source reader behind the page; an outer-row delete committed
 after the page is visible but unsequenced, so the live path cannot seed the member's
 FeedSet. Only the page-key handoff can emit the table-qualified tombstone, and the
@@ -240,8 +238,16 @@ and at the end of the hold. The end profile checks the requested mode and requir
 updates an assignment companion every 200 ms to exercise that path; this makes cold
 launch a corrected workload rather than a byte-for-byte replay of perf2. `readsPerChange`
 subtracts the benchmark writer's exact `BEGIN`/`COMMIT`/`ROLLBACK` utility statement
-count in addition to filtering its DML. The exact-head CI and five-repetition artifacts
-remain pending; no measurement is claimed until that run completes.
+count in addition to filtering its DML. The exact-head CI run `40717261548` (test job
+`122918228568`) reached the Rust and PostgreSQL lanes but failed before benchmark
+artifacts: rustfmt failed, the library tombstone assertion used an unqualified table
+name, and one new page contract failed before its event wait was made deterministic.
+No measurement is claimed from it.
+
+Earlier exact jobs are retained: group contracts passed in both modes at `8c0c6f0`
+(job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
+(`122838729992`); the Rust job remained red there on formatting and the unqualified
+tombstone assertion.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
@@ -295,8 +301,8 @@ key out/in/out after separate source receipts and checks the diagnostic mode and
 join-execution counter. Focused operator coverage includes distinct contributors,
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
 The join and reparenting controls passed at `7cbda3f`; the delete-gate, shared-worker,
-page-handoff and cancellation corrections are implemented on `87076ff` and await its
-exact-head CI run. Existing claim/lease, public snapshot query, group stream and
+page-handoff and cancellation corrections are implemented on `8185b7b` and the latest
+fix is pending CI. Existing claim/lease, public snapshot query, group stream and
 commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
