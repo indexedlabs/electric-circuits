@@ -2152,16 +2152,15 @@ impl Engine {
         let subscription = subscription.to_string();
         let group_id = group.id.clone();
         let task_release = release.clone();
-        let done =
-            self.shutdown_token().spawn(async move {
-                let result = engine.release_group_claim_owned(&subscription, group).await;
-                task_release.complete(&result);
-                let mut releases = engine.group_releases.lock().unwrap();
-                if releases.get(&group_id).is_some_and(|current| std::sync::Arc::ptr_eq(current, &task_release)) {
-                    releases.remove(&group_id);
-                }
-                result
-            });
+        let done = self.shutdown_token().spawn(async move {
+            let result = engine.release_group_claim_owned(&subscription, group).await;
+            task_release.complete(&result);
+            let mut releases = engine.group_releases.lock().unwrap();
+            if releases.get(&group_id).is_some_and(|current| std::sync::Arc::ptr_eq(current, &task_release)) {
+                releases.remove(&group_id);
+            }
+            result
+        });
         done.await.map_err(|_| anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN))?
     }
 

@@ -1735,10 +1735,7 @@ impl Engine {
                     self.group_fence.activate();
                 } else {
                     tracing::info!(%subscription, "restore: dropping group with a non-restorable subquery member");
-                    self.catalog_tx.send(CatalogEvent::GroupDropped {
-                        subscription,
-                        group_id: Some(group.id.clone()),
-                    });
+                    self.catalog_tx.send(CatalogEvent::GroupDropped { subscription, group_id: Some(group.id.clone()) });
                     for member in &group.members {
                         if let Some(rec) = st.shapes.remove(&member.shape_id) {
                             st.forget_subscriptions(&member.shape_id);
