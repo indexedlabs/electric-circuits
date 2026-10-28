@@ -32,6 +32,7 @@ import pgpkg from 'pg'
 import { postgres18Tools } from '../../../scripts/postgres18.js'
 import { LIVE_WORKER_JS } from './live-worker.js'
 import { createLiveReadinessGate } from './live-readiness.js'
+import { assertLiveMeasurements, summarizeLiveRuns, type LiveSummaryRun, type LiveWorkerSummary } from './live-summary.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 function repoRoot(): string {
@@ -351,90 +352,6 @@ async function stopWorkers(run: { procs: ChildProcess[]; closes: Promise<{ code:
   await Promise.all(run.closes)
 }
 
-interface LiveWorkerSummary {
-  liveMode: LiveMode
-  reads: number
-  failedReads?: number
-  reconnects: number
-  maxHeld: number
-  maxInFlight?: number
-  subscriptions?: number
-  readySubscriptions?: number
-  readyAt?: number | null
-  measurementReady?: boolean
-  elapsedMs: number | null
-  deliveryMs?: number[]
-}
-
-function percentile(values: number[], p: number): number | null {
-  const sorted = [...values].sort((a, b) => a - b)
-  return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]! : null
-}
-
-function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): {
-  reads: number
-  failedReads: number
-  heldConnections: number
-  inFlightConnections: number
-  totalReconnectsPerMinute: number
-  reconnectsPerSubscriptionMinute: number
-  readinessSpreadsMs: Array<number | null>
-  deliveryP50Ms: number | null
-  deliveryP90Ms: number | null
-  deliveries: number
-} {
-  const summaries: LiveWorkerSummary[] = []
-  for (const run of runs) {
-    for (const output of run.stdout) {
-      for (const line of output.split('\n')) {
-        if (!line) continue
-        try {
-          const parsed = JSON.parse(line) as LiveWorkerSummary
-          if (parsed.liveMode === LIVE_MODE && typeof parsed.reads === 'number') summaries.push(parsed)
-        } catch {
-          // Creation workers and diagnostic output are not live summaries.
-        }
-      }
-    }
-  }
-  const expected = runs.reduce((n, run) => n + run.procs.length, 0)
-  if (summaries.length !== expected) {
-    throw new Error(`live worker summaries missing: received ${summaries.length}, expected ${expected}`)
-  }
-  const notReady = summaries.find((s) => s.measurementReady === false || s.elapsedMs === null)
-  if (notReady) throw new Error('live worker measurement not ready')
-  const reads = summaries.reduce((n, s) => n + s.reads, 0)
-  const failedReads = summaries.reduce((n, s) => n + (s.failedReads ?? 0), 0)
-  const heldConnections = summaries.reduce((n, s) => n + s.maxHeld, 0)
-  const inFlightConnections = summaries.reduce((n, s) => n + (s.maxInFlight ?? s.maxHeld), 0)
-  const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
-  const measurementWindowMs = Math.max(...summaries.map((s) => s.elapsedMs ?? 0), 0)
-  const subscriptionMinutes = summaries.reduce((n, s) => n + (s.subscriptions ?? 1) * (s.elapsedMs ?? 0) / 60000, 0)
-  const readinessSpreadsMs = runs.map((run) => {
-    const times = run.stdout.flatMap((output) => output.split('\n')).flatMap((line) => {
-      try {
-        const parsed = JSON.parse(line) as LiveWorkerSummary
-        return typeof parsed.readyAt === 'number' ? [parsed.readyAt] : []
-      } catch {
-        return []
-      }
-    })
-    return times.length > 1 ? Math.max(...times) - Math.min(...times) : times.length ? 0 : null
-  })
-  const deliveries = summaries.flatMap((s) => s.deliveryMs ?? [])
-  return {
-    reads,
-    failedReads,
-    heldConnections,
-    inFlightConnections,
-    totalReconnectsPerMinute: measurementWindowMs ? reconnects * 60000 / measurementWindowMs : 0,
-    reconnectsPerSubscriptionMinute: subscriptionMinutes ? reconnects / subscriptionMinutes : 0,
-    readinessSpreadsMs,
-    deliveryP50Ms: percentile(deliveries, 0.5),
-    deliveryP90Ms: percentile(deliveries, 0.9),
-    deliveries: deliveries.length,
-  }
-}
 
 function chunks<T>(arr: T[], n: number): T[][] {
   const out: T[][] = Array.from({ length: n }, () => [])
@@ -585,22 +502,30 @@ async function main() {
     }
   }
   for (const run of liveRuns) await stopWorkers(run)
-  const live = liveSummary(liveRuns)
-  if (LIVE_RAMP.some((level) => level > 0) && live.reads === 0) {
-    throw new Error('live workers produced zero reads for requested subscriptions')
-  }
-  if (LIVE_RAMP.some((level) => level > 0) && live.failedReads * 2 >= Math.max(1, live.reads)) {
-    throw new Error(`live workers had too many failed reads: ${live.failedReads}/${live.reads}`)
-  }
+  const summaryRuns: LiveSummaryRun[] = liveRuns.map((run) => ({
+    expected: run.procs.length,
+    summaries: run.stdout.flatMap((output) => output.split('\n')).flatMap((line) => {
+      if (!line) return []
+      try {
+        const parsed = JSON.parse(line) as LiveWorkerSummary
+        return parsed.liveMode === LIVE_MODE && typeof parsed.reads === 'number' ? [parsed] : []
+      } catch {
+        return []
+      }
+    }),
+  }))
+  const live = summarizeLiveRuns(summaryRuns)
+  assertLiveMeasurements(live, LIVE_RAMP.some((level) => level > 0))
+  const totalReconnects = live.totalReconnectsPerMinute.map((value) => value.toFixed(2)).join(',') || 'n/a'
   const readinessSpreads = live.readinessSpreadsMs.map((value) => value ?? 'n/a').join(',') || 'n/a'
-  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} total-reconnects/observation-window/min=${live.totalReconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spreads=${readinessSpreads}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} total-reconnects/observation-window/min=${totalReconnects} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} readiness-spreads=${readinessSpreads}ms deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
 
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, total reconnects/observation-window/min=${live.totalReconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spreads=${readinessSpreads} ms per ramp level, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, total reconnects/observation-window/min=${totalReconnects}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, readiness spreads=${readinessSpreads} ms per ramp level, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
