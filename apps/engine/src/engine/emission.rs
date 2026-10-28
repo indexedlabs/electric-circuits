@@ -352,23 +352,66 @@ mod tests {
 
     #[tokio::test]
     async fn group_lane_capacity_waits_for_a_slot_and_preserves_batch_order() {
-        let (tx, mut rx) = mpsc::channel::<GroupBatch>(GROUP_LANE_CAPACITY);
-        for commit_lsn in 0..GROUP_LANE_CAPACITY as u64 {
-            tx.send(GroupBatch { commit_lsn, stream_path: "shape/group".into(), envs: Vec::new() })
-                .await
-                .unwrap();
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.append_fault.lock().unwrap() =
+            Some(("shape/group".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
+        let lanes = GroupEmissionLanes::new(
+            DsClient::with_test_store("scripted://group-lane".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            Arc::new(PendingFlips::default()),
+        );
+        lanes.register("shape/group");
+        let env = |commit_lsn: u64| Envelope {
+            type_: "shape/group".into(),
+            key: commit_lsn.to_string(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        };
+        lanes.enqueue("shape/group", vec![env(0)], 0).await;
+        while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
         }
-        let next = tx.send(GroupBatch { commit_lsn: 64, stream_path: "shape/group".into(), envs: Vec::new() });
-        tokio::pin!(next);
-        tokio::select! {
-            biased;
-            _ = &mut next => panic!("a full group lane accepted a batch without waiting"),
-            _ = tokio::task::yield_now() => {}
+        for commit_lsn in 1..=GROUP_LANE_CAPACITY as u64 {
+            lanes.enqueue("shape/group", vec![env(commit_lsn)], commit_lsn).await;
         }
-        assert_eq!(rx.recv().await.unwrap().commit_lsn, 0);
+        let next = tokio::spawn({
+            let lanes = lanes.clone();
+            async move { lanes.enqueue("shape/group", vec![env(65)], 65).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished(), "a full group lane accepted a batch without waiting");
+
+        for _ in 0..GROUP_LANE_CAPACITY {
+            let before = gate.arrived.load(std::sync::atomic::Ordering::Acquire);
+            *store.append_fault.lock().unwrap() =
+                Some(("shape/group".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
+            gate.released.notify_one();
+            while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == before {
+                tokio::task::yield_now().await;
+            }
+        }
+        gate.released.notify_one();
         next.await.unwrap();
-        for expected in 1..=GROUP_LANE_CAPACITY as u64 {
-            assert_eq!(rx.recv().await.unwrap().commit_lsn, expected);
-        }
+        let landed = store.appended.lock().unwrap().clone();
+        let keys = landed
+            .into_iter()
+            .map(|(_, _, body)| {
+                serde_json::from_slice::<Vec<serde_json::Value>>(&body).unwrap()[0]["key"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, (0..=65).collect::<Vec<_>>());
     }
 }
