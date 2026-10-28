@@ -1548,7 +1548,6 @@ impl Engine {
             ds.clone(),
             std::env::var("ELECTRIC_CIRCUITS_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             pending_flips.clone(),
-            degrade.clone(),
             shutdown.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
@@ -2876,7 +2875,7 @@ impl Engine {
     /// Reserve a group claim before any private member shape is created.  The ordinary
     /// subscription map and the group map are checked while holding one state lock, so a
     /// concurrent single-shape create cannot win the same claim between member creates.
-    pub(crate) async fn reserve_group(&self, subscription: &str) -> Result<()> {
+    pub(crate) async fn reserve_group(&self, subscription: &str, member_subscriptions: &[String]) -> Result<()> {
         let mut st = self.state.lock().await;
         if let Some(owner) = st.subscription_owner(subscription) {
             return Err(anyhow::Error::new(crate::engine::GroupConflict {
@@ -2884,7 +2883,29 @@ impl Engine {
                 owner: format!("shape {owner}"),
             }));
         }
-        st.group_claims.reserve(subscription, &format!("group {subscription}"))
+        if let Some(owner) = st.group_claims.private_owner(subscription) {
+            return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("group {owner}"),
+            }));
+        }
+        for member in member_subscriptions {
+            if let Some(owner) = st.subscription_owner(member) {
+                return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                    subscription: member.clone(),
+                    owner: format!("shape {owner}"),
+                }));
+            }
+            if let Some(owner) = st.group_claims.private_owner(member) {
+                return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                    subscription: member.clone(),
+                    owner: format!("group {owner}"),
+                }));
+            }
+        }
+        st.group_claims.reserve(subscription, &format!("group {subscription}"))?;
+        st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
+        Ok(())
     }
 
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {

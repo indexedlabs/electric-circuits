@@ -36,7 +36,6 @@ struct Batch {
 pub(crate) struct EmissionLanes {
     lanes: Arc<Vec<mpsc::Sender<Batch>>>,
     pending: Arc<PendingFlips>,
-    degrade: Arc<DegradeState>,
 }
 
 impl EmissionLanes {
@@ -46,7 +45,6 @@ impl EmissionLanes {
         ds: DsClient,
         n: usize,
         pending: Arc<PendingFlips>,
-        degrade: Arc<DegradeState>,
         shutdown: crate::shutdown::ShutdownToken,
     ) -> EmissionLanes {
         let n = n.max(1);
@@ -68,7 +66,7 @@ impl EmissionLanes {
             });
             lanes.push(tx);
         }
-        EmissionLanes { lanes: Arc::new(lanes), pending, degrade }
+        EmissionLanes { lanes: Arc::new(lanes), pending }
     }
 
     /// Which lane serves `path` (stable: one stream always drains through one FIFO).
@@ -109,11 +107,20 @@ pub(crate) struct GroupEmissionLanes {
     ds: DsClient,
     shutdown: crate::shutdown::ShutdownToken,
     pending: Arc<PendingFlips>,
+    origins: Arc<std::sync::Mutex<BTreeMap<u64, usize>>>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl GroupEmissionLanes {
     pub(crate) fn new(ds: DsClient, shutdown: crate::shutdown::ShutdownToken, pending: Arc<PendingFlips>) -> Self {
-        Self { lanes: Arc::new(std::sync::Mutex::new(HashMap::new())), ds, shutdown, pending }
+        Self {
+            lanes: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            ds,
+            shutdown,
+            pending,
+            origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
     }
 
     fn lane(&self, path: &str) -> mpsc::Sender<GroupBatch> {
@@ -138,38 +145,60 @@ impl GroupEmissionLanes {
         tx
     }
 
-    /// Append one complete group transaction batch. `send().await` is the explicit backpressure
-    /// point: a full group waits for its own worker and cannot drop, split, reorder or degrade the
-    /// engine. The oneshot keeps the caller's transaction barrier closed until durable append.
-    pub(crate) async fn append(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
+    pub(crate) fn register_origin(&self, commit_lsn: u64) {
+        *self.origins.lock().unwrap().entry(commit_lsn).or_default() += 1;
+    }
+
+    fn complete_origin(&self, commit_lsn: u64) {
+        let mut origins = self.origins.lock().unwrap();
+        let Some(count) = origins.get_mut(&commit_lsn) else { return };
+        *count -= 1;
+        if *count == 0 {
+            origins.remove(&commit_lsn);
+        }
+        drop(origins);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) fn has_origin_at_or_before(&self, marker_lsn: u64) -> bool {
+        self.origins.lock().unwrap().first_key_value().is_some_and(|(&lsn, _)| lsn <= marker_lsn)
+    }
+
+    /// Queue one complete group batch. The bounded send is awaited by an engine-owned task rather
+    /// than while the subquery registry mutex is held; a full group waits for its own lane and
+    /// cannot drop, split, reorder or degrade unrelated shapes.
+    pub(crate) fn enqueue(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if envs.is_empty() {
-            return Ok(());
+            return;
         }
         let (done, wait) = tokio::sync::oneshot::channel();
         self.pending.add(commit_lsn);
+        self.register_origin(commit_lsn);
         let batch = GroupBatch { stream_path: path.to_string(), envs, done };
         let sender = self.lane(path);
-        let sent = tokio::select! {
-            result = sender.send(batch) => result.is_ok(),
-            _ = self.shutdown.wait() => {
-                self.pending.complete(commit_lsn);
-                return Err(anyhow::anyhow!("group emission lane closed during shutdown"));
-            },
-        };
-        if !sent {
-            self.pending.complete(commit_lsn);
-            return Err(anyhow::anyhow!("group emission lane closed"));
-        }
-        let result = match wait.await {
-            Ok(result) => result,
-            Err(_) => {
-                self.pending.complete(commit_lsn);
-                return Err(anyhow::anyhow!("group emission worker stopped"));
+        let pending = self.pending.clone();
+        let origins = self.origins.clone();
+        let wake = self.wake.clone();
+        let shutdown = self.shutdown.clone();
+        self.shutdown.spawn_background(async move {
+            let sent = tokio::select! {
+                result = sender.send(batch) => result.is_ok(),
+                _ = shutdown.wait() => false,
+            };
+            if sent {
+                let _ = wait.await;
             }
-        };
-        self.pending.complete(commit_lsn);
-        result?;
-        Ok(())
+            pending.complete(commit_lsn);
+            let mut origins = origins.lock().unwrap();
+            if let Some(count) = origins.get_mut(&commit_lsn) {
+                *count -= 1;
+                if *count == 0 {
+                    origins.remove(&commit_lsn);
+                }
+            }
+            drop(origins);
+            wake.notify_waiters();
+        });
     }
 }
 
@@ -181,7 +210,7 @@ mod tests {
     fn a_worker_hands_its_commit_to_every_append_before_completing() {
         let pending = Arc::new(PendingFlips::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: DegradeState::new() };
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
         let envelope: Envelope = serde_json::from_value(serde_json::json!({
             "type": "test", "key": "1", "headers": {"operation": "upsert"}
         }))
@@ -209,16 +238,14 @@ mod tests {
     #[test]
     fn ordinary_lanes_remain_unbounded_and_do_not_degrade_when_busy() {
         let pending = Arc::new(PendingFlips::default());
-        let degrade = DegradeState::new();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: degrade.clone() };
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
         let envelope: Envelope = serde_json::from_value(serde_json::json!({
             "type": "public.items", "key": "1", "headers": {"operation": "upsert"}
         }))
         .unwrap();
         lanes.enqueue("shape/group-1", vec![envelope.clone()], 0x10);
         lanes.enqueue("shape/group-1", vec![envelope], 0x20);
-        assert!(!degrade.degraded.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(pending.count(), 2);
     }
 
@@ -227,7 +254,7 @@ mod tests {
         let pending = Arc::new(PendingFlips::default());
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone(), degrade: DegradeState::new() };
+        let lanes = EmissionLanes { lanes: Arc::new(vec![tx]), pending: pending.clone() };
         pending.add(0x30);
         let envelope = serde_json::from_value(serde_json::json!({
             "type": "test", "key": "1", "headers": {"operation": "upsert"}
