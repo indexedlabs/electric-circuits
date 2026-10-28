@@ -732,8 +732,8 @@ origin metadata, not as a total ordering of envelopes. The production handoff re
 decision map and xid gate; the PostgreSQL contract test additionally pauses the source reader to
 place its delete after the page snapshot. The bounded decision map is cleared on successful
 handoff and on cancellation. An aborted group request releases every private member claim and
-its query-back window before the group reservation is dropped, retaining failed releases until
-a durable `Left` is confirmed and re-enqueuing that event after a lost writer response. Once
+its query-back window before the group reservation is dropped, retrying a failed release while
+the catalog writer remains available and failing closed when the writer is gone. Once
 `GroupCreated` is queued, cancellation releases private member claims, queues a durable
 `GroupDropped`, and only then aborts the public reservation. The guard owns a counted shutdown
 party, so engine close waits for every concurrent compensation before draining the catalog; a

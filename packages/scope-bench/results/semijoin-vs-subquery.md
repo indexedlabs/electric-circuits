@@ -282,11 +282,13 @@ job `122975057785` failed. The subsequent `89a0b97` head added a shutdown party 
 compensation, a one-shot member-release re-enqueue, and the steady companion touch, but
 retained the same `drop_group_durable` type mismatch. Its test job `122988431056` failed at
 that compile error, its scope benchmark `122993623042` was skipped, and its engine image job
-`122988431228` failed. The reconciled follow-up adds the missing `?; Ok(())`, counts duplicate
-shutdown-party names, bounds writer-loss retries, fixes the four-stage barrier wiring and
-returns the source-fence cleanup to `Result<()>`. Its exact run `40741829458` (test job
-`123005145542`) was still compile/red while this report was reconciled; no benchmark result
-is claimed.
+`122988431228` failed. The `dba8b19` run `40741829458` (test job `123005145542`) was compile/red in formatting,
+group and Rust lanes; its Electric image was also red and Vitest was still running. The
+follow-up `c9ccae9` applies the missing `?; Ok(())`, counts duplicate shutdown-party names,
+bounds writer-loss retries, fixes the four-stage barrier wiring, and returns source-fence
+cleanup to `Result<()>`. Its exact run `40743452180` (test job `123010867174`) is the first
+candidate run with the corrected tree; at report time it was still in the Rust-cache/test
+lane, so no benchmark result is claimed.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
@@ -294,8 +296,8 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
 current candidate has passed; the five-repetition benchmark remains pending. The follow-up
 adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
-retry coverage. Merge head `d7cd60c` is pushed for a fresh exact-head CI run; no result from
-that run is claimed here yet.
+retry coverage. The current candidate is `c9ccae9`; its exact-head run is recorded above and remains
+unclaimed until all correctness and benchmark jobs finish.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

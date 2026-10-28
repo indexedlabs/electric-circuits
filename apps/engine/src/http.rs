@@ -1453,7 +1453,7 @@ impl GroupReservationGuard {
                 Ok(()) => return true,
                 Err(error) => {
                     tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
-                    if engine.shutdown_token().is_shutting_down() || tokio::time::Instant::now() >= deadline {
+                    if !first || tokio::time::Instant::now() >= deadline {
                         return false;
                     }
                     first = false;
@@ -1472,7 +1472,7 @@ impl GroupReservationGuard {
                 Ok(()) => return true,
                 Err(error) => {
                     tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
-                    if engine.shutdown_token().is_shutting_down() || tokio::time::Instant::now() >= deadline {
+                    if tokio::time::Instant::now() >= deadline {
                         return false;
                     }
                     tokio::time::sleep(backoff).await;
@@ -1486,21 +1486,23 @@ impl GroupReservationGuard {
         if !self.armed {
             return;
         }
+        let mut compensation_failed = false;
         while let Some((shape_id, subscription)) = self.members.last().cloned() {
             if !Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
-                return;
+                compensation_failed = true;
             }
-            if self.members.last().is_some_and(|member| member.0 == shape_id && member.1 == subscription) {
-                self.members.pop();
-            }
+            self.members.pop();
         }
         if self.group_created {
             if !Self::drop_group_durable(&self.engine, &self.subscription).await {
-                return;
+                compensation_failed = true;
             }
             self.group_created = false;
         }
         self.engine.abort_group(&self.subscription).await;
+        if compensation_failed {
+            tracing::error!(subscription = %self.subscription, "group compensation could not reach the catalog writer");
+        }
         self.armed = false;
     }
 
@@ -1522,16 +1524,10 @@ impl Drop for GroupReservationGuard {
         let party = self.compensation_party.take();
         engine.shutdown_token().spawn(async move {
             for (shape_id, member_subscription) in members {
-                if !GroupReservationGuard::release_member_durable(&engine, &shape_id, &member_subscription).await {
-                    drop(party);
-                    return;
-                }
+                let _ = GroupReservationGuard::release_member_durable(&engine, &shape_id, &member_subscription).await;
             }
             if group_created {
-                if !GroupReservationGuard::drop_group_durable(&engine, &subscription).await {
-                    drop(party);
-                    return;
-                }
+                let _ = GroupReservationGuard::drop_group_durable(&engine, &subscription).await;
             }
             engine.abort_group(&subscription).await;
             drop(party);
