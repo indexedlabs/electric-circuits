@@ -896,7 +896,9 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
             .filter(|event| event_key(event).as_deref() == Some("2") && event_operation(event) == Some("upsert"))
             .collect();
         ensure!(flips.len() >= 2, "missing T and T+1 member outputs: {events:?}");
-        ensure!(flips[0]["headers"]["lsn"] != flips[1]["headers"]["lsn"], "T and T+1 outputs were not separately fenced: {events:?}");
+        let first_txid: u64 = flips[0]["headers"]["txid"].as_str().unwrap_or_default().parse().unwrap_or(0);
+        let last_txid: u64 = flips.last().and_then(|event| event["headers"]["txid"].as_str()).unwrap_or_default().parse().unwrap_or(0);
+        ensure!(first_txid > 0 && first_txid < last_txid, "T+1 output crossed the T fence: {events:?}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
