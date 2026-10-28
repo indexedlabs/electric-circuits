@@ -1,10 +1,10 @@
 # Key-only semijoin versus subquery members
 
-Work in progress, not for merge. Correctness is still being validated by CI; two independent
-five-repetition PostgreSQL 18 benchmarks completed on `48501cd` and the preserved production
-tree at `9086025`. The measurements below are prototype evidence, not release qualification.
-Both runs show higher semijoin DBSP state, slower delivery and higher engine CPU; restart cost
-remains unavailable.
+Work in progress, not for merge. Correctness is still being validated by CI; four independent
+five-repetition PostgreSQL 18 benchmarks completed on the preserved production tree at
+`48501cd`, `9086025`, `8a93697` and `1d7bbbc`. The measurements below are prototype evidence,
+not release qualification. All four runs show higher semijoin DBSP state, slower delivery and
+higher engine CPU; restart cost remains unavailable.
 
 ## Pinned inputs and method
 
@@ -310,8 +310,9 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
-current candidate has passed. The earlier heads `89a0b97` through `48501cd` add completion durability compensation,
-shutdown-owned retry coverage and cancellation-stage retry coverage. The c78804a run
+current candidate has passed. The earlier heads `89a0b97` through `48501cd` add completion
+durability compensation, shutdown-owned retry coverage and cancellation-stage retry coverage.
+The c78804a run
 `40748888867` compiled and passed formatting, Rust, TypeScript and Node but its group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
 walsender pid 5267` during replacement restart; the restart helper now retries that transient
@@ -326,23 +327,51 @@ downloaded independently; its four raw JSON files have SHA-256 hashes
 `a41a2c6295e859a45ce4cee76c09fdb688303c0efefb62d586e9e7f27e4c70c9`,
 `4434bff4111fca45dcd4df89534111db763e7a5e6f71f0e145731c0c70c7c7dd`, and
 `8d9e762ceb83bbd87faf93625bfaf7947c01569b0a5aff9a74f2157cb824667b`.
-The 9086025 production tree is preserved through 1d7bbbc, docs-only `fc6c62a`, and current
-docs-only head `3438aa8`; 1d7bbbc adds test-barrier refactoring and evidence/docs updates.
-The exact-head test job `123079445250` for `3438aa8` is still running; 1d7bbbc's identical
-production tree already has a fully green test job `123064316739`.
+The 9086025 production tree is preserved through 1d7bbbc, docs-only `fc6c62a`, docs-only
+`3438aa8`, and current docs-only head `a3c67c9`; 1d7bbbc adds test-barrier refactoring and
+evidence/docs updates. The exact-head test job `123081366824` for `a3c67c9` is still running;
+1d7bbbc's identical production tree already has fully green test job `123064316739` and
+benchmark job `123077258047`.
 
 The 9086025 artifact is a second, independent five-repetition measurement on the production
 tree. Its medians are: cold group load 12,923/13,094 ms, cold RSS 71/73 MiB, cold DBSP used
 bytes 34,212/60,232, steady group load 4,349/4,358 ms, steady RSS 73/66 MiB, steady DBSP used
 bytes 65,092/103,176, actual reads/change 2.667/2.694, delivery p50/p90 530/684 and 1,282/2,035
-ms, engine CPU 2,000/3,070 ms, and gateway CPU 4,732/4,596 ms (subquery/semijoin). These
-replicate the direction of the first artifact but are not pooled because the runs are separate;
-the recommendation remains based on both measurements and the unavailable restart lane.
+ms, engine CPU 2,000/3,070 ms, and gateway CPU 4,732/4,596 ms (subquery/semijoin). The archive
+was independently downloaded and its digest is recorded above.
+
+The 8a93697 benchmark job `123073502747` (run `40757521152`) produced artifact `12849790738`,
+named `semijoin-vs-subquery-f83e7f42f2d6af3d861a2e5613da5dafef8ffbc6`, with digest
+`sha256:e6bd10cfd726b96d1563b673491f077aa937d711f17d0290e40e30937e451853`. Its medians
+(subquery/semijoin) were cold load 12,404/12,418 ms, cold RSS 74/76 MiB, cold DBSP
+34,212/60,232 bytes, steady load 3,969/3,953 ms, steady RSS 71/66 MiB, steady DBSP
+65,092/103,176 bytes, actual reads/change 2.661/2.722, delivery p50/p90 507/687 and 936/1,423
+ms, engine CPU 1,100/2,230 ms, and gateway CPU 4,660/4,652 ms. The archive was independently
+downloaded; its four raw JSON files have SHA-256 hashes
+`295f9477545f3b3f07aa2c2ddf515b603bc29ad0b3c94185379480eb0b1d8b3c`,
+`d5dc026ab6c3cf25af3a2f706883d5a51793679e21b1f21367472caf1e23fcac`,
+`d0f2f92dcda653a6308f4689985e5ef1d91eade4787f69c8b4fa7c28de23ebed`, and
+`412a215dfcb426a17cc0e79d3fd508c64daf259f8a870ecdd0597b1577990314`.
+
+The 1d7bbbc benchmark job `123077258047` (run `40758664517`) produced artifact `12849249330`,
+named `semijoin-vs-subquery-5d5fcf586f5d0020249f2fbce608819ebe6398da`, with digest
+`sha256:7fb5528954f2daa40746d2a28c1e5c1779e8a61eb38c042f24cbb9e7f813b713`. Its medians
+(subquery/semijoin) were cold load 13,166/13,175 ms, cold RSS 71/60 MiB, cold DBSP
+34,212/60,232 bytes, steady load 4,347/4,285 ms, steady RSS 71/61 MiB, steady DBSP
+65,092/98,844 bytes, actual reads/change 2.672/2.700, delivery p50/p90 519/735 and 1,282/2,045
+ms, engine CPU 2,070/3,180 ms, and gateway CPU 4,716/4,580 ms. The archive was independently
+downloaded; its four raw JSON files have SHA-256 hashes
+`efa3ffa625dae2eac276b9c1e6fdadef12469831c3ce2d7201357cb26d0c1325`,
+`e76542100079905b967295fc761fa01a22bb8366a25c7a3331f3f59946c71a37`,
+`20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324`, and
+`0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796`.
 
 | Replicate | Cold DBSP bytes (subquery / semijoin) | Steady DBSP bytes | Steady delivery p50/p90 (ms) | Engine CPU (ms) |
 | --- | ---: | ---: | ---: | ---: |
 | 48501cd | 34,212 / 60,232 | 65,092 / 94,512 | 495/734 / 1,373/1,981 | 1,920 / 3,070 |
 | 9086025 | 34,212 / 60,232 | 65,092 / 103,176 | 530/684 / 1,282/2,035 | 2,000 / 3,070 |
+| 8a93697 | 34,212 / 60,232 | 65,092 / 103,176 | 507/687 / 936/1,423 | 1,100 / 2,230 |
+| 1d7bbbc | 34,212 / 60,232 | 65,092 / 98,844 | 519/735 / 1,282/2,045 | 2,070 / 3,180 |
 
 Values in each cell are subquery / semijoin; the runs are reported separately, not pooled.
 
@@ -401,10 +430,11 @@ join-execution counter. Focused operator coverage includes distinct contributors
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
 The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
 corrections are implemented through `9cffab2`, while the page-handoff and cancellation
-corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the full test job and produced the first benchmark artifact; head
-`8a93697` adds the slot-busy stabilization and second-barrier rollback contract. The current
-merge/docs head `3438aa8` is docs-only over the identical production tree, and 1d7bbbc's fully
-green test job `123064316739` qualifies that tree.
+corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the full
+test job and produced the first benchmark artifact; head `8a93697` adds the slot-busy
+stabilization and second-barrier rollback contract. Current heads `fc6c62a`, `3438aa8` and
+`a3c67c9` are docs-only over the identical production tree, and 1d7bbbc's fully green test job
+`123064316739` qualifies that tree.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
@@ -456,10 +486,13 @@ only the October 25 scope-load/read-scaling changes.
 
 ## Recommendation
 
-Both completed five-repetition runs miss the decision threshold. Semijoin DBSP used bytes
-are about 76% higher cold and 45–59% higher steady; delivery is about 2.4–3.0× slower at
-p50/p90, and engine CPU is about 53–60% higher. Process RSS varies: semijoin is about 1 MiB
-higher in one steady run and 7 MiB lower in the other. Restart cost is unavailable. Keep the accepted subquery-members decision in place. Revisit semijoin only with a
-restart lane or a per-group scaling run that demonstrates lower DBSP memory and restart cost on
-the same target-version inputs. ec#44's documented lifecycle, cancellation and burst-pressure
-gaps also prevent treating either membership experiment as production-ready.
+All four completed five-repetition runs miss the decision threshold. Semijoin DBSP used bytes
+are about 76% higher cold and 45–59% higher steady; delivery is about 1.8–3.0× slower at
+p50/p90, and engine CPU is about 53–103% higher. Cold process RSS is 1.4–11 MiB higher for
+semijoin in three runs and lower by 11 MiB in one; steady semijoin RSS is 0.9–10 MiB lower
+in all four. That RSS variation is allocator noise beside the consistently higher DBSP state,
+latency and CPU. Restart cost is unavailable. Keep the accepted subquery-members decision in
+place. Revisit semijoin only with a restart lane or a per-group scaling run that demonstrates
+lower DBSP memory and restart cost on the same target-version inputs. ec#44's documented
+lifecycle, cancellation and burst-pressure gaps also prevent treating either membership
+experiment as production-ready.
