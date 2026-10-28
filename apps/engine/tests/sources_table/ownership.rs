@@ -1447,12 +1447,14 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    let close = engine.close(Duration::from_secs(10)).await;
+    // Keep the fault-cut variables available until the engine has drained all shutdown-owned
+    // compensation tasks; removing them earlier races native environment readers in those tasks.
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER") };
-    let close = engine.close(Duration::from_secs(10)).await;
     let fence = remove_source_fence(f).await;
     let replacement = async {
         let (replacement, replacement_app) = group_engine(f).await?;
