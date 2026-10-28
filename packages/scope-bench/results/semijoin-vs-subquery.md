@@ -1,7 +1,8 @@
 # Key-only semijoin versus subquery members
 
 Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes are implemented, but hosted review found regressions described below. No performance results are claimed. The experiment
+fixes are implemented; corrections for the reproduced hosted-review regressions
+await CI. No performance results are claimed. The experiment
 must finish before this report can support changing the membership decision.
 
 ## Pinned inputs and method
@@ -125,20 +126,77 @@ its status independently, and typecheck/Node/Vitest run when their setup succeed
 even after a Rust failure. Formatting and every failed test still fail the job;
 no test is disabled or treated as an expected pass.
 
+### Review-regression red checkpoint: `7cbda3f`
+
+[CI run 40667076997](https://github.com/indexedlabs/electric-circuits/actions/runs/40667076997),
+job `122744154957`, tested head `7cbda3f5991799e2cb2aa5e75fa37915c67a5c93`
+through merge checkout `256df353c108ed16917aab0bbcf01c247f3f2d53` with PostgreSQL
+**18.6** (`Ubuntu 18.6-1.pgdg24.04+2`). The raw job log SHA-256 is
+`b3e2cd7015e646e4c07c2be7abbb8fc83d7774d0f25e0a9c96fbc3e0f1e42bde`.
+
+| Gate | Observed result |
+| --- | --- |
+| Group contracts, subquery | 10 passed, 2 failed |
+| Group contracts, semijoin | 10 passed, 2 failed |
+| Full ignored source-table contracts | 22 passed, 2 failed |
+| Rust library | 741 passed, 1 failed, 3 ignored |
+| Other Rust integration targets | Passed (their ignored tests remain ignored) |
+| Deployment ownership, explicitly ignored lane | 1 passed |
+| PostgreSQL projection, explicitly ignored lane | 2 passed |
+| Formatting, TypeScript typecheck | Passed |
+| Supported Node gate | 9 passed |
+| Full Vitest | 79 files, 357 tests passed |
+
+Both group modes fail at the same intended semantic assertions:
+`group_disjoint_same_table_sibling_survives_move_out` receives deletes for both
+keys 1 and 2, although key 1 still belongs to the plain sibling;
+`group_never_member_insert_and_delete_do_not_wake_stream` receives a delete for
+out-of-scope key 3 after the insert's source receipt. The library fault contract
+fails at “create replay killed shared membership but engine still accepts receipt
+queries”. The original snapshot-only move-out and wire-LSN contracts, and the
+new reparenting control, pass in both modes. This is genuine-red evidence for the
+review defects; no regression assertion is changed in the correction.
+
+### Correction candidate (awaiting CI)
+
+Group companion creates now seed their FeedSet through the existing streamed
+outer backfill and phase-C seed/replay handoff before becoming live. For these
+changes-only members the backfill retains only primary keys and appends no public
+snapshot payload; the later shared group snapshot stays unchanged. Its xid fence
+and pending replay close the seed/live boundary. All deletes again require actual
+prior membership in that member's gate, preserving disjoint same-table siblings
+and keeping never-member writes quiet. This minimal correction reads full matching
+rows one bounded chunk at a time before discarding non-key columns; it does not
+yet project the SQL seed to keys. Include the extra read, transient payload work,
+and retained feed keys in both modes' memory and seed/restart measurements.
+
+The engine installs a synchronous degradation callback before the shared DBSP
+worker accepts any commands. The worker latches it before reporting a failed
+Select or Batch, independently of response cancellation; an unwind guard also
+latches unexpected worker failure. The worker then stops. Batch channel/response
+failures now propagate as errors through node seeding, live deltas and parent
+query-backs instead of returning zero flips. Ordinary shutdown disarms the guard
+and joins the same thread. No new worker, queue, retry loop or durable state is
+introduced; restart uses the existing reseed/drop-and-reload policy. An additional
+focused test drops a Select response receiver before submission, joins the failed
+worker, and checks that its owner was notified and subsequent Batch calls fail.
+
+The new `phone.test.ts` regression exercises production `Phone.hold` with a
+controlled streaming chunk and virtual time: return propagation, serialization
+at 1 Mbps, and byte accounting must precede delivery. Its first CI execution is
+pending; the streaming implementation is deliberately unchanged until genuine red
+is recorded for the hosted benchmark finding.
+
 The perf2 `gateway.ts`, `phone.ts`, and `run.ts` harness files have now been
 imported directly from the pinned perf2 commit, without its older engine code.
+Their source blobs are respectively `ec9699db0c3393d55601a5996ec4e27fe4e69af9`,
+`81251167803ff4bb307f1d0913afe721381c11cc`, and
+`d5dfd0aa57372b90b820ba39f0ef0982468e6b88`. The subsequent `run.ts` change
+repairs its Markdown table delimiter to match the 18 header/row cells.
 The old Node sketch is explicitly named `semijoin:model` in package scripts.
 This import supplies the starting harness only; mode comparison, resource/restart
 instrumentation, five-repetition CI execution and resulting numbers are still
 pending. Its modeled streaming charges must not be mistaken for provider reads.
-
-Planned correction: preserve the per-feed delete gate and seed group companion
-keys with an xid-fenced read before the member becomes live, reusing the existing
-atomic seed/replay path. Merely adding keys from the later group snapshot can
-race with live deletes and resurrect gate entries. The shared-worker failure
-must latch engine degradation independently of the requesting future. Both
-changes will be common to the two modes; the performance comparison will include
-their actual seed and state costs.
 
 Set `ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=subquery|semijoin` when starting the
 engine; the default is `subquery`. The baseline already keeps shared scope keys
@@ -162,19 +220,20 @@ bound, **not** a hard byte cap on arbitrary SQL text keys. Each chunk inserts,
 steps, reads output, retracts and steps again. The registry mutex spans this
 local-worker round trip, preventing membership changes mid-selection. Probe
 cleanup completes even if its response receiver is dropped. A probe transaction
-error stops the worker and returns an error to the existing emission/degradation
-path, preventing later decisions from a half-cleared left relation. Engine close
+error synchronously degrades the engine and stops the worker before returning an
+error, preventing later decisions from a half-cleared left relation. Engine close
 joins the worker; its disposable spill cleanup is unchanged.
 
-Both modes receive the same two correctness fixes: mark group membership before
-seed I/O, emit absolute deletes for snapshot-only companion rows, and stamp group
+Both modes receive the same correctness fixes: mark group membership before
+seed I/O, seed the member delete gate before live replay, and stamp group
 membership events with their triggering source commit LSN. The two frozen red
 contracts are unchanged. An additional PostgreSQL contract reparents one companion
 key out/in/out after separate source receipts and checks the diagnostic mode and
 join-execution counter. Focused operator coverage includes distinct contributors,
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
-These additions still await execution. Existing claim/lease, snapshot query,
-group stream and commit fence code is unchanged.
+The join and reparenting controls passed at `7cbda3f`; the delete-gate and
+shared-worker corrections still await CI. Existing claim/lease, public snapshot
+query, group stream and commit fence code is unchanged.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's
@@ -196,8 +255,8 @@ as the experiment progresses.
 | Thousands of groups plus held-log replay | Peak RSS against configured memory budget, rebuild + reload time | Pending |
 | Many groups and held SSE responses | Engine/DS/gateway fds and connections; release after close | Pending; native gateway/SSE topology absent from this checkout |
 | 30-phone reconnect burst | Seed columns, conflicts/timeouts, racing and retried claims | Pending; baseline rejects a repeated group claim with 409 |
-| Snapshot-only move-out and wire LSN | Exact delete after receipt and LSN on each membership event | Both genuinely red on PG18; common fixes await CI |
-| Companion reparenting | Table-qualified delete/upsert/delete after individual source receipts | Added public contract plus mode-execution diagnostic; awaiting CI |
+| Snapshot-only move-out and wire LSN | Exact delete after receipt and LSN on each membership event | Both green in both modes at `7cbda3f`; preserved through correction |
+| Companion reparenting | Table-qualified delete/upsert/delete after individual source receipts | Passed both modes at `7cbda3f`, including mode-execution diagnostic |
 | Snapshot/LSN boundary through Swift/GRDB | Same source prefix materialized across the real client stack | Unavailable in this repository alone |
 | Slot/WAL retention | No extra slots per group, lag and cleanup after drop/restart | Pending |
 | Five-second authority rechecks | Measured recheck load under peak held streams | Pending; perf2 has a modeled gateway |

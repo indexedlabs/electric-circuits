@@ -2348,7 +2348,7 @@ impl Engine {
             }
             let outer_ts =
                 begin.schemas.get(table).cloned().with_context(|| format!("unknown outer table '{table}'"))?;
-            let (outer_gate, seeded, seeded_pks) = if changes_only {
+            let (outer_gate, seeded, seeded_pks) = if changes_only && !group_member {
                 (crate::pg::SnapshotGate::passthrough(), 0u64, HashSet::new())
             } else {
                 let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
@@ -2373,6 +2373,12 @@ impl Engine {
                     }
                     for r in &chunk {
                         seeded_pks.insert(outer_ts.key_string(r).unwrap_or_default());
+                    }
+                    // A group's public snapshot is read later, across all members. Seed only
+                    // its delete gate here, before phase C makes the member live. Reusing the
+                    // snapshot/replay handoff prevents a live delete racing a later key insert.
+                    if changes_only {
+                        continue;
                     }
                     let out: Vec<(Row, ZWeight)> = chunk.into_iter().map(|r| (r, 1)).collect();
                     let envs = translate_output(&outer_ts, out, None, None, out_cols.as_deref().map(Vec::as_slice));

@@ -468,7 +468,7 @@ async function main() {
     console.log(
       '| Scenario | Design | First content | First content p90 (phones) | First table | Everything | Load requests | Gateway CPU (load) | Gateway lag p99 | Hold: gateway CPU | Hold: requests | Hold: upstream reads | Delivered / empty reads | Long-polls held/streams | Engine RSS MB | Write p50/p90 | PG statements | MB down |',
     )
-    console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
+    console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
     for (const name of names)
       for (const cfg of CONFIGS) {
         if (!results.some((r) => r.scenario === name && r.config === cfg.name)) continue

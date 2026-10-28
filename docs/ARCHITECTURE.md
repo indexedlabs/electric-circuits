@@ -687,30 +687,34 @@ the baseline contributor state and does not implement a persistent companion
 arrangement. Consequently it must not be described as eliminating all existing
 membership state or avoiding query-backs.
 
-**Known defects at the `b83da4e` test checkpoint:** the unconditional group
-delete path described below bypasses the never-member gate and can delete a
-disjoint same-table sibling. A probe error stops the shared worker without
-necessarily degrading the engine; standalone consumers can then use frozen
-membership. Regression tests are pending execution. These are accepted
-correctness defects, not supported failure semantics or benchmarkable behavior.
+The `7cbda3f` PostgreSQL regressions reproduced ungated deletes for never-member
+rows and disjoint same-table siblings, plus a focused create-replay shared-worker
+failure. The corrections below await CI; see the prototype report for exact red
+evidence. This experiment is not release qualification.
 
 Probe commands use the existing bounded worker channel and at most 1024 key/ordinal
 tuples per command (an item bound, not a byte cap on arbitrary SQL key values).
 The registry lock spans selection to preserve one membership snapshot; this adds
 two DBSP transactions per chunk, one to insert probes and one to retract them.
 The worker clears probes even if its response receiver disappears. A DBSP probe
-failure stops the worker and propagates to the existing emission error owner;
-it cannot continue with uncleared probes. Engine close joins that same worker.
+or contributor-batch failure synchronously latches the engine's degradation owner
+before replying and stops the worker; receiver cancellation cannot suppress this.
+An unwind guard covers unexpected worker failure. Failed Batch sends/responses
+propagate as errors, never empty successful flips. Engine close joins that same
+worker; ordinary shutdown and final-handle teardown disarm the failure guard.
 `GET /debug/dbsp-profile` reports `group_membership.mode`, `selectionBatches` and
 `eligibleMembers` alongside DBSP's complete operator profile. Use that profile
 and RSS when measuring: `/memory`'s published-snapshot counters omit join state.
 
-Both modes mark group members before seed I/O. Their live emission includes
-absolute nonmember deletes even for rows known only to the separately returned
-group snapshot, and stamps membership events with the triggering source commit
-LSN. That origin identifies deferred work; it is not a claim that a later
-Postgres query-back read precisely that source prefix. Standalone subquery feeds
-retain their existing FeedSet delete gate.
+Both modes mark group members before seed I/O. Changes-only group companions
+seed their FeedSet with matching primary keys through the existing streamed,
+xid-fenced backfill and phase-C replay before becoming live. This seed appends no
+payload; the later shared group snapshot is unchanged. It reads full matching
+rows one chunk at a time and discards non-key columns, so measurements must include
+that work. Group and standalone deletes require actual prior FeedSet membership.
+Group events carry their triggering source commit LSN. That origin identifies
+deferred work; it is not a claim that a later Postgres query-back read precisely
+that source prefix.
 
 A predicate leaf `col [NOT] IN (SELECT proj FROM inner WHERE …)` routes through a registry the
 sequencer feeds every table's deltas into:

@@ -1522,10 +1522,15 @@ impl Engine {
                 shutdown.clone(),
             )
         });
-        let membership = match config {
-            Some(config) => crate::subq_circuit::MembershipCircuit::start_config(&config.subq_storage),
-            None => crate::subq_circuit::MembershipCircuit::start(),
-        }
+        let degrade = DegradeState::new();
+        let membership_failure = degrade.clone();
+        let membership_settings = config
+            .map(|c| c.subq_storage.clone())
+            .unwrap_or_else(|| crate::subq_circuit::StorageSettings::resolve(|name| std::env::var(name).ok()));
+        let membership = crate::subq_circuit::MembershipCircuit::start_config_with_failure(
+            &membership_settings,
+            Arc::new(move || membership_failure.mark()),
+        )
         .expect("membership circuit failed to start");
         let subqueries = Arc::new(Mutex::new(SubqueryRegistry::with_pool(
             ds.clone(),
@@ -1536,7 +1541,6 @@ impl Engine {
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
-        let degrade = DegradeState::new();
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.

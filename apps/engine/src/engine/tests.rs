@@ -2024,7 +2024,7 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
                 },
             )],
         };
-        let member_deltas = circuit.apply(asserts).await;
+        let member_deltas = circuit.apply(asserts).await.unwrap();
         let flips = member_deltas
             .into_iter()
             .map(|d| Flip { value: d.value, dir: if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave } })

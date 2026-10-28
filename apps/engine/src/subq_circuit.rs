@@ -227,7 +227,7 @@ enum Cmd {
     },
     Batch {
         asserts: Assertions,
-        resp: oneshot::Sender<Vec<MemberDelta>>,
+        resp: oneshot::Sender<Result<Vec<MemberDelta>, String>>,
     },
     /// Bounded, transient companion keys. The worker retracts every probe before
     /// replying, including when the requester has been cancelled.
@@ -316,7 +316,17 @@ impl MembershipCircuit {
     }
 
     pub(crate) fn start_config(settings: &StorageSettings) -> Result<MembershipCircuit> {
-        Self::start_full_mode(settings.spill(), group_semijoin_mode(settings.group_membership.as_deref())?)
+        Self::start_config_with_failure(settings, Arc::new(|| {}))
+    }
+
+    /// The engine supplies its degradation owner before any command can be submitted.
+    /// The worker calls it synchronously on failure, independently of request cancellation.
+    pub(crate) fn start_config_with_failure(
+        settings: &StorageSettings,
+        on_failure: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<MembershipCircuit> {
+        let mode = group_semijoin_mode(settings.group_membership.as_deref())?;
+        Self::start_with_failure(settings.spill(), mode, on_failure)
     }
 
     /// [`start`], with everything explicit (tests).
@@ -326,6 +336,14 @@ impl MembershipCircuit {
     }
 
     fn start_full_mode(spill: Option<SpillConfig>, semijoin: bool) -> Result<MembershipCircuit> {
+        Self::start_with_failure(spill, semijoin, Arc::new(|| {}))
+    }
+
+    fn start_with_failure(
+        spill: Option<SpillConfig>,
+        semijoin: bool,
+        on_failure: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
         let (m_slot, c_slot) = (members.clone(), contributors.clone());
@@ -396,7 +414,7 @@ impl MembershipCircuit {
         let thread = std::thread::Builder::new()
             .name("dbsp-subq".into())
             .spawn(move || {
-                circuit_thread(dbsp, contrib_in, flips_out, selection, rx);
+                circuit_thread(dbsp, contrib_in, flips_out, selection, rx, on_failure);
                 // Membership storage is a disposable per-Engine cache. The thread removes it
                 // after dbsp has stopped; shutdown joins this cleanup too.
                 if let Some(dir) = cleanup_dir {
@@ -463,18 +481,20 @@ impl MembershipCircuit {
         Ok(selected)
     }
 
-    /// Assert, step, and return the step's membership flips. After this returns, snapshot reads
-    /// reflect the batch (read-your-writes).
-    pub async fn apply(&self, asserts: Assertions) -> Vec<MemberDelta> {
+    /// Assert, step, and return the step's membership flips. After success, snapshot reads
+    /// reflect the batch (read-your-writes). Once enqueued, the worker finishes the batch even
+    /// if the caller is cancelled; assertions are absolute and safe to repeat.
+    ///
+    /// # Errors
+    /// A failed transaction or a stopped worker is an error, never an empty successful batch.
+    /// Engine-owned circuits also latch degradation independently of the requesting future.
+    pub async fn apply(&self, asserts: Assertions) -> Result<Vec<MemberDelta>> {
         if asserts.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let (resp_tx, resp_rx) = oneshot::channel();
-        if self.tx.send(Cmd::Batch { asserts, resp: resp_tx }).await.is_err() {
-            tracing::error!("membership circuit: thread gone; dropping assertions");
-            return Vec::new();
-        }
-        resp_rx.await.unwrap_or_default()
+        self.tx.send(Cmd::Batch { asserts, resp: resp_tx }).await.context("membership worker stopped")?;
+        resp_rx.await.context("membership worker response lost")?.map_err(anyhow::Error::msg)
     }
 
     /// Is `value` currently a member of node `node_id`'s set? (Contributor count > 0.)
@@ -640,6 +660,25 @@ fn drain_flips(handle: &OutputHandle<SpineSnapshot<OrdZSet<Row>>>, out: &mut Vec
     }
 }
 
+/// Owns failure escalation on the worker thread, including unwinding. Normal shutdown or
+/// dropping all handles disarms it. No request receiver owns this obligation.
+struct WorkerFailureGuard(Option<Arc<dyn Fn() + Send + Sync>>);
+
+impl WorkerFailureGuard {
+    fn fail(&mut self) {
+        if let Some(on_failure) = self.0.take() {
+            tracing::error!("membership worker failed; membership state is no longer authoritative");
+            on_failure();
+        }
+    }
+}
+
+impl Drop for WorkerFailureGuard {
+    fn drop(&mut self) {
+        self.fail();
+    }
+}
+
 /// The circuit thread: owns the `DBSPHandle`, applies assertion batches, steps, drains.
 fn circuit_thread(
     mut dbsp: dbsp::DBSPHandle,
@@ -647,7 +686,9 @@ fn circuit_thread(
     flips_out: OutputHandle<SpineSnapshot<OrdZSet<Row>>>,
     selection: Option<SelectionHandles>,
     mut rx: mpsc::Receiver<Cmd>,
+    on_failure: Arc<dyn Fn() + Send + Sync>,
 ) {
+    let mut failure = WorkerFailureGuard(Some(on_failure));
     #[cfg(test)]
     let mut fail_next_select = false;
     while let Some(cmd) = rx.blocking_recv() {
@@ -675,6 +716,10 @@ fn circuit_thread(
                     Ok(selected)
                 })();
                 let failed = result.is_err();
+                if failed {
+                    // Mark BEFORE replying, even if the receiver has already disappeared.
+                    failure.fail();
+                }
                 let _ = resp.send(result.map_err(|e| format!("{e:#}")));
                 if failed {
                     // Never evaluate later rows against a half-cleared probe relation.
@@ -685,12 +730,18 @@ fn circuit_thread(
                 for Tup2(k, upd) in asserts.contributors {
                     contrib_in.push(k, upd);
                 }
-                let mut flips = Vec::new();
                 match dbsp.transaction() {
-                    Ok(()) => drain_flips(&flips_out, &mut flips),
-                    Err(e) => tracing::error!("membership circuit: transaction failed: {e}"),
+                    Ok(()) => {
+                        let mut flips = Vec::new();
+                        drain_flips(&flips_out, &mut flips);
+                        let _ = resp.send(Ok(flips));
+                    }
+                    Err(e) => {
+                        failure.fail();
+                        let _ = resp.send(Err(format!("membership transaction failed: {e}")));
+                        break;
+                    }
                 }
-                let _ = resp.send(flips);
             }
             Cmd::ProfileDump { resp } => {
                 let dump = match dbsp.retrieve_profile() {
@@ -707,13 +758,15 @@ fn circuit_thread(
                 let _ = resp.send(dump);
             }
             Cmd::Shutdown { resp } => {
+                failure.0 = None;
                 let _ = dbsp.kill();
                 let _ = resp.send(());
                 return;
             }
         }
     }
-    // Registry dropped without Shutdown (engine teardown): stop.
+    // No senders remain, or a failed command already latched degradation.
+    failure.0 = None;
     let _ = dbsp.kill();
 }
 
@@ -722,25 +775,50 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn worker_failure_is_owned_after_select_receiver_disappears() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let failures = Arc::new(AtomicUsize::new(0));
+        let owner = failures.clone();
+        let circuit = MembershipCircuit::start_with_failure(
+            None,
+            true,
+            Arc::new(move || {
+                owner.fetch_add(1, Ordering::SeqCst);
+            }),
+        )
+        .unwrap();
+        circuit.fail_next_select_for_test().await;
+        let (resp, receiver) = oneshot::channel();
+        drop(receiver);
+        let keys = vec![(Row(vec![Value::Int(1), Value::Int(7)]), 0)];
+        circuit.tx.send(Cmd::Select { keys, resp }).await.unwrap();
+        // Joining is the terminal fence, not a delay or a request observing the error.
+        circuit.shutdown().await;
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        let result = circuit.apply(contrib(1, 1, Some(Value::Int(7)))).await;
+        assert!(result.is_err(), "a dead shared worker cannot report a successful empty flip batch");
+    }
+
+    #[tokio::test]
     async fn key_semijoin_tracks_scope_moves_and_clears_companion_probes() {
         let circuit = MembershipCircuit::start_full_mode(None, true).unwrap();
-        circuit.apply(contrib(1, 1, Some(Value::Int(7)))).await;
-        circuit.apply(contrib(1, 2, Some(Value::Int(7)))).await;
-        circuit.apply(contrib(2, 1, Some(Value::Int(9)))).await;
+        circuit.apply(contrib(1, 1, Some(Value::Int(7)))).await.unwrap();
+        circuit.apply(contrib(1, 2, Some(Value::Int(7)))).await.unwrap();
+        circuit.apply(contrib(2, 1, Some(Value::Int(9)))).await.unwrap();
         let candidates = vec![Some(Value::Int(7)), Some(Value::Int(9)), Some(Value::Null), None];
         assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [true, false, false, false]);
         assert_eq!(circuit.select_keys(2, &candidates).await.unwrap(), [false, true, false, false]);
         // Reparenting a contributor changes only its old/new scope membership.
-        circuit.apply(contrib(1, 1, Some(Value::Int(9)))).await;
+        circuit.apply(contrib(1, 1, Some(Value::Int(9)))).await.unwrap();
         assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [true, true, false, false]);
-        circuit.apply(contrib(1, 2, None)).await;
+        circuit.apply(contrib(1, 2, None)).await.unwrap();
         assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [false, true, false, false]);
-        circuit.apply(contrib(1, 1, None)).await;
+        circuit.apply(contrib(1, 1, None)).await.unwrap();
         assert_eq!(circuit.select_keys(1, &candidates).await.unwrap(), [false, false, false, false]);
         // Reused ordinals must not leave old probes behind. Cross the RPC chunk boundary.
         let many = vec![Some(Value::Int(9)); 2050];
         assert!(circuit.select_keys(2, &many).await.unwrap().iter().all(|v| *v));
-        circuit.apply(contrib(2, 1, None)).await;
+        circuit.apply(contrib(2, 1, None)).await.unwrap();
         assert!(circuit.select_keys(2, &many).await.unwrap().iter().all(|v| !*v));
         assert!(circuit.selection_batches() >= 6);
         circuit.shutdown().await;
@@ -804,26 +882,26 @@ mod tests {
         };
 
         // a → 7: Enter. (pk ids: a=1, b=2, z=3.)
-        let flips = c.apply(contrib(1, 1, Some(Value::Int(7)))).await;
+        let flips = c.apply(contrib(1, 1, Some(Value::Int(7)))).await.unwrap();
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: 1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), 1)]).len(), 1);
         // b → 7: second contributor, no flip.
-        let flips = c.apply(contrib(1, 2, Some(Value::Int(7)))).await;
+        let flips = c.apply(contrib(1, 2, Some(Value::Int(7)))).await.unwrap();
         assert!(flips.is_empty());
         assert!(refold(&mut groups, vec![(Value::Int(7), 1)]).is_empty());
         // a moves 7→8 in ONE assertion: the map derives retract(7)+insert(8); 7 stays (b).
-        let flips = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
+        let flips = c.apply(contrib(1, 1, Some(Value::Int(8)))).await.unwrap();
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(8), delta: 1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), -1), (Value::Int(8), 1)]).len(), 1);
         assert!(c.contains(1, &Value::Int(7)) && c.contains(1, &Value::Int(8)));
         // b leaves: Leave(7).
-        let flips = c.apply(contrib(1, 2, None)).await;
+        let flips = c.apply(contrib(1, 2, None)).await.unwrap();
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: -1 }]);
         assert_eq!(refold(&mut groups, vec![(Value::Int(7), -1)]).len(), 1);
         // Idempotence: re-asserting a's current value nets nothing; deleting absent nets nothing.
-        let flips = c.apply(contrib(1, 1, Some(Value::Int(8)))).await;
+        let flips = c.apply(contrib(1, 1, Some(Value::Int(8)))).await.unwrap();
         assert!(flips.is_empty(), "re-asserting the held value must be a no-op");
-        let flips = c.apply(contrib(1, 3, None)).await;
+        let flips = c.apply(contrib(1, 3, None)).await.unwrap();
         assert!(flips.is_empty(), "deleting an absent key must be a no-op");
         c.shutdown().await;
     }
@@ -847,7 +925,8 @@ mod tests {
                 Tup2(ckey(2, 3), Assert::Insert(Value::Int(5))),
             ],
         })
-        .await;
+        .await
+        .unwrap();
         let mut entries = c.contributor_entries(1);
         entries.sort();
         assert_eq!(entries, vec![(1, Value::Int(5)), (2, Value::Int(6))]);
@@ -866,7 +945,8 @@ mod tests {
                 Tup2(ckey(1, 2), Assert::Insert(Value::Int(6))),
             ],
         })
-        .await;
+        .await
+        .unwrap();
         let (used, _stored, json) = c.profile_dump().await;
         assert!(used > 0, "circuit with state must report used bytes");
         let v: serde_json::Value = serde_json::from_str(&json).expect("profiler JSON parses");
@@ -887,7 +967,7 @@ mod tests {
         .unwrap();
         // Enough contributor entries to force at least one on-disk batch.
         let contributors = (0..2000).map(|i| Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 50)))).collect();
-        let flips = c.apply(Assertions { contributors }).await;
+        let flips = c.apply(Assertions { contributors }).await.unwrap();
         assert_eq!(flips.len(), 50, "50 distinct values entered");
         assert!(c.contains(1, &Value::Int(7)));
         let (distinct, _) = c.values_for_node(1, 5);
@@ -913,7 +993,7 @@ mod tests {
             // 1000 contributors over 100 distinct values on one node.
             a.contributors.push(Tup2(ckey(1, i as u32), Assert::Insert(Value::Int(i % 100))));
         }
-        c.apply(a).await;
+        c.apply(a).await.unwrap();
 
         let cb = c.snapshot_bytes();
         // Contributors integral: 1000 live tuples; members: 100 distinct.
@@ -945,12 +1025,12 @@ mod tests {
         const STEPS: i64 = 400;
         let c = MembershipCircuit::start_full(None).unwrap();
         let seed = (0..LIVE).map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(0)))).collect();
-        c.apply(Assertions { contributors: seed }).await;
+        c.apply(Assertions { contributors: seed }).await.unwrap();
 
         let mut max_contrib_len = 0usize;
         for step in 1..=STEPS {
             let contributors = (0..LIVE).map(|i| Tup2(ckey(7, i as u32), Assert::Insert(Value::Int(step)))).collect();
-            c.apply(Assertions { contributors }).await;
+            c.apply(Assertions { contributors }).await.unwrap();
             max_contrib_len = max_contrib_len.max(c.snapshot_bytes().contributors_len);
         }
 
@@ -982,8 +1062,9 @@ mod tests {
                 Tup2(ckey(1, 2), Assert::Insert(Value::Null)),
             ],
         })
-        .await;
-        let flips = c.apply(contrib(1, 1, None)).await;
+        .await
+        .unwrap();
+        let flips = c.apply(contrib(1, 1, None)).await.unwrap();
         assert_eq!(flips, vec![MemberDelta { node_id: 1, value: Value::Int(7), delta: -1 }]);
         assert!(!c.contains(1, &Value::Int(7)));
         assert!(c.contains(2, &Value::Int(7)), "node 2 unaffected");

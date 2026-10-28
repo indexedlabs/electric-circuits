@@ -655,20 +655,20 @@ impl SubqueryRegistry {
     /// thread never takes this lock, and awaiting the step is what gives every later membership
     /// read read-your-writes over this batch. (The delete gate is no longer a circuit relation —
     /// it lives in [`crate::subq_feed::FeedSet`], mutated synchronously under this same lock.)
-    async fn apply_asserts(&mut self, asserts: Assertions) -> Vec<(SubquerySig, Flip)> {
+    async fn apply_asserts(&mut self, asserts: Assertions) -> Result<Vec<(SubquerySig, Flip)>> {
         if asserts.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        self.circuit
-            .apply(asserts)
-            .await
+        let deltas = self.circuit.apply(asserts).await?;
+        let flips = deltas
             .into_iter()
             .filter_map(|d| {
                 let sig = self.node_by_id.get(&d.node_id)?.clone();
                 let dir = if d.delta > 0 { FlipDir::Enter } else { FlipDir::Leave };
                 Some((sig, Flip { value: d.value, dir }))
             })
-            .collect()
+            .collect();
+        Ok(flips)
     }
 
     /// Build one node's contributor assertion for `pk` and keep the template's `pk_nodes`
@@ -711,14 +711,14 @@ impl SubqueryRegistry {
     /// Assert a batch of per-pk evaluations against ONE node and return the resulting flips
     /// (seeding replay and flip-driven parent re-derivations, where the caller already
     /// evaluated the node's full predicate per row).
-    async fn apply_node_evals(&mut self, sig: &SubquerySig, evals: Vec<(String, Option<Value>)>) -> Vec<Flip> {
+    async fn apply_node_evals(&mut self, sig: &SubquerySig, evals: Vec<(String, Option<Value>)>) -> Result<Vec<Flip>> {
         let mut asserts = Assertions::default();
         for (pk, pv) in evals {
             asserts.contributors.extend(self.assert_node_row(sig, &pk, pv));
         }
         // Every assertion belongs to `sig`, so the sig on each flip is redundant here.
-        let flips = self.apply_asserts(asserts).await;
-        flips.into_iter().map(|(_, f)| f).collect()
+        let flips = self.apply_asserts(asserts).await?;
+        Ok(flips.into_iter().map(|(_, f)| f).collect())
     }
 
     /// Test seam (never compiled into the engine): assert one contributor onto a node exactly as
@@ -726,7 +726,7 @@ impl SubqueryRegistry {
     /// already holding real membership-circuit state.
     #[cfg(test)]
     pub(crate) async fn assert_seed_row_for_test(&mut self, sig: &SubquerySig, pk: &str, value: Value) {
-        self.apply_node_evals(sig, vec![(pk.to_string(), Some(value))]).await;
+        self.apply_node_evals(sig, vec![(pk.to_string(), Some(value))]).await.unwrap();
     }
 
     /// The node's current distinct-value count, read from the circuit snapshot.
@@ -1176,7 +1176,7 @@ impl SubqueryRegistry {
             // Initial state: the seed's flips are meaningless (every dependent's backfill
             // already reflects the seeded set), so this step's deltas are discarded — only
             // the replay below propagates.
-            let _ = self.apply_asserts(seed).await;
+            self.apply_asserts(seed).await?;
             let buffered = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.take()).unwrap_or_default();
             // Replayed one buffered delta at a time, in arrival order, so each keeps its own
             // commit stamp and is recorded as the live decision it is (the outer buffer's replay
@@ -1186,7 +1186,7 @@ impl SubqueryRegistry {
             for b in buffered {
                 let evals = self.node_present_values(&sig, &ts, &b.delta);
                 self.record_node_recency(&sig, evals.iter().map(|(pk, _)| pk), b.lsn, b.xid);
-                for f in self.apply_node_evals(&sig, evals).await {
+                for f in self.apply_node_evals(&sig, evals).await? {
                     work.push_back((b.lsn, sig.clone(), f));
                 }
             }
@@ -1508,7 +1508,7 @@ impl SubqueryRegistry {
             let evals = self.template_present(tkey, ts, delta);
             asserts.contributors.extend(self.template_assertions(tkey, evals, lsn, xid));
         }
-        let flips = self.apply_asserts(asserts).await;
+        let flips = self.apply_asserts(asserts).await?;
         for sig in live_sigs {
             let flipped = flips.iter().any(|(s, _)| s == &sig);
             hop(&mut trace, format!("node:{sig}"), if flipped { "passed" } else { "dropped" });
@@ -1870,10 +1870,10 @@ impl SubqueryRegistry {
         // Phase 1: evaluate each candidate against the current membership snapshot and, in the
         // SAME critical section, transition the host-side FeedSet — building the
         // member upserts and the gated deletes. A delete is emitted for a shape's pk **iff**
-        // `feed_sets.remove` returns true for standalone feeds (the pk was actually in the feed): the check-and-set IS
+        // `feed_sets.remove` returns true (the pk was actually in the feed): the check-and-set IS
         // the emission decision, in one indivisible expression under the registry lock, so the
         // spurious delete that used to wake idle long-polls is structurally impossible (the
-        // wake-storm gate, PR #30). Groups also delete snapshot-only rows. Upserts are delivered
+        // wake-storm gate, PR #30). Group feeds seed snapshot keys before becoming live. Upserts are delivered
         // for every current member unconditionally.
         let mut staged: Vec<(String, Vec<Row>)> = Vec::new();
         let mut deletes: HashMap<String, Vec<String>> = HashMap::new();
@@ -1964,17 +1964,6 @@ impl SubqueryRegistry {
                         evaluated.push(pk_id);
                     }
                     members.push(row);
-                } else if shape.group_member {
-                    // This row may exist solely in the group's separately returned snapshot.
-                    // Absence from FeedSet cannot prove absence from that client snapshot.
-                    // An absolute delete is idempotent even if the client never saw the row.
-                    if let Some(pk_id) = self.pk_dict.get(&pk) {
-                        self.feed_sets.remove(feed_id, pk_id);
-                    }
-                    deletes.entry(shape_id.clone()).or_default().push(pk.clone());
-                    if record_recency {
-                        evaluated.push(self.pk_dict.get_or_insert(&pk));
-                    }
                 } else {
                     // Non-member. The delete is emitted only if the pk was actually in the feed;
                     // the dictionary is probed WITHOUT minting — a never-interned pk can never
@@ -2490,7 +2479,7 @@ async fn requery_and_reconcile_parent(
     };
     let flips = reg.apply_node_evals(parent_sig, evals).await;
     reg.end_node_queryback(parent_sig);
-    Ok(Some((ts.table.clone(), flips)))
+    Ok(Some((ts.table.clone(), flips?)))
 }
 
 /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
@@ -3244,7 +3233,7 @@ mod tests {
         let (mut reg, deep, mid) = registry_mid_nested_create();
         let (deep_id, mid_id) = (reg.nodes[&deep].node_id, reg.nodes[&mid].node_id);
         // Phase C got as far as installing the deepest node's seed, then the request was dropped.
-        reg.apply_node_evals(&deep, vec![("1".to_string(), Some(Value::Int(7)))]).await;
+        reg.apply_node_evals(&deep, vec![("1".to_string(), Some(Value::Int(7)))]).await.unwrap();
         assert_eq!(reg.circuit_distinct(deep_id), 1, "the partial seed really landed");
 
         reg.abort_create("s1").await;
@@ -3316,18 +3305,18 @@ mod tests {
         let mut reg = registry_with_node(&sig);
         let evals = |pk: &str, v: Option<Value>| vec![(pk.to_string(), v)];
         assert_eq!(
-            reg.apply_node_evals(&sig, evals("a", Some(Value::Int(5)))).await,
+            reg.apply_node_evals(&sig, evals("a", Some(Value::Int(5)))).await.unwrap(),
             vec![Flip { value: Value::Int(5), dir: FlipDir::Enter }]
         );
         assert!(reg.contains(&sig, &Value::Int(5)));
         // second contributor to the same value -> no flip
-        assert_eq!(reg.apply_node_evals(&sig, evals("b", Some(Value::Int(5)))).await, vec![]);
+        assert_eq!(reg.apply_node_evals(&sig, evals("b", Some(Value::Int(5)))).await.unwrap(), vec![]);
         // removing one of two -> still present, no flip
-        assert_eq!(reg.apply_node_evals(&sig, evals("a", None)).await, vec![]);
+        assert_eq!(reg.apply_node_evals(&sig, evals("a", None)).await.unwrap(), vec![]);
         assert!(reg.contains(&sig, &Value::Int(5)));
         // removing the last -> Leave
         assert_eq!(
-            reg.apply_node_evals(&sig, evals("b", None)).await,
+            reg.apply_node_evals(&sig, evals("b", None)).await.unwrap(),
             vec![Flip { value: Value::Int(5), dir: FlipDir::Leave }]
         );
         assert!(!reg.contains(&sig, &Value::Int(5)));
@@ -3337,8 +3326,8 @@ mod tests {
     async fn reconcile_value_change_emits_leave_then_enter() {
         let sig: SubquerySig = "sig".into();
         let mut reg = registry_with_node(&sig);
-        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await;
-        let mut flips = reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(7)))]).await;
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await.unwrap();
+        let mut flips = reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(7)))]).await.unwrap();
         flips.sort_by(|a, b| a.value.cmp(&b.value));
         assert_eq!(
             flips,
@@ -3355,10 +3344,10 @@ mod tests {
     async fn reconcile_same_value_is_a_noop() {
         let sig: SubquerySig = "sig".into();
         let mut reg = registry_with_node(&sig);
-        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await;
-        assert_eq!(reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await, vec![]);
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await.unwrap();
+        assert_eq!(reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(5)))]).await.unwrap(), vec![]);
         // unchanged absence is also a no-op
-        assert_eq!(reg.apply_node_evals(&sig, vec![("z".into(), None)]).await, vec![]);
+        assert_eq!(reg.apply_node_evals(&sig, vec![("z".into(), None)]).await.unwrap(), vec![]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3366,12 +3355,12 @@ mod tests {
         let sig: SubquerySig = "sig".into();
         let mut reg = registry_with_node(&sig);
         assert_eq!(
-            reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Null))]).await,
+            reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Null))]).await.unwrap(),
             vec![Flip { value: Value::Null, dir: FlipDir::Enter }]
         );
         assert!(reg.has_null(&sig));
         assert_eq!(
-            reg.apply_node_evals(&sig, vec![("a".into(), None)]).await,
+            reg.apply_node_evals(&sig, vec![("a".into(), None)]).await.unwrap(),
             vec![Flip { value: Value::Null, dir: FlipDir::Leave }]
         );
         assert!(!reg.has_null(&sig));
@@ -3716,7 +3705,8 @@ mod tests {
             &sig,
             vec![("pm-1".into(), Some(Value::Int(100))), ("pm-2".into(), Some(Value::Int(200)))],
         )
-        .await;
+        .await
+        .unwrap();
         insert_outer_shape(&mut reg, "s100", "issues", keyed_membership_pred(100, &sig));
         insert_outer_shape(&mut reg, "s200", "issues", keyed_membership_pred(200, &sig));
 
@@ -3806,7 +3796,7 @@ mod tests {
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
         // The only project user 1 is a member of.
-        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await.unwrap();
         insert_membership_shape(&mut reg, "s1", &sig, 1);
 
         // Write an issue in a NON-matching project (999): never a member, so nothing is emitted.
@@ -3839,7 +3829,7 @@ mod tests {
         let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
-        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await.unwrap();
         insert_membership_shape(&mut reg, "s2", &sig, 1);
         fn emitted(reg: &SubqueryRegistry) -> u64 {
             reg.shapes["s2"].emitted.load(std::sync::atomic::Ordering::Relaxed)
@@ -3868,7 +3858,7 @@ mod tests {
         // has no Postgres, so the flip is driven directly and the still-present candidate row is
         // handed to the same `emit_for_shapes` re-derivation tail that query-back would call —
         // exactly the "membership flip" exit path, distinct from a row delete.
-        let flips = reg.apply_node_evals(&sig, vec![("pm-1".into(), None)]).await;
+        let flips = reg.apply_node_evals(&sig, vec![("pm-1".into(), None)]).await.unwrap();
         assert_eq!(flips, vec![Flip { value: Value::Int(100), dir: FlipDir::Leave }]);
         let results = reg
             .emit_for_shapes(
@@ -3906,7 +3896,7 @@ mod tests {
         let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
         let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
         insert_test_node(&mut reg, &sig);
-        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await.unwrap();
         insert_outer_shape(&mut reg, "s1", "issues", keyed_membership_pred(100, &sig));
         (ts, store, reg)
     }
@@ -4078,7 +4068,7 @@ mod tests {
         let ts = inner_ts();
         let sig: SubquerySig = "t|gid|MatchAll".into();
         let mut reg = registry_with_node(&sig);
-        reg.apply_node_evals(&sig, vec![("1".into(), Some(Value::Int(100)))]).await;
+        reg.apply_node_evals(&sig, vec![("1".into(), Some(Value::Int(100)))]).await.unwrap();
         assert!(reg.contains(&sig, &Value::Int(100)));
 
         // A re-derivation of this node is between its Postgres read and its reconcile.
@@ -4115,7 +4105,7 @@ mod tests {
             .node_queryback_evals(&sig, &ts, &[inner_row(100, 1), inner_row(200, 2)], &stale)
             .expect("the node is live");
         assert!(evals.is_empty(), "every candidate older than its live decision must be dropped");
-        reg.apply_node_evals(&sig, evals).await;
+        reg.apply_node_evals(&sig, evals).await.unwrap();
         assert!(!reg.contains(&sig, &Value::Int(100)), "a stale re-derivation must not re-admit a value");
         assert!(!reg.contains(&sig, &Value::Int(200)), "nor admit one the live verdict refused");
 
@@ -4125,7 +4115,7 @@ mod tests {
         let evals = reg
             .node_queryback_evals(&sig, &ts, &[inner_row(100, 1), inner_row(200, 2)], &fresh)
             .expect("the node is live");
-        reg.apply_node_evals(&sig, evals).await;
+        reg.apply_node_evals(&sig, evals).await.unwrap();
         assert!(reg.contains(&sig, &Value::Int(100)));
         assert!(reg.contains(&sig, &Value::Int(200)));
         reg.end_node_queryback(&sig);
@@ -4170,7 +4160,9 @@ mod tests {
     async fn registry_eval_reads_node_sets() {
         let sig: SubquerySig = "sig".into();
         let mut reg = registry_with_node(&sig);
-        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(1))), ("b".into(), Some(Value::Null))]).await;
+        reg.apply_node_evals(&sig, vec![("a".into(), Some(Value::Int(1))), ("b".into(), Some(Value::Null))])
+            .await
+            .unwrap();
         assert!(reg.contains(&sig, &Value::Int(1)));
         assert!(!reg.contains(&sig, &Value::Int(2)));
         assert!(reg.has_null(&sig));
