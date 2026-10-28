@@ -1447,6 +1447,9 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    // Let shutdown-owned compensation bypass the retry barrier while keeping the environment
+    // variables intact until the engine has drained its worker tasks.
+    electric_circuits_engine::http::test_disable_group_page_barrier();
     let close = engine.close(Duration::from_secs(10)).await;
     // Keep the fault-cut variables available until the engine has drained all shutdown-owned
     // compensation tasks; removing them earlier races native environment readers in those tasks.

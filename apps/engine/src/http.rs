@@ -1364,6 +1364,9 @@ struct GroupSnapshotGuard {
 /// applying a source transaction. Production builds never inspect this environment variable.
 #[cfg(feature = "test-support")]
 pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
+    if TEST_GROUP_PAGE_BARRIER_DISABLED.load(std::sync::atomic::Ordering::Acquire) {
+        return Ok(());
+    }
     let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return Ok(()) };
     // A caller can select one precise cancellation window.  The handoff contract leaves this
     // unset and therefore exercises both private and page barriers; cancellation tests set it so
@@ -1409,6 +1412,15 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 // Each ignored ownership contract runs in a fresh child process; the latch is intentionally
 // process-local so a once-only fault cannot fire twice inside one rollback trace.
 static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "test-support")]
+static TEST_GROUP_PAGE_BARRIER_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "test-support")]
+pub(crate) fn test_disable_group_page_barrier() {
+    TEST_GROUP_PAGE_BARRIER_DISABLED.store(true, std::sync::atomic::Ordering::Release);
+}
 
 #[cfg(feature = "test-support")]
 pub(crate) fn test_release_after_unsubscribe_once() -> bool {
