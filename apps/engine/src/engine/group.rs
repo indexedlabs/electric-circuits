@@ -204,4 +204,16 @@ mod tests {
         assert!(claims.release_if_matches("scope-1", "stream/two").is_none());
         assert_eq!(claims.get("scope-1").map(|group| group.id.as_str()), Some("stream/one"));
     }
+
+    #[tokio::test]
+    async fn concurrent_release_waiters_share_completion() {
+        let release = GroupRelease::new();
+        let waiter = {
+            let release = release.clone();
+            tokio::spawn(async move { release.wait().await })
+        };
+        tokio::task::yield_now().await;
+        release.complete(&Ok(()));
+        waiter.await.unwrap().unwrap();
+    }
 }
