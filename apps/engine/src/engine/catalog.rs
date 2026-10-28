@@ -1731,15 +1731,12 @@ impl Engine {
                     .iter()
                     .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
                 let lease_live = self.retention.subscription_lease_timeout.is_zero()
-                    || group
-                        .members
-                        .first()
-                        .and_then(|member| {
-                            st.feed_shares.get(&member.shape_id).and_then(|share| share.subs.get(&member.subscription))
-                        })
-                        .is_some_and(|at| {
-                            now.saturating_sub(*at) <= self.retention.subscription_lease_timeout.as_secs()
-                        });
+                    || group.members.iter().all(|member| {
+                        st.feed_shares
+                            .get(&member.shape_id)
+                            .and_then(|share| share.subs.get(&member.subscription))
+                            .is_some_and(|at| now.saturating_sub(*at) <= self.retention.subscription_lease_timeout.as_secs())
+                    });
                 if restorable && lease_live {
                     self.group_lanes.register(&group.stream_path);
                     st.group_claims.complete(group);

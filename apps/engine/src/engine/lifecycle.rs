@@ -2110,14 +2110,18 @@ impl Engine {
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }
-            let groups = expired
-                .iter()
-                .filter_map(|(_, subscription)| {
-                    st.group_claims.get(subscription).map(|group| (subscription.clone(), group.id.clone()))
-                })
-                .collect::<Vec<_>>();
+            let mut groups = HashMap::new();
+            for (_, subscription) in &expired {
+                if let Some(group) = st
+                    .group_claims
+                    .records_iter()
+                    .find(|group| group.subscription == *subscription || group.members.iter().any(|member| member.subscription == *subscription))
+                {
+                    groups.insert(group.id.clone(), (group.subscription.clone(), group.id.clone()));
+                }
+            }
             st.publish_subscription_gauge(&self.metrics);
-            (expired, groups)
+            (expired, groups.into_values().collect())
         };
         for (shape, subscription) in lapsed {
             tracing::debug!(
