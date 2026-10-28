@@ -785,7 +785,7 @@ pub(crate) async fn sequencer_loop(
                     for mut transaction in page.ready {
                         if group_fence.active()
                             && let Some(previous) = last_group_lsn
-                            && !wait_for_source_effects(&subq, &shutdown, previous).await
+                            && !wait_for_group_effects(&subq.group_lanes, &shutdown, previous).await
                         {
                             tracing::error!(previous, "group transaction barrier could not drain before the next commit");
                             processing_failed = true;
@@ -968,16 +968,8 @@ pub(crate) async fn sequencer_loop(
                             .collect();
                         for path in group_paths {
                             if let Some(envs) = txn_pending.remove(&path) {
-                                if let Err(error) = subq.group_lanes.append(&path, envs, group_lsn).await {
-                                    tracing::warn!(%error, stream_path = %path, "group append interrupted; preserving replay boundary");
-                                    highwater = txn_highwater;
-                                    processing_failed = true;
-                                    break;
-                                }
+                                subq.group_lanes.enqueue(&path, envs, group_lsn);
                             }
-                        }
-                        if processing_failed {
-                            break;
                         }
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
@@ -1255,6 +1247,25 @@ async fn wait_for_source_effects(
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            _ = shutdown.wait() => return false,
+        }
+    }
+}
+
+async fn wait_for_group_effects(
+    lanes: &crate::engine::emission::GroupEmissionLanes,
+    shutdown: &crate::shutdown::ShutdownToken,
+    marker_lsn: u64,
+) -> bool {
+    loop {
+        if shutdown.is_shutting_down() {
+            return false;
+        }
+        if !lanes.has_origin_at_or_before(marker_lsn) {
+            return true;
+        }
+        tokio::select! {
+            _ = lanes.wake().notified() => {}
             _ = shutdown.wait() => return false,
         }
     }

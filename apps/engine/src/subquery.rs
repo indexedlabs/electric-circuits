@@ -746,7 +746,8 @@ impl SubqueryRegistry {
     async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
         if stream_path.starts_with("shape/group-") {
             if let Some(lanes) = &self.group_lanes {
-                return lanes.append(stream_path, envs, commit_lsn).await;
+                lanes.enqueue(stream_path, envs, commit_lsn);
+                return Ok(());
             }
         }
         match &self.lanes {

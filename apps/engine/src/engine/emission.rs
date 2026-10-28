@@ -34,7 +34,7 @@ struct Batch {
 /// Hash-sharded, per-stream-ordered append lanes. Cheap to clone.
 #[derive(Clone)]
 pub(crate) struct EmissionLanes {
-    lanes: Arc<Vec<mpsc::Sender<Batch>>>,
+    lanes: Arc<Vec<mpsc::UnboundedSender<Batch>>>,
     pending: Arc<PendingFlips>,
 }
 
@@ -96,18 +96,24 @@ impl EmissionLanes {
 const GROUP_LANE_CAPACITY: usize = 64;
 
 struct GroupBatch {
+    commit_lsn: u64,
     stream_path: String,
     envs: Vec<Envelope>,
-    done: tokio::sync::oneshot::Sender<Result<()>>,
+}
+
+struct GroupLane {
+    queue: std::sync::Mutex<std::collections::VecDeque<GroupBatch>>,
+    wake: tokio::sync::Notify,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
 pub(crate) struct GroupEmissionLanes {
-    lanes: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<GroupBatch>>>>,
+    lanes: Arc<std::sync::Mutex<HashMap<String, Arc<GroupLane>>>>,
     ds: DsClient,
     shutdown: crate::shutdown::ShutdownToken,
     pending: Arc<PendingFlips>,
-    origins: Arc<std::sync::Mutex<BTreeMap<u64, usize>>>,
+    origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     wake: Arc<tokio::sync::Notify>,
 }
 
@@ -123,45 +129,84 @@ impl GroupEmissionLanes {
         }
     }
 
-    fn lane(&self, path: &str) -> mpsc::Sender<GroupBatch> {
+    fn lane(&self, path: &str) -> Arc<GroupLane> {
         let mut lanes = self.lanes.lock().unwrap();
         if let Some(sender) = lanes.get(path) {
             return sender.clone();
         }
         let (tx, mut rx) = mpsc::channel(GROUP_LANE_CAPACITY);
-        let ds = self.ds.clone();
-        let path_key = path.to_string();
+        let lane = Arc::new(GroupLane {
+            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            wake: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let dispatcher_lane = lane.clone();
+        let dispatcher_pending = self.pending.clone();
+        let dispatcher_origins = self.origins.clone();
+        let dispatcher_wake = self.wake.clone();
+        let dispatcher_shutdown = self.shutdown.clone();
+        let dispatcher = async move {
+            loop {
+                tokio::select! {
+                    _ = dispatcher_lane.wake.notified() => {}
+                    _ = dispatcher_shutdown.wait() => dispatcher_lane.closed.store(true, std::sync::atomic::Ordering::Release),
+                }
+                loop {
+                    let batch = dispatcher_lane.queue.lock().unwrap().pop_front();
+                    let Some(batch) = batch else { break };
+                    if dispatcher_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
+                        let mut queue = dispatcher_lane.queue.lock().unwrap();
+                        let mut dropped = std::collections::VecDeque::new();
+                        std::mem::swap(&mut *queue, &mut dropped);
+                        drop(queue);
+                        for batch in std::iter::once(batch).chain(dropped) {
+                            dispatcher_pending.complete(batch.commit_lsn);
+                            complete_origin_entry(&dispatcher_origins, &dispatcher_wake, &batch.stream_path, batch.commit_lsn);
+                        }
+                        return;
+                    }
+                    if let Err(batch) = tx.send(batch).await {
+                        let mut queue = dispatcher_lane.queue.lock().unwrap();
+                        let mut dropped = std::collections::VecDeque::new();
+                        std::mem::swap(&mut *queue, &mut dropped);
+                        drop(queue);
+                        for batch in std::iter::once(batch).chain(dropped) {
+                            dispatcher_pending.complete(batch.commit_lsn);
+                            complete_origin_entry(&dispatcher_origins, &dispatcher_wake, &batch.stream_path, batch.commit_lsn);
+                        }
+                        return;
+                    }
+                }
+                if dispatcher_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+            }
+        };
+        self.shutdown.clone().spawn_background(dispatcher);
+
+        let worker_lane = lane.clone();
+        let worker_ds = self.ds.clone();
+        let worker_pending = self.pending.clone();
+        let worker_origins = self.origins.clone();
+        let worker_wake = self.wake.clone();
         self.shutdown.clone().spawn_background(async move {
             while let Some(batch) = rx.recv().await {
-                let result = ds.append_reliable(&batch.stream_path, &batch.envs).await.map(|_| ());
-                if result.is_ok() {
-                    // The source commit barrier is released only after this group's batch landed.
-                    // A closed lane during shutdown releases the wait through the sender branch.
-                }
-                let _ = batch.done.send(result);
+                let _ = worker_ds.append_reliable(&batch.stream_path, &batch.envs).await;
+                worker_pending.complete(batch.commit_lsn);
+                complete_origin_entry(&worker_origins, &worker_wake, &batch.stream_path, batch.commit_lsn);
             }
+            worker_lane.closed.store(true, std::sync::atomic::Ordering::Release);
         });
-        lanes.insert(path_key, tx.clone());
-        tx
-    }
-
-    pub(crate) fn register_origin(&self, commit_lsn: u64) {
-        *self.origins.lock().unwrap().entry(commit_lsn).or_default() += 1;
-    }
-
-    fn complete_origin(&self, commit_lsn: u64) {
-        let mut origins = self.origins.lock().unwrap();
-        let Some(count) = origins.get_mut(&commit_lsn) else { return };
-        *count -= 1;
-        if *count == 0 {
-            origins.remove(&commit_lsn);
-        }
-        drop(origins);
-        self.wake.notify_waiters();
+        lanes.insert(path.to_string(), lane.clone());
+        lane
     }
 
     pub(crate) fn has_origin_at_or_before(&self, marker_lsn: u64) -> bool {
-        self.origins.lock().unwrap().first_key_value().is_some_and(|(&lsn, _)| lsn <= marker_lsn)
+        self.origins.lock().unwrap().iter().any(|((_, lsn), _)| *lsn <= marker_lsn)
+    }
+
+    pub(crate) fn wake(&self) -> Arc<tokio::sync::Notify> {
+        self.wake.clone()
     }
 
     /// Queue one complete group batch. The bounded send is awaited by an engine-owned task rather
@@ -171,35 +216,46 @@ impl GroupEmissionLanes {
         if envs.is_empty() {
             return;
         }
-        let (done, wait) = tokio::sync::oneshot::channel();
         self.pending.add(commit_lsn);
-        self.register_origin(commit_lsn);
-        let batch = GroupBatch { stream_path: path.to_string(), envs, done };
-        let sender = self.lane(path);
-        let pending = self.pending.clone();
-        let origins = self.origins.clone();
-        let wake = self.wake.clone();
-        let shutdown = self.shutdown.clone();
-        self.shutdown.spawn_background(async move {
-            let sent = tokio::select! {
-                result = sender.send(batch) => result.is_ok(),
-                _ = shutdown.wait() => false,
-            };
-            if sent {
-                let _ = wait.await;
-            }
-            pending.complete(commit_lsn);
-            let mut origins = origins.lock().unwrap();
-            if let Some(count) = origins.get_mut(&commit_lsn) {
-                *count -= 1;
-                if *count == 0 {
-                    origins.remove(&commit_lsn);
-                }
-            }
-            drop(origins);
-            wake.notify_waiters();
-        });
+        let path = path.to_string();
+        *self.origins.lock().unwrap().entry((path.clone(), commit_lsn)).or_default() += 1;
+        let lane = self.lane(&path);
+        lane.queue.lock().unwrap().push_back(GroupBatch { commit_lsn, stream_path: path, envs });
+        lane.wake.notify_one();
     }
+
+    pub(crate) fn remove(&self, path: &str) {
+        let lane = self.lanes.lock().unwrap().remove(path);
+        if let Some(lane) = lane {
+            lane.closed.store(true, std::sync::atomic::Ordering::Release);
+            let mut queue = lane.queue.lock().unwrap();
+            let dropped = std::mem::take(&mut *queue);
+            drop(queue);
+            for batch in dropped {
+                self.pending.complete(batch.commit_lsn);
+                complete_origin_entry(&self.origins, &self.wake, &batch.stream_path, batch.commit_lsn);
+            }
+            lane.wake.notify_one();
+        }
+    }
+}
+
+fn complete_origin_entry(
+    origins: &std::sync::Mutex<BTreeMap<(String, u64), usize>>,
+    wake: &tokio::sync::Notify,
+    path: &str,
+    commit_lsn: u64,
+) {
+    let mut origins = origins.lock().unwrap();
+    let key = (path.to_string(), commit_lsn);
+    if let Some(count) = origins.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            origins.remove(&key);
+        }
+    }
+    drop(origins);
+    wake.notify_waiters();
 }
 
 #[cfg(test)]

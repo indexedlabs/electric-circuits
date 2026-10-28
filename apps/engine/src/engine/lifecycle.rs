@@ -362,6 +362,14 @@ impl Engine {
                             owner: format!("group {sub}"),
                         }));
                     }
+                    if stream_path_override.is_none()
+                        && let Some(owner) = st.group_claims.private_owner(sub)
+                    {
+                        return Err(anyhow::Error::new(GroupConflict {
+                            subscription: sub.to_string(),
+                            owner: format!("group {owner}"),
+                        }));
+                    }
                     ensure_subscription_free(&st, sub, &existing_id)?;
                     // A join and a RENEWAL are the same call: `subscribe` returns false when the
                     // shape already holds this id, in which case nothing is claimed and only the
@@ -442,6 +450,14 @@ impl Engine {
             return Err(anyhow::Error::new(GroupConflict {
                 subscription: sub.to_string(),
                 owner: format!("group {sub}"),
+            }));
+        }
+        if stream_path_override.is_none()
+            && let Some(owner) = st.group_claims.private_owner(sub)
+        {
+            return Err(anyhow::Error::new(GroupConflict {
+                subscription: sub.to_string(),
+                owner: format!("group {owner}"),
             }));
         }
         ensure_subscription_free(&st, sub, "")?;
@@ -1130,7 +1146,7 @@ impl Engine {
     /// [`Self::release_subscription_durable`] instead: an acknowledged release must survive even
     /// when leases are disabled with `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`.
     pub async fn release_subscription(&self, id: &str, sub: Option<&str>) {
-        if let Err(error) = self.release_subscription_inner(id, sub, false).await {
+        if let Err(error) = self.release_subscription_inner(id, sub, false, false).await {
             tracing::error!(%error, "engine-internal subscription release lost its catalog writer");
         }
     }
@@ -1142,11 +1158,30 @@ impl Engine {
     /// that times out and drops this future therefore loses only its answer — the `Left` is the
     /// writer's from the moment it was enqueued, and lands regardless.
     pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) -> Result<()> {
-        self.release_subscription_inner(id, sub, true).await
+        self.release_subscription_inner(id, sub, true, false).await
     }
 
-    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) -> Result<()> {
+    pub(crate) async fn release_group_member_durable(&self, id: &str, sub: &str) -> Result<()> {
+        self.release_subscription_inner(id, Some(sub), true, true).await
+    }
+
+    async fn release_subscription_inner(
+        &self,
+        id: &str,
+        sub: Option<&str>,
+        durable: bool,
+        internal_group: bool,
+    ) -> Result<()> {
         let mut st = self.state.lock().await;
+        if !internal_group
+            && let Some(subscription) = sub
+            && let Some(owner) = st.group_claims.private_owner(subscription)
+        {
+            return Err(anyhow::Error::new(GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("group {owner}"),
+            }));
+        }
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
@@ -1198,6 +1233,11 @@ impl Engine {
     async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
+        let group_subscription = st
+            .group_claims
+            .records_iter()
+            .find(|group| group.members.iter().any(|member| member.shape_id == id))
+            .map(|group| group.subscription.clone());
         self.lives.lock().unwrap().remove(id);
         st.forget_subscriptions(id);
         if let Some(share) = st.feed_shares.remove(id) {
@@ -1230,6 +1270,9 @@ impl Engine {
             None
         };
         drop(st);
+        if let Some(subscription) = group_subscription {
+            self.release_group_claim(&subscription).await?;
+        }
         #[cfg(test)]
         if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
             self.purge_test_hook.removed.notify_one();
@@ -2077,8 +2120,9 @@ impl Engine {
 
     async fn release_group_claim(&self, subscription: &str) -> Result<()> {
         let Some(group) = self.group_record(subscription).await else { return Ok(()) };
+        self.group_lanes.remove(&group.stream_path);
         for member in &group.members {
-            self.release_subscription(&member.shape_id, Some(&member.subscription)).await;
+            self.release_group_member_durable(&member.shape_id, &member.subscription).await?;
         }
         self.finish_group_release(subscription).await
     }
