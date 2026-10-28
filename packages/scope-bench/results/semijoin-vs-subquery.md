@@ -303,8 +303,8 @@ current candidate has passed; the five-repetition benchmark remains pending. The
 adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
 retry coverage. `48501cd` then passed formatting, both group contracts, Rust engine tests, TypeScript and
 Node (run `40747358562`, test job `123024579773`); Vitest and the benchmark were still pending
-when reviewed. Current head `c78804a` retains members in place across rollback awaits; its exact
-run `40748888867` (test job `123029919319`) is still running, so no current-head result or
+when reviewed. Current head `82f2cd2` retains members in place across rollback awaits and adds the
+rollback-cancellation contract; its exact-head run is pending, so no current-head result or
 benchmark measurement is claimed.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
