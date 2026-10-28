@@ -63,7 +63,7 @@ fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> S
             match value {
                 Value::Null => format!("{name} {o} NULL"),
                 Value::Int(i) => format!("{name} {o} {i}"),
-                Value::Float(f) => format!("{name} {o} {}", f.0),
+                Value::Float(f) => format!("{name} {o} {}", f.into_inner()),
                 Value::Bool(b) => format!("{name} {o} {}", if *b { "true" } else { "false" }),
                 Value::Text(s) => {
                     // Bind text as a `$n` param, cast to the column's native type when known. Our schema

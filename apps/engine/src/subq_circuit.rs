@@ -40,7 +40,7 @@ use dbsp::typed_batch::{BatchReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
 use dbsp::{MapHandle, OutputHandle, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 
@@ -56,6 +56,7 @@ pub type Assert = dbsp::operator::Update<Value, Value>;
 #[derive(
     Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
 )]
+#[derive(OrdRepr)]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct PkKey {
     /// `node_id` (contributors) or `feed_id` (feeds). Ordered FIRST, so one id's entries are
@@ -237,19 +238,21 @@ enum Cmd {
 /// circuit state the host can size without dbsp's (heavy) profiler. Each byte field is dbsp's
 /// [`dbsp::trace::BatchReader::approximate_byte_size`]: exact in-memory columnar bytes (keys +
 /// weights) when the batch is resident, the on-disk file size when the batch is spilled (so
-/// under `ELECTRIC_CIRCUITS_SUBQ_STORAGE` these undercount RAM — spilling's whole point). `len` is the
-/// total tuple count across all batches the snapshot pins, **including superseded, not-yet-
-/// compacted `(key,+1)/(key,-1)` pairs** — the direct signal for compaction/pinning growth.
+/// under `ELECTRIC_CIRCUITS_SUBQ_STORAGE` these undercount RAM — spilling's whole point). Each `len`
+/// field is an upper bound on the tuple count across batches the snapshot pins, **including
+/// superseded, not-yet-compacted `(key,+1)/(key,-1)` pairs**, not an exact live membership count.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct CircuitBytes {
     /// The MEMBERS relation snapshot: `(node,value)` keys, weight = contributor count — the
     /// derived, deduplicated membership state published for `contains`/introspection.
     pub members_bytes: usize,
+    /// Upper bound on tuples in the pinned MEMBERS batches, including uncompacted updates.
     pub members_len: usize,
     /// The CONTRIBUTORS upsert-map integral: `(node,pk)→value`, one tuple per contributor.
     /// dbsp shares this exact spine with the upsert operator's own integral (registered under
     /// `TraceId(stream)` in the circuit cache), so this is the operator's own integral, not a copy.
     pub contributors_bytes: usize,
+    /// Upper bound on tuples in the pinned CONTRIBUTORS batches, including uncompacted updates.
     pub contributors_len: usize,
 }
 
@@ -422,7 +425,7 @@ impl MembershipCircuit {
 
     /// Measured byte sizes of the published snapshots (see [`CircuitBytes`]). Cheap: reads the
     /// two slot snapshots this circuit holds and sums dbsp's per-batch
-    /// `approximate_byte_size`/`len` — no circuit round-trip, no profiler. Safe on the on-demand
+    /// `approximate_byte_size`/`len_upper_bound` — no circuit round-trip, no profiler. Safe on the on-demand
     /// `GET /memory` or slower diagnostic logger; never call it from the 500 ms sampler.
     pub fn snapshot_bytes(&self) -> CircuitBytes {
         let (members_bytes, members_len) = snap_size(&self.members);
@@ -457,14 +460,14 @@ impl MembershipCircuit {
     }
 }
 
-/// `(approximate_byte_size, len)` of the snapshot a slot currently holds (0 if unpublished).
+/// `(approximate_byte_size, len_upper_bound)` of the snapshot a slot currently holds (0 if unpublished).
 /// `approximate_byte_size` is dbsp's per-batch columnar size summed over the batches the
-/// `ro_snapshot` pins; `len` is the total tuple count across those batches (superseded,
+/// `ro_snapshot` pins; the second value bounds the tuple count across those batches (superseded,
 /// uncompacted `(k,+w)`/`(k,-w)` pairs included). Cheap — no circuit round-trip.
 fn snap_size<T: BatchReader>(slot: &Slot<T>) -> (usize, usize) {
     let guard = slot.read().expect("snapshot slot");
     match guard.as_ref() {
-        Some(s) => (s.inner().approximate_byte_size(), s.inner().len()),
+        Some(s) => (s.inner().approximate_byte_size(), s.inner().len_upper_bound()),
         None => (0, 0),
     }
 }
@@ -751,8 +754,8 @@ mod tests {
 
         let cb = c.snapshot_bytes();
         // Contributors integral: 1000 live tuples; members: 100 distinct.
-        assert_eq!(cb.contributors_len, 1000);
-        assert_eq!(cb.members_len, 100, "members is the deduplicated (node,value) relation");
+        assert!(cb.contributors_len >= 1000);
+        assert!(cb.members_len >= 100, "members bound covers the deduplicated (node,value) relation");
         assert!(cb.contributors_bytes > 0 && cb.members_bytes > 0);
         // The integral (raw contributor map) dwarfs the derived membership snapshot.
         assert_eq!(cb.integral_bytes(), cb.contributors_bytes);
@@ -766,9 +769,9 @@ mod tests {
     /// the published snapshots bounded — dbsp's background merger reclaims the superseded
     /// `(k,+w)/(k,-w)` tuples despite our per-step `ro_snapshot` (which pins at most one step,
     /// since each step replaces the slot). If a snapshot pinned pre-compaction batches, the
-    /// spine's `len` would grow ~linearly with the step count instead of staying O(live keys).
+    /// spine's `len_upper_bound` would grow ~linearly with the step count instead of staying O(live keys).
     ///
-    /// We assert on `len` (total tuples across pinned batches, superseded ones included) rather
+    /// We assert on `len_upper_bound` (bounds pinned tuples, superseded ones included) rather
     /// than the brief's "snapshot bytes ≤ integral bytes × 1.5": members is a deduplicated
     /// projection that is *structurally* ≤ the contributor integral, so that ratio holds
     /// trivially and cannot detect intra-spine pinning. The real risk is superseded-batch

@@ -8,8 +8,8 @@
 //! exercises the archive impls (batches serialized to layer files).
 
 use anyhow::{Context, Result, bail};
-use feldera_macros::IsNone;
-use ordered_float::OrderedFloat;
+use dbsp::algebra::F64;
+use feldera_macros::{IsNone, OrdRepr};
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 
@@ -22,19 +22,20 @@ pub use dbsp::ZWeight;
 /// A weighted pair, the element of a Z-set delta (`Tup2(row, weight)`).
 pub use dbsp::utils::Tup2;
 
-/// A scalar cell value. `Float` wraps `OrderedFloat` because a bare `f64` is not
+/// A scalar cell value. `Float` wraps dbsp's `F64` because a bare `f64` is not
 /// `Eq`/`Ord`/`Hash` and so could not be a map key (aggregate multisets, routing indexes).
 #[derive(
     Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
 )]
-#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
+#[derive(OrdRepr)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub enum Value {
     #[default]
     Null,
     Int(i64),
     Text(String),
     Bool(bool),
-    Float(OrderedFloat<f64>),
+    Float(F64),
 }
 
 /// Integers a JSON **number** round-trips through IEEE-754 double without loss: `2^53 - 1`. Beyond
@@ -59,7 +60,7 @@ impl Value {
                 }
                 _ => Value::Int(j.as_i64().context("expected an integer")?),
             },
-            ColumnType::Float => Value::Float(OrderedFloat(j.as_f64().context("expected a float")?)),
+            ColumnType::Float => Value::Float(F64::new(j.as_f64().context("expected a float")?)),
             ColumnType::Text => Value::Text(j.as_str().context("expected a string")?.to_string()),
             ColumnType::Bool => Value::Bool(j.as_bool().context("expected a bool")?),
         })
@@ -76,7 +77,7 @@ impl Value {
                 ColumnType::Text => Value::Text(s.clone()),
                 ColumnType::Int => Value::Int(s.parse().with_context(|| format!("invalid integer literal '{s}'"))?),
                 ColumnType::Float => {
-                    Value::Float(OrderedFloat(s.parse().with_context(|| format!("invalid float literal '{s}'"))?))
+                    Value::Float(F64::new(s.parse().with_context(|| format!("invalid float literal '{s}'"))?))
                 }
                 ColumnType::Bool => match s.as_str() {
                     "t" | "true" | "TRUE" | "True" => Value::Bool(true),
@@ -92,7 +93,7 @@ impl Value {
     pub fn from_key_string(s: &str, ty: ColumnType) -> Result<Value> {
         Ok(match ty {
             ColumnType::Int => Value::Int(s.parse().context("pk is not an integer")?),
-            ColumnType::Float => Value::Float(OrderedFloat(s.parse().context("pk is not a float")?)),
+            ColumnType::Float => Value::Float(F64::new(s.parse().context("pk is not a float")?)),
             ColumnType::Text => Value::Text(s.to_string()),
             ColumnType::Bool => Value::Bool(s.parse().context("pk is not a bool")?),
         })
@@ -111,7 +112,7 @@ impl Value {
             Value::Null => serde_json::Value::Null,
             Value::Int(i) if i.unsigned_abs() <= JSON_EXACT_INT_MAX => (*i).into(),
             Value::Int(i) => serde_json::Value::String(i.to_string()),
-            Value::Float(f) => serde_json::json!(f.0),
+            Value::Float(f) => serde_json::json!(f.into_inner()),
             Value::Text(s) => s.clone().into(),
             Value::Bool(b) => (*b).into(),
         }
@@ -122,7 +123,7 @@ impl Value {
         match self {
             Value::Null => "null".to_string(),
             Value::Int(i) => i.to_string(),
-            Value::Float(f) => f.0.to_string(),
+            Value::Float(f) => f.into_inner().to_string(),
             Value::Text(s) => s.clone(),
             Value::Bool(b) => b.to_string(),
         }
@@ -133,7 +134,8 @@ impl Value {
 #[derive(
     Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
 )]
-#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
+#[derive(OrdRepr)]
+#[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct Row(pub Vec<Value>);
 
 impl Row {
@@ -191,7 +193,7 @@ mod tests {
             assert_eq!(round, Value::Int(v), "int {v} must survive the wire encoding");
         }
         // Only integers change form; the other types are unaffected.
-        assert_eq!(Value::Float(OrderedFloat(1.5)).to_json(), serde_json::json!(1.5));
+        assert_eq!(Value::Float(F64::new(1.5)).to_json(), serde_json::json!(1.5));
         assert_eq!(Value::Text("9007199254740993".into()).to_json(), serde_json::json!("9007199254740993"));
     }
 
