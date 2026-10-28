@@ -1347,6 +1347,42 @@ struct GroupReservationGuard {
     armed: bool,
 }
 
+/// Balances the per-member page-handoff query-back window even when the request future is
+/// canceled while a stream or Postgres read is pending.  The cleanup is owned by the engine's
+/// shutdown task set, so a disconnected client cannot leave recency state live forever.
+struct GroupSnapshotGuard {
+    engine: Engine,
+    shape_ids: Vec<String>,
+    armed: bool,
+}
+
+impl GroupSnapshotGuard {
+    fn new(engine: &Engine, shape_ids: impl IntoIterator<Item = String>) -> Self {
+        Self { engine: engine.clone(), shape_ids: shape_ids.into_iter().collect(), armed: true }
+    }
+
+    async fn finish(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.engine.end_group_snapshot_keys(self.shape_ids.iter().map(String::as_str)).await;
+        self.armed = false;
+    }
+}
+
+impl Drop for GroupSnapshotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let engine = self.engine.clone();
+        let shape_ids = self.shape_ids.clone();
+        engine.shutdown_token().spawn(async move {
+            engine.end_group_snapshot_keys(shape_ids.iter().map(String::as_str)).await;
+        });
+    }
+}
+
 impl GroupReservationGuard {
     fn new(engine: &Engine, subscription: &str) -> Self {
         Self { engine: engine.clone(), subscription: subscription.to_string(), armed: true }
@@ -1641,19 +1677,22 @@ async fn subset_load_group(
             }
         }
     }
-    let page_seed_shapes: Vec<String> = created
-        .iter()
-        .zip(members.iter())
-        .filter(|(_, member)| member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery))
-        .map(|((rec, _), _)| rec.id.clone())
-        .collect();
+    let mut page_seed_shapes = Vec::new();
+    for ((rec, _), member) in created.iter().zip(members.iter()) {
+        if let Some(where_) = member.where_.as_ref()
+            && crate::subquery::predicate_has_subquery(where_)
+        {
+            page_seed_shapes.push(rec.id.clone());
+        }
+    }
     // Begin tracking live decisions before any await after the private seed.  This covers
     // the full interval through the public page read and the gated key handoff.
     engine.begin_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
+    let mut snapshot_guard = GroupSnapshotGuard::new(engine, page_seed_shapes.clone());
     let offset = match engine.stream_tail(&group_path).await {
         Ok(Some(offset)) => offset,
         Ok(None) => {
-            engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
+            snapshot_guard.finish().await;
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
@@ -1663,7 +1702,7 @@ async fn subset_load_group(
             })));
         }
         Err(error) => {
-            engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
+            snapshot_guard.finish().await;
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
@@ -1685,7 +1724,7 @@ async fn subset_load_group(
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {
-            engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
+            snapshot_guard.finish().await;
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
@@ -1697,14 +1736,16 @@ async fn subset_load_group(
     // subquery member's delete gate before the group becomes durable; a later move-out can then
     // retract a row that was visible only in this shared page.
     let page_gate = crate::pg::SnapshotGate::parse_with_horizon(&page.snapshot, &page.lsn, &page.horizon);
-    let snapshot_keys = created
-        .iter()
-        .zip(page.pages.iter())
-        .zip(members.iter())
-        .filter(|((_, _), member)| member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery))
-        .map(|(((rec, _), rows), _)| (rec.id.as_str(), rows.as_slice()));
+    let mut snapshot_keys = Vec::new();
+    for (((rec, _), rows), member) in created.iter().zip(page.pages.iter()).zip(members.iter()) {
+        if let Some(where_) = member.where_.as_ref()
+            && crate::subquery::predicate_has_subquery(where_)
+        {
+            snapshot_keys.push((rec.id.as_str(), rows.as_slice()));
+        }
+    }
     let seed_result = engine.seed_group_snapshot_keys(snapshot_keys, &page_gate).await;
-    engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
+    snapshot_guard.finish().await;
     if let Err(error) = seed_result {
         for (rec, sub) in &created {
             let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;

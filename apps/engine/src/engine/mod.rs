@@ -2911,11 +2911,13 @@ impl Engine {
         gate: &crate::pg::SnapshotGate,
     ) -> Result<()> {
         let mut registry = self.subqueries.lock().await;
+        let mut pending = Vec::new();
         for (shape_id, rows) in members {
-            let pending = registry.seed_group_snapshot_keys(shape_id, rows, gate)?;
-            for (stream_path, lsn, envs) in pending {
-                registry.deliver(&stream_path, envs, lsn).await?;
-            }
+            pending.extend(registry.seed_group_snapshot_keys(shape_id, rows, gate)?);
+        }
+        pending.sort_by_key(|(_, lsn, _)| *lsn);
+        for (stream_path, lsn, envs) in pending {
+            registry.deliver(&stream_path, envs, lsn).await?;
         }
         Ok(())
     }

@@ -283,9 +283,12 @@ pub struct SubqueryShape {
     /// when it returns to zero: with no query-back in flight there is no older read to lose to,
     /// so the steady state carries no per-pk map at all.
     pub(crate) recent: HashMap<u32, (u64, Option<u64>)>,
-    /// Absolute membership verdict paired with `recent`; page handoff uses it to emit a
-    /// tombstone when a newer decision removed a page-visible key before it entered FeedSet.
-    pub(crate) recent_verdicts: HashMap<u32, bool>,
+    /// The newest absolute membership decision observed while a group page handoff is in
+    /// flight: `(observation_lsn, xid, member, delete_delivered)`.  This is deliberately
+    /// separate from `recent`, which is the stale-query-back fence for ordinary shapes.  A
+    /// query-back's triggering commit is not the observation point of its rows, so putting that
+    /// stamp in `recent` can overwrite a newer live decision and resurrect stale data.
+    pub(crate) page_decisions: HashMap<u32, PageDecision>,
     /// How many query-backs for this shape are between their registry-lock release and their
     /// evaluation. Non-zero is exactly the window `recent` has to cover.
     pub(crate) inflight_querybacks: u32,
@@ -302,7 +305,20 @@ impl HeapSize for SubqueryShape {
             + self.stream_path.heap_bytes()
             + self.gate.heap_bytes()
             + self.recent.heap_bytes()
-            + self.recent_verdicts.heap_bytes()
+            + self.page_decisions.heap_bytes()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageDecision {
+    pub(crate) stamp: (u64, Option<u64>),
+    pub(crate) member: bool,
+    pub(crate) delete_delivered: bool,
+}
+
+impl HeapSize for PageDecision {
+    fn heap_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -761,22 +777,17 @@ impl SubqueryRegistry {
             let newer_decision = self
                 .pk_dict
                 .get(&pk)
-                .and_then(|pk_id| self.shapes.get(shape_id).and_then(|shape| shape.recent.get(&pk_id)))
-                .filter(|&&(lsn, xid)| !gate.should_skip(lsn, xid));
-            if let Some(&(lsn, _)) = newer_decision {
-                let pk_id = self.pk_dict.get(&pk).context("recent decision has no dictionary key")?;
-                let member = self
-                    .shapes
-                    .get(shape_id)
-                    .and_then(|shape| shape.recent_verdicts.get(&pk_id))
-                    .copied()
-                    .unwrap_or(true);
-                if !member {
+                .and_then(|pk_id| self.shapes.get(shape_id).and_then(|shape| shape.page_decisions.get(&pk_id)))
+                .copied()
+                .filter(|decision| !gate.should_skip(decision.stamp.0, decision.stamp.1));
+            if let Some(decision) = newer_decision {
+                let pk_id = self.pk_dict.get(&pk).context("page decision has no dictionary key")?;
+                if !decision.member {
                     // If the key was already seeded, the decision's normal gated delete has
                     // already been delivered.  Otherwise the public page is the only client
                     // copy, so append the missing tombstone after the handoff.
-                    if !self.feed_sets.remove(feed_id, pk_id) {
-                        tombstones.entry(lsn).or_default().push(pk);
+                    if !decision.delete_delivered && !self.feed_sets.remove(feed_id, pk_id) {
+                        tombstones.entry(decision.stamp.0).or_default().push(pk);
                     }
                     continue;
                 }
@@ -797,6 +808,7 @@ impl SubqueryRegistry {
                 pending.push((stream_path.clone(), lsn, envs));
             }
         }
+        pending.sort_by_key(|(_, lsn, _)| *lsn);
         Ok(pending)
     }
 
@@ -1300,7 +1312,7 @@ impl SubqueryRegistry {
             feed_id,
             group_member: pending.group_member,
             recent: HashMap::new(),
-            recent_verdicts: HashMap::new(),
+            page_decisions: HashMap::new(),
             inflight_querybacks: 0,
         });
         // Seed the feed with the backfilled pks (the stream already carries the snapshot) —
@@ -1848,7 +1860,7 @@ impl SubqueryRegistry {
             s.inflight_querybacks = s.inflight_querybacks.saturating_sub(1);
             if s.inflight_querybacks == 0 {
                 s.recent = HashMap::new();
-                s.recent_verdicts = HashMap::new();
+                s.page_decisions = HashMap::new();
             }
         }
     }
@@ -1955,11 +1967,11 @@ impl SubqueryRegistry {
             EmissionSource::Live { lsn, .. } | EmissionSource::Replay { lsn, .. } => *lsn,
             EmissionSource::QueryBack { commit_lsn, .. } => *commit_lsn,
         };
-        // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
-        // query-back, which reads this map instead of writing it.
+        // The commit stamp a live/replayed decision records for the pks it evaluates. Query-backs
+        // read `recent` but never write it: their triggering commit is not the observation point
+        // of the rows they fetched and must not overwrite a newer live stamp.
         let decision_stamp: Option<(u64, Option<u64>)> = match &source {
             EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => Some((*lsn, *xid)),
-            EmissionSource::QueryBack { commit_lsn, .. } if *commit_lsn != 0 => Some((*commit_lsn, None)),
             EmissionSource::QueryBack { .. } => None,
         };
         for (shape_id, candidates) in groups {
@@ -1970,6 +1982,19 @@ impl SubqueryRegistry {
             // could overwrite this decision, so the map stays empty (and no pk id is minted for a
             // non-member that would otherwise never need one).
             let record_recency = shape.inflight_querybacks > 0 && decision_stamp.is_some();
+            // Page handoff decisions use the read's observation LSN, not the triggering flip's
+            // LSN.  The fallback keeps library-mode tests useful when no read LSN exists.
+            let page_stamp = if shape.group_member && shape.inflight_querybacks > 0 {
+                match &source {
+                    EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => Some((*lsn, *xid)),
+                    EmissionSource::QueryBack { gate, commit_lsn } => {
+                        (gate.lsn != 0).then_some((gate.lsn, None)).or_else(|| (*commit_lsn != 0).then_some((*commit_lsn, None)))
+                    }
+                }
+            } else {
+                None
+            };
+            let record_decision = record_recency || page_stamp.is_some();
             // A query-back's candidates are pre-filtered against the live decisions taken since
             // its snapshot. `should_skip(lsn, xid)` is "this commit was already visible to that
             // snapshot" — i.e. the read already reflects it, so the candidate row is current and
@@ -2022,7 +2047,7 @@ impl SubqueryRegistry {
                 None
             };
             let mut members: Vec<Row> = Vec::new();
-            let mut evaluated: Vec<(u32, bool)> = Vec::new();
+            let mut evaluated: Vec<(u32, bool, bool)> = Vec::new();
             for (ordinal, (row, exists)) in candidates.into_iter().enumerate() {
                 let pk = match ts.key_string(&row) {
                     Ok(pk) => pk,
@@ -2033,8 +2058,8 @@ impl SubqueryRegistry {
                     // Current member: deliver the upsert and record presence in the feed.
                     let pk_id = self.pk_dict.get_or_insert(&pk);
                     self.feed_sets.insert(feed_id, pk_id);
-                    if record_recency {
-                        evaluated.push((pk_id, true));
+                    if record_decision {
+                        evaluated.push((pk_id, true, false));
                     }
                     members.push(row);
                 } else {
@@ -2043,26 +2068,41 @@ impl SubqueryRegistry {
                     // have been a member, so it gates with no id allocated (the same
                     // probe-without-mint rationale as `template_assertions`).
                     if let Some(pk_id) = self.pk_dict.get(&pk) {
-                        if self.feed_sets.remove(feed_id, pk_id) {
+                        let delete_delivered = self.feed_sets.remove(feed_id, pk_id);
+                        if delete_delivered {
                             deletes.entry(shape_id.clone()).or_default().push(pk);
                         }
-                        if record_recency {
-                            evaluated.push((pk_id, false));
+                        if record_decision {
+                            evaluated.push((pk_id, false, delete_delivered));
                         }
-                    } else if record_recency {
+                    } else if record_decision {
                         // A never-interned non-member emits nothing — and still has to win over a
                         // query-back holding an older row for this pk, which WOULD emit an upsert
                         // (the empty-shape row-moved-away case). Recording it needs an id, so this
                         // is the one place a non-member mints one; it is bounded by the pks a live
                         // commit touches while a query-back is in flight.
-                        evaluated.push((self.pk_dict.get_or_insert(&pk), false));
+                        evaluated.push((self.pk_dict.get_or_insert(&pk), false, false));
                     }
                 }
             }
             if let (Some(stamp), Some(shape)) = (decision_stamp, self.shapes.get_mut(&shape_id)) {
-                for (pk_id, member) in evaluated {
-                    shape.recent.insert(pk_id, stamp);
-                    shape.recent_verdicts.insert(pk_id, member);
+                for (pk_id, _, _) in &evaluated {
+                    let replace = shape.recent.get(pk_id).is_none_or(|old| old.0 <= stamp.0);
+                    if replace {
+                        shape.recent.insert(*pk_id, stamp);
+                    }
+                }
+            }
+            if let Some(stamp) = page_stamp
+                && let Some(shape) = self.shapes.get_mut(&shape_id)
+            {
+                for (pk_id, member, delete_delivered) in evaluated {
+                    let replace = shape.page_decisions.get(&pk_id).is_none_or(|old| {
+                        stamp.0 > old.stamp.0 || (stamp.0 == old.stamp.0 && old.stamp.1.is_none() && stamp.1.is_some())
+                    });
+                    if replace {
+                        shape.page_decisions.insert(pk_id, PageDecision { stamp, member, delete_delivered });
+                    }
                 }
             }
             staged.push((shape_id, members));
@@ -2447,7 +2487,7 @@ async fn move_shape_for_value(
     commit_lsn: u64,
 ) -> Result<Option<(TableRef, i64)>> {
     // Brief lock: snapshot what the query-back needs.
-    let (ts, pg_url) = {
+    let (ts, pg_url, group_member) = {
         let mut reg = registry.lock().await;
         // A shape whose create is still in flight has edges (phase A) but no installed shape to
         // move: the flip waits on its pending entry and runs at install, instead of falling through
@@ -2459,7 +2499,7 @@ async fn move_shape_for_value(
             return Ok(None);
         }
         let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_pool.clone());
+        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_pool.clone(), shape.group_member);
         // In flight from here until the evaluation below: live decisions taken in that window are
         // stamped on the shape and beat whatever this read returns.
         reg.begin_queryback(shape_id);
@@ -2468,13 +2508,26 @@ async fn move_shape_for_value(
     // Every exit from here on must decrement — including the read's error path — or the shape
     // would keep recording recency (and dropping candidates) forever. There is no guard object
     // that can do it: the registry mutex is async and cannot be taken in `Drop`.
-    let (rows, gate) = match query_candidates(&pg_url, &ts, connecting_col, value).await {
+    let (mut rows, mut gate) = match query_candidates(&pg_url, &ts, connecting_col, value).await {
         Ok(r) => r,
         Err(e) => {
             registry.lock().await.end_queryback(shape_id);
             return Err(e);
         }
     };
+    // An inner flip can race a value-specific read all the way to an empty result.  For a group
+    // member, reconcile the whole outer table in that case so a page-visible row gets an absolute
+    // negative decision recorded for the handoff.  Ordinary shapes keep the cheaper empty result:
+    // their stream has no public page seam to fence.
+    if rows.is_empty() && group_member {
+        match query_all(&pg_url, &ts).await {
+            Ok(all) => (rows, gate) = all,
+            Err(error) => {
+                registry.lock().await.end_queryback(shape_id);
+                return Err(error);
+            }
+        }
+    }
     if rows.is_empty() {
         registry.lock().await.end_queryback(shape_id);
         return Ok(None);
@@ -3745,7 +3798,7 @@ mod tests {
             feed_id,
             group_member: false,
             recent: HashMap::new(),
-            recent_verdicts: HashMap::new(),
+            page_decisions: HashMap::new(),
             inflight_querybacks: 0,
         });
     }
@@ -4039,6 +4092,79 @@ mod tests {
             vec!["upsert"],
             "a query-back that already saw the live commit must still apply its row"
         );
+    }
+
+    /// A query-back carrying an older triggering commit may be evaluated after a newer live
+    /// decision.  It must not replace that decision's ordinary stale-read fence; a later stale
+    /// query-back is still dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_queryback_stamp_cannot_replace_a_newer_live_stamp() {
+        let (ts, store, mut reg) = recency_fixture().await;
+        reg.begin_queryback("s1");
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x200, Some(50), None, None)
+            .await
+            .unwrap();
+
+        // This query-back was triggered by an older flip, but its read snapshot already saw the
+        // live xid.  It may apply, but it must not write its older triggering LSN into `recent`.
+        let fresh = crate::pg::SnapshotGate::parse("60:70:", "0/300");
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &fresh, commit_lsn: 0x100 },
+        )
+        .await
+        .unwrap();
+
+        // A stale read that cannot see xid 50 must still be fenced by the live 0x200 decision.
+        let stale = crate::pg::SnapshotGate::parse("40:45:", "0/100");
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &stale, commit_lsn: 0x090 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ops_for(&store, "shape/s1"), vec!["upsert"]);
+        let pk_id = reg.pk_dict.get("1").unwrap();
+        assert_eq!(reg.shapes["s1"].recent.get(&pk_id), Some(&(0x200, Some(50))));
+        reg.end_queryback("s1");
+    }
+
+    /// Page handoff observes a negative query-back decision at its read LSN and emits the missing
+    /// table-qualified tombstone when the public page had already included the key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn page_handoff_emits_tombstone_for_newer_negative_queryback() {
+        let ts = issues_ts();
+        let (ds_url, _store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        insert_outer_shape(&mut reg, "s1", "issues", CompiledPredicate::Not(Box::new(CompiledPredicate::MatchAll)));
+        reg.shapes.get_mut("s1").unwrap().group_member = true;
+        reg.begin_queryback("s1");
+        let observed = crate::pg::SnapshotGate::parse("60:70:", "0/200");
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &observed, commit_lsn: 0x100 },
+        )
+        .await
+        .unwrap();
+
+        let page = crate::pg::SnapshotGate::parse("40:45:", "0/150");
+        let pending = reg
+            .seed_group_snapshot_keys(
+                "s1",
+                &[serde_json::json!({"id": 1, "project_id": 100})],
+                &page,
+            )
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].2[0].headers.operation, "delete");
+        assert_eq!(pending[0].2[0].type_, "issues");
+        reg.end_queryback("s1");
     }
 
     /// (b) The map is bounded by the in-flight window: nothing is recorded with no query-back
