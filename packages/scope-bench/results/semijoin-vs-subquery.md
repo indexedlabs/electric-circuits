@@ -453,12 +453,12 @@ fault-cut contract failure and the latter also had the split static declaration 
 rustfmt; `dafba36`'s release count made the second barrier pass instead of holding cancellation.
 Head `6c71df7` changed the production compensation path to report whether a claim was removed,
 re-enqueue `Left` for an already-removed claim, and add a deterministic retry-window barrier.
-The current candidate removes the impossible second-barrier wait and uses rustfmt's canonical
-declaration; exact-head CI is pending. The benchmark production tree remains the one preserved
-by `1d7bbbc`, while this candidate's compensation path still requires its own green test job.
-Existing claim/lease, public snapshot query,
-group stream and commit fence code is unchanged; the candidate additionally changes durable
-compensation to re-enqueue `Left` when a claim is already absent from in-memory state.
+The current docs-only head is `3a46632`; exact-head group contracts are still red in job
+`123132971902` after the impossible second-barrier wait was removed. The benchmark production
+tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path still
+requires its own green test job. Existing claim/lease, public snapshot query, group stream and
+commit fence code is unchanged; the candidate additionally changes durable compensation to
+re-enqueue `Left` when a claim is already absent from in-memory state.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's
