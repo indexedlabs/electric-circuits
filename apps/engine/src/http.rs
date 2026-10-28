@@ -1360,8 +1360,8 @@ struct GroupSnapshotGuard {
 /// process sets a unique base path, then releases the private-seed and page-read windows after
 /// applying a source transaction. Production builds never inspect this environment variable.
 #[cfg(feature = "test-support")]
-async fn test_group_page_barrier(stage: &str) {
-    let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return };
+async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
+    let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return Ok(()) };
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
     let release = std::path::PathBuf::from(format!("{base}.{stage}.release"));
     let _ = std::fs::OpenOptions::new().create(true).write(true).open(&ready);
@@ -1369,6 +1369,8 @@ async fn test_group_page_barrier(stage: &str) {
     while !release.exists() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    anyhow::ensure!(release.exists(), "test group {stage} barrier timed out");
+    Ok(())
 }
 
 impl GroupSnapshotGuard {
@@ -1726,7 +1728,7 @@ async fn subset_load_group(
         }
     };
     #[cfg(feature = "test-support")]
-    test_group_page_barrier("private").await;
+    test_group_page_barrier("private").await.map_err(AppError::from)?;
     let reads = members
         .iter()
         .map(|m| crate::engine::SubsetReadReq {
@@ -1750,7 +1752,7 @@ async fn subset_load_group(
         }
     };
     #[cfg(feature = "test-support")]
-    test_group_page_barrier("page").await;
+    test_group_page_barrier("page").await.map_err(AppError::from)?;
     // The public page is read after the private member seeds. Add its actual keys to each
     // subquery member's delete gate before the group becomes durable; a later move-out can then
     // retract a row that was visible only in this shared page.

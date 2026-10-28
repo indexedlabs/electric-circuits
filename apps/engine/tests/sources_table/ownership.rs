@@ -65,6 +65,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupNeverMember => group_never_member_writes_are_silent(&fixture).await,
             Case::GroupSibling => group_disjoint_sibling_survives_inner_move_out(&fixture).await,
             Case::GroupPageHandoff => group_page_handoff_preserves_newer_move_out(&fixture).await,
+            Case::GroupPageCancellation => group_page_cancellation_releases_queryback_window(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -97,6 +98,7 @@ enum Case {
     GroupNeverMember,
     GroupSibling,
     GroupPageHandoff,
+    GroupPageCancellation,
 }
 
 #[test]
@@ -115,6 +117,12 @@ fn group_disjoint_same_table_sibling_survives_move_out() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_page_handoff_preserves_newer_move_out() -> Result<()> {
     isolated("ownership::group_page_handoff_preserves_newer_move_out", Case::GroupPageHandoff)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_page_cancellation_releases_queryback_window() -> Result<()> {
+    isolated("ownership::group_page_cancellation_releases_queryback_window", Case::GroupPageCancellation)
 }
 
 #[test]
@@ -1053,12 +1061,17 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
     let (engine, app) = group_engine(f).await?;
     let result = async {
+        // Keep the source reader behind the page so the row committed after the private seed is
+        // visible to SQL but still absent from the member's FeedSet when the page is returned.
+        engine.pause_reads_for_test().await?;
         let request = membership_group_body(f, "group-page-handoff");
         let task = tokio::spawn({
             let app = app.clone();
             async move { post_group(&app, request).await }
         });
-        let ready = |stage: &str| async {
+        async fn wait_ready(base: &str, stage: &str) -> Result<()> {
+            let base = base.to_owned();
+            let stage = stage.to_owned();
             let path = PathBuf::from(format!("{base}.{stage}.ready"));
             tokio::time::timeout(Duration::from_secs(15), async {
                 loop {
@@ -1070,9 +1083,9 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
             })
             .await
             .context(format!("waiting for group {stage} barrier"))??;
-            Ok::<_, anyhow::Error>(())
-        };
-        ready("private").await?;
+            Ok(())
+        }
+        wait_ready(&base, "private").await?;
         let entered = uuid::Uuid::new_v4();
         f.client
             .batch_execute(&format!(
@@ -1082,10 +1095,9 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
                 f.outer, f.inner, entered
             ))
             .await?;
-        wait_source_receipt(&engine, f, entered).await?;
         std::fs::write(format!("{base}.private.release"), b"release")?;
 
-        ready("page").await?;
+        wait_ready(&base, "page").await?;
         let left = uuid::Uuid::new_v4();
         f.client
             .batch_execute(&format!(
@@ -1094,6 +1106,7 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
                 f.inner, left
             ))
             .await?;
+        engine.resume_reads_for_test().await?;
         wait_source_receipt(&engine, f, left).await?;
         let receipt = engine.source_drain_receipt(&left.to_string()).context("move-out receipt disappeared")?;
         std::fs::write(format!("{base}.page.release"), b"release")?;
@@ -1123,6 +1136,56 @@ async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> 
     engine.close(Duration::from_secs(10)).await;
     remove_source_fence(f).await;
     result
+}
+
+async fn group_page_cancellation_releases_queryback_window(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    for (index, cancel_stage) in ["private", "page"].into_iter().enumerate() {
+        let barrier = f.root.join(format!("group-page-cancel-{index}"));
+        let base = barrier.to_string_lossy().into_owned();
+        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+        let (engine, app) = group_engine(f).await?;
+        let request = membership_group_body(f, &format!("group-page-cancel-{index}"));
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move { post_group(&app, request).await }
+        });
+        async fn wait_ready(base: &str, stage: &str) -> Result<()> {
+            let path = PathBuf::from(format!("{base}.{stage}.ready"));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if path.exists() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .context(format!("waiting for cancelled group {stage} barrier"))??;
+            Ok(())
+        }
+        wait_ready(&base, "private").await?;
+        if cancel_stage == "page" {
+            std::fs::write(format!("{base}.private.release"), b"release")?;
+            wait_ready(&base, "page").await?;
+        }
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if engine.subquery_inflight_querybacks_for_test().await == 0 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
+        unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+        engine.close(Duration::from_secs(10)).await;
+    }
+    remove_source_fence(f).await;
+    Ok(())
 }
 
 async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {

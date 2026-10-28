@@ -151,20 +151,23 @@ jobs:
           ONLY_CONFIG: 'scope group'
           ENGINE_BIN: ${{ github.workspace }}/target/release/electric-circuits-engine
         run: |
-          set -euo pipefail
+          set -uo pipefail
           mkdir -p packages/scope-bench/results/ci
+          result=0
           for mode in subquery semijoin; do
             ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
               ONLY='cold launch' STEADY=0 \
               OUT="${{ github.workspace }}/packages/scope-bench/results/ci/${mode}-cold.json" \
-              pnpm --filter @electric-circuits/scope-bench bench
+              pnpm --filter @electric-circuits/scope-bench bench || result=1
             ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
               ONLY='chat open' STEADY=1 STEADY_WRITE_MS=500 \
               OUT="${{ github.workspace }}/packages/scope-bench/results/ci/${mode}-steady.json" \
-              pnpm --filter @electric-circuits/scope-bench bench
+              pnpm --filter @electric-circuits/scope-bench bench || result=1
           done
+          exit "$result"
       - name: Upload benchmark measurements
         uses: actions/upload-artifact@v4
+        if: ${{ always() }}
         with:
           name: semijoin-vs-subquery-${{ github.sha }}
           path: packages/scope-bench/results/ci/*.json

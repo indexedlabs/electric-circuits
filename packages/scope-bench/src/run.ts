@@ -209,6 +209,8 @@ interface RunResult {
   engineMemory?: unknown
   /** Complete on-demand DBSP profile, including membership mode and semijoin counters. */
   dbspProfile?: unknown
+  engineMemoryEnd?: unknown
+  dbspProfileEnd?: unknown
   steadyWrites?: number
   readsPerChange?: number | null
 }
@@ -236,7 +238,9 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     const r = await admin.query(
       `select coalesce(sum(calls),0)::float8 as calls, coalesce(sum(total_exec_time),0)::float8 as ms from pg_stat_statements
        where query not ilike '%pg_stat_statements%' and query not ilike 'update record set title%'
-         and query not ilike 'insert into assistant_stream_event%' and query not ilike 'insert into message%'`,
+         and query not ilike 'insert into assistant_stream_event%' and query not ilike 'insert into message%'
+         and query not ilike 'insert into assignment%' and query not ilike 'insert into tagged_item%'
+         and query not ilike 'update assignment%' and query not ilike 'update tagged_item%'`,
     )
     return { calls: Number(r.rows[0].calls), ms: Number(r.rows[0].ms) }
   }
@@ -317,9 +321,6 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
       if (diagnostics?.mode !== MEMBERSHIP_MODE) {
         throw new Error(`membership mode mismatch: requested ${MEMBERSHIP_MODE}, profile=${JSON.stringify(diagnostics)}`)
       }
-      if (MEMBERSHIP_MODE === 'semijoin' && Number(diagnostics?.selectionBatches ?? 0) <= 0) {
-        throw new Error(`semijoin made no DBSP selections: ${JSON.stringify(diagnostics)}`)
-      }
     }
     for (const [screen, rows] of perScreen) {
       const fs = rows.map((r) => r.first).filter((x): x is number => x != null)
@@ -339,8 +340,13 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     if (!STEADY) {
       timers.push(
         setInterval(() => {
-          admin
-            .query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, n++ % 50])
+          const offset = n++ % 50
+          Promise.all([
+            admin.query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
+            // Touch an eligible companion as well as the plain Record member so the cold-launch
+            // run proves that the semijoin selection path executes before its profile snapshot.
+            admin.query(`update assignment set payload = payload || '.' where user_id = $1 and id in (select id from assignment where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
+          ])
             .catch(() => {})
         }, 200),
       )
@@ -423,6 +429,21 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     result.authorityRechecks = gs.authorityRechecks - gsLoad.authorityRechecks
     result.engineCpuMs = Math.round(cpuMs(srv.enginePid) - cpu0)
     result.engineRssMb = Math.round(rssMb(srv.enginePid) * 10) / 10
+    if (cfg.design === 'scope-group') {
+      const memoryEndResponse = await fetch(`${srv.engineUrl}/memory`)
+      if (!memoryEndResponse.ok) throw new Error(`GET /memory (end) ${memoryEndResponse.status}`)
+      result.engineMemoryEnd = await memoryEndResponse.json()
+      const profileEndResponse = await fetch(`${srv.engineUrl}/debug/dbsp-profile`)
+      if (!profileEndResponse.ok) throw new Error(`GET /debug/dbsp-profile (end) ${profileEndResponse.status}`)
+      result.dbspProfileEnd = await profileEndResponse.json()
+      const diagnostics = (result.dbspProfileEnd as any)?.group_membership
+      if (diagnostics?.mode !== MEMBERSHIP_MODE) {
+        throw new Error(`membership mode mismatch at end: requested ${MEMBERSHIP_MODE}, profile=${JSON.stringify(diagnostics)}`)
+      }
+      if (MEMBERSHIP_MODE === 'semijoin' && Number(diagnostics?.selectionBatches ?? 0) <= 0) {
+        throw new Error(`semijoin made no DBSP selections after writes: ${JSON.stringify(diagnostics)}`)
+      }
+    }
     if (STEADY) {
       result.steadyWriteP50 = writeLatencies.length ? Math.round(median(writeLatencies)) : null
       result.steadyWriteP90 = writeLatencies.length ? Math.round(quantile(writeLatencies, 0.9)) : null

@@ -2940,6 +2940,12 @@ impl Engine {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn subquery_inflight_querybacks_for_test(&self) -> u32 {
+        self.subqueries.lock().await.shapes.values().map(|shape| shape.inflight_querybacks).sum()
+    }
+
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }
@@ -3423,6 +3429,33 @@ impl Engine {
     pub async fn table_offset(&self, _table: &TableRef) -> Option<LogPosition> {
         let st = self.state.lock().await;
         st.sequencer.as_ref().map(|s| s.processed.lock().unwrap().clone())
+    }
+
+    /// Pause/resume the change-log reader for the real PostgreSQL page-handoff contract.
+    /// These controls are available only in the test-support build and never affect production
+    /// binaries; the sequencer still services shape commands while its reader is paused.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn pause_reads_for_test(&self) -> Result<()> {
+        let cmd_tx = {
+            let mut state = self.state.lock().await;
+            self.ensure_sequencer(&mut state).cmd_tx.clone()
+        };
+        let (done, ack) = tokio::sync::oneshot::channel();
+        cmd_tx.send(SequencerCmd::PauseReads { done }).context("sequencer stopped before test pause")?;
+        ack.await.context("test pause acknowledgement lost")
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn resume_reads_for_test(&self) -> Result<()> {
+        let cmd_tx = {
+            let mut state = self.state.lock().await;
+            self.ensure_sequencer(&mut state).cmd_tx.clone()
+        };
+        let (done, ack) = tokio::sync::oneshot::channel();
+        cmd_tx.send(SequencerCmd::ResumeReads { done }).context("sequencer stopped before test resume")?;
+        ack.await.context("test resume acknowledgement lost")
     }
 
     /// The ingestor's own change-log position: the CURRENT segment and the tail offset of its last
