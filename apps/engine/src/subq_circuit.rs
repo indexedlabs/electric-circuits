@@ -159,7 +159,7 @@ struct SpillConfig {
     ///
     /// dbsp treats a `Some` value as the **grand TOTAL** cache size and uses it verbatim — no
     /// further multiplication by worker count or thread-type (see `RuntimeInner::new` in
-    /// dbsp 0.318: `Some(cache_mib) => cache_mib * 1 MiB`, full stop). The ×nworkers×thread-types
+    /// dbsp 0.365, `circuit/runtime.rs:568-569`: `Some(cache_mib) => cache_mib * 1 MiB`). The ×nworkers×thread-types
     /// scaling dbsp describes in its own docs only fires on ITS unset-default (`None` ⇒
     /// `256 MiB × nworkers × ThreadType::LENGTH(=2)`); for our 1-worker circuit that default is
     /// 512 MiB, which is why we always pass an explicit value here (see
@@ -769,6 +769,8 @@ mod tests {
         // Contributors integral: 1000 live tuples; members: 100 distinct.
         assert!(cb.contributors_len >= 1000);
         assert!(cb.members_len >= 100, "members bound covers the deduplicated (node,value) relation");
+        assert_eq!(c.contributor_entries(1).len(), 1000, "all contributors remain live");
+        assert_eq!(c.values_for_node(1, 1000).0, 100, "members deduplicate the contributors by value");
         assert!(cb.contributors_bytes > 0 && cb.members_bytes > 0);
         // The integral (raw contributor map) dwarfs the derived membership snapshot.
         assert_eq!(cb.integral_bytes(), cb.contributors_bytes);
