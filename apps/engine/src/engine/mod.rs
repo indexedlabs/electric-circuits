@@ -2959,17 +2959,32 @@ impl Engine {
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
         self.group_lanes.register(&record.stream_path);
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
-        let valid = {
+        let (valid, renewals) = {
             let mut st = self.state.lock().await;
             let valid = record.members.iter().all(|member| {
                 st.shapes.contains_key(&member.shape_id)
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
             });
             if valid {
+                let now = crate::changelog::now_secs();
+                let renewals = record
+                    .members
+                    .iter()
+                    .map(|member| {
+                        st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                        CatalogEvent::Joined {
+                            id: member.shape_id.clone(),
+                            subscription: member.subscription.clone(),
+                            at: now,
+                        }
+                    })
+                    .collect::<Vec<_>>();
                 st.group_claims.complete(record.clone());
                 self.group_fence.activate();
+                (true, renewals)
+            } else {
+                (false, Vec::new())
             }
-            valid
         };
         if !valid {
             let _ = self
@@ -2980,6 +2995,9 @@ impl Engine {
                 })
                 .await;
             return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
+        }
+        for event in renewals {
+            self.catalog_tx.send(event);
         }
         Ok(())
     }
@@ -2995,6 +3013,12 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
+        self.state.lock().await.group_claims.get(subscription).cloned()
+    }
+
+    #[cfg(not(feature = "test-support"))]
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }

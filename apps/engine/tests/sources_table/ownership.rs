@@ -1592,27 +1592,41 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
             .await
             .context("group load did not reach GroupCreated durability")?;
-        let member_id = engine
-            .graph()
+        let graph = tokio::time::timeout(Duration::from_secs(10), engine.graph())
             .await
-            .shapes
-            .into_iter()
-            .find(|shape| shape.stream_path.contains("shape/group-"))
-            .context("member shape was not installed before GroupCreated")?
-            .id;
-        tokio::time::sleep(Duration::from_secs(6)).await;
+            .context("group graph did not settle while assembly was held")??
+            .shapes;
+        let member0 = graph
+            .iter()
+            .find(|shape| {
+                shape.stream_path.contains("shape/group-") && shape.table.to_string() == format!("public.{}", f.outer)
+            })
+            .context("plain member shape was not installed before GroupCreated")?
+            .id
+            .clone();
+        let member1 = graph
+            .iter()
+            .find(|shape| {
+                shape.stream_path.contains("shape/group-") && shape.table.to_string() == format!("public.{}", f.inner)
+            })
+            .context("private member shape was not installed before GroupCreated")?
+            .id
+            .clone();
+        let (status, body) = json(&app, Method::DELETE, &format!("/v1/shapes/{member0}"), Body::empty()).await?;
+        ensure!(status == StatusCode::CONFLICT, "anonymous reservation release escaped the guard: {status} {body}");
+        tokio::time::timeout(Duration::from_secs(7), tokio::time::sleep(Duration::from_secs(6))).await.unwrap();
         ensure!(
-            engine.subscription_owner("group-assembly-race").await.as_deref() == Some(member_id.as_str()),
+            engine.subscription_owner("group-assembly-race").await.as_deref() == Some(member0.as_str()),
             "public reservation lease lapsed while group assembly was held"
         );
         ensure!(
-            engine.subscription_owner("group-assembly-race:member:1").await.is_some(),
+            engine.subscription_owner("group-assembly-race:member:1").await.as_deref() == Some(member1.as_str()),
             "private reservation lease lapsed while group assembly was held"
         );
         let (status, body) = json(
             &app,
             Method::DELETE,
-            &format!("/v1/shapes/{member_id}?subscription=group-assembly-race"),
+            &format!("/v1/shapes/{member0}?subscription=group-assembly-race"),
             Body::empty(),
         )
         .await?;
@@ -1623,6 +1637,16 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
             .context("group load did not complete after catalog release")?
             .context("group load task failed")??;
         ensure!(status == StatusCode::OK, "assembly completed without every claim: {status} {body}");
+        tokio::time::timeout(Duration::from_secs(4), tokio::time::sleep(Duration::from_secs(3))).await.unwrap();
+        ensure!(
+            engine.group_record("group-assembly-race").await.is_some(),
+            "completed group was retired immediately after its assembly lease renewal"
+        );
+        ensure!(
+            engine.subscription_owner("group-assembly-race").await.as_deref() == Some(member0.as_str())
+                && engine.subscription_owner("group-assembly-race:member:1").await.as_deref() == Some(member1.as_str()),
+            "completed group lost a member claim after assembly"
+        );
         let public_body = serde_json::json!({
             "table": format!("public.{}", f.outer),
             "changesOnly": true,
@@ -1632,8 +1656,8 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         ensure!(status == StatusCode::CONFLICT, "completed group lost its public claim: {status} {conflict}");
         let member_owner = engine.subscription_owner("group-assembly-race:member:1").await;
         ensure!(
-            member_owner.as_deref() == Some(member_id.as_str()),
-            "completed group lost its private claim: owner={member_owner:?}, member={member_id}"
+            member_owner.as_deref() == Some(member1.as_str()),
+            "completed group lost its private claim: owner={member_owner:?}, member={member1}"
         );
         Ok::<_, anyhow::Error>(())
     }
