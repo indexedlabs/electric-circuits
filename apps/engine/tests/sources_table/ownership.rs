@@ -28,10 +28,10 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0");
         if matches!(case, Case::GroupLapse) {
             command
-                .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1")
-                .env("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1")
+                .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "5")
+                .env("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1");
         } else {
-            command.env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "0")
+            command.env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "0");
         }
     })? {
         return Ok(());
@@ -1172,6 +1172,7 @@ async fn group_lapse_reloads_same_subscription(f: &Fixture) -> Result<()> {
         let (status, first) = post_group(&app, group_body(f, "group-lapse-reload", true)).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
         let old_path = first["streamPath"].as_str().context("old group stream path")?.to_owned();
+        tokio::time::sleep(Duration::from_secs(6)).await;
         wait_group_stream_retired(f, &old_path).await?;
         let (reload_status, second) = post_group(&app, group_body(f, "group-lapse-reload", true)).await?;
         ensure!(reload_status == StatusCode::OK, "lapsed group did not reload: {reload_status} {second}");
