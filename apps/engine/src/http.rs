@@ -1476,15 +1476,14 @@ impl GroupReservationGuard {
         if !self.armed {
             return;
         }
-        let mut failed_members = Vec::new();
-        while let Some((shape_id, subscription)) = self.members.last().cloned() {
-            self.members.pop();
-            if !Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
-                failed_members.push((shape_id, subscription));
+        let mut index = self.members.len();
+        while index > 0 {
+            index -= 1;
+            let (shape_id, subscription) = self.members[index].clone();
+            if Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
+                self.members.remove(index);
             }
         }
-        failed_members.reverse();
-        self.members = failed_members;
         if self.group_created {
             if !Self::drop_group_durable(&self.engine, &self.subscription).await {
                 tracing::warn!(subscription = %self.subscription, "cancelled group compensation could not append GroupDropped");

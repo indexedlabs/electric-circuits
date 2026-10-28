@@ -287,11 +287,13 @@ group and Rust lanes; its Electric image was also red and Vitest was still runni
 follow-up `c9ccae9` applied the barrier wiring and workload corrections; its exact run
 `40743452180` (test job `123010867174`) was red in group and Rust lanes because cleanup used
 invalid PostgreSQL publication syntax, while formatting, TypeScript and Node gates were green;
-no benchmark result was produced. The subsequent `fb6c7ae` run `40746277581` was red in the
-formatting gate before its contracts could qualify the cleanup. Current head `0f06114` keeps
-the valid plain table cleanup, preserves the one re-enqueue attempt during clean shutdown,
-continues through remaining member claims and `GroupDropped`, and keeps the body error ahead of
-cleanup errors; it awaits a fresh exact-head run.
+no benchmark result was produced. The subsequent `fb6c7ae` run `40746277581` was red only in the formatting gate; its group,
+Rust, TypeScript and Node steps passed. `48501cd` then made compensation single-shot after
+writer loss, retained failed members in the guard, and collected concurrent-contract errors;
+its test run `40747358562` passed formatting and both membership-mode group contracts while
+Rust and benchmark lanes were still pending when reviewed. The current candidate keeps the
+valid plain table cleanup, preserves the one re-enqueue attempt during clean shutdown, and
+retains each member in place until its release succeeds.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
@@ -299,8 +301,8 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
 current candidate has passed; the five-repetition benchmark remains pending. The follow-up
 adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
-retry coverage. The current candidate is `0f06114`; its exact-head run is unclaimed until all
-correctness and benchmark jobs finish.
+retry coverage. The current candidate is `48501cd`; its exact-head run is recorded above and remains
+unclaimed until all correctness and benchmark jobs finish.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
