@@ -1149,20 +1149,20 @@ impl Engine {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
         };
-        let event = released.map(|subscription| CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false });
-        let needs_barrier = durable && event.is_none();
-        drop(st);
-        self.touch_shape(id);
-        if let Some(event) = event {
-            #[cfg(feature = "test-support")]
+        let wait = released.and_then(|subscription| {
+            let event = CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false };
             if durable {
-                crate::http::test_group_page_barrier("rollback-release").await?;
-            }
-            if durable {
-                self.catalog_tx.send_durable(event).await?;
+                Some(self.catalog_tx.send_durable(event))
             } else {
                 self.catalog_tx.send(event);
+                None
             }
+        });
+        let needs_barrier = durable && wait.is_none();
+        drop(st);
+        self.touch_shape(id);
+        if let Some(wait) = wait {
+            wait.await?;
         } else if needs_barrier {
             self.catalog_tx.wait_durable().await?;
         }

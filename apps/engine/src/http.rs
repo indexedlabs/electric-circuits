@@ -1370,7 +1370,7 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     // a member-create or catalog-completion barrier does not accidentally block earlier stages.
     match std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") {
         Ok(selected) if selected != stage => return Ok(()),
-        Err(_) if matches!(stage, "member" | "complete" | "rollback") => return Ok(()),
+        Err(_) if matches!(stage, "member" | "complete") || stage.starts_with("rollback") => return Ok(()),
         _ => {}
     }
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
@@ -1485,6 +1485,12 @@ impl GroupReservationGuard {
         while index > 0 {
             index -= 1;
             let (shape_id, subscription) = self.members[index].clone();
+            #[cfg(feature = "test-support")]
+            let rollback_stage = format!("rollback-{index}");
+            #[cfg(feature = "test-support")]
+            if let Err(error) = test_group_page_barrier(&rollback_stage).await {
+                tracing::warn!(%error, %shape_id, %subscription, "group rollback test barrier failed");
+            }
             if Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
                 self.members.remove(index);
             }
@@ -1875,12 +1881,6 @@ async fn subset_load_group(
         reservation.rollback().await;
         return Err(AppError::from(error));
     }
-    #[cfg(feature = "test-support")]
-    if test_group_page_failure("page") {
-        snapshot_guard.finish().await;
-        reservation.rollback().await;
-        return Err(AppError::from(anyhow::anyhow!("test-injected group page failure")));
-    }
     // The public page is read after the private member seeds. Add its actual keys to each
     // subquery member's delete gate before the group becomes durable; a later move-out can then
     // retract a row that was visible only in this shared page.
@@ -1902,6 +1902,11 @@ async fn subset_load_group(
     // Keep one live caller claim for the group. Member claims after the first are private
     // implementation handles and are released once the group record has captured them.
     for (rec, sub) in created.iter().skip(1) {
+        #[cfg(feature = "test-support")]
+        if test_group_page_failure("member_release") {
+            reservation.rollback().await;
+            return Err(AppError::from(anyhow::anyhow!("test-injected member release failure")));
+        }
         if let Err(error) = engine.release_subscription_durable(&rec.id, Some(sub)).await {
             reservation.rollback().await;
             return Err(AppError::from(error));

@@ -734,9 +734,10 @@ place its delete after the page snapshot. The bounded decision map is cleared on
 handoff and on cancellation. An aborted group request releases every private member claim and
 its query-back window before the group reservation is dropped, retrying a failed release while
 the catalog writer remains available and failing closed when the writer is gone. Once
-`GroupCreated` is queued, cancellation releases private member claims, queues a durable
-`GroupDropped`, and only then aborts the public reservation. The guard owns a counted shutdown
-party, so engine close waits for every concurrent compensation before draining the catalog; a
+`GroupCreated` is queued, cancellation releases private member claims and tries to queue a durable
+`GroupDropped` before aborting the public reservation. If the catalog writer is already gone, the
+reservation aborts in memory while the guard retains the compensation state for its shutdown-owned
+retry. The guard owns a counted shutdown party, so engine close waits for every concurrent compensation before draining the catalog; a
 clean close within the grace period cannot resurrect an all-plain group whose create never
 returned. A crash, forced close, or catalog-writer loss can still leave a queued `GroupCreated`
 for replay. These page-handoff rules are part of the not-for-merge PR #45 experiment and require
