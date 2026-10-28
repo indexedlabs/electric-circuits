@@ -3432,6 +3432,56 @@ mod cancellation_tests {
             .expect("aggregate create admission guard engine close must complete");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserve_group_refuses_generated_member_id_owned_by_another_group() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-member-admission-guard".into(), store);
+        let (engine, _) = engine_with_subquery_tables_ds(ds).await;
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope:member:1", "group:scope:member:1").unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.reserve_group("scope", &["scope:member:1".into()]),
+        )
+        .await
+        .expect("generated member reservation check must not hang");
+        let error = result.expect_err("a public reservation must block its generated member id");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        assert!(!engine.has_group_record("scope").await);
+        assert!(!engine.state.lock().await.group_claims.is_reserved("scope"));
+
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope:member:1");
+            st.group_claims.reserve("scope:member:1", "group:scope:member:1").unwrap();
+            st.group_claims.complete(GroupRecord {
+                id: "shape/group-member-id".into(),
+                stream_path: "shape/group-member-id".into(),
+                subscription: "scope:member:1".into(),
+                members: Vec::new(),
+                lsn: "0/0".into(),
+                snapshot: String::new(),
+                horizon: "0/0".into(),
+                replay_fence: "0".into(),
+            });
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.reserve_group("scope", &["scope:member:1".into()]),
+        )
+        .await
+        .expect("generated member record check must not hang");
+        let error = result.expect_err("a public record must block its generated member id");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        assert!(!engine.has_group_record("scope").await);
+        assert!(!engine.state.lock().await.group_claims.is_reserved("scope"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
+            .await
+            .expect("generated member admission guard engine close must complete");
+    }
+
     #[tokio::test]
     async fn create_replay_keeps_each_commit_separately_pending() {
         use crate::subquery::{DeferredNodeWork, DeferredShapeWork, FinishedCreate, Flip, FlipDir};

@@ -2950,6 +2950,12 @@ impl Engine {
                     owner: format!("group {owner}"),
                 }));
             }
+            if st.group_claims.is_reserved(member) || st.group_claims.get(member).is_some() {
+                return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                    subscription: member.clone(),
+                    owner: format!("group {member}"),
+                }));
+            }
         }
         st.group_claims.reserve(subscription, &format!("group {subscription}"))?;
         st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
