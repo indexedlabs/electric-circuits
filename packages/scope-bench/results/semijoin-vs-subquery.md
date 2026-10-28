@@ -459,8 +459,9 @@ job `123141177393`), `ee7667a` (`40781440354`, job `123143837823`) and `21be5d6`
 (`40782847956`, job `123148605838`) were also red; `ee7667a` moved the fault-cut variables
 before engine startup, which ruled out the environment-ordering hypothesis, and `21be5d6` moved
 cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compile-red because
-the integration hook was private. The current head is `ccc29b2`; it exposes that hook and has
-rustfmt-green but group-contract-red exact-head job `123160613419`. The benchmark production tree
+the integration hook was private. The current docs-only head is `46717e6`; it records that
+`ccc29b2` exposed that hook and had rustfmt-green but group-contract-red exact-head job
+`123160613419`. The benchmark production tree
 remains the one preserved by `1d7bbbc`, while this candidate's compensation path still requires
 its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
