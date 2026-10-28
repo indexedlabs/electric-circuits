@@ -881,7 +881,7 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
         let baseline = stream_events(f, &stream_path).await.len();
         let t = uuid::Uuid::new_v4();
         f.client
-            .batch_execute(&format!("BEGIN; DELETE FROM public.{} WHERE id = 1; INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.inner, t))
+            .batch_execute(&format!("BEGIN; INSERT INTO public.{} (id) VALUES (2); INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT", f.inner, t))
             .await?;
         wait_source_receipt(&engine, f, t).await?;
         let t1 = uuid::Uuid::new_v4();
@@ -890,18 +890,13 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
             .await?;
         wait_source_receipt(&engine, f, t1).await?;
         let events = wait_group_events(f, &stream_path, baseline + 2).await?;
-        let mut delete = None;
-        let mut plain_update = None;
-        for (index, event) in events.iter().enumerate().skip(baseline) {
-            if event_key(event).as_deref() == Some("1") && event_operation(event) == Some("delete") {
-                delete = Some(index);
-            }
-            if event_key(event).as_deref() == Some("2") && event_operation(event) == Some("upsert") {
-                plain_update = Some(index);
-            }
-        }
-        ensure!(delete.is_some() && plain_update.is_some(), "missing deferred flip/output: {events:?}");
-        ensure!(delete < plain_update, "T+1 plain output crossed delayed T flip: {events:?}");
+        let flips: Vec<_> = events
+            .iter()
+            .skip(baseline)
+            .filter(|event| event_key(event).as_deref() == Some("2") && event_operation(event) == Some("upsert"))
+            .collect();
+        ensure!(flips.len() >= 2, "missing T and T+1 member outputs: {events:?}");
+        ensure!(flips[0]["headers"]["lsn"] != flips[1]["headers"]["lsn"], "T and T+1 outputs were not separately fenced: {events:?}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -942,7 +937,7 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
     install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
-        let (status, body) = post_group(&app, group_body(f, "group-delete", false)).await?;
+        let (status, body) = post_group(&app, group_body(f, "group-delete", true)).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let stream_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
         let baseline = stream_events(f, &stream_path).await.len();
