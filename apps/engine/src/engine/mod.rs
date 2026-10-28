@@ -3055,7 +3055,10 @@ impl Engine {
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
             })
         };
-        members_healthy && self.stream_tail(&group.stream_path).await.ok().flatten().is_some()
+        members_healthy
+            && self.ds.head(&group.stream_path).await.ok().flatten().is_some_and(|head| {
+                !head.closed && head.next_offset.is_some()
+            })
     }
 
     /// Remove the public group record and return its private members.  The caller performs

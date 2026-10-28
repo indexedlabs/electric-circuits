@@ -1221,7 +1221,8 @@ async fn subset_load_group(
                 release.wait().await.map_err(AppError::from)?;
             } else {
                 let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
-                if renewed {
+                let renewed_healthy = renewed && engine.group_is_healthy(&existing).await;
+                if renewed_healthy {
                     let offset =
                         engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| {
                             AppError {
@@ -1266,6 +1267,9 @@ async fn subset_load_group(
                         "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
                         "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
                     })));
+                }
+                if renewed {
+                    engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
                 }
             }
         }

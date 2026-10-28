@@ -1724,17 +1724,30 @@ impl Engine {
             // subquery member deliberately cannot survive a restart because its inner-node
             // contributor state is not persisted; its group is dropped as one unit and the
             // client recreates the scope.
+            let now = crate::changelog::now_secs();
             for (subscription, group) in groups {
                 let restorable = group
                     .members
                     .iter()
                     .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
-                if restorable {
+                let lease_live = self.retention.subscription_lease_timeout.is_zero()
+                    || group.members.first().and_then(|member| {
+                        st.feed_shares
+                            .get(&member.shape_id)
+                            .and_then(|share| share.subs.get(&member.subscription))
+                    })
+                    .is_some_and(|at| now.saturating_sub(*at) <= self.retention.subscription_lease_timeout.as_secs());
+                if restorable && lease_live {
                     self.group_lanes.register(&group.stream_path);
                     st.group_claims.complete(group);
                     self.group_fence.activate();
                 } else {
-                    tracing::info!(%subscription, "restore: dropping group with a non-restorable subquery member");
+                    tracing::info!(
+                        %subscription,
+                        restorable,
+                        lease_live,
+                        "restore: dropping group without a restorable live claim"
+                    );
                     self.catalog_tx.send(CatalogEvent::GroupDropped { subscription, group_id: Some(group.id.clone()) });
                     for member in &group.members {
                         if let Some(rec) = st.shapes.remove(&member.shape_id) {

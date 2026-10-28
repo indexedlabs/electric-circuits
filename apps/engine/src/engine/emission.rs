@@ -264,9 +264,21 @@ impl GroupEmissionLanes {
             // not resurrect a writer task for a stream that no longer has a group owner.
             return;
         };
+        self.enqueue_existing_lane(lane, path, envs, commit_lsn);
+    }
+
+    fn enqueue_existing_lane(&self, lane: Arc<GroupLane>, path: String, envs: Vec<Envelope>, commit_lsn: u64) {
         self.pending.add(commit_lsn);
         self.begin_origin(&path, commit_lsn);
-        lane.queue.lock().unwrap().push_back(GroupBatch { commit_lsn, stream_path: path, envs });
+        let mut queue = lane.queue.lock().unwrap();
+        if lane.closed.load(std::sync::atomic::Ordering::Acquire) {
+            drop(queue);
+            self.pending.complete(commit_lsn);
+            complete_origin_entry(&self.origins, &self.wake, &path, commit_lsn);
+            return;
+        }
+        queue.push_back(GroupBatch { commit_lsn, stream_path: path, envs });
+        drop(queue);
         lane.wake.notify_one();
     }
 
@@ -365,5 +377,24 @@ mod tests {
         lanes.enqueue("shape/a", vec![envelope], 0x10);
         assert_eq!(pending.count(), 1);
         assert!(!pending.has_at_or_before(0x20));
+    }
+
+    #[tokio::test]
+    async fn enqueue_after_remove_completes_its_origin() {
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new(
+            DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+        );
+        let lane = lanes.lane("shape/group");
+        lanes.remove("shape/group");
+        let envelope: Envelope = serde_json::from_value(serde_json::json!({
+            "type": "shape/group", "key": "1", "headers": {"operation": "upsert"}
+        }))
+        .unwrap();
+        lanes.enqueue_existing_lane(lane, "shape/group".into(), vec![envelope], 0x42);
+        assert_eq!(pending.count(), 0);
+        assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 0x42));
     }
 }
