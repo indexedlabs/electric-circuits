@@ -2484,6 +2484,25 @@ async fn enqueue_finished_create_work(
     id: &str,
     finished: crate::subquery::FinishedCreate,
 ) -> Result<()> {
+    enqueue_finished_create_work_parts(
+        &engine.subqueries,
+        &engine.group_lanes,
+        &engine.pending_flips,
+        &engine.flip_tx,
+        id,
+        finished,
+    )
+    .await
+}
+
+async fn enqueue_finished_create_work_parts(
+    registry: &Arc<Mutex<SubqueryRegistry>>,
+    group_lanes: &crate::engine::emission::GroupEmissionLanes,
+    pending_flips: &PendingFlips,
+    flip_tx: &mpsc::UnboundedSender<FlipWork>,
+    id: &str,
+    finished: crate::subquery::FinishedCreate,
+) -> Result<()> {
     let crate::subquery::FinishedCreate { work, deferred, node_work } = finished;
     // A create may replay multiple commits. Separate origins so finishing an early commit
     // never waits for a later commit bundled into the same worker. Within an origin retain
@@ -2517,7 +2536,7 @@ async fn enqueue_finished_create_work(
         }))
         .collect();
     let mut batches = batches;
-    let registry = engine.subqueries.lock().await;
+    let registry = registry.lock().await;
     for batch in &mut batches {
         let paths = match batch {
             FlipWork::Walk { work, .. } => registry.group_paths_for_work(work),
@@ -2533,23 +2552,23 @@ async fn enqueue_finished_create_work(
     drop(registry);
     for batch in &batches {
         for path in batch.group_paths() {
-            engine.group_lanes.begin_origin(path, batch.commit_lsn());
+            group_lanes.begin_origin(path, batch.commit_lsn());
         }
     }
-    engine.pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
+    pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
     let mut batches = batches.into_iter();
     while let Some(batch) = batches.next() {
         let commit_lsn = batch.commit_lsn();
-        if let Err(error) = engine.flip_tx.send(batch) {
+        if let Err(error) = flip_tx.send(batch) {
             let batch = error.0;
-            engine.pending_flips.complete(commit_lsn);
+            pending_flips.complete(commit_lsn);
             for path in batch.group_paths() {
-                engine.group_lanes.complete_origin(path, commit_lsn);
+                group_lanes.complete_origin(path, commit_lsn);
             }
             for unsent in batches {
-                engine.pending_flips.complete(unsent.commit_lsn());
+                pending_flips.complete(unsent.commit_lsn());
                 for path in unsent.group_paths() {
-                    engine.group_lanes.complete_origin(path, unsent.commit_lsn());
+                    group_lanes.complete_origin(path, unsent.commit_lsn());
                 }
             }
             return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
@@ -3216,9 +3235,10 @@ impl Engine {
 mod cancellation_tests {
     use super::*;
 
-    #[test]
-    fn create_replay_keeps_each_commit_separately_pending() {
+    #[tokio::test]
+    async fn create_replay_keeps_each_commit_separately_pending() {
         use crate::subquery::{DeferredNodeWork, DeferredShapeWork, FinishedCreate, Flip, FlipDir};
+        let (engine, _) = engine_with_subquery_tables().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let pending = PendingFlips::default();
         let finished = FinishedCreate {
@@ -3235,7 +3255,16 @@ mod cancellation_tests {
                 .map(|commit_lsn| ("parent".to_string(), DeferredNodeWork::Full { commit_lsn }))
                 .collect(),
         };
-        enqueue_finished_create_work(&tx, &pending, "s1", finished).unwrap();
+        enqueue_finished_create_work_parts(
+            &engine.subqueries,
+            &engine.group_lanes,
+            &pending,
+            &tx,
+            "s1",
+            finished,
+        )
+        .await
+        .unwrap();
         assert_eq!(pending.count(), 6);
         let mut earlier = 0;
         while let Ok(batch) = rx.try_recv() {
@@ -3254,8 +3283,9 @@ mod cancellation_tests {
     /// A create must not acknowledge after shutdown closes the flip propagator channel: the
     /// deferred effects returned by `finish_create` have nowhere to run, so the caller needs the
     /// normal shutdown error and rollback path.
-    #[test]
-    fn closed_flip_channel_rejects_finished_create_handoff() {
+    #[tokio::test]
+    async fn closed_flip_channel_rejects_finished_create_handoff() {
+        let (engine, _) = engine_with_subquery_tables().await;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         drop(flip_rx);
         let pending_flips = PendingFlips::default();
@@ -3268,7 +3298,15 @@ mod cancellation_tests {
             node_work: [("parent".into(), crate::subquery::DeferredNodeWork::Full { commit_lsn: 0x20 })].into(),
         };
 
-        let err = enqueue_finished_create_work(&flip_tx, &pending_flips, "s1", finished)
+        let err = enqueue_finished_create_work_parts(
+            &engine.subqueries,
+            &engine.group_lanes,
+            &pending_flips,
+            &flip_tx,
+            "s1",
+            finished,
+        )
+            .await
             .expect_err("a closed propagator cannot acknowledge deferred create work");
         assert_eq!(err.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
         assert_eq!(pending_flips.count(), 0, "failed handoff must not hold the barrier");
