@@ -284,11 +284,14 @@ retained the same `drop_group_durable` type mismatch. Its test job `122988431056
 that compile error, its scope benchmark `122993623042` was skipped, and its engine image job
 `122988431228` failed. The `dba8b19` run `40741829458` (test job `123005145542`) was compile/red in formatting,
 group and Rust lanes; its Electric image was also red and Vitest was still running. The
-follow-up `c9ccae9` applies the missing `?; Ok(())`, counts duplicate shutdown-party names,
-bounds writer-loss retries, fixes the four-stage barrier wiring, and returns source-fence
-cleanup to `Result<()>`. Its exact run `40743452180` (test job `123010867174`) is the first
-candidate run with the corrected tree; at report time it was still in the Rust-cache/test
-lane, so no benchmark result is claimed.
+follow-up `c9ccae9` applied the barrier wiring and workload corrections; its exact run
+`40743452180` (test job `123010867174`) was red in group and Rust lanes because cleanup used
+invalid PostgreSQL publication syntax, while formatting, TypeScript and Node gates were green;
+no benchmark result was produced. The subsequent `fb6c7ae` run `40746277581` was red in the
+formatting gate before its contracts could qualify the cleanup. Current head `0f06114` keeps
+the valid plain table cleanup, preserves the one re-enqueue attempt during clean shutdown,
+continues through remaining member claims and `GroupDropped`, and keeps the body error ahead of
+cleanup errors; it awaits a fresh exact-head run.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
@@ -296,8 +299,8 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
 current candidate has passed; the five-repetition benchmark remains pending. The follow-up
 adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
-retry coverage. The current candidate is `c9ccae9`; its exact-head run is recorded above and remains
-unclaimed until all correctness and benchmark jobs finish.
+retry coverage. The current candidate is `0f06114`; its exact-head run is unclaimed until all
+correctness and benchmark jobs finish.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

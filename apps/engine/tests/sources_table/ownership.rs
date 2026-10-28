@@ -938,9 +938,7 @@ async fn install_source_fence(f: &Fixture) -> Result<()> {
 }
 
 async fn remove_source_fence(f: &Fixture) -> Result<()> {
-    f.client
-        .batch_execute("DROP TABLE IF EXISTS public.circuits_source_fence")
-        .await?;
+    f.client.batch_execute("DROP TABLE IF EXISTS public.circuits_source_fence").await?;
     Ok(())
 }
 
@@ -1370,13 +1368,24 @@ async fn concurrent_page_cancellation_contract(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    ensure!(
-        close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
-        "concurrent cancellation engine did not close cleanly"
-    );
-    fence?;
-    result?;
-    replacement
+    let mut errors = Vec::new();
+    if close != electric_circuits_engine::shutdown::ShutdownOutcome::Complete {
+        errors.push(format!("concurrent cancellation engine did not close cleanly: {close:?}"));
+    }
+    if let Err(error) = fence {
+        errors.push(format!("remove source fence after concurrent cancellation: {error:#}"));
+    }
+    if let Err(error) = result {
+        errors.push(format!("concurrent cancellation contract: {error:#}"));
+    }
+    if let Err(error) = replacement {
+        errors.push(format!("retry after concurrent cancellation: {error:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
 }
 
 async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {

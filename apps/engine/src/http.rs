@@ -1463,18 +1463,13 @@ impl GroupReservationGuard {
     }
 
     async fn drop_group_durable(engine: &Engine, subscription: &str) -> bool {
-        if let Err(error) = engine.drop_group_durable(subscription).await {
-            tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            return match engine.drop_group_durable(subscription).await {
-                Ok(()) => true,
-                Err(retry_error) => {
-                    tracing::warn!(%subscription, %retry_error, "catalog writer unavailable for cancelled group");
-                    false
-                }
-            };
+        match engine.drop_group_durable(subscription).await {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%subscription, %error, "catalog writer unavailable for cancelled group");
+                false
+            }
         }
-        true
     }
 
     async fn rollback(&mut self) {
