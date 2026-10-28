@@ -301,8 +301,11 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
 current candidate has passed; the five-repetition benchmark remains pending. The follow-up
 adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
-retry coverage. The current candidate is `48501cd`; its exact-head run is recorded above and remains
-unclaimed until all correctness and benchmark jobs finish.
+retry coverage. `48501cd` then passed formatting, both group contracts, Rust engine tests, TypeScript and
+Node (run `40747358562`, test job `123024579773`); Vitest and the benchmark were still pending
+when reviewed. Current head `c78804a` retains members in place across rollback awaits; its exact
+run `40748888867` (test job `123029919319`) is still running, so no current-head result or
+benchmark measurement is claimed.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
