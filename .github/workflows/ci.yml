@@ -26,9 +26,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Rust formatting (rustfmt.toml at the root)
+        id: format
         run: cargo fmt --check
 
       - name: Start isolated PostgreSQL 18 for Rust ownership tests
+        id: pg18
         run: |
           # Pin the ephemeral logical-replication harness to PostgreSQL 18; do not let the
           # runner's preinstalled major select the test boundary implicitly.
@@ -50,14 +52,22 @@ jobs:
           "$PGBIN/pg_ctl" -D "$DATA" -o "-p 55432 -c wal_level=logical -c unix_socket_directories=$RUNNER_TEMP" -w start
           echo 'ELECTRIC_CIRCUITS_TEST_PG_URL=postgres://postgres@127.0.0.1:55432/postgres' >> "$GITHUB_ENV"
 
+      - name: Group contracts in both membership modes
+        run: |
+          # Run both even when one mode fails: retain each first divergence.
+          result=0
+          for mode in subquery semijoin; do
+            ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
+              cargo test -p electric-circuits-engine --features test-support --test sources_table group_ -- --ignored || result=1
+          done
+          exit "$result"
+
       - name: Rust engine tests
+        if: ${{ !cancelled() && steps.format.outcome == 'success' && steps.pg18.outcome == 'success' }}
         run: |
           cargo test -p electric-circuits-engine --features test-support
           cargo test -p electric-circuits-engine --test deployment_ownership -- --ignored
           cargo test -p electric-circuits-engine --features test-support --test sources_table -- --ignored
-          # Same group contracts and binary; only membership selection changes.
-          ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=semijoin \
-            cargo test -p electric-circuits-engine --features test-support --test sources_table group_ -- --ignored
           # Projection restart/backfill and live INSERT/UPDATE/DELETE against a SQL oracle.
           cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored
 

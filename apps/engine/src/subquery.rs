@@ -1030,7 +1030,8 @@ impl SubqueryRegistry {
     /// Called in the same registry critical section as `begin_create`, before any
     /// seed I/O or buffered-delta replay. Cancellation uses the ordinary pending rollback.
     pub(crate) fn mark_group_member(&mut self, shape_id: &str) -> Result<()> {
-        let pending = self.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id).context("pending group member")?;
+        let pending =
+            self.pending_shapes.iter_mut().find(|p| p.shape_id == shape_id).context("pending group member")?;
         pending.group_member = true;
         Ok(())
     }

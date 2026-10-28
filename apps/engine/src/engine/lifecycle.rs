@@ -3168,7 +3168,18 @@ mod cancellation_tests {
     /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream
     /// DELETE fails and is ignored, which leaves exactly the in-memory state these tests assert on.
     async fn engine_with_subquery_tables() -> (Engine, PredicateJson) {
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine_with_subquery_config(None).await
+    }
+
+    async fn engine_with_subquery_config(config: Option<&crate::config::Config>) -> (Engine, PredicateJson) {
+        let engine = Engine::new_inner(
+            DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+            None,
+            None,
+            PostgresSetup::EngineManaged,
+            config,
+            None,
+        );
         let schema: Schema = serde_json::from_value(serde_json::json!({
             "tables": {
                 "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },
@@ -3185,6 +3196,61 @@ mod cancellation_tests {
         }))
         .unwrap();
         (engine, where_json)
+    }
+
+    /// Reproduce the error owner that is not a flip worker: finish_create replays
+    /// an outer delta after seeding. A failure there must poison the shared engine,
+    /// not just fail this request while standalone shapes keep using frozen keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn semijoin_failure_during_create_replay_refuses_unrelated_membership_receipts() {
+        let config = crate::config::Config::resolve(|key| match key {
+            "ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP" => Some("semijoin".into()),
+            "ELECTRIC_CIRCUITS_SUBQ_STORAGE" => Some("0".into()),
+            _ => None,
+        })
+        .unwrap();
+        let (engine, predicate) = engine_with_subquery_config(Some(&config)).await;
+        let mut reg = engine.subqueries.lock().await;
+        let begin =
+            reg.begin_create("standalone", &"outer_t".into(), "shape/standalone", &predicate, None, true).unwrap();
+        let seeds = begin
+            .seeds
+            .into_iter()
+            .map(|(sig, _, _)| (sig, Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        reg.finish_create("standalone", seeds, crate::pg::SnapshotGate::passthrough(), 0, HashSet::new())
+            .await
+            .unwrap();
+        let begin = reg.begin_create("group", &"outer_t".into(), "group/test", &predicate, None, true).unwrap();
+        assert!(begin.seeds.is_empty(), "reuse the standalone member's live node");
+        reg.mark_group_member("group").unwrap();
+        let ts = engine.tables_shared.read().unwrap()[&TableRef::from("outer_t")].clone();
+        let row = ts.row_from_json(serde_json::json!({"id": 1, "gid": 7}).as_object().unwrap()).unwrap();
+        reg.on_table_delta(&ts, &[Tup2(row, 1)], 10, Some(10), None, None).await.unwrap();
+        engine.membership.fail_next_select_for_test().await;
+        let result =
+            reg.finish_create("group", Vec::new(), crate::pg::SnapshotGate::passthrough(), 0, HashSet::new()).await;
+        let error = result.err().expect("injected Select failure must reach the creator");
+        assert!(format!("{error:#}").contains("injected semijoin transaction failure"), "wrong error: {error:#}");
+        // Rollback uses the production path; it must not clear a circuit-wide fault.
+        reg.abort_create("group").await;
+        let inner = engine.tables_shared.read().unwrap()[&TableRef::from("inner_t")].clone();
+        let added = inner.row_from_json(serde_json::json!({"id": 1, "gid": 7}).as_object().unwrap()).unwrap();
+        // This change would move the unrelated standalone member into the scope.
+        // An error is allowed; success against the frozen circuit is not authority
+        // to answer a drain query. Do not run its deferred work against fake Postgres.
+        let _ = reg.on_table_delta(&inner, &[Tup2(added, 1)], 20, Some(20), None, None).await;
+        drop(reg);
+        let marker = AuthorityMarker {
+            source_commit_id: uuid::Uuid::new_v4().to_string(),
+            user_id: uuid::Uuid::new_v4().to_string(),
+            generation: "a".repeat(64),
+        };
+        let receipt = engine.runtime_drain_receipt(&marker);
+        let refused = receipt.err().is_some_and(|error| error.downcast_ref::<Degraded>().is_some());
+        let degraded = engine.degraded();
+        engine.close(std::time::Duration::from_secs(5)).await;
+        assert!(degraded && refused, "create replay killed shared membership but engine still accepts receipt queries");
     }
 
     /// Everything `create_shape`'s subquery path registers before its first await, plus the guard

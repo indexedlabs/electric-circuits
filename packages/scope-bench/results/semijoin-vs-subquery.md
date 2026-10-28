@@ -1,7 +1,7 @@
 # Key-only semijoin versus subquery members
 
 Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes are implemented but awaiting CI. No performance results are claimed. The experiment
+fixes are implemented, but hosted review found regressions described below. No performance results are claimed. The experiment
 must finish before this report can support changing the membership decision.
 
 ## Pinned inputs and method
@@ -91,6 +91,36 @@ after the intended Rust failure. Both hosted reviews accepted this test-only
 checkpoint; their verdicts do not cover the subsequent implementation.
 
 ### Candidate and controls
+
+**Review checkpoint `6d7551e`: not correct yet.** Both hosted reviewers found that
+unconditional group deletes wake streams for never-member rows; a deferred
+query-back can also delete a row belonging to a disjoint same-table sibling.
+They also found that killing the shared DBSP worker on a Select error can leave
+standalone shapes reading frozen membership. The current implementation must
+not be benchmarked as a correct alternative. CI run
+[40660381572](https://github.com/indexedlabs/electric-circuits/actions/runs/40660381572)
+stopped at one rustfmt line wrap; no runtime tests executed in that job. Engine,
+Node and Electric container builds passed in run `40660381475`.
+
+The next test checkpoint fixes only that formatting and adds two PostgreSQL
+contracts: a never-member insert/delete must leave the group stream unchanged
+after source receipts, and an inner-key move-out must preserve a disjoint plain
+sibling on the same table while deleting the companion. A focused fault test
+injects a Select transaction failure during `finish_create` buffered replay,
+rolls back the group, then applies an unrelated standalone membership change
+and demands typed degradation on the runtime receipt query. The injection is
+compiled only into unit tests and traverses the production error branch. These
+tests await genuine-red execution before the behavior fixes. CI runs both
+membership modes even if one fails, and separately runs library tests so the
+fault regression is not hidden behind the PostgreSQL failures.
+
+Planned correction: preserve the per-feed delete gate and seed group companion
+keys with an xid-fenced read before the member becomes live, reusing the existing
+atomic seed/replay path. Merely adding keys from the later group snapshot can
+race with live deletes and resurrect gate entries. The shared-worker failure
+must latch engine degradation independently of the requesting future. Both
+changes will be common to the two modes; the performance comparison will include
+their actual seed and state costs.
 
 Set `ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=subquery|semijoin` when starting the
 engine; the default is `subquery`. The baseline already keeps shared scope keys

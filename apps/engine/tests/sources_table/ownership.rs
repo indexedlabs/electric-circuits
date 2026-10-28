@@ -62,6 +62,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupSnapshotMoveOut => group_snapshot_only_member_moves_out(&fixture).await,
             Case::GroupMemberLsn => group_member_events_have_lsn(&fixture).await,
             Case::GroupReparent => group_companion_reparenting(&fixture).await,
+            Case::GroupNeverMember => group_never_member_writes_are_silent(&fixture).await,
+            Case::GroupSibling => group_disjoint_sibling_survives_inner_move_out(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -91,6 +93,20 @@ enum Case {
     GroupSnapshotMoveOut,
     GroupMemberLsn,
     GroupReparent,
+    GroupNeverMember,
+    GroupSibling,
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_never_member_insert_and_delete_do_not_wake_stream() -> Result<()> {
+    isolated("ownership::group_never_member_insert_and_delete_do_not_wake_stream", Case::GroupNeverMember)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_disjoint_same_table_sibling_survives_move_out() -> Result<()> {
+    isolated("ownership::group_disjoint_same_table_sibling_survives_move_out", Case::GroupSibling)
 }
 
 #[test]
@@ -1114,6 +1130,84 @@ async fn group_companion_reparenting(f: &Fixture) -> Result<()> {
                 "semijoin did not select any candidates: {profile}"
             );
         }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+async fn group_never_member_writes_are_silent(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, membership_group_body(f, "group-no-wake")).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let path = body["streamPath"].as_str().context("group stream path")?;
+        let baseline = stream_events(f, path).await;
+        for mutation in [
+            format!("INSERT INTO public.{} (id, body) VALUES (3, 'never in this scope')", f.outer),
+            format!("DELETE FROM public.{} WHERE id = 3", f.outer),
+        ] {
+            let commit = uuid::Uuid::new_v4();
+            f.client
+                .batch_execute(&format!(
+                    "BEGIN; {mutation}; INSERT INTO public.circuits_source_fence VALUES ('{commit}'); COMMIT"
+                ))
+                .await?;
+            wait_source_receipt(&engine, f, commit).await?;
+            let events = stream_events(f, path).await;
+            ensure!(events == baseline, "never-member mutation woke group after its receipt: {mutation}: {events:?}");
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+async fn group_disjoint_sibling_survives_inner_move_out(f: &Fixture) -> Result<()> {
+    f.client
+        .batch_execute(&format!("ALTER TABLE public.{} ADD COLUMN parent_id integer DEFAULT 1", f.outer))
+        .await?;
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let mut request = group_body(f, "group-sibling", false);
+        request["members"][0]["where"] = serde_json::json!({"col": "body", "op": "eq", "value": "kept"});
+        request["members"][1]["where"] = serde_json::json!({"and": [
+            {"col": "body", "op": "eq", "value": "excluded"},
+            {"col": "parent_id", "in": {"table": format!("public.{}", f.inner), "project": "id"}}
+        ]});
+        let (status, body) = post_group(&app, request).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        ensure!(body["results"][0]["rows"][0]["id"] == 1, "plain snapshot fixture: {body}");
+        ensure!(body["results"][1]["rows"][0]["id"] == 2, "companion snapshot fixture: {body}");
+        let path = body["streamPath"].as_str().context("group stream path")?;
+        let baseline = stream_events(f, path).await.len();
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; DELETE FROM public.{} WHERE id = 1; \
+                 INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.inner, commit
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, commit).await?;
+        let events = stream_events(f, path).await;
+        let table = format!("public.{}", f.outer);
+        let delivered: Vec<_> =
+            events.iter().skip(baseline).filter(|e| e["type"].as_str() == Some(table.as_str())).collect();
+        ensure!(
+            delivered.iter().any(|e| event_key(e).as_deref() == Some("2") && event_operation(e) == Some("delete")),
+            "subquery sibling did not move out: {events:?}"
+        );
+        ensure!(
+            !delivered.iter().any(|e| event_key(e).as_deref() == Some("1") && event_operation(e) == Some("delete")),
+            "unmodified plain sibling was deleted by a disjoint subquery member: {events:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;

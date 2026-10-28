@@ -220,6 +220,9 @@ fn process_alive(pid: u32) -> bool {
 }
 
 enum Cmd {
+    /// Test-only fault at the same error boundary as a failed probe transaction.
+    #[cfg(test)]
+    FailNextSelect { resp: oneshot::Sender<()> },
     Batch {
         asserts: Assertions,
         resp: oneshot::Sender<Vec<MemberDelta>>,
@@ -416,6 +419,13 @@ impl MembershipCircuit {
 
     pub(crate) fn selection_batches(&self) -> u64 {
         self.selections.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn fail_next_select_for_test(&self) {
+        let (tx, rx) = oneshot::channel();
+        self.tx.send(Cmd::FailNextSelect { resp: tx }).await.unwrap();
+        rx.await.unwrap();
     }
 
     /// Select companion candidates using the real DBSP incremental join. Callers
@@ -636,14 +646,23 @@ fn circuit_thread(
     selection: Option<SelectionHandles>,
     mut rx: mpsc::Receiver<Cmd>,
 ) {
+    #[cfg(test)]
+    let mut fail_next_select = false;
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            #[cfg(test)]
+            Cmd::FailNextSelect { resp } => {
+                fail_next_select = true;
+                let _ = resp.send(());
+            }
             Cmd::Select { keys, resp } => {
                 let result = (|| -> Result<Vec<i64>> {
                     let (input, output) = selection.as_ref().context("semijoin circuit disabled")?;
                     for (key, ordinal) in &keys {
                         input.push(key.clone(), (*ordinal, 1));
                     }
+                    #[cfg(test)]
+                    anyhow::ensure!(!std::mem::take(&mut fail_next_select), "injected semijoin transaction failure");
                     dbsp.transaction().map_err(|e| anyhow::anyhow!("semijoin insert: {e}"))?;
                     let selected = output.concat().iter().filter(|(_, _, w)| *w > 0).map(|(i, _, _)| i).collect();
                     for (key, ordinal) in keys {
