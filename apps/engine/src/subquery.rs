@@ -2573,7 +2573,7 @@ async fn enqueue_staged_group_emissions(
     if staged.is_empty() {
         return;
     }
-    let lanes = registry.lock().await.group_lanes.clone();
+    let lanes = { registry.lock().await.group_lanes.clone() };
     if let Some(lanes) = lanes {
         for (path, envs, commit_lsn) in staged {
             lanes.enqueue(&path, envs, commit_lsn).await;
