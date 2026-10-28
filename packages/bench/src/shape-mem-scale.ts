@@ -6,8 +6,8 @@
 //   - creation fan-out across SCALE_CLIENT_PROCS spawned worker processes (plain-JS `node -e`
 //     workers fed shape bodies over stdin as JSON lines — the parent keeps the TS workload
 //     logic, the workers are dumb POST pools);
-//   - after the last milestone, SCALE_LIVE_SUBS live long-polls are HELD OPEN against the
-//     durable-streams server (`?live=long-poll`), spread over SCALE_LIVE_PROCS workers, and
+//   - after the last milestone, SCALE_LIVE_SUBS per-table live reads are HELD OPEN against the
+//     durable-streams server (`?live=sse` or `?live=long-poll`), spread over SCALE_LIVE_PROCS workers, and
 //     memory is sampled again with subscriptions active (engine RSS must not care — live
 //     serving is the streams server's job);
 //   - samples include the durable-streams server's RSS next to the engine's;
@@ -53,6 +53,16 @@ const CLIENT_PROCS = numEnv('SCALE_CLIENT_PROCS', 4)
 const CONC_PER_PROC = numEnv('SCALE_CONC_PER_PROC', 12)
 const LIVE_SUBS = numEnv('SCALE_LIVE_SUBS', 20000)
 const LIVE_PROCS = numEnv('SCALE_LIVE_PROCS', 8)
+const LIVE_WRITES = numEnv('SCALE_LIVE_WRITES', 0)
+const LIVE_WRITE_INTERVAL_MS = numEnv('SCALE_LIVE_WRITE_INTERVAL_MS', 500)
+const LIVE_HOLD_MS = numEnv('SCALE_LIVE_HOLD_MS', 15000)
+const WRITE_MARKER_PREFIX = `bench-${process.pid}-${Date.now()}-`
+type LiveMode = 'sse' | 'long-poll'
+function parseLiveMode(value: string): LiveMode {
+  if (value === 'sse' || value === 'long-poll') return value
+  throw new Error(`SCALE_LIVE_MODE must be sse or long-poll, got ${value}`)
+}
+const LIVE_MODE = parseLiveMode(process.env.SCALE_LIVE_MODE ?? 'long-poll')
 const MATERIALIZED = process.env.SCALE_MATERIALIZED !== '0'
 const OUT = process.env.SCALE_OUT ?? join(repoRoot(), 'docs', 'bench', 'shape-memory-scale.md')
 // Phase-0 attribution hook (Task 0.2): after the final milestone drains, snapshot /memory (full
@@ -291,6 +301,67 @@ async function runWorkers(
   return { procs, stdout: outs }
 }
 
+async function stopWorkers(run: { procs: ChildProcess[] }): Promise<void> {
+  const exits = run.procs.map((p) => {
+    if (p.exitCode !== null || p.signalCode !== null) return Promise.resolve()
+    const exited = new Promise<void>((resolve) => p.once('exit', () => resolve()))
+    p.kill('SIGTERM')
+    return exited
+  })
+  await Promise.all(exits)
+}
+
+interface LiveWorkerSummary {
+  liveMode: LiveMode
+  reads: number
+  reconnects: number
+  maxActive: number
+  elapsedMs: number
+  deliveryMs?: number[]
+}
+
+function percentile(values: number[], p: number): number | null {
+  const sorted = [...values].sort((a, b) => a - b)
+  return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))]! : null
+}
+
+function liveSummary(runs: Array<{ stdout: string[] }>): {
+  reads: number
+  heldConnections: number
+  reconnectsPerMinute: number
+  deliveryP50Ms: number | null
+  deliveryP90Ms: number | null
+  deliveries: number
+} {
+  const summaries: LiveWorkerSummary[] = []
+  for (const run of runs) {
+    for (const output of run.stdout) {
+      for (const line of output.split('\n')) {
+        if (!line) continue
+        try {
+          const parsed = JSON.parse(line) as LiveWorkerSummary
+          if (parsed.liveMode === LIVE_MODE && typeof parsed.reads === 'number') summaries.push(parsed)
+        } catch {
+          // Creation workers and diagnostic output are not live summaries.
+        }
+      }
+    }
+  }
+  const reads = summaries.reduce((n, s) => n + s.reads, 0)
+  const heldConnections = summaries.reduce((n, s) => n + s.maxActive, 0)
+  const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
+  const elapsedMs = Math.max(1, ...summaries.map((s) => s.elapsedMs))
+  const deliveries = summaries.flatMap((s) => s.deliveryMs ?? [])
+  return {
+    reads,
+    heldConnections,
+    reconnectsPerMinute: reconnects * 60000 / elapsedMs,
+    deliveryP50Ms: percentile(deliveries, 0.5),
+    deliveryP90Ms: percentile(deliveries, 0.9),
+    deliveries: deliveries.length,
+  }
+}
+
 function chunks<T>(arr: T[], n: number): T[][] {
   const out: T[][] = Array.from({ length: n }, () => [])
   arr.forEach((x, i) => out[i % n]!.push(x))
@@ -320,12 +391,12 @@ async function main() {
   const engine = await spawnEngine(dsUrl, pg.pgUrl)
   await sleep(1500)
 
-  type Row = { label: string; users: number; requested: number; engineShapes: number; engineRssMib: number; engineFpMib: number; dsRssMib: number; card: Record<string, number> }
+  type Row = { label: string; liveMode: LiveMode; users: number; requested: number; engineShapes: number; engineRssMib: number; engineFpMib: number; dsRssMib: number; card: Record<string, number> }
   const rows: Row[] = []
   const sample = async (label: string, users: number, requested: number) => {
     const m = await engineMemory(engine.url)
     const row: Row = {
-      label, users, requested,
+      label, liveMode: LIVE_MODE, users, requested,
       engineShapes: m.card.shapes ?? 0,
       engineRssMib: m.rss / MIB,
       engineFpMib: footprintMib(engine.proc.pid ?? undefined),
@@ -375,48 +446,70 @@ async function main() {
     ? process.env.SCALE_LIVE_RAMP.split(',').map(Number)
     : LIVE_SUBS > 0 ? [LIVE_SUBS] : []
   let liveProcs: ChildProcess[] = []
+  const liveRuns: Array<{ procs: ChildProcess[]; stdout: string[] }> = []
   let held = 0
   for (const level of LIVE_RAMP) {
     if (!streamUrls.length) break
     const targets: string[] = []
     for (let i = held; i < level; i++) targets.push(streamUrls[i % streamUrls.length]!)
     if (targets.length) {
-      liveProcs.push(...(await runWorkers(LIVE_WORKER_JS, {}, chunks(targets, LIVE_PROCS), false)).procs)
+      const run = await runWorkers(
+        LIVE_WORKER_JS,
+        { WORKER_LIVE_MODE: LIVE_MODE, WORKER_WRITE_MARKER_PREFIX: WRITE_MARKER_PREFIX },
+        chunks(targets, LIVE_PROCS),
+        false,
+      )
+      liveRuns.push(run)
+      liveProcs.push(...run.procs)
     }
     held = level
-    console.log(`holding ${held} live long-polls…`)
+    console.log(`holding ${held} live ${LIVE_MODE} reads…`)
     const psSample = (label: string) => {
       const engineRss = procRssMib(engine.proc.pid ?? undefined)
       const engineFp = footprintMib(engine.proc.pid ?? undefined)
       const dsRss = procRssMib(dsPid)
       const last = rows[rows.length - 1]!
-      rows.push({ ...last, label, engineRssMib: engineRss, engineFpMib: engineFp, dsRssMib: dsRss })
+      rows.push({ ...last, label, liveMode: LIVE_MODE, engineRssMib: engineRss, engineFpMib: engineFp, dsRssMib: dsRss })
       console.log(`${label.padEnd(22)} engineRSS=${engineRss.toFixed(1)}MiB engineFP=${engineFp.toFixed(1)}MiB dsRSS=${dsRss.toFixed(1)}MiB (ps+footprint)`)
     }
-    await sleep(15000)
-    psSample(`live subs ${held}`)
+    if (held === LIVE_RAMP[LIVE_RAMP.length - 1] && LIVE_WRITES > 0) {
+      for (let i = 0; i < LIVE_WRITES; i++) {
+        const writtenAt = Date.now()
+        await client.query('UPDATE issues SET title = $1 WHERE id = 1', [`${WRITE_MARKER_PREFIX}${writtenAt}`])
+        if (i + 1 < LIVE_WRITES) await sleep(LIVE_WRITE_INTERVAL_MS)
+      }
+    }
+    await sleep(LIVE_HOLD_MS)
+    psSample(`live ${LIVE_MODE} subs ${held}`)
     if (held === LIVE_RAMP[LIVE_RAMP.length - 1]) {
       await sleep(15000)
-      psSample(`live subs ${held} +15s`)
+      psSample(`live ${LIVE_MODE} subs ${held} +15s`)
     }
   }
+  for (const run of liveRuns) await stopWorkers(run)
+  const live = liveSummary(liveRuns)
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} held=${live.heldConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
-    `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, peak held connections=${live.heldConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
-  md.push('| phase | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
-  md.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
+  md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
+    `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
+    `liveWrites=${LIVE_WRITES}/${LIVE_WRITE_INTERVAL_MS}ms, liveHold=${LIVE_HOLD_MS}ms`)
+  md.push('')
+  md.push('| phase | live mode | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
+  md.push('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|')
   for (const r of rows) {
-    md.push(`| ${r.label} | ${r.users} | ${r.requested} | ${r.engineShapes} | ${r.engineRssMib.toFixed(1)} | ${r.engineFpMib.toFixed(1)} | ${r.dsRssMib.toFixed(1)} | ${r.card.subquery_nodes ?? 0} | ${r.card.subquery_contributors ?? 0} |`)
+    md.push(`| ${r.label} | ${r.liveMode} | ${r.users} | ${r.requested} | ${r.engineShapes} | ${r.engineRssMib.toFixed(1)} | ${r.engineFpMib.toFixed(1)} | ${r.dsRssMib.toFixed(1)} | ${r.card.subquery_nodes ?? 0} | ${r.card.subquery_contributors ?? 0} |`)
   }
   writeFileSync(OUT, md.join('\n') + '\n')
   console.log(`wrote ${OUT}`)
 
-  for (const p of liveProcs) p.kill('SIGKILL')
+  for (const p of liveProcs) if (p.exitCode === null && p.signalCode === null) p.kill('SIGKILL')
   engine.proc.kill('SIGKILL')
   await client.end()
   try { execFileSync(postgres18Tools().pgCtl, ['-D', join(pg.dir, 'data'), '-m', 'immediate', 'stop'], { stdio: 'ignore' }) } catch {}

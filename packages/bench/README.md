@@ -48,6 +48,25 @@ MATRIX_SIZES=1000,10000,100000 MATRIX_USERS=10,25,50,100 MATRIX_PROJECTS=20 \
   pnpm --filter @electric-circuits/bench shape-mem
 ```
 
+### Direct per-table live transport comparison
+
+`src/shape-mem-scale.ts` can hold the same per-table feeds against Durable Streams with either
+transport. `SCALE_LIVE_MODE=long-poll` is the default; set `SCALE_LIVE_MODE=sse` for a real
+`text/event-stream` read. The SSE worker advances only from `control` events' `streamNextOffset`
+and reconnects from that opaque cursor when the server ends a response. Both modes report upstream
+read count, peak held connections, reconnects per minute and write-to-delivery p50/p90 when writes
+are enabled.
+
+```bash
+SCALE_LIVE_MODE=sse SCALE_LIVE_SUBS=100 SCALE_LIVE_WRITES=20 \
+  SCALE_LIVE_WRITE_INTERVAL_MS=500 SCALE_OUT=docs/bench/per-table-sse.md \
+  pnpm --filter @electric-circuits/bench exec tsx src/shape-mem-scale.ts
+```
+
+Run the same command with `SCALE_LIVE_MODE=long-poll` and the same seed, shape and write settings
+to compare direct engine/Durable Streams behavior. This bench does not model gateway CPU or pool
+limits; those measurements require the real Indexed dev load balancer.
+
 ## Other runners
 
 - **`src/run.ts`** (`pnpm bench` from the root) — local stress benchmark: many equality shapes,
