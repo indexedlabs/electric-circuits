@@ -1222,14 +1222,13 @@ async fn subset_load_group(
             } else {
                 let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
                 if renewed {
-                    let offset = engine
-                        .stream_tail(&existing.stream_path)
-                        .await
-                        .map_err(AppError::from)?
-                        .ok_or_else(|| AppError {
-                            status: StatusCode::CONFLICT,
-                            msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
-                            retry_after: false,
+                    let offset =
+                        engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| {
+                            AppError {
+                                status: StatusCode::CONFLICT,
+                                msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
+                                retry_after: false,
+                            }
                         })?;
                     let reads = existing
                         .members

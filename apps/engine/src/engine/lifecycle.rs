@@ -2134,7 +2134,7 @@ impl Engine {
 
     pub(crate) async fn release_group_claim(&self, subscription: &str, expected_id: &str) -> Result<()> {
         let Some((group, release, joined_existing)) = self.begin_group_release(subscription, expected_id).await else {
-            return Ok(())
+            return Ok(());
         };
         if joined_existing {
             return release.wait().await;

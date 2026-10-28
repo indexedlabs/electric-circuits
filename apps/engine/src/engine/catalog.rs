@@ -3243,6 +3243,25 @@ mod tests {
     }
 
     #[test]
+    fn a_group_drop_for_an_old_identity_does_not_remove_the_replacement() {
+        let group = GroupRecord {
+            id: "shape/group-2".into(),
+            stream_path: "shape/group-2".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        let fold = fold_of(vec![
+            CatalogEvent::GroupCreated { group },
+            CatalogEvent::GroupDropped { subscription: "scope".into(), group_id: Some("shape/group-1".into()) },
+        ]);
+        assert_eq!(fold.groups.get("scope").map(|group| group.id.as_str()), Some("shape/group-2"));
+    }
+
+    #[test]
     fn backfill_sized_updates_created_records_and_old_records_remain_compatible() {
         let rec = crate::engine::ShapeRecord {
             id: "s1".into(),

@@ -1173,10 +1173,7 @@ async fn group_release_reloads_same_subscription(f: &Fixture) -> Result<()> {
             Body::empty(),
         )
         .await?;
-        ensure!(
-            stale_status == StatusCode::OK,
-            "stale member release was not idempotent: {stale_status} {stale_body}"
-        );
+        ensure!(stale_status == StatusCode::OK, "stale member release was not idempotent: {stale_status} {stale_body}");
         f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (3, 'reload')", f.outer)).await?;
         let events = wait_group_events(f, new_path, 1).await?;
         ensure!(
