@@ -2150,12 +2150,7 @@ async fn emission_lanes_order_and_barrier() {
 
     let ds = crate::ds::DsClient::new_for_in_process_test(&format!("http://{addr}"));
     let pending = Arc::new(PendingFlips::default());
-    let lanes = emission::EmissionLanes::spawn(
-        ds,
-        4,
-        pending.clone(),
-        crate::shutdown::ShutdownToken::new(),
-    );
+    let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone(), crate::shutdown::ShutdownToken::new());
 
     // Same stream always hashes to the same lane (structural precondition for ordering).
     assert_eq!(lanes.lane_for("shape/a"), lanes.lane_for("shape/a"));
