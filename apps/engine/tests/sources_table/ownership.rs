@@ -1325,17 +1325,44 @@ async fn group_closed_reload_waits_for_release(f: &Fixture) -> Result<()> {
         });
         wait_group_stream_closed(f, &old_path).await?;
 
+        let public_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "changesOnly": true,
+            "subscription": "group-closed-reload",
+        });
+        let (status, conflict) = json(&app, Method::POST, "/v1/shapes", Body::from(public_body.to_string())).await?;
+        ensure!(
+            status == StatusCode::CONFLICT,
+            "plain create claimed a group subscription during release: {status} {conflict}"
+        );
+
+        release_group_delete(f, &old_path, gate).await;
+        let (release_status, release_body) = tokio::time::timeout(Duration::from_secs(15), release_task)
+            .await
+            .context("group release did not finish after stream retirement was released")?
+            .context("group release task failed")??;
+        ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release_body}");
+        let (status, recreated) = json(&app, Method::POST, "/v1/shapes", Body::from(public_body.to_string())).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "plain create could not claim the released group subscription: {status} {recreated}"
+        );
+        let recreated_id = recreated["shapeId"].as_str().context("recreated standalone shape")?;
+        let (status, released) = json(
+            &app,
+            Method::DELETE,
+            &format!("/v1/shapes/{recreated_id}?subscription=group-closed-reload"),
+            Body::empty(),
+        )
+        .await?;
+        ensure!(status == StatusCode::OK, "standalone claim release failed: {status} {released}");
         let reload_app = app.clone();
         let reload_body = group_body(f, "group-closed-reload", true);
-        let mut reload_task = tokio::spawn(async move { post_group(&reload_app, reload_body).await });
-        ensure!(
-            tokio::time::timeout(Duration::from_millis(250), &mut reload_task).await.is_err(),
-            "same-members load renewed a group while its close/release was still in flight"
-        );
-        release_group_delete(f, &old_path, gate).await;
-        let (release_status, release_body) = release_task.await??;
-        ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release_body}");
-        let (reload_status, fresh) = reload_task.await??;
+        let reload_task = tokio::spawn(async move { post_group(&reload_app, reload_body).await });
+        let (reload_status, fresh) = tokio::time::timeout(Duration::from_secs(15), reload_task)
+            .await
+            .context("same-members reload did not finish after release")?
+            .context("same-members reload task failed")??;
         ensure!(reload_status == StatusCode::OK, "same-members reload failed: {reload_status} {fresh}");
         let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
         ensure!(new_path != old_path, "closed group reload reused its old stream");

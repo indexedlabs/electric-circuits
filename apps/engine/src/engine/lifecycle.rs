@@ -372,6 +372,12 @@ impl Engine {
                             owner: format!("group {owner}"),
                         }));
                     }
+                    if stream_path_override.is_none() && st.group_claims.get(sub).is_some() {
+                        return Err(anyhow::Error::new(GroupConflict {
+                            subscription: sub.to_string(),
+                            owner: format!("group {sub}"),
+                        }));
+                    }
                     ensure_subscription_free(&st, sub, &existing_id)?;
                     // A join and a RENEWAL are the same call: `subscribe` returns false when the
                     // shape already holds this id, in which case nothing is claimed and only the
@@ -460,6 +466,12 @@ impl Engine {
             return Err(anyhow::Error::new(GroupConflict {
                 subscription: sub.to_string(),
                 owner: format!("group {owner}"),
+            }));
+        }
+        if stream_path_override.is_none() && st.group_claims.get(sub).is_some() {
+            return Err(anyhow::Error::new(GroupConflict {
+                subscription: sub.to_string(),
+                owner: format!("group {sub}"),
             }));
         }
         ensure_subscription_free(&st, sub, "")?;
