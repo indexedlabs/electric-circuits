@@ -67,6 +67,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupPageHandoff => page_handoff_tombstone_contract(&fixture).await,
             Case::GroupPagePrivateCancellation => page_cancellation_contract(&fixture, "private").await,
             Case::GroupPagePageCancellation => page_cancellation_contract(&fixture, "page").await,
+            Case::GroupPageCompleteCancellation => page_cancellation_contract(&fixture, "complete").await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -101,6 +102,7 @@ enum Case {
     GroupPageHandoff,
     GroupPagePrivateCancellation,
     GroupPagePageCancellation,
+    GroupPageCompleteCancellation,
 }
 
 #[test]
@@ -131,6 +133,12 @@ fn group_page_private_cancellation_releases_queryback_window() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_page_page_cancellation_releases_queryback_window() -> Result<()> {
     isolated("ownership::group_page_page_cancellation_releases_queryback_window", Case::GroupPagePageCancellation)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_page_complete_cancellation_releases_group_claim() -> Result<()> {
+    isolated("ownership::group_page_complete_cancellation_releases_group_claim", Case::GroupPageCompleteCancellation)
 }
 
 #[test]
@@ -1189,9 +1197,13 @@ async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<(
         Ok(())
     }
     wait_ready(&base, "private").await?;
-    if cancel_stage == "page" {
+    if cancel_stage == "page" || cancel_stage == "complete" {
         std::fs::write(format!("{base}.private.release"), b"release")?;
         wait_ready(&base, "page").await?;
+    }
+    if cancel_stage == "complete" {
+        std::fs::write(format!("{base}.page.release"), b"release")?;
+        wait_ready(&base, "complete").await?;
     }
     task.abort();
     let _ = task.await;
@@ -1206,6 +1218,19 @@ async fn page_cancellation_contract(f: &Fixture, cancel_stage: &str) -> Result<(
     .await
     .context(format!("cancelled group {cancel_stage} left queryback state armed"))?;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+    let retry_body = membership_group_body(f, &format!("group-page-cancel-{cancel_stage}"));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let (status, body) = post_group(&app, retry_body.clone()).await?;
+            if status == StatusCode::OK {
+                return Ok::<_, anyhow::Error>(());
+            }
+            ensure!(status == StatusCode::CONFLICT, "retry after cancellation failed: {status} {body}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context(format!("cancelled group {cancel_stage} could not be recreated"))??;
     ensure!(
         engine.close(Duration::from_secs(10)).await == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
         "cancelled group {cancel_stage} did not close cleanly and may have retained its replication slot"

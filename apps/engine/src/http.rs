@@ -1345,6 +1345,7 @@ struct GroupReservationGuard {
     engine: Engine,
     subscription: String,
     members: Vec<(String, String)>,
+    group_created: bool,
     armed: bool,
 }
 
@@ -1403,25 +1404,48 @@ impl Drop for GroupSnapshotGuard {
 
 impl GroupReservationGuard {
     fn new(engine: &Engine, subscription: &str) -> Self {
-        Self { engine: engine.clone(), subscription: subscription.to_string(), members: Vec::new(), armed: true }
+        Self {
+            engine: engine.clone(),
+            subscription: subscription.to_string(),
+            members: Vec::new(),
+            group_created: false,
+            armed: true,
+        }
     }
 
     fn add_member(&mut self, shape_id: &str, subscription: &str) {
         self.members.push((shape_id.to_string(), subscription.to_string()));
     }
 
-    fn retain_members(&mut self, keep: impl Fn(&(String, String)) -> bool) {
-        self.members.retain(keep);
+    fn remove_member(&mut self, shape_id: &str, subscription: &str) {
+        if let Some(index) = self.members.iter().position(|(id, sub)| id == shape_id && sub == subscription) {
+            self.members.remove(index);
+        }
+    }
+
+    fn mark_group_created(&mut self) {
+        self.group_created = true;
     }
 
     async fn rollback(&mut self) {
         if !self.armed {
             return;
         }
-        let members = std::mem::take(&mut self.members);
-        for (shape_id, subscription) in members {
+        while let Some((shape_id, subscription)) = self.members.last().cloned() {
             if let Err(error) = self.engine.release_subscription_durable(&shape_id, Some(&subscription)).await {
                 tracing::warn!(%shape_id, %subscription, %error, "failed to compensate cancelled group member");
+            }
+            if self.members.last().is_some_and(|member| member.0 == shape_id && member.1 == subscription) {
+                self.members.pop();
+            }
+        }
+        if self.group_created {
+            if let Err(error) = self
+                .engine
+                .drop_group_durable(&self.subscription)
+                .await
+            {
+                tracing::warn!(subscription = %self.subscription, %error, "failed to compensate cancelled group");
             }
         }
         self.engine.abort_group(&self.subscription).await;
@@ -1429,6 +1453,7 @@ impl GroupReservationGuard {
     }
 
     fn complete(&mut self) {
+        self.members.clear();
         self.armed = false;
     }
 }
@@ -1441,10 +1466,17 @@ impl Drop for GroupReservationGuard {
         let engine = self.engine.clone();
         let subscription = self.subscription.clone();
         let members = self.members.clone();
+        let group_created = self.group_created;
         engine.shutdown_token().spawn(async move {
             for (shape_id, member_subscription) in members {
                 if let Err(error) = engine.release_subscription_durable(&shape_id, Some(&member_subscription)).await {
                     tracing::warn!(%shape_id, subscription = %member_subscription, %error, "failed to compensate cancelled group member");
+                }
+            }
+            if group_created {
+                if let Err(error) = engine.drop_group_durable(&subscription).await
+                {
+                    tracing::warn!(%subscription, %error, "failed to compensate cancelled group");
                 }
             }
             engine.abort_group(&subscription).await;
@@ -1801,9 +1833,9 @@ async fn subset_load_group(
     }
     // Keep one live caller claim for the group. Member claims after the first are private
     // implementation handles and are released once the group record has captured them.
-    reservation.retain_members(|(_, sub)| sub == &group_sub);
     for (rec, sub) in created.iter().skip(1) {
-        let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
+        engine.release_subscription_durable(&rec.id, Some(sub)).await?;
+        reservation.remove_member(&rec.id, sub);
     }
     let lease_seconds = engine.lease_seconds();
     let group_id = group_path.clone();
@@ -1827,6 +1859,7 @@ async fn subset_load_group(
         horizon: page.horizon.clone(),
         replay_fence: offset.clone(),
     };
+    reservation.mark_group_created();
     if let Err(error) = engine.complete_group(group_record).await {
         reservation.rollback().await;
         return Err(AppError::from(error));

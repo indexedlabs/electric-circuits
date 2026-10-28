@@ -142,37 +142,51 @@ async function bootServers(pgUrl: string) {
   const dsUrl = `http://127.0.0.1:${new URL(dsRaw).port}`
   const slot = `scope_bench_${process.pid}_${++slotSeq}`
   const bootStarted = performance.now()
-  const engine = spawn(process.env.ENGINE_BIN ?? join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
-    env: {
-      ...process.env,
-      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
-      // Loopback HTTP durable streams (needs an engine built with --features test-support).
-      ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST: '1',
-      ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE: '1',
-      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
-      ELECTRIC_CIRCUITS_LOG: 'warn',
-      ELECTRIC_CIRCUITS_PG_URL: pgUrl,
-      ELECTRIC_CIRCUITS_PG_TABLES: Object.keys(TABLES).join(','),
-      ELECTRIC_CIRCUITS_PG_SLOT: slot,
-      ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
-    },
-    stdio: ['ignore', 'pipe', 'inherit'],
-  })
-  const engineUrl = await waitFor(engine, /ENGINE_LISTENING (\S+)/, 'engine')
-  const engineBootMs = Math.round(performance.now() - bootStarted)
-  const gw = spawn(process.execPath, ['--import', 'tsx', join(dirname(fileURLToPath(import.meta.url)), 'gateway.ts')], {
-    env: { ...process.env, ENGINE_URL: engineUrl, DS_URL: dsUrl },
-    stdio: ['ignore', 'pipe', 'inherit'],
-  })
-  const gateway = await waitFor(gw, /GATEWAY_LISTENING (\S+)/, 'gateway')
-  const stop = async (admin: pg.Client) => {
-    gw.kill('SIGKILL')
-    engine.kill('SIGKILL')
+  let engine: ChildProcess | undefined
+  let gw: ChildProcess | undefined
+  try {
+    engine = spawn(process.env.ENGINE_BIN ?? join(repoRoot(), 'target', 'release', 'electric-circuits-engine'), [], {
+      env: {
+        ...process.env,
+        ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+        // Loopback HTTP durable streams (needs an engine built with --features test-support).
+        ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST: '1',
+        ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE: '1',
+        ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
+        ELECTRIC_CIRCUITS_LOG: 'warn',
+        ELECTRIC_CIRCUITS_PG_URL: pgUrl,
+        ELECTRIC_CIRCUITS_PG_TABLES: Object.keys(TABLES).join(','),
+        ELECTRIC_CIRCUITS_PG_SLOT: slot,
+        ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
+      },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    const engineUrl = await waitFor(engine, /ENGINE_LISTENING (\S+)/, 'engine')
+    const engineBootMs = Math.round(performance.now() - bootStarted)
+    gw = spawn(process.execPath, ['--import', 'tsx', join(dirname(fileURLToPath(import.meta.url)), 'gateway.ts')], {
+      env: { ...process.env, ENGINE_URL: engineUrl, DS_URL: dsUrl },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    const gateway = await waitFor(gw, /GATEWAY_LISTENING (\S+)/, 'gateway')
+    const stop = async (admin: pg.Client) => {
+      gw!.kill('SIGKILL')
+      engine!.kill('SIGKILL')
+      await new Promise((r) => setTimeout(r, 300))
+      await admin.query('select pg_drop_replication_slot($1)', [slot]).catch(() => {})
+      await ds.stop().catch(() => {})
+    }
+    return { gateway, engineUrl, engineBootMs, enginePid: engine.pid!, gwPid: gw.pid!, stop }
+  } catch (error) {
+    gw?.kill('SIGKILL')
+    engine?.kill('SIGKILL')
     await new Promise((r) => setTimeout(r, 300))
-    await admin.query('select pg_drop_replication_slot($1)', [slot]).catch(() => {})
+    const cleanup = new pg.Client({ connectionString: pgUrl })
+    await cleanup.connect().catch(() => {})
+    await cleanup.query('select pg_drop_replication_slot($1)', [slot]).catch(() => {})
+    await cleanup.end().catch(() => {})
     await ds.stop().catch(() => {})
+    throw error
   }
-  return { gateway, engineUrl, engineBootMs, enginePid: engine.pid!, gwPid: gw.pid!, stop }
 }
 
 interface RunResult {

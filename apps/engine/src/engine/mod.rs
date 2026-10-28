@@ -705,6 +705,20 @@ pub enum PostgresSetup {
     ExternallyManaged,
 }
 
+#[cfg(feature = "test-support")]
+async fn test_group_complete_barrier() -> Result<()> {
+    let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return Ok(()) };
+    let ready = std::path::PathBuf::from(format!("{base}.complete.ready"));
+    let release = std::path::PathBuf::from(format!("{base}.complete.release"));
+    let _ = std::fs::OpenOptions::new().create(true).write(true).open(&ready);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while !release.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    anyhow::ensure!(release.exists(), "test group complete barrier timed out");
+    Ok(())
+}
+
 pub(crate) struct PurgeBarrier {
     dropped_durable: std::sync::atomic::AtomicBool,
     dropped_failed: std::sync::atomic::AtomicBool,
@@ -2884,21 +2898,23 @@ impl Engine {
 
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        #[cfg(feature = "test-support")]
+        test_group_complete_barrier().await?;
         let valid = {
             let st = self.state.lock().await;
             st.shapes.contains_key(&record.members[0].shape_id)
                 && record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id))
         };
         if !valid {
-            let _ = self
-                .catalog_tx
-                .send_durable(CatalogEvent::GroupDropped { subscription: record.subscription.clone() })
-                .await;
             return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
         }
         self.state.lock().await.group_claims.complete(record);
         crate::engine::group::activate();
         Ok(())
+    }
+
+    pub(crate) async fn drop_group_durable(&self, subscription: &str) -> Result<()> {
+        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await
     }
 
     pub(crate) async fn abort_group(&self, subscription: &str) {
