@@ -2112,16 +2112,16 @@ impl Engine {
             }
             let mut groups = HashMap::new();
             for (_, subscription) in &expired {
-                if let Some(group) = st
-                    .group_claims
-                    .records_iter()
-                    .find(|group| group.subscription == *subscription || group.members.iter().any(|member| member.subscription == *subscription))
+                if let Some(group) = st.group_claims.records_iter().find(|group| {
+                    group.subscription == *subscription
+                        || group.members.iter().any(|member| member.subscription == *subscription)
+                })
                 {
                     groups.insert(group.id.clone(), (group.subscription.clone(), group.id.clone()));
                 }
             }
             st.publish_subscription_gauge(&self.metrics);
-            (expired, groups.into_values().collect())
+            (expired, groups.into_values().collect::<Vec<_>>())
         };
         for (shape, subscription) in lapsed {
             tracing::debug!(

@@ -1735,7 +1735,9 @@ impl Engine {
                         st.feed_shares
                             .get(&member.shape_id)
                             .and_then(|share| share.subs.get(&member.subscription))
-                            .is_some_and(|at| now.saturating_sub(*at) <= self.retention.subscription_lease_timeout.as_secs())
+                            .is_some_and(|at| {
+                                now.saturating_sub(*at) <= self.retention.subscription_lease_timeout.as_secs()
+                            })
                     });
                 if restorable && lease_live {
                     self.group_lanes.register(&group.stream_path);
