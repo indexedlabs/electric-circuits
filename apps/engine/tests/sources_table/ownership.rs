@@ -10,6 +10,7 @@ use anyhow::ensure;
 use electric_circuits_engine::ds::DsClient;
 use electric_circuits_engine::engine::{Engine, PostgresSetup};
 use electric_circuits_engine::http::router_with_introspection;
+use electric_circuits_engine::replication::Refused;
 use electric_circuits_engine::table_ref::TableSelector;
 use tokio::sync::watch;
 
@@ -871,29 +872,7 @@ async fn post_group(app: &Router, body: serde_json::Value) -> Result<(StatusCode
     Ok((status, body))
 }
 
-async fn wait_group_slot_idle(f: &Fixture) -> Result<()> {
-    let slot = &f.slots[0];
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let row = f
-                .client
-                .query_one("SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1", &[slot])
-                .await
-                .with_context(|| format!("checking replication slot {slot}"))?;
-            let active_pid: Option<i32> = row.get(0);
-            if active_pid.is_none() {
-                return Ok::<_, anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .with_context(|| format!("waiting for replication slot {slot} walsender to exit"))??;
-    Ok(())
-}
-
 async fn group_engine(f: &Fixture) -> Result<(Engine, Router)> {
-    wait_group_slot_idle(f).await?;
     let engine = Engine::new_pg_for_in_process_test_with_setup(
         DsClient::new_for_in_process_test(&f.ds_url),
         f.pg_url.clone(),
@@ -901,7 +880,19 @@ async fn group_engine(f: &Fixture) -> Result<(Engine, Router)> {
     );
     let tables =
         [TableSelector::parse(&format!("public.{}", f.outer))?, TableSelector::parse(&format!("public.{}", f.inner))?];
-    engine.setup_postgres(&tables, &f.slots[0]).await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match engine.setup_postgres(&tables, &f.slots[0]).await {
+            Ok(()) => break,
+            Err(error)
+                if error.downcast_ref::<Refused>().is_some_and(|refused| matches!(refused, Refused::SlotBusy(_)))
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let app = router_with_introspection(engine.clone(), false);
     Ok((engine, app))
 }
@@ -1424,7 +1415,7 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     let base = barrier.to_string_lossy().into_owned();
     let subscription = "group-rollback-cancel";
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback-0") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback") };
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "member_release") };
     let (engine, app) = group_engine(f).await?;
     let result = async {
@@ -1433,26 +1424,37 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
             let app = app.clone();
             async move { post_group(&app, request).await }
         });
-        let ready = PathBuf::from(format!("{base}.rollback-0.ready"));
+        let ready = PathBuf::from(format!("{base}.rollback.ready"));
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if ready.exists() {
+                if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 1 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .context("waiting for second rollback release cancellation barrier")?;
+        .context("waiting for rollback cancellation barrier")?;
+        std::fs::write(format!("{base}.rollback.release"), b"1")?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("waiting for second rollback cancellation barrier")?;
         task.abort();
         ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    let close = engine.close(Duration::from_secs(10)).await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
+    let close = engine.close(Duration::from_secs(10)).await;
     let fence = remove_source_fence(f).await;
     let replacement = async {
         let (replacement, replacement_app) = group_engine(f).await?;

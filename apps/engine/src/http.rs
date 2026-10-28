@@ -1370,7 +1370,7 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     // a member-create or catalog-completion barrier does not accidentally block earlier stages.
     match std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") {
         Ok(selected) if selected != stage => return Ok(()),
-        Err(_) if matches!(stage, "member" | "complete") || stage.starts_with("rollback") => return Ok(()),
+        Err(_) if matches!(stage, "member" | "complete" | "rollback") => return Ok(()),
         _ => {}
     }
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
@@ -1378,11 +1378,25 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     use std::io::Write;
     let mut ready_file = std::fs::OpenOptions::new().create(true).append(true).open(&ready)?;
     writeln!(ready_file, "ready")?;
+    let ready_count = std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count());
+    let released = || {
+        if stage == "rollback" {
+            std::fs::read_to_string(&release)
+                .ok()
+                .and_then(|contents| contents.trim().parse::<usize>().ok())
+                .is_some_and(|count| count >= ready_count)
+        } else {
+            release.exists()
+        }
+    };
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-    while !release.exists() && tokio::time::Instant::now() < deadline {
+    while tokio::time::Instant::now() < deadline {
+        if released() {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    anyhow::ensure!(release.exists(), "test group {stage} barrier timed out");
+    anyhow::ensure!(released(), "test group {stage} barrier timed out");
     Ok(())
 }
 
@@ -1486,9 +1500,7 @@ impl GroupReservationGuard {
             index -= 1;
             let (shape_id, subscription) = self.members[index].clone();
             #[cfg(feature = "test-support")]
-            let rollback_stage = format!("rollback-{index}");
-            #[cfg(feature = "test-support")]
-            if let Err(error) = test_group_page_barrier(&rollback_stage).await {
+            if let Err(error) = test_group_page_barrier("rollback").await {
                 tracing::warn!(%error, %shape_id, %subscription, "group rollback test barrier failed");
             }
             if Self::release_member_durable(&self.engine, &shape_id, &subscription).await {

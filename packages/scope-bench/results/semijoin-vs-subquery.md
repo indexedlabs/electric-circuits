@@ -1,10 +1,9 @@
 # Key-only semijoin versus subquery members
 
-Work in progress, not for merge. The real DBSP candidate and common group correctness
-fixes for the reproduced hosted-review regressions are being validated by CI. The corrected
-five-repetition PostgreSQL 18 benchmark completed on `48501cd`; its measurements below are
-characterization evidence for DBSP 0.318, not target-version or production qualification.
-The experiment must finish before this report can support changing the membership decision.
+Work in progress, not for merge. Correctness is still being validated by CI; the first
+five-repetition PostgreSQL 18 benchmark completed on `48501cd`. The measurements below are
+prototype evidence, not release qualification. The first measured semijoin run uses more DBSP
+state and has slower delivery and higher engine CPU; restart cost remains unavailable.
 
 ## Pinned inputs and method
 
@@ -33,22 +32,26 @@ The experiment must finish before this report can support changing the membershi
   charged read count is not a measurement of native Durable Streams SSE. Preserve
   actual provider reads separately; do not use that model for fd qualification.
 
-| Metric | Subquery members | Key-only semijoin | Evidence status |
-| --- | --- | --- | --- |
-| Cold group load / boot / RSS | 13082 ms / 151 ms / 73.7 MB | 13017 ms / 149 ms / 75.1 MB | Median, benchmark job `123037684019` |
-| Steady group load / RSS | 4340 ms / 76.8 MB | 4209 ms / 75.9 MB | Median, benchmark job `123037684019` |
-| Actual reads per change | 2.667 | 2.694 | Median, benchmark job `123037684019` |
-| Steady writes p50 / p90 | 495 / 734 ms | 1373 / 1981 ms | Median, benchmark job `123037684019` |
-| Semijoin selection batches, cold / steady | 0 / 0 | 390 / 3600 | Profile counter; subquery is the control |
-| Engine / gateway CPU | Pending | Pending | Not emitted by this artifact |
+| Metric (5-rep median) | Subquery members | Key-only semijoin | Evidence |
+| --- | ---: | ---: | --- |
+| Cold group load (ms) | 13,082 | 13,017 | Measured; artifact 12844722320 |
+| Cold engine RSS (MiB) | 73.7 | 75.1 | Measured process RSS |
+| Cold DBSP used bytes | 34,212 | 60,232 | Measured profile; semijoin arrangement state |
+| Steady group load (ms) | 4,340 | 4,209 | Measured; artifact 12844722320 |
+| Steady engine RSS (MiB) | 76.8 | 75.9 | Measured process RSS |
+| Steady DBSP used bytes | 65,092 | 94,512 | Measured profile |
+| Actual reads/change | 2.667 | 2.694 | Measured pg_stat_statements calls / 180 writes |
+| Delivery p50 / p90 (ms) | 495 / 734 | 1,373 / 1,981 | Measured steady writes |
+| Engine CPU (ms) | 1,920 | 3,070 | Measured steady hold |
+| Gateway CPU (ms) | 4,864 | 4,588 | Measured steady hold |
+| Restart peak RSS / reload time | Unavailable | Unavailable | Harness boots fresh process; no persisted restart lane |
+| New-group seed time | Included in group load | Included in group load | No separate seed timer |
 
-The completed characterization is run `40747358562`, benchmark job `123037684019`, artifact
-`semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44c` (artifact ID `12844722320`,
-SHA-256 `ef48795b0cba5f5366492f2b1f0926c9c96856e69f9e43eb812a29cdb8ed7768`). The benchmark
-ran both modes and both cold/steady scenarios for five repetitions; it completed successfully.
-
-`engineBootMs` is a cold process boot plus catalog/shape reload measurement for this harness;
-it is not a SIGTERM restart or a persisted durable-stream restore. `groupLoadMs` is the
+The measured benchmark is run `40747358562`, test job `123024579773`, benchmark job
+`123037684019`, artifact `12844722320` (`semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44`).
+It ran five repetitions for each mode and both scenarios with PostgreSQL 18.6. `engineBootMs` is a
+cold process boot plus catalog/shape reload measurement for this harness; it is not a SIGTERM
+restart or a persisted durable-stream restore. `groupLoadMs` is the
 end-to-end group request through the simulated gateway, including the public page and private
 member seed. `/memory`'s process RSS is total engine memory; its `cardinalities` byte fields are
 owned lower bounds, and per-group memory is estimated as a change divided by the number of
@@ -198,8 +201,8 @@ public group page into each subquery member's FeedSet before the group claim bec
 durable, closing the page/live handoff that could otherwise leave a snapshot row without
 a delete gate. The private key seed and this public-page seed both retain only keys; the
 extra bounded reads and feed entries belong in both modes' measurements. Its focused
-phone regression was genuinely red before that correction; the benchmark artifact was
-still pending at that earlier head and is recorded below from the completed `48501cd` run.
+phone regression was genuinely red before that correction; the exact-head benchmark
+artifact is still pending.
 
 
 
@@ -295,12 +298,12 @@ follow-up `c9ccae9` applied the barrier wiring and workload corrections; its exa
 invalid PostgreSQL publication syntax, while formatting, TypeScript and Node gates were green;
 no benchmark result was produced. The subsequent `fb6c7ae` run `40746277581` was red only in the formatting gate; its group,
 Rust, TypeScript and Node steps passed. `48501cd` then made compensation single-shot after
-writer loss, retained failed members in the guard, and collected concurrent-contract errors.
-Its test run `40747358562` (job `123024579773`) passed formatting, both membership-mode group
+writer loss, retained failed members in the guard, and collected concurrent-contract errors;
+its test run `40747358562` (job `123024579773`) passed formatting, both membership-mode group
 contracts, Rust engine tests, TypeScript, Node and Vitest. Its benchmark job `123037684019`
-also completed successfully; the characterization artifact and medians are recorded above.
-The current candidate keeps the valid plain table cleanup, preserves the one re-enqueue attempt
-during clean shutdown, and retains each member in place until its release succeeds.
+also completed successfully. The current candidate keeps the valid plain table cleanup,
+preserves the one re-enqueue attempt during clean shutdown, and retains each member in place
+until its release succeeds.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
@@ -310,14 +313,12 @@ current candidate has passed. The follow-up adds completion durability compensat
 cancellation-stage retry coverage. The c78804a run `40748888867` compiled and passed
 formatting, Rust, TypeScript and Node but its group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
-walsender pid 5267` during replacement restart; the current harness waits for
-`pg_replication_slots.active_pid` to clear before replacing an engine. Heads `82f2cd2` and
-`9c5b821` then exposed compile/format failures in the new rollback contract. Head `9086025`
-fixed those blockers and passed formatting and both group modes; its exact test job was still
-finishing when reviewed. Current head `fe5fe74443e3eb95e2746f32b90ac1f44393fcfa` adds the
-bounded slot-release wait and moves rollback cancellation to the second member-release window,
-after the first private member has been durably released. No current-head performance claim is
-made; the completed benchmark is the `48501cd` characterization above.
+walsender pid 5267` during replacement restart; the restart helper now retries that transient
+`SlotBusy` state. Heads `82f2cd2` and `9c5b821` then exposed compile/format failures in the new
+rollback contract. Head `9086025` fixed those blockers. Reviewed head `8a93697` adds the bounded
+slot-busy retry and the second member-release cancellation barrier; its exact-head CI is the
+remaining correctness gate. No performance claim is made beyond the completed `48501cd`
+characterization above.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
@@ -335,10 +336,9 @@ Their source blobs are respectively `ec9699db0c3393d55601a5996ec4e27fe4e69af9`,
 `81251167803ff4bb307f1d0913afe721381c11cc`, and
 `d5dfd0aa57372b90b820ba39f0ef0982468e6b88`. The subsequent `run.ts` change
 repairs its Markdown table delimiter to match the 18 header/row cells.
-The old Node sketch is explicitly named `semijoin:model` in package scripts.
-This import supplies the starting harness only; mode comparison, resource/restart
-instrumentation, five-repetition CI execution and resulting numbers are still
-pending. Its modeled streaming charges must not be mistaken for provider reads.
+The old Node sketch is explicitly named `semijoin:model` in package scripts. The corrected
+five-repetition mode comparison is now measured in artifact 12844722320. Its modeled
+streaming charges must not be mistaken for provider reads.
 
 Set `ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=subquery|semijoin` when starting the
 engine; the default is `subquery`. The baseline already keeps shared scope keys
@@ -375,9 +375,9 @@ join-execution counter. Focused operator coverage includes distinct contributors
 scope isolation, key moves/removal, NULL and reused ordinals across 1024-key chunks.
 The join and reparenting controls passed at `7cbda3f`; the delete-gate and shared-worker
 corrections are implemented through `9cffab2`, while the page-handoff and cancellation
-corrections are carried through `53dd7e3` and `9e9171e`; the working-tree follow-up adds
-the all-plain restart check, pinned formatting cleanup, and partial-boot slot cleanup. The
-exact candidate `fe5fe74443e3eb95e2746f32b90ac1f44393fcfa` still awaits its fresh CI run.
+corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the
+full test job and produced the benchmark artifact; head `8a93697` adds the slot-busy stabilization
+and second-barrier rollback contract, with its full exact-head qualification still running.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
@@ -429,8 +429,10 @@ only the October 25 scope-load/read-scaling changes.
 
 ## Recommendation
 
-Pending real DBSP measurements. Keep the accepted subquery-members decision in
-place until a correct semijoin demonstrates lower memory and restart cost. This
-is an evidence threshold, not a measured performance verdict. ec#44's documented
-lifecycle, cancellation and burst-pressure gaps also prevent treating either
-membership experiment as production-ready.
+The first completed five-repetition run does not meet the decision threshold. Semijoin DBSP
+used bytes are about 76% higher cold and 45% higher steady, delivery p50/p90 is about 2.7–2.8×
+slower, and engine CPU is about 60% higher; process RSS is similar and restart cost is
+unavailable. Keep the accepted subquery-members decision in place. Revisit semijoin only with a
+restart lane or a per-group scaling run that demonstrates lower DBSP memory and restart cost on
+the same target-version inputs. ec#44's documented lifecycle, cancellation and burst-pressure
+gaps also prevent treating either membership experiment as production-ready.
