@@ -293,7 +293,7 @@ async function runWorkers(
   const outs: string[] = []
   const readyExpected = waitReady ? feeds.reduce((n, feed) => n + feed.length, 0) : 0
   const readinessGate = createLiveReadinessGate(readyExpected, LIVE_READY_TIMEOUT_MS)
-  const readySeen: number[] = []
+  const readyBuffers: string[] = []
   for (const feed of feeds) {
     const p = spawn(process.execPath, ['-e', js], {
       env: { ...process.env, ...env, WORKER_EXPECTED_SUBSCRIPTIONS: String(feed.length) },
@@ -301,7 +301,7 @@ async function runWorkers(
     })
     procs.push(p)
     const idx = outs.push('') - 1
-    readySeen[idx] = 0
+    readyBuffers[idx] = ''
     const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
       p.once('close', (code, signal) => {
         if (readinessGate.count() < readyExpected) readinessGate.closed()
@@ -310,10 +310,15 @@ async function runWorkers(
     closes.push(close)
     // Consume stdout LIVE — a full pipe buffer would block the worker.
     p.stdout!.on('data', (d: Buffer) => {
-      outs[idx] += d.toString()
-      const seen = (outs[idx]!.match(/^READY /gm) ?? []).length
-      readinessGate.observe(seen - readySeen[idx]!)
-      readySeen[idx] = seen
+      const chunk = d.toString()
+      outs[idx] += chunk
+      readyBuffers[idx] += chunk
+      let newline
+      while ((newline = readyBuffers[idx]!.indexOf('\n')) >= 0) {
+        const line = readyBuffers[idx]!.slice(0, newline)
+        readyBuffers[idx] = readyBuffers[idx]!.slice(newline + 1)
+        if (line.startsWith('READY ')) readinessGate.observe(1)
+      }
     })
     for (const line of feed) p.stdin!.write(line + '\n')
     p.stdin!.end()
@@ -356,7 +361,8 @@ interface LiveWorkerSummary {
   subscriptions?: number
   readySubscriptions?: number
   readyAt?: number | null
-  elapsedMs: number
+  measurementReady?: boolean
+  elapsedMs: number | null
   deliveryMs?: number[]
 }
 
@@ -395,13 +401,15 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   if (summaries.length !== expected) {
     throw new Error(`live worker summaries missing: received ${summaries.length}, expected ${expected}`)
   }
+  const notReady = summaries.find((s) => s.measurementReady === false || s.elapsedMs === null)
+  if (notReady) throw new Error('live worker measurement not ready')
   const reads = summaries.reduce((n, s) => n + s.reads, 0)
   const failedReads = summaries.reduce((n, s) => n + (s.failedReads ?? 0), 0)
   const heldConnections = summaries.reduce((n, s) => n + s.maxHeld, 0)
   const inFlightConnections = summaries.reduce((n, s) => n + (s.maxInFlight ?? s.maxHeld), 0)
   const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
-  const workerMinutes = summaries.reduce((n, s) => n + s.elapsedMs / 60000, 0)
-  const subscriptionMinutes = summaries.reduce((n, s) => n + (s.subscriptions ?? 1) * s.elapsedMs / 60000, 0)
+  const workerMinutes = summaries.reduce((n, s) => n + (s.elapsedMs ?? 0) / 60000, 0)
+  const subscriptionMinutes = summaries.reduce((n, s) => n + (s.subscriptions ?? 1) * (s.elapsedMs ?? 0) / 60000, 0)
   const readyTimes = summaries.map((s) => s.readyAt).filter((value): value is number => typeof value === 'number')
   const deliveries = summaries.flatMap((s) => s.deliveryMs ?? [])
   return {
@@ -585,7 +593,7 @@ async function main() {
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
-    `liveWrites=${LIVE_WRITES}/${LIVE_WRITE_INTERVAL_MS}ms, liveHold=${LIVE_HOLD_MS}ms, readinessWindowsMs=${readinessWindowsMs.join(',') || 'none'}`)
+    `liveWrites=${LIVE_WRITES}/${LIVE_WRITE_INTERVAL_MS}ms, liveHold=${LIVE_HOLD_MS}ms, liveReadyTimeout=${LIVE_READY_TIMEOUT_MS}ms, readinessWindowsMs=${readinessWindowsMs.join(',') || 'none'}`)
   md.push('')
   md.push('| phase | live mode | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
   md.push('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|')

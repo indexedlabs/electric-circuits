@@ -31,6 +31,7 @@ let measurementStartedAt = expectedSubscriptions > 0 ? null : startedAt;
 let measurementReadsAtStart = 0;
 let measurementFailedReadsAtStart = 0;
 let measurementReconnectsAtStart = 0;
+let measurementReady = expectedSubscriptions === 0;
 
 function reportReady(subscriptionId) {
   if (readyIds.has(subscriptionId)) return;
@@ -38,6 +39,13 @@ function reportReady(subscriptionId) {
   readySubscriptions++;
   const now = Date.now();
   readyAt = now;
+  if (expectedSubscriptions > 0 && readySubscriptions >= expectedSubscriptions && measurementStartedAt === null) {
+    measurementStartedAt = now;
+    measurementReadsAtStart = reads;
+    measurementFailedReadsAtStart = failedReads;
+    measurementReconnectsAtStart = reconnects;
+    measurementReady = true;
+  }
   process.stdout.write('READY ' + subscriptionId + ' ' + now + '\\n');
 }
 
@@ -120,9 +128,7 @@ async function hold(url) {
   while (!stopping) {
     const ctl = new AbortController();
     controllers.add(ctl);
-    let countedHeld = true;
-    held++;
-    maxHeld = Math.max(maxHeld, held);
+    let countedHeld = false;
     inFlight++;
     maxInFlight = Math.max(maxInFlight, inFlight);
     try {
@@ -131,24 +137,19 @@ async function hold(url) {
       if (!r.ok) {
         throw new Error('live response was ' + r.status);
       }
+      countedHeld = true;
+      held++;
+      maxHeld = Math.max(maxHeld, held);
       if (reconnectPending) reconnects++;
       reconnectPending = false;
       offset = liveMode === 'sse'
         ? await readSse(r, offset, subscriptionId)
         : await readLongPoll(r, offset, subscriptionId);
       reads++;
-      if (expectedSubscriptions > 0 && readySubscriptions >= expectedSubscriptions && measurementStartedAt === null) {
-        measurementStartedAt = Date.now();
-        measurementReadsAtStart = reads;
-        measurementFailedReadsAtStart = failedReads;
-        measurementReconnectsAtStart = reconnects;
-      }
       reconnectPending = true;
     } catch {
       if (!stopping) {
         failedReads++;
-        held--;
-        countedHeld = false;
         await new Promise((res) => setTimeout(res, 1000));
       }
     } finally {
@@ -168,19 +169,23 @@ process.on('SIGTERM', () => {
   if (stopping) return;
   stopping = true;
   for (const ctl of controllers) ctl.abort();
-  const elapsedMs = Math.max(1, Date.now() - (measurementStartedAt ?? startedAt));
+  const elapsedMs = measurementStartedAt === null ? null : Math.max(1, Date.now() - measurementStartedAt);
+  const measuredReads = measurementReady ? reads - measurementReadsAtStart : 0;
+  const measuredFailedReads = measurementReady ? failedReads - measurementFailedReadsAtStart : 0;
+  const measuredReconnects = measurementReady ? reconnects - measurementReconnectsAtStart : 0;
   const summary = {
     liveMode,
-    reads: reads - measurementReadsAtStart,
-    failedReads: failedReads - measurementFailedReadsAtStart,
-    reconnects: reconnects - measurementReconnectsAtStart,
+    measurementReady,
+    reads: measuredReads,
+    failedReads: measuredFailedReads,
+    reconnects: measuredReconnects,
     maxHeld,
     maxInFlight,
     subscriptions: nextSubscriptionId,
     readySubscriptions,
     readyAt,
     elapsedMs,
-    reconnectsPerMinute: (reconnects - measurementReconnectsAtStart) * 60000 / elapsedMs,
+    reconnectsPerMinute: elapsedMs === null ? null : measuredReconnects * 60000 / elapsedMs,
     deliveries: deliveryMs.length,
     deliveryMs,
     deliveryP50Ms: percentile(deliveryMs, 0.5),

@@ -16,6 +16,7 @@ interface ListenerRun {
   firstRequest: Promise<URL>
   secondRequest: Promise<URL>
   thirdRequest: Promise<URL>
+  readyLine: Promise<number>
 }
 
 function deferred<T>() {
@@ -32,6 +33,9 @@ function summaryOf(stdout: string): {
   maxHeld: number
   maxInFlight: number
   readySubscriptions: number
+  measurementReady: boolean
+  elapsedMs: number | null
+  readyAt: number | null
   deliveries: number
   deliveryP50Ms: number | null
   deliveryP90Ms: number | null
@@ -55,12 +59,13 @@ async function within<T>(promise: Promise<T>, label: string): Promise<T> {
   }
 }
 
-async function startListener(mode: string | undefined, expectedSubscriptions = 0): Promise<ListenerRun> {
+async function startListener(mode: string | undefined, expectedSubscriptions = 0, keepReadyOpenMs = 0): Promise<ListenerRun> {
   const server = createServer()
   const requests: URL[] = []
   const first = deferred<URL>()
   const second = deferred<URL>()
   const third = deferred<URL>()
+  const ready = deferred<number>()
   const markerPrefix = 'bench-test-'
   const writtenAt = Date.now() - 25
   const secondWrittenAt = Date.now() - 35
@@ -80,7 +85,8 @@ async function startListener(mode: string | undefined, expectedSubscriptions = 0
             res.write('\n')
             res.write('event: control\ndata: {}\n\n')
             res.write('event: control\ndata: {"streamNextOffset":"next-1","upToDate":true}\n\n')
-            res.end()
+            if (keepReadyOpenMs > 0) setTimeout(() => res.end(), keepReadyOpenMs)
+            else res.end()
           }, 10)
         }, 10)
       } else {
@@ -116,8 +122,12 @@ async function startListener(mode: string | undefined, expectedSubscriptions = 0
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
   })
-  const run = { requests, worker, server, stdout: '', stderr: '', firstRequest: first.promise, secondRequest: second.promise, thirdRequest: third.promise }
-  worker.stdout!.on('data', (d: Buffer) => { run.stdout += d.toString() })
+  const run = { requests, worker, server, stdout: '', stderr: '', firstRequest: first.promise, secondRequest: second.promise, thirdRequest: third.promise, readyLine: ready.promise }
+  worker.stdout!.on('data', (d: Buffer) => {
+    run.stdout += d.toString()
+    const match = run.stdout.match(/READY \d+ (\d+)/)
+    if (match) ready.resolve(Number(match[1]))
+  })
   worker.stderr!.on('data', (d: Buffer) => { run.stderr += d.toString() })
   worker.stdin.end(`${base}/v1/stream/shape/test\n`)
   return run
@@ -142,6 +152,12 @@ describe('per-table bench live mode', () => {
     const timedOut = createLiveReadinessGate(1, 10)
     await expect(timedOut.ready).rejects.toThrow('live readiness timed out: 0 of 1 subscriptions ready')
     timedOut.dispose()
+
+    const closed = createLiveReadinessGate(2, 1000)
+    closed.observe(1)
+    closed.closed()
+    await expect(closed.ready).rejects.toThrow('live readiness failed: 1 of 2 subscriptions ready')
+    closed.dispose()
   })
 
   it('emits a syntactically valid worker script', async () => {
@@ -192,6 +208,69 @@ describe('per-table bench live mode', () => {
     expect(summary.readySubscriptions).toBe(1)
     expect(summary.reads).toBe(1)
     expect(summary.reconnects).toBe(1)
+  })
+
+  it('starts the SSE measurement window at up-to-date while the response remains open', async () => {
+    const run = await startListener('sse', 1, 300)
+    let readyAt = 0
+    let stoppedAt = 0
+    try {
+      readyAt = await within(run.readyLine, 'SSE readiness line')
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      stoppedAt = Date.now()
+    } finally {
+      await stopListener(run)
+    }
+    const summary = summaryOf(run.stdout)
+    expect(summary.measurementReady).toBe(true)
+    expect(summary.readyAt).not.toBeNull()
+    expect(summary.elapsedMs).not.toBeNull()
+    expect(summary.elapsedMs!).toBeGreaterThanOrEqual(stoppedAt - readyAt - 20)
+    expect(summary.elapsedMs!).toBeLessThan(250)
+    expect(summary.reads).toBe(0)
+    expect(summary.reconnects).toBe(0)
+  })
+
+  it('fences long-poll measurements at stream-up-to-date', async () => {
+    const run = await startListener('long-poll', 1)
+    try {
+      await within(run.readyLine, 'long-poll readiness line')
+      await within(run.secondRequest, 'post-readiness long-poll request')
+    } finally {
+      await stopListener(run)
+    }
+    const summary = summaryOf(run.stdout)
+    expect(summary.measurementReady).toBe(true)
+    expect(summary.readySubscriptions).toBe(1)
+    expect(summary.reads).toBeGreaterThanOrEqual(2)
+  })
+
+  it('reports an unfenced measurement as not ready', async () => {
+    const request = deferred<void>()
+    const server = createServer((_req, res) => {
+      request.resolve(undefined)
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+      res.end('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('missing listener address')
+    const worker = spawn(process.execPath, ['-e', LIVE_WORKER_JS], {
+      env: { ...process.env, WORKER_LIVE_MODE: 'sse', WORKER_EXPECTED_SUBSCRIPTIONS: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    worker.stdout!.on('data', (d: Buffer) => { stdout += d.toString() })
+    worker.stdin!.end(`http://127.0.0.1:${address.port}/stream\n`)
+    await within(request.promise, 'unfenced SSE request')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    worker.kill('SIGTERM')
+    await once(worker, 'close')
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    const summary = summaryOf(stdout)
+    expect(summary.measurementReady).toBe(false)
+    expect(summary.elapsedMs).toBeNull()
   })
 
   it.each([undefined, 'long-poll'] as const)('keeps long-poll for mode %s', async (mode) => {
@@ -247,7 +326,7 @@ describe('per-table bench live mode', () => {
     server.closeAllConnections()
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
     const summary = summaryOf(stdout)
-    expect(summary.maxHeld).toBe(1)
+    expect(summary.maxHeld).toBe(0)
     expect(summary.maxInFlight).toBe(1)
     expect(summary.failedReads).toBe(0)
   })
