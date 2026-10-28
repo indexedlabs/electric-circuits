@@ -371,10 +371,10 @@ downloaded; its four raw JSON files have SHA-256 hashes
 `20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324`, and
 `0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796`.
 
-Commit `67b4dc7` corrected earlier transcription errors by re-extracting every median from
-the downloaded JSON files. The extraction and its source-file SHA-256 keys are recorded in
-[`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it confirms the
-`9086025` steady semijoin profile at 103,176 bytes and the `1d7bbbc` cold semijoin RSS at
+Commits `67b4dc7` and `41d97b0` corrected earlier transcription errors by re-extracting every
+median from the downloaded JSON files. The extraction and its source-file SHA-256 keys are
+recorded in [`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it confirms
+the `9086025` steady semijoin profile at 94,512 bytes and the `1d7bbbc` cold semijoin RSS at
 63.3 MiB. The replicate table and recommendation below use that extraction.
 
 | Replicate | Cold DBSP bytes (subquery / semijoin) | Steady DBSP bytes | Steady delivery p50/p90 (ms) | Engine CPU (ms) |
