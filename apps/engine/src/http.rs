@@ -1406,9 +1406,17 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 }
 
 #[cfg(feature = "test-support")]
+static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "test-support")]
 pub(crate) fn test_release_after_unsubscribe_once() -> bool {
-    if std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE").ok().as_deref() == Some("once") {
-        unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE") };
+    if std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE").ok().as_deref() == Some("once")
+        && !TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        if let Ok(marker) = std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER") {
+            let _ = std::fs::write(marker, b"fired");
+        }
         true
     } else {
         false

@@ -33,9 +33,10 @@ not cancel groups, so that path is not exercised by its measurements.
   retention, shared state and cache effects must not be called owned group bytes.
 - The checked-in [median extraction manifest](semijoin-vs-subquery-medians.json) keys every
   result to its artifact and raw-file SHA-256. It takes medians over each `results[]` array,
-  uses the runner's `engineRssMb` field, takes cold DBSP bytes from `dbspProfileEnd`, and takes
-  steady DBSP bytes from `dbspProfile` before steady writes. This keeps the cold and steady rows
-  tied to the same named captures across all four artifacts.
+  uses the runner's `engineRssMb` field, and takes DBSP bytes from `dbspProfile` immediately
+  after group load for both cold and steady scenarios. The hold-end `dbspProfileEnd` values are
+  retained separately in the manifest so growth during the hold is visible. Reproduce it with
+  `python3 packages/scope-bench/scripts/extract_semijoin_medians.py --artifacts <artifact-root>`.
 - The perf2 streaming mode models one open response using provider long polls. Its
   charged read count is not a measurement of native Durable Streams SSE. Preserve
   actual provider reads separately; do not use that model for fd qualification.
@@ -44,7 +45,7 @@ not cancel groups, so that path is not exercised by its measurements.
 | --- | ---: | ---: | --- |
 | Cold group load (ms) | 13,082 | 13,017 | Measured; artifact 12844722320 |
 | Cold engine RSS (MiB) | 73.7 | 75.1 | Measured process RSS |
-| Cold DBSP used bytes | 34,212 | 60,232 | Measured profile; semijoin arrangement state |
+| Cold DBSP used bytes | 34,212 | 51,568 | Measured profile; semijoin arrangement state |
 | Steady group load (ms) | 4,340 | 4,209 | Measured; artifact 12844722320 |
 | Steady engine RSS (MiB) | 76.8 | 75.9 | Measured process RSS |
 | Steady DBSP used bytes | 65,092 | 94,512 | Measured profile |
@@ -340,7 +341,7 @@ already has fully green test job `123064316739` and benchmark job `123077258047`
 
 The 9086025 artifact is a second, independent five-repetition measurement on the production
 tree. Its medians are: cold group load 12,923/13,094 ms, cold RSS 74.6/76.8 MiB, cold DBSP
-used bytes 34,212/60,232, steady group load 4,349/4,358 ms, steady RSS 77.6/75.9 MiB, steady
+used bytes 34,212/51,568, steady group load 4,349/4,358 ms, steady RSS 77.6/75.9 MiB, steady
 DBSP used bytes 65,092/94,512, actual reads/change 2.667/2.694, delivery p50/p90 530/684 and
 1,282/2,035 ms, engine CPU 2,000/3,070 ms, and gateway CPU 4,732/4,596 ms (subquery/semijoin).
 The archive was independently downloaded and its digest is recorded above.
@@ -349,7 +350,7 @@ The 8a93697 benchmark job `123073502747` (run `40757521152`) produced artifact `
 named `semijoin-vs-subquery-f83e7f42f2d6af3d861a2e5613da5dafef8ffbc6`, with digest
 `sha256:e6bd10cfd726b96d1563b673491f077aa937d711f17d0290e40e30937e451853`. Its medians
 (subquery/semijoin) were cold load 12,404/12,418 ms, cold RSS 78.2/80.4 MiB, cold DBSP
-34,212/60,232 bytes, steady load 3,969/3,953 ms, steady RSS 75.4/77.7 MiB, steady DBSP
+34,212/51,568 bytes, steady load 3,969/3,953 ms, steady RSS 75.4/77.7 MiB, steady DBSP
 65,092/94,512 bytes, actual reads/change 2.661/2.722, delivery p50/p90 507/687 and 936/1,423
 ms, engine CPU 1,100/2,230 ms, and gateway CPU 4,660/4,652 ms. The archive was independently
 downloaded; its four raw JSON files have SHA-256 hashes
@@ -362,7 +363,7 @@ The 1d7bbbc benchmark job `123077258047` (run `40758664517`) produced artifact `
 named `semijoin-vs-subquery-5d5fcf586f5d0020249f2fbce608819ebe6398da`, with digest
 `sha256:7fb5528954f2daa40746d2a28c1e5c1779e8a61eb38c042f24cbb9e7f813b713`. Its medians
 (subquery/semijoin) were cold load 13,166/13,175 ms, cold RSS 74.9/63.3 MiB, cold DBSP
-34,212/60,232 bytes, steady load 4,347/4,285 ms, steady RSS 75.2/76.6 MiB, steady DBSP
+34,212/51,568 bytes, steady load 4,347/4,285 ms, steady RSS 75.2/76.6 MiB, steady DBSP
 65,092/94,512 bytes, actual reads/change 2.672/2.700, delivery p50/p90 519/735 and 1,282/2,045
 ms, engine CPU 2,070/3,180 ms, and gateway CPU 4,716/4,580 ms. The archive was independently
 downloaded; its four raw JSON files have SHA-256 hashes
@@ -373,16 +374,17 @@ downloaded; its four raw JSON files have SHA-256 hashes
 
 Commits `67b4dc7` and `41d97b0` corrected earlier transcription errors by re-extracting every
 median from the downloaded JSON files. The extraction and its source-file SHA-256 keys are
-recorded in [`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it confirms
-the `9086025` steady semijoin profile at 94,512 bytes and the `1d7bbbc` cold semijoin RSS at
-63.3 MiB. The replicate table and recommendation below use that extraction.
+recorded in [`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it uses
+the load-time DBSP profile for both scenarios and retains hold-end values separately. It
+confirms the `1d7bbbc` cold semijoin RSS at 63.3 MiB. The replicate table and recommendation
+below use the load-time extraction.
 
 | Replicate | Cold DBSP bytes (subquery / semijoin) | Steady DBSP bytes | Steady delivery p50/p90 (ms) | Engine CPU (ms) |
 | --- | ---: | ---: | ---: | ---: |
-| 48501cd | 34,212 / 60,232 | 65,092 / 94,512 | 495/734 / 1,373/1,981 | 1,920 / 3,070 |
-| 9086025 | 34,212 / 60,232 | 65,092 / 94,512 | 530/684 / 1,282/2,035 | 2,000 / 3,070 |
-| 8a93697 | 34,212 / 60,232 | 65,092 / 94,512 | 507/687 / 936/1,423 | 1,100 / 2,230 |
-| 1d7bbbc | 34,212 / 60,232 | 65,092 / 94,512 | 519/735 / 1,282/2,045 | 2,070 / 3,180 |
+| 48501cd | 34,212 / 51,568 | 65,092 / 94,512 | 495/734 / 1,373/1,981 | 1,920 / 3,070 |
+| 9086025 | 34,212 / 51,568 | 65,092 / 94,512 | 530/684 / 1,282/2,035 | 2,000 / 3,070 |
+| 8a93697 | 34,212 / 51,568 | 65,092 / 94,512 | 507/687 / 936/1,423 | 1,100 / 2,230 |
+| 1d7bbbc | 34,212 / 51,568 | 65,092 / 94,512 | 519/735 / 1,282/2,045 | 2,070 / 3,180 |
 
 Values in each cell are subquery / semijoin; the runs are reported separately, not pooled.
 
@@ -444,7 +446,9 @@ corrections are implemented through `9cffab2`, while the page-handoff and cancel
 corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the full
 test job and produced the first benchmark artifact; head `8a93697` adds the slot-busy
 stabilization and second-barrier rollback contract. Every later head is docs-only over the
-identical production tree, and 1d7bbbc's fully green test job `123064316739` qualifies that tree.
+identical production tree, except `41d97b0`, which adds test-support-only durable-release fault
+injection and its rollback contract. The production build remains identical to 1d7bbbc, whose
+fully green test job `123064316739` qualifies that tree.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
@@ -496,10 +500,12 @@ only the October 25 scope-load/read-scaling changes.
 
 ## Recommendation
 
-The four completed artifacts were re-derived from their raw JSON manifests; an earlier
-transcription had used the post-hold DBSP field for one steady row and was corrected here.
-All four completed five-repetition runs miss the decision threshold. Semijoin DBSP used bytes
-are about 76% higher cold and 45% higher steady in every run; delivery is about 1.8–3.0× slower at
+The four completed artifacts were re-derived from their raw JSON manifests; earlier transcription
+had mixed load-time and hold-end DBSP fields, so this report uses the load-time field for both
+scenarios and records hold-end values separately. All four completed five-repetition runs miss
+the decision threshold. Semijoin DBSP used bytes are about 51% higher cold and 45% higher steady
+in every run; the hold-end snapshots are about 76% higher cold and 45–59% higher steady. Delivery
+is about 1.8–3.0× slower at
 p50/p90, and engine CPU is about 53–103% higher. Process RSS is noisy across runs: semijoin is
 1.4–2.2 MiB higher cold in three runs and 11.6 MiB lower in one, while steady RSS ranges from
 1.7 MiB lower to 2.3 MiB higher. That variation does not offset the consistently higher DBSP
