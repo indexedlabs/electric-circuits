@@ -89,9 +89,7 @@ impl Default for SubqueryAdmission {
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
-pub(crate) use group::{GroupClaims, GroupConflict, GroupMember, GroupRecord, GroupStreamClosed};
-
-static GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+pub(crate) use group::{GroupClaims, GroupConflict, GroupFence, GroupMember, GroupRecord, GroupStreamClosed};
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
     GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
@@ -596,6 +594,9 @@ pub struct Engine {
     pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
+    /// Per-engine group transaction fence. It must never be process-global.
+    group_fence: GroupFence,
+    group_lanes: crate::engine::emission::GroupEmissionLanes,
     /// Latched when live replay cannot continue: a missing segment or unrecoverable body-cap breach.
     pub(crate) sequencer_read_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Table schemas shared with the sequencer task and the replication ingestor — the set of
@@ -871,6 +872,7 @@ struct SubqueryHandle {
     flip_tx: mpsc::UnboundedSender<FlipWork>,
     pending_flips: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
+    group_lanes: crate::engine::emission::GroupEmissionLanes,
 }
 
 /// Spawn the flip-propagation dispatcher: FlipWork batches run **concurrently**, bounded by a
@@ -1370,7 +1372,7 @@ fn sid_of_path(stream_path: &str) -> &str {
 
 impl Engine {
     pub(crate) fn group_stream_path(&self) -> String {
-        format!("shape/group-{}-{}", self.sub_nonce, GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        format!("shape/group-{}-{}", self.sub_nonce, uuid::Uuid::new_v4())
     }
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
@@ -1537,6 +1539,8 @@ impl Engine {
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
         let degrade = DegradeState::new();
+        let group_fence = GroupFence::default();
+        let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1548,6 +1552,7 @@ impl Engine {
             shutdown.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
+        subqueries.try_lock().expect("fresh registry").set_group_lanes(group_lanes.clone());
         spawn_flip_propagator(
             subqueries.clone(),
             flip_rx,
@@ -1616,6 +1621,8 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
+            group_fence,
+            group_lanes,
             sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
@@ -2316,6 +2323,7 @@ impl Engine {
             flip_tx: self.flip_tx.clone(),
             pending_flips: self.pending_flips.clone(),
             degrade: self.degrade.clone(),
+            group_lanes: self.group_lanes.clone(),
         }
     }
 
@@ -2337,6 +2345,7 @@ impl Engine {
                 self.source_receipt_progress.clone(),
                 self.runtime_receipts.clone(),
                 self.subquery_handle(),
+                self.group_fence.clone(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
@@ -2893,7 +2902,7 @@ impl Engine {
             return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
         }
         self.state.lock().await.group_claims.complete(record);
-        crate::engine::group::activate();
+        self.group_fence.activate();
         Ok(())
     }
 
@@ -2905,13 +2914,39 @@ impl Engine {
         self.state.lock().await.group_claims.get(subscription).cloned()
     }
 
+    /// Renew the public group lease and every private member claim together. A retried load is
+    /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
+    /// to the same wall-clock instant.
+    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<()> {
+        let now = crate::changelog::now_secs();
+        let mut events = Vec::with_capacity(group.members.len());
+        {
+            let mut st = self.state.lock().await;
+            for member in &group.members {
+                if st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id) {
+                    st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                    events.push(CatalogEvent::Joined {
+                        id: member.shape_id.clone(),
+                        subscription: member.subscription.clone(),
+                        at: now,
+                    });
+                }
+            }
+            st.publish_subscription_gauge(&self.metrics);
+        }
+        for event in events {
+            self.catalog_tx.send(event);
+        }
+        Ok(())
+    }
+
     /// Remove the public group record and return its private members.  The caller performs
     /// the durable member releases outside the state lock, preserving the normal lifecycle
     /// ordering and avoiding network I/O while holding engine state.
     pub(crate) async fn take_group(&self, subscription: &str) -> Option<GroupRecord> {
         let record = self.state.lock().await.group_claims.release(subscription);
         if record.is_some() {
-            crate::engine::group::deactivate();
+            self.group_fence.deactivate();
         }
         record
     }

@@ -327,7 +327,15 @@ impl Engine {
         // is joined (ref-count++), returning the same stream — no second stream, no per-subscriber append
         // fan-out. Subquery shapes share their inner-set nodes in the registry regardless; sharing the
         // *outer* shape here collapses identical subquery shapes fully.
-        let feed_sig = if share { Some(shape_signature(table, &where_, &out_cols, changes_only)) } else { None };
+        let feed_sig = if share {
+            Some(shape_signature(table, &where_, &out_cols, changes_only))
+        } else if stream_path_override.is_some() {
+            // Group members are private shapes, but their claims must still be represented in
+            // the normal lease index so lapse/release can remove every member with the group.
+            Some(format!("group-member:{sub}"))
+        } else {
+            None
+        };
         // Storage may have lost the retained shape's stream since it was made; a stale entry is
         // retired here so the join below falls through to a fresh create (see
         // `retire_join_target_if_stream_lost`).
@@ -348,6 +356,12 @@ impl Engine {
                     // One subscription id belongs to one shape (ADR-0008). Reusing it for a
                     // different predicate is refused rather than silently accepted: the caller
                     // would hold one name for two shapes and could release neither unambiguously.
+                    if stream_path_override.is_none() && st.group_claims.is_reserved(sub) {
+                        return Err(anyhow::Error::new(GroupConflict {
+                            subscription: sub.to_string(),
+                            owner: format!("group {sub}"),
+                        }));
+                    }
                     ensure_subscription_free(&st, sub, &existing_id)?;
                     // A join and a RENEWAL are the same call: `subscribe` returns false when the
                     // shape already holds this id, in which case nothing is claimed and only the
@@ -424,6 +438,12 @@ impl Engine {
         }
         // Nothing to join: this create is about to mint a shape, so the id must be free of any
         // OTHER shape as well (the join path checked it against the one it was joining).
+        if stream_path_override.is_none() && st.group_claims.is_reserved(sub) {
+            return Err(anyhow::Error::new(GroupConflict {
+                subscription: sub.to_string(),
+                owner: format!("group {sub}"),
+            }));
+        }
         ensure_subscription_free(&st, sub, "")?;
 
         let num_id = st.next_shape_id;

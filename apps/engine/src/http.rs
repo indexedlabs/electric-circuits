@@ -287,7 +287,7 @@ fn openapi_subset_feed() {}
 
 #[utoipa::path(
     post,
-    path = "/v1/subset-loads",
+    path = "/v1/subsets/load",
     request_body = SubsetLoadRequest,
     responses(
         (status = 200, description = "Changes-only feed and snapshot page", body = SubsetLoadResponse),
@@ -425,7 +425,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/subset-feeds", post(create_subset_feed))
         .route("/v1/subsets/query-batch", post(query_subset_batch))
         .route("/v1/scopes/load", post(load_scope))
-        .route("/v1/subset-loads", post(subset_load))
+        .route("/v1/subsets/load", post(subset_load))
         .route("/v1/aggregates", post(create_aggregate))
         .route("/changes/position", get(changes_position))
         .route("/changes/{segment}", get(read_changes))
@@ -725,7 +725,7 @@ fn is_native_dto_path(path: &str) -> bool {
         "/v1/shapes"
             | "/v1/subsets/query"
             | "/v1/subset-feeds"
-            | "/v1/subset-loads"
+            | "/v1/subsets/load"
             | "/v1/subsets/query-batch"
             | "/v1/scopes/load"
             | "/v1/aggregates"
@@ -1298,7 +1298,7 @@ async fn load_scope(
 }
 
 /// Create (or renew) one validated changes-only feed and read its stream's tail offset: the first
-/// two steps of a load, shared by `/v1/scopes/load` and `/v1/subset-loads`. The offset is read after
+/// two steps of a load, shared by `/v1/scopes/load` and `/v1/subsets/load`. The offset is read after
 /// the feed exists and before any snapshot, so a client tailing from it misses nothing.
 async fn open_feed(
     engine: &Engine,
@@ -1582,13 +1582,23 @@ async fn subset_load_group(
     subscription: Option<String>,
     members: Vec<ScopeLoadEntry>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    const MAX_GROUP_MEMBERS: usize = 16;
+    const MAX_GROUP_MEMBERS: usize = 8;
     if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
             msg: "members must contain 1..8 entries".into(),
             retry_after: false,
         });
+    }
+    let mut tables = std::collections::HashSet::new();
+    for member in &members {
+        if !tables.insert(member.table.clone()) {
+            return Err(AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: format!("duplicate group member table '{}'", member.table),
+                retry_after: false,
+            });
+        }
     }
     validate_new_subscription(subscription.clone())?;
     for member in &members {
@@ -1610,8 +1620,47 @@ async fn subset_load_group(
             })?;
     }
     let _control = engine.admit_control()?;
-    let group_path = engine.group_stream_path();
     let group_sub = engine.resolve_subscription(subscription).await;
+    if let Some(existing) = engine.group_record(&group_sub).await {
+        let same = existing.members.len() == members.len()
+            && existing.members.iter().zip(&members).all(|(old, new)| {
+                old.key == new.key.to_string()
+                    && old.table == new.table.to_string()
+                    && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
+                    && old.columns == new.columns
+            });
+        if !same {
+            return Err(AppError {
+                status: StatusCode::CONFLICT,
+                msg: format!("subscription '{}' belongs to another group", group_sub),
+                retry_after: false,
+            });
+        }
+        engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
+        let offset = engine.stream_tail(&existing.stream_path).await.map_err(AppError::from)?.ok_or_else(|| {
+            AppError { status: StatusCode::SERVICE_UNAVAILABLE, msg: "group stream has no tail offset".into(), retry_after: true }
+        })?;
+        let reads = existing.members.iter().map(|m| crate::engine::SubsetReadReq {
+            table: TableRef::parse(&m.table).expect("validated table reference"),
+            where_: m.where_.clone(),
+            columns: m.columns.clone(),
+            order_by: None,
+            limit: None,
+            offset: None,
+        }).collect();
+        let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
+        let results = existing.members.iter().zip(page.pages).map(|(member, rows)| serde_json::json!({
+            "key": member.key, "table": member.table, "shapeId": member.shape_id,
+            "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
+            "subscription": group_sub, "leaseSeconds": engine.lease_seconds(), "offset": offset, "rows": rows,
+        })).collect::<Vec<_>>();
+        return Ok(Json(serde_json::json!({
+            "groupId": existing.id, "subscription": group_sub,
+            "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
+            "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
+        })));
+    }
+    let group_path = engine.group_stream_path();
     // Reserve the one public claim before the first member create.  This check is made
     // under the same engine state lock as ordinary shape subscriptions, so a competing
     // single-shape create cannot win the name between member creates.
@@ -1681,11 +1730,6 @@ async fn subset_load_group(
             return Err(AppError::from(error));
         }
     };
-    // Keep one live caller claim for the group. Member claims after the first are private
-    // implementation handles and are released once the group record has captured them.
-    for (rec, sub) in created.iter().skip(1) {
-        let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
-    }
     let lease_seconds = engine.lease_seconds();
     let group_id = group_path.clone();
     let group_record = GroupRecord {
@@ -1699,6 +1743,8 @@ async fn subset_load_group(
                 key: member.key.clone(),
                 shape_id: rec.id.clone(),
                 table: member.table.to_string(),
+                where_: member.where_.clone(),
+                columns: member.columns.clone(),
                 subscription: sub.clone(),
                 is_subquery: member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery),
             })

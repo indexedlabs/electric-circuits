@@ -1723,7 +1723,7 @@ impl Engine {
                     .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
                 if restorable {
                     st.group_claims.complete(group);
-                    crate::engine::group::activate();
+                    self.group_fence.activate();
                 } else {
                     tracing::info!(%subscription, "restore: dropping group with a non-restorable subquery member");
                     self.catalog_tx.send(CatalogEvent::GroupDropped { subscription });

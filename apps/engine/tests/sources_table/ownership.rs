@@ -771,7 +771,7 @@ async fn post_group(app: &Router, body: serde_json::Value) -> Result<(StatusCode
     let response = app
         .clone()
         .oneshot(
-            axum::http::Request::post("/v1/subset-loads")
+            axum::http::Request::post("/v1/subsets/load")
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))?,
         )

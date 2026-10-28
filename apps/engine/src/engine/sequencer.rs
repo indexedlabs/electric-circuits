@@ -144,6 +144,7 @@ pub(crate) fn spawn_sequencer(
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
     subq: SubqueryHandle,
+    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -184,6 +185,7 @@ pub(crate) fn spawn_sequencer(
         stats.clone(),
         node_states.clone(),
         subq,
+        group_fence,
         trace_tx,
         arr,
         arr_gates,
@@ -453,6 +455,7 @@ pub(crate) async fn sequencer_loop(
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
+    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -780,7 +783,7 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if crate::engine::group::active()
+                        if group_fence.active()
                             && let Some(previous) = last_group_lsn
                             && !wait_for_source_effects(&subq, &shutdown, previous).await
                         {
@@ -953,6 +956,29 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
                         }
+                        // Group members, including ordinary filters, use the same bounded append
+                        // entry point as deferred subquery effects. This keeps a group's outputs
+                        // behind its source-transaction barrier and applies backpressure only to
+                        // that group's stream.
+                        let group_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+                        let group_paths: Vec<String> = txn_pending
+                            .keys()
+                            .filter(|path| path.starts_with("shape/group-"))
+                            .cloned()
+                            .collect();
+                        for path in group_paths {
+                            if let Some(envs) = txn_pending.remove(&path) {
+                                if let Err(error) = subq.group_lanes.append(&path, envs, group_lsn).await {
+                                    tracing::warn!(%error, stream_path = %path, "group append interrupted; preserving replay boundary");
+                                    highwater = txn_highwater;
+                                    processing_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if processing_failed {
+                            break;
+                        }
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
@@ -1013,7 +1039,7 @@ pub(crate) async fn sequencer_loop(
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
                         }
-                        if crate::engine::group::active()
+                        if group_fence.active()
                             && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
                         {
                             last_group_lsn = Some(commit_lsn);

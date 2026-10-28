@@ -9,33 +9,46 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::ds::Envelope;
 
-static ACTIVE_GROUPS: AtomicUsize = AtomicUsize::new(0);
-
-pub(crate) fn activate() {
-    ACTIVE_GROUPS.fetch_add(1, Ordering::AcqRel);
+/// Per-engine group activity.  This is deliberately owned by the Engine rather than a
+/// process-global counter: two engines may share a process during a handoff and their
+/// transaction fences must not affect one another.
+#[derive(Clone, Default)]
+pub(crate) struct GroupFence {
+    active: Arc<AtomicUsize>,
 }
 
-pub(crate) fn deactivate() {
-    let _ = ACTIVE_GROUPS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+impl GroupFence {
+    pub(crate) fn activate(&self) {
+        self.active.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn deactivate(&self) {
+        let _ = self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.active.load(Ordering::Acquire) != 0
+    }
 }
 
-pub(crate) fn active() -> bool {
-    ACTIVE_GROUPS.load(Ordering::Acquire) != 0
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GroupMember {
     pub key: String,
     pub shape_id: String,
     pub table: String,
+    #[serde(rename = "where", default)]
+    pub where_: Option<crate::predicate::PredicateJson>,
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
     pub subscription: String,
     pub is_subquery: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GroupRecord {
     pub id: String,
     pub stream_path: String,

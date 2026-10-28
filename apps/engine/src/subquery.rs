@@ -574,6 +574,7 @@ pub struct SubqueryRegistry {
     /// streams asynchronously, covered by the `pendingFlips` barrier. `None` (unit tests)
     /// falls back to a direct reliable append.
     lanes: Option<crate::engine::emission::EmissionLanes>,
+    group_lanes: Option<crate::engine::emission::GroupEmissionLanes>,
 }
 
 impl HeapSize for SubqueryRegistry {
@@ -642,6 +643,7 @@ impl SubqueryRegistry {
             pg_pool,
             schemas: Arc::new(HashMap::new()),
             lanes: None,
+            group_lanes: None,
         }
     }
 
@@ -733,11 +735,20 @@ impl SubqueryRegistry {
         self.lanes = Some(lanes);
     }
 
+    pub(crate) fn set_group_lanes(&mut self, lanes: crate::engine::emission::GroupEmissionLanes) {
+        self.group_lanes = Some(lanes);
+    }
+
     /// Deliver membership envelopes to a shape stream in **evaluation order**: enqueue on the
     /// stream's emission lane while the caller holds this registry's lock (per-stream FIFO ⇒
     /// append order = eval order — the "data in the right place" invariant). Without lanes
     /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
     async fn deliver(&self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
+        if stream_path.starts_with("shape/group-") {
+            if let Some(lanes) = &self.group_lanes {
+                return lanes.append(stream_path, envs, commit_lsn).await;
+            }
+        }
         match &self.lanes {
             Some(l) => l.enqueue(stream_path, envs, commit_lsn),
             None => {
