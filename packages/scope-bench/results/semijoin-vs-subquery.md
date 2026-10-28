@@ -48,7 +48,7 @@ state and has slower delivery and higher engine CPU; restart cost remains unavai
 | New-group seed time | Included in group load | Included in group load | No separate seed timer |
 
 The measured benchmark is run `40747358562`, test job `123024579773`, benchmark job
-`123037684019`, artifact `12844722320` (`semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44`).
+`123037684019`, artifact `12844722320` (`semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44c`).
 It ran five repetitions for each mode and both scenarios with PostgreSQL 18.6. `engineBootMs` is a
 cold process boot plus catalog/shape reload measurement for this harness; it is not a SIGTERM
 restart or a persisted durable-stream restore. `groupLoadMs` is the
@@ -315,10 +315,13 @@ formatting, Rust, TypeScript and Node but its group step failed in
 `concurrent_group_cancellations_preserve_both_durable_drops` with `the slot is held by
 walsender pid 5267` during replacement restart; the restart helper now retries that transient
 `SlotBusy` state. Heads `82f2cd2` and `9c5b821` then exposed compile/format failures in the new
-rollback contract. Head `9086025` fixed those blockers. Reviewed head `8a93697` adds the bounded
-slot-busy retry and the second member-release cancellation barrier; its exact-head CI is the
-remaining correctness gate. No performance claim is made beyond the completed `48501cd`
-characterization above.
+rollback contract. Head `9086025` fixed those blockers. Reviewed head `8a93697` added the bounded slot-busy retry and the second member-release
+cancellation barrier. Head `9086025` passed formatting, both group modes, Rust engine tests,
+TypeScript, Node and Vitest (run `40754547033`, test job `123049856807`); its benchmark job
+`123062180725` was still building when reviewed. Merge head `1d7bbbc` preserves that production
+tree apart from test-only barrier refactoring and the evidence/docs updates; its test job
+`123064316739` is still running. No performance claim beyond the completed `48501cd`
+characterization is needed for the decision.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain

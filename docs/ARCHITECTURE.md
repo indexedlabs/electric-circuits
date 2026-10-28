@@ -737,8 +737,9 @@ the catalog writer remains available and failing closed when the writer is gone.
 `GroupCreated` is queued, cancellation releases private member claims and tries to queue a durable
 `GroupDropped` before aborting the public reservation. If the catalog writer is already gone, the
 reservation aborts in memory while the guard retains the compensation state for its shutdown-owned
-retry. The guard owns a counted shutdown party, so engine close waits for every concurrent compensation before draining the catalog; a
-clean close within the grace period cannot resurrect an all-plain group whose create never
+retry. The guard owns a counted shutdown party, so engine close waits for every concurrent
+compensation before draining the catalog; a clean close within the grace period cannot
+resurrect an all-plain group whose create never
 returned. A crash, forced close, or catalog-writer loss can still leave a queued `GroupCreated`
 for replay. These page-handoff rules are part of the not-for-merge PR #45 experiment and require
 exact-head CI evidence; they do not qualify the gateway or native client seams.
