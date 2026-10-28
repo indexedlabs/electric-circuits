@@ -54,9 +54,22 @@ pub type Assert = dbsp::operator::Update<Value, Value>;
 /// the old `Row([Int(id), Text(pk)])` key: 12 inline bytes with NO per-entry heap string (the
 /// string lives once in the dictionary), which is the memory win driving Task 2.1.
 #[derive(
-    Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
 )]
-#[derive(OrdRepr)]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct PkKey {
     /// `node_id` (contributors) or `feed_id` (feeds). Ordered FIRST, so one id's entries are

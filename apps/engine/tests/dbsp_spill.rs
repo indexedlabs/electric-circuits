@@ -24,9 +24,8 @@ fn with_storage(test: impl FnOnce() + Clone + Send + 'static) {
     .unwrap();
     // FileZSet/FileIndexedZSet always write files, regardless of the spill thresholds or
     // background merge timing. Leave compression at the upstream default used in production.
-    let result = Runtime::run(CircuitConfig::with_workers(1).with_storage(Some(storage)), move |_| test())
-        .unwrap()
-        .join();
+    let result =
+        Runtime::run(CircuitConfig::with_workers(1).with_storage(Some(storage)), move |_| test()).unwrap().join();
     std::fs::remove_dir_all(&dir).unwrap();
     result.unwrap();
 }

@@ -25,16 +25,6 @@ jobs:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
 
-      # OTTO-10302: CI is the dependency-resolution host until a remote profile exists.
-      # Remove these two steps once the resulting Cargo.lock is committed on the PR.
-      - name: Resolve upgraded Cargo dependencies
-        run: cargo metadata --format-version 1 > /dev/null
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: otto-10302-cargo-lock
-          path: Cargo.lock
-
       - name: Rust formatting (rustfmt.toml at the root)
         run: cargo fmt --check
 

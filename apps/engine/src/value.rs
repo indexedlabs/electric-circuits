@@ -25,9 +25,21 @@ pub use dbsp::utils::Tup2;
 /// A scalar cell value. `Float` wraps dbsp's `F64` because a bare `f64` is not
 /// `Eq`/`Ord`/`Hash` and so could not be a map key (aggregate multisets, routing indexes).
 #[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
+    Clone,
+    Default,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
 )]
-#[derive(OrdRepr)]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub enum Value {
     #[default]
@@ -132,9 +144,21 @@ impl Value {
 
 /// A row is a positional vector of cell values; the schema gives names to the positions.
 #[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
+    Clone,
+    Default,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
 )]
-#[derive(OrdRepr)]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd))]
 pub struct Row(pub Vec<Value>);
 
