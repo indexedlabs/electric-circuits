@@ -1439,9 +1439,10 @@ impl GroupReservationGuard {
         self.group_created = true;
     }
 
-    async fn release_member_durable(engine: &Engine, shape_id: &str, subscription: &str) {
+    async fn release_member_durable(engine: &Engine, shape_id: &str, subscription: &str) -> bool {
         let mut first = true;
         let mut backoff = std::time::Duration::from_millis(100);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             let result = if first {
                 engine.release_subscription_durable(shape_id, Some(subscription)).await
@@ -1449,9 +1450,12 @@ impl GroupReservationGuard {
                 engine.retry_subscription_release_durable(shape_id, subscription).await
             };
             match result {
-                Ok(()) => return,
+                Ok(()) => return true,
                 Err(error) => {
                     tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
+                    if engine.shutdown_token().is_shutting_down() || tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
                     first = false;
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
@@ -1460,13 +1464,17 @@ impl GroupReservationGuard {
         }
     }
 
-    async fn drop_group_durable(engine: &Engine, subscription: &str) {
+    async fn drop_group_durable(engine: &Engine, subscription: &str) -> bool {
         let mut backoff = std::time::Duration::from_millis(100);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         loop {
             match engine.drop_group_durable(subscription).await {
-                Ok(()) => return,
+                Ok(()) => return true,
                 Err(error) => {
                     tracing::warn!(%subscription, %error, "retrying cancelled group compensation");
+                    if engine.shutdown_token().is_shutting_down() || tokio::time::Instant::now() >= deadline {
+                        return false;
+                    }
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
                 }
@@ -1479,13 +1487,17 @@ impl GroupReservationGuard {
             return;
         }
         while let Some((shape_id, subscription)) = self.members.last().cloned() {
-            Self::release_member_durable(&self.engine, &shape_id, &subscription).await;
+            if !Self::release_member_durable(&self.engine, &shape_id, &subscription).await {
+                return;
+            }
             if self.members.last().is_some_and(|member| member.0 == shape_id && member.1 == subscription) {
                 self.members.pop();
             }
         }
         if self.group_created {
-            Self::drop_group_durable(&self.engine, &self.subscription).await;
+            if !Self::drop_group_durable(&self.engine, &self.subscription).await {
+                return;
+            }
             self.group_created = false;
         }
         self.engine.abort_group(&self.subscription).await;
@@ -1510,10 +1522,16 @@ impl Drop for GroupReservationGuard {
         let party = self.compensation_party.take();
         engine.shutdown_token().spawn(async move {
             for (shape_id, member_subscription) in members {
-                GroupReservationGuard::release_member_durable(&engine, &shape_id, &member_subscription).await;
+                if !GroupReservationGuard::release_member_durable(&engine, &shape_id, &member_subscription).await {
+                    drop(party);
+                    return;
+                }
             }
             if group_created {
-                GroupReservationGuard::drop_group_durable(&engine, &subscription).await;
+                if !GroupReservationGuard::drop_group_durable(&engine, &subscription).await {
+                    drop(party);
+                    return;
+                }
             }
             engine.abort_group(&subscription).await;
             drop(party);

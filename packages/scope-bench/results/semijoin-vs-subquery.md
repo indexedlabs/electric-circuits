@@ -233,12 +233,12 @@ after the page is visible but unsequenced, so the live path cannot seed the memb
 FeedSet. Only the page-key handoff can emit the table-qualified tombstone, and the
 assertion checks the delete's source commit LSN. A second contract aborts the group
 request at both handoff barriers and checks that `inflight_querybacks` returns to zero.
-Head `6a58456` makes the event wait deterministic, installs the missing library-test schema,
-and applies the pinned formatting. Head `53dd7e3` adds a clean-close/slot-reuse assertion,
+Head `327653b` makes the event wait deterministic; `6a58456` installs the missing library-test schema
+and passes its group/library tests, while its formatting gate remains red. Head `53dd7e3` adds a clean-close/slot-reuse assertion,
 member-claim compensation on canceled creates, and failed-boot result capture.
 Head `9e9171e` makes the member releases durable across cancellation, records a durable
 `GroupDropped` after `GroupCreated` is queued, and adds a catalog-completion cancellation
-barrier. Commit `48ab7a0` extends that completion case to an all-plain group, closes the
+barrier. Commit `ccb02c6` extends that completion case to an all-plain group, closes the
 original engine, boots a replacement on the same slot/store, and retries the same claim only
 after restore; this is the restart assertion for the durable drop path. Merge head `d7cd60c`
 records the concurrent-party reconciliation with the remote branch and retains this tree.
@@ -249,10 +249,10 @@ table-qualified delete/key/LSN tuple.
 
 The benchmark now captures `/memory` and `/debug/dbsp-profile` both after group load
 and at the end of the hold. The end profile checks the requested mode and requires
-`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch and steady
-workloads update the `record_date_index` companion every 200 ms / write so the chat-open
-transcript groups exercise that path too; this makes the workload a corrected run rather
-than a byte-for-byte replay of perf2. `readsPerChange`
+`selectionBatches > 0` for semijoin runs after an eligible write. Cold launch updates an assignment companion every 200 ms without changing scope membership.
+Steady writes toggle the eligible `record_date_index` day between two bounded values so
+transcript groups exercise the semijoin path without accumulating drift across repetitions;
+this makes the workload a corrected run rather than a byte-for-byte replay of perf2. `readsPerChange`
 uses a per-process benchmark writer role and excludes that role's DML and transaction
 utility statements by `userid`; defensive text filters remain for SQL issued through the
 admin session. The exact-head `327653b` run `40720275270` (test job `122928965091`) ran
@@ -279,12 +279,14 @@ The follow-up `ccb02c6` run `40733299001` (test job `122975056498`) repeated the
 (`expected Result<(), anyhow::Error>, found Result<(), CatalogWriterGone>`) before running
 the cancellation contracts; its benchmark `122977296090` was skipped and the Electric image
 job `122975057785` failed. The subsequent `89a0b97` head added a shutdown party around detached
-compensation, a one-shot member-release re-enqueue, and the steady `record_date_index` touch,
-but retained the same `drop_group_durable` type mismatch. Its test job `122988431056` failed at
+compensation, a one-shot member-release re-enqueue, and the steady companion touch, but
+retained the same `drop_group_durable` type mismatch. Its test job `122988431056` failed at
 that compile error, its scope benchmark `122993623042` was skipped, and its engine image job
-`122988431228` failed. This checkout applies the missing `?; Ok(())`, counts duplicate
-shutdown-party names, and retries compensation until each durable `Left` and `GroupDropped`
-acknowledges; it still needs a fresh exact-head run.
+`122988431228` failed. The reconciled follow-up adds the missing `?; Ok(())`, counts duplicate
+shutdown-party names, bounds writer-loss retries, fixes the four-stage barrier wiring and
+returns the source-fence cleanup to `Result<()>`. Its exact run `40741829458` (test job
+`123005145542`) was still compile/red while this report was reconciled; no benchmark result
+is claimed.
 
 Earlier exact jobs remain part of the ledger: group contracts passed in both modes at
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
@@ -301,8 +303,9 @@ the triggering commit LSN for synthetic tombstone headers. The handoff guard bal
 on request cancellation, and tombstones are delivered in commit-LSN order. Empty inner-flip
 query-backs do not scan the whole companion table; they remain a no-op unless a scoped decision
 exists. The cancellation contract now also aborts two all-plain group creates at the completion
-barrier, closes the engine, and retries both subscriptions after restore; the counted shutdown
-party is therefore exercised by concurrent compensation rather than only by a unit check.
+barrier, closes the engine, and retries both subscriptions after restore. The counted-party
+unit test is the direct proof of multiplicity; the concurrent contract covers end-to-end
+cleanup and restart but is not claimed as an isolated red/green proof of the count.
 
 The perf2 `gateway.ts`, `phone.ts`, and `run.ts` harness files have now been
 imported directly from the pinned perf2 commit, without its older engine code.

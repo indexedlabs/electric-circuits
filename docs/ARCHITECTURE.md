@@ -737,7 +737,8 @@ a durable `Left` is confirmed and re-enqueuing that event after a lost writer re
 `GroupCreated` is queued, cancellation releases private member claims, queues a durable
 `GroupDropped`, and only then aborts the public reservation. The guard owns a counted shutdown
 party, so engine close waits for every concurrent compensation before draining the catalog; a
-restart cannot resurrect an all-plain group whose create never returned. These page-handoff
+clean close within the grace period cannot resurrect an all-plain group whose create never
+returned. A crash or forced close can still leave a queued `GroupCreated` for replay. These page-handoff
 rules are part of the not-for-merge PR #45 experiment and require exact-head CI evidence; they
 do not qualify the gateway or native client seams.
 

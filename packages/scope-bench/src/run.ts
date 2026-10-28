@@ -260,6 +260,7 @@ async function runOnce(admin: pg.Client, writer: pg.Client, pgUrl: string, scs: 
          and query not ilike '%pg_stat_statements%' and query not ilike 'update record set title%'
          and query not ilike 'insert into assistant_stream_event%' and query not ilike 'insert into message%'
          and query not ilike 'insert into assignment%' and query not ilike 'insert into tagged_item%'
+         and query not ilike 'update record_date_index%'
          and query not ilike 'update assignment%' and query not ilike 'update tagged_item%'`,
       [BENCH_WRITER_ROLE],
     )
@@ -369,9 +370,10 @@ async function runOnce(admin: pg.Client, writer: pg.Client, pgUrl: string, scs: 
           const offset = n++ % 50
           Promise.all([
             writer.query(`update record set title = title || '.' where user_id = $1 and id in (select id from record where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
-            // Touch an eligible companion as well as the plain Record member so the cold-launch
-            // run proves that the semijoin selection path executes before its profile snapshot.
-            writer.query(`update record_date_index set day = day + 1 where user_id = $1 and id in (select id from record_date_index where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
+            // Touch an eligible companion as well as the plain Record member. This payload-only
+            // update exercises the same positive-IN companion path without changing scope
+            // membership across repetitions.
+            writer.query(`update assignment set payload = payload || '.' where user_id = $1 and id in (select id from assignment where user_id = $1 order by id limit 1 offset $2)`, [HEAVY, offset]),
           ])
             .catch(() => {})
         }, 200),
@@ -398,7 +400,9 @@ async function runOnce(admin: pg.Client, writer: pg.Client, pgUrl: string, scs: 
             // Chat-open transcript groups select record_date_index through the same positive IN
             // predicate; touch that companion so the semijoin profile records a real selection
             // in both the cold-launch and steady workloads.
-            await writer.query(`update record_date_index set day = day + 1 where user_id = $1 and record_id = $2`, [user, recordId])
+            // Toggle between two bounded values so repeated reps do not accumulate a different
+            // day/window state while still touching the eligible companion relation.
+            await writer.query(`update record_date_index set day = case when day = 0 then 1 else 0 end where user_id = $1 and record_id = $2`, [user, recordId])
             await writer.query(
               `insert into assignment (id, user_id, record_id, payload) values ($1, $2, $3, $4) on conflict (id) do update set payload = excluded.payload`,
               [assignmentId, user, recordId, marker],

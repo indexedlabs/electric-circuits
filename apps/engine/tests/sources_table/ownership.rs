@@ -937,14 +937,14 @@ async fn install_source_fence(f: &Fixture) -> Result<()> {
     Ok(())
 }
 
-async fn remove_source_fence(f: &Fixture) {
-    let _ = f
-        .client
+async fn remove_source_fence(f: &Fixture) -> Result<()> {
+    f.client
         .batch_execute(&format!(
             "ALTER PUBLICATION \"{}_pub\" DROP TABLE IF EXISTS public.circuits_source_fence; DROP TABLE IF EXISTS public.circuits_source_fence",
             f.slots[0]
         ))
-        .await;
+        .await?;
+    Ok(())
 }
 
 async fn wait_source_receipt(engine: &Engine, f: &Fixture, commit: uuid::Uuid) -> Result<()> {
@@ -1005,7 +1005,7 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1033,7 +1033,7 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1082,7 +1082,7 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1179,7 +1179,7 @@ async fn page_handoff_tombstone_contract(f: &Fixture) -> Result<()> {
     .await;
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1219,15 +1219,7 @@ async fn page_cancellation_contract(f: &Fixture) -> Result<()> {
             let stage_result = match cancel_stage {
                 "member" => wait_ready(&base, "member").await,
                 "private" => wait_ready(&base, "private").await,
-                "page" => {
-                    match wait_ready(&base, "private").await {
-                        Ok(()) => match std::fs::write(format!("{base}.private.release"), b"release") {
-                            Ok(()) => wait_ready(&base, "page").await,
-                            Err(error) => Err(error.into()),
-                        },
-                        Err(error) => Err(error),
-                    }
-                }
+                "page" => wait_ready(&base, "page").await,
                 "complete" => wait_ready(&base, "complete").await,
                 _ => unreachable!("unknown group cancellation stage"),
             };
@@ -1327,10 +1319,7 @@ async fn concurrent_page_cancellation_contract(f: &Fixture) -> Result<()> {
     install_source_fence(f).await?;
     let barrier = f.root.join("group-page-cancel-concurrent");
     let base = barrier.to_string_lossy().into_owned();
-    let subscriptions = [
-        "group-page-cancel-concurrent-a".to_string(),
-        "group-page-cancel-concurrent-b".to_string(),
-    ];
+    let subscriptions = ["group-page-cancel-concurrent-a".to_string(), "group-page-cancel-concurrent-b".to_string()];
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "complete") };
     let (engine, app) = group_engine(f).await?;
@@ -1433,7 +1422,7 @@ async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1492,7 +1481,7 @@ async fn group_companion_reparenting(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1522,7 +1511,7 @@ async fn group_never_member_writes_are_silent(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1568,7 +1557,7 @@ async fn group_disjoint_sibling_survives_inner_move_out(f: &Fixture) -> Result<(
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
@@ -1606,7 +1595,7 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
     }
     .await;
     engine.close(Duration::from_secs(10)).await;
-    remove_source_fence(f).await;
+    remove_source_fence(f).await?;
     result
 }
 
