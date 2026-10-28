@@ -783,6 +783,18 @@ fn group_body(f: &Fixture, subscription: &str, plain_only: bool) -> serde_json::
     serde_json::json!({ "subscription": subscription, "members": members })
 }
 
+// A Record table plus its companion table: one member per table, so a companion
+// move-out is not masked by a sibling member that still includes the same row.
+fn membership_group_body(f: &Fixture, subscription: &str) -> serde_json::Value {
+    let mut body = group_body(f, subscription, false);
+    body["members"][0] = serde_json::json!({
+        "key": "records",
+        "table": format!("public.{}", f.inner),
+        "columns": ["id"]
+    });
+    body
+}
+
 async fn post_group(app: &Router, body: serde_json::Value) -> Result<(StatusCode, serde_json::Value)> {
     let response = app
         .clone()
@@ -958,7 +970,7 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
     install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
-        let (status, body) = post_group(&app, group_body(f, "group-snapshot-move-out", false)).await?;
+        let (status, body) = post_group(&app, membership_group_body(f, "group-snapshot-move-out")).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let rows = body["results"][1]["rows"].as_array().context("companion snapshot rows")?;
         ensure!(rows.len() == 1, "expected the one snapshot-only companion row: {body}");
@@ -973,6 +985,7 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
             ))
             .await?;
         wait_source_receipt(&engine, f, commit).await?;
+        let receipt = engine.source_drain_receipt(&commit.to_string()).context("source receipt disappeared")?;
         let events = stream_events(f, path).await;
         let expected_type = format!("public.{}", f.outer);
         ensure!(
@@ -983,6 +996,13 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
             }),
             "snapshot-only companion remained after its source receipt: {events:?}"
         );
+        for event in events.iter().skip(baseline) {
+            ensure!(
+                event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str()),
+                "move-out event LSN differs from source commit {}: {event}",
+                receipt.commit_lsn
+            );
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -995,7 +1015,7 @@ async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {
     install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
     let result = async {
-        let (status, body) = post_group(&app, group_body(f, "group-member-lsn", false)).await?;
+        let (status, body) = post_group(&app, membership_group_body(f, "group-member-lsn")).await?;
         ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
         let path = body["streamPath"].as_str().context("group stream path")?;
         let baseline = stream_events(f, path).await.len();
@@ -1008,13 +1028,23 @@ async fn group_member_events_have_lsn(f: &Fixture) -> Result<()> {
             ))
             .await?;
         wait_source_receipt(&engine, f, commit).await?;
+        let receipt = engine.source_drain_receipt(&commit.to_string()).context("source receipt disappeared")?;
         let events = stream_events(f, path).await;
         let delivered: Vec<_> = events.iter().skip(baseline).collect();
-        ensure!(!delivered.is_empty(), "move-in produced no member event after source receipt");
+        let expected_type = format!("public.{}", f.outer);
+        ensure!(
+            delivered.iter().any(|event| {
+                event_key(event).as_deref() == Some("2")
+                    && event_operation(event) == Some("upsert")
+                    && event["type"].as_str() == Some(expected_type.as_str())
+            }),
+            "move-in produced no companion event after source receipt: {events:?}"
+        );
         for event in delivered {
             ensure!(
-                event["headers"]["lsn"].as_str().is_some_and(|lsn| !lsn.is_empty()),
-                "membership event lacks the wire LSN required by the client: {event}"
+                event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str()),
+                "move-in event LSN differs from source commit {}: {event}",
+                receipt.commit_lsn
             );
         }
         Ok::<_, anyhow::Error>(())

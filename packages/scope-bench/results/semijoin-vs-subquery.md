@@ -40,14 +40,18 @@ production code through real PostgreSQL 18, the native group API, the sequencer,
 and ec#44's observed in-memory DS fixture:
 
 1. `ownership::group_snapshot_only_member_emits_move_out`: take a group snapshot
-   containing one companion row; delete its inner key and write a source marker in
+   with the inner Record table and a separate companion table containing one row;
+   delete its inner key and write a source marker in
    the same transaction. Once the marker's receipt is visible, require the
    table-qualified companion delete. No intermediate live upsert is allowed to
-   populate the delete gate. A missing delete fails the semantic assertion rather
-   than timing out waiting for an event.
+   populate the delete gate. No other member covers the companion row. Require
+   every resulting event's wire LSN to equal the source receipt's commit LSN.
+   A missing delete fails the semantic assertion rather than timing out waiting
+   for an event.
 2. `ownership::group_membership_events_carry_commit_lsn`: insert an inner key and
-   source marker in one transaction; after its receipt require a nonempty wire LSN
-   on every resulting membership event.
+   source marker in one transaction; after its receipt require the companion
+   upsert and require every resulting event's wire LSN to equal that receipt's
+   commit LSN. A snapshot/seed LSN or any other stale nonempty LSN is a failure.
 
 Run both with the existing source-table command:
 
