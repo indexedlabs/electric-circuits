@@ -238,9 +238,10 @@ and applies the pinned formatting. Head `53dd7e3` adds a clean-close/slot-reuse 
 member-claim compensation on canceled creates, and failed-boot result capture.
 Head `9e9171e` makes the member releases durable across cancellation, records a durable
 `GroupDropped` after `GroupCreated` is queued, and adds a catalog-completion cancellation
-barrier. The working tree extends that completion case to an all-plain group, closes the
+barrier. Commit `48ab7a0` extends that completion case to an all-plain group, closes the
 original engine, boots a replacement on the same slot/store, and retries the same claim only
-after restore; this is the restart assertion for the durable drop path.
+after restore; this is the restart assertion for the durable drop path. Merge head `d7cd60c`
+records the concurrent-party reconciliation with the remote branch and retains this tree.
 The handoff wrapper keeps the established `group_page_handoff_preserves_newer_move_out`
 name so the CI `group_` filter remains stable, while its body uses a deterministic outer-row
 delete. The event wait subscribes before observing the stream and waits for the exact
@@ -289,9 +290,10 @@ Earlier exact jobs remain part of the ledger: group contracts passed in both mod
 `8c0c6f0` (job `122831109853`), `88b00cc` (`122836183365`) and `1c2926a`
 (`122838729992`), while their rustfmt and library lanes were red. Heads `661babb` and
 `87076ff` were compile-red. These entries are evidence boundaries, not a claim that the
-current candidate has passed; the five-repetition benchmark remains pending. The working-tree
-follow-up adds completion durability compensation, shutdown-owned retry coverage and
-cancellation-stage retry coverage; it still needs a new exact-candidate run.
+current candidate has passed; the five-repetition benchmark remains pending. The follow-up
+adds completion durability compensation, shutdown-owned retry coverage and cancellation-stage
+retry coverage. Merge head `d7cd60c` is pushed for a fresh exact-head CI run; no result from
+that run is claimed here yet.
 
 The page/live handoff keeps ordinary stale-query-back recency separate from a bounded
 `page_decisions` map. Query-back decisions use their read LSN for snapshot ordering and retain
