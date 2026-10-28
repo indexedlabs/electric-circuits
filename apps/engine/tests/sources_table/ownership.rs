@@ -64,6 +64,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupReparent => group_companion_reparenting(&fixture).await,
             Case::GroupNeverMember => group_never_member_writes_are_silent(&fixture).await,
             Case::GroupSibling => group_disjoint_sibling_survives_inner_move_out(&fixture).await,
+            Case::GroupPageHandoff => group_page_handoff_preserves_newer_move_out(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -95,6 +96,7 @@ enum Case {
     GroupReparent,
     GroupNeverMember,
     GroupSibling,
+    GroupPageHandoff,
 }
 
 #[test]
@@ -107,6 +109,12 @@ fn group_never_member_insert_and_delete_do_not_wake_stream() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_disjoint_same_table_sibling_survives_move_out() -> Result<()> {
     isolated("ownership::group_disjoint_same_table_sibling_survives_move_out", Case::GroupSibling)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_page_handoff_preserves_newer_move_out() -> Result<()> {
+    isolated("ownership::group_page_handoff_preserves_newer_move_out", Case::GroupPageHandoff)
 }
 
 #[test]
@@ -1030,6 +1038,88 @@ async fn group_snapshot_only_member_moves_out(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+// Hold the real group request twice so a source transaction can be placed on each side of the
+// page/feed handoff: the new row is committed after the private changes-only seed but before the
+// public page, then its inner key is removed after the page and before page keys are installed.
+async fn group_page_handoff_preserves_newer_move_out(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let barrier = f.root.join("group-page-handoff");
+    let base = barrier.to_string_lossy().into_owned();
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let request = membership_group_body(f, "group-page-handoff");
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move { post_group(&app, request).await }
+        });
+        let ready = |stage: &str| async {
+            let path = PathBuf::from(format!("{base}.{stage}.ready"));
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if path.exists() {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .context(format!("waiting for group {stage} barrier"))??;
+            Ok::<_, anyhow::Error>(())
+        };
+        ready("private").await?;
+        let entered = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id, body) VALUES (3, 'entered between seeds'); \
+                 INSERT INTO public.{} (id) VALUES (3); \
+                 INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.outer, f.inner, entered
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, entered).await?;
+        std::fs::write(format!("{base}.private.release"), b"release")?;
+
+        ready("page").await?;
+        let left = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; DELETE FROM public.{} WHERE id = 3; \
+                 INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.inner, left
+            ))
+            .await?;
+        wait_source_receipt(&engine, f, left).await?;
+        let receipt = engine.source_drain_receipt(&left.to_string()).context("move-out receipt disappeared")?;
+        std::fs::write(format!("{base}.page.release"), b"release")?;
+
+        let (status, body) = task.await.context("group request task panicked")??;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        ensure!(
+            body["results"][1]["rows"].as_array().is_some_and(|rows| rows.iter().any(|row| row["id"] == 3)),
+            "page did not observe the row inserted between private seed and page: {body}"
+        );
+        let path = body["streamPath"].as_str().context("group stream path")?;
+        let events = wait_group_events(f, path, 1).await?;
+        let table = format!("public.{}", f.outer);
+        ensure!(
+            events.iter().any(|event| {
+                event_key(event).as_deref() == Some("3")
+                    && event_operation(event) == Some("delete")
+                    && event["type"].as_str() == Some(table.as_str())
+                    && event["headers"]["lsn"].as_str() == Some(receipt.commit_lsn.as_str())
+            }),
+            "page-visible row moved out before key handoff without a fenced tombstone: {events:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     engine.close(Duration::from_secs(10)).await;
     remove_source_fence(f).await;
     result

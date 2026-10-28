@@ -1991,7 +1991,9 @@ impl SubqueryRegistry {
                 match &source {
                     EmissionSource::Live { lsn, xid } | EmissionSource::Replay { lsn, xid } => Some((*lsn, *xid)),
                     EmissionSource::QueryBack { gate, commit_lsn } => {
-                        (gate.lsn != 0).then_some((gate.lsn, None)).or_else(|| (*commit_lsn != 0).then_some((*commit_lsn, None)))
+                        (gate.lsn != 0)
+                            .then_some((gate.lsn, None))
+                            .or_else(|| (*commit_lsn != 0).then_some((*commit_lsn, None)))
                     }
                 }
             } else {
@@ -2104,12 +2106,12 @@ impl SubqueryRegistry {
                         stamp.0 > old.stamp.0 || (stamp.0 == old.stamp.0 && old.stamp.1.is_none() && stamp.1.is_some())
                     });
                     if replace {
-                    let delete_delivered = delete_delivered
-                        || shape.page_decisions.get(&pk_id).is_some_and(|old| !member && old.delete_delivered);
-                    shape.page_decisions.insert(
-                        pk_id,
-                        PageDecision { stamp, commit_lsn, member, delete_delivered },
-                    );
+                        let delete_delivered = delete_delivered
+                            || shape.page_decisions.get(&pk_id).is_some_and(|old| !member && old.delete_delivered);
+                        shape.page_decisions.insert(
+                            pk_id,
+                            PageDecision { stamp, commit_lsn, member, delete_delivered },
+                        );
                     }
                 }
             }

@@ -207,6 +207,8 @@ interface RunResult {
   engineBootMs?: number
   groupLoadMs?: number
   engineMemory?: unknown
+  /** Complete on-demand DBSP profile, including membership mode and semijoin counters. */
+  dbspProfile?: unknown
   steadyWrites?: number
   readsPerChange?: number | null
 }
@@ -302,7 +304,22 @@ async function runOnce(admin: pg.Client, pgUrl: string, scs: Scenario[], cfg: Co
     result.engineBootMs = srv.engineBootMs
     if (cfg.design === 'scope-group') result.groupLoadMs = Math.round(performance.now() - loadStarted)
     if (cfg.design === 'scope-group') {
-      result.engineMemory = await fetch(`${srv.engineUrl}/memory`).then((r) => r.json()).catch(() => undefined)
+      const memoryResponse = await fetch(`${srv.engineUrl}/memory`)
+      if (!memoryResponse.ok) throw new Error(`GET /memory ${memoryResponse.status}`)
+      result.engineMemory = await memoryResponse.json()
+      // `/memory` intentionally excludes the DBSP join's profiler-only arrangements. Keep the
+      // complete diagnostic response with every group run so the artifact proves the selected
+      // mode, positive semijoin execution, and the circuit's used/storage bytes.
+      const profileResponse = await fetch(`${srv.engineUrl}/debug/dbsp-profile`)
+      if (!profileResponse.ok) throw new Error(`GET /debug/dbsp-profile ${profileResponse.status}`)
+      result.dbspProfile = await profileResponse.json()
+      const diagnostics = (result.dbspProfile as any)?.group_membership
+      if (diagnostics?.mode !== MEMBERSHIP_MODE) {
+        throw new Error(`membership mode mismatch: requested ${MEMBERSHIP_MODE}, profile=${JSON.stringify(diagnostics)}`)
+      }
+      if (MEMBERSHIP_MODE === 'semijoin' && Number(diagnostics?.selectionBatches ?? 0) <= 0) {
+        throw new Error(`semijoin made no DBSP selections: ${JSON.stringify(diagnostics)}`)
+      }
     }
     for (const [screen, rows] of perScreen) {
       const fs = rows.map((r) => r.first).filter((x): x is number => x != null)
@@ -483,6 +500,11 @@ async function main() {
     mkdirSync(dirname(OUT), { recursive: true })
     const version = String((await admin.query('select version()')).rows[0]?.version ?? '')
     writeFileSync(OUT, JSON.stringify({ params: { RTT_MS, DOWN_MBPS, REPS, OTHER_USERS, HOLD_MS, PHONES, DS_LONGPOLL_MS, COALESCE_LINGER_MS, STEADY_WRITE_MS, STEADY, STEADY_CHAT, membershipMode: MEMBERSHIP_MODE, postgresVersion: version }, seed: s.rows, results }, null, 2))
+
+    const failed = results.filter((r) => r.error)
+    if (failed.length) {
+      throw new Error(`${failed.length} benchmark repetitions failed; see ${OUT}: ${failed.map((r) => `${r.membershipMode}/${r.scenario}/${r.config}#${r.rep}: ${r.error}`).join(' | ')}`)
+    }
 
     // Summary: medians over reps.
     console.log(`\nRTT ${RTT_MS} ms, downlink ${DOWN_MBPS} Mbps, ${PHONES} phone(s), ${REPS} reps (medians)\n`)

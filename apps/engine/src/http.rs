@@ -1356,6 +1356,21 @@ struct GroupSnapshotGuard {
     armed: bool,
 }
 
+/// Test-support-only barriers for the real PostgreSQL page/feed handoff contract. The test
+/// process sets a unique base path, then releases the private-seed and page-read windows after
+/// applying a source transaction. Production builds never inspect this environment variable.
+#[cfg(feature = "test-support")]
+async fn test_group_page_barrier(stage: &str) {
+    let Ok(base) = std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") else { return };
+    let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
+    let release = std::path::PathBuf::from(format!("{base}.{stage}.release"));
+    let _ = std::fs::OpenOptions::new().create(true).write(true).open(&ready);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !release.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
 impl GroupSnapshotGuard {
     fn new(engine: &Engine, shape_ids: impl IntoIterator<Item = String>) -> Self {
         Self { engine: engine.clone(), shape_ids: shape_ids.into_iter().collect(), armed: true }
@@ -1710,6 +1725,8 @@ async fn subset_load_group(
             return Err(AppError::from(error));
         }
     };
+    #[cfg(feature = "test-support")]
+    test_group_page_barrier("private").await;
     let reads = members
         .iter()
         .map(|m| crate::engine::SubsetReadReq {
@@ -1732,6 +1749,8 @@ async fn subset_load_group(
             return Err(AppError::from(error));
         }
     };
+    #[cfg(feature = "test-support")]
+    test_group_page_barrier("page").await;
     // The public page is read after the private member seeds. Add its actual keys to each
     // subquery member's delete gate before the group becomes durable; a later move-out can then
     // retract a row that was visible only in this shared page.
