@@ -372,7 +372,7 @@ downloaded; its four raw JSON files have SHA-256 hashes
 `20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324`, and
 `0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796`.
 
-Commits `67b4dc7` and `41d97b0` corrected earlier transcription errors by re-extracting every
+Commits `67b4dc7`, `41d97b0` and `df69d57` corrected earlier transcription errors by re-extracting every
 median from the downloaded JSON files. The extraction and its source-file SHA-256 keys are
 recorded in [`semijoin-vs-subquery-medians.json`](semijoin-vs-subquery-medians.json); it uses
 the load-time DBSP profile for both scenarios and retains hold-end values separately. It
@@ -445,10 +445,12 @@ The join and reparenting controls passed at `7cbda3f`; the delete-gate and share
 corrections are implemented through `9cffab2`, while the page-handoff and cancellation
 corrections are carried through the subsequent reviewed heads. Head `48501cd` passed the full
 test job and produced the first benchmark artifact; head `8a93697` adds the slot-busy
-stabilization and second-barrier rollback contract. Every later head is docs-only over the
-identical production tree, except `41d97b0`, which adds test-support-only durable-release fault
-injection and its rollback contract. The production build remains identical to 1d7bbbc, whose
-fully green test job `123064316739` qualifies that tree.
+stabilization and second-barrier rollback contract. Head `41d97b0` adds test-support-only
+durable-release fault injection and its rollback contract, and `dafba36` advances the second
+rollback barrier after the injected retry. Its first exact-head run `40770165734` (test job
+`123104894370`) was red because the barrier was not advanced; the current candidate reruns
+that contract with the deterministic release count. The production build remains identical to
+1d7bbbc, whose fully green test job `123064316739` qualifies the production tree.
 Existing claim/lease, public snapshot query,
 group stream and commit fence code is unchanged.
 
