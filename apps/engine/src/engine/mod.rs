@@ -33,6 +33,7 @@ mod drift;
 pub(crate) mod emission;
 pub(crate) mod epoch;
 mod executors;
+pub(crate) mod group;
 mod held;
 mod introspection;
 mod lifecycle;
@@ -88,6 +89,9 @@ impl Default for SubqueryAdmission {
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
+pub(crate) use group::{GroupClaims, GroupConflict, GroupMember, GroupRecord, GroupStreamClosed};
+
+static GROUP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
     GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
@@ -208,6 +212,10 @@ pub struct SubscriptionConflict {
     /// The shape that holds it now.
     pub shape: String,
 }
+
+/// A grouped feed's public stream disappeared while the client was holding its lease.  A
+/// group cannot be repaired member-by-member because its cursor and snapshot are shared, so
+/// the API returns a conflict that tells the caller to reload the whole scope.
 
 /// Why a touch cannot hand back the shape it was asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -482,6 +490,42 @@ pub struct SubsetPage {
     pub snapshot: String,
     /// `pg_current_wal_insert_lsn()` at the snapshot.
     pub horizon: String,
+}
+
+/// One read of a [`Engine::query_subset_batch`].
+pub struct SubsetReadReq {
+    pub table: TableRef,
+    pub where_: Option<PredicateJson>,
+    pub columns: Option<Vec<String>>,
+    pub order_by: Option<(String, bool)>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// The pages of a batch, in request order, read in one snapshot whose fences they share.
+pub struct SubsetBatchPage {
+    pub pages: Vec<Vec<serde_json::Value>>,
+    pub lsn: String,
+    pub snapshot: String,
+    pub horizon: String,
+}
+
+struct SubsetPlan {
+    ts: TableSchema,
+    out_cols: Option<Arc<Vec<usize>>>,
+    where_sql: Option<(String, Vec<String>)>,
+    scope: crate::pg::SettleScope,
+    scope_tables: Vec<TableRef>,
+    order: Option<(usize, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl SubsetPlan {
+    fn project(&self, rows: &[crate::value::Row]) -> Vec<serde_json::Value> {
+        let proj = self.out_cols.as_deref().map(Vec::as_slice);
+        rows.iter().map(|r| self.ts.row_to_json_cols(r, proj)).collect()
+    }
 }
 
 #[derive(Clone)]
@@ -916,6 +960,10 @@ struct EngineState {
     tables: HashMap<TableRef, TableSchema>,
     sequencer: Option<SequencerHandle>,
     shapes: HashMap<String, ShapeRecord>,
+    /// Group claims and their private member list live under the same state lock as
+    /// ordinary subscription claims, making a group reservation atomic with a competing
+    /// single-shape create.
+    group_claims: GroupClaims,
     next_shape_id: u64,
     /// Shape sharing. Any two **equal** shapes — same kind and definition (see `shape_signature` /
     /// `agg_signature`: table + canonical predicate + columns + changes-only, or table + predicate +
@@ -1321,6 +1369,9 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
+    pub(crate) fn group_stream_path(&self) -> String {
+        format!("shape/group-{}-{}", self.sub_nonce, GROUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
@@ -1485,6 +1536,7 @@ impl Engine {
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
+        let degrade = DegradeState::new();
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1492,10 +1544,10 @@ impl Engine {
             ds.clone(),
             std::env::var("ELECTRIC_CIRCUITS_EMIT_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
             pending_flips.clone(),
+            degrade.clone(),
             shutdown.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
-        let degrade = DegradeState::new();
         spawn_flip_propagator(
             subqueries.clone(),
             flip_rx,
@@ -1533,6 +1585,7 @@ impl Engine {
                 tables: HashMap::new(),
                 sequencer: None,
                 shapes: HashMap::new(),
+                group_claims: GroupClaims::default(),
                 next_shape_id: 1,
                 feed_by_sig: HashMap::new(),
                 feed_shares: HashMap::new(),
@@ -2740,6 +2793,11 @@ impl Engine {
         self.ds.stream_url(path)
     }
 
+    /// A stream's current tail offset (`stream-next-offset` of a `HEAD`); `None` if it is gone.
+    pub async fn stream_tail(&self, path: &str) -> Result<Option<String>> {
+        Ok(self.ds.head(path).await?.and_then(|h| h.next_offset))
+    }
+
     /// Define a library-mode schema. PostgreSQL mode configures schemas through introspection.
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
         // Reject at the engine boundary, before any storage/schema mutation or sequencer spawn.
@@ -2784,6 +2842,141 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SubsetPage> {
+        let plan = self.plan_subset(table, where_, columns, order_by, limit, offset).await?;
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+        let sq = crate::pg::query_subset_where(
+            &mut client,
+            &plan.ts,
+            plan.where_sql.clone(),
+            &plan.scope,
+            plan.order,
+            plan.limit,
+            plan.offset,
+        )
+        .await?;
+        let rows = plan.project(&sq.rows);
+        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
+    }
+
+    /// Return the current owner of a subscription claim. HTTP compound-load admission holds the
+    /// control permit while using this to distinguish a new claim from a renewal.
+    pub(crate) async fn subscription_owner(&self, subscription: &str) -> Option<String> {
+        self.state.lock().await.subscription_owner(subscription).cloned()
+    }
+
+    /// Reserve a group claim before any private member shape is created.  The ordinary
+    /// subscription map and the group map are checked while holding one state lock, so a
+    /// concurrent single-shape create cannot win the same claim between member creates.
+    pub(crate) async fn reserve_group(&self, subscription: &str) -> Result<()> {
+        let mut st = self.state.lock().await;
+        if let Some(owner) = st.subscription_owner(subscription) {
+            return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("shape {owner}"),
+            }));
+        }
+        st.group_claims.reserve(subscription, &format!("group {subscription}"))
+    }
+
+    pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
+        self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        let valid = {
+            let st = self.state.lock().await;
+            st.shapes.contains_key(&record.members[0].shape_id)
+                && record.members.iter().all(|member| st.shapes.contains_key(&member.shape_id))
+        };
+        if !valid {
+            let _ = self
+                .catalog_tx
+                .send_durable(CatalogEvent::GroupDropped { subscription: record.subscription.clone() })
+                .await;
+            return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
+        }
+        self.state.lock().await.group_claims.complete(record);
+        crate::engine::group::activate();
+        Ok(())
+    }
+
+    pub(crate) async fn abort_group(&self, subscription: &str) {
+        self.state.lock().await.group_claims.release(subscription);
+    }
+
+    pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
+        self.state.lock().await.group_claims.get(subscription).cloned()
+    }
+
+    /// Remove the public group record and return its private members.  The caller performs
+    /// the durable member releases outside the state lock, preserving the normal lifecycle
+    /// ordering and avoiding network I/O while holding engine state.
+    pub(crate) async fn take_group(&self, subscription: &str) -> Option<GroupRecord> {
+        let record = self.state.lock().await.group_claims.release(subscription);
+        if record.is_some() {
+            crate::engine::group::deactivate();
+        }
+        record
+    }
+
+    pub(crate) async fn finish_group_release(&self, subscription: &str) -> Result<()> {
+        self.catalog_tx.send_durable(CatalogEvent::GroupDropped { subscription: subscription.to_string() }).await?;
+        let _ = self.take_group(subscription).await;
+        Ok(())
+    }
+
+    /// Validate a subset read without opening Postgres or changing engine state.
+    ///
+    /// HTTP compound loads use this before creating their changes-only feed so a malformed
+    /// page (for example an unknown `orderBy` column) cannot leave a subscription claim behind.
+    pub(crate) async fn validate_subset(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<()> {
+        self.plan_subset(table, where_, columns, order_by, limit, offset).await.map(|_| ())
+    }
+
+    /// Several one-shot subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the
+    /// scope load). The snapshot settles against every table any read depends on, so the pages are
+    /// mutually consistent and share one set of fences.
+    pub async fn query_subset_batch(&self, reads: Vec<SubsetReadReq>) -> Result<SubsetBatchPage> {
+        anyhow::ensure!(!reads.is_empty(), "a batch needs at least one table");
+        let mut plans = Vec::with_capacity(reads.len());
+        for r in reads {
+            plans.push(self.plan_subset(&r.table, r.where_, r.columns, r.order_by, r.limit, r.offset).await?);
+        }
+        let mut scope = plans[0].scope.clone();
+        for p in &plans[1..] {
+            scope = scope.with(p.scope_tables.iter());
+        }
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+        let batch_reads: Vec<crate::pg::SubsetRead<'_>> = plans
+            .iter()
+            .map(|p| crate::pg::SubsetRead {
+                ts: &p.ts,
+                where_sql: p.where_sql.clone(),
+                order: p.order,
+                limit: p.limit,
+                offset: p.offset,
+            })
+            .collect();
+        let bq = crate::pg::query_subset_batch_where(&mut client, batch_reads, &scope).await?;
+        let pages = plans.iter().zip(bq.pages.iter()).map(|(p, rows)| p.project(rows)).collect();
+        Ok(SubsetBatchPage { pages, lsn: bq.lsn, snapshot: bq.snapshot, horizon: bq.horizon })
+    }
+
+    /// Validate a subset read and build its SQL, projection and settle scope without touching Postgres.
+    async fn plan_subset(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<SubsetPlan> {
         let (ts, schemas) = {
             let st = self.state.lock().await;
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
@@ -2829,11 +3022,10 @@ impl Engine {
         // the inner tables of any subquery in its predicate.
         let scope = crate::pg::SettleScope::request(table)
             .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
-        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
-        let sq = crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await?;
-        let proj = out_cols.as_deref().map(Vec::as_slice);
-        let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
-        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
+        let scope_tables: Vec<TableRef> = std::iter::once(table.clone())
+            .chain(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default())
+            .collect();
+        Ok(SubsetPlan { ts, out_cols, where_sql, scope, scope_tables, order, limit, offset })
     }
 
     /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the

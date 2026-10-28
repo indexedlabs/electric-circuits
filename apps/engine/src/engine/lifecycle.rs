@@ -217,8 +217,43 @@ impl Engine {
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res = self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub).await;
+            let res =
+                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None).await;
             match retry_create(res, attempt, "shape", table) {
+                Ok(out) => return out.map(|rec| (rec, sub)),
+                Err(()) => redo_backoff().await,
+            }
+        }
+        unreachable!("retry_create returns the error on the last attempt")
+    }
+
+    /// Prototype-only variant used by the shape-group benchmark. Each member still has its own
+    /// ordinary shape record and circuit, but its output is directed to the caller's shared stream
+    /// path. Group creation intentionally owns the surrounding shortcut and is responsible for
+    /// releasing the member claims it does not expose to the client.
+    pub(crate) async fn create_shape_as_on_stream(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        changes_only: bool,
+        subscription: Option<String>,
+        stream_path: String,
+    ) -> Result<(ShapeRecord, String)> {
+        let sub = self.resolve_subscription(subscription).await;
+        for attempt in 1..=CREATE_RACE_ATTEMPTS {
+            let res = self
+                .create_shape_once(
+                    table,
+                    where_.clone(),
+                    columns.clone(),
+                    changes_only,
+                    false,
+                    &sub,
+                    Some(stream_path.clone()),
+                )
+                .await;
+            match retry_create(res, attempt, "shape group member", table) {
                 Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
             }
@@ -252,6 +287,7 @@ impl Engine {
         changes_only: bool,
         share: bool,
         sub: &str,
+        stream_path_override: Option<String>,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
         // so it refuses to make one rather than backfill from state it knows is wrong. This early
@@ -393,7 +429,7 @@ impl Engine {
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
-        let stream_path = format!("shape/{id}");
+        let stream_path = stream_path_override.unwrap_or_else(|| format!("shape/{id}"));
         // NOTE: the stream itself is created AFTER the state lock is released (per path below):
         // the PUT is a storage round-trip with a durability fsync, and holding the global lock
         // across it serializes concurrent shape creations.
@@ -2000,14 +2036,31 @@ impl Engine {
             st.publish_subscription_gauge(&self.metrics);
             expired
         };
+        let mut lapsed_groups = Vec::new();
         for (shape, subscription) in lapsed {
             tracing::debug!(
                 "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
                 cfg.subscription_lease_timeout
             );
-            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
+            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription: subscription.clone(), lapsed: true });
             self.metrics.subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
+            if self.group_record(&subscription).await.is_some() {
+                lapsed_groups.push(subscription);
+            }
         }
+        for subscription in lapsed_groups {
+            if let Err(error) = self.release_group_claim(&subscription).await {
+                tracing::warn!(%subscription, %error, "retention: failed to retire lapsed group claim");
+            }
+        }
+    }
+
+    async fn release_group_claim(&self, subscription: &str) -> Result<()> {
+        let Some(group) = self.group_record(subscription).await else { return Ok(()) };
+        for member in &group.members {
+            self.release_subscription(&member.shape_id, Some(&member.subscription)).await;
+        }
+        self.finish_group_release(subscription).await
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the

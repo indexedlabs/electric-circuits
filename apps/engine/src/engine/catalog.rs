@@ -52,6 +52,16 @@ pub(crate) enum CatalogEvent {
         subscription: String,
         at: u64,
     },
+    /// A grouped feed's public claim and its private member list.  Members remain ordinary
+    /// shape records; this event is the durable binding that lets a plain-only group restore
+    /// as one lease after a restart.  Groups containing subquery members are deliberately
+    /// skipped during restore because their inner-node state is not persisted.
+    GroupCreated {
+        group: GroupRecord,
+    },
+    GroupDropped {
+        subscription: String,
+    },
     /// A subscription joined a shared feed, or RENEWED its lease (ADR-0008): the same subscription
     /// id twice is one claim, and the second one only moves `at`. The fold keeps a SET, so a
     /// duplicate is a no-op rather than a second count.
@@ -601,6 +611,8 @@ fn event_kind(ev: &CatalogEvent) -> &'static str {
     match ev {
         CatalogEvent::StoreBound(_) => "storeBound",
         CatalogEvent::Created { .. } => "created",
+        CatalogEvent::GroupCreated { .. } => "groupCreated",
+        CatalogEvent::GroupDropped { .. } => "groupDropped",
         CatalogEvent::Joined { .. } => "joined",
         CatalogEvent::Left { .. } => "left",
         CatalogEvent::Dormant { .. } => "dormant",
@@ -959,6 +971,7 @@ type Restored = (
 /// in.
 pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
+    groups: HashMap<String, GroupRecord>,
     ingest_columns: std::collections::BTreeMap<TableRef, Vec<String>>,
     // Historical names distinguish a dropped configured column from a typo even after a
     // later witness records the narrower effective set. Derived from existing events only.
@@ -1013,6 +1026,7 @@ impl Default for CatalogFold {
     fn default() -> Self {
         CatalogFold {
             recs: HashMap::new(),
+            groups: HashMap::new(),
             ingest_columns: std::collections::BTreeMap::new(),
             ingest_columns_seen: std::collections::BTreeMap::new(),
             pending_retire: HashMap::new(),
@@ -1048,6 +1062,12 @@ impl CatalogFold {
     fn apply(&mut self, ev: CatalogEvent) {
         match ev {
             CatalogEvent::StoreBound(_) => {}
+            CatalogEvent::GroupCreated { group } => {
+                self.groups.insert(group.subscription.clone(), group);
+            }
+            CatalogEvent::GroupDropped { subscription } => {
+                self.groups.remove(&subscription);
+            }
             CatalogEvent::Created { rec, sig, subscription, at } => {
                 // Every create moves the id high-water mark, and nothing ever moves it back (see
                 // `max_shape_id`). `max`, not "the last one wins": the engine mints ids
@@ -1565,7 +1585,7 @@ impl Engine {
             self.release_restore_reads().await?;
             return Ok(());
         }
-        let CatalogFold { recs, start_pos, start_highwater, .. } = fold;
+        let CatalogFold { recs, groups, start_pos, start_highwater, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The durable floor was adopted before any restore work, including the empty fast path.
@@ -1692,6 +1712,36 @@ impl Engine {
                     }
                 }
             }
+            // Restore the public group claim only when every private member survived.  A
+            // subquery member deliberately cannot survive a restart because its inner-node
+            // contributor state is not persisted; its group is dropped as one unit and the
+            // client recreates the scope.
+            for (subscription, group) in groups {
+                let restorable = group
+                    .members
+                    .iter()
+                    .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
+                if restorable {
+                    st.group_claims.complete(group);
+                    crate::engine::group::activate();
+                } else {
+                    tracing::info!(%subscription, "restore: dropping group with a non-restorable subquery member");
+                    self.catalog_tx.send(CatalogEvent::GroupDropped { subscription });
+                    for member in &group.members {
+                        if let Some(rec) = st.shapes.remove(&member.shape_id) {
+                            st.forget_subscriptions(&member.shape_id);
+                            if let Some(share) = st.feed_shares.remove(&member.shape_id) {
+                                st.feed_by_sig.remove(&share.sig);
+                            }
+                            st.circuit_placement.remove(&member.shape_id);
+                            self.lives.lock().unwrap().remove(&member.shape_id);
+                            self.catalog_tx.send(CatalogEvent::Dropped { id: member.shape_id.clone() });
+                            dead_streams.push((member.shape_id.clone(), rec.stream_path));
+                        }
+                    }
+                }
+            }
+            resume.retain(|rec| st.shapes.contains_key(&rec.id));
             self.ensure_sequencer(&mut st);
         }
         // Restored dormant shapes still need the TTL/eviction layers running.
