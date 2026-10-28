@@ -23,6 +23,11 @@ def dbsp(profile):
     return profile["membership_circuit"]["total_used_bytes"]
 
 
+def dbsp_median(results, field):
+    values = [dbsp(row[field]) for row in results if row.get(field)]
+    return statistics.median(values) if values else None
+
+
 def extract(path):
     output = {}
     for mode in ("subquery", "semijoin"):
@@ -36,12 +41,8 @@ def extract(path):
                 "raw_sha256": hashlib.sha256(raw).hexdigest(),
                 "groupLoadMs": median(rows, "groupLoadMs"),
                 "engineRssMb": median(rows, "engineRssMb"),
-                "dbspLoadUsedBytes": statistics.median(
-                    dbsp(row["dbspProfile"]) for row in rows
-                ),
-                "dbspHoldEndUsedBytes": statistics.median(
-                    dbsp(row["dbspProfileEnd"]) for row in rows
-                ),
+                "dbspUsedBytes": dbsp_median(rows, "dbspProfile"),
+                "dbspHoldEndUsedBytes": dbsp_median(rows, "dbspProfileEnd"),
                 "engineCpuMs": median(rows, "engineCpuMs"),
                 "gatewayCpuMs": median(rows, "gatewayCpuMs"),
                 "steadyWriteP50": median(rows, "steadyWriteP50"),

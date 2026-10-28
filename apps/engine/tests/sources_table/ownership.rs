@@ -1415,44 +1415,42 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     let base = barrier.to_string_lossy().into_owned();
     let subscription = "group-rollback-cancel";
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "member_retry") };
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "member_release") };
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let request = group_body(f, subscription, true);
+        let fired = format!("{base}.rollback.release-fired");
+        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
+        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER", &fired) };
         let task = tokio::spawn({
             let app = app.clone();
             async move { post_group(&app, request).await }
         });
-        let ready = PathBuf::from(format!("{base}.rollback.ready"));
+        let retry_ready = PathBuf::from(format!("{base}.member_retry.ready"));
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 1 {
+                if std::fs::read_to_string(&retry_ready).map_or(0, |contents| contents.lines().count()) >= 1 {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .context("waiting for rollback cancellation barrier")?;
-        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
-        let fired = format!("{base}.rollback.release-fired");
-        unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER", &fired) };
-        // Let the retry pass the second rollback barrier deterministically after the injected
-        // post-unsubscribe failure; the test still waits for that barrier before cancellation.
-        std::fs::write(format!("{base}.rollback.release"), b"2")?;
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                if std::fs::read_to_string(&ready).map_or(0, |contents| contents.lines().count()) >= 2 {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .context("waiting for second rollback cancellation barrier")?;
+        .context("waiting for post-unsubscribe retry barrier")?;
         task.abort();
         ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if std::fs::read_to_string(&retry_ready).map_or(0, |contents| contents.lines().count()) >= 2 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("waiting for shutdown-owned retry barrier")?;
+        std::fs::write(format!("{base}.member_retry.release"), b"2")?;
         ensure!(
             std::fs::read_to_string(&fired).is_ok(),
             "durable-release fault injection did not fire"

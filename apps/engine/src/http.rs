@@ -1370,7 +1370,7 @@ pub(crate) async fn test_group_page_barrier(stage: &str) -> anyhow::Result<()> {
     // a member-create or catalog-completion barrier does not accidentally block earlier stages.
     match std::env::var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") {
         Ok(selected) if selected != stage => return Ok(()),
-        Err(_) if matches!(stage, "member" | "complete" | "rollback") => return Ok(()),
+        Err(_) if matches!(stage, "member" | "complete" | "rollback" | "member_retry") => return Ok(()),
         _ => {}
     }
     let ready = std::path::PathBuf::from(format!("{base}.{stage}.ready"));
@@ -1406,8 +1406,7 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 }
 
 #[cfg(feature = "test-support")]
-static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
 pub(crate) fn test_release_after_unsubscribe_once() -> bool {
@@ -1477,26 +1476,43 @@ impl GroupReservationGuard {
     }
 
     async fn release_member_durable(engine: &Engine, shape_id: &str, subscription: &str) -> bool {
-        if let Err(error) = engine.release_subscription_durable(shape_id, Some(subscription)).await {
-            tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
-            // A durable release can fail after its in-memory mutation when shutdown has already
-            // started. Re-enqueue the idempotent Left once while the catalog writer may still be
-            // draining. A second writer-loss error is terminal for this engine instance.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            return match engine.retry_subscription_release_durable(shape_id, subscription).await {
-                Ok(()) => true,
-                Err(retry_error) => {
-                    tracing::warn!(
-                        %shape_id,
-                        %subscription,
-                        %retry_error,
-                        "catalog writer unavailable for cancelled group member"
-                    );
-                    false
+        match engine.release_subscription_durable(shape_id, Some(subscription)).await {
+            Ok(true) => true,
+            Ok(false) => {
+                // A prior cancelled compensation may already have removed the in-memory claim
+                // before its durable retry. Re-enqueue Left directly in that case.
+                match engine.retry_subscription_release_durable(shape_id, subscription).await {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(%shape_id, %subscription, %error, "catalog writer unavailable for cancelled group member");
+                        false
+                    }
                 }
-            };
+            }
+            Err(error) => {
+                tracing::warn!(%shape_id, %subscription, %error, "retrying cancelled group member compensation");
+                #[cfg(feature = "test-support")]
+                if let Err(barrier_error) = test_group_page_barrier("member_retry").await {
+                    tracing::warn!(%barrier_error, %shape_id, %subscription, "group member retry test barrier failed");
+                }
+                // A durable release can fail after its in-memory mutation when shutdown has already
+                // started. Re-enqueue the idempotent Left once while the catalog writer may still be
+                // draining. A second writer-loss error is terminal for this engine instance.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                match engine.retry_subscription_release_durable(shape_id, subscription).await {
+                    Ok(()) => true,
+                    Err(retry_error) => {
+                        tracing::warn!(
+                            %shape_id,
+                            %subscription,
+                            %retry_error,
+                            "catalog writer unavailable for cancelled group member"
+                        );
+                        false
+                    }
+                }
+            }
         }
-        true
     }
 
     async fn drop_group_durable(engine: &Engine, subscription: &str) -> bool {
@@ -1589,7 +1605,7 @@ impl FeedClaimGuard {
             return;
         }
         match self.engine.release_subscription_durable(&self.shape_id, Some(&self.subscription)).await {
-            Ok(()) => self.armed = false,
+            Ok(_) => self.armed = false,
             Err(error) => {
                 tracing::warn!(shape = %self.shape_id, subscription = %self.subscription, %error, "failed to compensate subset-load claim")
             }
