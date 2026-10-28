@@ -2908,12 +2908,31 @@ impl Engine {
     pub(crate) async fn seed_group_snapshot_keys(
         &self,
         members: impl IntoIterator<Item = (&str, &[serde_json::Value])>,
+        gate: &crate::pg::SnapshotGate,
     ) -> Result<()> {
         let mut registry = self.subqueries.lock().await;
         for (shape_id, rows) in members {
-            registry.seed_group_snapshot_keys(shape_id, rows)?;
+            registry.seed_group_snapshot_keys(shape_id, rows, gate)?;
         }
         Ok(())
+    }
+
+    /// Mark group subquery members as having a page read in flight.  Live decisions taken
+    /// while the Postgres snapshot is being established or consumed are retained in the
+    /// same bounded recency map used by ordinary query-backs, so the page-key handoff cannot
+    /// overwrite a newer delete or re-add a key after its live decision.
+    pub(crate) async fn begin_group_snapshot_keys<'a>(&self, shape_ids: impl IntoIterator<Item = &'a str>) {
+        let mut registry = self.subqueries.lock().await;
+        for shape_id in shape_ids {
+            registry.begin_queryback(shape_id);
+        }
+    }
+
+    pub(crate) async fn end_group_snapshot_keys<'a>(&self, shape_ids: impl IntoIterator<Item = &'a str>) {
+        let mut registry = self.subqueries.lock().await;
+        for shape_id in shape_ids {
+            registry.end_queryback(shape_id);
+        }
     }
 
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {

@@ -190,15 +190,22 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     const recheckMs = Number(process.env.STREAM_RECHECK_MS ?? 30_000)
     const started = performance.now()
     let nextRecheck = started + recheckMs
+    // A phone closing the streaming response must cancel the upstream durable-streams
+    // long-poll immediately.  Otherwise every reconnect holds a provider request until its
+    // normal timeout, inflating dsCalls and retaining one task/socket per abandoned stream.
+    const ctl = new AbortController()
+    const abortUpstream = () => ctl.abort()
+    req.once('aborted', abortUpstream)
+    res.once('close', abortUpstream)
     res.writeHead(200, { 'content-type': 'application/x-ndjson', 'transfer-encoding': 'chunked' })
     try {
-      while (!req.destroyed && !res.destroyed) {
+      while (!req.destroyed && !res.destroyed && !ctl.signal.aborted) {
         if (performance.now() >= nextRecheck) {
           burn(STREAM_MS)
           stats.authorityRechecks++
           nextRecheck += recheckMs
         }
-        const r = await dsRead(path, offset, true)
+        const r = await dsRead(path, offset, true, ctl.signal)
         offset = r.next
         res.write(`${JSON.stringify({ next: r.next, body: r.status === 200 ? r.body : '' })}\n`)
         if (r.status !== 200 || !r.body || r.body === '[]') await sleep(Number(process.env.DS_EMPTY_BACKOFF_MS ?? 25))
@@ -206,6 +213,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
     } catch {
       // Client cancellation is the normal end of a held streaming response.
     } finally {
+      req.off('aborted', abortUpstream)
+      res.off('close', abortUpstream)
       res.end()
     }
     return

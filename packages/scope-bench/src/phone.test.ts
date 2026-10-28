@@ -56,3 +56,46 @@ test('streaming delivery accounts for response propagation, bandwidth and bytes'
     await stopped
   }
 })
+
+test('streaming chunks use their local receive time without serializing another half-RTT', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] })
+  let incoming!: ReadableStreamDefaultController<Uint8Array>
+  const network = new ReadableStream<Uint8Array>({ start(controller) { incoming = controller } })
+  const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+    init?.signal?.addEventListener('abort', () => incoming.error(new DOMException('Aborted', 'AbortError')), { once: true })
+    return new Response(network, { status: 200 })
+  })
+  vi.stubGlobal('fetch', fetchMock)
+  const delivered: { body: string; at: number }[] = []
+  const phone = new Phone({
+    gateway: 'http://controlled-network',
+    rttMs: 250,
+    downMbps: 1,
+    slots: null,
+    design: 'scope-group',
+    live: 'streaming',
+    onWake: (body, at) => delivered.push({ body, at }),
+  })
+  phone.hold([{ key: 'group', streamUrl: '/stream/group/test', offset: '-1' }])
+  try {
+    await vi.advanceTimersByTimeAsync(125)
+    const first = new TextEncoder().encode(`${JSON.stringify({ next: '1', body: 'first' })}\n`)
+    const second = new TextEncoder().encode(`${JSON.stringify({ next: '2', body: 'second' })}\n`)
+    incoming.enqueue(first)
+    await vi.advanceTimersByTimeAsync(50)
+    incoming.enqueue(second)
+    incoming.close()
+    const serializationMs = (first.byteLength * 8) / 1000
+    await vi.advanceTimersByTimeAsync(74)
+    expect(delivered).toEqual([])
+    await vi.advanceTimersByTimeAsync(serializationMs + 1)
+    expect(delivered.map((x) => x.body)).toEqual(['first'])
+    await vi.advanceTimersByTimeAsync(50)
+    expect(delivered.map((x) => x.body)).toEqual(['first', 'second'])
+    expect(delivered[1]!.at - delivered[0]!.at).toBeLessThan(100)
+  } finally {
+    const stopped = phone.stop()
+    await vi.advanceTimersByTimeAsync(10_000)
+    await stopped
+  }
+})

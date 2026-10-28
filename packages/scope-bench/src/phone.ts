@@ -101,13 +101,18 @@ export class Phone {
     return { status: r.status, headers: r.headers, text: buf.toString() }
   }
 
-  /** Account a streamed response chunk on the same shared downlink as ordinary HTTP replies. */
-  private async receiveChunk(bytes: number) {
+  /** Schedule a streamed response chunk on the same shared downlink as ordinary HTTP replies.
+   *
+   * The schedule is computed when the chunk arrives locally.  The reader may continue pulling
+   * later chunks while this one is in flight; delivery is serialized by the caller, but a later
+   * chunk does not pay another propagation half-RTT merely because an earlier chunk is waiting.
+   */
+  private receiveChunk(bytes: number) {
     this.bytesDown += bytes
     const now = performance.now()
     const start = Math.max(now + this.o.rttMs / 2, this.downFreeAt)
     this.downFreeAt = start + (bytes * 8) / (this.o.downMbps * 1000)
-    await sleep(this.downFreeAt - now)
+    return sleep(Math.max(0, this.downFreeAt - performance.now()))
   }
 
   private async stream(path: string, signal: AbortSignal) {
@@ -232,22 +237,28 @@ export class Phone {
             const reader = body.getReader()
             const decoder = new TextDecoder()
             let buffered = ''
+            let deliveryTail = Promise.resolve()
             while (true) {
               const chunk = await reader.read()
               if (chunk.done) break
               // The provider chunk has arrived locally, but the phone observes it only
               // after the return half-RTT and its share of the serialized downlink.
-              await this.receiveChunk(chunk.value.byteLength)
-              buffered += decoder.decode(chunk.value, { stream: true })
-              const lines = buffered.split('\n')
-              buffered = lines.pop() ?? ''
-              for (const line of lines) {
-                if (!line) continue
-                const x = JSON.parse(line)
-                this.o.onWake?.(x.body ?? '', performance.now())
-                s.offset = x.next
-              }
+              const value = chunk.value
+              const ready = this.receiveChunk(value.byteLength)
+              deliveryTail = deliveryTail.then(async () => {
+                await ready
+                buffered += decoder.decode(value, { stream: true })
+                const lines = buffered.split('\n')
+                buffered = lines.pop() ?? ''
+                for (const line of lines) {
+                  if (!line) continue
+                  const x = JSON.parse(line)
+                  this.o.onWake?.(x.body ?? '', performance.now())
+                  s.offset = x.next
+                }
+              })
             }
+            await deliveryTail
           } else if (this.o.live === 'mux' && streams.length > 1) {
             const qs = streams.map((s) => `s=${encodeURIComponent(`${s.streamUrl}@${s.offset}`)}`).join('&')
             const r = JSON.parse((await this.http('GET', `/gw/mux?${qs}`, undefined, ctl.signal)).text)

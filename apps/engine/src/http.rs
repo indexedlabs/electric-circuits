@@ -1641,9 +1641,19 @@ async fn subset_load_group(
             }
         }
     }
+    let page_seed_shapes: Vec<String> = created
+        .iter()
+        .zip(members.iter())
+        .filter(|(_, member)| member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery))
+        .map(|((rec, _), _)| rec.id.clone())
+        .collect();
+    // Begin tracking live decisions before any await after the private seed.  This covers
+    // the full interval through the public page read and the gated key handoff.
+    engine.begin_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
     let offset = match engine.stream_tail(&group_path).await {
         Ok(Some(offset)) => offset,
         Ok(None) => {
+            engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
@@ -1653,6 +1663,7 @@ async fn subset_load_group(
             })));
         }
         Err(error) => {
+            engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
@@ -1674,6 +1685,7 @@ async fn subset_load_group(
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {
+            engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
             for (rec, sub) in &created {
                 let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
             }
@@ -1684,13 +1696,16 @@ async fn subset_load_group(
     // The public page is read after the private member seeds. Add its actual keys to each
     // subquery member's delete gate before the group becomes durable; a later move-out can then
     // retract a row that was visible only in this shared page.
+    let page_gate = crate::pg::SnapshotGate::parse_with_horizon(&page.snapshot, &page.lsn, &page.horizon);
     let snapshot_keys = created
         .iter()
         .zip(page.pages.iter())
         .zip(members.iter())
         .filter(|((_, _), member)| member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery))
-        .map(|((rec, rows), _)| (rec.id.as_str(), rows.as_slice()));
-    if let Err(error) = engine.seed_group_snapshot_keys(snapshot_keys).await {
+        .map(|(((rec, _), rows), _)| (rec.id.as_str(), rows.as_slice()));
+    let seed_result = engine.seed_group_snapshot_keys(snapshot_keys, &page_gate).await;
+    engine.end_group_snapshot_keys(page_seed_shapes.iter().map(String::as_str)).await;
+    if let Err(error) = seed_result {
         for (rec, sub) in &created {
             let _ = engine.release_subscription_durable(&rec.id, Some(sub)).await;
         }

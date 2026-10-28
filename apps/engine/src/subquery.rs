@@ -264,8 +264,8 @@ pub struct SubqueryShape {
     /// in sync.
     pub(crate) feed_id: i64,
     /// Group companions seed their delete gate before becoming live, retain gated deletes,
-    /// and stamp source LSNs. The later public snapshot needs its own safe key handoff;
-    /// the prototype's snapshot/catch-up regression tracks that remaining gap.
+    /// and stamp source LSNs. The later public snapshot uses the same recency handoff as a
+    /// query-back, so a live decision newer than that page's snapshot cannot be overwritten.
     pub(crate) group_member: bool,
     /// **Per-pk recency, for the duration of a query-back only** — `pk_dict` id → the commit
     /// stamp `(lsn, xid)` of the LIVE outer-row decision most recently applied to this shape's
@@ -737,6 +737,7 @@ impl SubqueryRegistry {
         &mut self,
         shape_id: &str,
         rows: &[serde_json::Value],
+        gate: &crate::pg::SnapshotGate,
     ) -> Result<()> {
         let (feed_id, ts) = {
             let shape = self.shapes.get(shape_id).context("group snapshot shape disappeared")?;
@@ -747,6 +748,19 @@ impl SubqueryRegistry {
             let object = value.as_object().context("group snapshot row is not an object")?;
             let row = ts.row_from_json(object)?;
             let pk = ts.key_string(&row)?;
+            // The page was read after the member feed became live.  A live decision made
+            // after the page snapshot is newer than the page and must win over its key seed;
+            // otherwise a delete processed before this handoff would be resurrected in the
+            // FeedSet.  Decisions visible to the page are safe to seed (and preserve the
+            // snapshot-only move-out gate).
+            let newer_live_decision = self
+                .pk_dict
+                .get(&pk)
+                .and_then(|pk_id| self.shapes.get(shape_id).and_then(|shape| shape.recent.get(&pk_id)))
+                .is_some_and(|&(lsn, xid)| !gate.should_skip(lsn, xid));
+            if newer_live_decision {
+                continue;
+            }
             let pk_id = self.pk_dict.get_or_insert(&pk);
             self.feed_sets.insert(feed_id, pk_id);
         }
@@ -1781,7 +1795,7 @@ impl SubqueryRegistry {
     /// the evaluation that follows it) is outstanding lands in [`SubqueryShape::recent`].
     /// Increment first, release second: the reverse order would leave a hole exactly the size of
     /// the race being closed.
-    fn begin_queryback(&mut self, shape_id: &str) {
+    pub(crate) fn begin_queryback(&mut self, shape_id: &str) {
         if let Some(s) = self.shapes.get_mut(shape_id) {
             s.inflight_querybacks = s.inflight_querybacks.saturating_add(1);
         }
@@ -1795,7 +1809,7 @@ impl SubqueryRegistry {
     /// nothing left that could overwrite a live decision, so keeping per-pk stamps would only be
     /// unbounded growth. This is what makes the map cost proportional to a query-back window
     /// rather than to the shape.
-    fn end_queryback(&mut self, shape_id: &str) {
+    pub(crate) fn end_queryback(&mut self, shape_id: &str) {
         if let Some(s) = self.shapes.get_mut(shape_id) {
             s.inflight_querybacks = s.inflight_querybacks.saturating_sub(1);
             if s.inflight_querybacks == 0 {
