@@ -95,33 +95,54 @@ impl EmissionLanes {
 
 const GROUP_LANE_CAPACITY: usize = 64;
 
-struct GroupBatch {
-    commit_lsn: u64,
-    stream_path: String,
-    envs: Vec<Envelope>,
-}
-
 struct GroupLane {
-    queue: std::sync::Mutex<std::collections::VecDeque<Arc<QueuedGroupBatch>>>,
+    state: std::sync::Mutex<GroupLaneState>,
     wake: tokio::sync::Notify,
-    slots: Arc<tokio::sync::Semaphore>,
-    closed: std::sync::atomic::AtomicBool,
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     origin_wake: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    failure_gate: std::sync::Mutex<Option<Arc<crate::ds::BodyGate>>>,
 }
 
-struct QueuedGroupBatch {
-    batch: std::sync::Mutex<Option<GroupBatch>>,
-    permit: std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
-    ready: std::sync::atomic::AtomicBool,
-    cancelled: std::sync::atomic::AtomicBool,
+struct GroupLaneState {
+    /// Reservation tickets are deliberately lightweight: the envelope vector remains owned by
+    /// its producer until the ticket is admitted, so a stalled lane does not build an unbounded
+    /// queue of full payloads.
+    waiting: std::collections::VecDeque<Arc<GroupTicket>>,
+    /// At most GROUP_LANE_CAPACITY payloads are admitted ahead of the writer. The in-flight append
+    /// is tracked separately, as it was with the old producer-side permit.
+    admitted: std::collections::VecDeque<Arc<GroupTicket>>,
+    in_flight: Option<Arc<GroupTicket>>,
+    /// A failed reliable append is held until remove() claims it, so the pending/origin entry
+    /// cannot be stranded in the race between append failure and group retirement.
+    held_failed: Option<Arc<GroupTicket>>,
+    next_seq: u64,
+    taken: u64,
+    closed: bool,
+}
+
+struct GroupBatchEntry {
+    commit_lsn: u64,
+    stream_path: String,
+    envs: std::sync::Mutex<Option<Vec<Envelope>>>,
+    accounted: std::sync::atomic::AtomicBool,
+}
+
+struct GroupTicket {
+    seq: u64,
+    entry: Arc<GroupBatchEntry>,
+    state: std::sync::atomic::AtomicU8,
 }
 
 pub(crate) struct GroupBatchHandle {
     lane: Arc<GroupLane>,
-    queued: Arc<QueuedGroupBatch>,
+    ticket: Arc<GroupTicket>,
 }
+
+const TICKET_WAITING: u8 = 0;
+const TICKET_ADMITTED: u8 = 1;
+const TICKET_CANCELLED: u8 = 2;
 
 #[derive(Clone)]
 pub(crate) struct GroupEmissionLanes {
@@ -151,13 +172,21 @@ impl GroupEmissionLanes {
             return sender.clone();
         }
         let lane = Arc::new(GroupLane {
-            queue: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            state: std::sync::Mutex::new(GroupLaneState {
+                waiting: std::collections::VecDeque::new(),
+                admitted: std::collections::VecDeque::new(),
+                in_flight: None,
+                held_failed: None,
+                next_seq: 0,
+                taken: 0,
+                closed: false,
+            }),
             wake: tokio::sync::Notify::new(),
-            slots: Arc::new(tokio::sync::Semaphore::new(GROUP_LANE_CAPACITY)),
-            closed: std::sync::atomic::AtomicBool::new(false),
             pending: self.pending.clone(),
             origins: self.origins.clone(),
             origin_wake: self.wake.clone(),
+            #[cfg(test)]
+            failure_gate: std::sync::Mutex::new(None),
         });
         let worker_lane = lane.clone();
         let worker_ds = self.ds.clone();
@@ -166,66 +195,72 @@ impl GroupEmissionLanes {
                 let notified = worker_lane.wake.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                let queued = {
-                    let mut queue = worker_lane.queue.lock().unwrap();
-                    if worker_lane.closed.load(std::sync::atomic::Ordering::Acquire) && queue.is_empty() {
+                let ticket = {
+                    let mut state = worker_lane.state.lock().unwrap();
+                    if state.closed
+                        && state.waiting.is_empty()
+                        && state.admitted.is_empty()
+                        && state.in_flight.is_none()
+                        && state.held_failed.is_none()
+                    {
                         return;
                     }
-                    if queue.front().is_some_and(|item| {
-                        item.ready.load(std::sync::atomic::Ordering::Acquire)
-                            || item.cancelled.load(std::sync::atomic::Ordering::Acquire)
-                    }) {
-                        queue.pop_front()
-                    } else {
-                        None
+                    let ticket = state.admitted.pop_front();
+                    if let Some(ticket) = &ticket {
+                        state.in_flight = Some(ticket.clone());
+                        state.taken = state.taken.saturating_add(1);
                     }
+                    drop(state);
+                    if ticket.is_some() {
+                        worker_lane.wake.notify_waiters();
+                    }
+                    ticket
                 };
-                let Some(queued) = queued else {
+                let Some(ticket) = ticket else {
                     notified.await;
                     continue;
                 };
-                let permit = queued.permit.lock().unwrap().take();
-                let Some(permit) = permit else {
-                    continue;
-                };
-                // The producer bound covers queued batches, like a bounded mpsc channel. Once
-                // the worker owns the batch, release the slot while the reliable append runs.
-                drop(permit);
-                let batch = queued.batch.lock().unwrap().take();
-                let Some(batch) = batch else {
-                    continue;
-                };
-                if worker_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
-                    worker_lane.pending.complete(batch.commit_lsn);
-                    complete_origin_entry(
-                        &worker_lane.origins,
-                        &worker_lane.origin_wake,
-                        &batch.stream_path,
-                        batch.commit_lsn,
-                    );
-                    continue;
-                }
-                if worker_ds.append_reliable(&batch.stream_path, &batch.envs).await.is_err() {
-                    if worker_lane.closed.load(std::sync::atomic::Ordering::Acquire) {
-                        worker_lane.pending.complete(batch.commit_lsn);
-                        complete_origin_entry(
-                            &worker_lane.origins,
-                            &worker_lane.origin_wake,
-                            &batch.stream_path,
-                            batch.commit_lsn,
-                        );
+                let envs = ticket.entry.envs.lock().unwrap().take();
+                let Some(envs) = envs else {
+                    let mut state = worker_lane.state.lock().unwrap();
+                    if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
+                        state.in_flight = None;
                     }
-                    // Keep the pending count and origin held for a failed live append: a source
-                    // receipt must never advance past an effect that did not land.
+                    drop(state);
+                    worker_lane.wake.notify_waiters();
+                    continue;
+                };
+                let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs).await;
+                if append.is_err() {
+                    #[cfg(test)]
+                    if let Some(gate) = worker_lane.failure_gate.lock().unwrap().clone() {
+                        gate.arrived.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        gate.entered.notify_one();
+                        gate.released.notified().await;
+                    }
+                    let mut state = worker_lane.state.lock().unwrap();
+                    let closed = state.closed;
+                    if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
+                        state.in_flight = None;
+                    }
+                    if !closed {
+                        state.held_failed = Some(ticket.clone());
+                    }
+                    drop(state);
+                    if closed {
+                        complete_group_entry(&worker_lane, &ticket.entry);
+                    }
+                    // Keep the pending count and origin held for a failed live append until
+                    // remove() claims the held entry, unless removal already won the race.
                     return;
                 }
-                worker_lane.pending.complete(batch.commit_lsn);
-                complete_origin_entry(
-                    &worker_lane.origins,
-                    &worker_lane.origin_wake,
-                    &batch.stream_path,
-                    batch.commit_lsn,
-                );
+                let mut state = worker_lane.state.lock().unwrap();
+                if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
+                    state.in_flight = None;
+                }
+                drop(state);
+                complete_group_entry(&worker_lane, &ticket.entry);
+                worker_lane.wake.notify_waiters();
             }
         });
         lanes.insert(path.to_string(), lane.clone());
@@ -238,6 +273,13 @@ impl GroupEmissionLanes {
 
     fn existing_lane(&self, path: &str) -> Option<Arc<GroupLane>> {
         self.lanes.lock().unwrap().get(path).cloned()
+    }
+
+    #[cfg(test)]
+    fn set_failure_gate(&self, path: &str, gate: Arc<crate::ds::BodyGate>) {
+        if let Some(lane) = self.existing_lane(path) {
+            *lane.failure_gate.lock().unwrap() = Some(gate);
+        }
     }
 
     pub(crate) fn begin_origin(&self, path: &str, commit_lsn: u64) {
@@ -275,29 +317,44 @@ impl GroupEmissionLanes {
         }
         let path = path.to_string();
         let lane = self.existing_lane(&path)?;
-        self.pending.add(commit_lsn);
-        self.begin_origin(&path, commit_lsn);
-        let queued = Arc::new(QueuedGroupBatch {
-            batch: std::sync::Mutex::new(Some(GroupBatch { commit_lsn, stream_path: path.clone(), envs })),
-            permit: std::sync::Mutex::new(None),
-            ready: std::sync::atomic::AtomicBool::new(false),
-            cancelled: std::sync::atomic::AtomicBool::new(false),
-        });
-        let mut queue = lane.queue.lock().unwrap();
-        if lane.closed.load(std::sync::atomic::Ordering::Acquire) {
-            drop(queue);
-            self.pending.complete(commit_lsn);
-            complete_origin_entry(&self.origins, &self.wake, &path, commit_lsn);
-            return None;
-        }
-        queue.push_back(queued.clone());
-        drop(queue);
-        lane.wake.notify_one();
-        Some(GroupBatchHandle { lane, queued })
+        self.reserve_on_lane(lane, &path, envs, commit_lsn)
     }
 
-    /// Queue one complete group batch and await its producer-side capacity slot. The queue entry
-    /// is reserved before the await, preserving evaluation order without holding the registry lock.
+    fn reserve_on_lane(
+        &self,
+        lane: Arc<GroupLane>,
+        path: &str,
+        envs: Vec<Envelope>,
+        commit_lsn: u64,
+    ) -> Option<GroupBatchHandle> {
+        self.pending.add(commit_lsn);
+        self.begin_origin(path, commit_lsn);
+        let entry = Arc::new(GroupBatchEntry {
+            commit_lsn,
+            stream_path: path.to_string(),
+            envs: std::sync::Mutex::new(Some(envs)),
+            accounted: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut state = lane.state.lock().unwrap();
+        if state.closed {
+            drop(state);
+            complete_group_entry(&lane, &entry);
+            return None;
+        }
+        let ticket = Arc::new(GroupTicket {
+            seq: state.next_seq,
+            entry,
+            state: std::sync::atomic::AtomicU8::new(TICKET_WAITING),
+        });
+        state.next_seq = state.next_seq.saturating_add(1);
+        state.waiting.push_back(ticket.clone());
+        drop(state);
+        lane.wake.notify_one();
+        Some(GroupBatchHandle { lane, ticket })
+    }
+
+    /// Queue one complete group batch and await its queue-position admission. The queue entry is
+    /// reserved before the await, preserving evaluation order without holding the registry lock.
     pub(crate) async fn enqueue(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if let Some(handle) = self.reserve(path, envs, commit_lsn) {
             handle.wait().await;
@@ -307,16 +364,25 @@ impl GroupEmissionLanes {
     pub(crate) fn remove(&self, path: &str) {
         let lane = self.lanes.lock().unwrap().remove(path);
         if let Some(lane) = lane {
-            lane.closed.store(true, std::sync::atomic::Ordering::Release);
-            let dropped = std::mem::take(&mut *lane.queue.lock().unwrap());
-            for queued in dropped {
-                queued.cancelled.store(true, std::sync::atomic::Ordering::Release);
-                let _permit = queued.permit.lock().unwrap().take();
-                let Some(batch) = queued.batch.lock().unwrap().take() else {
-                    continue;
-                };
-                self.pending.complete(batch.commit_lsn);
-                complete_origin_entry(&self.origins, &self.wake, &batch.stream_path, batch.commit_lsn);
+            let dropped = {
+                let mut state = lane.state.lock().unwrap();
+                state.closed = true;
+                let mut dropped = Vec::new();
+                for ticket in state.waiting.drain(..) {
+                    ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                    dropped.push(ticket);
+                }
+                dropped.extend(state.admitted.drain(..));
+                if let Some(ticket) = state.in_flight.take() {
+                    dropped.push(ticket);
+                }
+                if let Some(ticket) = state.held_failed.take() {
+                    dropped.push(ticket);
+                }
+                dropped
+            };
+            for ticket in dropped {
+                complete_group_entry(&lane, &ticket.entry);
             }
             lane.wake.notify_waiters();
         }
@@ -325,34 +391,90 @@ impl GroupEmissionLanes {
 
 impl GroupBatchHandle {
     pub(crate) async fn wait(self) {
-        let Ok(permit) = self.lane.slots.clone().acquire_owned().await else { return };
-        if self.queued.cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+        loop {
+            let notified = self.lane.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            enum Admission {
+                Admitted,
+                Waiting,
+                Cancelled,
+            }
+            let admission = {
+                let mut state = self.lane.state.lock().unwrap();
+                while state
+                    .waiting
+                    .front()
+                    .is_some_and(|front| front.state.load(std::sync::atomic::Ordering::Acquire) == TICKET_CANCELLED)
+                {
+                    state.waiting.pop_front();
+                    state.taken = state.taken.saturating_add(1);
+                }
+                match self.ticket.state.load(std::sync::atomic::Ordering::Acquire) {
+                    TICKET_CANCELLED => Admission::Cancelled,
+                    TICKET_ADMITTED => Admission::Admitted,
+                    _ if state.closed => {
+                        self.ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                        Admission::Cancelled
+                    }
+                    _ if state.waiting.front().is_some_and(|front| Arc::ptr_eq(front, &self.ticket))
+                        && state.admitted.len() < GROUP_LANE_CAPACITY
+                        && self.ticket.seq < state.taken.saturating_add(GROUP_LANE_CAPACITY as u64) =>
+                    {
+                        state.waiting.pop_front();
+                        self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);
+                        state.admitted.push_back(self.ticket.clone());
+                        Admission::Admitted
+                    }
+                    _ => Admission::Waiting,
+                }
+            };
+            match admission {
+                Admission::Admitted => {
+                    self.lane.wake.notify_one();
+                    return;
+                }
+                Admission::Cancelled => {
+                    complete_group_entry(&self.lane, &self.ticket.entry);
+                    self.lane.wake.notify_waiters();
+                    return;
+                }
+                Admission::Waiting => notified.await,
+            }
         }
-        *self.queued.permit.lock().unwrap() = Some(permit);
-        self.queued.ready.store(true, std::sync::atomic::Ordering::Release);
-        self.lane.wake.notify_one();
     }
 }
 
 impl Drop for GroupBatchHandle {
     fn drop(&mut self) {
-        if self.queued.ready.load(std::sync::atomic::Ordering::Acquire)
-            || self.queued.cancelled.swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+        let state = self.ticket.state.load(std::sync::atomic::Ordering::Acquire);
+        if state == TICKET_ADMITTED || state == TICKET_CANCELLED {
             return;
         }
-        let _permit = self.queued.permit.lock().unwrap().take();
-        let Some(batch) = self.queued.batch.lock().unwrap().take() else {
-            return;
-        };
-        self.lane.pending.complete(batch.commit_lsn);
-        complete_origin_entry(&self.lane.origins, &self.lane.origin_wake, &batch.stream_path, batch.commit_lsn);
-        self.lane.wake.notify_one();
-        // The handle is the owner of a reserved-but-not-submitted batch. Cancellation must undo
-        // the barrier entry just as a closed lane does, otherwise its front queue item strands
-        // every later batch behind it.
+        if self
+            .ticket
+            .state
+            .compare_exchange(
+                TICKET_WAITING,
+                TICKET_CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            complete_group_entry(&self.lane, &self.ticket.entry);
+            self.lane.wake.notify_waiters();
+        }
     }
+}
+
+fn complete_group_entry(lane: &GroupLane, entry: &GroupBatchEntry) {
+    if entry.accounted.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let _ = entry.envs.lock().unwrap().take();
+    lane.pending.complete(entry.commit_lsn);
+    complete_origin_entry(&lane.origins, &lane.origin_wake, &entry.stream_path, entry.commit_lsn);
 }
 
 fn complete_origin_entry(
@@ -444,13 +566,13 @@ mod tests {
             crate::shutdown::ShutdownToken::new(),
             pending.clone(),
         );
-        let _lane = lanes.lane("shape/group");
+        let lane = lanes.lane("shape/group");
         lanes.remove("shape/group");
         let envelope: Envelope = serde_json::from_value(serde_json::json!({
             "type": "shape/group", "key": "1", "headers": {"operation": "upsert"}
         }))
         .unwrap();
-        lanes.enqueue("shape/group", vec![envelope], 0x42).await;
+        assert!(lanes.reserve_on_lane(lane, "shape/group", vec![envelope], 0x42).is_none());
         assert_eq!(pending.count(), 0);
         assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 0x42));
     }
@@ -501,6 +623,237 @@ mod tests {
             .map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"].clone())
             .collect::<Vec<_>>();
         assert_eq!(keys, vec![serde_json::json!("old"), serde_json::json!("new")]);
+    }
+
+    #[tokio::test]
+    async fn capacity_admission_stays_in_reservation_order_across_producers() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes = GroupEmissionLanes::new(
+            DsClient::with_test_store("scripted://group-capacity-order".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            Arc::new(PendingFlips::default()),
+        );
+        lanes.register("shape/group");
+        fn env(key: String) -> Envelope {
+            Envelope {
+                type_: "shape/group".into(),
+                key,
+                value: None,
+                old: None,
+                headers: EnvelopeHeaders {
+                    operation: "upsert".into(),
+                    txid: None,
+                    offset: None,
+                    lsn: None,
+                    seq: None,
+                    last: None,
+                },
+            }
+        }
+
+        let mut first_producer = Vec::new();
+        for i in 0..=128u64 {
+            first_producer.push(lanes.reserve("shape/group", vec![env(format!("x{i}"))], i).unwrap());
+        }
+        let first_waiters = first_producer.split_off(GROUP_LANE_CAPACITY);
+        for handle in first_producer {
+            handle.wait().await;
+        }
+        let mut second_producer = Vec::new();
+        for i in 0..GROUP_LANE_CAPACITY {
+            second_producer.push(lanes.reserve("shape/group", vec![env(format!("y{i}"))], 1000 + i as u64).unwrap());
+        }
+        let second_tasks = second_producer
+            .into_iter()
+            .map(|handle| tokio::spawn(handle.wait()))
+            .collect::<Vec<_>>();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let first_task = tokio::spawn(async move {
+            for handle in first_waiters {
+                handle.wait().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_task).await.unwrap().unwrap();
+        for task in second_tasks {
+            task.await.unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store.appended.lock().unwrap().len() == 129 + GROUP_LANE_CAPACITY {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_producers_are_fifo_and_bounded_while_append_is_held() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.append_fault.lock().unwrap() =
+            Some(("shape/group".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
+        let lanes = GroupEmissionLanes::new(
+            DsClient::with_test_store("scripted://group-concurrent-capacity".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            Arc::new(PendingFlips::default()),
+        );
+        lanes.register("shape/group");
+        let env = |key: u64| Envelope {
+            type_: "shape/group".into(),
+            key: key.to_string(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        };
+
+        let first = lanes.reserve("shape/group", vec![env(0)], 0).unwrap();
+        let first_wait = tokio::spawn(first.wait());
+        while gate.arrived.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut producers = Vec::new();
+        for key in 1..=130u64 {
+            let handle = lanes.reserve("shape/group", vec![env(key)], key).unwrap();
+            producers.push(tokio::spawn(handle.wait()));
+        }
+        for task in producers.iter_mut().take(GROUP_LANE_CAPACITY) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap().unwrap();
+        }
+        assert!(!producers[GROUP_LANE_CAPACITY].is_finished(), "the 65th admitted batch bypassed capacity");
+        assert_eq!(store.appended.lock().unwrap().len(), 0);
+
+        gate.released.notify_one();
+        first_wait.await.unwrap();
+        for task in producers {
+            tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if store.appended.lock().unwrap().len() == 131 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let keys = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, body)| {
+                serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(keys, (0..=130).collect::<Vec<_>>());
+    }
+
+    fn failure_test_envelope() -> Envelope {
+        Envelope {
+            type_: "shape/group".into(),
+            key: "failure".into(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_wins_append_failure_before_failed_batch_is_parked() {
+        let store = Arc::new(crate::ds::ScriptedStore {
+            fail_append_path: Some("shape/group".into()),
+            ..Default::default()
+        });
+        let append_shutdown = crate::shutdown::ShutdownToken::new();
+        let lane_shutdown = crate::shutdown::ShutdownToken::new();
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        let pending = Arc::new(PendingFlips::default());
+        let ds = DsClient::with_test_store("scripted://group-failure-before-park".into(), store)
+            .with_shutdown(append_shutdown.clone());
+        let lanes = GroupEmissionLanes::new(ds, lane_shutdown, pending.clone());
+        lanes.register("shape/group");
+        lanes.set_failure_gate("shape/group", gate.clone());
+        lanes.enqueue("shape/group", vec![failure_test_envelope()], 7).await;
+        append_shutdown.begin();
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
+        assert_eq!(pending.count(), 1);
+        lanes.remove("shape/group");
+        gate.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pending.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 7));
+    }
+
+    #[tokio::test]
+    async fn parked_append_failure_is_released_by_remove() {
+        let store = Arc::new(crate::ds::ScriptedStore {
+            fail_append_path: Some("shape/group".into()),
+            ..Default::default()
+        });
+        let append_shutdown = crate::shutdown::ShutdownToken::new();
+        let lane_shutdown = crate::shutdown::ShutdownToken::new();
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        let pending = Arc::new(PendingFlips::default());
+        let ds = DsClient::with_test_store("scripted://group-failure-parked".into(), store)
+            .with_shutdown(append_shutdown.clone());
+        let lanes = GroupEmissionLanes::new(ds, lane_shutdown, pending.clone());
+        lanes.register("shape/group");
+        lanes.set_failure_gate("shape/group", gate.clone());
+        lanes.enqueue("shape/group", vec![failure_test_envelope()], 8).await;
+        append_shutdown.begin();
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
+        gate.released.notify_one();
+        let lane = lanes.existing_lane("shape/group").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if lane.state.lock().unwrap().held_failed.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(pending.count(), 1);
+        lanes.remove("shape/group");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pending.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 8));
     }
 
     #[tokio::test]

@@ -2174,7 +2174,6 @@ pub(crate) async fn process_envelope(
     // this tailer. The convergence barrier is processed offsets + a drained flip queue
     // (`pending_flips == 0`).
     {
-        let mut work = std::collections::VecDeque::new();
         let mut group_paths = HashSet::new();
         let (result, staged_group_emissions) = {
             let mut reg = subq.registry.lock().await;
@@ -2182,8 +2181,7 @@ pub(crate) async fn process_envelope(
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
                 if let Ok(result_work) = result.as_ref() {
-                    work = result_work.clone();
-                    group_paths = reg.group_paths_for_work(&work);
+                    group_paths = reg.group_paths_for_work(result_work);
                     for path in &group_paths {
                         subq.group_lanes.begin_origin(path, lsn_u64);
                     }
@@ -2198,8 +2196,6 @@ pub(crate) async fn process_envelope(
                         }
                         hops.extend(sq);
                     }
-                } else {
-                    work = std::collections::VecDeque::new();
                 }
                 result
             } else {
@@ -2207,7 +2203,7 @@ pub(crate) async fn process_envelope(
             };
             (result, reg.take_group_emissions())
         };
-        work = match result {
+        let work = match result {
             Ok(work) => {
                 for handle in staged_group_emissions {
                     handle.wait().await;
