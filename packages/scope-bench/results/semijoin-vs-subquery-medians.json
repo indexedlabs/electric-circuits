@@ -1,0 +1,274 @@
+{
+  "description": "Five-repetition medians extracted from the four checked-in benchmark artifacts. Values are subquery/semijoin; dbsp_profile_total_used_bytes is the initial profile snapshot used in the report.",
+  "extraction": "For each JSON file: parse results, take the median of the named result field across five reps; take the median of the first total_used_bytes in dbspProfile.",
+  "artifacts": {
+    "48501cd": {
+      "dir": "first",
+      "artifact_id": 12844722320,
+      "job_id": 123037684019,
+      "run_id": 40747358562,
+      "artifact": "semijoin-vs-subquery-5ebc3f863a377fca22d5ca55346348a3c92ae44c",
+      "files": {
+        "subquery-cold.json": {
+          "sha256": "a7132620790bd54ebb2c6b5e619e80ab89f38278392245f049e7d02e7e0c32cf"
+        },
+        "subquery-steady.json": {
+          "sha256": "1b6f40c85c9d7c5708e5a769983b71c30a47a95bb0b927832f8fd99f40c78dcb"
+        },
+        "semijoin-cold.json": {
+          "sha256": "ff4a43cba7144ae8052286d743d6405fc679d6d14e79191be79401492eae3a55"
+        },
+        "semijoin-steady.json": {
+          "sha256": "1e6f5e44ffd9ddc48e5d1bff48b0a5af5127c6301f801e9fe9a248b873c3fc03"
+        }
+      },
+      "medians": {
+        "cold": {
+          "subquery": {
+            "group_load_ms": 13082,
+            "engine_cpu_ms": 1920,
+            "gateway_cpu_ms": 11400,
+            "engine_rss_mib": 73.7,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 34212
+          },
+          "semijoin": {
+            "group_load_ms": 13017,
+            "engine_cpu_ms": 2100,
+            "gateway_cpu_ms": 11324,
+            "engine_rss_mib": 75.1,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 51568
+          }
+        },
+        "steady": {
+          "subquery": {
+            "group_load_ms": 4340,
+            "engine_cpu_ms": 1920,
+            "gateway_cpu_ms": 4864,
+            "engine_rss_mib": 76.8,
+            "reads_per_change": 2.6666666666666665,
+            "steady_write_p50_ms": 495,
+            "steady_write_p90_ms": 734,
+            "dbsp_profile_total_used_bytes": 65092
+          },
+          "semijoin": {
+            "group_load_ms": 4209,
+            "engine_cpu_ms": 3070,
+            "gateway_cpu_ms": 4588,
+            "engine_rss_mib": 75.9,
+            "reads_per_change": 2.6944444444444446,
+            "steady_write_p50_ms": 1373,
+            "steady_write_p90_ms": 1981,
+            "dbsp_profile_total_used_bytes": 94512
+          }
+        }
+      }
+    },
+    "9086025": {
+      "dir": "second",
+      "artifact_id": 12847482774,
+      "job_id": 123062180725,
+      "run_id": 40754547033,
+      "artifact": "semijoin-vs-subquery-5c4c91e515bf80de5e69ab809f0a84948abb1365",
+      "files": {
+        "subquery-cold.json": {
+          "sha256": "4434bff4111fca45dcd4df89534111db763e7a5e6f71f0e145731c0c70c7c7dd"
+        },
+        "subquery-steady.json": {
+          "sha256": "8d9e762ceb83bbd87faf93625bfaf7947c01569b0a5aff9a74f2157cb824667b"
+        },
+        "semijoin-cold.json": {
+          "sha256": "6457f8cf1e5ff3f232dabacd0229e0392940a03c90b3cdc2ac8e9d7b0678e59e"
+        },
+        "semijoin-steady.json": {
+          "sha256": "a41a2c6295e859a45ce4cee76c09fdb688303c0efefb62d586e9e7f27e4c70c9"
+        }
+      },
+      "medians": {
+        "cold": {
+          "subquery": {
+            "group_load_ms": 12923,
+            "engine_cpu_ms": 1960,
+            "gateway_cpu_ms": 11340,
+            "engine_rss_mib": 74.6,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 34212
+          },
+          "semijoin": {
+            "group_load_ms": 13094,
+            "engine_cpu_ms": 2210,
+            "gateway_cpu_ms": 11344,
+            "engine_rss_mib": 76.8,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 51568
+          }
+        },
+        "steady": {
+          "subquery": {
+            "group_load_ms": 4349,
+            "engine_cpu_ms": 2000,
+            "gateway_cpu_ms": 4732,
+            "engine_rss_mib": 77.6,
+            "reads_per_change": 2.6666666666666665,
+            "steady_write_p50_ms": 530,
+            "steady_write_p90_ms": 684,
+            "dbsp_profile_total_used_bytes": 65092
+          },
+          "semijoin": {
+            "group_load_ms": 4358,
+            "engine_cpu_ms": 3070,
+            "gateway_cpu_ms": 4596,
+            "engine_rss_mib": 75.9,
+            "reads_per_change": 2.6944444444444446,
+            "steady_write_p50_ms": 1282,
+            "steady_write_p90_ms": 2035,
+            "dbsp_profile_total_used_bytes": 94512
+          }
+        }
+      }
+    },
+    "8a93697": {
+      "dir": "third",
+      "artifact_id": 12849790738,
+      "job_id": 123073502747,
+      "run_id": 40757521152,
+      "artifact": "semijoin-vs-subquery-f83e7f42f2d6af3d861a2e5613da5dafef8ffbc6",
+      "files": {
+        "subquery-cold.json": {
+          "sha256": "d0f2f92dcda653a6308f4689985e5ef1d91eade4787f69c8b4fa7c28de23ebed"
+        },
+        "subquery-steady.json": {
+          "sha256": "412a215dfcb426a17cc0e79d3fd508c64daf259f8a870ecdd0597b1577990314"
+        },
+        "semijoin-cold.json": {
+          "sha256": "295f9477545f3b3f07aa2c2ddf515b603bc29ad0b3c94185379480eb0b1d8b3c"
+        },
+        "semijoin-steady.json": {
+          "sha256": "d5dc026ab6c3cf25af3a2f706883d5a51793679e21b1f21367472caf1e23fcac"
+        }
+      },
+      "medians": {
+        "cold": {
+          "subquery": {
+            "group_load_ms": 12404,
+            "engine_cpu_ms": 1320,
+            "gateway_cpu_ms": 11304,
+            "engine_rss_mib": 78.2,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 34212
+          },
+          "semijoin": {
+            "group_load_ms": 12418,
+            "engine_cpu_ms": 1440,
+            "gateway_cpu_ms": 11360,
+            "engine_rss_mib": 80.4,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 51568
+          }
+        },
+        "steady": {
+          "subquery": {
+            "group_load_ms": 3969,
+            "engine_cpu_ms": 1100,
+            "gateway_cpu_ms": 4660,
+            "engine_rss_mib": 75.4,
+            "reads_per_change": 2.661111111111111,
+            "steady_write_p50_ms": 507,
+            "steady_write_p90_ms": 687,
+            "dbsp_profile_total_used_bytes": 65092
+          },
+          "semijoin": {
+            "group_load_ms": 3953,
+            "engine_cpu_ms": 2230,
+            "gateway_cpu_ms": 4652,
+            "engine_rss_mib": 77.7,
+            "reads_per_change": 2.7222222222222223,
+            "steady_write_p50_ms": 936,
+            "steady_write_p90_ms": 1423,
+            "dbsp_profile_total_used_bytes": 94512
+          }
+        }
+      }
+    },
+    "1d7bbbc": {
+      "dir": "fourth",
+      "artifact_id": 12849249330,
+      "job_id": 123077258047,
+      "run_id": 40758664517,
+      "artifact": "semijoin-vs-subquery-5d5fcf586f5d0020249f2fbce608819ebe6398da",
+      "files": {
+        "subquery-cold.json": {
+          "sha256": "20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324"
+        },
+        "subquery-steady.json": {
+          "sha256": "0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796"
+        },
+        "semijoin-cold.json": {
+          "sha256": "efa3ffa625dae2eac276b9c1e6fdadef12469831c3ce2d7201357cb26d0c1325"
+        },
+        "semijoin-steady.json": {
+          "sha256": "e76542100079905b967295fc761fa01a22bb8366a25c7a3331f3f59946c71a37"
+        }
+      },
+      "medians": {
+        "cold": {
+          "subquery": {
+            "group_load_ms": 13166,
+            "engine_cpu_ms": 2030,
+            "gateway_cpu_ms": 11368,
+            "engine_rss_mib": 74.9,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 34212
+          },
+          "semijoin": {
+            "group_load_ms": 13175,
+            "engine_cpu_ms": 2260,
+            "gateway_cpu_ms": 11376,
+            "engine_rss_mib": 63.3,
+            "reads_per_change": null,
+            "steady_write_p50_ms": null,
+            "steady_write_p90_ms": null,
+            "dbsp_profile_total_used_bytes": 51568
+          }
+        },
+        "steady": {
+          "subquery": {
+            "group_load_ms": 4347,
+            "engine_cpu_ms": 2070,
+            "gateway_cpu_ms": 4716,
+            "engine_rss_mib": 75.2,
+            "reads_per_change": 2.672222222222222,
+            "steady_write_p50_ms": 519,
+            "steady_write_p90_ms": 735,
+            "dbsp_profile_total_used_bytes": 65092
+          },
+          "semijoin": {
+            "group_load_ms": 4285,
+            "engine_cpu_ms": 3180,
+            "gateway_cpu_ms": 4580,
+            "engine_rss_mib": 76.6,
+            "reads_per_change": 2.7,
+            "steady_write_p50_ms": 1282,
+            "steady_write_p90_ms": 2045,
+            "dbsp_profile_total_used_bytes": 94512
+          }
+        }
+      }
+    }
+  }
+}
