@@ -1324,7 +1324,7 @@ async fn subset_load_group(
         }
         Err(error) => {
             reservation.rollback().await;
-            return Err(AppError::from(error));
+            return Err(AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error)));
         }
     };
     let reads = members

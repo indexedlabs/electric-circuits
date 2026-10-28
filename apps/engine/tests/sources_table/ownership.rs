@@ -1521,8 +1521,23 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
 async fn group_retry_renews(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
+        *f.ds.group_head_faults.lock().await = vec![Some(503)];
+        let (status, headers, failed) = post_group_response(&app, group_body(f, "group-retry-renews", true)).await?;
+        ensure!(
+            status == StatusCode::SERVICE_UNAVAILABLE,
+            "fresh group tail outage was not retryable: {status} {failed}"
+        );
+        ensure!(headers.get("retry-after").is_some(), "fresh group tail outage omitted Retry-After");
+        ensure!(
+            engine.subscription_owner("group-retry-renews").await.is_none(),
+            "fresh group failure leaked its public claim"
+        );
+        ensure!(
+            engine.subscription_owner("group-retry-renews:member:1").await.is_none(),
+            "fresh group failure leaked a private member claim"
+        );
         let (status, first) = post_group(&app, group_body(f, "group-retry-renews", true)).await?;
-        ensure!(status == StatusCode::OK, "initial group load failed: {status} {first}");
+        ensure!(status == StatusCode::OK, "fresh group retry failed: {status} {first}");
         let old_path = first["streamPath"].as_str().context("initial group stream path")?.to_owned();
         let old_id = first["groupId"].as_str().context("initial group id")?.to_owned();
         let old_members = first["results"]

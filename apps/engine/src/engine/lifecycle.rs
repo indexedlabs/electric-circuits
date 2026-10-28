@@ -4059,7 +4059,9 @@ mod cancellation_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn renewing_a_group_moves_every_member_lease() {
-        let (engine, group) = engine_with_group_claim().await;
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-renew-lease".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
         let before = {
             let st = engine.state.lock().await;
             group
@@ -4083,7 +4085,9 @@ mod cancellation_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_private_member_lease_lapse_releases_the_whole_group() {
-        let (engine, group) = engine_with_group_claim().await;
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-private-lapse".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
         {
             let mut st = engine.state.lock().await;
             st.subscribe("member-0", "scope".into(), crate::changelog::now_secs());
@@ -4092,7 +4096,9 @@ mod cancellation_tests {
             subscription_lease_timeout: std::time::Duration::from_secs(5),
             ..crate::retention::RetentionConfig::default()
         };
-        engine.sweep_leases(&cfg).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.sweep_leases(&cfg))
+            .await
+            .expect("private member lease lapse sweep must complete");
         assert!(engine.group_record("scope").await.is_none(), "private lapse must release the group record");
         assert!(engine.subscription_owner("scope").await.is_none());
         assert!(engine.subscription_owner("scope:member:1").await.is_none());
