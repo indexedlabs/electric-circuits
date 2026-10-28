@@ -15,12 +15,37 @@ let failedReads = 0;
 let reconnects = 0;
 let held = 0;
 let maxHeld = 0;
+let inFlight = 0;
+let maxInFlight = 0;
+let readySubscriptions = 0;
+let readyAt = null;
 const controllers = new Set();
 const startedAt = Date.now();
 const deliveryMs = [];
 const seenWrites = new Set();
+const readyIds = new Set();
 const markerPrefix = process.env.WORKER_WRITE_MARKER_PREFIX;
+const expectedSubscriptions = Number(process.env.WORKER_EXPECTED_SUBSCRIPTIONS || 0);
 let nextSubscriptionId = 0;
+let measurementStartedAt = expectedSubscriptions > 0 ? null : startedAt;
+let measurementReadsAtStart = 0;
+let measurementFailedReadsAtStart = 0;
+let measurementReconnectsAtStart = 0;
+
+function reportReady(subscriptionId) {
+  if (readyIds.has(subscriptionId)) return;
+  readyIds.add(subscriptionId);
+  readySubscriptions++;
+  const now = Date.now();
+  readyAt = now;
+  if (expectedSubscriptions > 0 && readySubscriptions >= expectedSubscriptions && measurementStartedAt === null) {
+    measurementStartedAt = now;
+    measurementReadsAtStart = reads;
+    measurementFailedReadsAtStart = failedReads;
+    measurementReconnectsAtStart = reconnects;
+  }
+  process.stdout.write('READY ' + subscriptionId + ' ' + now + '\\n');
+}
 
 function observeData(text, subscriptionId) {
   if (!markerPrefix) return;
@@ -54,6 +79,7 @@ function applySseEvent(block, offset, subscriptionId) {
     try {
       const frame = JSON.parse(payload);
       if (typeof frame.streamNextOffset === 'string') offset = frame.streamNextOffset;
+      if (frame.upToDate === true) reportReady(subscriptionId);
     } catch {
       // A malformed data event is not a resume token. The next complete control frame remains
       // authoritative; the response is otherwise allowed to end and retry from the last token.
@@ -88,6 +114,7 @@ async function readSse(response, offset, subscriptionId) {
 
 async function readLongPoll(response, offset, subscriptionId) {
   const next = response.headers.get('stream-next-offset');
+  if ((response.headers.get('stream-up-to-date') ?? '').toLowerCase() === 'true') reportReady(subscriptionId);
   if (response.body) observeData(await response.text(), subscriptionId);
   return next || offset;
 }
@@ -95,26 +122,28 @@ async function readLongPoll(response, offset, subscriptionId) {
 async function hold(url) {
   const subscriptionId = String(nextSubscriptionId++);
   let offset = '-1';
-  let responseEnded = false;
+  let reconnectPending = false;
   while (!stopping) {
     const ctl = new AbortController();
     controllers.add(ctl);
+    let countedHeld = true;
     held++;
     maxHeld = Math.max(maxHeld, held);
-    reads++;
-    let countedHeld = true;
-    if (responseEnded) reconnects++;
-    responseEnded = false;
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
     try {
       const live = liveMode === 'sse' ? 'sse' : 'long-poll';
       const r = await fetch(url + '?offset=' + encodeURIComponent(offset) + '&live=' + live, { signal: ctl.signal });
       if (!r.ok) {
         throw new Error('live response was ' + r.status);
       }
+      if (reconnectPending) reconnects++;
+      reconnectPending = false;
       offset = liveMode === 'sse'
         ? await readSse(r, offset, subscriptionId)
         : await readLongPoll(r, offset, subscriptionId);
-      responseEnded = true;
+      reads++;
+      reconnectPending = true;
     } catch {
       if (!stopping) {
         failedReads++;
@@ -123,6 +152,7 @@ async function hold(url) {
         await new Promise((res) => setTimeout(res, 1000));
       }
     } finally {
+      inFlight--;
       if (countedHeld) held--;
       controllers.delete(ctl);
     }
@@ -138,13 +168,17 @@ process.on('SIGTERM', () => {
   if (stopping) return;
   stopping = true;
   for (const ctl of controllers) ctl.abort();
-  const elapsedMs = Math.max(1, Date.now() - startedAt);
+  const elapsedMs = Math.max(1, Date.now() - (measurementStartedAt ?? startedAt));
   const summary = {
     liveMode,
-    reads,
-    failedReads,
-    reconnects,
+    reads: reads - measurementReadsAtStart,
+    failedReads: failedReads - measurementFailedReadsAtStart,
+    reconnects: reconnects - measurementReconnectsAtStart,
     maxHeld,
+    maxInFlight,
+    subscriptions: nextSubscriptionId,
+    readySubscriptions,
+    readyAt,
     elapsedMs,
     reconnectsPerMinute: reconnects * 60000 / elapsedMs,
     deliveries: deliveryMs.length,

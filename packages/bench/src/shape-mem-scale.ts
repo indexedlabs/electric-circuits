@@ -283,19 +283,36 @@ async function runWorkers(
   env: Record<string, string>,
   feeds: string[][],
   waitExit: boolean,
-): Promise<{ procs: ChildProcess[]; stdout: string[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] }> {
+): Promise<{ procs: ChildProcess[]; stdout: string[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[]; ready: Promise<{ elapsedMs: number }> }> {
   const procs: ChildProcess[] = []
   const closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] = []
   const outs: string[] = []
+  const readyExpected = feeds.reduce((n, feed) => n + feed.length, 0)
+  const readyStartedAt = Date.now()
+  let readyCount = 0
+  let resolveReady!: (value: { elapsedMs: number }) => void
+  const ready = new Promise<{ elapsedMs: number }>((resolve) => { resolveReady = resolve })
+  if (readyExpected === 0) resolveReady({ elapsedMs: 0 })
+  const readySeen: number[] = []
   for (const feed of feeds) {
-    const p = spawn(process.execPath, ['-e', js], { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'inherit'] })
+    const p = spawn(process.execPath, ['-e', js], {
+      env: { ...process.env, ...env, WORKER_EXPECTED_SUBSCRIPTIONS: String(feed.length) },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    })
     procs.push(p)
     const idx = outs.push('') - 1
+    readySeen[idx] = 0
     const close = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) =>
       p.once('close', (code, signal) => resolve({ code, signal })))
     closes.push(close)
     // Consume stdout LIVE — a full pipe buffer would block the worker.
-    p.stdout!.on('data', (d: Buffer) => { outs[idx] += d.toString() })
+    p.stdout!.on('data', (d: Buffer) => {
+      outs[idx] += d.toString()
+      const seen = (outs[idx]!.match(/^READY /gm) ?? []).length
+      readyCount += seen - readySeen[idx]!
+      readySeen[idx] = seen
+      if (readyCount >= readyExpected) resolveReady({ elapsedMs: Date.now() - readyStartedAt })
+    })
     for (const line of feed) p.stdin!.write(line + '\n')
     p.stdin!.end()
   }
@@ -320,6 +337,10 @@ interface LiveWorkerSummary {
   failedReads?: number
   reconnects: number
   maxHeld: number
+  maxInFlight?: number
+  subscriptions?: number
+  readySubscriptions?: number
+  readyAt?: number | null
   elapsedMs: number
   deliveryMs?: number[]
 }
@@ -333,7 +354,9 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   reads: number
   failedReads: number
   heldConnections: number
+  inFlightConnections: number
   reconnectsPerMinute: number
+  reconnectsPerSubscriptionMinute: number
   deliveryP50Ms: number | null
   deliveryP90Ms: number | null
   deliveries: number
@@ -359,14 +382,18 @@ function liveSummary(runs: Array<{ procs: ChildProcess[]; stdout: string[] }>): 
   const reads = summaries.reduce((n, s) => n + s.reads, 0)
   const failedReads = summaries.reduce((n, s) => n + (s.failedReads ?? 0), 0)
   const heldConnections = summaries.reduce((n, s) => n + s.maxHeld, 0)
+  const inFlightConnections = summaries.reduce((n, s) => n + (s.maxInFlight ?? s.maxHeld), 0)
   const reconnects = summaries.reduce((n, s) => n + s.reconnects, 0)
-  const elapsedMs = Math.max(1, ...summaries.map((s) => s.elapsedMs))
+  const workerMinutes = summaries.reduce((n, s) => n + s.elapsedMs / 60000, 0)
+  const subscriptionMinutes = summaries.reduce((n, s) => n + (s.subscriptions ?? 1) * s.elapsedMs / 60000, 0)
   const deliveries = summaries.flatMap((s) => s.deliveryMs ?? [])
   return {
     reads,
     failedReads,
     heldConnections,
-    reconnectsPerMinute: reconnects * 60000 / elapsedMs,
+    inFlightConnections,
+    reconnectsPerMinute: workerMinutes ? reconnects / workerMinutes : 0,
+    reconnectsPerSubscriptionMinute: subscriptionMinutes ? reconnects / subscriptionMinutes : 0,
     deliveryP50Ms: percentile(deliveries, 0.5),
     deliveryP90Ms: percentile(deliveries, 0.9),
     deliveries: deliveries.length,
@@ -457,6 +484,7 @@ async function main() {
     ? process.env.SCALE_LIVE_RAMP.split(',').map(Number)
     : LIVE_SUBS > 0 ? [LIVE_SUBS] : []
   let liveProcs: ChildProcess[] = []
+  const readinessWindowsMs: number[] = []
   const liveRuns: Array<{
     procs: ChildProcess[]
     stdout: string[]
@@ -476,6 +504,9 @@ async function main() {
       )
       liveRuns.push(run)
       liveProcs.push(...run.procs)
+      const readiness = await run.ready
+      readinessWindowsMs.push(readiness.elapsedMs)
+      console.log(`live ${LIVE_MODE} readiness: ${readiness.elapsedMs}ms for ${targets.length} subscriptions`)
     }
     held = level
     console.log(`holding ${held} live ${LIVE_MODE} reads…`)
@@ -506,18 +537,21 @@ async function main() {
   if (LIVE_RAMP.some((level) => level > 0) && live.reads === 0) {
     throw new Error('live workers produced zero reads for requested subscriptions')
   }
-  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
+  if (LIVE_RAMP.some((level) => level > 0) && live.failedReads * 2 >= Math.max(1, live.reads)) {
+    throw new Error(`live workers had too many failed reads: ${live.failedReads}/${live.reads}`)
+  }
+  console.log(`live ${LIVE_MODE}: reads=${live.reads} failed=${live.failedReads} sum-worker-peak-held=${live.heldConnections} sum-worker-peak-in-flight=${live.inFlightConnections} reconnects/min=${live.reconnectsPerMinute.toFixed(2)} reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)} deliveries=${live.deliveries} write→delivery p50=${live.deliveryP50Ms ?? 'n/a'}ms p90=${live.deliveryP90Ms ?? 'n/a'}ms`)
 
   // Report.
   mkdirSync(dirname(OUT), { recursive: true })
   const md: string[] = []
   md.push(`# Shape-memory at scale — ${ISSUES} issues, ${MAX_USERS} users, ${requested} subscriptions`)
   md.push('')
-  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
+  md.push(`Live transport: \`${LIVE_MODE}\`. Direct Durable Streams worker metrics: upstream reads=${live.reads}, failed reads=${live.failedReads}, sum of per-worker peak held connections=${live.heldConnections}, sum of per-worker peak in-flight requests=${live.inFlightConnections}, reconnects/min=${live.reconnectsPerMinute.toFixed(2)}, reconnects/subscription/min=${live.reconnectsPerSubscriptionMinute.toFixed(2)}, write-to-delivery p50/p90=${live.deliveryP50Ms ?? 'n/a'}/${live.deliveryP90Ms ?? 'n/a'} ms over ${live.deliveries} deliveries.`)
   md.push('')
   md.push(`Config: projects=${PROJECTS}, memberships/user=${MEMBERSHIPS_PER_USER}, shapes/user=${SHAPES_PER_USER}, ` +
     `materialized=${MATERIALIZED}, clientProcs=${CLIENT_PROCS}, liveMode=${LIVE_MODE}, liveSubs=${LIVE_SUBS}/${LIVE_PROCS} procs, ` +
-    `liveWrites=${LIVE_WRITES}/${LIVE_WRITE_INTERVAL_MS}ms, liveHold=${LIVE_HOLD_MS}ms`)
+    `liveWrites=${LIVE_WRITES}/${LIVE_WRITE_INTERVAL_MS}ms, liveHold=${LIVE_HOLD_MS}ms, readinessWindowsMs=${readinessWindowsMs.join(',') || 'none'}`)
   md.push('')
   md.push('| phase | live mode | users | subscriptions | live shapes | engine RSS (MiB) | engine footprint (MiB) | ds RSS (MiB) | sq nodes | contributors |')
   md.push('|---|---|---:|---:|---:|---:|---:|---:|---:|---:|')

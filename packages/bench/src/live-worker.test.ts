@@ -23,6 +23,21 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
+function summaryOf(stdout: string): {
+  reads: number
+  failedReads: number
+  reconnects: number
+  maxHeld: number
+  maxInFlight: number
+  deliveries: number
+  deliveryP50Ms: number | null
+  deliveryP90Ms: number | null
+} {
+  const line = stdout.split('\n').findLast((value) => value.startsWith('{'))
+  if (!line) throw new Error(`missing worker summary: ${stdout}`)
+  return JSON.parse(line) as ReturnType<typeof summaryOf>
+}
+
 async function within<T>(promise: Promise<T>, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
@@ -60,18 +75,24 @@ async function startListener(mode: string | undefined): Promise<ListenerRun> {
           setTimeout(() => {
             res.write('\n')
             res.write('event: control\ndata: {}\n\n')
-            res.write('event: control\ndata: {"streamNextOffset":"next-1"}\n\n')
+            res.write('event: control\ndata: {"streamNextOffset":"next-1","upToDate":true}\n\n')
             res.end()
           }, 10)
         }, 10)
       } else {
-        res.writeHead(200, { 'stream-next-offset': 'next-1' })
+        res.writeHead(200, { 'stream-next-offset': 'next-1', 'stream-up-to-date': 'true' })
         res.end(`${markerPrefix}${writtenAt} ${markerPrefix}${secondWrittenAt}`)
       }
       return
     }
     second.resolve(request)
-    // Keep the second response open until cleanup. The assertion only needs request metadata.
+    if (mode === 'sse') {
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' })
+      res.end('event: control\ndata: {"streamNextOffset":"next-1","upToDate":true}\n\n')
+    } else {
+      res.writeHead(200, { 'stream-next-offset': 'next-1', 'stream-up-to-date': 'true' })
+      res.end(`${markerPrefix}${writtenAt} ${markerPrefix}${secondWrittenAt}`)
+    }
   })
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
@@ -100,6 +121,17 @@ async function stopListener(run: ListenerRun): Promise<void> {
 }
 
 describe('per-table bench live mode', () => {
+  it('emits a syntactically valid worker script', async () => {
+    const worker = spawn(process.execPath, ['--check', '-'], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    })
+    let stderr = ''
+    worker.stderr!.on('data', (d: Buffer) => { stderr += d.toString() })
+    worker.stdin!.end(LIVE_WORKER_JS)
+    const [code] = await once(worker, 'close')
+    expect(code, stderr).toBe(0)
+  })
+
   it('parses SSE control frames and resumes from the committed offset', async () => {
     const run = await startListener('sse')
     try {
@@ -113,17 +145,11 @@ describe('per-table bench live mode', () => {
     } finally {
       await stopListener(run)
     }
-    const summary = JSON.parse(run.stdout.trim()) as {
-      reads: number
-      reconnects: number
-      maxHeld: number
-      deliveries: number
-      deliveryP50Ms: number | null
-      deliveryP90Ms: number | null
-    }
+    const summary = summaryOf(run.stdout)
     expect(summary.reads).toBeGreaterThanOrEqual(2)
     expect(summary.reconnects).toBeGreaterThanOrEqual(1)
     expect(summary.maxHeld).toBe(1)
+    expect(summary.maxInFlight).toBe(1)
     expect(summary.deliveries).toBeGreaterThanOrEqual(2)
     expect(summary.deliveryP50Ms).not.toBeNull()
     expect(summary.deliveryP90Ms).not.toBeNull()
@@ -141,17 +167,11 @@ describe('per-table bench live mode', () => {
     } finally {
       await stopListener(run)
     }
-    const summary = JSON.parse(run.stdout.trim()) as {
-      reads: number
-      reconnects: number
-      maxHeld: number
-      deliveries: number
-      deliveryP50Ms: number | null
-      deliveryP90Ms: number | null
-    }
+    const summary = summaryOf(run.stdout)
     expect(summary.reads).toBeGreaterThanOrEqual(2)
     expect(summary.reconnects).toBeGreaterThanOrEqual(1)
     expect(summary.maxHeld).toBe(1)
+    expect(summary.maxInFlight).toBe(1)
     expect(summary.deliveries).toBeGreaterThanOrEqual(2)
     expect(summary.deliveryP50Ms).not.toBeNull()
     expect(summary.deliveryP90Ms).not.toBeNull()
@@ -167,5 +187,57 @@ describe('per-table bench live mode', () => {
     const [code] = await once(worker, 'close')
     expect(code).toBe(2)
     expect(stderr).toContain('unknown WORKER_LIVE_MODE=SSE')
+  })
+
+  it('counts a pending long-poll as in flight until shutdown', async () => {
+    const first = deferred<void>()
+    const server = createServer((_req, _res) => first.resolve(undefined))
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('missing listener address')
+    const worker = spawn(process.execPath, ['-e', LIVE_WORKER_JS], {
+      env: { ...process.env, WORKER_LIVE_MODE: 'long-poll' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    worker.stdout!.on('data', (d: Buffer) => { stdout += d.toString() })
+    worker.stdin!.end(`http://127.0.0.1:${address.port}/stream\n`)
+    await within(first.promise, 'pending long-poll request')
+    worker.kill('SIGTERM')
+    await once(worker, 'close')
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    const summary = summaryOf(stdout)
+    expect(summary.maxHeld).toBe(1)
+    expect(summary.maxInFlight).toBe(1)
+    expect(summary.failedReads).toBe(0)
+  })
+
+  it('counts reset connections as failed without reconnects', async () => {
+    const request = deferred<void>()
+    const server = createServer((req, res) => {
+      request.resolve(undefined)
+      req.socket.destroy()
+      res.destroy()
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('missing listener address')
+    const worker = spawn(process.execPath, ['-e', LIVE_WORKER_JS], {
+      env: { ...process.env, WORKER_LIVE_MODE: 'long-poll' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    worker.stdout!.on('data', (d: Buffer) => { stdout += d.toString() })
+    worker.stdin!.end(`http://127.0.0.1:${address.port}/stream\n`)
+    await within(request.promise, 'reset connection request')
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    worker.kill('SIGTERM')
+    await once(worker, 'close')
+    server.closeAllConnections()
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    const summary = summaryOf(stdout)
+    expect(summary.failedReads).toBeGreaterThan(0)
+    expect(summary.reconnects).toBe(0)
   })
 })
