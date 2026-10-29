@@ -1120,8 +1120,12 @@ async fn pause_group_delete(f: &Fixture, stream_path: &str) -> Arc<Notify> {
     gate
 }
 
+/// Open a delete gate for every DELETE it holds. Each member purge and the group release retire
+/// the same group stream, so several DELETEs can be waiting; `notify_one` alone would leave all
+/// but one parked. The extra permit covers a DELETE that took the gate but has not yet waited.
 async fn release_group_delete(f: &Fixture, stream_path: &str, gate: Arc<Notify>) {
     f.ds.delete_gates.lock().await.remove(stream_path);
+    gate.notify_waiters();
     gate.notify_one();
 }
 
@@ -1775,6 +1779,7 @@ async fn group_renewal_rechecks_a_racing_release(f: &Fixture, before_close: bool
         let early = tokio::time::timeout(Duration::from_millis(500), &mut renew).await;
         if before_close {
             f.ds.close_gates.lock().await.remove(&old_path);
+            close_gate.notify_waiters();
             close_gate.notify_one();
         }
         release_group_delete(f, &old_path, gate).await;

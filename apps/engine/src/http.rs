@@ -1261,7 +1261,7 @@ async fn subset_load_group(
                     let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
                     // Recheck under the state lock, where a release begins: a release that has
                     // not begun by now is ordered after this answer (#g-group-recheck).
-                    if true {
+                    if engine.group_is_current(&existing).await {
                         return Ok(Json(group_answer(engine, &existing, &offset, page)));
                     }
                 }
