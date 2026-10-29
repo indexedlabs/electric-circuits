@@ -1243,8 +1243,11 @@ async fn group_uses_one_snapshot_fence(f: &Fixture) -> Result<()> {
             "group did not return both member pages: {body}"
         );
         let sql_count: i64 = f.client.query_one(&format!("SELECT count(*) FROM public.{}", f.outer), &[]).await?.get(0);
+        let outer = format!("public.{}", f.outer);
+        let rows = body["rows"].as_array().context("group answer has no flat rows")?;
+        ensure!(rows.iter().all(|row| row["table"].is_string()), "a group row is not tagged with its table: {body}");
         ensure!(
-            body["results"][0]["rows"].as_array().map_or(0, Vec::len) as i64 == sql_count,
+            rows.iter().filter(|row| row["table"] == outer.as_str()).count() as i64 == sql_count,
             "plain page crossed snapshot fence: {body}"
         );
         Ok::<_, anyhow::Error>(())

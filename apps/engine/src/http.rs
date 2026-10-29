@@ -1140,6 +1140,9 @@ struct SubsetLoadResponse {
     subscription: String,
     lease_seconds: u64,
     offset: String,
+    /// Snapshot rows of every member, each `{"table", "value"}`.
+    rows: Vec<serde_json::Value>,
+    /// Members in request order: `key`, `table`, `shapeId`, `subscription`.
     results: Vec<serde_json::Value>,
     stream_path: String,
     stream_url: String,
@@ -1261,29 +1264,7 @@ async fn subset_load_group(
                     })
                     .collect();
                 let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
-                let results = existing
-                    .members
-                    .iter()
-                    .zip(page.pages)
-                    .map(|(member, rows)| {
-                        serde_json::json!({
-                            "key": member.key,
-                            "table": member.table,
-                            "shapeId": member.shape_id,
-                            "streamUrl": engine.stream_url(&existing.stream_path),
-                            "streamPath": existing.stream_path,
-                            "subscription": group_sub,
-                            "leaseSeconds": engine.lease_seconds(),
-                            "offset": offset,
-                            "rows": rows,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                return Ok(Json(serde_json::json!({
-                    "groupId": existing.id, "shapeId": existing.id, "subscription": group_sub,
-                    "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
-                    "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
-                })));
+                return Ok(Json(group_answer(engine, &existing, &offset, page)));
             }
             // A member claim can lapse between the health probe and the renewal lock, or the
             // renewal can succeed while its stream closes. Treat either outcome as an
@@ -1356,7 +1337,6 @@ async fn subset_load_group(
             return Err(AppError::from(error));
         }
     };
-    let lease_seconds = engine.lease_seconds();
     let group_id = group_path.clone();
     let group_record = GroupRecord {
         id: group_id.clone(),
@@ -1380,20 +1360,55 @@ async fn subset_load_group(
         horizon: page.horizon.clone(),
         replay_fence: offset.clone(),
     };
-    if let Err(error) = engine.complete_group(group_record).await {
+    if let Err(error) = engine.complete_group(group_record.clone()).await {
         reservation.rollback().await;
         return Err(AppError::from(error));
     }
     reservation.complete();
-    let results: Vec<serde_json::Value> = members.into_iter().zip(created.iter()).zip(page.pages).map(|((member, (rec, _)), rows)| serde_json::json!({
-        "key": member.key(), "table": member.table, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
-        "subscription": group_sub, "leaseSeconds": lease_seconds, "offset": offset, "rows": rows,
-    })).collect();
-    Ok(Json(serde_json::json!({
-        "groupId": group_id, "shapeId": group_id, "subscription": group_sub,
-        "streamUrl": engine.stream_url(&group_path), "streamPath": group_path, "offset": offset,
-        "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
-    })))
+    Ok(Json(group_answer(engine, &group_record, &offset, page)))
+}
+
+/// A group load's answer: one `shapeId` (the group id) and stream, one snapshot fence, and the
+/// snapshot `rows` flat, each as `{"table", "value"}` so equal keys in different tables never
+/// collide. `results` lists the members in request order with their `key`, `table` and private
+/// `shapeId`; a member's id is diagnostic only, since nothing outside the group can claim,
+/// release or purge it.
+fn group_answer(
+    engine: &Engine,
+    group: &GroupRecord,
+    offset: &str,
+    page: crate::engine::SubsetBatchPage,
+) -> serde_json::Value {
+    let mut rows = Vec::new();
+    for (member, member_rows) in group.members.iter().zip(page.pages) {
+        rows.extend(member_rows.into_iter().map(|value| serde_json::json!({ "table": member.table, "value": value })));
+    }
+    let results = group
+        .members
+        .iter()
+        .map(|member| {
+            serde_json::json!({
+                "key": member.key,
+                "table": member.table,
+                "shapeId": member.shape_id,
+                "subscription": member.subscription,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "groupId": group.id,
+        "shapeId": group.id,
+        "subscription": group.subscription,
+        "leaseSeconds": engine.lease_seconds(),
+        "streamUrl": engine.stream_url(&group.stream_path),
+        "streamPath": group.stream_path,
+        "offset": offset,
+        "lsn": page.lsn,
+        "snapshot": page.snapshot,
+        "horizon": page.horizon,
+        "rows": rows,
+        "results": results,
+    })
 }
 
 /// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized

@@ -1242,13 +1242,19 @@ impl Engine {
                 owner: format!("shape {id}"),
             }));
         }
-        let group_release = st
+        drop(st);
+        self.purge_shape_member(id, durable).await?;
+        // Look the group up only once the member is gone: a `complete_group` that took the lock
+        // first has completed a record naming this member, and one that comes after finds the
+        // member missing and fails, so no completed group outlives its retired member.
+        let group_release = self
+            .state
+            .lock()
+            .await
             .group_claims
             .records_iter()
             .find(|group| group.members.iter().any(|member| member.shape_id == id))
             .map(|group| (group.subscription.clone(), group.id.clone()));
-        drop(st);
-        self.purge_shape_member(id, durable).await?;
         if let Some((subscription, group_id)) = group_release {
             if let Err(error) = self.release_group_claim(&subscription, &group_id).await {
                 tracing::warn!(%error, %subscription, "purge: failed to durably release group claim; continuing shape retirement");
