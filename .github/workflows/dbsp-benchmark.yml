@@ -1,0 +1,78 @@
+name: dbsp spill benchmark
+
+# Two cold release builds and ten full-scale runs take hours, so this runs only when asked:
+# add the `dbsp-benchmark` label to a pull request (each time it's added measures the head
+# at that moment), or dispatch it with the two commits to compare.
+on:
+  pull_request:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Baseline commit or branch name; the comparison uses its merge-base with head
+        required: true
+      head:
+        description: Candidate commit
+        required: true
+
+jobs:
+  compare:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'dbsp-benchmark'
+    # Re-adding the label while a run is in flight queues behind it rather than doubling up.
+    concurrency:
+      group: dbsp-benchmark-${{ github.event.pull_request.number || inputs.head }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install PostgreSQL 18
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor --yes -o /etc/apt/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/etc/apt/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-18 postgresql-client-18
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Compare baseline and candidate sequentially
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head }}
+          BENCH_REPS: '5'
+          BENCH_ARTIFACT_ROOT: ${{ github.workspace }}/.bench-artifacts
+        run: ./scripts/dbsp-spill-benchmark.sh
+
+      - name: Upload raw benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbsp-spill-comparison-${{ github.event.pull_request.head.sha || inputs.head }}
+          path: .bench-artifacts
+          # upload-artifact v4 skips dot-paths unless asked, and the results live under .bench-artifacts.
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30

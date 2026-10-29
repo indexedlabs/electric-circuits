@@ -247,7 +247,7 @@ pub enum AggFn {
 pub(crate) fn value_f64(v: &Value) -> f64 {
     match v {
         Value::Int(i) => *i as f64,
-        Value::Float(f) => f.0,
+        Value::Float(f) => f.into_inner(),
         Value::Bool(b) => {
             if *b {
                 1.0

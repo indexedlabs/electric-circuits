@@ -1,12 +1,12 @@
 # Pinned: rustc stable 1.97.0 ICEs (rustc_next_trait_solver panic in
 # structural_traits.rs) while compiling dbsp 0.318.0 (edition 2024, backend-mode).
 # Re-checked 2026-08-21: 1.97.1 and 1.98.0 still ICE at the same site.
-# 1.96.0 is the last known-good stable. Do NOT float back to "stable" until the
-# upstream ICE is fixed. See PR #24.
+# dbsp 0.365 requires 1.96.1. Keep the 1.96 pin; trying newer compilers is a
+# separate change. See PR #24 for the original compiler crash.
 #
 # NOTE for mise users: mise exports RUSTUP_TOOLCHAIN, which rustup ranks ABOVE this
 # file, so a global `rust = "latest"` silently overrides the pin. Either run
 # `mise settings add idiomatic_version_file_enable_tools rust` (mise then honours this
 # file) or unset RUSTUP_TOOLCHAIN in this repo.
 [toolchain]
-channel = "1.96.0"
+channel = "1.96.1"

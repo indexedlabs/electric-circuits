@@ -24,19 +24,14 @@ path = "src/main.rs"
 # one shared circuit whose arrangements spill to disk when tables grow. Version reqs kept at
 # minor-level so cargo unifies our direct deps with dbsp's own tree (so the rkyv/size-of/
 # feldera-macros derive macros match dbsp's expected rkyv 0.7).
-dbsp = "0.318"
+dbsp = "0.365"
 # default-features=false avoids rkyv's default `size_32`, which is mutually exclusive with
 # the `size_64` that dbsp selects (cargo unions features across dependents).
 rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
 # dbsp uses Feldera's fork of size-of. The `SizeOf` derive emits hardcoded `size_of::` paths,
 # so the crate must be in scope under the name `size_of` (dbsp renames it the same way).
-# `ordered-float` feature pulls the SizeOf impl for OrderedFloat (used by our Float cell).
-size_of = { package = "feldera-size-of", version = "0.1.7", features = ["ordered-float"] }
-feldera-macros = "0.318"
-# `OrderedFloat` gives `Value::Float` the `Eq`/`Ord`/`Hash` a bare f64 lacks (map keys:
-# aggregate multisets, routing indexes). Pinned to 3.x to match feldera-size-of's SizeOf
-# impl; rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
-ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
+size_of = { package = "feldera-size-of", version = "0.1.7" }
+feldera-macros = "0.365"
 anyhow = "1"
 constant_time_eq = "0.3"
 aws-config = "1"
@@ -54,7 +49,7 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 # Durable Streams supports private HTTP and verified HTTPS with optional client authentication.
 # Native roots provide the system trust store when no explicit CA bundle is configured.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "http2", "rustls-tls", "rustls-tls-native-roots"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 # Postgres source: logical-replication slot polling (test_decoding) + backfill queries.

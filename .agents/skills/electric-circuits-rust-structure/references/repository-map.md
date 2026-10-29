@@ -6,9 +6,10 @@
 - `apps/engine` supplies both the `electric_circuits_engine` library and the
   `electric-circuits-engine` binary. Keeping this as one deployable package is an intentional
   option, not technical debt by definition.
-- `rust-toolchain.toml` pins Rust 1.96.0 because newer stable compilers have an upstream compiler
-  ICE while compiling the current dbsp version. Do not float it or change related Cargo policy in
-  an incidental refactor.
+- `rust-toolchain.toml` pins Rust 1.96.1 to meet dbsp 0.365's MSRV. The repository records upstream
+  compiler ICEs with earlier dbsp on newer stable compilers; newer compilers still need re-checking
+  against the current dbsp version and CI. Do not float the pin or change related Cargo policy in an
+  incidental refactor.
 - `Cargo.lock` is committed. The engine directly pins a dbsp/rkyv/size-of compatibility group;
   inspect its feature graph before changing any member.
 - The current package uses edition 2024, while the virtual workspace explicitly selects resolver

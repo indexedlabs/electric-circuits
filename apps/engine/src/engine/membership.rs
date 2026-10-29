@@ -100,7 +100,7 @@ pub(crate) fn value_eq_sql(col: &str, value: &Value, pg_type: Option<&str>) -> (
     match value {
         Value::Null => (format!("{name} IS NULL"), Vec::new()),
         Value::Int(i) => (format!("{name} = {i}"), Vec::new()),
-        Value::Float(f) => (format!("{name} = {}", f.0), Vec::new()),
+        Value::Float(f) => (format!("{name} = {}", f.into_inner()), Vec::new()),
         Value::Bool(b) => (format!("{name} = {}", if *b { "true" } else { "false" }), Vec::new()),
         Value::Text(s) => (crate::sql::text_param_cmp(&name, "=", 1, pg_type), vec![s.clone()]),
     }

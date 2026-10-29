@@ -18,7 +18,7 @@
 //   tsx src/shape-mem-scale.ts
 
 import { type ChildProcess, execFile, execFileSync, execSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -55,6 +55,8 @@ const CLIENT_PROCS = numEnv('SCALE_CLIENT_PROCS', 4)
 const CONC_PER_PROC = numEnv('SCALE_CONC_PER_PROC', 12)
 const LIVE_SUBS = numEnv('SCALE_LIVE_SUBS', 20000)
 const LIVE_PROCS = numEnv('SCALE_LIVE_PROCS', 8)
+const STEADY_UPDATES = numEnv('SCALE_STEADY_UPDATES', 20)
+const STEADY_INTERVAL_MS = numEnv('SCALE_STEADY_INTERVAL_MS', 250)
 const LIVE_WRITES = numEnv('SCALE_LIVE_WRITES', 0)
 const LIVE_WRITE_INTERVAL_MS = numEnv('SCALE_LIVE_WRITE_INTERVAL_MS', 500)
 const LIVE_HOLD_MS = numEnv('SCALE_LIVE_HOLD_MS', 120000)
@@ -85,6 +87,42 @@ const STATUSES = ['backlog', 'todo', 'in_progress', 'done', 'canceled']
 const MIB = 1024 * 1024
 let activeCleanup: (() => Promise<void>) | undefined
 
+type ProcessIo = { read_bytes: number; write_bytes: number }
+
+function processIo(pid: number | undefined): ProcessIo | null {
+  if (!pid || process.platform !== 'linux') return null
+  try {
+    const fields = Object.fromEntries(
+      readFileSync(`/proc/${pid}/io`, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => {
+          const [key, value] = line.split(':')
+          return [key!.trim(), Number(value!.trim())]
+        }),
+    ) as Record<string, number>
+    return { read_bytes: fields.read_bytes ?? 0, write_bytes: fields.write_bytes ?? 0 }
+  } catch {
+    return null
+  }
+}
+
+function directoryBytes(dir: string | undefined): number {
+  if (!dir || !existsSync(dir)) return 0
+  let total = 0
+  const walk = (path: string) => {
+    for (const entry of readdirSync(path, { withFileTypes: true })) {
+      const child = join(path, entry.name)
+      if (entry.isDirectory()) walk(child)
+      else {
+        try { total += statSync(child).size } catch { /* file rotated between scan and stat */ }
+      }
+    }
+  }
+  walk(dir)
+  return total
+}
+
 // --- infra (same shapes as shape-mem-matrix) ---------------------------------------------------
 
 function bootPgSimple(): { pgUrl: string; dir: string; port: number } {
@@ -93,7 +131,15 @@ function bootPgSimple(): { pgUrl: string; dir: string; port: number } {
   const dataDir = join(dir, 'data')
   execFileSync(postgres.initdb, ['-D', dataDir, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   const port = 20000 + Math.floor(Math.random() * 20000)
-  execFileSync(postgres.pgCtl, ['-D', dataDir, '-o', `-p ${port} -c listen_addresses=127.0.0.1 -c wal_level=logical -c fsync=off -c synchronous_commit=off -c max_wal_senders=8 -c max_replication_slots=8`, '-w', 'start'], { stdio: 'ignore' })
+  // The socket goes in the temp dir: Debian/Ubuntu builds default to /var/run/postgresql,
+  // which an unprivileged CI user can't write, and pg_ctl then fails to start.
+  const log = join(dir, 'postgres.log')
+  try {
+    execFileSync(postgres.pgCtl, ['-D', dataDir, '-l', log, '-o', `-p ${port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=${dir} -c wal_level=logical -c fsync=off -c synchronous_commit=off -c max_wal_senders=8 -c max_replication_slots=8`, '-w', 'start'], { stdio: 'ignore' })
+  } catch (err) {
+    if (existsSync(log)) process.stderr.write(readFileSync(log, 'utf8'))
+    throw err
+  }
   return { pgUrl: `postgres://postgres@127.0.0.1:${port}/postgres`, dir, port }
 }
 
@@ -136,6 +182,12 @@ async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string;
     env: {
       ...process.env,
       ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      // The DS test server is plain loopback HTTP with no store identity; without this the
+      // engine refuses to boot for want of ELECTRIC_CIRCUITS_DS_STORE_ID and friends. Needs an
+      // engine built with `--features test-support`.
+      ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST: '1',
+      // Every repetition owns a fresh DS data directory, so initialize its namespace on first boot.
+      ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE: '1',
       ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
       ELECTRIC_CIRCUITS_LOG: 'warn',
       ELECTRIC_CIRCUITS_PG_URL: pgUrl,
@@ -166,6 +218,28 @@ function procRssMib(pid: number | undefined): number {
   } catch {
     return 0
   }
+}
+
+/// utime + stime in clock ticks from /proc/<pid>/stat. `ps -o %cpu` divides by the process's
+/// whole lifetime, so a window's CPU is the difference of two of these over its wall time.
+function procCpuTicks(pid: number | undefined): number | null {
+  if (!pid || process.platform !== 'linux') return null
+  try {
+    // Fields after the parenthesised comm, which can itself contain spaces; utime and stime
+    // are fields 14 and 15 of the full line.
+    const rest = readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop()!.split(' ')
+    return Number(rest[11]) + Number(rest[12])
+  } catch {
+    return null
+  }
+}
+
+let clockTicks: number | undefined
+function clkTck(): number {
+  if (clockTicks === undefined) {
+    try { clockTicks = Number(execSync('getconf CLK_TCK').toString().trim()) || 100 } catch { clockTicks = 100 }
+  }
+  return clockTicks
 }
 
 /// macOS "phys footprint" — includes compressed pages, which `ps rss` excludes (idle
@@ -345,6 +419,65 @@ async function runWorkers(
   return { procs, stdout: outs, closes, ready: readiness }
 }
 
+type SteadyResult = {
+  updates: number
+  interval_ms: number
+  delivery_latency_ms: number[]
+  // Engine CPU over each interval between updates (update, delivery and the sleep after it).
+  cpu_percent: number[]
+  // Long polls that came back 204 or without advancing the offset; not in the latencies.
+  missed_deliveries: number
+  stream_url: string
+}
+
+async function runSteadyPhase(client: pgpkg.Client, enginePid: number | undefined, streamUrl: string): Promise<SteadyResult> {
+  const head = await fetch(streamUrl, { method: 'HEAD' })
+  if (!head.ok) throw new Error(`HEAD steady stream -> ${head.status}`)
+  let offset = head.headers.get('stream-next-offset') ?? '-1'
+  const delivery_latency_ms: number[] = []
+  const cpu_percent: number[] = []
+  let missed_deliveries = 0
+  let cpuTicks = procCpuTicks(enginePid)
+  let cpuAt = performance.now()
+  for (let i = 0; i < STEADY_UPDATES; i++) {
+    const pending = fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}&live=long-poll`, {
+      signal: AbortSignal.timeout(30000),
+    })
+    const committedAt = performance.now()
+    await client.query('UPDATE issues SET title = $1 WHERE id = 1', [`steady-${Date.now()}-${i}`])
+    const response = await pending
+    if (!response.ok && response.status !== 204) throw new Error(`steady stream -> ${response.status}`)
+    await response.arrayBuffer()
+    const deliveredAt = performance.now()
+    const next = response.headers.get('stream-next-offset')
+    // A 204 is DS's long-poll timeout: nothing was delivered, so its wait isn't a latency.
+    if (response.status === 204 || !next || next === offset) {
+      missed_deliveries++
+      // The missed update is still unread past `offset`; without resyncing, the next poll would
+      // return it at once and every later sample would be timed against the wrong update.
+      const tail = await fetch(streamUrl, { method: 'HEAD' })
+      offset = tail.headers.get('stream-next-offset') ?? next ?? offset
+    } else {
+      delivery_latency_ms.push(deliveredAt - committedAt)
+      offset = next
+    }
+    if (i + 1 < STEADY_UPDATES) await sleep(STEADY_INTERVAL_MS)
+    const ticks = procCpuTicks(enginePid)
+    const at = performance.now()
+    if (ticks !== null && cpuTicks !== null && at > cpuAt) {
+      cpu_percent.push(((ticks - cpuTicks) / clkTck()) / ((at - cpuAt) / 1000) * 100)
+    }
+    cpuTicks = ticks
+    cpuAt = at
+  }
+  return { updates: STEADY_UPDATES, interval_ms: STEADY_INTERVAL_MS, delivery_latency_ms, cpu_percent, missed_deliveries, stream_url: streamUrl }
+}
+
+function percentile(values: number[], p: number): number {
+  if (!values.length) return 0
+  const sorted = [...values].sort((a, b) => a - b)
+  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1)]!
+}
 async function stopWorkers(run: { procs: ChildProcess[]; closes: Promise<{ code: number | null; signal: NodeJS.Signals | null }>[] }): Promise<void> {
   run.procs.forEach((p) => {
     if (p.exitCode === null && p.signalCode === null) p.kill('SIGTERM')
@@ -381,6 +514,9 @@ async function main() {
 
   const engine = await spawnEngine(dsUrl, pg.pgUrl)
   await sleep(1500)
+  const engineIoStart = processIo(engine.proc.pid ?? undefined)
+  const storageDir = process.env.ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR
+  const storageBytesStart = directoryBytes(storageDir)
 
   let liveProcs: ChildProcess[] = []
   const liveRuns: Array<{
@@ -446,9 +582,32 @@ async function main() {
   // Phase-0 attribution hook (Task 0.2): once the final milestone has drained (creation storm
   // settled), snapshot /memory + vmmap --summary + footprint for the engine process. Additive —
   // no effect on the existing tables/rows when SCALE_ATTRIBUTION is unset.
+  const engineIoCold = processIo(engine.proc.pid ?? undefined)
+  const storageBytesCold = directoryBytes(storageDir)
+  const coldPhase = rows[rows.length - 1]!
   if (ATTRIBUTION) {
     await sleep(2000)
-    await writeAttributionSnapshot(engine.url, engine.proc.pid ?? undefined, ATTRIBUTION_DIR, ATTRIBUTION_LABEL)
+    await writeAttributionSnapshot(engine.url, engine.proc.pid ?? undefined, ATTRIBUTION_DIR, `${ATTRIBUTION_LABEL}-cold`)
+  }
+
+  // A dedicated status feed gives the steady phase a small, stable target.  HEAD captures
+  // its current tail, then each UPDATE is fenced by a long-poll response so the measured
+  // latency is commit-to-delivery rather than commit-to-request.
+  const steadyShape = await fetch(`${engine.url}/shapes`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ table: 'issues', where: { col: 'status', op: 'eq', value: 'backlog' } }),
+  })
+  if (!steadyShape.ok) throw new Error(`create steady shape -> ${steadyShape.status}`)
+  const steadyShapeJson = (await steadyShape.json()) as { streamUrl?: string }
+  if (!steadyShapeJson.streamUrl) throw new Error('steady shape did not return streamUrl')
+  const steady = await runSteadyPhase(client, engine.proc.pid ?? undefined, steadyShapeJson.streamUrl)
+  const engineIoSteady = processIo(engine.proc.pid ?? undefined)
+  const storageBytesSteady = directoryBytes(storageDir)
+  await sample('steady', createdUsers, requested + 1)
+  const steadyPhase = rows[rows.length - 1]!
+  if (ATTRIBUTION) {
+    await writeAttributionSnapshot(engine.url, engine.proc.pid ?? undefined, ATTRIBUTION_DIR, `${ATTRIBUTION_LABEL}-steady`)
   }
 
   // Hold live subscriptions — either one step (SCALE_LIVE_SUBS) or a ramp
@@ -537,6 +696,53 @@ async function main() {
     md.push(`| ${r.label} | ${r.liveMode} | ${r.users} | ${r.requested} | ${r.engineShapes} | ${r.engineRssMib.toFixed(1)} | ${r.engineFpMib.toFixed(1)} | ${r.dsRssMib.toFixed(1)} | ${r.card.subquery_nodes ?? 0} | ${r.card.subquery_contributors ?? 0} |`)
   }
   writeFileSync(OUT, md.join('\n') + '\n')
+  const summary = {
+    schema: 1,
+    config: {
+      issues: ISSUES,
+      projects: PROJECTS,
+      memberships_per_user: MEMBERSHIPS_PER_USER,
+      user_milestones: USER_MILESTONES,
+      client_procs: CLIENT_PROCS,
+      concurrency_per_proc: CONC_PER_PROC,
+      live_subs: LIVE_SUBS,
+      live_procs: LIVE_PROCS,
+      materialized: MATERIALIZED,
+      steady_updates: STEADY_UPDATES,
+      steady_interval_ms: STEADY_INTERVAL_MS,
+      storage_dir: storageDir ?? null,
+    },
+    phases: rows,
+    cold: coldPhase,
+    steady_phase: steadyPhase,
+    io: {
+      engine_start: engineIoStart,
+      engine_cold: engineIoCold,
+      engine_steady: engineIoSteady,
+      storage_bytes_start: storageBytesStart,
+      storage_bytes_cold: storageBytesCold,
+      storage_bytes_steady: storageBytesSteady,
+      cold_read_bytes: engineIoStart && engineIoCold ? engineIoCold.read_bytes - engineIoStart.read_bytes : null,
+      cold_write_bytes: engineIoStart && engineIoCold ? engineIoCold.write_bytes - engineIoStart.write_bytes : null,
+      steady_read_bytes: engineIoCold && engineIoSteady ? engineIoSteady.read_bytes - engineIoCold.read_bytes : null,
+      steady_write_bytes: engineIoCold && engineIoSteady ? engineIoSteady.write_bytes - engineIoCold.write_bytes : null,
+      spill_disk_bytes_cold: storageBytesCold - storageBytesStart,
+      spill_disk_bytes_steady: storageBytesSteady - storageBytesCold,
+    },
+    steady: {
+      ...steady,
+      latency_ms: {
+        p50: percentile(steady.delivery_latency_ms, 0.5),
+        p95: percentile(steady.delivery_latency_ms, 0.95),
+        max: Math.max(...steady.delivery_latency_ms, 0),
+      },
+      cpu_percent: {
+        mean: steady.cpu_percent.length ? steady.cpu_percent.reduce((a, b) => a + b, 0) / steady.cpu_percent.length : 0,
+        max: Math.max(...steady.cpu_percent, 0),
+      },
+    },
+  }
+  writeFileSync(join(dirname(OUT), 'raw-run.json'), JSON.stringify(summary, null, 2) + '\n')
   console.log(`wrote ${OUT}`)
   await cleanup()
   activeCleanup = undefined

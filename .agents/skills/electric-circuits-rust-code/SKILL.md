@@ -21,7 +21,7 @@ Use this skill for work in `apps/engine` (and its Rust/Cargo/CI support) when a 
 ## Read first
 
 1. Read `AGENTS.md`, then the relevant area of `docs/ARCHITECTURE.md` and any matching ADR in `docs/adr/` before proposing an engine change. Those documents define the durable behavior; do not restate or weaken them.
-2. Read the changed module, its neighboring tests, `rust-toolchain.toml`, root and engine `Cargo.toml`, `rustfmt.toml`, and `.github/workflows/ci.yml`. Keep the Rust 1.96.0 pin. The repository records `dbsp` ICEs on the tested newer releases named in `rust-toolchain.toml`; re-check that file and CI before changing the pin.
+2. Read the changed module, its neighboring tests, `rust-toolchain.toml`, root and engine `Cargo.toml`, `rustfmt.toml`, and `.github/workflows/ci.yml`. Keep the Rust 1.96.1 pin to meet dbsp 0.365's MSRV. The repository records `dbsp` ICEs on the tested newer releases named in `rust-toolchain.toml`; newer compilers still need re-checking against the current dbsp version and CI before changing the pin.
 3. Before editing, read [the production checklist's Boundary review, Test and evidence selection, and Validation matrix](references/production-rust.md). Then load its applicable errors/tasks/bounds/unsafe/observability section for the risk.
 
 ## Pre-edit workflow
