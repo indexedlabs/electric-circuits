@@ -769,7 +769,10 @@ pub struct GroupAbortTestGate {
 pub enum GroupLoadAwait {
     BeforeReservation,
     AfterReservation,
-    MemberCreate,
+    MemberCreate(usize),
+    RenewalHealth,
+    RenewalStreamTail,
+    RenewalSnapshot,
     StreamTail,
     Snapshot,
 }

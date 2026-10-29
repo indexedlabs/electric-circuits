@@ -1246,7 +1246,11 @@ async fn subset_load_group(
             // A teardown already owns this group.  Join it before probing storage: a transient
             // HEAD failure must not turn an in-flight release into a misleading health failure.
             release.wait().await.map_err(AppError::from)?;
-        } else if !engine.group_is_healthy(&existing).await.map_err(AppError::from)? {
+        } else if {
+            #[cfg(feature = "test-support")]
+            engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalHealth).await;
+            !engine.group_is_healthy(&existing).await.map_err(AppError::from)?
+        } {
             engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         } else if let Some(release) = engine.group_release_in_flight(&existing.id) {
             // Re-check after the health probe: a release can begin between that probe and the
@@ -1259,6 +1263,8 @@ async fn subset_load_group(
             if renewed_healthy {
                 // `None` once the stream has closed: a release that began after the renewal can
                 // have retired it while this request was between its probes.
+                #[cfg(feature = "test-support")]
+                engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalStreamTail).await;
                 let tail = engine.stream_tail(&existing.stream_path).await.map_err(|error| {
                     AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error))
                 })?;
@@ -1275,6 +1281,8 @@ async fn subset_load_group(
                             offset: None,
                         })
                         .collect();
+                    #[cfg(feature = "test-support")]
+                    engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalSnapshot).await;
                     let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
                     // Recheck under the state lock, where a release begins: a release that has
                     // not begun by now is ordered after this answer (#g-group-recheck).
@@ -1307,7 +1315,7 @@ async fn subset_load_group(
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
         #[cfg(feature = "test-support")]
-        engine.wait_group_load_gate_for_test(GroupLoadAwait::MemberCreate).await;
+        engine.wait_group_load_gate_for_test(GroupLoadAwait::MemberCreate(i)).await;
         match engine
             .create_shape_as_on_stream(
                 &member.table,

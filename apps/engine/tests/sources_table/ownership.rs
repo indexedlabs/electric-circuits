@@ -79,6 +79,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupMembersMax => group_members_max(&fixture).await,
             Case::GroupCompletionCuts => group_completion_cuts(&fixture).await,
             Case::GroupReleaseCancellation => group_release_cancellation(&fixture).await,
+            Case::GroupRenewalCancellation => group_renewal_cancellation(&fixture).await,
             Case::GroupReconnectBurst => group_reconnect_burst(&fixture).await,
             Case::GroupAdmission => group_admission_gate(&fixture).await,
         };
@@ -121,6 +122,7 @@ enum Case {
     GroupMembersMax,
     GroupCompletionCuts,
     GroupReleaseCancellation,
+    GroupRenewalCancellation,
     GroupReconnectBurst,
     GroupAdmission,
 }
@@ -300,6 +302,12 @@ fn group_completion_cuts_leave_no_claims_or_durable_group() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_release_cancelled_after_durability_still_completes() -> Result<()> {
     isolated("ownership::group_release_cancelled_after_durability_still_completes", Case::GroupReleaseCancellation)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_cancelled_at_each_renewal_await_keeps_the_group() -> Result<()> {
+    isolated("ownership::group_renewal_cancelled_at_each_renewal_await_keeps_the_group", Case::GroupRenewalCancellation)
 }
 
 #[test]
@@ -2216,7 +2224,8 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
         for (subscription, cut) in [
             ("group-cut-cancel-before-reservation", "cancel-before-reservation"),
             ("group-cut-cancel-after-reservation", "cancel-after-reservation"),
-            ("group-cut-cancel-member-create", "cancel-member-create"),
+            ("group-cut-cancel-member-create", "cancel-member-create-0"),
+            ("group-cut-cancel-member-create-1", "cancel-member-create-1"),
             ("group-cut-cancel-seed", "cancel-seed"),
             ("group-cut-cancel-stream-tail", "cancel-stream-tail"),
             ("group-cut-cancel-snapshot", "cancel-snapshot"),
@@ -2230,7 +2239,8 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let pre_durability_stage = match cut {
                 "cancel-before-reservation" => Some(GroupLoadAwait::BeforeReservation),
                 "cancel-after-reservation" => Some(GroupLoadAwait::AfterReservation),
-                "cancel-member-create" => Some(GroupLoadAwait::MemberCreate),
+                "cancel-member-create-0" => Some(GroupLoadAwait::MemberCreate(0)),
+                "cancel-member-create-1" => Some(GroupLoadAwait::MemberCreate(1)),
                 "cancel-stream-tail" => Some(GroupLoadAwait::StreamTail),
                 "cancel-snapshot" => Some(GroupLoadAwait::Snapshot),
                 _ => None,
@@ -2516,6 +2526,37 @@ async fn group_release_cancellation(f: &Fixture) -> Result<()> {
             status == StatusCode::OK,
             "subscription was not reusable after cancelled release: {status} {replacement}"
         );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_renewal_cancellation(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-renewal-cancel", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        for stage in [GroupLoadAwait::RenewalHealth, GroupLoadAwait::RenewalStreamTail, GroupLoadAwait::RenewalSnapshot]
+        {
+            let gate = engine.group_load_gate_for_test();
+            gate.arm(stage).await;
+            let renew_app = app.clone();
+            let renew_body = group_body(f, "group-renewal-cancel", true);
+            let renew = tokio::spawn(async move { post_group(&renew_app, renew_body).await });
+            tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+                .await
+                .context("renewal did not reach its cancellation gate")?;
+            renew.abort();
+            gate.release.notify_waiters();
+            ensure!(engine.has_group_record("group-renewal-cancel").await, "cancelled renewal lost the group");
+            ensure!(
+                engine.subscription_owner("group-renewal-cancel").await.is_some()
+                    && engine.subscription_owner("group-renewal-cancel:member:1").await.is_some(),
+                "cancelled renewal lost a member claim"
+            );
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
