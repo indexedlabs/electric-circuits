@@ -71,6 +71,9 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupLapse => group_lapse_reloads_same_subscription(&fixture).await,
             Case::GroupOneSubscription => group_one_subscription_claims(&fixture).await,
             Case::GroupRetryRenews => group_retry_renews(&fixture).await,
+            Case::GroupRenewalRelease => group_renewal_rechecks_a_racing_release(&fixture, false).await,
+            Case::GroupRenewalReleaseOpen => group_renewal_rechecks_a_racing_release(&fixture, true).await,
+            Case::GroupRenewalReplaced => group_renewal_follows_a_replacement(&fixture).await,
             Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
             Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
@@ -109,6 +112,9 @@ enum Case {
     GroupLapse,
     GroupOneSubscription,
     GroupRetryRenews,
+    GroupRenewalRelease,
+    GroupRenewalReleaseOpen,
+    GroupRenewalReplaced,
     GroupReleaseDuringAssembly,
     GroupRetirementDuringAssembly,
     GroupMembersMax,
@@ -239,6 +245,27 @@ fn group_retry_renews_after_a_dropped_response() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_never_answers_a_release_that_raced_it() -> Result<()> {
+    isolated("ownership::group_renewal_never_answers_a_release_that_raced_it", Case::GroupRenewalRelease)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_rechecks_a_release_that_has_not_closed_the_stream() -> Result<()> {
+    isolated(
+        "ownership::group_renewal_rechecks_a_release_that_has_not_closed_the_stream",
+        Case::GroupRenewalReleaseOpen,
+    )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_renews_a_same_members_replacement() -> Result<()> {
+    isolated("ownership::group_renewal_renews_a_same_members_replacement", Case::GroupRenewalReplaced)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_release_during_assembly_is_rejected_and_claims_survive() -> Result<()> {
     isolated(
         "ownership::group_release_during_assembly_is_rejected_and_claims_survive",
@@ -286,12 +313,21 @@ struct ObservedDs {
     retired: Arc<Mutex<Vec<(Method, String)>>>,
     closed: Arc<Mutex<HashSet<String>>>,
     delete_gates: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    /// Like `delete_gates`, for the `POST` that closes a stream: holds a release before its
+    /// stream closes. `close_gate_arrived` fires when one is held.
+    close_gates: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    close_gate_arrived: Arc<Notify>,
     fail_group_head_after_put: Arc<Mutex<bool>>,
     fail_next_group_head: Arc<Mutex<bool>>,
     /// Queued HEAD outcomes: `Some(status)` returns that status, while `None` passes through
     /// to the real store.  The latter lets a test target the post-renew probe without turning
     /// the pre-renew probe into a malformed 200 response.
     group_head_faults: Arc<Mutex<Vec<Option<u16>>>>,
+    /// Hold one group-stream HEAD: `Some(n)` passes `n` HEADs through and holds the next until
+    /// `group_head_release`, so a test can stop a renewal at a chosen storage probe.
+    hold_group_head_after: Arc<Mutex<Option<usize>>>,
+    group_head_arrived: Arc<Notify>,
+    group_head_release: Arc<Notify>,
     hold_group_catalog: Arc<Mutex<bool>>,
     hold_group_drop_id: Arc<Mutex<Option<String>>>,
     group_catalog_arrived: Arc<Notify>,
@@ -312,6 +348,24 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         }
     }
     if method == Method::HEAD && group_path {
+        let hold = {
+            let mut armed = ds.hold_group_head_after.lock().await;
+            match armed.as_mut() {
+                Some(0) => {
+                    *armed = None;
+                    true
+                }
+                Some(remaining) => {
+                    *remaining -= 1;
+                    false
+                }
+                None => false,
+            }
+        };
+        if hold {
+            ds.group_head_arrived.notify_one();
+            ds.group_head_release.notified().await;
+        }
         if let Some(Some(status)) = {
             let mut faults = ds.group_head_faults.lock().await;
             (!faults.is_empty()).then(|| faults.remove(0))
@@ -352,6 +406,20 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
             ds.group_catalog_release.notified().await;
         }
         request = AxumRequest::from_parts(parts, Body::from(bytes));
+    }
+    let close_gate = if closing {
+        ds.close_gates
+            .lock()
+            .await
+            .iter()
+            .find(|(suffix, _)| path.ends_with(suffix.as_str()))
+            .map(|(_, gate)| gate.clone())
+    } else {
+        None
+    };
+    if let Some(gate) = close_gate {
+        ds.close_gate_arrived.notify_one();
+        gate.notified().await;
     }
     let delete_gate = if method == Method::DELETE {
         ds.delete_gates
@@ -469,9 +537,14 @@ impl Fixture {
             retired: Arc::new(Mutex::new(Vec::new())),
             closed: Arc::new(Mutex::new(HashSet::new())),
             delete_gates: Arc::new(Mutex::new(HashMap::new())),
+            close_gates: Arc::new(Mutex::new(HashMap::new())),
+            close_gate_arrived: Arc::new(Notify::new()),
             fail_group_head_after_put: Arc::new(Mutex::new(false)),
             fail_next_group_head: Arc::new(Mutex::new(false)),
             group_head_faults: Arc::new(Mutex::new(Vec::new())),
+            hold_group_head_after: Arc::new(Mutex::new(None)),
+            group_head_arrived: Arc::new(Notify::new()),
+            group_head_release: Arc::new(Notify::new()),
             hold_group_catalog: Arc::new(Mutex::new(false)),
             hold_group_drop_id: Arc::new(Mutex::new(None)),
             group_catalog_arrived: Arc::new(Notify::new()),
@@ -1079,8 +1152,12 @@ async fn pause_group_delete(f: &Fixture, stream_path: &str) -> Arc<Notify> {
     gate
 }
 
+/// Open a delete gate for every DELETE it holds. Each member purge and the group release retire
+/// the same group stream, so several DELETEs can be waiting; `notify_one` alone would leave all
+/// but one parked. The extra permit covers a DELETE that took the gate but has not yet waited.
 async fn release_group_delete(f: &Fixture, stream_path: &str, gate: Arc<Notify>) {
     f.ds.delete_gates.lock().await.remove(stream_path);
+    gate.notify_waiters();
     gate.notify_one();
 }
 
@@ -1675,6 +1752,148 @@ async fn group_retry_renews(f: &Fixture) -> Result<()> {
             !retired.iter().any(|(method, path)| *method == Method::DELETE && path.ends_with(&old_path)),
             "post-renew HEAD outage deleted the healthy group stream: {retired:?}"
         );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// A retried load renews its group, then a release starts before the renewal answers. The
+/// renewal must never answer `200` with the stream that release is retiring (`#g-group-recheck`):
+/// it waits for the release and answers a fresh group on a new stream. With `before_close` the
+/// release is held before it closes the stream, so the renewal's tail read sees an open stream
+/// and only the recheck before answering can notice the release.
+async fn group_renewal_rechecks_a_racing_release(f: &Fixture, before_close: bool) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let subscription = "group-renewal-release";
+        let (status, first) = post_group(&app, group_body(f, subscription, true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("group stream path")?.to_owned();
+        let first_shape = first["results"][0]["shapeId"].as_str().context("first group member")?.to_owned();
+
+        // A renewal HEADs the group stream three times: the health probe before and after the
+        // renewal, then the stream-tail read for its answer. Hold the third, after the renewal.
+        *f.ds.hold_group_head_after.lock().await = Some(2);
+        let renew_app = app.clone();
+        let renew_body = group_body(f, subscription, true);
+        let mut renew = tokio::spawn(async move { post_group(&renew_app, renew_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+            .await
+            .context("renewal did not reach its stream-tail read")?;
+
+        // Release the group while the renewal is held, and hold its teardown either before the
+        // stream closes or after it has closed, before the stream is deleted.
+        let close_gate = Arc::new(Notify::new());
+        if before_close {
+            f.ds.close_gates.lock().await.insert(old_path.clone(), close_gate.clone());
+        }
+        let gate = pause_group_delete(f, &old_path).await;
+        let release_app = app.clone();
+        let release_task = tokio::spawn(async move {
+            json(
+                &release_app,
+                Method::DELETE,
+                &format!("/v1/shapes/{first_shape}?subscription={subscription}"),
+                Body::empty(),
+            )
+            .await
+        });
+        if before_close {
+            tokio::time::timeout(Duration::from_secs(10), f.ds.close_gate_arrived.notified())
+                .await
+                .context("group release did not reach its stream close")?;
+        } else {
+            wait_group_stream_closed(f, &old_path).await?;
+        }
+        f.ds.group_head_release.notify_one();
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut renew).await;
+        if before_close {
+            f.ds.close_gates.lock().await.remove(&old_path);
+            close_gate.notify_waiters();
+            close_gate.notify_one();
+        }
+        release_group_delete(f, &old_path, gate).await;
+        if let Ok(answered) = early {
+            let (status, body) = answered.context("renewal task failed")??;
+            ensure!(
+                !(status == StatusCode::OK && body["streamPath"].as_str() == Some(old_path.as_str())),
+                "renewal answered 200 with the stream its racing release is retiring: {body}"
+            );
+            anyhow::bail!("renewal answered before its racing release finished: {status} {body}");
+        }
+
+        let (release_status, release_body) = tokio::time::timeout(Duration::from_secs(15), release_task)
+            .await
+            .context("group release did not finish")?
+            .context("group release task failed")??;
+        ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release_body}");
+        let (status, fresh) = tokio::time::timeout(Duration::from_secs(15), renew)
+            .await
+            .context("renewal did not finish after the release")?
+            .context("renewal task failed")??;
+        ensure!(status == StatusCode::OK, "renewal after the release failed: {status} {fresh}");
+        let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
+        ensure!(new_path != old_path, "renewal answered the released group's stream");
+        ensure!(engine.has_group_record(subscription).await, "fresh group has no record");
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (7, 'renewal-release')", f.outer))
+            .await?;
+        let events = wait_group_events(f, new_path, 1).await?;
+        ensure!(
+            events.iter().any(|event| event_key(event).as_deref() == Some("7")),
+            "fresh group missed live output: {events:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// A retried load whose group is released and replaced by a load with the same members while
+/// the retry is still building its answer renews the replacement: it never answers the released
+/// stream, and never a `409` against a group with its own members (`#g-group-retry-renews`).
+async fn group_renewal_follows_a_replacement(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let subscription = "group-renewal-replaced";
+        let (status, first) = post_group(&app, group_body(f, subscription, true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("group stream path")?.to_owned();
+        let first_shape = first["results"][0]["shapeId"].as_str().context("first group member")?.to_owned();
+
+        // Hold the retry at its stream-tail read, after it has renewed the first group.
+        *f.ds.hold_group_head_after.lock().await = Some(2);
+        let renew_app = app.clone();
+        let renew_body = group_body(f, subscription, true);
+        let renew = tokio::spawn(async move { post_group(&renew_app, renew_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+            .await
+            .context("renewal did not reach its stream-tail read")?;
+
+        let (status, body) =
+            json(&app, Method::DELETE, &format!("/v1/shapes/{first_shape}?subscription={subscription}"), Body::empty())
+                .await?;
+        ensure!(status == StatusCode::OK, "group release failed: {status} {body}");
+        wait_group_stream_retired(f, &old_path).await?;
+        let (status, replacement) = post_group(&app, group_body(f, subscription, true)).await?;
+        ensure!(status == StatusCode::OK, "replacement load failed: {status} {replacement}");
+        let new_path = replacement["streamPath"].as_str().context("replacement stream path")?.to_owned();
+        ensure!(new_path != old_path, "replacement reused the released stream");
+
+        f.ds.group_head_release.notify_one();
+        let (status, renewed) = tokio::time::timeout(Duration::from_secs(15), renew)
+            .await
+            .context("held renewal did not finish")?
+            .context("renewal task failed")??;
+        ensure!(status == StatusCode::OK, "held renewal did not renew the replacement: {status} {renewed}");
+        ensure!(
+            renewed["streamPath"].as_str() == Some(new_path.as_str()),
+            "held renewal answered another stream than the replacement's {new_path}: {renewed}"
+        );
+        ensure!(renewed["groupId"] == replacement["groupId"], "held renewal answered another group: {renewed}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
