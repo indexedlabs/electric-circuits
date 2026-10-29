@@ -2,9 +2,10 @@
 
 Work in progress, not for merge. Correctness is still being validated by CI; four independent
 five-repetition PostgreSQL 18 benchmarks completed on the preserved production tree at
-`48501cd`, `9086025`, `8a93697` and `1d7bbbc`. The measurements below are prototype evidence,
-not release qualification. All four runs show higher semijoin DBSP state, slower delivery and
-higher engine CPU; restart cost remains unavailable.
+`48501cd`, `9086025`, `8a93697` and `1d7bbbc`, followed by one five-repetition rerun on the
+compensation tree at `d26818d`. The measurements below are prototype evidence, not release
+qualification. All five runs show higher semijoin DBSP state, slower delivery and higher engine
+CPU; restart cost remains unavailable.
 The `48501cd` benchmark predates the later in-place rollback correction, but this workload does
 not cancel groups, so that path is not exercised by its measurements.
 
@@ -372,6 +373,34 @@ downloaded; its four raw JSON files have SHA-256 hashes
 `20d057092bf1b19d5d14f09f04fddecd41e38684e55a66e563e0595c621ba324`, and
 `0a553828a6589739e868d4bc99b71ddb103cfcd3afb99e8ac194c63c5a045796`.
 
+The follow-up benchmark job `123248987339` (run `40810672853`) produced artifact `12871519030`,
+named `semijoin-vs-subquery-57e8af2775909e2d66439efa33cbe3c69eb0c69d`, with digest
+`sha256:91119d8f9b0440de7a27ebd76d57d3b022c1446389ab17de0a72a531f368e1c6`. It ran the same
+five repetitions on the compensation tree. Its medians (subquery/semijoin) were cold load
+12,718/12,644 ms, cold RSS 76/78 MiB, cold DBSP 34,212/51,568 bytes, steady load 4,075/4,102 ms,
+steady RSS 77/74 MiB, steady DBSP 65,092/94,512 bytes, actual reads/change 2.661/2.706,
+delivery p50/p90 454/653 and 1,114/1,641 ms, engine CPU 1,310/2,610 ms, and gateway CPU
+4,756/4,628 ms. Its raw JSON files have SHA-256 hashes
+`18bf1de5a48bfa8997a01d597cac099a39ba0fba6da0e52cc6b16940bddab542`,
+`db6a16e460e9d34cbcb1c0a2f9c5b71034b79355a5bf31f31eed05dc9866abb3`,
+`0803747ac7cad8b968a87157c2923fda82b5021ab68a800fed1f2a576bb66fb0`, and
+`55e67c8d5551a373c258b5138eba9ae3025d0adcc4b9dd5afd3cab64c3356dcb`. The cancellation-free
+workload does not exercise the compensation path; the rerun is consistent with the four earlier
+artifacts and is included as a fifth replicate for record keeping.
+
+The current-head benchmark job `123263148983` (run `40815711977`) produced artifact `12873937219`,
+named `semijoin-vs-subquery-1ba7c25778380872dfd0e1c8dbe3561b9e5caba7`, with digest
+`sha256:77b83847327a20a22179a319489188ca32b87cd4ce7e07e3c94693a97edf34a6`. Its medians
+(subquery/semijoin) were cold load 13,039/13,079 ms, cold RSS 75/75 MiB, cold DBSP
+34,212/51,568 bytes, steady load 4,317/4,293 ms, steady RSS 71/69 MiB, steady DBSP
+65,092/94,512 bytes, actual reads/change 2.661/2.700, delivery p50/p90 565/683 and 1,360/2,098
+ms, engine CPU 1,940/3,120 ms, and gateway CPU 4,784/4,544 ms. Its raw JSON files have SHA-256
+hashes `0d0efbc8f488b97fba02fdad477fea6e9bbc127af526ec4ce5d0941b34aadccc`,
+`83373603463be53cb84240c3791387e734b9977bbee2bb21f61dc33cb6d93cf4`,
+`897b4b41ecf3bae26cc6167f7551449b7acb9103ff675a9cfc63809aa5962b21`, and
+`ceae48621b6449c2982844d2e05f292d51a8347e4c988b19b0fd8268e80f2463`. This second compensation-tree
+rerun is also cancellation-free and confirms the same direction.
+
 Commits `67b4dc7` and `47037ed` corrected earlier transcription errors by re-extracting every
 median from the downloaded JSON files. The extraction script emits per-directory medians; the
 checked-in manifest wraps those values with commit/artifact metadata and source-file SHA-256 keys
@@ -386,6 +415,8 @@ below use the load-time extraction.
 | 9086025 | 34,212 / 51,568 | 65,092 / 94,512 | 530/684 / 1,282/2,035 | 2,000 / 3,070 |
 | 8a93697 | 34,212 / 51,568 | 65,092 / 94,512 | 507/687 / 936/1,423 | 1,100 / 2,230 |
 | 1d7bbbc | 34,212 / 51,568 | 65,092 / 94,512 | 519/735 / 1,282/2,045 | 2,070 / 3,180 |
+| d26818d follow-up | 34,212 / 51,568 | 65,092 / 94,512 | 454/653 / 1,114/1,641 | 1,310 / 2,610 |
+| 2230b32 follow-up | 34,212 / 51,568 | 65,092 / 94,512 | 565/683 / 1,360/2,098 | 1,940 / 3,120 |
 
 Values in each cell are subquery / semijoin; the runs are reported separately, not pooled.
 
@@ -476,12 +507,12 @@ passed but observed only that a replacement could claim the group. The current f
 injected failure to the actual durable wait path and checks each member's catalog `Left` directly.
 The merged `d26818d` tree is green in both membership modes with the rollback contract unskipped,
 the default Rust engine suite, Vitest/conformance, rustfmt, and all three featureless images
-(`40810672853`, test job `123239956655`, engine image `123239956961`). The scope-benchmark job is
-rerunning on this tree; the four completed five-repetition artifacts remain the performance evidence.
-The benchmark production tree remains the one preserved by `1d7bbbc`. Follow-up `24e985c` then
-removed the shutdown barrier bypass while cleaning comments; its group and full Rust lanes went red
-because shutdown-owned compensation waited on the held `member_retry` barrier. `68f7a49` restores
-that bypass with the shutdown ordering rationale; its exact-head result is pending.
+(`40810672853`, test job `123239956655`, engine image `123239956961`). The current head `2230b32`
+then passed the same correctness and image lanes (`40815711977`, test job `123256148452`, engine
+image `123256148576`) and its scope-benchmark job passed (`123263148983`, artifact `12873937219`).
+Follow-up `24e985c` removed the shutdown barrier bypass while cleaning comments; its group and full
+Rust lanes went red because shutdown-owned compensation waited on the held `member_retry` barrier.
+`68f7a49` restores that bypass with the shutdown ordering rationale; `2230b32` records the regression.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` for group members,
@@ -539,10 +570,10 @@ only the October 25 scope-load/read-scaling changes.
 
 ## Recommendation
 
-The four completed artifacts were re-derived from their raw JSON manifests; earlier transcription
+The six completed artifacts were re-derived from their raw JSON manifests; earlier transcription
 had mixed load-time and hold-end DBSP fields, so this report uses the load-time field for both
-scenarios and records hold-end values separately. All four completed five-repetition runs miss
-the decision threshold. Semijoin DBSP used bytes are about 51% higher cold and 45% higher steady
+scenarios and records hold-end values separately. The four preserved-tree runs miss the decision
+threshold, and both compensation-tree follow-ups are consistent with them. Semijoin DBSP used bytes are about 51% higher cold and 45% higher steady
 in every run; the hold-end snapshots are about 76% higher cold and 45–59% higher steady. Delivery
 is about 1.8–3.0× slower at
 p50/p90, and engine CPU is about 53–103% higher. Process RSS is noisy across runs: semijoin is
