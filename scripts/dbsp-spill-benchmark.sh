@@ -5,6 +5,9 @@ set -euo pipefail
 # shape-mem-scale harness with membership storage enabled.  Each run gets a new worktree,
 # spill directory and artifact directory; no result is reused between revisions or reps.
 
+# Each worktree builds with the toolchain its own rust-toolchain.toml pins.
+unset RUSTUP_TOOLCHAIN
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 base_input=${BASE_SHA:?BASE_SHA is required}
 head_sha=${HEAD_SHA:?HEAD_SHA is required}
@@ -20,10 +23,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-git -C "$repo_root" fetch --no-tags origin "$base_input" "$head_sha"
+# A branch name given to a dispatch isn't a local ref, so the base resolves through FETCH_HEAD.
+git -C "$repo_root" fetch --no-tags origin "$base_input"
+base_tip=$(git -C "$repo_root" rev-parse FETCH_HEAD)
+git -C "$repo_root" fetch --no-tags origin "$head_sha"
 # The baseline is the point the candidate branched from, so a base branch that moved after
 # the branch was cut doesn't leak unrelated changes into the comparison.
-base_sha=$(git -C "$repo_root" merge-base "$base_input" "$head_sha")
+base_sha=$(git -C "$repo_root" merge-base "$base_tip" "$head_sha")
 git -C "$repo_root" worktree add --detach "$work_root/base" "$base_sha"
 git -C "$repo_root" worktree add --detach "$work_root/head" "$head_sha"
 # Both revisions run the candidate's harness, so the two sides take the same measurements and
@@ -36,6 +42,7 @@ run_revision() {
   local out="$artifact_root/$name"
   mkdir -p "$out"
   printf '%s\n' "$sha" > "$out/commit.txt"
+  (cd "$tree" && rustc --version) >> "$out/commit.txt"
   (cd "$tree" && pnpm install --frozen-lockfile)
   (cd "$tree" && cargo build --release --locked -p electric-circuits-engine --features test-support)
 
@@ -92,7 +99,11 @@ def metrics(rev, rep):
     profile_cold = json.loads((raw / f"attribution-{rev}-rep-{rep}-cold-dbsp-profile.json").read_text())
     profile_steady = json.loads((raw / f"attribution-{rev}-rep-{rep}-steady-dbsp-profile.json").read_text())
     for phase, profile in (("cold", profile_cold), ("steady", profile_steady)):
-        if profile.get("error") or profile.get("membership_circuit", {}).get("error"):
+        mcp = profile.get("membership_circuit", {})
+        # A failed profiler read comes back as 0 bytes with the error under `profile`, and an
+        # unparseable dump as a string; either would read as a real zero in the table.
+        inner = mcp.get("profile")
+        if profile.get("error") or mcp.get("error") or isinstance(inner, str) or (isinstance(inner, dict) and inner.get("error")):
             raise SystemExit(f"{rev} rep {rep} {phase} dbsp profile is an error: {profile}")
     mc = profile_cold["membership_circuit"]
     ms = profile_steady["membership_circuit"]
@@ -118,6 +129,7 @@ def metrics(rev, rep):
         "delivery_max_ms": s["latency_ms"]["max"],
         "cpu_mean_percent": s["cpu_percent"]["mean"],
         "cpu_max_percent": s["cpu_percent"]["max"],
+        "missed_deliveries": s["missed_deliveries"],
     }
 
 rows = []
@@ -130,12 +142,12 @@ print("# dbsp 0.318 vs 0.365 spill and memory comparison")
 print()
 print(f"Baseline commit: `{base_sha}` (merge-base); candidate commit: `{head_sha}`; repetitions: {reps} per revision, sequential on one runner. Both revisions ran the candidate's `shape-mem-scale.ts`.")
 print("Workload: `shape-mem-scale.ts`, 100,000 issues, 2,000 projects, 6 memberships/user, milestones 1,000/2,500/5,000/10,000 users, 64 MiB DBSP cache, membership spill enabled, then 20 steady updates at 250 ms, then 20,000 held live feeds.")
-print("`cold` covers seeding and shape creation through the final milestone. `steady` runs after it and before the live feeds are held: it measures commit-to-feed delivery for 20 fenced long-poll updates that change only `issues.title`, so it does not exercise membership-relation spill and its spill-directory delta is expected to be near zero; read the cold columns for the LZ4 comparison. Engine process I/O is recorded from `/proc/<pid>/io`; the dedicated DBSP storage directory is scanned for on-disk bytes. The I/O counters include other engine file I/O and are retained as raw evidence rather than treated as DBSP-only counters.")
+print("`cold` covers seeding and shape creation through the final milestone. `steady` runs after it and before the live feeds are held: it measures commit-to-feed delivery for 20 fenced long-poll updates that change only `issues.title`, so it does not exercise membership-relation spill and its spill-directory delta is expected to be near zero; read the cold columns for the LZ4 comparison. Steady CPU is the engine's utime+stime from `/proc/<pid>/stat` over each interval between updates, not its lifetime average; steady latencies exclude long polls that timed out (counted as missed). Engine process I/O is recorded from `/proc/<pid>/io`; the dedicated DBSP storage directory is scanned for on-disk bytes. The I/O counters include other engine file I/O and are retained as raw evidence rather than treated as DBSP-only counters.")
 print()
-print("| revision | rep | cold RSS MiB | membership bytes | integral bytes | snapshot bytes | DBSP used bytes | DBSP storage bytes | cold spill dir bytes | cold read bytes | cold write bytes | steady RSS MiB | steady DBSP used | steady DBSP storage | steady p50 ms | steady p95 ms | steady CPU mean % | steady CPU max % | steady spill dir delta |")
-print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+print("| revision | rep | cold RSS MiB | membership bytes | integral bytes | snapshot bytes | DBSP used bytes | DBSP storage bytes | cold spill dir bytes | cold read bytes | cold write bytes | steady RSS MiB | steady DBSP used | steady DBSP storage | steady p50 ms | steady p95 ms | steady CPU mean % | steady CPU max % | steady missed deliveries | steady spill dir delta |")
+print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
 for rev, rep, sha, m, raw_hash in rows:
-    print(f"| {rev} | {rep} | {m['cold_rss_mib']:.1f} | {m['cold_membership_bytes']} | {m['cold_integral_bytes']} | {m['cold_snapshot_bytes']} | {m['cold_profile_used_bytes']} | {m['cold_profile_storage_bytes']} | {m['cold_spill_disk_bytes']} | {m['cold_io_read_bytes']} | {m['cold_io_write_bytes']} | {m['steady_rss_mib']:.1f} | {m['steady_profile_used_bytes']} | {m['steady_profile_storage_bytes']} | {m['delivery_p50_ms']:.2f} | {m['delivery_p95_ms']:.2f} | {m['cpu_mean_percent']:.2f} | {m['cpu_max_percent']:.2f} | {m['steady_spill_disk_bytes']} |")
+    print(f"| {rev} | {rep} | {m['cold_rss_mib']:.1f} | {m['cold_membership_bytes']} | {m['cold_integral_bytes']} | {m['cold_snapshot_bytes']} | {m['cold_profile_used_bytes']} | {m['cold_profile_storage_bytes']} | {m['cold_spill_disk_bytes']} | {m['cold_io_read_bytes']} | {m['cold_io_write_bytes']} | {m['steady_rss_mib']:.1f} | {m['steady_profile_used_bytes']} | {m['steady_profile_storage_bytes']} | {m['delivery_p50_ms']:.2f} | {m['delivery_p95_ms']:.2f} | {m['cpu_mean_percent']:.2f} | {m['cpu_max_percent']:.2f} | {m['missed_deliveries']} | {m['steady_spill_disk_bytes']} |")
     print(f"  - raw-run SHA-256: `{raw_hash}`; all files: `{(root / rev / f'rep-{rep}' / 'artifact-sha256sums.txt').relative_to(root)}`")
 print()
 for rev in ("baseline", "candidate"):

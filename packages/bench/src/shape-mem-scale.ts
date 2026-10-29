@@ -199,9 +199,26 @@ function procRssMib(pid: number | undefined): number {
   }
 }
 
-function procCpuPercent(pid: number | undefined): number {
-  if (!pid) return 0
-  try { return Number(execSync(`ps -o %cpu= -p ${pid}`).toString().trim()) || 0 } catch { return 0 }
+/// utime + stime in clock ticks from /proc/<pid>/stat. `ps -o %cpu` divides by the process's
+/// whole lifetime, so a window's CPU is the difference of two of these over its wall time.
+function procCpuTicks(pid: number | undefined): number | null {
+  if (!pid || process.platform !== 'linux') return null
+  try {
+    // Fields after the parenthesised comm, which can itself contain spaces; utime and stime
+    // are fields 14 and 15 of the full line.
+    const rest = readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop()!.split(' ')
+    return Number(rest[11]) + Number(rest[12])
+  } catch {
+    return null
+  }
+}
+
+let clockTicks: number | undefined
+function clkTck(): number {
+  if (clockTicks === undefined) {
+    try { clockTicks = Number(execSync('getconf CLK_TCK').toString().trim()) || 100 } catch { clockTicks = 100 }
+  }
+  return clockTicks
 }
 
 /// macOS "phys footprint" — includes compressed pages, which `ps rss` excludes (idle
@@ -370,7 +387,10 @@ type SteadyResult = {
   updates: number
   interval_ms: number
   delivery_latency_ms: number[]
+  // Engine CPU over each interval between updates (update, delivery and the sleep after it).
   cpu_percent: number[]
+  // Long polls that came back 204 or without advancing the offset; not in the latencies.
+  missed_deliveries: number
   stream_url: string
 }
 
@@ -380,6 +400,9 @@ async function runSteadyPhase(client: pgpkg.Client, enginePid: number | undefine
   let offset = head.headers.get('stream-next-offset') ?? '-1'
   const delivery_latency_ms: number[] = []
   const cpu_percent: number[] = []
+  let missed_deliveries = 0
+  let cpuTicks = procCpuTicks(enginePid)
+  let cpuAt = performance.now()
   for (let i = 0; i < STEADY_UPDATES; i++) {
     const pending = fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}&live=long-poll`, {
       signal: AbortSignal.timeout(30000),
@@ -389,13 +412,22 @@ async function runSteadyPhase(client: pgpkg.Client, enginePid: number | undefine
     const response = await pending
     if (!response.ok && response.status !== 204) throw new Error(`steady stream -> ${response.status}`)
     await response.arrayBuffer()
+    const deliveredAt = performance.now()
     const next = response.headers.get('stream-next-offset')
+    // A 204 is DS's long-poll timeout: nothing was delivered, so its wait isn't a latency.
+    if (response.status === 204 || !next || next === offset) missed_deliveries++
+    else delivery_latency_ms.push(deliveredAt - committedAt)
     if (next) offset = next
-    delivery_latency_ms.push(performance.now() - committedAt)
-    cpu_percent.push(procCpuPercent(enginePid))
     if (i + 1 < STEADY_UPDATES) await sleep(STEADY_INTERVAL_MS)
+    const ticks = procCpuTicks(enginePid)
+    const at = performance.now()
+    if (ticks !== null && cpuTicks !== null && at > cpuAt) {
+      cpu_percent.push(((ticks - cpuTicks) / clkTck()) / ((at - cpuAt) / 1000) * 100)
+    }
+    cpuTicks = ticks
+    cpuAt = at
   }
-  return { updates: STEADY_UPDATES, interval_ms: STEADY_INTERVAL_MS, delivery_latency_ms, cpu_percent, stream_url: streamUrl }
+  return { updates: STEADY_UPDATES, interval_ms: STEADY_INTERVAL_MS, delivery_latency_ms, cpu_percent, missed_deliveries, stream_url: streamUrl }
 }
 
 function percentile(values: number[], p: number): number {

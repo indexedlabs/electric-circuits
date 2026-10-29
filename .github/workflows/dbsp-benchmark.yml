@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       base:
-        description: Baseline commit or ref; the comparison uses its merge-base with head
+        description: Baseline commit or branch name; the comparison uses its merge-base with head
         required: true
       head:
         description: Candidate commit
@@ -18,6 +18,10 @@ on:
 jobs:
   compare:
     if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'dbsp-benchmark'
+    # Re-adding the label while a run is in flight queues behind it rather than doubling up.
+    concurrency:
+      group: dbsp-benchmark-${{ github.event.pull_request.number || inputs.head }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
