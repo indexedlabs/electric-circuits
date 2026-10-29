@@ -4192,7 +4192,7 @@ mod cancellation_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn complete_group_rejects_a_missing_member_claim() {
         let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
-        let ds = DsClient::with_test_store("scripted://group-invalid-completion".into(), store);
+        let ds = DsClient::with_test_store("scripted://group-invalid-completion".into(), store.clone());
         let (engine, group) = engine_with_group_claim_ds(ds).await;
         let mut invalid = group.clone();
         invalid.subscription = "scope-invalid".into();
@@ -4209,8 +4209,22 @@ mod cancellation_tests {
             st.subscribe("member-1", "scope-invalid:member:1".into(), crate::changelog::now_secs());
             st.unsubscribe("member-1", "scope-invalid:member:1");
         }
-        assert!(engine.complete_group(invalid).await.is_err());
+        for member in &invalid.members {
+            engine.state.lock().await.shapes.get_mut(&member.shape_id).unwrap().stream_path =
+                invalid.stream_path.clone();
+        }
+        engine.ds.ensure_stream(&invalid.stream_path).await.unwrap();
+        let error =
+            engine.complete_group(invalid.clone()).await.expect_err("missing member claim must reject completion");
+        assert!(error.downcast_ref::<crate::engine::GroupStreamClosed>().is_some(), "wrong error: {error:#}");
         assert!(engine.group_record("scope-invalid").await.is_none());
+        let appended = store.appended.lock().unwrap().clone();
+        assert!(
+            appended
+                .iter()
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap_or_default())
+                .any(|event| event["t"] == "groupDropped" && event["subscription"] == "scope-invalid")
+        );
         engine.close(std::time::Duration::from_secs(1)).await;
     }
 
@@ -4223,6 +4237,12 @@ mod cancellation_tests {
         let ds = DsClient::with_test_store("scripted://group-purge-complete-order".into(), store);
         let (engine, group) = engine_with_group_claim_ds(ds).await;
         engine.ds.ensure_stream(&group.stream_path).await.unwrap();
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+        }
         for member in &group.members {
             engine.state.lock().await.shapes.get_mut(&member.shape_id).unwrap().stream_path = group.stream_path.clone();
         }

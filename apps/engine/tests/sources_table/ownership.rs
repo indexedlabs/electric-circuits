@@ -2133,6 +2133,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
     let result = async {
         for (subscription, cut) in [
             ("group-cut-cancel", "cancel"),
+            ("group-cut-cancel-head", "cancel-head"),
             ("group-cut-closed", "closed"),
             ("group-cut-truncate", "truncate"),
             ("group-cut-degraded", "degraded"),
@@ -2150,7 +2151,12 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 .await
                 .map(|shape| shape.stream_path)
                 .context("group cut did not install its member stream")?;
-            if cut == "closed" {
+            if cut == "cancel" || cut == "cancel-head" {
+                *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
+            }
+            if cut == "cancel-head" {
+                *f.ds.hold_group_head_after.lock().await = Some(0);
+            } else if cut == "closed" {
                 f.ds.closed.lock().await.insert(group_path.clone());
             } else if cut == "truncate" {
                 f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
@@ -2179,7 +2185,20 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             }
             *f.ds.hold_group_catalog.lock().await = false;
             f.ds.group_catalog_release.notify_one();
-            if cut != "cancel" {
+            if cut == "cancel-head" {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+                    .await
+                    .context("post-durability HEAD did not reach its gate")?;
+                load.abort();
+                f.ds.group_head_release.notify_one();
+            }
+            if cut == "cancel" || cut == "cancel-head" {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("cancel cleanup did not reach GroupDropped durability")?;
+                f.ds.group_catalog_release.notify_one();
+            }
+            if cut != "cancel" && cut != "cancel-head" {
                 let (status, body) = tokio::time::timeout(Duration::from_secs(15), &mut load)
                     .await
                     .context("group cut load did not finish")?
@@ -2204,7 +2223,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
                 "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
             );
-            if cut == "cancel" || cut == "closed" {
+            if cut == "cancel" || cut == "cancel-head" || cut == "closed" {
                 let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
                 ensure!(status == StatusCode::OK, "compensated group could not be retried: {status} {body}");
             }
@@ -2227,17 +2246,39 @@ async fn group_reconnect_burst(f: &Fixture) -> Result<()> {
             let body = group_body(f, &format!("group-burst-{i}"), true);
             tasks.push(tokio::spawn(async move { post_group(&app, body).await }));
         }
+        let mut first = Vec::new();
         for (i, task) in tasks.into_iter().enumerate() {
             let (status, body) = task.await.context("burst load task failed")??;
             ensure!(status == StatusCode::OK, "burst load {i} was not admitted: {status} {body}");
+            first.push((
+                body["groupId"].as_str().unwrap_or_default().to_owned(),
+                body["streamPath"].as_str().unwrap_or_default().to_owned(),
+                body["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|member| member["shapeId"].as_str().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>(),
+            ));
         }
         for i in 0..30 {
             let (status, body) = post_group(&app, group_body(f, &format!("group-burst-{i}"), true)).await?;
             ensure!(status == StatusCode::OK, "burst renewal {i} was not idempotent: {status} {body}");
+            ensure!(
+                body["groupId"] == first[i].0 && body["streamPath"] == first[i].1,
+                "burst renewal changed group identity: {body}"
+            );
+            let members = body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|member| member["shapeId"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>();
+            ensure!(members == first[i].2, "burst renewal changed member identities: {body}");
         }
         ensure!(
-            engine.graph().await.shapes.iter().filter(|shape| shape.stream_path.contains("shape/group-")).count() >= 60,
-            "burst did not retain both members for every group"
+            engine.graph().await.shapes.iter().filter(|shape| shape.stream_path.contains("shape/group-")).count() == 60,
+            "burst changed exact shape count"
         );
         Ok::<_, anyhow::Error>(())
     }

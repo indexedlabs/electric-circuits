@@ -3202,6 +3202,11 @@ impl Engine {
     }
 
     #[cfg(feature = "test-support")]
+    pub async fn group_reservation_for_test(&self, subscription: &str) -> bool {
+        self.state.lock().await.group_claims.is_reserved(subscription)
+    }
+
+    #[cfg(feature = "test-support")]
     pub fn group_seed_gate_for_test(&self) -> Arc<GroupSeedTestGate> {
         self.group_seed_test_gate.clone()
     }
