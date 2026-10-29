@@ -459,12 +459,12 @@ job `123141177393`), `ee7667a` (`40781440354`, job `123143837823`) and `21be5d6`
 (`40782847956`, job `123148605838`) were also red; `ee7667a` moved the fault-cut variables
 before engine startup, which ruled out the environment-ordering hypothesis, and `21be5d6` moved
 cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compile-red because
-the integration hook was private. The current head is `feadedb`, which includes the one-line
-formatter fix and CI diagnostics that print each membership mode and child contract output. Its
-exact test job `123179345889` (run `40792037118`) was started on the preceding `0d6aff0` tree and
-therefore remains evidence for that predecessor only; a fresh run on `feadedb` is required. The
-benchmark production tree remains the one preserved by `1d7bbbc`, while this candidate's
-compensation path still requires its own green test job.
+the integration hook was private. `0d6aff0` (`40792037118`, job `123179345889`) was red in
+rustfmt, group contracts and Rust engine tests; `feadedb` added CI diagnostics, and `a5c66a5`
+is the current docs-only head. Its exact test job `123191825709` (run `40795789456`) is
+rustfmt-green but group-contract-red in both modes, so no head containing the compensation
+change has a green qualification. The benchmark production tree remains the one preserved by
+`1d7bbbc`, while this candidate's compensation path still requires its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
