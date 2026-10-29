@@ -1415,7 +1415,7 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     let base = barrier.to_string_lossy().into_owned();
     let subscription = "group-rollback-cancel";
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "member_retry") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback,member_retry") };
     unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "member_release") };
     let fired = format!("{base}.rollback.release-fired");
     // Set the fault-cut variables before starting the engine.  The engine owns worker threads
@@ -1430,6 +1430,19 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
             let app = app.clone();
             async move { post_group(&app, request).await }
         });
+        let rollback_ready = PathBuf::from(format!("{base}.rollback.ready"));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if std::fs::read_to_string(&rollback_ready).map_or(0, |contents| contents.lines().count()) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("waiting for rollback barrier before fault arm")?;
+        electric_circuits_engine::http::test_arm_release_after_unsubscribe();
+        std::fs::write(format!("{base}.rollback.release"), b"1")?;
         let retry_ready = PathBuf::from(format!("{base}.member_retry.ready"));
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
