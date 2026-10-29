@@ -59,7 +59,7 @@ run_revision() {
       cd "$tree"
       SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_MEMBERSHIPS=6 \
       SCALE_USERS=1000,2500,5000,10000 SCALE_CLIENT_PROCS=4 SCALE_CONC_PER_PROC=12 \
-      SCALE_LIVE_SUBS=20000 SCALE_LIVE_PROCS=8 SCALE_LIVE_HOLD_MS=15000 SCALE_MATERIALIZED=1 \
+      SCALE_LIVE_SUBS=0 SCALE_MATERIALIZED=1 \
       SCALE_STEADY_UPDATES=20 SCALE_STEADY_INTERVAL_MS=250 \
       SCALE_ATTRIBUTION=1 SCALE_ATTRIBUTION_LABEL="$name-rep-$rep" \
       SCALE_OUT="$run/shape-memory-scale.md" SCALE_ATTRIBUTION_DIR="$run/raw" \
@@ -146,8 +146,8 @@ for rev, sha in (("baseline", base_sha), ("candidate", head_sha)):
 print("# dbsp 0.318 vs 0.365 spill and memory comparison")
 print()
 print(f"Baseline commit: `{base_sha}` (merge-base); candidate commit: `{head_sha}`; repetitions: {reps} per revision, sequential on one runner. Both revisions ran the candidate's `shape-mem-scale.ts`.")
-print("Workload: `shape-mem-scale.ts`, 100,000 issues, 2,000 projects, 6 memberships/user, milestones 1,000/2,500/5,000/10,000 users, 64 MiB DBSP cache, membership spill enabled, then 20 steady updates at 250 ms, then 20,000 held live feeds.")
-print("`cold` covers seeding and shape creation through the final milestone. `steady` runs after it and before the live feeds are held: it measures commit-to-feed delivery for 20 fenced long-poll updates that change only `issues.title`, so it does not exercise membership-relation spill and its spill-directory delta is expected to be near zero; read the cold columns for the LZ4 comparison. Steady CPU is the engine's utime+stime from `/proc/<pid>/stat` over each interval between updates, not its lifetime average; steady latencies exclude long polls that timed out (counted as missed). Engine process I/O is recorded from `/proc/<pid>/io`; the dedicated DBSP storage directory is scanned for on-disk bytes. The I/O counters include other engine file I/O and are retained as raw evidence rather than treated as DBSP-only counters.")
+print("Workload: `shape-mem-scale.ts`, 100,000 issues, 2,000 projects, 6 memberships/user, milestones 1,000/2,500/5,000/10,000 users, 64 MiB DBSP cache, membership spill enabled, then 20 steady updates at 250 ms. No live feeds are held: the comparison reads only the cold and steady phases.")
+print("`cold` covers seeding and shape creation through the final milestone. `steady` runs after it: it measures commit-to-feed delivery for 20 fenced long-poll updates that change only `issues.title`, so it does not exercise membership-relation spill and its spill-directory delta is expected to be near zero; read the cold columns for the LZ4 comparison. Steady CPU is the engine's utime+stime from `/proc/<pid>/stat` over each interval between updates, not its lifetime average; steady latencies exclude long polls that timed out (counted as missed). Engine process I/O is recorded from `/proc/<pid>/io`; the dedicated DBSP storage directory is scanned for on-disk bytes. The I/O counters include other engine file I/O and are retained as raw evidence rather than treated as DBSP-only counters.")
 print()
 print("| revision | rep | cold RSS MiB | membership bytes | integral bytes | snapshot bytes | DBSP used bytes | DBSP storage bytes | cold spill dir bytes | cold read bytes | cold write bytes | steady RSS MiB | steady DBSP used | steady DBSP storage | steady p50 ms | steady p95 ms | steady CPU mean % | steady CPU max % | steady missed deliveries | steady spill dir delta |")
 print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
