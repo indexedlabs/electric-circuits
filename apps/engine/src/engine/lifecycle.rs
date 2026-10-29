@@ -2444,6 +2444,12 @@ impl Engine {
             if needs_seed && admission.seed_slot.is_none() {
                 if let Ok(slot) = self.subquery_init.seed_slots.clone().try_acquire_owned() {
                     admission.seed_slot = Some(slot);
+                    #[cfg(feature = "test-support")]
+                    {
+                        drop(registry);
+                        self.wait_group_seed_gate_for_test().await;
+                        continue;
+                    }
                 } else {
                     drop(registry);
                     tracing::info!(
@@ -4102,10 +4108,6 @@ mod cancellation_tests {
 
     async fn refcount(engine: &Engine, id: &str) -> usize {
         engine.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
-    }
-
-    async fn engine_with_group_claim() -> (Engine, GroupRecord) {
-        engine_with_group_claim_ds(DsClient::new_for_in_process_test("http://127.0.0.1:1")).await
     }
 
     async fn engine_with_group_claim_ds(ds: DsClient) -> (Engine, GroupRecord) {

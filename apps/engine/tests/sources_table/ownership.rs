@@ -1335,17 +1335,24 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
             .context("first group did not reach its reservation gate")?;
         let second_app = app.clone();
         let second_body = group_body(f, "group-overlap", true);
+        let loser_body = second_body.clone();
         gate.arm(GroupLoadAwait::BeforeReservation).await;
-        let second = tokio::spawn(async move { post_group(&second_app, second_body).await });
+        let second = tokio::spawn(async move { post_group_response(&second_app, loser_body).await });
         tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
             .await
             .context("losing group did not reach its reservation gate")?;
         gate.release.notify_one();
+        let (status, headers, in_flight_body) = second.await.context("second group task failed")??;
+        ensure!(
+            status == StatusCode::SERVICE_UNAVAILABLE,
+            "in-flight loser was not retryable: {status} {in_flight_body}"
+        );
+        ensure!(headers.get("retry-after").is_some(), "in-flight loser omitted Retry-After");
+        gate.release.notify_one();
         let (status, first_body) = first.await.context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
         let winner_catalog = stream_events(f, "meta/catalog").await;
-        gate.release.notify_one();
-        let (status, second_body) = second.await.context("second group task failed")??;
+        let (status, second_body) = post_group(&app, second_body.clone()).await?;
         ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second_body}");
         ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
         ensure!(engine.group_id_for_test("group-overlap").await.is_some(), "winner group was lost");
@@ -2201,7 +2208,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 *f.ds.hold_group_catalog.lock().await = true;
             }
             let load_app = app.clone();
-            let load_body = group_body(f, subscription, true);
+            let load_body = group_body(f, subscription, cut != "cancel-seed");
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
             let mut pre_attempt_id = None;
             let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
@@ -2253,8 +2260,13 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             if cut == "replacement" {
                 let abort_gate = engine.group_abort_gate_for_test();
                 abort_gate.arm();
+                *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
                 load.abort();
                 *f.ds.hold_group_catalog.lock().await = false;
+                f.ds.group_catalog_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("old cleanup did not reach GroupDropped durability")?;
                 f.ds.group_catalog_release.notify_one();
                 tokio::time::timeout(Duration::from_secs(10), abort_gate.arrived.notified())
                     .await
