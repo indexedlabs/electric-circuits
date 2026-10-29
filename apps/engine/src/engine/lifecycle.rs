@@ -4254,10 +4254,16 @@ mod cancellation_tests {
             head_gate_path: std::sync::Mutex::new(None),
             ..Default::default()
         });
-        let ds = DsClient::with_test_store("scripted://group-recheck-health".into(), store);
+        let ds = DsClient::with_test_store("scripted://group-recheck-health".into(), store.clone());
         let (engine, group) = engine_with_group_claim_ds(ds).await;
         engine.ds.ensure_stream(&group.stream_path).await.unwrap();
         *store.head_gate_path.lock().unwrap() = Some(group.stream_path.clone());
+        {
+            let mut st = engine.state.lock().await;
+            for member in &group.members {
+                st.shapes.get_mut(&member.shape_id).unwrap().stream_path = group.stream_path.clone();
+            }
+        }
         {
             let mut st = engine.state.lock().await;
             st.group_claims.release("scope");

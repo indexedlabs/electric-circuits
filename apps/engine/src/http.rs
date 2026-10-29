@@ -1345,6 +1345,8 @@ async fn subset_load_group(
             offset: None,
         })
         .collect();
+    #[cfg(feature = "test-support")]
+    engine.wait_group_seed_gate_for_test().await;
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {

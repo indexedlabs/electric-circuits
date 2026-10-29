@@ -440,7 +440,7 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
     if closing {
         ds.closed.lock().await.insert(path.clone());
     }
-    if method == Method::HEAD && ds.closed.lock().await.contains(&path) {
+    if method == Method::HEAD && ds.closed.lock().await.iter().any(|suffix| path.ends_with(suffix)) {
         response.headers_mut().insert("stream-closed", "true".parse().unwrap());
     }
     if closing || (method == Method::DELETE && delete_gate.is_none()) {
@@ -2144,16 +2144,14 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
                 .await
                 .context("group cut did not reach GroupCreated durability")?;
+            let member_id = engine.subscription_owner(subscription).await.context("group cut has no public member")?;
             let group_path = engine
-                .graph()
+                .get_shape(&member_id)
                 .await
-                .shapes
-                .into_iter()
-                .find(|shape| shape.stream_path.contains("shape/group-"))
                 .map(|shape| shape.stream_path)
-                .context("group cut did not install a member stream")?;
+                .context("group cut did not install its member stream")?;
             if cut == "closed" {
-                f.ds.closed.lock().await.insert(format!("/{group_path}"));
+                f.ds.closed.lock().await.insert(group_path.clone());
             } else if cut == "truncate" {
                 f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
                 let mut changed = f.ds.changed.subscribe();
@@ -2253,13 +2251,14 @@ async fn group_reconnect_burst(f: &Fixture) -> Result<()> {
 async fn group_admission_gate(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
-        *f.ds.hold_group_catalog.lock().await = true;
+        let seed_gate = engine.group_seed_gate_for_test();
+        seed_gate.arm();
         let first_app = app.clone();
         let first_body = group_body(f, "group-admission-held", false);
         let first = tokio::spawn(async move { post_group(&first_app, first_body).await });
-        tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+        tokio::time::timeout(Duration::from_secs(10), seed_gate.arrived.notified())
             .await
-            .context("held admission group did not reach GroupCreated")?;
+            .context("held group seed did not reach its gate")?;
         let second_app = app.clone();
         let second_body = group_body(f, "group-admission-independent", true);
         let second = tokio::spawn(async move { post_group(&second_app, second_body).await });
@@ -2285,8 +2284,7 @@ async fn group_admission_gate(f: &Fixture) -> Result<()> {
             .context("independent group load waited behind held admission")?
             .context("independent group task failed")??;
         ensure!(status == StatusCode::OK, "independent group load failed: {status} {body}");
-        *f.ds.hold_group_catalog.lock().await = false;
-        f.ds.group_catalog_release.notify_one();
+        seed_gate.release.notify_one();
         let (status, body) = tokio::time::timeout(Duration::from_secs(15), first)
             .await
             .context("held admission group did not finish")?

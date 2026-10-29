@@ -636,6 +636,8 @@ pub struct Engine {
     purge_barriers: Arc<std::sync::Mutex<HashMap<String, Arc<PurgeBarrier>>>>,
     #[cfg(test)]
     pub(crate) purge_test_hook: Arc<PurgeTestHook>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_seed_test_gate: Arc<GroupSeedTestGate>,
     /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
@@ -739,6 +741,38 @@ pub(crate) struct PurgeTestHook {
     pub(crate) pause_after_remove: std::sync::atomic::AtomicBool,
     pub(crate) removed: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupSeedTestGate {
+    armed: std::sync::atomic::AtomicBool,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupSeedTestGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupSeedTestGate {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_if_armed(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.arrived.notify_one();
+            self.release.notified().await;
+        }
+    }
 }
 
 impl PurgeBarrier {
@@ -1676,6 +1710,8 @@ impl Engine {
             purge_barriers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             purge_test_hook: Arc::new(PurgeTestHook::default()),
+            #[cfg(feature = "test-support")]
+            group_seed_test_gate: Arc::new(GroupSeedTestGate::default()),
             changes,
             consumers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
@@ -3062,7 +3098,7 @@ impl Engine {
                     "group stream '{}' closed during group activation",
                     record.stream_path
                 ))))
-            } else if self.group_releases.lock().unwrap().contains_key(&record.id) {
+            } else if self.group_retirement_started(&record.id) {
                 Some(anyhow::Error::new(CreateRaced(format!(
                     "group '{}' began retirement during group activation",
                     record.id
@@ -3165,6 +3201,16 @@ impl Engine {
         self.state.lock().await.group_claims.get(subscription).is_some()
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn group_seed_gate_for_test(&self) -> Arc<GroupSeedTestGate> {
+        self.group_seed_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_group_seed_gate_for_test(&self) {
+        self.group_seed_test_gate.wait_if_armed().await;
+    }
+
     pub(crate) async fn begin_group_release(
         &self,
         subscription: &str,
@@ -3182,6 +3228,12 @@ impl Engine {
         let release = GroupRelease::new();
         releases.insert(group.id.clone(), release.clone());
         Some((group, release, false))
+    }
+
+    /// The single retirement mark used by renewal and fresh group activation. Callers hold the
+    /// engine state lock before invoking this helper, matching `group_is_current`'s ordering.
+    fn group_retirement_started(&self, group_id: &str) -> bool {
+        self.group_releases.lock().unwrap().contains_key(group_id)
     }
 
     pub(crate) fn group_release_in_flight(&self, group_id: &str) -> Option<Arc<GroupRelease>> {
@@ -3241,7 +3293,7 @@ impl Engine {
     pub(crate) async fn group_is_current(&self, group: &GroupRecord) -> bool {
         let st = self.state.lock().await;
         st.group_claims.get(&group.subscription).is_some_and(|current| current.id == group.id)
-            && !self.group_releases.lock().unwrap().contains_key(&group.id)
+            && !self.group_retirement_started(&group.id)
             && group.members.iter().all(|member| {
                 st.shapes.contains_key(&member.shape_id)
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)

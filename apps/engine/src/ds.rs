@@ -3069,9 +3069,11 @@ mod tests {
                         Some(closed) => res.closed = *closed,
                     }
                 }
-                let mut fault = self.head_fault.lock().unwrap();
-                if fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
-                    res.status = fault.take().unwrap().1;
+                {
+                    let mut fault = self.head_fault.lock().unwrap();
+                    if fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
+                        res.status = fault.take().unwrap().1;
+                    }
                 }
                 if let Some(observer) = self.head_observer.lock().unwrap().as_ref() {
                     let _ = observer.send((path.to_string(), res.status));
