@@ -60,42 +60,9 @@ jobs:
           result=0
           for mode in subquery semijoin; do
             echo "Running group contracts with ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP=$mode"
-            # Temporary skip-only bisect: identify whether the red lane is the rollback
-            # compensation contract while the hosted child log is unavailable.
             ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
               cargo test -p electric-circuits-engine --features test-support --test sources_table group_ -- \
-                --ignored --nocapture --skip group_canceled_rollback_retains_unreleased_group_members || result=1
-          done
-          exit "$result"
-
-      - name: Rollback compensation diagnostic
-        if: ${{ !cancelled() && steps.pg18.outcome == 'success' }}
-        run: |
-          # Keep the bisect above, but run the excluded contract separately so its child
-          # failure is visible as check-run annotations even when Actions log blobs are hidden.
-          set -uo pipefail
-          result=0
-          for mode in subquery semijoin; do
-            log="$RUNNER_TEMP/rollback-$mode.log"
-            set +e
-            ELECTRIC_CIRCUITS_GROUP_MEMBERSHIP="$mode" \
-              cargo test -p electric-circuits-engine --features test-support --test sources_table \
-                ownership::group_canceled_rollback_retains_unreleased_group_members -- \
-                --exact --ignored --nocapture 2>&1 | tee "$log"
-            status=${PIPESTATUS[0]}
-            set -e
-            while IFS= read -r line; do
-              case "$line" in
-                *"rollback cancellation"*|*"post-unsubscribe retry barrier"*|*"retry after rollback"*|*"contract ownership::group_canceled"*|*"test result:"*|*FAILED*)
-                  safe=${line//'%'/'%25'}
-                  safe=${safe//$'\r'/}
-                  echo "::error title=$mode rollback diagnostic::$safe"
-                  ;;
-              esac
-            done < "$log"
-            if [ "$status" -ne 0 ]; then
-              result=1
-            fi
+                --ignored --nocapture || result=1
           done
           exit "$result"
 

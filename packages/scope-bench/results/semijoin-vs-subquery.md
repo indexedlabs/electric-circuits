@@ -468,17 +468,19 @@ did not make the contracts green. `e01f89f` temporarily skipped only
 `group_canceled_rollback_retains_unreleased_group_members`; its step-7 bisect was green in both
 modes (`40800299454`, job `123206516252`), while step 8 remained red. The same tree without
 the skip (`c45e31b`, run `40799770386`, job `123204807672`) was red, localizing the failure to
-that rollback contract. This is bisect evidence, not qualification. `6d71a66` keeps the
-skip-only bisect and adds a dedicated two-mode rollback diagnostic; `06e2a83` adds the
-`group_canceled_before_first_rollback_release_releases_all_members` contract covering
-cancellation while the guard still owns both members. Its exact result is pending. No head
-containing the compensation change has a green qualification. The benchmark production tree
-remains the one preserved by `1d7bbbc`, while this candidate's compensation path still requires
-its own green test job.
+that rollback contract. This is bisect evidence, not qualification. `6d71a66` added a
+dedicated two-mode diagnostic; on `7a0b539` it reported `waiting for post-unsubscribe retry barrier:
+deadline has elapsed` in both modes. The trace showed that group members are created without an
+in-memory feed claim, so the after-unsubscribe fault could never fire; the pre-release contract
+passed but observed only that a replacement could claim the group. The current fix moves the
+injected failure to the actual durable wait path and checks each member's catalog `Left` directly.
+No head containing the compensation change has a green qualification yet. The benchmark production
+tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path requires a
+fresh exact-head test.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
-the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
-already absent from in-memory state.
+the candidate additionally changes durable compensation to re-enqueue `Left` for group members,
+whose private release has no in-memory feed claim.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's

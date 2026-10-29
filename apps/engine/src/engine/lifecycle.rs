@@ -1151,11 +1151,6 @@ impl Engine {
         };
         let had_release = released.is_some();
         #[cfg(feature = "test-support")]
-        if durable && had_release && crate::http::test_release_after_unsubscribe_once() {
-            drop(st);
-            self.touch_shape(id);
-            return Err(anyhow::anyhow!("test-injected durable release failure after unsubscribe"));
-        }
         let wait = released.and_then(|subscription| {
             let event = CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false };
             if durable {
@@ -1171,6 +1166,10 @@ impl Engine {
         if let Some(wait) = wait {
             wait.await?;
         } else if needs_barrier {
+            #[cfg(feature = "test-support")]
+            if crate::http::test_release_wait_durable_once() {
+                return Err(anyhow::anyhow!("test-injected durable release wait failure"));
+            }
             self.catalog_tx.wait_durable().await?;
         }
         Ok(had_release)

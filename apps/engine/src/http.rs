@@ -1411,13 +1411,13 @@ pub(crate) fn test_group_page_failure(stage: &str) -> bool {
 #[cfg(feature = "test-support")]
 // Each ignored ownership contract runs in a fresh child process; the latch is intentionally
 // process-local so a once-only fault cannot fire twice inside one rollback trace.
-static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TEST_RELEASE_WAIT_DURABLE_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
-// The rollback contract arms this after the request has reached its first rollback barrier.  The
+// The rollback contract arms this after the request has reached its first rollback barrier. The
 // environment variables are installed before engine workers start, so the arm itself is an atomic
 // test control and never mutates libc's process environment while those workers are live.
-static TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TEST_RELEASE_WAIT_DURABLE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
 // Each ignored ownership contract runs in a fresh child process, so this process-local switch
@@ -1430,17 +1430,17 @@ pub fn test_disable_group_page_barrier() {
 }
 
 #[cfg(feature = "test-support")]
-pub fn test_arm_release_after_unsubscribe() {
-    TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED.store(true, std::sync::atomic::Ordering::Release);
+pub fn test_arm_release_wait_durable() {
+    TEST_RELEASE_WAIT_DURABLE_ARMED.store(true, std::sync::atomic::Ordering::Release);
 }
 
 #[cfg(feature = "test-support")]
-pub(crate) fn test_release_after_unsubscribe_once() -> bool {
-    if TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED.load(std::sync::atomic::Ordering::Acquire)
-        && std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE").ok().as_deref() == Some("once")
-        && !TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED.swap(true, std::sync::atomic::Ordering::AcqRel)
+pub(crate) fn test_release_wait_durable_once() -> bool {
+    if TEST_RELEASE_WAIT_DURABLE_ARMED.load(std::sync::atomic::Ordering::Acquire)
+        && std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_WAIT_DURABLE").ok().as_deref() == Some("once")
+        && !TEST_RELEASE_WAIT_DURABLE_FIRED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
-        if let Ok(marker) = std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER") {
+        if let Ok(marker) = std::env::var("ELECTRIC_CIRCUITS_TEST_RELEASE_WAIT_DURABLE_MARKER") {
             let _ = std::fs::write(marker, b"fired");
         }
         true
@@ -1506,8 +1506,9 @@ impl GroupReservationGuard {
         match engine.release_subscription_durable(shape_id, Some(subscription)).await {
             Ok(true) => true,
             Ok(false) => {
-                // A prior cancelled compensation may already have removed the in-memory claim
-                // before its durable retry. Re-enqueue Left directly in that case.
+                // Group members are created without a shared feed claim, so their first release
+                // is an in-memory no-op. Re-enqueue Left directly to make that durable release
+                // observable and restart-safe.
                 match engine.retry_subscription_release_durable(shape_id, subscription).await {
                     Ok(()) => true,
                     Err(error) => {

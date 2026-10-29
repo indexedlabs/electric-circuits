@@ -915,6 +915,47 @@ async fn stream_events(f: &Fixture, stream_path: &str) -> Vec<serde_json::Value>
     streams.iter().find(|(path, _)| path.ends_with(stream_path)).map(|(_, events)| events.clone()).unwrap_or_default()
 }
 
+async fn catalog_events(f: &Fixture) -> Result<Vec<serde_json::Value>> {
+    let ds = DsClient::new_for_in_process_test(&f.ds_url);
+    let mut offset = "-1".to_string();
+    let mut events = Vec::new();
+    loop {
+        let (page, next, up_to_date) = ds.read_json("meta/catalog", &offset).await?;
+        events.extend(page);
+        match next {
+            Some(next) if !up_to_date && next != offset => offset = next,
+            _ => return Ok(events),
+        }
+    }
+}
+
+async fn assert_group_member_lefts(f: &Fixture, subscription: &str) -> Result<()> {
+    let events = catalog_events(f).await?;
+    let created: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["t"] == "created"
+                && event["subscription"]
+                    .as_str()
+                    .is_some_and(|member| member == subscription || member.starts_with(&format!("{subscription}:member:")))
+        })
+        .collect();
+    ensure!(!created.is_empty(), "catalog has no created members for {subscription}");
+    for event in created {
+        let id = event["rec"]["id"].as_str().context("created member id")?;
+        let member_subscription = event["subscription"].as_str().context("created member subscription")?;
+        ensure!(
+            events.iter().any(|candidate| {
+                candidate["t"] == "left"
+                    && candidate["id"].as_str() == Some(id)
+                    && candidate["subscription"].as_str() == Some(member_subscription)
+            }),
+            "catalog has no durable Left for member {id} / {member_subscription}"
+        );
+    }
+    Ok(())
+}
+
 async fn wait_group_events(f: &Fixture, stream_path: &str, minimum: usize) -> Result<Vec<serde_json::Value>> {
     let mut changed = f.ds.changed.subscribe();
     let result = tokio::time::timeout(Duration::from_secs(15), async {
@@ -1434,8 +1475,8 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     // Set the fault-cut variables before starting the engine.  The engine owns worker threads
     // that may call native libc environment readers while this contract is running; adding
     // variables after those threads start can race glibc's environ reallocation.
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE", "once") };
-    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER", &fired) };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_WAIT_DURABLE", "once") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_RELEASE_WAIT_DURABLE_MARKER", &fired) };
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let request = group_body(f, subscription, true);
@@ -1454,7 +1495,7 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         })
         .await
         .context("waiting for rollback barrier before fault arm")?;
-        electric_circuits_engine::http::test_arm_release_after_unsubscribe();
+        electric_circuits_engine::http::test_arm_release_wait_durable();
         std::fs::write(format!("{base}.rollback.release"), b"1")?;
         let retry_ready = PathBuf::from(format!("{base}.member_retry.ready"));
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -1482,8 +1523,9 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
-    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE") };
-    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_AFTER_UNSUBSCRIBE_MARKER") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_WAIT_DURABLE") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_RELEASE_WAIT_DURABLE_MARKER") };
+    let member_lefts = assert_group_member_lefts(f, subscription).await;
     let fence = remove_source_fence(f).await;
     let replacement = async {
         let (replacement, replacement_app) = group_engine(f).await?;
@@ -1525,6 +1567,9 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     }
     if let Err(error) = result {
         errors.push(format!("rollback cancellation: {error:#}"));
+    }
+    if let Err(error) = member_lefts {
+        errors.push(format!("rollback cancellation durable member cleanup: {error:#}"));
     }
     if let Err(error) = replacement {
         errors.push(format!("retry after rollback cancellation: {error:#}"));
@@ -1576,6 +1621,7 @@ async fn rollback_before_first_release_cancellation_contract(f: &Fixture) -> Res
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
+    let member_lefts = assert_group_member_lefts(f, subscription).await;
     let fence = remove_source_fence(f).await;
     let replacement = async {
         let (replacement, replacement_app) = group_engine(f).await?;
@@ -1614,6 +1660,9 @@ async fn rollback_before_first_release_cancellation_contract(f: &Fixture) -> Res
     }
     if let Err(error) = result {
         errors.push(format!("pre-release rollback cancellation: {error:#}"));
+    }
+    if let Err(error) = member_lefts {
+        errors.push(format!("pre-release rollback cancellation durable member cleanup: {error:#}"));
     }
     if let Err(error) = replacement {
         errors.push(format!("retry after pre-release rollback cancellation: {error:#}"));
