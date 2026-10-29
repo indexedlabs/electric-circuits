@@ -116,7 +116,15 @@ function bootPgSimple(): { pgUrl: string; dir: string; port: number } {
   const dataDir = join(dir, 'data')
   execFileSync(postgres.initdb, ['-D', dataDir, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
   const port = 20000 + Math.floor(Math.random() * 20000)
-  execFileSync(postgres.pgCtl, ['-D', dataDir, '-o', `-p ${port} -c listen_addresses=127.0.0.1 -c wal_level=logical -c fsync=off -c synchronous_commit=off -c max_wal_senders=8 -c max_replication_slots=8`, '-w', 'start'], { stdio: 'ignore' })
+  // The socket goes in the temp dir: Debian/Ubuntu builds default to /var/run/postgresql,
+  // which an unprivileged CI user can't write, and pg_ctl then fails to start.
+  const log = join(dir, 'postgres.log')
+  try {
+    execFileSync(postgres.pgCtl, ['-D', dataDir, '-l', log, '-o', `-p ${port} -c listen_addresses=127.0.0.1 -c unix_socket_directories=${dir} -c wal_level=logical -c fsync=off -c synchronous_commit=off -c max_wal_senders=8 -c max_replication_slots=8`, '-w', 'start'], { stdio: 'ignore' })
+  } catch (err) {
+    if (existsSync(log)) process.stderr.write(readFileSync(log, 'utf8'))
+    throw err
+  }
   return { pgUrl: `postgres://postgres@127.0.0.1:${port}/postgres`, dir, port }
 }
 

@@ -1,18 +1,23 @@
 name: dbsp spill benchmark
 
+# Two cold release builds and ten full-scale runs take hours, so this runs only when asked:
+# add the `dbsp-benchmark` label to a pull request (each time it's added measures the head
+# at that moment), or dispatch it with the two commits to compare.
 on:
   pull_request:
-    paths:
-      - 'apps/engine/**'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'packages/bench/**'
-      - 'scripts/dbsp-spill-benchmark.sh'
-      - 'rust-toolchain.toml'
+    types: [labeled]
   workflow_dispatch:
+    inputs:
+      base:
+        description: Baseline commit or ref; the comparison uses its merge-base with head
+        required: true
+      head:
+        description: Candidate commit
+        required: true
 
 jobs:
   compare:
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'dbsp-benchmark'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
@@ -51,16 +56,17 @@ jobs:
 
       - name: Compare baseline and candidate sequentially
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.repository.default_branch }}
-          HEAD_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || inputs.base }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head }}
           BENCH_REPS: '5'
           BENCH_ARTIFACT_ROOT: ${{ github.workspace }}/.bench-artifacts
         run: ./scripts/dbsp-spill-benchmark.sh
 
       - name: Upload raw benchmark artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dbsp-spill-comparison-${{ github.sha }}
+          name: dbsp-spill-comparison-${{ github.event.pull_request.head.sha || inputs.head }}
           path: .bench-artifacts
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
