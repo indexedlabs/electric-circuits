@@ -42,6 +42,9 @@ run_revision() {
   local out="$artifact_root/$name"
   mkdir -p "$out"
   printf '%s\n' "$sha" > "$out/commit.txt"
+  # Each revision pins its own toolchain (the baseline 1.96.0, the candidate 1.96.1). Install the
+  # pin explicitly rather than relying on rustup's auto-install of a missing override.
+  (cd "$tree" && rustup toolchain install)
   (cd "$tree" && rustc --version) >> "$out/commit.txt"
   (cd "$tree" && pnpm install --frozen-lockfile)
   (cd "$tree" && cargo build --release --locked -p electric-circuits-engine --features test-support)
@@ -56,7 +59,7 @@ run_revision() {
       cd "$tree"
       SCALE_ISSUES=100000 SCALE_PROJECTS=2000 SCALE_MEMBERSHIPS=6 \
       SCALE_USERS=1000,2500,5000,10000 SCALE_CLIENT_PROCS=4 SCALE_CONC_PER_PROC=12 \
-      SCALE_LIVE_SUBS=20000 SCALE_LIVE_PROCS=8 SCALE_MATERIALIZED=1 \
+      SCALE_LIVE_SUBS=20000 SCALE_LIVE_PROCS=8 SCALE_LIVE_HOLD_MS=15000 SCALE_MATERIALIZED=1 \
       SCALE_STEADY_UPDATES=20 SCALE_STEADY_INTERVAL_MS=250 \
       SCALE_ATTRIBUTION=1 SCALE_ATTRIBUTION_LABEL="$name-rep-$rep" \
       SCALE_OUT="$run/shape-memory-scale.md" SCALE_ATTRIBUTION_DIR="$run/raw" \
