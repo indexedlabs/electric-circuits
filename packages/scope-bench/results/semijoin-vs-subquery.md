@@ -459,10 +459,11 @@ job `123141177393`), `ee7667a` (`40781440354`, job `123143837823`) and `21be5d6`
 (`40782847956`, job `123148605838`) were also red; `ee7667a` moved the fault-cut variables
 before engine startup, which ruled out the environment-ordering hypothesis, and `21be5d6` moved
 cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compile-red because
-the integration hook was private. The current head is `0d6aff0`, which adds the atomic post-barrier
-fault arm. Its exact test job `123179345889` (run `40792037118`) is still pending; the review of
-this head has flagged the split `TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED` declaration for rustfmt.
-The benchmark production tree remains the one preserved by `1d7bbbc`, while this candidate's
+the integration hook was private. The current head is `feadedb`, which includes the one-line
+formatter fix and CI diagnostics that print each membership mode and child contract output. Its
+exact test job `123179345889` (run `40792037118`) was started on the preceding `0d6aff0` tree and
+therefore remains evidence for that predecessor only; a fresh run on `feadedb` is required. The
+benchmark production tree remains the one preserved by `1d7bbbc`, while this candidate's
 compensation path still requires its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
