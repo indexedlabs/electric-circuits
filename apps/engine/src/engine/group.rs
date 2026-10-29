@@ -134,6 +134,14 @@ impl GroupClaims {
         None
     }
 
+    pub(crate) fn release_reservation_if_matches(&mut self, subscription: &str, group_id: &str) {
+        let legacy = format!("group {subscription}");
+        if self.reserved.get(subscription).is_some_and(|owner| owner == group_id || owner == &legacy) {
+            self.reserved.remove(subscription);
+            self.private_members.retain(|_, owner| owner != subscription);
+        }
+    }
+
     pub(crate) fn release_if_matches(&mut self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         if self.records.get(subscription).is_some_and(|record| record.id == group_id) {
             self.reserved.remove(subscription);

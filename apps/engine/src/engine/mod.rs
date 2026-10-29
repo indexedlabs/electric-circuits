@@ -638,6 +638,8 @@ pub struct Engine {
     pub(crate) purge_test_hook: Arc<PurgeTestHook>,
     #[cfg(feature = "test-support")]
     pub(crate) group_seed_test_gate: Arc<GroupSeedTestGate>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_abort_test_gate: Arc<GroupAbortTestGate>,
     /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
@@ -748,6 +750,38 @@ pub struct GroupSeedTestGate {
     armed: std::sync::atomic::AtomicBool,
     pub arrived: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupAbortTestGate {
+    armed: std::sync::atomic::AtomicBool,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupAbortTestGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupAbortTestGate {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_if_armed(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.arrived.notify_one();
+            self.release.notified().await;
+        }
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -1712,6 +1746,8 @@ impl Engine {
             purge_test_hook: Arc::new(PurgeTestHook::default()),
             #[cfg(feature = "test-support")]
             group_seed_test_gate: Arc::new(GroupSeedTestGate::default()),
+            #[cfg(feature = "test-support")]
+            group_abort_test_gate: Arc::new(GroupAbortTestGate::default()),
             changes,
             consumers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
@@ -3167,6 +3203,9 @@ impl Engine {
                 group_id: Some(group_id.to_string()),
             })
             .await?;
+        self.state.lock().await.group_claims.release_reservation_if_matches(subscription, group_id);
+        #[cfg(feature = "test-support")]
+        self.group_abort_test_gate.wait_if_armed().await;
         self.state.lock().await.group_claims.abort_if_matches(subscription, group_id);
         Ok(())
     }
@@ -3209,6 +3248,11 @@ impl Engine {
     #[cfg(feature = "test-support")]
     pub fn group_seed_gate_for_test(&self) -> Arc<GroupSeedTestGate> {
         self.group_seed_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_abort_gate_for_test(&self) -> Arc<GroupAbortTestGate> {
+        self.group_abort_test_gate.clone()
     }
 
     #[cfg(feature = "test-support")]

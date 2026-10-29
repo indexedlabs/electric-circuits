@@ -2134,6 +2134,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
         for (subscription, cut) in [
             ("group-cut-cancel", "cancel"),
             ("group-cut-cancel-head", "cancel-head"),
+            ("group-cut-replacement", "replacement"),
             ("group-cut-closed", "closed"),
             ("group-cut-truncate", "truncate"),
             ("group-cut-degraded", "degraded"),
@@ -2153,6 +2154,41 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 .context("group cut did not install its member stream")?;
             if cut == "cancel" || cut == "cancel-head" {
                 *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
+            }
+            if cut == "replacement" {
+                let abort_gate = engine.group_abort_gate_for_test();
+                abort_gate.arm();
+                load.abort();
+                *f.ds.hold_group_catalog.lock().await = false;
+                f.ds.group_catalog_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), abort_gate.arrived.notified())
+                    .await
+                    .context("old cleanup did not reach its abort gate")?;
+                let (status, replacement) = post_group(&app, group_body(f, subscription, true)).await?;
+                ensure!(
+                    status == StatusCode::OK,
+                    "replacement load did not survive old cleanup: {status} {replacement}"
+                );
+                let replacement_id = replacement["groupId"].as_str().unwrap_or_default().to_owned();
+                ensure!(replacement_id != group_path, "replacement reused the old group id");
+                abort_gate.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !engine.has_group_record(subscription).await {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .context("replacement group did not remain live")?;
+                let catalog = stream_events(f, "meta/catalog").await;
+                ensure!(
+                    catalog.iter().any(|event| event["t"] == "groupDropped" && event["group_id"] == group_path),
+                    "old cleanup did not drop its own group"
+                );
+                ensure!(
+                    !catalog.iter().any(|event| event["t"] == "groupDropped" && event["group_id"] == replacement_id),
+                    "old cleanup dropped replacement group"
+                );
+                continue;
             }
             if cut == "cancel-head" {
                 *f.ds.hold_group_head_after.lock().await = Some(0);
