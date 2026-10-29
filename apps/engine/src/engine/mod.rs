@@ -640,6 +640,10 @@ pub struct Engine {
     pub(crate) group_seed_test_gate: Arc<GroupSeedTestGate>,
     #[cfg(feature = "test-support")]
     pub(crate) group_abort_test_gate: Arc<GroupAbortTestGate>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_load_test_gate: Arc<GroupLoadTestGate>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_release_test_gate: Arc<GroupReleaseTestGate>,
     /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
@@ -757,10 +761,90 @@ pub struct GroupAbortTestGate {
     armed: std::sync::atomic::AtomicBool,
     pub arrived: tokio::sync::Notify,
     pub release: tokio::sync::Notify,
+    pub finished: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupLoadAwait {
+    BeforeReservation,
+    AfterReservation,
+    MemberCreate,
+    StreamTail,
+    Snapshot,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupLoadTestGate {
+    stage: tokio::sync::Mutex<Option<GroupLoadAwait>>,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupReleaseTestGate {
+    armed: std::sync::atomic::AtomicBool,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 #[cfg(feature = "test-support")]
 impl Default for GroupAbortTestGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupAbortTestGate {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_if_armed(&self) -> bool {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.arrived.notify_one();
+            self.release.notified().await;
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupLoadTestGate {
+    fn default() -> Self {
+        Self {
+            stage: tokio::sync::Mutex::new(None),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupLoadTestGate {
+    pub async fn arm(&self, stage: GroupLoadAwait) {
+        *self.stage.lock().await = Some(stage);
+    }
+
+    async fn wait_if_armed(&self, stage: GroupLoadAwait) {
+        let armed = self.stage.lock().await.as_ref() == Some(&stage);
+        if armed {
+            *self.stage.lock().await = None;
+            self.arrived.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupReleaseTestGate {
     fn default() -> Self {
         Self {
             armed: std::sync::atomic::AtomicBool::new(false),
@@ -771,7 +855,7 @@ impl Default for GroupAbortTestGate {
 }
 
 #[cfg(feature = "test-support")]
-impl GroupAbortTestGate {
+impl GroupReleaseTestGate {
     pub fn arm(&self) {
         self.armed.store(true, Ordering::Release);
     }
@@ -1748,6 +1832,10 @@ impl Engine {
             group_seed_test_gate: Arc::new(GroupSeedTestGate::default()),
             #[cfg(feature = "test-support")]
             group_abort_test_gate: Arc::new(GroupAbortTestGate::default()),
+            #[cfg(feature = "test-support")]
+            group_load_test_gate: Arc::new(GroupLoadTestGate::default()),
+            #[cfg(feature = "test-support")]
+            group_release_test_gate: Arc::new(GroupReleaseTestGate::default()),
             changes,
             consumers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
@@ -3205,8 +3293,12 @@ impl Engine {
             .await?;
         self.state.lock().await.group_claims.release_reservation_if_matches(subscription, group_id);
         #[cfg(feature = "test-support")]
-        self.group_abort_test_gate.wait_if_armed().await;
+        let abort_was_gated = self.group_abort_test_gate.wait_if_armed().await;
         self.state.lock().await.group_claims.abort_if_matches(subscription, group_id);
+        #[cfg(feature = "test-support")]
+        if abort_was_gated {
+            self.group_abort_test_gate.finished.notify_one();
+        }
         Ok(())
     }
 
@@ -3253,6 +3345,21 @@ impl Engine {
     #[cfg(feature = "test-support")]
     pub fn group_abort_gate_for_test(&self) -> Arc<GroupAbortTestGate> {
         self.group_abort_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_load_gate_for_test(&self) -> Arc<GroupLoadTestGate> {
+        self.group_load_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_release_gate_for_test(&self) -> Arc<GroupReleaseTestGate> {
+        self.group_release_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_group_load_gate_for_test(&self, stage: GroupLoadAwait) {
+        self.group_load_test_gate.wait_if_armed(stage).await;
     }
 
     #[cfg(feature = "test-support")]
@@ -3385,6 +3492,8 @@ impl Engine {
                 group_id: Some(group_id.to_string()),
             })
             .await?;
+        #[cfg(feature = "test-support")]
+        self.group_release_test_gate.wait_if_armed().await;
         let _ = self.take_group(subscription, group_id).await;
         Ok(())
     }

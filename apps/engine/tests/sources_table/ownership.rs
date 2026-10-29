@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::ensure;
 use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::{Engine, PostgresSetup};
+use electric_circuits_engine::engine::{Engine, GroupLoadAwait, PostgresSetup};
 use electric_circuits_engine::http::router_with_introspection;
 use electric_circuits_engine::table_ref::TableSelector;
 use tokio::sync::{Notify, watch};
@@ -78,6 +78,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
             Case::GroupCompletionCuts => group_completion_cuts(&fixture).await,
+            Case::GroupReleaseCancellation => group_release_cancellation(&fixture).await,
             Case::GroupReconnectBurst => group_reconnect_burst(&fixture).await,
             Case::GroupAdmission => group_admission_gate(&fixture).await,
         };
@@ -119,6 +120,7 @@ enum Case {
     GroupRetirementDuringAssembly,
     GroupMembersMax,
     GroupCompletionCuts,
+    GroupReleaseCancellation,
     GroupReconnectBurst,
     GroupAdmission,
 }
@@ -296,6 +298,12 @@ fn group_completion_cuts_leave_no_claims_or_durable_group() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_release_cancelled_after_durability_still_completes() -> Result<()> {
+    isolated("ownership::group_release_cancelled_after_durability_still_completes", Case::GroupReleaseCancellation)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn thirty_group_reconnects_claim_and_renew_without_conflicts() -> Result<()> {
     isolated("ownership::thirty_group_reconnects_claim_and_renew_without_conflicts", Case::GroupReconnectBurst)
 }
@@ -330,6 +338,7 @@ struct ObservedDs {
     group_head_release: Arc<Notify>,
     hold_group_catalog: Arc<Mutex<bool>>,
     hold_group_drop_id: Arc<Mutex<Option<String>>>,
+    hold_group_drop_subscription: Arc<Mutex<Option<String>>>,
     group_catalog_arrived: Arc<Notify>,
     group_catalog_release: Arc<Notify>,
 }
@@ -384,14 +393,19 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(body, 64 * 1024 * 1024).await.unwrap_or_default();
         let expected_group_drop = ds.hold_group_drop_id.lock().await.clone();
+        let expected_group_drop_subscription = ds.hold_group_drop_subscription.lock().await.clone();
         let events = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default();
         let group_created = events.iter().any(|event| event["t"] == "groupCreated");
         let group_dropped = events.iter().any(|event| {
             event["t"] == "groupDropped"
-                && expected_group_drop.as_deref().is_some_and(|group_id| event["group_id"].as_str() == Some(group_id))
+                && (expected_group_drop.as_deref().is_some_and(|group_id| event["group_id"].as_str() == Some(group_id))
+                    || expected_group_drop_subscription
+                        .as_deref()
+                        .is_some_and(|subscription| event["subscription"].as_str() == Some(subscription)))
         });
         let hold = if group_dropped {
             *ds.hold_group_drop_id.lock().await = None;
+            *ds.hold_group_drop_subscription.lock().await = None;
             true
         } else if group_created {
             let mut armed = ds.hold_group_catalog.lock().await;
@@ -547,6 +561,7 @@ impl Fixture {
             group_head_release: Arc::new(Notify::new()),
             hold_group_catalog: Arc::new(Mutex::new(false)),
             hold_group_drop_id: Arc::new(Mutex::new(None)),
+            hold_group_drop_subscription: Arc::new(Mutex::new(None)),
             group_catalog_arrived: Arc::new(Notify::new()),
             group_catalog_release: Arc::new(Notify::new()),
         };
@@ -1314,12 +1329,41 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
 async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
-        let (status, first) = post_group(&app, group_body(f, "group-overlap", false)).await?;
-        ensure!(status == StatusCode::OK, "first group create failed: {status} {first}");
-        let (status, second) = post_group(&app, group_body(f, "group-overlap", true)).await?;
-        ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second}");
-        let (status, third) = post_group(&app, group_body(f, "group-overlap-2", true)).await?;
-        ensure!(status == StatusCode::OK, "failed group left reservation behind: {status} {third}");
+        // Hold the first request immediately after its atomic reservation. The second request
+        // must not create either member while that reservation is in flight; after the winner
+        // completes, the same request (with different members) is the ordinary 409 conflict.
+        let gate = engine.group_load_gate_for_test();
+        gate.arm(GroupLoadAwait::AfterReservation).await;
+        let first_app = app.clone();
+        let first_body = group_body(f, "group-overlap", false);
+        let first = tokio::spawn(async move { post_group(&first_app, first_body).await });
+        tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+            .await
+            .context("first group did not reach its reservation gate")?;
+        let second_app = app.clone();
+        let second_body = group_body(f, "group-overlap", true);
+        gate.arm(GroupLoadAwait::BeforeReservation).await;
+        let second = tokio::spawn(async move { post_group(&second_app, second_body).await });
+        tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+            .await
+            .context("losing group did not reach its reservation gate")?;
+        gate.release.notify_waiters();
+        let (status, first_body) = first.await.context("first group task failed")??;
+        ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
+        gate.release.notify_waiters();
+        let (status, second_body) = second.await.context("second group task failed")??;
+        ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second_body}");
+        ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
+        ensure!(engine.group_record("group-overlap").await.is_some(), "winner group was lost");
+        let catalog = stream_events(f, "meta/catalog").await;
+        ensure!(
+            catalog
+                .iter()
+                .filter(|event| event["t"] == "groupCreated" && event["subscription"] == "group-overlap")
+                .count()
+                == 1,
+            "loser wrote a group catalog event: {catalog:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -2132,6 +2176,9 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
         for (subscription, cut) in [
+            ("group-cut-cancel-member-create", "cancel-member-create"),
+            ("group-cut-cancel-stream-tail", "cancel-stream-tail"),
+            ("group-cut-cancel-snapshot", "cancel-snapshot"),
             ("group-cut-cancel", "cancel"),
             ("group-cut-cancel-head", "cancel-head"),
             ("group-cut-replacement", "replacement"),
@@ -2139,19 +2186,42 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             ("group-cut-truncate", "truncate"),
             ("group-cut-degraded", "degraded"),
         ] {
-            *f.ds.hold_group_catalog.lock().await = true;
+            let pre_durability_stage = match cut {
+                "cancel-member-create" => Some(GroupLoadAwait::MemberCreate),
+                "cancel-stream-tail" => Some(GroupLoadAwait::StreamTail),
+                "cancel-snapshot" => Some(GroupLoadAwait::Snapshot),
+                _ => None,
+            };
+            if let Some(stage) = pre_durability_stage {
+                engine.group_load_gate_for_test().arm(stage).await;
+            } else {
+                *f.ds.hold_group_catalog.lock().await = true;
+            }
             let load_app = app.clone();
             let load_body = group_body(f, subscription, true);
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
-            tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
-                .await
-                .context("group cut did not reach GroupCreated durability")?;
-            let member_id = engine.subscription_owner(subscription).await.context("group cut has no public member")?;
-            let group_path = engine
-                .get_shape(&member_id)
-                .await
-                .map(|shape| shape.stream_path)
-                .context("group cut did not install its member stream")?;
+            let group_path = if pre_durability_stage.is_some() {
+                tokio::time::timeout(Duration::from_secs(10), engine.group_load_gate_for_test().arrived.notified())
+                    .await
+                    .context("group cut did not reach its pre-durability gate")?;
+                load.abort();
+                engine.group_load_gate_for_test().release.notify_one();
+                None
+            } else {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("group cut did not reach GroupCreated durability")?;
+                let member_id =
+                    engine.subscription_owner(subscription).await.context("group cut has no public member")?;
+                Some(
+                    engine
+                        .get_shape(&member_id)
+                        .await
+                        .map(|shape| shape.stream_path)
+                        .context("group cut did not install its member stream")?,
+                )
+            };
+            let group_path = group_path.unwrap_or_default();
             if cut == "cancel" || cut == "cancel-head" {
                 *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
             }
@@ -2172,13 +2242,23 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 let replacement_id = replacement["groupId"].as_str().unwrap_or_default().to_owned();
                 ensure!(replacement_id != group_path, "replacement reused the old group id");
                 abort_gate.release.notify_one();
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    while !engine.has_group_record(subscription).await {
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .context("replacement group did not remain live")?;
+                tokio::time::timeout(Duration::from_secs(10), abort_gate.finished.notified())
+                    .await
+                    .context("old abort did not finish")?;
+                ensure!(
+                    engine.group_record(subscription).await.as_ref().map(|group| group.id.as_str())
+                        == Some(replacement_id.as_str()),
+                    "old abort removed the replacement group"
+                );
+                for member in replacement["results"].as_array().context("replacement members")? {
+                    let member_subscription =
+                        member["subscription"].as_str().context("replacement member subscription")?;
+                    let member_id = member["shapeId"].as_str().context("replacement member id")?;
+                    ensure!(
+                        engine.subscription_owner(member_subscription).await.as_deref() == Some(member_id),
+                        "old abort removed replacement member claim {member_subscription}"
+                    );
+                }
                 let catalog = stream_events(f, "meta/catalog").await;
                 ensure!(
                     catalog.iter().any(|event| event["t"] == "groupDropped" && event["group_id"] == group_path),
@@ -2234,7 +2314,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .context("cancel cleanup did not reach GroupDropped durability")?;
                 f.ds.group_catalog_release.notify_one();
             }
-            if cut != "cancel" && cut != "cancel-head" {
+            if cut != "cancel" && cut != "cancel-head" && pre_durability_stage.is_none() {
                 let (status, body) = tokio::time::timeout(Duration::from_secs(15), &mut load)
                     .await
                     .context("group cut load did not finish")?
@@ -2245,6 +2325,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 loop {
                     if engine.subscription_owner(subscription).await.is_none()
                         && engine.subscription_owner(&format!("{subscription}:member:1")).await.is_none()
+                        && !engine.group_reservation_for_test(subscription).await
                         && !engine.has_group_record(subscription).await
                     {
                         return Ok::<_, anyhow::Error>(());
@@ -2255,15 +2336,77 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             .await
             .context("group cut compensation left claims behind")??;
             let catalog = stream_events(f, "meta/catalog").await;
-            ensure!(
-                catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
-                "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
-            );
-            if cut == "cancel" || cut == "cancel-head" || cut == "closed" {
+            if pre_durability_stage.is_some() {
+                ensure!(
+                    !catalog.iter().any(|event| {
+                        (event["t"] == "groupCreated" || event["t"] == "groupDropped")
+                            && event["subscription"] == subscription
+                    }),
+                    "pre-durability cancellation left a durable group event: {subscription} events={catalog:?}"
+                );
+            } else {
+                ensure!(
+                    catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
+                    "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
+                );
+            }
+            if cut == "cancel" || cut == "cancel-head" || cut == "closed" || pre_durability_stage.is_some() {
                 let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
                 ensure!(status == StatusCode::OK, "compensated group could not be retried: {status} {body}");
             }
         }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// The release acknowledgement is durable before the engine-owned teardown is allowed to
+/// remove the group record. Dropping the HTTP DELETE at that exact point must not cancel the
+/// teardown; a retry can then reuse the subscription without a hidden member claim.
+async fn group_release_cancellation(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-release-cancel", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        let member_id = first["results"][0]["shapeId"].as_str().context("release cancellation member")?.to_owned();
+        let gate = engine.group_release_gate_for_test();
+        gate.arm();
+        let delete_app = app.clone();
+        let delete = tokio::spawn(async move {
+            json(
+                &delete_app,
+                Method::DELETE,
+                &format!("/v1/shapes/{member_id}?subscription=group-release-cancel"),
+                Body::empty(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+            .await
+            .context("release did not reach its post-durability gate")?;
+        delete.abort();
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if engine.subscription_owner("group-release-cancel").await.is_none()
+                    && engine.subscription_owner("group-release-cancel:member:1").await.is_none()
+                    && !engine.group_reservation_for_test("group-release-cancel").await
+                    && !engine.has_group_record("group-release-cancel").await
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancelled release did not complete")??;
+        let (status, replacement) = post_group(&app, group_body(f, "group-release-cancel", true)).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "subscription was not reusable after cancelled release: {status} {replacement}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;

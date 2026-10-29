@@ -12,6 +12,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
+#[cfg(feature = "test-support")]
+use crate::engine::GroupLoadAwait;
 use crate::engine::{Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
@@ -1294,12 +1296,18 @@ async fn subset_load_group(
     // single-shape create cannot win the name between member creates.
     let member_subscriptions: Vec<String> =
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
     engine.reserve_group_with_id(&group_sub, &member_subscriptions, &group_path).await?;
     engine.register_group_lane(&group_path);
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::AfterReservation).await;
     let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
+        #[cfg(feature = "test-support")]
+        engine.wait_group_load_gate_for_test(GroupLoadAwait::MemberCreate).await;
         match engine
             .create_shape_as_on_stream(
                 &member.table,
@@ -1321,6 +1329,8 @@ async fn subset_load_group(
             }
         }
     }
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::StreamTail).await;
     let offset = match engine.stream_tail(&group_path).await {
         Ok(Some(offset)) => offset,
         Ok(None) => {
@@ -1347,6 +1357,8 @@ async fn subset_load_group(
         .collect();
     #[cfg(feature = "test-support")]
     engine.wait_group_seed_gate_for_test().await;
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::Snapshot).await;
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {
