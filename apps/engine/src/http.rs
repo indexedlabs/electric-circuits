@@ -1035,13 +1035,22 @@ async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -
 
 #[derive(Deserialize)]
 struct GroupMemberReq {
-    key: String,
+    /// The member's name in the response; defaults to its table, which is unique in a group.
+    #[serde(default)]
+    key: Option<String>,
     table: TableRef,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
     #[serde(default)]
     columns: Option<Vec<String>>,
 }
+
+impl GroupMemberReq {
+    fn key(&self) -> String {
+        self.key.clone().unwrap_or_else(|| self.table.to_string())
+    }
+}
+
 struct GroupReservationGuard {
     engine: Engine,
     subscription: String,
@@ -1126,6 +1135,8 @@ struct SubsetLoadRequest {
 #[serde(rename_all = "camelCase")]
 struct SubsetLoadResponse {
     group_id: String,
+    /// The group's one shape id (equal to `groupId`); members' own ids are in `results`.
+    shape_id: String,
     subscription: String,
     lease_seconds: u64,
     offset: String,
@@ -1199,7 +1210,7 @@ async fn subset_load_group(
     if let Some(existing) = engine.group_record(&group_sub).await {
         let same = existing.members.len() == members.len()
             && existing.members.iter().zip(&members).all(|(old, new)| {
-                old.key == new.key.to_string()
+                old.key == new.key()
                     && old.table == new.table.to_string()
                     && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
                     && old.columns == new.columns
@@ -1269,7 +1280,7 @@ async fn subset_load_group(
                     })
                     .collect::<Vec<_>>();
                 return Ok(Json(serde_json::json!({
-                    "groupId": existing.id, "subscription": group_sub,
+                    "groupId": existing.id, "shapeId": existing.id, "subscription": group_sub,
                     "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
                     "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
                 })));
@@ -1355,7 +1366,7 @@ async fn subset_load_group(
             .iter()
             .zip(created.iter())
             .map(|(member, (rec, sub))| GroupMember {
-                key: member.key.clone(),
+                key: member.key(),
                 shape_id: rec.id.clone(),
                 table: member.table.to_string(),
                 where_: member.where_.clone(),
@@ -1375,11 +1386,11 @@ async fn subset_load_group(
     }
     reservation.complete();
     let results: Vec<serde_json::Value> = members.into_iter().zip(created.iter()).zip(page.pages).map(|((member, (rec, _)), rows)| serde_json::json!({
-        "key": member.key, "table": member.table, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
+        "key": member.key(), "table": member.table, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
         "subscription": group_sub, "leaseSeconds": lease_seconds, "offset": offset, "rows": rows,
     })).collect();
     Ok(Json(serde_json::json!({
-        "groupId": group_id, "subscription": group_sub,
+        "groupId": group_id, "shapeId": group_id, "subscription": group_sub,
         "streamUrl": engine.stream_url(&group_path), "streamPath": group_path, "offset": offset,
         "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
     })))
@@ -2150,6 +2161,7 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
             || e.downcast_ref::<crate::engine::GroupStreamUnavailable>().is_some()
+            || e.downcast_ref::<crate::engine::GroupLoadInFlight>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));

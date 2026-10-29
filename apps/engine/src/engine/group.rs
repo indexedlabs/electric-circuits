@@ -66,6 +66,14 @@ pub(crate) struct GroupConflict {
     pub owner: String,
 }
 
+/// A load named a subscription whose group is still being assembled or compensated. A retry
+/// after a lost response lands here, so it is retryable (`503` with `Retry-After`), not a `409`.
+#[derive(Debug, thiserror::Error)]
+#[error("group subscription '{subscription}' is still being loaded or released; retry")]
+pub(crate) struct GroupLoadInFlight {
+    pub subscription: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("group stream '{stream_path}' is closed; reload the scope")]
 pub(crate) struct GroupStreamClosed {

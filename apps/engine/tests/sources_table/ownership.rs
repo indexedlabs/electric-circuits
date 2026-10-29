@@ -72,6 +72,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupOneSubscription => group_one_subscription_claims(&fixture).await,
             Case::GroupRetryRenews => group_retry_renews(&fixture).await,
             Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
+            Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
@@ -106,6 +107,7 @@ enum Case {
     GroupOneSubscription,
     GroupRetryRenews,
     GroupReleaseDuringAssembly,
+    GroupRetirementDuringAssembly,
     GroupMembersMax,
 }
 
@@ -235,6 +237,15 @@ fn group_release_during_assembly_is_rejected_and_claims_survive() -> Result<()> 
     isolated(
         "ownership::group_release_during_assembly_is_rejected_and_claims_survive",
         Case::GroupReleaseDuringAssembly,
+    )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_engine_retirement_during_assembly_retires_member_and_fails_the_load() -> Result<()> {
+    isolated(
+        "ownership::group_engine_retirement_during_assembly_retires_member_and_fails_the_load",
+        Case::GroupRetirementDuringAssembly,
     )
 }
 
@@ -1696,6 +1707,11 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         )
         .await?;
         ensure!(status == StatusCode::CONFLICT, "public release escaped the assembly reservation: {status} {body}");
+        // A retry after a lost response, while the first load is still assembling, must hear
+        // "retry" (#g-group-retry-renews), never a conflict with itself.
+        let (status, headers, body) = post_group_response(&app, group_body(f, "group-assembly-race", true)).await?;
+        ensure!(status == StatusCode::SERVICE_UNAVAILABLE, "retry during assembly was not retryable: {status} {body}");
+        ensure!(headers.get("retry-after").is_some(), "retry during assembly omitted Retry-After");
         f.ds.group_catalog_release.notify_one();
         let (status, body) = tokio::time::timeout(Duration::from_secs(15), load)
             .await
@@ -1723,6 +1739,73 @@ async fn group_release_during_assembly(f: &Fixture) -> Result<()> {
         ensure!(
             member_owner.as_deref() == Some(member1.as_str()),
             "completed group lost its private claim: owner={member_owner:?}, member={member1}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// An engine retirement (epoch reset, drift, `TRUNCATE`) of member 0 while its group is still
+/// assembling must retire the shape, not be refused by the reservation, and the load must then
+/// fail and compensate instead of answering `200` for a group with a retired member.
+async fn group_retirement_during_assembly(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        *f.ds.hold_group_catalog.lock().await = true;
+        let load_app = app.clone();
+        let load_body = group_body(f, "group-assembly-retire", true);
+        let load = tokio::spawn(async move { post_group(&load_app, load_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+            .await
+            .context("group load did not reach GroupCreated durability")?;
+        let member0 = engine
+            .subscription_owner("group-assembly-retire")
+            .await
+            .context("member 0 did not claim the group subscription before GroupCreated")?;
+        let (status, body) =
+            json(&app, Method::DELETE, &format!("/v1/shapes/{member0}?purge=true"), Body::empty()).await?;
+        ensure!(status == StatusCode::CONFLICT, "native purge escaped the assembly reservation: {status} {body}");
+        ensure!(
+            engine.subscription_owner("group-assembly-retire").await.as_deref() == Some(member0.as_str()),
+            "refused native purge still released member 0"
+        );
+        engine.purge_shape(&member0).await.context("engine retirement of member 0 was refused")?;
+        ensure!(
+            engine.subscription_owner("group-assembly-retire").await.is_none(),
+            "engine retirement left member 0 holding the group subscription"
+        );
+        *f.ds.hold_group_catalog.lock().await = false;
+        f.ds.group_catalog_release.notify_one();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), load)
+            .await
+            .context("group load did not finish after catalog release")?
+            .context("group load task failed")??;
+        ensure!(status != StatusCode::OK, "group answered 200 with a retired member: {body}");
+        ensure!(!engine.has_group_record("group-assembly-retire").await, "failed load left a group record");
+        ensure!(
+            engine.subscription_owner("group-assembly-retire:member:1").await.is_none(),
+            "failed load left a private member claim"
+        );
+        // The reload uses the contract's member shape, `{table, where, columns}` with no `key`.
+        let outer = format!("public.{}", f.outer);
+        let reload = serde_json::json!({
+            "subscription": "group-assembly-retire",
+            "members": [
+                { "table": outer, "columns": ["id", "body"] },
+                { "table": format!("public.{}", f.inner), "columns": ["id"] },
+            ],
+        });
+        let (status, body) = post_group(&app, reload).await?;
+        ensure!(status == StatusCode::OK, "reload after a retired assembly failed: {status} {body}");
+        ensure!(
+            body["shapeId"].is_string() && body["shapeId"] == body["groupId"],
+            "group answer has no single shapeId: {body}"
+        );
+        ensure!(
+            body["results"][0]["key"] == outer.as_str(),
+            "a member without a key is not named by its table: {body}"
         );
         Ok::<_, anyhow::Error>(())
     }

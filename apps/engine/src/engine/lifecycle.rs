@@ -1215,19 +1215,28 @@ impl Engine {
     ///
     /// It does NOT wait on the retirement either: the stream may still be being deleted in the
     /// background when this returns, and `GET /shapes/{id}` is 404 from now on regardless.
+    ///
+    /// Engine retirements must always retire the shape, even a group member whose group is still
+    /// being assembled: `complete_group` then finds the member gone and the load compensates. Only
+    /// the native purge refuses a member of an assembling group.
     pub async fn purge_shape(&self, id: &str) -> Result<()> {
-        self.purge_shape_inner(id, false).await
+        self.purge_shape_inner(id, false, false).await
     }
 
     /// Native client-facing purge: durably record `Dropped` before acknowledging or retiring.
     pub async fn purge_shape_durable(&self, id: &str) -> Result<()> {
-        self.purge_shape_inner(id, true).await
+        self.purge_shape_inner(id, true, true).await
     }
 
-    async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
+    async fn purge_shape_inner(&self, id: &str, durable: bool, native: bool) -> Result<()> {
         let st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
-        if st.subs_by_id.iter().any(|(subscription, owner)| owner == id && st.group_claims.is_reserved(subscription)) {
+        if native
+            && st
+                .subs_by_id
+                .iter()
+                .any(|(subscription, owner)| owner == id && st.group_claims.is_reserved(subscription))
+        {
             return Err(anyhow::Error::new(GroupConflict {
                 subscription: "group reservation".to_string(),
                 owner: format!("shape {id}"),

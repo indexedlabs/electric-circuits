@@ -91,7 +91,8 @@ pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub(crate) use group::{
-    GroupClaims, GroupConflict, GroupFence, GroupMember, GroupRecord, GroupRelease, GroupStreamClosed,
+    GroupClaims, GroupConflict, GroupFence, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease,
+    GroupStreamClosed,
 };
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
@@ -2949,6 +2950,13 @@ impl Engine {
     /// concurrent single-shape create cannot win the same claim between member creates.
     pub(crate) async fn reserve_group(&self, subscription: &str, member_subscriptions: &[String]) -> Result<()> {
         let mut st = self.state.lock().await;
+        // Checked first: while assembling, member 0 already owns the subscription, and a retry
+        // must hear "retry" rather than a conflict with its own in-flight load.
+        if st.group_claims.is_reserved(subscription) && st.group_claims.get(subscription).is_none() {
+            return Err(anyhow::Error::new(crate::engine::GroupLoadInFlight {
+                subscription: subscription.to_string(),
+            }));
+        }
         if let Some(owner) = st.subscription_owner(subscription) {
             return Err(anyhow::Error::new(crate::engine::GroupConflict {
                 subscription: subscription.to_string(),
