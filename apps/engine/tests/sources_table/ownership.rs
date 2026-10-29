@@ -1351,13 +1351,43 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
             "in-flight loser was not retryable: {status} {in_flight_body}"
         );
         ensure!(headers.get("retry-after").is_some(), "in-flight loser omitted Retry-After");
+        ensure!(
+            engine.group_id_for_test("group-overlap").await.is_some()
+                && engine.subscription_owner("group-overlap:member:1").await.is_none(),
+            "in-flight loser left a private claim"
+        );
+        ensure!(
+            !stream_events(f, "meta/catalog")
+                .await
+                .iter()
+                .any(|event| event["subscription"] == "group-overlap:member:1"),
+            "in-flight loser wrote a catalog event"
+        );
         gate.release.notify_one();
         let (status, first_body) = tokio::time::timeout(Duration::from_secs(15), first)
             .await
             .context("winning group did not finish")?
             .context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
-        let winner_catalog = stream_events(f, "meta/catalog").await;
+        let mut changed = f.ds.changed.subscribe();
+        let winner_catalog = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = stream_events(f, "meta/catalog").await;
+                let joined = events
+                    .iter()
+                    .filter(|event| {
+                        event["t"] == "joined"
+                            && event["subscription"].as_str().is_some_and(|s| s.starts_with("group-overlap"))
+                    })
+                    .count();
+                if joined >= 2 {
+                    return Ok::<_, anyhow::Error>(events);
+                }
+                changed.changed().await.context("catalog observation channel closed")?;
+            }
+        })
+        .await
+        .context("winner Joined events did not become durable")??;
         let (status, second_body) = post_group(&app, second_body.clone()).await?;
         ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second_body}");
         ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
