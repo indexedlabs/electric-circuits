@@ -1210,7 +1210,10 @@ async fn subset_load_group(
     }
     let _control = engine.admit_control()?;
     let group_sub = engine.resolve_subscription(subscription).await;
-    if let Some(existing) = engine.group_record(&group_sub).await {
+    // Each pass either answers, or waits for a release of the group it read to finish and then
+    // reads the subscription's group again: a same-members group that replaced it is renewed,
+    // never answered as a conflict (#g-group-retry-renews).
+    while let Some(existing) = engine.group_record(&group_sub).await {
         let same = existing.members.len() == members.len()
             && existing.members.iter().zip(&members).all(|(old, new)| {
                 old.key == new.key()
@@ -1268,8 +1271,8 @@ async fn subset_load_group(
             }
             // A member claim can lapse between the health probe and the renewal lock, the
             // stream can close, or a release can begin before the answer. Treat each as an
-            // unhealthy existing group: join or start its release, and let this request reserve
-            // a fresh group rather than answering the old stream or a conflict.
+            // unhealthy existing group: join or start its release, then read the subscription's
+            // group again rather than answering the old stream or a conflict.
             engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         }
     }
