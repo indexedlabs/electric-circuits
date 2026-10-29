@@ -3030,21 +3030,50 @@ impl Engine {
     pub(crate) async fn complete_group_with_gens(&self, record: GroupRecord, gens: &SchemaGens) -> Result<()> {
         self.group_lanes.register(&record.stream_path);
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
-        if let Err(error) = self.recheck_group_after_durability(&record, gens).await {
-            self.remove_group_lane(&record.stream_path);
-            // GroupCreated may already be in the durable catalog.  Leave a durable compensating
-            // intent behind before the caller's cancellation guard is allowed to disappear.
-            let _ = self
-                .catalog_tx
-                .send_durable(CatalogEvent::GroupDropped {
-                    subscription: record.subscription.clone(),
-                    group_id: Some(record.id.clone()),
-                })
-                .await;
-            return Err(error);
-        }
+        let stream_open = match self.recheck_group_after_durability(&record, gens).await {
+            Ok(open) => open,
+            Err(error) => {
+                self.remove_group_lane(&record.stream_path);
+                // GroupCreated may already be in the durable catalog.  Leave a durable compensating
+                // intent behind before the caller's cancellation guard is allowed to disappear.
+                let _ = self
+                    .catalog_tx
+                    .send_durable(CatalogEvent::GroupDropped {
+                        subscription: record.subscription.clone(),
+                        group_id: Some(record.id.clone()),
+                    })
+                    .await;
+                return Err(error);
+            }
+        };
         let (valid, renewals) = {
             let mut st = self.state.lock().await;
+            let closing_error = if self.degraded() {
+                Some(anyhow::Error::new(Degraded))
+            } else if st.epoch_reset_since(gens) {
+                Some(anyhow::Error::new(CreateRaced("the replication epoch was reset during group creation")))
+            } else if let Some(table) = st.drifted_since(gens) {
+                Some(anyhow::Error::new(CreateRaced(format!("schema of '{table}' changed during group creation"))))
+            } else if !stream_open {
+                Some(anyhow::Error::new(CreateRaced(format!(
+                    "group stream '{}' closed during group activation",
+                    record.stream_path
+                ))))
+            } else {
+                None
+            };
+            if let Some(error) = closing_error {
+                drop(st);
+                self.remove_group_lane(&record.stream_path);
+                let _ = self
+                    .catalog_tx
+                    .send_durable(CatalogEvent::GroupDropped {
+                        subscription: record.subscription.clone(),
+                        group_id: Some(record.id.clone()),
+                    })
+                    .await;
+                return Err(error);
+            }
             let valid = record.members.iter().all(|member| {
                 st.shapes.contains_key(&member.shape_id)
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
@@ -3105,14 +3134,14 @@ impl Engine {
         self.state.lock().await.capture_gens(tables)
     }
 
-    async fn recheck_group_after_durability(&self, record: &GroupRecord, gens: &SchemaGens) -> Result<()> {
+    async fn recheck_group_after_durability(&self, record: &GroupRecord, gens: &SchemaGens) -> Result<bool> {
         for member in &record.members {
             self.recheck_after_durability(&member.shape_id, &record.stream_path, gens).await?;
         }
         match self.ds.head(&record.stream_path).await {
-            Ok(Some(head)) if !head.closed && head.next_offset.is_some() => Ok(()),
-            Ok(_) => Err(anyhow::Error::new(CreateRaced(format!(
-                "group stream '{}' was closed during its catalog durability wait",
+            Ok(Some(head)) => Ok(!head.closed && head.next_offset.is_some()),
+            Ok(None) => Err(anyhow::Error::new(CreateRaced(format!(
+                "group stream '{}' disappeared during its catalog durability wait",
                 record.stream_path
             )))),
             Err(error) => Err(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error)),
