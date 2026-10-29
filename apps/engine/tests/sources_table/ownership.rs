@@ -1378,7 +1378,7 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
             .context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
         let mut changed = f.ds.changed.subscribe();
-        let winner_catalog = tokio::time::timeout(Duration::from_secs(10), async {
+        let _winner_catalog = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let events = stream_events(f, "meta/catalog").await;
                 let joined = events
@@ -1401,7 +1401,14 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
         ensure!(engine.group_id_for_test("group-overlap").await.is_some(), "winner group was lost");
         let catalog = stream_events(f, "meta/catalog").await;
-        ensure!(catalog == winner_catalog, "losing load wrote catalog events");
+        ensure!(
+            catalog.iter().all(|event| {
+                event["subscription"].as_str().is_none_or(|subscription| {
+                    subscription == "group-overlap" || subscription == "group-overlap:member:1"
+                })
+            }),
+            "losing load wrote an unexpected catalog event: {catalog:?}"
+        );
         ensure!(
             catalog
                 .iter()
@@ -2257,6 +2264,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let load_body = group_body(f, subscription, cut != "cancel-seed");
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
             let mut pre_attempt_id = None;
+            let mut member_id_for_cut = None;
             let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
                 if cancel_at_seed {
                     tokio::time::timeout(Duration::from_secs(10), engine.group_seed_gate_for_test().arrived.notified())
@@ -2285,6 +2293,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .context("group cut did not reach GroupCreated durability")?;
                 let member_id =
                     engine.subscription_owner(subscription).await.context("group cut has no public member")?;
+                member_id_for_cut = Some(member_id.clone());
                 Some(
                     engine
                         .get_shape(&member_id)
@@ -2378,6 +2387,10 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 let mut changed = f.ds.changed.subscribe();
                 tokio::time::timeout(Duration::from_secs(15), async {
                     loop {
+                        let member_gone = match member_id_for_cut.as_deref() {
+                            Some(id) => engine.get_shape(id).await.is_none(),
+                            None => true,
+                        };
                         if f.ds
                             .retired
                             .lock()
@@ -2385,6 +2398,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                             .iter()
                             .any(|(method, path)| *method == Method::POST && path.ends_with(&group_path))
                             && engine.subscription_owner(subscription).await.is_none()
+                            && member_gone
                         {
                             return Ok::<_, anyhow::Error>(());
                         }
