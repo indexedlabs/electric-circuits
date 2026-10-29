@@ -69,6 +69,9 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupPageCancellation => page_cancellation_contract(&fixture).await,
             Case::GroupConcurrentPageCancellation => concurrent_page_cancellation_contract(&fixture).await,
             Case::GroupRollbackCancellation => rollback_cancellation_contract(&fixture).await,
+            Case::GroupRollbackBeforeReleaseCancellation => {
+                rollback_before_first_release_cancellation_contract(&fixture).await
+            }
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -104,6 +107,7 @@ enum Case {
     GroupPageCancellation,
     GroupConcurrentPageCancellation,
     GroupRollbackCancellation,
+    GroupRollbackBeforeReleaseCancellation,
 }
 
 #[test]
@@ -143,6 +147,15 @@ fn concurrent_group_cancellations_preserve_both_durable_drops() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_canceled_rollback_retains_unreleased_group_members() -> Result<()> {
     isolated("ownership::group_canceled_rollback_retains_unreleased_group_members", Case::GroupRollbackCancellation)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_canceled_before_first_rollback_release_releases_all_members() -> Result<()> {
+    isolated(
+        "ownership::group_canceled_before_first_rollback_release_releases_all_members",
+        Case::GroupRollbackBeforeReleaseCancellation,
+    )
 }
 
 #[test]
@@ -1518,6 +1531,95 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     }
     if let Err(error) = fence {
         errors.push(format!("remove source fence after rollback cancellation: {error:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("\n"));
+    }
+}
+
+async fn rollback_before_first_release_cancellation_contract(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let barrier = f.root.join("group-rollback-before-release");
+    let base = barrier.to_string_lossy().into_owned();
+    let subscription = "group-rollback-before-release";
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER", &base) };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE", "rollback") };
+    unsafe { std::env::set_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE", "member_release") };
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let request = group_body(f, subscription, true);
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move { post_group(&app, request).await }
+        });
+        let rollback_ready = PathBuf::from(format!("{base}.rollback.ready"));
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if std::fs::read_to_string(&rollback_ready).map_or(0, |contents| contents.lines().count()) >= 1 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .context("waiting for first rollback barrier before cancellation")?;
+        task.abort();
+        ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    // Shutdown-owned compensation must bypass the held barrier while it releases every retained member.
+    electric_circuits_engine::http::test_disable_group_page_barrier();
+    let close = engine.close(Duration::from_secs(10)).await;
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
+    unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
+    let fence = remove_source_fence(f).await;
+    let replacement = async {
+        let (replacement, replacement_app) = group_engine(f).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let attempt = post_group(&replacement_app, group_body(f, subscription, true)).await?;
+            if attempt.0 == StatusCode::OK {
+                break;
+            }
+            ensure!(
+                attempt.0 == StatusCode::CONFLICT,
+                "retry after pre-release rollback cancellation failed: {} {}",
+                attempt.0,
+                attempt.1
+            );
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "pre-release rollback cancellation did not release the group claim: {} {}",
+                    attempt.0,
+                    attempt.1
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let replacement_close = replacement.close(Duration::from_secs(10)).await;
+        ensure!(
+            replacement_close == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+            "replacement engine after pre-release rollback cancellation did not close cleanly"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    let mut errors = Vec::new();
+    if close != electric_circuits_engine::shutdown::ShutdownOutcome::Complete {
+        errors.push(format!("pre-release rollback cancellation engine did not close cleanly: {close:?}"));
+    }
+    if let Err(error) = result {
+        errors.push(format!("pre-release rollback cancellation: {error:#}"));
+    }
+    if let Err(error) = replacement {
+        errors.push(format!("retry after pre-release rollback cancellation: {error:#}"));
+    }
+    if let Err(error) = fence {
+        errors.push(format!("remove source fence after pre-release rollback cancellation: {error:#}"));
     }
     if errors.is_empty() {
         Ok(())
