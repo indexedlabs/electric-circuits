@@ -478,7 +478,10 @@ The merged `d26818d` tree is green in both membership modes with the rollback co
 the default Rust engine suite, Vitest/conformance, rustfmt, and all three featureless images
 (`40810672853`, test job `123239956655`, engine image `123239956961`). The scope-benchmark job is
 rerunning on this tree; the four completed five-repetition artifacts remain the performance evidence.
-The benchmark production tree remains the one preserved by `1d7bbbc`.
+The benchmark production tree remains the one preserved by `1d7bbbc`. Follow-up `24e985c` then
+removed the shutdown barrier bypass while cleaning comments; its group and full Rust lanes went red
+because shutdown-owned compensation waited on the held `member_retry` barrier. `68f7a49` restores
+that bypass with the shutdown ordering rationale; its exact-head result is pending.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` for group members,
