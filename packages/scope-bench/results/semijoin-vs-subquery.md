@@ -469,11 +469,12 @@ did not make the contracts green. `e01f89f` temporarily skipped only
 modes (`40800299454`, job `123206516252`), while step 8 remained red. The same tree without
 the skip (`c45e31b`, run `40799770386`, job `123204807672`) was red, localizing the failure to
 that rollback contract. This is bisect evidence, not qualification. `6d71a66` keeps the
-skip-only bisect and adds a dedicated two-mode rollback diagnostic that emits the child failure lines as check-run
-annotations. The new `group_canceled_before_first_rollback_release_releases_all_members`
-contract covers cancellation while the guard still owns both members; its exact result is
-pending. No head containing the compensation change has a green qualification. The benchmark production tree remains the one preserved by `1d7bbbc`,
-while this candidate's compensation path still requires its own green test job.
+skip-only bisect and adds a dedicated two-mode rollback diagnostic; `06e2a83` adds the
+`group_canceled_before_first_rollback_release_releases_all_members` contract covering
+cancellation while the guard still owns both members. Its exact result is pending. No head
+containing the compensation change has a green qualification. The benchmark production tree
+remains the one preserved by `1d7bbbc`, while this candidate's compensation path still requires
+its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
