@@ -462,11 +462,12 @@ cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compil
 the integration hook was private. `0d6aff0` (`40792037118`, job `123179345889`) was red in
 rustfmt, group contracts and Rust engine tests; `feadedb` added CI diagnostics. `a5c66a5`
 (`40795789456`, job `123191825709`) was rustfmt-green but group-contract-red in both modes;
-its hosted reviews required the failing child output before another rollback change. The current
-head is `07a8899`, which records that exact result and is awaiting its own checks and hosted
-reviews. No head containing the compensation change has a green qualification. The benchmark
-production tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path
-still requires its own green test job.
+its hosted reviews required the failing child output before another rollback change. `07a8899`
+(`40797741254`, job `123198188564`) and current docs-only head `670d566` (`40798069270`, job
+`123199260461`) were also rustfmt-green but group-contract-red in both modes. The arm-after-barrier
+hypothesis in `93c1428` did not make the contracts green. No head containing the compensation
+change has a green qualification. The benchmark production tree remains the one preserved by
+`1d7bbbc`, while this candidate's compensation path still requires its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
