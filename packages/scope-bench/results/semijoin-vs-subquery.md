@@ -477,11 +477,19 @@ injected failure to the actual durable wait path and checks each member's catalo
 The merged `d26818d` tree is green in both membership modes with the rollback contract unskipped,
 the default Rust engine suite, Vitest/conformance, rustfmt, and all three featureless images
 (`40810672853`, test job `123239956655`, engine image `123239956961`). The scope-benchmark job is
-rerunning on this tree; the four completed five-repetition artifacts remain the performance evidence.
-The benchmark production tree remains the one preserved by `1d7bbbc`. Follow-up `24e985c` then
+green on the corrected head `2230b32` as test job `123256148452` in run `40815711977`; its
+artifact `12873937219` (`semijoin-vs-subquery-1ba7c25778380872dfd0e1c8dbe3561b9e5caba7`, zip
+SHA-256 `77b83847327a20a22179a319489188ca32b87cd4ce7e07e3c94693a97edf34a6`) is intentionally
+excluded from the comparison medians because this cancellation-free workload does not exercise
+the compensation change. The earlier `d26818d` artifact `12871519030`
+(`semijoin-vs-subquery-57e8af2775909e2d66439efa33cbe3c69eb0c69d`, zip SHA-256
+`91119d8f9b0440de7a27ebd76d57d3b022c1446389ab17de0a72a531f368e1c6`) is excluded for the same
+reason; the four completed five-repetition artifacts remain the performance comparison evidence.
+The benchmark production tree for those medians remains the one preserved by `1d7bbbc`. Follow-up `24e985c` then
 removed the shutdown barrier bypass while cleaning comments; its group and full Rust lanes went red
 because shutdown-owned compensation waited on the held `member_retry` barrier. `68f7a49` restores
-that bypass with the shutdown ordering rationale; its exact-head result is pending.
+that bypass with the shutdown ordering rationale; the exact-head test and benchmark lanes are green
+on `2230b32`.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` for group members,

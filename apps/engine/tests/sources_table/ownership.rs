@@ -1520,7 +1520,7 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
     // the Err arm would otherwise wait 15 seconds and outlive close's grace period.
     electric_circuits_engine::http::test_disable_group_page_barrier();
     let close = engine.close(Duration::from_secs(10)).await;
-    // Remove the fault-cut variables only after the engine has drained its owned tasks.
+    // Remove the durable-wait test controls only after the engine has drained its owned tasks.
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };
