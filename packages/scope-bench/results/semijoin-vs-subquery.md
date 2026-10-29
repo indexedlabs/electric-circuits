@@ -477,6 +477,9 @@ injected failure to the actual durable wait path and checks each member's catalo
 No head containing the compensation change has a green qualification yet. The benchmark production
 tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path requires a
 fresh exact-head test.
+On `dbcca49`, the full group step passed in both modes, while rustfmt, the featureless engine
+image build, and the full Rust step were red; the next candidate removes the production cfg error
+and formats the catalog assertion before rerunning all lanes.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` for group members,

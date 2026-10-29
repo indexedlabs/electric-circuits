@@ -931,13 +931,14 @@ async fn catalog_events(f: &Fixture) -> Result<Vec<serde_json::Value>> {
 
 async fn assert_group_member_lefts(f: &Fixture, subscription: &str) -> Result<()> {
     let events = catalog_events(f).await?;
+    let member_prefix = format!("{subscription}:member:");
     let created: Vec<_> = events
         .iter()
         .filter(|event| {
             event["t"] == "created"
                 && event["subscription"]
                     .as_str()
-                    .is_some_and(|member| member == subscription || member.starts_with(&format!("{subscription}:member:")))
+                    .is_some_and(|member| member.starts_with(&member_prefix))
         })
         .collect();
     ensure!(!created.is_empty(), "catalog has no created members for {subscription}");

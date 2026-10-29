@@ -1523,9 +1523,9 @@ impl GroupReservationGuard {
                 if let Err(barrier_error) = test_group_page_barrier("member_retry").await {
                     tracing::warn!(%barrier_error, %shape_id, %subscription, "group member retry test barrier failed");
                 }
-                // A durable release can fail after its in-memory mutation when shutdown has already
-                // started. Re-enqueue the idempotent Left once while the catalog writer may still be
-                // draining. A second writer-loss error is terminal for this engine instance.
+                // A durable wait can fail after the member's no-claim release when shutdown has
+                // already started. Re-enqueue the idempotent Left once while the catalog writer
+                // may still be draining. A second writer-loss error is terminal for this engine.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 match engine.retry_subscription_release_durable(shape_id, subscription).await {
                     Ok(()) => true,

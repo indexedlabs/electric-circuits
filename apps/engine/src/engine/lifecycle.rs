@@ -1127,11 +1127,9 @@ impl Engine {
         self.release_subscription_inner(id, sub, true).await
     }
 
-    /// Re-enqueue a release whose in-memory mutation already happened but whose first catalog
-    /// append did not become durable. Compensation callers use this after
-    /// [`Self::release_subscription_durable`] has returned `CatalogWriterGone`; the ordinary
-    /// idempotent release would otherwise find no claim and wait on the failed writer without
-    /// putting a new `Left` back in the catalog queue.
+    /// Re-enqueue a release whose first catalog append did not become durable. Group-member
+    /// compensation also uses this for the normal no-claim release, because the private member
+    /// has no shared feed entry for `release_subscription_durable` to remove.
     pub(crate) async fn retry_subscription_release_durable(&self, id: &str, subscription: &str) -> Result<()> {
         self.catalog_tx
             .send_durable(CatalogEvent::Left {
@@ -1150,7 +1148,6 @@ impl Engine {
             None => st.unsubscribe_anonymous(id),
         };
         let had_release = released.is_some();
-        #[cfg(feature = "test-support")]
         let wait = released.and_then(|subscription| {
             let event = CatalogEvent::Left { id: id.to_string(), subscription, lapsed: false };
             if durable {
