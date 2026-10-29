@@ -144,7 +144,6 @@ pub(crate) fn spawn_sequencer(
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
     subq: SubqueryHandle,
-    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -185,7 +184,6 @@ pub(crate) fn spawn_sequencer(
         stats.clone(),
         node_states.clone(),
         subq,
-        group_fence,
         trace_tx,
         arr,
         arr_gates,
@@ -455,7 +453,6 @@ pub(crate) async fn sequencer_loop(
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
-    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -531,12 +528,6 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
-    // Groups add one cross-lane fence: before the next source transaction is allowed to
-    // publish, all deferred subquery effects from the previous transaction must have landed.
-    // This is enabled only while at least one group lease is active; ordinary single-table
-    // shapes keep their existing throughput path.
-    let mut last_group_lsn: Option<u64> = None;
-    let mut last_group_paths = HashSet::new();
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -784,14 +775,6 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if group_fence.active()
-                            && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
-                        {
-                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
-                            processing_failed = true;
-                            break;
-                        }
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -957,40 +940,10 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
                         }
-                        // Group members, including ordinary filters, use the same bounded append
-                        // entry point as deferred subquery effects. This keeps a group's outputs
-                        // behind its source-transaction barrier and applies backpressure only to
-                        // that group's stream.
-                        let group_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
-                        let group_paths: Vec<String> = txn_pending
-                            .keys()
-                            .filter(|path| path.starts_with("shape/group-"))
-                            .cloned()
-                            .collect();
-                        let direct_group_paths: HashSet<String> = group_paths.iter().cloned().collect();
-                        for path in group_paths {
-                            if let Some(envs) = txn_pending.remove(&path) {
-                                subq.group_lanes.enqueue(&path, envs, group_lsn).await;
-                            }
-                        }
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
                             tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
-                            highwater = txn_highwater;
-                            processing_failed = true;
-                            break;
-                        }
-                        if !direct_group_paths.is_empty()
-                            && !wait_for_group_effects(
-                                &subq.group_lanes,
-                                &direct_group_paths,
-                                &shutdown,
-                                group_lsn,
-                            )
-                            .await
-                        {
-                            tracing::error!(group_lsn, "group output could not land before advancing the processed position");
                             highwater = txn_highwater;
                             processing_failed = true;
                             break;
@@ -1046,18 +999,6 @@ pub(crate) async fn sequencer_loop(
                             source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
-                        }
-                        if group_fence.active()
-                            && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
-                        {
-                            let paths = subq.group_lanes.paths_at_or_before(commit_lsn);
-                            if !paths.is_empty() {
-                                last_group_lsn = Some(commit_lsn);
-                                last_group_paths = paths;
-                            } else {
-                                last_group_lsn = None;
-                                last_group_paths.clear();
-                            }
                         }
                     }
                     if processing_failed {
@@ -1270,30 +1211,6 @@ async fn wait_for_source_effects(
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-            _ = shutdown.wait() => return false,
-        }
-    }
-}
-
-async fn wait_for_group_effects(
-    lanes: &crate::engine::emission::GroupEmissionLanes,
-    paths: &HashSet<String>,
-    shutdown: &crate::shutdown::ShutdownToken,
-    marker_lsn: u64,
-) -> bool {
-    loop {
-        if shutdown.is_shutting_down() {
-            return false;
-        }
-        let wake = lanes.wake();
-        let notified = wake.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !lanes.has_origin_at_or_before(paths, marker_lsn) {
-            return true;
-        }
-        tokio::select! {
-            _ = notified => {}
             _ = shutdown.wait() => return false,
         }
     }
@@ -2174,64 +2091,30 @@ pub(crate) async fn process_envelope(
     // this tailer. The convergence barrier is processed offsets + a drained flip queue
     // (`pending_flips == 0`).
     {
-        let mut group_paths = HashSet::new();
-        let (result, staged_group_emissions) = {
+        let mut work = std::collections::VecDeque::new();
+        {
             let mut reg = subq.registry.lock().await;
-            let result = if reg.touches(&ts.table) {
+            if reg.touches(&ts.table) {
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
-                let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
-                if let Ok(result_work) = result.as_ref() {
-                    group_paths = reg.group_paths_for_work(result_work);
-                    for path in &group_paths {
-                        subq.group_lanes.begin_origin(path, lsn_u64);
-                    }
-                    if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
-                        for h in &sq {
-                            if h.outcome == "passed"
-                                && let Some(sid) = h.node.strip_prefix("shape:")
-                                && !ids.iter().any(|i| i == sid)
-                            {
-                                ids.push(sid.to_string());
-                            }
+                work = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await?;
+                if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
+                    for h in &sq {
+                        if h.outcome == "passed"
+                            && let Some(sid) = h.node.strip_prefix("shape:")
+                            && !ids.iter().any(|i| i == sid)
+                        {
+                            ids.push(sid.to_string());
                         }
-                        hops.extend(sq);
                     }
+                    hops.extend(sq);
                 }
-                result
-            } else {
-                Ok(std::collections::VecDeque::new())
-            };
-            (result, reg.take_group_emissions())
-        };
-        let work = match result {
-            Ok(work) => {
-                for handle in staged_group_emissions {
-                    handle.wait().await;
-                }
-                work
             }
-            Err(error) => {
-                drop(staged_group_emissions);
-                return Err(error);
-            }
-        };
+        }
         if !work.is_empty() {
             subq.pending_flips.add(lsn_u64);
-            if subq
-                .flip_tx
-                .send(FlipWork::Walk {
-                    work,
-                    txid: txid.clone(),
-                    lsn: lsn.clone(),
-                    group_paths: group_paths.iter().cloned().collect(),
-                })
-                .is_err()
-            {
+            if subq.flip_tx.send(FlipWork::Walk { work, txid: txid.clone(), lsn: lsn.clone() }).is_err() {
                 // Propagator gone (shutdown) — don't leave the barrier stuck.
                 subq.pending_flips.complete(lsn_u64);
-                for path in &group_paths {
-                    subq.group_lanes.complete_origin(path, lsn_u64);
-                }
             }
         }
     }
@@ -2608,7 +2491,6 @@ mod source_fence_tests {
             Default::default(),
             Default::default(),
             engine.subquery_handle(),
-            engine.group_fence.clone(),
             engine.trace_tx.clone(),
             None,
             HashMap::new(),
@@ -2658,14 +2540,14 @@ mod source_fence_tests {
         for _ in 0..pending {
             pending_flips.add(0);
         }
-        let ds = DsClient::new_for_in_process_test("http://127.0.0.1:1");
-        let shutdown = crate::shutdown::ShutdownToken::new();
         SubqueryHandle {
-            registry: Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None))),
+            registry: Arc::new(Mutex::new(SubqueryRegistry::new(
+                DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+                None,
+            ))),
             flip_tx,
-            pending_flips: pending_flips.clone(),
+            pending_flips,
             degrade: DegradeState::new(),
-            group_lanes: crate::engine::emission::GroupEmissionLanes::new(ds, shutdown, pending_flips.clone()),
         }
     }
 
@@ -3029,7 +2911,6 @@ mod held_spill_tests {
                 Default::default(),
                 Default::default(),
                 engine.subquery_handle(),
-                engine.group_fence.clone(),
                 engine.trace_tx.clone(),
                 None,
                 HashMap::new(),

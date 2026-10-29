@@ -209,13 +209,7 @@ async fn json(app: &Router, method: Method, uri: &str, body: Body) -> anyhow::Re
     let method_name = method.to_string();
     let response = app
         .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(body)?,
-        )
+        .oneshot(axum::http::Request::builder().method(method).uri(uri).body(body)?)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let status = response.status();

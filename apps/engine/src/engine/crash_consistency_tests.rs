@@ -953,7 +953,7 @@ async fn lose_successor_after_boot_check(status: u16) -> (Run, LogPosition) {
     if status != 503 {
         Arc::get_mut(&mut saved).unwrap().missing_status = status;
     }
-    let restarted = Run::new(saved, oracle).await;
+    let mut restarted = Run::new(saved, oracle).await;
     let fold = restarted.engine.fold_catalog().await.unwrap();
     restarted
         .engine
