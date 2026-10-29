@@ -1508,19 +1508,15 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
             }
         })
         .await
-        .context("waiting for post-unsubscribe retry barrier")?;
+        .context("waiting for durable-release retry barrier")?;
         task.abort();
         ensure!(task.await.is_err(), "rollback request unexpectedly completed before cancellation");
         ensure!(std::fs::read_to_string(&fired).is_ok(), "durable-release fault injection did not fire");
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    // Let shutdown-owned compensation bypass the retry barrier while keeping the environment
-    // variables intact until the engine has drained its worker tasks.
-    electric_circuits_engine::http::test_disable_group_page_barrier();
     let close = engine.close(Duration::from_secs(10)).await;
-    // Keep the fault-cut variables available until the engine has drained all shutdown-owned
-    // compensation tasks; removing them earlier races native environment readers in those tasks.
+    // Remove the fault-cut variables only after the engine has drained its owned tasks.
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER_STAGE") };
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_FAIL_STAGE") };

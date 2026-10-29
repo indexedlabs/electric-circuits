@@ -474,17 +474,19 @@ deadline has elapsed` in both modes. The trace showed that group members are cre
 in-memory feed claim, so the after-unsubscribe fault could never fire; the pre-release contract
 passed but observed only that a replacement could claim the group. The current fix moves the
 injected failure to the actual durable wait path and checks each member's catalog `Left` directly.
-`dbcca49` made the group-contract step green in both modes with the skip removed (`40807662025`),
-but its featureless engine image exposed a stray test-only cfg on the durable release path and
-rustfmt exposed one over-width assertion line. This follow-up removes both blockers; the exact-head
-all-lane result is pending. The benchmark production tree remains the one preserved by `1d7bbbc`,
-while this candidate's compensation path requires a fresh exact-head test.
+The merged `d26818d` tree is green in both membership modes with the rollback contract unskipped,
+the default Rust engine suite, Vitest/conformance, rustfmt, and all three featureless images
+(`40810672853`, test job `123239956655`, engine image `123239956961`). The scope-benchmark job is
+rerunning on this tree; the four completed five-repetition artifacts remain the performance evidence.
+The benchmark production tree remains the one preserved by `1d7bbbc`.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` for group members,
 whose private release has no in-memory feed claim. The cancellation contracts now directly fail if
 the `Ok(false)` re-enqueue or shutdown-owned member loop is removed; those intended-red mutations
-have not been run as separate CI patches because this checkout has no local Rust/PG lane.
+have not been run as separate CI patches because this checkout has no local Rust/PG lane. The
+rollback contract intentionally cancels while the retry barrier is held, so it does not exercise
+the later 100 ms retry or writer-loss branch; those remain evidence gaps.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's
