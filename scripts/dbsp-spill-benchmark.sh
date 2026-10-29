@@ -164,3 +164,5 @@ PY
 
 sha256sum "$artifact_root/results.md" > "$artifact_root/results.md.sha256"
 cat "$artifact_root/results.md"
+echo
+echo "results.md SHA-256: $(cut -d' ' -f1 "$artifact_root/results.md.sha256")"
