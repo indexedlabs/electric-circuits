@@ -539,6 +539,45 @@ pub(crate) async fn connect_owned(url: &str, owner: &crate::shutdown::ShutdownTo
     PgConnectionConfig::from_process_env(url)?.connect(Some(owner)).await
 }
 
+/// A timed step of a subset query, named in its telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryPhase {
+    /// Waiting for one of a [`Pool`]'s slots.
+    PoolWait,
+    /// Dialing a new pooled connection.
+    Connect,
+    /// Opening a settled snapshot, settle wait included.
+    Snapshot,
+    /// The page `SELECT`, its decoding and the `COMMIT`.
+    Select,
+}
+
+impl QueryPhase {
+    pub fn name(self) -> &'static str {
+        match self {
+            QueryPhase::PoolWait => "pool_wait",
+            QueryPhase::Connect => "connect",
+            QueryPhase::Snapshot => "snapshot",
+            QueryPhase::Select => "select",
+        }
+    }
+}
+
+/// Where a [`Pool`] checkout spent its time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CheckoutTiming {
+    /// Waiting for one of the pool's `size` slots.
+    pub slot_wait: std::time::Duration,
+    /// Dialing a new connection (TCP, TLS, authentication) when no idle one was left; `None` when
+    /// an idle connection was reused.
+    pub connect: Option<std::time::Duration>,
+    /// The step under way and when it began, so a checkout dropped mid-await can still say where
+    /// its time went; `None` between steps.
+    pub in_progress: Option<(QueryPhase, std::time::Instant)>,
+    /// The last step begun, which names where a failed checkout failed.
+    pub last: Option<QueryPhase>,
+}
+
 /// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
 /// Backfills/query-backs mark their explicit transaction bracket, so check-in only rolls back a
 /// checkout that may actually have left a transaction open or aborted.
@@ -552,6 +591,8 @@ struct PoolInner {
     url: String,
     idle: std::sync::Mutex<Vec<Client>>,
     sem: Arc<tokio::sync::Semaphore>,
+    /// The checkout cap `sem` was created with, so [`Pool::in_use`] can report occupancy.
+    size: usize,
     /// What the sequencer reading this database's changes has fanned out without a snapshot having
     /// been seen to contain it — the settle record every snapshot on this pool is checked against,
     /// with its own visibility poller (a dedicated connection, outside this pool's `size`).
@@ -576,6 +617,7 @@ impl Pool {
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
+                size: size.max(1),
             }),
         };
         pool
@@ -587,6 +629,22 @@ impl Pool {
         self.inner.idle.lock().unwrap().clear();
     }
 
+    /// The most connections this pool checks out at once.
+    pub fn size(&self) -> usize {
+        self.inner.size
+    }
+
+    /// Checkouts holding a slot right now: a point-in-time reading for telemetry, not a reservation.
+    pub fn in_use(&self) -> usize {
+        self.inner.size.saturating_sub(self.inner.sem.available_permits())
+    }
+
+    /// Take one slot without a connection, so a test can fill the pool without a server.
+    #[cfg(test)]
+    pub(crate) async fn hold_slot_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.inner.sem.clone().acquire_owned().await.expect("test pool open")
+    }
+
     /// The settle set for snapshots taken on this pool (see [`SequencedXids`]). The sequencer that
     /// consumes this database's change log notes into it.
     pub fn sequenced(&self) -> Arc<SequencedXids> {
@@ -596,7 +654,12 @@ impl Pool {
     /// Check out a connection; waits if all `size` are in use. The checkout is returned to the
     /// pool (or discarded, if broken) when the guard drops.
     pub async fn get(&self) -> Result<PooledClient> {
-        let (client, permit) = self.inner.checkout().await?;
+        self.get_timed(&mut CheckoutTiming::default()).await
+    }
+
+    /// [`Self::get`], recording into `timing` how long it waited for a slot and whether it dialed.
+    pub async fn get_timed(&self, timing: &mut CheckoutTiming) -> Result<PooledClient> {
+        let (client, permit) = self.inner.checkout(timing).await?;
         Ok(PooledClient {
             client: Some(client),
             inner: self.inner.clone(),
@@ -614,12 +677,28 @@ impl Drop for PoolInner {
 
 impl PoolInner {
     /// A permit plus a healthy connection: an idle one if there is one, otherwise a new dial.
-    async fn checkout(&self) -> Result<(Client, tokio::sync::OwnedSemaphorePermit)> {
-        let permit = self.sem.clone().acquire_owned().await.context("pg pool closed")?;
+    /// `timing` records the slot wait and any dial as each finishes, so a failed checkout still
+    /// reports how long it waited.
+    async fn checkout(&self, timing: &mut CheckoutTiming) -> Result<(Client, tokio::sync::OwnedSemaphorePermit)> {
+        let started = std::time::Instant::now();
+        timing.in_progress = Some((QueryPhase::PoolWait, started));
+        timing.last = Some(QueryPhase::PoolWait);
+        let permit = self.sem.clone().acquire_owned().await;
+        timing.slot_wait = started.elapsed();
+        timing.in_progress = None;
+        let permit = permit.context("pg pool closed")?;
         let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
         let client = match reused {
             Some(c) => c,
-            None => connect_owned(&self.url, &self.shutdown).await?,
+            None => {
+                let dialing = std::time::Instant::now();
+                timing.in_progress = Some((QueryPhase::Connect, dialing));
+                timing.last = Some(QueryPhase::Connect);
+                let dialed = connect_owned(&self.url, &self.shutdown).await;
+                timing.connect = Some(dialing.elapsed());
+                timing.in_progress = None;
+                dialed?
+            }
         };
         Ok((client, permit))
     }
@@ -671,7 +750,7 @@ impl PooledClient {
     /// Take a connection again after [`Self::release`] — waiting for a pool slot like
     /// [`Pool::get`].
     async fn reacquire(&mut self) -> Result<()> {
-        let (client, permit) = self.inner.checkout().await?;
+        let (client, permit) = self.inner.checkout(&mut CheckoutTiming::default()).await?;
         self.client = Some(client);
         self.permit = Some(permit);
         self.transaction_open.store(false, Ordering::SeqCst);
@@ -1782,6 +1861,21 @@ pub struct SubsetQuery {
     pub horizon: String,
 }
 
+/// The two Postgres phases of a subset query, timed separately so an operator can tell a settle
+/// wait from a slow `SELECT`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubsetQueryTiming {
+    /// Opening the settled snapshot: `BEGIN`, the snapshot fences and any settle wait, including the
+    /// pool wait to retake a connection after one.
+    pub snapshot: std::time::Duration,
+    /// The page `SELECT`, decoding its rows and the `COMMIT`.
+    pub select: std::time::Duration,
+    /// The phase under way and when it began; `None` between phases (see [`CheckoutTiming`]).
+    pub in_progress: Option<(QueryPhase, std::time::Instant)>,
+    /// The last phase begun, which names where a failed query failed.
+    pub last: Option<QueryPhase>,
+}
+
 /// Run a **non-materialized** subset query: a single `SELECT … WHERE … ORDER BY … LIMIT … OFFSET …`
 /// against Postgres in a `REPEATABLE READ` snapshot, returning the page rows and the snapshot LSN.
 /// Unlike [`backfill_reader`], this creates no shape and no durable stream — it is the ephemeral query-back a
@@ -1796,7 +1890,8 @@ pub async fn query_subset(
     offset: Option<i64>,
 ) -> Result<SubsetQuery> {
     let where_sql = filter.and_then(|p| crate::sql::predicate_to_sql(p, ts));
-    query_subset_where(client, ts, where_sql, &SettleScope::request(&ts.table), order, limit, offset).await
+    let scope = SettleScope::request(&ts.table);
+    query_subset_where(client, ts, where_sql, &scope, order, limit, offset, &mut SubsetQueryTiming::default()).await
 }
 
 /// Like [`query_subset`], but with a **prebuilt** `WHERE` fragment + params — used when the predicate
@@ -1804,6 +1899,8 @@ pub async fn query_subset(
 /// so paginated subquery lists work without engine-side subquery state).
 ///
 /// `scope` must name the inner tables of any subquery in `where_sql` (see [`SettleScope`]).
+/// `timing` receives each phase as it ends, so a failed query still reports the phases it ran.
+#[allow(clippy::too_many_arguments)]
 pub async fn query_subset_where(
     client: &mut PooledClient,
     ts: &TableSchema,
@@ -1812,12 +1909,24 @@ pub async fn query_subset_where(
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
+    timing: &mut SubsetQueryTiming,
 ) -> Result<SubsetQuery> {
-    let fences = begin_settled_snapshot(client, scope, 0, "subset").await?;
+    let started = std::time::Instant::now();
+    timing.in_progress = Some((QueryPhase::Snapshot, started));
+    timing.last = Some(QueryPhase::Snapshot);
+    let fences = begin_settled_snapshot(client, scope, 0, "subset").await;
+    timing.snapshot = started.elapsed();
+    timing.in_progress = None;
+    let fences = fences?;
+    let selecting = std::time::Instant::now();
+    timing.in_progress = Some((QueryPhase::Select, selecting));
+    timing.last = Some(QueryPhase::Select);
     let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
+    timing.select = selecting.elapsed();
+    timing.in_progress = None;
     let rows = result?;
     Ok(SubsetQuery { rows, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
 }
@@ -2235,5 +2344,64 @@ mod ownership_tests {
         assert!(a.inner.sem.is_closed());
         assert!(!b.inner.sem.is_closed());
         b.close();
+    }
+
+    /// A checkout holding its slot, as [`PoolInner::checkout`] hands one out, minus the connection
+    /// (which needs a server); release and drop treat the missing connection as already gone.
+    async fn held_checkout(pool: &Pool) -> PooledClient {
+        PooledClient {
+            client: None,
+            inner: pool.inner.clone(),
+            permit: Some(pool.inner.sem.clone().acquire_owned().await.unwrap()),
+            transaction_open: AtomicBool::new(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_use_follows_checkouts_through_release_and_drop() {
+        let pool = Pool::new("postgres://unused/test".into(), 3);
+        assert_eq!((pool.size(), pool.in_use()), (3, 0));
+        let mut settling = held_checkout(&pool).await;
+        let reading = held_checkout(&pool).await;
+        assert_eq!(pool.in_use(), 2);
+        // A settle wait gives its slot back while keeping the checkout.
+        settling.release();
+        assert_eq!(pool.in_use(), 1);
+        drop(reading);
+        assert_eq!(pool.in_use(), 0);
+        drop(settling);
+        assert_eq!(pool.in_use(), 0);
+        pool.close();
+    }
+
+    #[tokio::test]
+    async fn a_failed_checkout_still_reports_its_slot_wait() {
+        let pool = Pool::new("postgres://unused/test".into(), 1);
+        let held = pool.hold_slot_for_test().await;
+        let closer = pool.clone();
+        let close_later = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            closer.close();
+        });
+        let mut timing = CheckoutTiming::default();
+        assert!(pool.get_timed(&mut timing).await.is_err(), "a closed pool refuses the waiter");
+        assert!(timing.slot_wait >= std::time::Duration::from_millis(30), "{timing:?}");
+        assert!(timing.in_progress.is_none(), "{timing:?}");
+        close_later.await.unwrap();
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_checkout_dropped_while_waiting_names_the_slot_wait() {
+        let pool = Pool::new("postgres://unused/test".into(), 1);
+        let held = pool.hold_slot_for_test().await;
+        let mut timing = CheckoutTiming::default();
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(30), pool.get_timed(&mut timing)).await;
+        assert!(waited.is_err(), "the full pool keeps the checkout waiting");
+        let (phase, since) = timing.in_progress.expect("the slot wait is still under way");
+        assert_eq!(phase, QueryPhase::PoolWait);
+        assert!(since.elapsed() >= std::time::Duration::from_millis(25));
+        drop(held);
+        pool.close();
     }
 }

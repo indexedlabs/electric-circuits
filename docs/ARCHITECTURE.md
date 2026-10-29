@@ -860,6 +860,25 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 *only* here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
+Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
+backfills, seeds and query-backs. Each page the engine accepts (one `ensure_not_degraded` has not
+already refused) logs one `subset query finished` event (target
+`electric_circuits_engine::subset_query`) when it ends. `outcome` is `ok`, `error` or `cancelled`
+(the request was dropped mid-await). A failed page names the `phase` it failed in (`prepare` for the
+table lookup, predicate, columns and pool lookup, before Postgres) and why, without the error's text, which can quote predicate
+values: `error_kind` is `settle_timed_out`, `settle_rejected`, `settle_shared`, `settle_overflowed`,
+`postgres` (with its `sqlstate`), `postgres_closed` or `other`. A cancelled page names the `phase` it
+was dropped in and credits that phase with the time it had run. Phases a page never reached read 0:
+
+| Field | Time spent |
+|---|---|
+| `state_wait_ms` | taking the engine-state lock |
+| `pool_wait_ms` | waiting for one of the pool's slots; `pool_in_use`/`pool_size` are its occupancy when the page asked |
+| `connect_ms` | dialing a new connection when no idle one was left (`dialed`) |
+| `snapshot_ms` | opening the settled snapshot, settle wait and the slot retake after one included |
+| `select_ms` | the page `SELECT`, decoding its rows and the `COMMIT` |
+| `total_ms` | the whole page, including projecting rows to JSON |
+
 The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk
 versions**: a row read from a page carries that page's snapshot (`snapshot` = `pg_current_snapshot()`
 and `horizon` = `pg_current_wal_insert_lsn()`, returned with every page), and an applied delta
