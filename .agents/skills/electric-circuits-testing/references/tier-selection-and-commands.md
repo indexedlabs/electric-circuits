@@ -30,13 +30,13 @@ These are development/regression tools, not target launch acceptance:
 - `SEED=90210 FUZZ_SEEDS=5 FUZZ_SHAPES=10 FUZZ_OPS=250 pnpm exec vitest run packages/conformance/src/conformance-fuzz.test.ts`
   is a reproducible bounded fuzz invocation. Store the resulting journal, not only the seed.
 - `ELECTRIC_DIR=/absolute/throwaway/electric ./electric-conformance/run.sh oracle` exercises the
-  external Electric oracle in an isolated pinned checkout. The profile also calls for `property`
-  and `subqueries` when those prerequisites exist.
+  external Electric oracle in an isolated pinned checkout. It is optional and never a gate; run it
+  (and `property` or `subqueries`) only when a `/v1/shape` change warrants it.
 - `pnpm demo:linearlite` is a manual/external-browser smoke for live engine, shapes, or visualizer
   changes. Record the actions, public result and screenshot, or the missing-tool blocker.
 
 Follow `AGENTS.md` for the complete engine-touching checklist: format, typecheck, engine tests,
-full prebuilt Vitest, external Electric oracle, and applicable live browser verification. Report
+full prebuilt Vitest, and applicable live browser verification. Report
 unavailable prerequisites and any existing baseline failure as `blocked` or `fail`; do not call the
 remaining lanes a substitute.
 

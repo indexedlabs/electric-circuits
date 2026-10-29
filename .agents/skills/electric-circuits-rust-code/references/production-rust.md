@@ -79,13 +79,11 @@ cargo fmt --check
 pnpm typecheck
 pnpm engine:test
 ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test
-ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
-  ./electric-conformance/run.sh oracle
 ```
 
-The last command requires the pinned Elixir/Erlang toolchain and sibling Electric checkout; report it as blocked when those prerequisites are absent. For a live engine/shape/visualizer path, also run the demo/browser validation specified in `AGENTS.md`. A focused test is useful early, but it does not replace the packet's phase-classified author/merge gates or final qualification. Follow `AGENTS.md` for the narrow owned-baseline repair rule; an inherited blocker remains visible and never becomes release evidence.
+Electric's own oracle (`./electric-conformance/run.sh oracle`, which needs the pinned Elixir/Erlang toolchain and a sibling Electric checkout) is an optional check, not a gate. For a live engine/shape/visualizer path, also run the demo/browser validation specified in `AGENTS.md`. A focused test is useful early, but it does not replace the packet's phase-classified author/merge gates or final qualification. Follow `AGENTS.md` for the narrow owned-baseline repair rule; an inherited blocker remains visible and never becomes release evidence.
 
-`pnpm typecheck` is required because Vitest transpiles without type checking. `pnpm test` includes the repository conformance suite; the Electric oracle is a separate suite. CI currently runs formatting, engine tests, typecheck, and the full test suite—check `.github/workflows/ci.yml` if it changes.
+`pnpm typecheck` is required because Vitest transpiles without type checking. `pnpm test` includes the repository conformance suite; the Electric oracle is a separate, optional suite. CI currently runs formatting, engine tests, typecheck, and the full test suite—check `.github/workflows/ci.yml` if it changes.
 
 ### Proposed or risk-triggered hardening (not current CI gates)
 

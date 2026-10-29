@@ -69,7 +69,7 @@ valid YAML with string `interface.display_name` and `interface.short_description
 | `packages/oracle` | Reference implementation shapes are checked against. |
 | `packages/bench` | Benchmarks incl. the **benchmarking-fleet runner** (`electric-bench-runner.ts`, `pnpm bench:fleet` — auto-clones electric-sql/benchmarking-fleet). |
 | `packages/loadgen` | Headless load generator (state-machine users; memory/CPU/disk sampling; Docker-scalable clients). |
-| `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
+| `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. Optional; not a gate. |
 | `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Dockerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
 | `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
 | `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
@@ -446,17 +446,22 @@ cargo fmt --check                         # root rustfmt.toml; CI enforces it
 pnpm typecheck                            # tsc --noEmit over the TS workspace (vitest cannot see type errors)
 pnpm engine:test                          # Rust unit + integration (fast)
 ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
-ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
-  ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 ```
 
 The vitest suite includes `packages/conformance` — the engine-vs-oracle harness — and runs
 against the always-on circuit on every run (there is no off mode). The
 `ELECTRIC_CIRCUITS_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
-versus which fall through to the routing/fallback tiers. The `electric-conformance` line is
-Electric's *own* oracle suite pointed at our `/v1/shape` — a separate tier from our conformance
-package; run both. (The ASDF pins matter: `../electric` asks for an Elixir that may not be
-installed locally.)
+versus which fall through to the routing/fallback tiers.
+
+Electric's *own* oracle suite pointed at our `/v1/shape` is an optional tool, not a gate: no task,
+merge or qualification has to run it or report it. Run it when a change to `/v1/shape` warrants a
+check against Electric's client (the ASDF pins matter: `../electric` asks for an Elixir that may not
+be installed locally):
+
+```bash
+ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
+  ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
+```
 
 Gate phases prevent a red inherited baseline from deadlocking the task that repairs or hermeticizes
 it. `TST-000` freezes every existing failure/blocker. A validator-declared baseline-repair task must

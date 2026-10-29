@@ -68,7 +68,7 @@ Load only the section matching the proposed change.
   facade and invariant evidence.
 - Always run `cargo fmt --check` and scope-appropriate Rust checks. For engine/live-path work,
   run and report the full `AGENTS.md` matrix under its generated gate phases: `pnpm typecheck`,
-  `pnpm engine:test`, prebuilt `pnpm test`, Electric's oracle suite, plus the demo/browser pass when
+  `pnpm engine:test`, prebuilt `pnpm test`, plus the demo/browser pass when
   it exercises the changed seam. Do not move an unavailable qualification lane into direct gates.
 - Report: public API delta, dependency direction/package graph, error and feature/platform impact,
   toolchain/lockfile effect, before/after measurements, invariant evidence, commands run, and
