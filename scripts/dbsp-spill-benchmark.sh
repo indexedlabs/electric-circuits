@@ -93,6 +93,8 @@ def metrics(rev, rep):
     d = load(rev, rep)
     io = d["io"]
     s = d["steady"]
+    if s.get("missed_deliveries", 0):
+        raise SystemExit(f"{rev} rep {rep} had {s['missed_deliveries']} missed steady deliveries; refusing to summarize shifted latency samples")
     cold = d["cold"]
     steady_phase = d["steady_phase"]
     raw = root / rev / f"rep-{rep}" / "raw"
