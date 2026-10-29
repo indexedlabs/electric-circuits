@@ -1300,9 +1300,9 @@ async fn subset_load_group(
     engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
     engine.reserve_group_with_id(&group_sub, &member_subscriptions, &group_path).await?;
     engine.register_group_lane(&group_path);
+    let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::AfterReservation).await;
-    let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };

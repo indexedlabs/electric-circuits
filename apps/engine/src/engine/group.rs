@@ -164,6 +164,10 @@ impl GroupClaims {
         self.reserved.contains_key(subscription)
     }
 
+    pub(crate) fn reservation_id(&self, subscription: &str) -> Option<&String> {
+        self.reserved.get(subscription)
+    }
+
     /// True for the public reservation and every private member reservation belonging to it.
     /// Member claims are recorded separately so a group can create ordinary shapes atomically,
     /// but their lease protection must last for the whole assembly window.

@@ -1340,14 +1340,14 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
             .await
             .context("losing group did not reach its reservation gate")?;
-        gate.release.notify_waiters();
+        gate.release.notify_one();
         let (status, first_body) = first.await.context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
-        gate.release.notify_waiters();
+        gate.release.notify_one();
         let (status, second_body) = second.await.context("second group task failed")??;
         ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second_body}");
         ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
-        ensure!(engine.group_record("group-overlap").await.is_some(), "winner group was lost");
+        ensure!(engine.group_id_for_test("group-overlap").await.is_some(), "winner group was lost");
         let catalog = stream_events(f, "meta/catalog").await;
         ensure!(
             catalog
@@ -2169,6 +2169,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
         for (subscription, cut) in [
+            ("group-cut-cancel-before-reservation", "cancel-before-reservation"),
             ("group-cut-cancel-member-create", "cancel-member-create"),
             ("group-cut-cancel-stream-tail", "cancel-stream-tail"),
             ("group-cut-cancel-snapshot", "cancel-snapshot"),
@@ -2180,6 +2181,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             ("group-cut-degraded", "degraded"),
         ] {
             let pre_durability_stage = match cut {
+                "cancel-before-reservation" => Some(GroupLoadAwait::BeforeReservation),
                 "cancel-member-create" => Some(GroupLoadAwait::MemberCreate),
                 "cancel-stream-tail" => Some(GroupLoadAwait::StreamTail),
                 "cancel-snapshot" => Some(GroupLoadAwait::Snapshot),
@@ -2193,12 +2195,18 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let load_app = app.clone();
             let load_body = group_body(f, subscription, true);
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
+            let mut pre_attempt_id = None;
             let group_path = if pre_durability_stage.is_some() {
                 tokio::time::timeout(Duration::from_secs(10), engine.group_load_gate_for_test().arrived.notified())
                     .await
                     .context("group cut did not reach its pre-durability gate")?;
+                if cut != "cancel-before-reservation" {
+                    let id = engine.group_id_for_test(subscription).await.context("pre-durability reservation id")?;
+                    *f.ds.hold_group_drop_id.lock().await = Some(id.clone());
+                    pre_attempt_id = Some(id);
+                }
                 load.abort();
-                engine.group_load_gate_for_test().release.notify_one();
+                engine.group_load_gate_for_test().release.notify_waiters();
                 None
             } else {
                 tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
@@ -2215,6 +2223,12 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 )
             };
             let group_path = group_path.unwrap_or_default();
+            if pre_attempt_id.is_some() {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("pre-durability cleanup did not reach GroupDropped durability")?;
+                f.ds.group_catalog_release.notify_one();
+            }
             if cut == "cancel" || cut == "cancel-head" {
                 *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
             }
@@ -2239,8 +2253,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .await
                     .context("old abort did not finish")?;
                 ensure!(
-                    engine.group_record(subscription).await.as_ref().map(|group| group.id.as_str())
-                        == Some(replacement_id.as_str()),
+                    engine.group_id_for_test(subscription).await.as_deref() == Some(replacement_id.as_str()),
                     "old abort removed the replacement group"
                 );
                 for member in replacement["results"].as_array().context("replacement members")? {
@@ -2331,12 +2344,26 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let catalog = stream_events(f, "meta/catalog").await;
             if pre_durability_stage.is_some() {
                 ensure!(
-                    !catalog.iter().any(|event| {
-                        (event["t"] == "groupCreated" || event["t"] == "groupDropped")
-                            && event["subscription"] == subscription
-                    }),
-                    "pre-durability cancellation left a durable group event: {subscription} events={catalog:?}"
+                    !catalog.iter().any(|event| event["t"] == "groupCreated" && event["subscription"] == subscription),
+                    "pre-durability cancellation wrote GroupCreated: {subscription} events={catalog:?}"
                 );
+                if let Some(attempt_id) = pre_attempt_id {
+                    ensure!(
+                        catalog.iter().any(|event| {
+                            event["t"] == "groupDropped"
+                                && event["subscription"] == subscription
+                                && event["group_id"] == attempt_id
+                        }),
+                        "pre-durability cancellation dropped the wrong group: {subscription} events={catalog:?}"
+                    );
+                } else {
+                    ensure!(
+                        !catalog
+                            .iter()
+                            .any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
+                        "before-reservation cancellation wrote GroupDropped: {subscription} events={catalog:?}"
+                    );
+                }
             } else {
                 ensure!(
                     catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),

@@ -3333,6 +3333,15 @@ impl Engine {
     }
 
     #[cfg(feature = "test-support")]
+    pub async fn group_id_for_test(&self, subscription: &str) -> Option<String> {
+        let st = self.state.lock().await;
+        st.group_claims
+            .get(subscription)
+            .map(|record| record.id.clone())
+            .or_else(|| st.group_claims.reservation_id(subscription).cloned())
+    }
+
+    #[cfg(feature = "test-support")]
     pub async fn group_reservation_for_test(&self, subscription: &str) -> bool {
         self.state.lock().await.group_claims.is_reserved(subscription)
     }
