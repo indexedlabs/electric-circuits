@@ -510,8 +510,10 @@ the default Rust engine suite, Vitest/conformance, rustfmt, and all three featur
 (`40810672853`, test job `123239956655`, engine image `123239956961`). The current head `2230b32`
 then passed the same correctness and image lanes (`40815711977`, test job `123256148452`, engine
 image `123256148576`) and its scope-benchmark job passed (`123263148983`, artifact `12873937219`).
-Follow-up `24e985c` removed the shutdown barrier bypass while cleaning comments; its group and full
-Rust lanes went red because shutdown-owned compensation waited on the held `member_retry` barrier.
+Both compensation-tree benchmark artifacts are recorded below and excluded from the comparison
+medians because their cancellation-free workload does not exercise compensation. Follow-up
+`24e985c` removed the shutdown barrier bypass while cleaning comments; its group and full Rust
+lanes went red because shutdown-owned compensation waited on the held `member_retry` barrier.
 `68f7a49` restores that bypass with the shutdown ordering rationale; `2230b32` records the regression.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
