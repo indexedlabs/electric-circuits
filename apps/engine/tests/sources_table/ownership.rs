@@ -1530,7 +1530,11 @@ async fn group_one_subscription_claims(f: &Fixture) -> Result<()> {
                 status == StatusCode::CONFLICT,
                 "anonymous member release escaped group ownership: {status} {body}"
             );
+            let (status, body) =
+                json(&app, Method::DELETE, &format!("/v1/shapes/{member_shape}?purge=true"), Body::empty()).await?;
+            ensure!(status == StatusCode::CONFLICT, "native purge of a group member was not refused: {status} {body}");
         }
+        ensure!(engine.has_group_record("group-one-sub").await, "a refused member purge released the group");
         ensure!(
             engine.subscription_owner("group-one-sub").await.as_deref() == Some(group_id),
             "anonymous release removed the public group claim"
