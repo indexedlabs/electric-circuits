@@ -2564,12 +2564,21 @@ async fn group_renewal_cancellation(f: &Fixture) -> Result<()> {
                 .context("renewal did not reach its cancellation gate")?;
             renew.abort();
             gate.release.notify_waiters();
+            ensure!(
+                tokio::time::timeout(Duration::from_secs(10), renew)
+                    .await
+                    .context("cancelled renewal did not terminate")
+                    .is_ok_and(|result| result.is_err()),
+                "renewal cancellation was not observed"
+            );
             ensure!(engine.has_group_record("group-renewal-cancel").await, "cancelled renewal lost the group");
             ensure!(
                 engine.subscription_owner("group-renewal-cancel").await.is_some()
                     && engine.subscription_owner("group-renewal-cancel:member:1").await.is_some(),
                 "cancelled renewal lost a member claim"
             );
+            let (status, retried) = post_group(&app, group_body(f, "group-renewal-cancel", true)).await?;
+            ensure!(status == StatusCode::OK && retried["groupId"] == first["groupId"], "renewal retry changed group");
         }
         Ok::<_, anyhow::Error>(())
     }
