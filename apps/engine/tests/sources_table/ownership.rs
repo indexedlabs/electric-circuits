@@ -74,6 +74,9 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
             Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
+            Case::GroupCompletionCuts => group_completion_cuts(&fixture).await,
+            Case::GroupReconnectBurst => group_reconnect_burst(&fixture).await,
+            Case::GroupAdmission => group_admission_gate(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -109,6 +112,9 @@ enum Case {
     GroupReleaseDuringAssembly,
     GroupRetirementDuringAssembly,
     GroupMembersMax,
+    GroupCompletionCuts,
+    GroupReconnectBurst,
+    GroupAdmission,
 }
 
 #[test]
@@ -253,6 +259,24 @@ fn group_engine_retirement_during_assembly_retires_member_and_fails_the_load() -
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_rejects_more_than_eight_members_without_partial_state() -> Result<()> {
     isolated("ownership::group_rejects_more_than_eight_members_without_partial_state", Case::GroupMembersMax)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_completion_cuts_leave_no_claims_or_durable_group() -> Result<()> {
+    isolated("ownership::group_completion_cuts_leave_no_claims_or_durable_group", Case::GroupCompletionCuts)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn thirty_group_reconnects_claim_and_renew_without_conflicts() -> Result<()> {
+    isolated("ownership::thirty_group_reconnects_claim_and_renew_without_conflicts", Case::GroupReconnectBurst)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_admission_does_not_block_other_loads_or_plain_shapes() -> Result<()> {
+    isolated("ownership::group_admission_does_not_block_other_loads_or_plain_shapes", Case::GroupAdmission)
 }
 
 #[derive(Clone)]
@@ -1875,6 +1899,180 @@ async fn group_members_max(f: &Fixture) -> Result<()> {
         );
         let (status, body) = post_group(&app, group_body(f, "group-partial-rollback", true)).await?;
         ensure!(status == StatusCode::OK, "partial rollback left a claim behind: {status} {body}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// Exercise the public group-load boundary at the post-GroupCreated cuts. Each variant must
+/// compensate its durable GroupCreated with GroupDropped and release both the public and private
+/// claims before the subscription can be loaded again.
+async fn group_completion_cuts(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        for (subscription, cut) in [
+            ("group-cut-cancel", "cancel"),
+            ("group-cut-closed", "closed"),
+            ("group-cut-truncate", "truncate"),
+            ("group-cut-degraded", "degraded"),
+        ] {
+            *f.ds.hold_group_catalog.lock().await = true;
+            let load_app = app.clone();
+            let load_body = group_body(f, subscription, true);
+            let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
+            tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                .await
+                .context("group cut did not reach GroupCreated durability")?;
+            let group_path = engine
+                .graph()
+                .await
+                .shapes
+                .into_iter()
+                .find(|shape| shape.stream_path.contains("shape/group-"))
+                .map(|shape| shape.stream_path)
+                .context("group cut did not install a member stream")?;
+            if cut == "closed" {
+                f.ds.closed.lock().await.insert(format!("/{group_path}"));
+            } else if cut == "truncate" {
+                f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
+                let mut changed = f.ds.changed.subscribe();
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if f.ds
+                            .retired
+                            .lock()
+                            .await
+                            .iter()
+                            .any(|(method, path)| *method == Method::POST && path.ends_with(&group_path))
+                        {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        changed.changed().await.context("truncate retirement observation channel closed")?;
+                    }
+                })
+                .await
+                .context("truncate did not retire the group stream")??;
+            } else if cut == "degraded" {
+                engine.force_degraded();
+            }
+            if cut == "cancel" {
+                load.abort();
+            }
+            *f.ds.hold_group_catalog.lock().await = false;
+            f.ds.group_catalog_release.notify_one();
+            if cut != "cancel" {
+                let (status, body) = tokio::time::timeout(Duration::from_secs(15), &mut load)
+                    .await
+                    .context("group cut load did not finish")?
+                    .context("group cut load task failed")??;
+                ensure!(status != StatusCode::OK, "group cut answered 200: {status} {body}");
+            }
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if engine.subscription_owner(subscription).await.is_none()
+                        && engine.subscription_owner(&format!("{subscription}:member:1")).await.is_none()
+                        && !engine.has_group_record(subscription).await
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("group cut compensation left claims behind")??;
+            let catalog = stream_events(f, "meta/catalog").await;
+            ensure!(
+                catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
+                "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
+            );
+            if cut == "cancel" {
+                let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
+                ensure!(status == StatusCode::OK, "cancelled group could not be retried: {status} {body}");
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// Production gate #v-gate-reconnect-burst: independent scopes sharing the same member tables
+/// claim concurrently, then every reconnect retries the same named load as a renewal.
+async fn group_reconnect_burst(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let mut tasks = Vec::new();
+        for i in 0..30 {
+            let app = app.clone();
+            let body = group_body(f, &format!("group-burst-{i}"), true);
+            tasks.push(tokio::spawn(async move { post_group(&app, body).await }));
+        }
+        for (i, task) in tasks.into_iter().enumerate() {
+            let (status, body) = task.await.context("burst load task failed")??;
+            ensure!(status == StatusCode::OK, "burst load {i} was not admitted: {status} {body}");
+        }
+        for i in 0..30 {
+            let (status, body) = post_group(&app, group_body(f, &format!("group-burst-{i}"), true)).await?;
+            ensure!(status == StatusCode::OK, "burst renewal {i} was not idempotent: {status} {body}");
+        }
+        ensure!(
+            engine.graph().await.shapes.iter().filter(|shape| shape.stream_path.contains("shape/group-")).count() >= 60,
+            "burst did not retain both members for every group"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// Production gate #v-gate-admission: one held group completion must not block another group or
+/// a plain shape create from making progress.
+async fn group_admission_gate(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        *f.ds.hold_group_catalog.lock().await = true;
+        let first_app = app.clone();
+        let first_body = group_body(f, "group-admission-held", false);
+        let first = tokio::spawn(async move { post_group(&first_app, first_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+            .await
+            .context("held admission group did not reach GroupCreated")?;
+        let second_app = app.clone();
+        let second_body = group_body(f, "group-admission-independent", true);
+        let second = tokio::spawn(async move { post_group(&second_app, second_body).await });
+        let plain_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "changesOnly": true,
+            "subscription": "group-admission-plain",
+        });
+        let plain = tokio::time::timeout(
+            Duration::from_secs(2),
+            json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())),
+        )
+        .await
+        .context("plain create waited behind held group admission")??;
+        ensure!(
+            plain.0 == StatusCode::OK,
+            "plain create failed during independent admission: {} {:?}",
+            plain.0,
+            plain.1
+        );
+        let (status, body) = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .context("independent group load waited behind held admission")?
+            .context("independent group task failed")??;
+        ensure!(status == StatusCode::OK, "independent group load failed: {status} {body}");
+        *f.ds.hold_group_catalog.lock().await = false;
+        f.ds.group_catalog_release.notify_one();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), first)
+            .await
+            .context("held admission group did not finish")?
+            .context("held admission task failed")??;
+        ensure!(status == StatusCode::OK, "held admission group failed: {status} {body}");
         Ok::<_, anyhow::Error>(())
     }
     .await;

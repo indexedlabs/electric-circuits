@@ -3048,16 +3048,23 @@ impl Engine {
         };
         let (valid, renewals) = {
             let mut st = self.state.lock().await;
-            let closing_error = if self.degraded() {
-                Some(anyhow::Error::new(Degraded))
+            let closing_error = if let Err(error) = self.ensure_not_degraded() {
+                Some(error)
             } else if st.epoch_reset_since(gens) {
-                Some(anyhow::Error::new(CreateRaced("the replication epoch was reset during group creation")))
+                Some(anyhow::Error::new(CreateRaced(
+                    "the replication epoch was reset during group creation".to_string(),
+                )))
             } else if let Some(table) = st.drifted_since(gens) {
                 Some(anyhow::Error::new(CreateRaced(format!("schema of '{table}' changed during group creation"))))
             } else if !stream_open {
                 Some(anyhow::Error::new(CreateRaced(format!(
                     "group stream '{}' closed during group activation",
                     record.stream_path
+                ))))
+            } else if self.group_releases.lock().unwrap().contains_key(&record.id) {
+                Some(anyhow::Error::new(CreateRaced(format!(
+                    "group '{}' began retirement during group activation",
+                    record.id
                 ))))
             } else {
                 None

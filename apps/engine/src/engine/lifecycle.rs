@@ -4251,11 +4251,19 @@ mod cancellation_tests {
         let gate = std::sync::Arc::new(crate::ds::BodyGate::default());
         let store = std::sync::Arc::new(crate::ds::ScriptedStore {
             head_gate: std::sync::Mutex::new(Some(gate.clone())),
+            head_gate_path: std::sync::Mutex::new(None),
             ..Default::default()
         });
         let ds = DsClient::with_test_store("scripted://group-recheck-health".into(), store);
         let (engine, group) = engine_with_group_claim_ds(ds).await;
         engine.ds.ensure_stream(&group.stream_path).await.unwrap();
+        *store.head_gate_path.lock().unwrap() = Some(group.stream_path.clone());
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+        }
         let task = tokio::spawn({
             let engine = engine.clone();
             async move { engine.complete_group(group).await }
