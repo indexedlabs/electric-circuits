@@ -459,12 +459,11 @@ job `123141177393`), `ee7667a` (`40781440354`, job `123143837823`) and `21be5d6`
 (`40782847956`, job `123148605838`) were also red; `ee7667a` moved the fault-cut variables
 before engine startup, which ruled out the environment-ordering hypothesis, and `21be5d6` moved
 cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compile-red because
-the integration hook was private. The current docs-only head is `5131ffa`; it records that
-`ccc29b2` exposed that hook and had rustfmt-green but group-contract-red exact-head job
-`123160613419`. The reviewed `5131ffa` test job `123168214487` (run `40788694679`) also failed
-its group-contract step, so no head containing the compensation change has a green
-qualification. The benchmark production tree remains the one preserved by `1d7bbbc`, while
-this candidate's compensation path still requires its own green test job.
+the integration hook was private. The current head is `0d6aff0`, which adds the atomic post-barrier
+fault arm. Its exact test job `123179345889` (run `40792037118`) is still pending; the review of
+this head has flagged the split `TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED` declaration for rustfmt.
+The benchmark production tree remains the one preserved by `1d7bbbc`, while this candidate's
+compensation path still requires its own green test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
