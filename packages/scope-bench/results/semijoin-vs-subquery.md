@@ -474,13 +474,17 @@ deadline has elapsed` in both modes. The trace showed that group members are cre
 in-memory feed claim, so the after-unsubscribe fault could never fire; the pre-release contract
 passed but observed only that a replacement could claim the group. The current fix moves the
 injected failure to the actual durable wait path and checks each member's catalog `Left` directly.
-No head containing the compensation change has a green qualification yet. The benchmark production
-tree remains the one preserved by `1d7bbbc`, while this candidate's compensation path requires a
-fresh exact-head test.
+`dbcca49` made the group-contract step green in both modes with the skip removed (`40807662025`),
+but its featureless engine image exposed a stray test-only cfg on the durable release path and
+rustfmt exposed one over-width assertion line. This follow-up removes both blockers; the exact-head
+all-lane result is pending. The benchmark production tree remains the one preserved by `1d7bbbc`,
+while this candidate's compensation path requires a fresh exact-head test.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` for group members,
-whose private release has no in-memory feed claim.
+whose private release has no in-memory feed claim. The cancellation contracts now directly fail if
+the `Ok(false)` re-enqueue or shutdown-owned member loop is removed; those intended-red mutations
+have not been run as separate CI patches because this checkout has no local Rust/PG lane.
 
 Use the complete `GET /debug/dbsp-profile` plus RSS to measure memory: the
 published-snapshot byte counters in `/memory` do not include the new join's
