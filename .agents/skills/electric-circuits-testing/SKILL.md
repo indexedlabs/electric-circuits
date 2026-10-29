@@ -87,4 +87,4 @@ Record the contract/scenario hash, profile, exact candidate identity, seeds/jour
 target receipts, oracle, cut matrix, commands, raw artifact hashes, cleanup result, first
 divergence, clean-source/external-input/mount/run-root/effective-config hashes, and every unrun gate
 with its reason. Run the applicable repository gates; for engine/live-shape/client-path changes,
-report the full `AGENTS.md` suite and required browser or external-oracle blockers honestly.
+report the full `AGENTS.md` suite and any required browser blockers honestly.
