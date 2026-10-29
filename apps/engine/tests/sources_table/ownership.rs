@@ -2205,14 +2205,15 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
             let mut pre_attempt_id = None;
             let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
-                let arrived = if cancel_at_seed {
-                    engine.group_seed_gate_for_test().arrived.notified()
+                if cancel_at_seed {
+                    tokio::time::timeout(Duration::from_secs(10), engine.group_seed_gate_for_test().arrived.notified())
+                        .await
+                        .context("group cut did not reach its pre-durability gate")?;
                 } else {
-                    engine.group_load_gate_for_test().arrived.notified()
-                };
-                tokio::time::timeout(Duration::from_secs(10), arrived)
-                    .await
-                    .context("group cut did not reach its pre-durability gate")?;
+                    tokio::time::timeout(Duration::from_secs(10), engine.group_load_gate_for_test().arrived.notified())
+                        .await
+                        .context("group cut did not reach its pre-durability gate")?;
+                }
                 if cut != "cancel-before-reservation" {
                     let id = engine.group_id_for_test(subscription).await.context("pre-durability reservation id")?;
                     *f.ds.hold_group_drop_id.lock().await = Some(id.clone());
@@ -2258,17 +2259,34 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 tokio::time::timeout(Duration::from_secs(10), abort_gate.arrived.notified())
                     .await
                     .context("old cleanup did not reach its abort gate")?;
-                let (status, replacement) = post_group(&app, group_body(f, subscription, true)).await?;
-                ensure!(
-                    status == StatusCode::OK,
-                    "replacement load did not survive old cleanup: {status} {replacement}"
-                );
-                let replacement_id = replacement["groupId"].as_str().unwrap_or_default().to_owned();
-                ensure!(replacement_id != group_path, "replacement reused the old group id");
+                let replacement_gate = engine.group_load_gate_for_test();
+                replacement_gate.arm(GroupLoadAwait::AfterReservation).await;
+                let replacement_app = app.clone();
+                let replacement_body = group_body(f, subscription, true);
+                let replacement_task =
+                    tokio::spawn(async move { post_group(&replacement_app, replacement_body).await });
+                tokio::time::timeout(Duration::from_secs(10), replacement_gate.arrived.notified())
+                    .await
+                    .context("replacement did not reach its reservation")?;
+                let replacement_id =
+                    engine.group_id_for_test(subscription).await.context("replacement reservation id")?;
                 abort_gate.release.notify_one();
                 tokio::time::timeout(Duration::from_secs(10), abort_gate.finished.notified())
                     .await
                     .context("old abort did not finish")?;
+                ensure!(
+                    engine.group_reservation_for_test(subscription).await
+                        && engine.group_id_for_test(subscription).await.as_deref() == Some(replacement_id.as_str()),
+                    "old abort removed replacement reservation"
+                );
+                replacement_gate.release.notify_one();
+                let (status, replacement) = replacement_task.await.context("replacement task failed")??;
+                ensure!(
+                    status == StatusCode::OK,
+                    "replacement load did not survive old cleanup: {status} {replacement}"
+                );
+                ensure!(replacement["groupId"] == replacement_id, "replacement changed its reservation id");
+                ensure!(replacement_id != group_path, "replacement reused the old group id");
                 ensure!(
                     engine.group_id_for_test(subscription).await.as_deref() == Some(replacement_id.as_str()),
                     "old abort removed the replacement group"

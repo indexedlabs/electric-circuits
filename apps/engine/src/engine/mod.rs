@@ -808,8 +808,11 @@ impl GroupAbortTestGate {
 
     async fn wait_if_armed(&self) -> bool {
         if self.armed.swap(false, Ordering::AcqRel) {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             self.arrived.notify_one();
-            self.release.notified().await;
+            notified.await;
             return true;
         }
         false
@@ -865,8 +868,11 @@ impl GroupReleaseTestGate {
 
     async fn wait_if_armed(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             self.arrived.notify_one();
-            self.release.notified().await;
+            notified.await;
         }
     }
 }
@@ -890,8 +896,11 @@ impl GroupSeedTestGate {
 
     async fn wait_if_armed(&self) {
         if self.armed.swap(false, Ordering::AcqRel) {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             self.arrived.notify_one();
-            self.release.notified().await;
+            notified.await;
         }
     }
 }
