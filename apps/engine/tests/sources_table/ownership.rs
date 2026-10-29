@@ -1987,9 +1987,9 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
                 "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
             );
-            if cut == "cancel" {
+            if cut == "cancel" || cut == "closed" {
                 let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
-                ensure!(status == StatusCode::OK, "cancelled group could not be retried: {status} {body}");
+                ensure!(status == StatusCode::OK, "compensated group could not be retried: {status} {body}");
             }
         }
         Ok::<_, anyhow::Error>(())
