@@ -338,7 +338,6 @@ struct ObservedDs {
     group_head_release: Arc<Notify>,
     hold_group_catalog: Arc<Mutex<bool>>,
     hold_group_drop_id: Arc<Mutex<Option<String>>>,
-    hold_group_drop_subscription: Arc<Mutex<Option<String>>>,
     group_catalog_arrived: Arc<Notify>,
     group_catalog_release: Arc<Notify>,
 }
@@ -393,19 +392,14 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(body, 64 * 1024 * 1024).await.unwrap_or_default();
         let expected_group_drop = ds.hold_group_drop_id.lock().await.clone();
-        let expected_group_drop_subscription = ds.hold_group_drop_subscription.lock().await.clone();
         let events = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes).unwrap_or_default();
         let group_created = events.iter().any(|event| event["t"] == "groupCreated");
         let group_dropped = events.iter().any(|event| {
             event["t"] == "groupDropped"
-                && (expected_group_drop.as_deref().is_some_and(|group_id| event["group_id"].as_str() == Some(group_id))
-                    || expected_group_drop_subscription
-                        .as_deref()
-                        .is_some_and(|subscription| event["subscription"].as_str() == Some(subscription)))
+                && expected_group_drop.as_deref().is_some_and(|group_id| event["group_id"].as_str() == Some(group_id))
         });
         let hold = if group_dropped {
             *ds.hold_group_drop_id.lock().await = None;
-            *ds.hold_group_drop_subscription.lock().await = None;
             true
         } else if group_created {
             let mut armed = ds.hold_group_catalog.lock().await;
@@ -561,7 +555,6 @@ impl Fixture {
             group_head_release: Arc::new(Notify::new()),
             hold_group_catalog: Arc::new(Mutex::new(false)),
             hold_group_drop_id: Arc::new(Mutex::new(None)),
-            hold_group_drop_subscription: Arc::new(Mutex::new(None)),
             group_catalog_arrived: Arc::new(Notify::new()),
             group_catalog_release: Arc::new(Notify::new()),
         };
