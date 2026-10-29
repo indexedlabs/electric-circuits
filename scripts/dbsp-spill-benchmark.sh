@@ -162,7 +162,8 @@ print()
 print("The proposal requires this measurement before merge and sets no pass threshold; compare the candidate means with the baseline means above.")
 PY
 
-sha256sum "$artifact_root/results.md" > "$artifact_root/results.md.sha256"
+# Relative name, so `sha256sum -c results.md.sha256` works in the downloaded artifact.
+(cd "$artifact_root" && sha256sum results.md > results.md.sha256)
 cat "$artifact_root/results.md"
 echo
 echo "results.md SHA-256: $(cut -d' ' -f1 "$artifact_root/results.md.sha256")"
