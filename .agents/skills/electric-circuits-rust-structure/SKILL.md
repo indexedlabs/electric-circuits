@@ -120,7 +120,7 @@ transitive duplicate or upgrade the dbsp compatibility island without tracing th
 the full evidence matrix.
 
 Run `cargo fmt --check` and the applicable checks in `AGENTS.md`. Engine or live-path structure
-changes run and report its complete Rust, TypeScript, conformance, Electric-oracle, and relevant demo/
+changes run and report its complete Rust, TypeScript, conformance, and relevant demo/
 browser matrix under the validator-owned author/merge/qualification phases; an external blocker
 never becomes release evidence or an author-chosen direct gate. Report every command not run and why.
 Hand off the supported facade, package and
