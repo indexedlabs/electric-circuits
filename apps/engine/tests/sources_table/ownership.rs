@@ -1515,6 +1515,10 @@ async fn rollback_cancellation_contract(f: &Fixture) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     }
     .await;
+    // Shutdown-owned compensation must bypass the request's held member_retry barrier. Once
+    // close begins, wait_durable can report CatalogWriterGone while catalog events are in flight;
+    // the Err arm would otherwise wait 15 seconds and outlive close's grace period.
+    electric_circuits_engine::http::test_disable_group_page_barrier();
     let close = engine.close(Duration::from_secs(10)).await;
     // Remove the fault-cut variables only after the engine has drained its owned tasks.
     unsafe { std::env::remove_var("ELECTRIC_CIRCUITS_TEST_GROUP_PAGE_BARRIER") };
