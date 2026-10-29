@@ -217,8 +217,43 @@ impl Engine {
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res = self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub).await;
+            let res =
+                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None).await;
             match retry_create(res, attempt, "shape", table) {
+                Ok(out) => return out.map(|rec| (rec, sub)),
+                Err(()) => redo_backoff().await,
+            }
+        }
+        unreachable!("retry_create returns the error on the last attempt")
+    }
+
+    /// Prototype-only variant used by the shape-group benchmark. Each member still has its own
+    /// ordinary shape record and circuit, but its output is directed to the caller's shared stream
+    /// path. Group creation intentionally owns the surrounding shortcut and is responsible for
+    /// releasing the member claims it does not expose to the client.
+    pub(crate) async fn create_shape_as_on_stream(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        changes_only: bool,
+        subscription: Option<String>,
+        stream_path: String,
+    ) -> Result<(ShapeRecord, String)> {
+        let sub = self.resolve_subscription(subscription).await;
+        for attempt in 1..=CREATE_RACE_ATTEMPTS {
+            let res = self
+                .create_shape_once(
+                    table,
+                    where_.clone(),
+                    columns.clone(),
+                    changes_only,
+                    false,
+                    &sub,
+                    Some(stream_path.clone()),
+                )
+                .await;
+            match retry_create(res, attempt, "shape group member", table) {
                 Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
             }
@@ -252,6 +287,7 @@ impl Engine {
         changes_only: bool,
         share: bool,
         sub: &str,
+        stream_path_override: Option<String>,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
         // so it refuses to make one rather than backfill from state it knows is wrong. This early
@@ -291,7 +327,17 @@ impl Engine {
         // is joined (ref-count++), returning the same stream — no second stream, no per-subscriber append
         // fan-out. Subquery shapes share their inner-set nodes in the registry regardless; sharing the
         // *outer* shape here collapses identical subquery shapes fully.
-        let feed_sig = if share { Some(shape_signature(table, &where_, &out_cols, changes_only)) } else { None };
+        let feed_sig = if share {
+            Some(shape_signature(table, &where_, &out_cols, changes_only))
+        } else if let Some(stream_path) = stream_path_override.as_deref() {
+            // Group members are private shapes, but their claims must still be represented in
+            // the normal lease index so lapse/release can remove every member with the group.
+            // Include the group's stream path so a later group with the same subscription cannot
+            // join the released group's dormant member shape and route live output to its old stream.
+            Some(format!("group-member:{stream_path}:{sub}"))
+        } else {
+            None
+        };
         // Storage may have lost the retained shape's stream since it was made; a stale entry is
         // retired here so the join below falls through to a fresh create (see
         // `retire_join_target_if_stream_lost`).
@@ -312,6 +358,7 @@ impl Engine {
                     // One subscription id belongs to one shape (ADR-0008). Reusing it for a
                     // different predicate is refused rather than silently accepted: the caller
                     // would hold one name for two shapes and could release neither unambiguously.
+                    ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
                     ensure_subscription_free(&st, sub, &existing_id)?;
                     // A join and a RENEWAL are the same call: `subscribe` returns false when the
                     // shape already holds this id, in which case nothing is claimed and only the
@@ -388,12 +435,13 @@ impl Engine {
         }
         // Nothing to join: this create is about to mint a shape, so the id must be free of any
         // OTHER shape as well (the join path checked it against the one it was joining).
+        ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
         ensure_subscription_free(&st, sub, "")?;
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
-        let stream_path = format!("shape/{id}");
+        let stream_path = stream_path_override.unwrap_or_else(|| format!("shape/{id}"));
         // NOTE: the stream itself is created AFTER the state lock is released (per path below):
         // the PUT is a storage round-trip with a durability fsync, and holding the global lock
         // across it serializes concurrent shape creations.
@@ -772,6 +820,7 @@ impl Engine {
                 // Refuse before taking the claim — see the row-shape join path. Re-checked against
                 // the `gens` captured with `ts`, so a drift inside the `HEAD` window refuses the join.
                 self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+                ensure_group_subscription_available(&st, sub, false)?;
                 ensure_subscription_free(&st, sub, &existing_id)?;
                 let now = crate::changelog::now_secs();
                 let fresh = st.subscribe(&existing_id, sub.to_string(), now);
@@ -810,6 +859,7 @@ impl Engine {
                 return Ok(rec);
             }
         }
+        ensure_group_subscription_available(&st, sub, false)?;
         ensure_subscription_free(&st, sub, "")?;
 
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
@@ -1074,7 +1124,7 @@ impl Engine {
     /// [`Self::release_subscription_durable`] instead: an acknowledged release must survive even
     /// when leases are disabled with `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`.
     pub async fn release_subscription(&self, id: &str, sub: Option<&str>) {
-        if let Err(error) = self.release_subscription_inner(id, sub, false).await {
+        if let Err(error) = self.release_subscription_inner(id, sub, false, false).await {
             tracing::error!(%error, "engine-internal subscription release lost its catalog writer");
         }
     }
@@ -1086,11 +1136,46 @@ impl Engine {
     /// that times out and drops this future therefore loses only its answer — the `Left` is the
     /// writer's from the moment it was enqueued, and lands regardless.
     pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) -> Result<()> {
-        self.release_subscription_inner(id, sub, true).await
+        self.release_subscription_inner(id, sub, true, false).await
     }
 
-    async fn release_subscription_inner(&self, id: &str, sub: Option<&str>, durable: bool) -> Result<()> {
+    pub(crate) async fn release_group_member_durable(&self, id: &str, sub: &str) -> Result<()> {
+        self.release_subscription_inner(id, Some(sub), true, true).await
+    }
+
+    async fn release_subscription_inner(
+        &self,
+        id: &str,
+        sub: Option<&str>,
+        durable: bool,
+        internal_group: bool,
+    ) -> Result<()> {
         let mut st = self.state.lock().await;
+        if !internal_group && let Some(subscription) = sub {
+            if st.group_claims.is_reserved(subscription) {
+                return Err(anyhow::Error::new(GroupConflict {
+                    subscription: subscription.to_string(),
+                    owner: format!("group {subscription}"),
+                }));
+            }
+            if let Some(owner) = st.group_claims.private_owner(subscription) {
+                return Err(anyhow::Error::new(GroupConflict {
+                    subscription: subscription.to_string(),
+                    owner: format!("group {owner}"),
+                }));
+            }
+        } else if !internal_group && sub.is_none() {
+            let subscriptions =
+                st.feed_shares.get(id).map(|share| share.subs.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+            let group_owned =
+                subscriptions.iter().any(|subscription| st.group_claims.owns_shape_claim(subscription, id));
+            if group_owned {
+                return Err(anyhow::Error::new(GroupConflict {
+                    subscription: format!("shape:{id}"),
+                    owner: "group claim".to_string(),
+                }));
+            }
+        }
         let released = match sub {
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
@@ -1130,16 +1215,60 @@ impl Engine {
     ///
     /// It does NOT wait on the retirement either: the stream may still be being deleted in the
     /// background when this returns, and `GET /shapes/{id}` is 404 from now on regardless.
+    ///
+    /// Engine retirements must always retire the shape, even a group member: a member of a
+    /// completed group releases its whole group, and one whose group is still being assembled
+    /// makes `complete_group` find it gone so the load compensates. Only the native purge refuses
+    /// a group member.
     pub async fn purge_shape(&self, id: &str) -> Result<()> {
-        self.purge_shape_inner(id, false).await
+        self.purge_shape_inner(id, false, false).await
     }
 
     /// Native client-facing purge: durably record `Dropped` before acknowledging or retiring.
     pub async fn purge_shape_durable(&self, id: &str) -> Result<()> {
-        self.purge_shape_inner(id, true).await
+        self.purge_shape_inner(id, true, true).await
     }
 
-    async fn purge_shape_inner(&self, id: &str, durable: bool) -> Result<()> {
+    async fn purge_shape_inner(&self, id: &str, durable: bool, native: bool) -> Result<()> {
+        let st = self.state.lock().await;
+        self.cancel_reactivation_scan(id);
+        // A group member is private to its group, assembling or complete: a native purge of one
+        // is refused like a native release, and the group is released only as a whole.
+        if native
+            && st
+                .subs_by_id
+                .iter()
+                .any(|(subscription, owner)| owner == id && st.group_claims.owns_shape_claim(subscription, id))
+        {
+            return Err(anyhow::Error::new(GroupConflict {
+                subscription: format!("shape:{id}"),
+                owner: "group claim".to_string(),
+            }));
+        }
+        drop(st);
+        self.purge_shape_member(id, durable).await?;
+        // Look the group up only once the member is gone: a `complete_group` that took the lock
+        // first has completed a record naming this member, and one that comes after finds the
+        // member missing and fails, so no completed group outlives its retired member.
+        let group_release = self
+            .state
+            .lock()
+            .await
+            .group_claims
+            .records_iter()
+            .find(|group| group.members.iter().any(|member| member.shape_id == id))
+            .map(|group| (group.subscription.clone(), group.id.clone()));
+        if let Some((subscription, group_id)) = group_release {
+            if let Err(error) = self.release_group_claim(&subscription, &group_id).await {
+                tracing::warn!(%error, %subscription, "purge: failed to durably release group claim; continuing shape retirement");
+            }
+        }
+        Ok(())
+    }
+
+    /// Purge one shape without consulting or releasing a group claim. Group teardown calls this
+    /// helper for each private member, so it cannot recurse back into `release_group_claim`.
+    async fn purge_shape_member(&self, id: &str, durable: bool) -> Result<()> {
         let mut st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
         self.lives.lock().unwrap().remove(id);
@@ -1990,24 +2119,120 @@ impl Engine {
     /// it. `subscription_lease_timeout == 0` disables lease expiry; dormancy is controlled
     /// independently by `idle_timeout`.
     async fn sweep_leases(&self, cfg: &crate::retention::RetentionConfig) {
-        let lapsed = {
+        let (lapsed, lapsed_groups) = {
             let mut st = self.state.lock().await;
             let now = crate::changelog::now_secs();
-            let expired = st.lapsed_subscriptions(cfg.subscription_lease_timeout, now);
+            let expired = st
+                .lapsed_subscriptions(cfg.subscription_lease_timeout, now)
+                .into_iter()
+                .filter(|(_, sub)| !st.group_claims.in_active_reservation(sub))
+                .collect::<Vec<_>>();
             for (shape, sub) in &expired {
                 st.unsubscribe(shape, sub);
             }
+            let mut groups = HashMap::new();
+            for (_, subscription) in &expired {
+                if let Some(group) = st.group_claims.records_iter().find(|group| {
+                    group.subscription == *subscription
+                        || group.members.iter().any(|member| member.subscription == *subscription)
+                }) {
+                    groups.insert(group.id.clone(), (group.subscription.clone(), group.id.clone()));
+                }
+            }
             st.publish_subscription_gauge(&self.metrics);
-            expired
+            (expired, groups.into_values().collect::<Vec<_>>())
         };
         for (shape, subscription) in lapsed {
             tracing::debug!(
                 "retention: subscription {subscription} on shape {shape} was not renewed within {:?}; released",
                 cfg.subscription_lease_timeout
             );
-            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription, lapsed: true });
+            self.catalog_tx.send(CatalogEvent::Left { id: shape, subscription: subscription.clone(), lapsed: true });
             self.metrics.subscriptions_lapsed.fetch_add(1, Ordering::Relaxed);
         }
+        for (subscription, group_id) in lapsed_groups {
+            if let Err(error) = self.release_group_claim(&subscription, &group_id).await {
+                tracing::warn!(%subscription, %error, "retention: failed to retire lapsed group claim");
+            }
+        }
+    }
+
+    pub(crate) async fn release_group_claim(&self, subscription: &str, expected_id: &str) -> Result<()> {
+        let Some((group, release, joined_existing)) = self.begin_group_release(subscription, expected_id).await else {
+            return Ok(());
+        };
+        if joined_existing {
+            return release.wait().await;
+        }
+        self.group_lanes.remove(&group.stream_path);
+        let engine = self.clone();
+        let subscription = subscription.to_string();
+        let group_id = group.id.clone();
+        let task_release = release.clone();
+        let done = self.shutdown_token().spawn(async move {
+            let result = engine.release_group_claim_owned(&subscription, group).await;
+            task_release.complete(&result);
+            let mut releases = engine.group_releases.lock().unwrap();
+            if releases.get(&group_id).is_some_and(|current| std::sync::Arc::ptr_eq(current, &task_release)) {
+                releases.remove(&group_id);
+            }
+            result
+        });
+        done.await.map_err(|_| anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN))?
+    }
+
+    async fn release_group_claim_owned(&self, subscription: &str, group: GroupRecord) -> Result<()> {
+        let mut first_error = None;
+        for member in &group.members {
+            if let Err(error) = self.release_group_member_durable(&member.shape_id, &member.subscription).await {
+                tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member release failed");
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = self.purge_shape_member(&member.shape_id, true).await {
+                tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member purge failed");
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.ds.retire_stream(&group.stream_path).await {
+            tracing::warn!(%error, stream_path = %group.stream_path, "group stream retirement failed; queued");
+            self.retirements.enqueue(&group.stream_path, None);
+            first_error.get_or_insert(error);
+        }
+        // The public claim is dropped last, after every private member release and purge has
+        // completed. A cancelled request leaves this engine-owned task running to completion.
+        if let Err(error) = self.finish_group_release(subscription, &group.id).await {
+            first_error.get_or_insert(error);
+        }
+        if let Some(error) = first_error { Err(error) } else { Ok(()) }
+    }
+
+    pub(crate) async fn cleanup_group_reservation(
+        &self,
+        subscription: &str,
+        stream_path: &str,
+        created: Vec<(String, String)>,
+    ) -> Result<()> {
+        self.remove_group_lane(stream_path);
+        let mut first_error = None;
+        for (shape_id, member_subscription) in created {
+            if let Err(error) = self.release_group_member_durable(&shape_id, &member_subscription).await {
+                tracing::warn!(%error, %shape_id, %member_subscription, "group member release failed during rollback");
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = self.purge_shape_member(&shape_id, true).await {
+                tracing::warn!(%error, %shape_id, %member_subscription, "group member purge failed during rollback");
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Err(error) = self.ds.retire_stream(stream_path).await {
+            tracing::warn!(%error, %stream_path, "group reservation stream retirement failed; queued");
+            self.retirements.enqueue(stream_path, None);
+            first_error.get_or_insert(error);
+        }
+        if let Err(error) = self.abort_group(subscription, stream_path).await {
+            first_error.get_or_insert(error);
+        }
+        if let Some(error) = first_error { Err(error) } else { Ok(()) }
     }
 
     /// Delete the change-log segments nothing can resume inside any more, evicting first the
@@ -2335,8 +2560,23 @@ impl Engine {
         // the caller's create rollback (which reaches the registry via `abort_create`), so there is
         // exactly one undo path whether the create failed or was cancelled.
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
-        let finished =
-            self.subqueries.lock().await.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?;
+        let (finished, staged_group_emissions) = {
+            let mut registry = self.subqueries.lock().await;
+            let finished = registry.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await;
+            (finished, registry.take_group_emissions())
+        };
+        let finished = match finished {
+            Ok(finished) => {
+                for handle in staged_group_emissions {
+                    handle.wait().await;
+                }
+                finished
+            }
+            Err(error) => {
+                drop(staged_group_emissions);
+                return Err(error);
+            }
+        };
         tracing::info!(
             target: "electric_circuits_engine::shape_create",
             shape_id = id,
@@ -2345,7 +2585,7 @@ impl Engine {
             seeded,
             "subquery shape create finished"
         );
-        enqueue_finished_create_work(&self.flip_tx, &self.pending_flips, id, finished)?;
+        enqueue_finished_create_work(self, id, finished).await?;
         Ok(())
     }
 }
@@ -2355,9 +2595,27 @@ impl Engine {
 /// Each non-empty batch is counted before sending so the convergence barrier cannot observe a
 /// partially delivered create. The sender is unbounded, but it still closes during shutdown; a
 /// failed send releases its count and refuses the create so its guard can roll back the install.
-fn enqueue_finished_create_work(
-    flip_tx: &mpsc::UnboundedSender<FlipWork>,
+async fn enqueue_finished_create_work(
+    engine: &Engine,
+    id: &str,
+    finished: crate::subquery::FinishedCreate,
+) -> Result<()> {
+    enqueue_finished_create_work_parts(
+        &engine.subqueries,
+        &engine.group_lanes,
+        &engine.pending_flips,
+        &engine.flip_tx,
+        id,
+        finished,
+    )
+    .await
+}
+
+async fn enqueue_finished_create_work_parts(
+    registry: &Arc<Mutex<SubqueryRegistry>>,
+    group_lanes: &crate::engine::emission::GroupEmissionLanes,
     pending_flips: &PendingFlips,
+    flip_tx: &mpsc::UnboundedSender<FlipWork>,
     id: &str,
     finished: crate::subquery::FinishedCreate,
 ) -> Result<()> {
@@ -2379,26 +2637,55 @@ fn enqueue_finished_create_work(
     }
     let batches: Vec<_> = nodes
         .into_iter()
-        .map(|(commit_lsn, work)| FlipWork::DeferredNode { commit_lsn, work })
+        .map(|(commit_lsn, work)| FlipWork::DeferredNode { commit_lsn, work, group_paths: Vec::new() })
         .chain(walks.into_iter().map(|(commit_lsn, work)| FlipWork::Walk {
             work,
             txid: None,
             lsn: Some(format!("{:X}/{:X}", commit_lsn >> 32, commit_lsn & 0xffff_ffff)),
+            group_paths: Vec::new(),
         }))
         .chain(shapes.into_iter().map(|(commit_lsn, work)| FlipWork::Deferred {
             commit_lsn,
             shape_id: id.to_string(),
             work,
+            group_paths: Vec::new(),
         }))
         .collect();
+    let mut batches = batches;
+    let registry = registry.lock().await;
+    for batch in &mut batches {
+        let paths = match batch {
+            FlipWork::Walk { work, .. } => registry.group_paths_for_work(work),
+            FlipWork::Deferred { shape_id, .. } => registry.group_paths_for_shape(shape_id),
+            FlipWork::DeferredNode { .. } => registry.all_group_paths(),
+        };
+        match batch {
+            FlipWork::Walk { group_paths, .. }
+            | FlipWork::Deferred { group_paths, .. }
+            | FlipWork::DeferredNode { group_paths, .. } => *group_paths = paths.into_iter().collect(),
+        }
+    }
+    drop(registry);
+    for batch in &batches {
+        for path in batch.group_paths() {
+            group_lanes.begin_origin(path, batch.commit_lsn());
+        }
+    }
     pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
     let mut batches = batches.into_iter();
     while let Some(batch) = batches.next() {
         let commit_lsn = batch.commit_lsn();
-        if flip_tx.send(batch).is_err() {
+        if let Err(error) = flip_tx.send(batch) {
+            let batch = error.0;
             pending_flips.complete(commit_lsn);
+            for path in batch.group_paths() {
+                group_lanes.complete_origin(path, commit_lsn);
+            }
             for unsent in batches {
                 pending_flips.complete(unsent.commit_lsn());
+                for path in unsent.group_paths() {
+                    group_lanes.complete_origin(path, unsent.commit_lsn());
+                }
             }
             return Err(anyhow::anyhow!(crate::engine::sequencer::SHUTTING_DOWN));
         }
@@ -2420,6 +2707,28 @@ fn ensure_subscription_free(st: &EngineState, sub: &str, shape: &str) -> Result<
         }
         _ => Ok(()),
     }
+}
+
+/// Refuse native claims that collide with a group's public reservation, record, or private member
+/// claim. Group member creation passes `internal_group_member` so its own claims can be installed
+/// atomically under the reservation capability; all other shape and aggregate paths pass `false`.
+fn ensure_group_subscription_available(st: &EngineState, sub: &str, internal_group_member: bool) -> Result<()> {
+    if internal_group_member {
+        return Ok(());
+    }
+    if st.group_claims.is_reserved(sub) {
+        return Err(anyhow::Error::new(GroupConflict { subscription: sub.to_string(), owner: format!("group {sub}") }));
+    }
+    if let Some(owner) = st.group_claims.private_owner(sub) {
+        return Err(anyhow::Error::new(GroupConflict {
+            subscription: sub.to_string(),
+            owner: format!("group {owner}"),
+        }));
+    }
+    if st.group_claims.get(sub).is_some() {
+        return Err(anyhow::Error::new(GroupConflict { subscription: sub.to_string(), owner: format!("group {sub}") }));
+    }
+    Ok(())
 }
 
 /// Everything a JOIN claimed before its first await, given back if it never reaches its own end —
@@ -2845,11 +3154,20 @@ impl Engine {
         // Only shape streams are reconciled: the change log uses `append`/`append_checked`, which
         // never come through here, and anything else is not the engine's to retire.
         let Some(id) = path.strip_prefix("shape/") else { return GoneVerdict::Discard };
-        let registered = {
+        let (shape_id, group_release) = {
             let st = self.state.lock().await;
-            st.shapes.get(id).is_some_and(|rec| rec.stream_path == path)
+            if st.shapes.get(id).is_some_and(|rec| rec.stream_path == path) {
+                (Some(id.to_string()), None)
+            } else {
+                let group = st
+                    .group_claims
+                    .records_iter()
+                    .find(|group| group.stream_path == path)
+                    .map(|group| (group.subscription.clone(), group.id.clone()));
+                (None, group)
+            }
         };
-        if !registered {
+        if shape_id.is_none() && group_release.is_none() {
             return GoneVerdict::Discard;
         }
         if self.shutdown.is_shutting_down() {
@@ -2862,18 +3180,26 @@ impl Engine {
             // Closed or absent: storage really has retired this stream under a live shape. Retire
             // the shape for real so nothing keeps serving it.
             Ok(_) => {
-                tracing::error!(
-                    "shape {id}: its stream '{path}' is gone from storage while the shape was live; \
-                     retiring the shape so its subscribers re-subscribe"
-                );
-                let (engine, id) = (self.clone(), id.to_string());
-                self.shutdown.spawn(async move {
-                    let _ = engine.purge_shape(&id).await;
-                });
+                if let Some((group, group_id)) = group_release {
+                    tracing::error!(%group, "group stream '{path}' is gone from storage; releasing the group claim");
+                    let engine = self.clone();
+                    self.shutdown.spawn(async move {
+                        let _ = engine.release_group_claim(&group, &group_id).await;
+                    });
+                } else if let Some(id) = shape_id {
+                    tracing::error!(
+                        "shape {id}: its stream '{path}' is gone from storage while the shape was live; \
+                         retiring the shape so its subscribers re-subscribe"
+                    );
+                    let (engine, id) = (self.clone(), id.to_string());
+                    self.shutdown.spawn(async move {
+                        let _ = engine.purge_shape(&id).await;
+                    });
+                }
                 GoneVerdict::Discard
             }
             Err(e) => {
-                tracing::warn!("shape {id}: HEAD {path} failed ({e:#}) after a terminal append; retrying the append");
+                tracing::warn!("stream {path}: HEAD failed ({e:#}) after a terminal append; retrying the append");
                 GoneVerdict::Retry
             }
         }
@@ -3047,9 +3373,137 @@ impl Engine {
 mod cancellation_tests {
     use super::*;
 
-    #[test]
-    fn create_replay_keeps_each_commit_separately_pending() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_plain_create_refuses_a_recorded_group_subscription_during_teardown() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-admission-guard".into(), store);
+        let (engine, _) = engine_with_subquery_tables_ds(ds).await;
+        let group = GroupRecord {
+            id: "shape/group-teardown".into(),
+            stream_path: "shape/group-teardown".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: String::new(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+            st.group_claims.complete(group);
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.create_shape_as(&"outer_t".into(), None, None, false, true, Some("scope".into())),
+        )
+        .await
+        .expect("plain create admission guard must not hang");
+        let error = result.expect_err("a recorded group subscription must remain unavailable to plain create");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
+            .await
+            .expect("plain create admission guard engine close must complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_aggregate_create_refuses_group_subscription_during_reservation_and_teardown() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://aggregate-group-admission-guard".into(), store);
+        let (engine, _) = engine_with_subquery_tables_ds(ds).await;
+        let group = GroupRecord {
+            id: "shape/group-teardown".into(),
+            stream_path: "shape/group-teardown".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: String::new(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.create_aggregate_as(&"outer_t".into(), None, AggFn::Count, None, Some("scope".into())),
+        )
+        .await
+        .expect("aggregate create reservation guard must not hang");
+        let error = result.expect_err("a reserved group subscription must remain unavailable to aggregate create");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.complete(group);
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.create_aggregate_as(&"outer_t".into(), None, AggFn::Count, None, Some("scope".into())),
+        )
+        .await
+        .expect("aggregate create teardown guard must not hang");
+        let error = result.expect_err("a recorded group subscription must remain unavailable to aggregate create");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
+            .await
+            .expect("aggregate create admission guard engine close must complete");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reserve_group_refuses_generated_member_id_owned_by_another_group() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-member-admission-guard".into(), store);
+        let (engine, _) = engine_with_subquery_tables_ds(ds).await;
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope:member:1", "group:scope:member:1").unwrap();
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.reserve_group("scope", &["scope:member:1".into()]),
+        )
+        .await
+        .expect("generated member reservation check must not hang");
+        let error = result.expect_err("a public reservation must block its generated member id");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        assert!(!engine.has_group_record("scope").await);
+        assert!(!engine.state.lock().await.group_claims.is_reserved("scope"));
+
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope:member:1");
+            st.group_claims.reserve("scope:member:1", "group:scope:member:1").unwrap();
+            st.group_claims.complete(GroupRecord {
+                id: "shape/group-member-id".into(),
+                stream_path: "shape/group-member-id".into(),
+                subscription: "scope:member:1".into(),
+                members: Vec::new(),
+                lsn: "0/0".into(),
+                snapshot: String::new(),
+                horizon: "0/0".into(),
+                replay_fence: "0".into(),
+            });
+        }
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.reserve_group("scope", &["scope:member:1".into()]),
+        )
+        .await
+        .expect("generated member record check must not hang");
+        let error = result.expect_err("a public record must block its generated member id");
+        assert!(error.downcast_ref::<GroupConflict>().is_some(), "expected GroupConflict, got {error:#}");
+        assert!(!engine.has_group_record("scope").await);
+        assert!(!engine.state.lock().await.group_claims.is_reserved("scope"));
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.close(std::time::Duration::from_secs(1)))
+            .await
+            .expect("generated member admission guard engine close must complete");
+    }
+
+    #[tokio::test]
+    async fn create_replay_keeps_each_commit_separately_pending() {
         use crate::subquery::{DeferredNodeWork, DeferredShapeWork, FinishedCreate, Flip, FlipDir};
+        let (engine, _) = engine_with_subquery_tables().await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let pending = PendingFlips::default();
         let finished = FinishedCreate {
@@ -3066,7 +3520,9 @@ mod cancellation_tests {
                 .map(|commit_lsn| ("parent".to_string(), DeferredNodeWork::Full { commit_lsn }))
                 .collect(),
         };
-        enqueue_finished_create_work(&tx, &pending, "s1", finished).unwrap();
+        enqueue_finished_create_work_parts(&engine.subqueries, &engine.group_lanes, &pending, &tx, "s1", finished)
+            .await
+            .unwrap();
         assert_eq!(pending.count(), 6);
         let mut earlier = 0;
         while let Ok(batch) = rx.try_recv() {
@@ -3085,8 +3541,9 @@ mod cancellation_tests {
     /// A create must not acknowledge after shutdown closes the flip propagator channel: the
     /// deferred effects returned by `finish_create` have nowhere to run, so the caller needs the
     /// normal shutdown error and rollback path.
-    #[test]
-    fn closed_flip_channel_rejects_finished_create_handoff() {
+    #[tokio::test]
+    async fn closed_flip_channel_rejects_finished_create_handoff() {
+        let (engine, _) = engine_with_subquery_tables().await;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         drop(flip_rx);
         let pending_flips = PendingFlips::default();
@@ -3099,8 +3556,16 @@ mod cancellation_tests {
             node_work: [("parent".into(), crate::subquery::DeferredNodeWork::Full { commit_lsn: 0x20 })].into(),
         };
 
-        let err = enqueue_finished_create_work(&flip_tx, &pending_flips, "s1", finished)
-            .expect_err("a closed propagator cannot acknowledge deferred create work");
+        let err = enqueue_finished_create_work_parts(
+            &engine.subqueries,
+            &engine.group_lanes,
+            &pending_flips,
+            &flip_tx,
+            "s1",
+            finished,
+        )
+        .await
+        .expect_err("a closed propagator cannot acknowledge deferred create work");
         assert_eq!(err.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
         assert_eq!(pending_flips.count(), 0, "failed handoff must not hold the barrier");
     }
@@ -3108,7 +3573,11 @@ mod cancellation_tests {
     /// A subquery-capable engine with no durable-streams server behind it: the rollback's stream
     /// DELETE fails and is ignored, which leaves exactly the in-memory state these tests assert on.
     async fn engine_with_subquery_tables() -> (Engine, PredicateJson) {
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        engine_with_subquery_tables_ds(DsClient::new_for_in_process_test("http://127.0.0.1:1")).await
+    }
+
+    async fn engine_with_subquery_tables_ds(ds: DsClient) -> (Engine, PredicateJson) {
+        let engine = Engine::new_for_in_process_test(ds);
         let schema: Schema = serde_json::from_value(serde_json::json!({
             "tables": {
                 "outer_t": { "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id" },
@@ -3630,6 +4099,160 @@ mod cancellation_tests {
         engine.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
     }
 
+    async fn engine_with_group_claim() -> (Engine, GroupRecord) {
+        engine_with_group_claim_ds(DsClient::new_for_in_process_test("http://127.0.0.1:1")).await
+    }
+
+    async fn engine_with_group_claim_ds(ds: DsClient) -> (Engine, GroupRecord) {
+        let engine = Engine::new_for_in_process_test(ds);
+        let now = crate::changelog::now_secs();
+        let members = [("member-0", "scope", "items-a"), ("member-1", "scope:member:1", "items-b")];
+        let mut st = engine.state.lock().await;
+        for (id, subscription, table) in members {
+            st.shapes.insert(
+                id.to_string(),
+                ShapeRecord {
+                    id: id.to_string(),
+                    table: crate::table_ref::TableRef::parse(table).unwrap(),
+                    stream_path: format!("shape/{id}"),
+                    changes_only: true,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
+                },
+            );
+            let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+            drop(ready_tx);
+            st.feed_shares
+                .insert(id.to_string(), FeedShare { sig: format!("group-{id}"), subs: Default::default(), ready });
+            st.subscribe(id, subscription.to_string(), now - 20);
+        }
+        let group = GroupRecord {
+            id: "shape/group-test".into(),
+            stream_path: "shape/group-test".into(),
+            subscription: "scope".into(),
+            members: vec![
+                GroupMember {
+                    key: "one".into(),
+                    shape_id: "member-0".into(),
+                    table: "items-a".into(),
+                    where_: None,
+                    columns: None,
+                    subscription: "scope".into(),
+                    is_subquery: false,
+                },
+                GroupMember {
+                    key: "two".into(),
+                    shape_id: "member-1".into(),
+                    table: "items-b".into(),
+                    where_: None,
+                    columns: None,
+                    subscription: "scope:member:1".into(),
+                    is_subquery: false,
+                },
+            ],
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        st.group_claims.reserve("scope", "group:scope").unwrap();
+        st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+        st.group_claims.complete(group.clone());
+        drop(st);
+        (engine, group)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_group_head_failure_preserves_claim_for_retry() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_error: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://group-health".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let error = engine.group_is_healthy(&group).await.unwrap_err();
+        assert!(error.downcast_ref::<crate::engine::GroupStreamUnavailable>().is_some());
+        assert!(engine.group_record(&group.subscription).await.is_some());
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn complete_group_rejects_a_missing_member_claim() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-invalid-completion".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let mut invalid = group.clone();
+        invalid.subscription = "scope-invalid".into();
+        invalid.id = "shape/group-invalid".into();
+        invalid.stream_path = invalid.id.clone();
+        invalid.members[0].subscription = "scope-invalid".into();
+        invalid.members[1].subscription = "scope-invalid:member:1".into();
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope-invalid", "group scope-invalid").unwrap();
+            st.group_claims.reserve_private_members("scope-invalid", ["scope-invalid:member:1".into()]);
+            st.subscribe("member-0", "scope-invalid".into(), crate::changelog::now_secs());
+            st.subscribe("member-1", "scope-invalid:member:1".into(), crate::changelog::now_secs());
+            st.unsubscribe("member-1", "scope-invalid:member:1");
+        }
+        assert!(engine.complete_group(invalid).await.is_err());
+        assert!(engine.group_record("scope-invalid").await.is_none());
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewing_a_group_moves_every_member_lease() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-renew-lease".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let before = {
+            let st = engine.state.lock().await;
+            group
+                .members
+                .iter()
+                .map(|member| st.feed_shares[&member.shape_id].subs[&member.subscription])
+                .collect::<Vec<_>>()
+        };
+        assert!(engine.renew_group_claim(&group).await.unwrap());
+        let after = {
+            let st = engine.state.lock().await;
+            group
+                .members
+                .iter()
+                .map(|member| st.feed_shares[&member.shape_id].subs[&member.subscription])
+                .collect::<Vec<_>>()
+        };
+        assert!(after.iter().zip(before).all(|(new, old)| *new > old), "renew must move every member lease");
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_member_lease_lapse_releases_the_whole_group() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-private-lapse".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        {
+            let mut st = engine.state.lock().await;
+            st.subscribe("member-0", "scope".into(), crate::changelog::now_secs());
+        }
+        let cfg = crate::retention::RetentionConfig {
+            subscription_lease_timeout: std::time::Duration::from_secs(5),
+            ..crate::retention::RetentionConfig::default()
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.sweep_leases(&cfg))
+            .await
+            .expect("private member lease lapse sweep must complete");
+        assert!(engine.group_record("scope").await.is_none(), "private lapse must release the group record");
+        assert!(engine.subscription_owner("scope").await.is_none());
+        assert!(engine.subscription_owner("scope:member:1").await.is_none());
+        engine.close(std::time::Duration::from_secs(1)).await;
+        let _ = group;
+    }
+
     /// Park until the joiner has actually joined (its refcount is taken) and is waiting on the
     /// creator's outcome, so the outcome below is published INTO that wait.
     async fn await_joined(engine: &Engine, id: &str) {
@@ -3915,6 +4538,38 @@ mod subscription_tests {
         };
         engine.sweep_leases(&cfg).await;
         assert_eq!(refcount(&engine, "s1").await, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn renewing_an_in_flight_group_release_waits_without_holding_the_release_lock() {
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+        let group = GroupRecord {
+            id: "shape/group-1".into(),
+            stream_path: "shape/group-1".into(),
+            subscription: "scope".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+            st.group_claims.complete(group.clone());
+        }
+        let release = crate::engine::GroupRelease::new();
+        engine.group_releases.lock().unwrap().insert(group.id.clone(), release.clone());
+        let waiting = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.renew_group_claim(&group).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "renew must wait for the engine-owned release");
+        let completed: anyhow::Result<()> = Ok(());
+        release.complete(&completed);
+        assert!(!waiting.await.unwrap().unwrap(), "a waiter must hand control to fresh group creation");
+        engine.close(std::time::Duration::from_secs(1)).await;
     }
 
     /// A join that is abandoned mid-wait (the client disconnected while storage was slow) gives its

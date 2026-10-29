@@ -33,6 +33,7 @@ mod drift;
 pub(crate) mod emission;
 pub(crate) mod epoch;
 mod executors;
+pub(crate) mod group;
 mod held;
 mod introspection;
 mod lifecycle;
@@ -89,6 +90,10 @@ impl Default for SubqueryAdmission {
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
+pub(crate) use group::{
+    GroupClaims, GroupConflict, GroupFence, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease,
+    GroupStreamClosed,
+};
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
     GraphNode, GraphShape, NodeIndex, NodeStateSummary, NodeValue, OpEdge, OpNode, ShapeRecord, StateSnapshot,
@@ -291,6 +296,19 @@ impl std::fmt::Display for ReplayHeadUnavailable {
 
 impl std::error::Error for ReplayHeadUnavailable {}
 
+/// A group health probe could not reach Durable Streams. The group remains owned and callers
+/// should retry rather than tearing down a healthy claim on an inconclusive HEAD.
+#[derive(Debug)]
+pub(crate) struct GroupStreamUnavailable;
+
+impl std::fmt::Display for GroupStreamUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("group stream health is temporarily unavailable; retrying preserves the group claim")
+    }
+}
+
+impl std::error::Error for GroupStreamUnavailable {}
+
 impl ReactivationRecreate {
     pub(crate) fn over_budget(shape: impl Into<String>) -> Self {
         Self { shape: shape.into(), reason: RecreateReason::OverBudget }
@@ -485,6 +503,42 @@ pub struct SubsetPage {
     pub horizon: String,
 }
 
+/// One read of a [`Engine::query_subset_batch`].
+pub struct SubsetReadReq {
+    pub table: TableRef,
+    pub where_: Option<PredicateJson>,
+    pub columns: Option<Vec<String>>,
+    pub order_by: Option<(String, bool)>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// The pages of a batch, in request order, read in one snapshot whose fences they share.
+pub struct SubsetBatchPage {
+    pub pages: Vec<Vec<serde_json::Value>>,
+    pub lsn: String,
+    pub snapshot: String,
+    pub horizon: String,
+}
+
+struct SubsetPlan {
+    ts: TableSchema,
+    out_cols: Option<Arc<Vec<usize>>>,
+    where_sql: Option<(String, Vec<String>)>,
+    scope: crate::pg::SettleScope,
+    scope_tables: Vec<TableRef>,
+    order: Option<(usize, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+impl SubsetPlan {
+    fn project(&self, rows: &[crate::value::Row]) -> Vec<serde_json::Value> {
+        let proj = self.out_cols.as_deref().map(Vec::as_slice);
+        rows.iter().map(|r| self.ts.row_to_json_cols(r, proj)).collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct Engine {
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
@@ -553,6 +607,12 @@ pub struct Engine {
     pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
+    /// Per-engine group transaction fence. It must never be process-global.
+    group_fence: GroupFence,
+    group_lanes: crate::engine::emission::GroupEmissionLanes,
+    /// Group teardowns keyed by group identity. A reload waits for an in-flight release instead of
+    /// renewing the dying record or allowing a stale task to drop a replacement under the same name.
+    group_releases: Arc<std::sync::Mutex<HashMap<String, Arc<GroupRelease>>>>,
     /// Latched when live replay cannot continue: a missing segment or unrecoverable body-cap breach.
     pub(crate) sequencer_read_failed: Arc<std::sync::atomic::AtomicBool>,
     /// Table schemas shared with the sequencer task and the replication ingestor — the set of
@@ -752,11 +812,19 @@ pub(crate) enum FlipWork {
         /// propagation — letting the activity log group them as one write (see
         /// `subquery::emit_flip_trace`).
         lsn: Option<String>,
+        /// Group stream paths reachable from this walk. Registered before the work is sent so a
+        /// following source transaction cannot pass the group fence while this walk is in flight.
+        group_paths: Vec<String>,
     },
     /// Work that reached a shape while it was still being created, run against that one shape now
     /// that it is installed (see `SubqueryRegistry::finish_create`). Its dependency walk already
     /// happened, so there is nothing left to walk.
-    Deferred { commit_lsn: u64, shape_id: String, work: std::collections::VecDeque<crate::subquery::DeferredShapeWork> },
+    Deferred {
+        commit_lsn: u64,
+        shape_id: String,
+        work: std::collections::VecDeque<crate::subquery::DeferredShapeWork>,
+        group_paths: Vec<String>,
+    },
     /// Work that reached a fresh parent NODE while a create was still seeding it, re-derived now
     /// that its set is installed (see `SubqueryRegistry::finish_create`). Unlike `Deferred`, this
     /// one DOES walk: reconciling the node produces flips, and the dependents below it — the
@@ -764,6 +832,7 @@ pub(crate) enum FlipWork {
     DeferredNode {
         commit_lsn: u64,
         work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::DeferredNodeWork)>,
+        group_paths: Vec<String>,
     },
 }
 
@@ -772,6 +841,14 @@ impl FlipWork {
         match self {
             Self::Walk { lsn, .. } => lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0),
             Self::Deferred { commit_lsn, .. } | Self::DeferredNode { commit_lsn, .. } => *commit_lsn,
+        }
+    }
+
+    fn group_paths(&self) -> &[String] {
+        match self {
+            Self::Walk { group_paths, .. }
+            | Self::Deferred { group_paths, .. }
+            | Self::DeferredNode { group_paths, .. } => group_paths,
         }
     }
 }
@@ -828,6 +905,7 @@ struct SubqueryHandle {
     flip_tx: mpsc::UnboundedSender<FlipWork>,
     pending_flips: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
+    group_lanes: crate::engine::emission::GroupEmissionLanes,
 }
 
 /// Spawn the flip-propagation dispatcher: FlipWork batches run **concurrently**, bounded by a
@@ -844,6 +922,7 @@ fn spawn_flip_propagator(
     pending: Arc<PendingFlips>,
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
+    group_lanes: crate::engine::emission::GroupEmissionLanes,
     shutdown: crate::shutdown::ShutdownToken,
 ) {
     let workers: usize =
@@ -856,12 +935,14 @@ fn spawn_flip_propagator(
             let pending = pending.clone();
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
+            let group_lanes = group_lanes.clone();
             shutdown.spawn_background(async move {
                 let commit_lsn = fw.commit_lsn();
+                let group_paths = fw.group_paths().to_vec();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
                 // is treated exactly like a live one, because its effects are just as lost.
                 let failed = match fw {
-                    FlipWork::Walk { mut work, txid, lsn } => {
+                    FlipWork::Walk { mut work, txid, lsn, .. } => {
                         crate::subquery::propagate_with_retry(&registry, &mut work, txid, lsn, &trace_tx)
                             .await
                             .err()
@@ -900,6 +981,9 @@ fn spawn_flip_propagator(
                         unfinished
                     );
                     degrade.mark();
+                    for path in &group_paths {
+                        group_lanes.complete_origin(path, commit_lsn);
+                    }
                     drop(permit);
                     return;
                 }
@@ -907,6 +991,9 @@ fn spawn_flip_propagator(
                 // batch — each batch carries its own pending increment until it lands, so
                 // the barrier never reads zero with effects in flight.
                 pending.complete(commit_lsn);
+                for path in &group_paths {
+                    group_lanes.complete_origin(path, commit_lsn);
+                }
                 drop(permit);
             });
         }
@@ -917,6 +1004,10 @@ struct EngineState {
     tables: HashMap<TableRef, TableSchema>,
     sequencer: Option<SequencerHandle>,
     shapes: HashMap<String, ShapeRecord>,
+    /// Group claims and their private member list live under the same state lock as
+    /// ordinary subscription claims, making a group reservation atomic with a competing
+    /// single-shape create.
+    group_claims: GroupClaims,
     next_shape_id: u64,
     /// Shape sharing. Any two **equal** shapes — same kind and definition (see `shape_signature` /
     /// `agg_signature`: table + canonical predicate + columns + changes-only, or table + predicate +
@@ -1322,6 +1413,9 @@ fn sid_of_path(stream_path: &str) -> &str {
 }
 
 impl Engine {
+    pub(crate) fn group_stream_path(&self) -> String {
+        format!("shape/group-{}-{}", self.sub_nonce, uuid::Uuid::new_v4())
+    }
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
@@ -1486,6 +1580,9 @@ impl Engine {
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
+        let degrade = DegradeState::new();
+        let group_fence = GroupFence::default();
+        let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1496,13 +1593,14 @@ impl Engine {
             shutdown.clone(),
         );
         subqueries.try_lock().expect("fresh registry").set_lanes(lanes);
-        let degrade = DegradeState::new();
+        subqueries.try_lock().expect("fresh registry").set_group_lanes(group_lanes.clone());
         spawn_flip_propagator(
             subqueries.clone(),
             flip_rx,
             pending_flips.clone(),
             degrade.clone(),
             trace_tx.clone(),
+            group_lanes.clone(),
             shutdown.clone(),
         );
         // Created before the writer so the writer can register a shutdown party while it is
@@ -1534,6 +1632,7 @@ impl Engine {
                 tables: HashMap::new(),
                 sequencer: None,
                 shapes: HashMap::new(),
+                group_claims: GroupClaims::default(),
                 next_shape_id: 1,
                 feed_by_sig: HashMap::new(),
                 feed_shares: HashMap::new(),
@@ -1564,6 +1663,9 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
+            group_fence,
+            group_lanes,
+            group_releases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tables_shared: Arc::new(std::sync::RwLock::new(HashMap::new())),
             catalog_tx,
@@ -2264,6 +2366,7 @@ impl Engine {
             flip_tx: self.flip_tx.clone(),
             pending_flips: self.pending_flips.clone(),
             degrade: self.degrade.clone(),
+            group_lanes: self.group_lanes.clone(),
         }
     }
 
@@ -2285,6 +2388,7 @@ impl Engine {
                 self.source_receipt_progress.clone(),
                 self.runtime_receipts.clone(),
                 self.subquery_handle(),
+                self.group_fence.clone(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
@@ -2741,6 +2845,11 @@ impl Engine {
         self.ds.stream_url(path)
     }
 
+    /// A stream's current tail offset (`stream-next-offset` of a `HEAD`); `None` if it is gone.
+    pub async fn stream_tail(&self, path: &str) -> Result<Option<String>> {
+        Ok(self.ds.head(path).await?.and_then(|h| h.next_offset))
+    }
+
     /// Define a library-mode schema. PostgreSQL mode configures schemas through introspection.
     pub async fn define_schema(&self, schema: &Schema) -> Result<()> {
         // Reject at the engine boundary, before any storage/schema mutation or sequencer spawn.
@@ -2804,9 +2913,327 @@ impl Engine {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<SubsetPage> {
+        let plan = self.plan_subset(Some(&mut *log), table, where_, columns, order_by, limit, offset).await?;
+        let pool = self.pg_pool.as_ref().context("Postgres pool unavailable")?;
+        log.pool = Some((pool.in_use(), pool.size()));
+        let mut client = pool.get_timed(&mut log.checkout).await?;
+        let sq = crate::pg::query_subset_where(
+            &mut client,
+            &plan.ts,
+            plan.where_sql.clone(),
+            &plan.scope,
+            plan.order,
+            plan.limit,
+            plan.offset,
+            &mut log.query,
+        )
+        .await?;
+        log.rows = sq.rows.len();
+        let rows = plan.project(&sq.rows);
+        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn subscription_owner(&self, subscription: &str) -> Option<String> {
+        self.state.lock().await.subscription_owner(subscription).cloned()
+    }
+
+    #[cfg(not(feature = "test-support"))]
+    /// Return the current owner of a subscription claim. HTTP compound-load admission holds the
+    /// control permit while using this to distinguish a new claim from a renewal.
+    pub(crate) async fn subscription_owner(&self, subscription: &str) -> Option<String> {
+        self.state.lock().await.subscription_owner(subscription).cloned()
+    }
+
+    /// Reserve a group claim before any private member shape is created.  The ordinary
+    /// subscription map and the group map are checked while holding one state lock, so a
+    /// concurrent single-shape create cannot win the same claim between member creates.
+    pub(crate) async fn reserve_group(&self, subscription: &str, member_subscriptions: &[String]) -> Result<()> {
+        let mut st = self.state.lock().await;
+        // Checked first: while assembling, member 0 already owns the subscription, and a retry
+        // must hear "retry" rather than a conflict with its own in-flight load.
+        if st.group_claims.is_reserved(subscription) && st.group_claims.get(subscription).is_none() {
+            return Err(anyhow::Error::new(crate::engine::GroupLoadInFlight {
+                subscription: subscription.to_string(),
+            }));
+        }
+        if let Some(owner) = st.subscription_owner(subscription) {
+            return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("shape {owner}"),
+            }));
+        }
+        if let Some(owner) = st.group_claims.private_owner(subscription) {
+            return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                subscription: subscription.to_string(),
+                owner: format!("group {owner}"),
+            }));
+        }
+        for member in member_subscriptions {
+            if let Some(owner) = st.subscription_owner(member) {
+                return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                    subscription: member.clone(),
+                    owner: format!("shape {owner}"),
+                }));
+            }
+            if let Some(owner) = st.group_claims.private_owner(member) {
+                return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                    subscription: member.clone(),
+                    owner: format!("group {owner}"),
+                }));
+            }
+            if st.group_claims.is_reserved(member) || st.group_claims.get(member).is_some() {
+                return Err(anyhow::Error::new(crate::engine::GroupConflict {
+                    subscription: member.clone(),
+                    owner: format!("group {member}"),
+                }));
+            }
+        }
+        st.group_claims.reserve(subscription, &format!("group {subscription}"))?;
+        st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
+        Ok(())
+    }
+
+    pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
+        self.group_lanes.register(&record.stream_path);
+        self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        let (valid, renewals) = {
+            let mut st = self.state.lock().await;
+            let valid = record.members.iter().all(|member| {
+                st.shapes.contains_key(&member.shape_id)
+                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
+            });
+            if valid {
+                let now = crate::changelog::now_secs();
+                let renewals = record
+                    .members
+                    .iter()
+                    .map(|member| {
+                        st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                        CatalogEvent::Joined {
+                            id: member.shape_id.clone(),
+                            subscription: member.subscription.clone(),
+                            at: now,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                st.group_claims.complete(record.clone());
+                self.group_fence.activate();
+                (true, renewals)
+            } else {
+                (false, Vec::new())
+            }
+        };
+        if !valid {
+            let _ = self
+                .catalog_tx
+                .send_durable(CatalogEvent::GroupDropped {
+                    subscription: record.subscription.clone(),
+                    group_id: Some(record.id.clone()),
+                })
+                .await;
+            return Err(anyhow::Error::new(crate::engine::GroupStreamClosed { stream_path: record.stream_path }));
+        }
+        for event in renewals {
+            self.catalog_tx.send(event);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn abort_group(&self, subscription: &str, group_id: &str) -> Result<()> {
+        self.catalog_tx
+            .send_durable(CatalogEvent::GroupDropped {
+                subscription: subscription.to_string(),
+                group_id: Some(group_id.to_string()),
+            })
+            .await?;
+        self.state.lock().await.group_claims.release(subscription);
+        Ok(())
+    }
+
+    pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
+        self.state.lock().await.group_claims.get(subscription).cloned()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn has_group_record(&self, subscription: &str) -> bool {
+        self.state.lock().await.group_claims.get(subscription).is_some()
+    }
+
+    pub(crate) async fn begin_group_release(
+        &self,
+        subscription: &str,
+        expected_id: &str,
+    ) -> Option<(GroupRecord, Arc<GroupRelease>, bool)> {
+        let st = self.state.lock().await;
+        let group = st.group_claims.get(subscription).cloned()?;
+        if group.id != expected_id {
+            return None;
+        }
+        let mut releases = self.group_releases.lock().unwrap();
+        if let Some(existing) = releases.get(&group.id) {
+            return Some((group, existing.clone(), true));
+        }
+        let release = GroupRelease::new();
+        releases.insert(group.id.clone(), release.clone());
+        Some((group, release, false))
+    }
+
+    pub(crate) fn group_release_in_flight(&self, group_id: &str) -> Option<Arc<GroupRelease>> {
+        self.group_releases.lock().unwrap().get(group_id).cloned()
+    }
+
+    pub(crate) fn register_group_lane(&self, stream_path: &str) {
+        self.group_lanes.register(stream_path);
+    }
+
+    pub(crate) fn remove_group_lane(&self, stream_path: &str) {
+        self.group_lanes.remove(stream_path);
+    }
+
+    /// Renew the public group lease and every private member claim together. A retried load is
+    /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
+    /// to the same wall-clock instant.
+    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+        let now = crate::changelog::now_secs();
+        let mut events = Vec::with_capacity(group.members.len());
+        {
+            let mut st = self.state.lock().await;
+            let in_flight = self.group_releases.lock().unwrap().get(&group.id).cloned();
+            if let Some(release) = in_flight {
+                drop(st);
+                release.wait().await?;
+                return Ok(false);
+            }
+            for member in &group.members {
+                if !(st.shapes.contains_key(&member.shape_id)
+                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id))
+                {
+                    return Ok(false);
+                }
+                st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                events.push(CatalogEvent::Joined {
+                    id: member.shape_id.clone(),
+                    subscription: member.subscription.clone(),
+                    at: now,
+                });
+            }
+            // Registration is part of the same state-locked admission as the claim check. A
+            // release that wins this lock removes the lane after the renew; a release already in
+            // flight makes this branch return before it can recreate the dying lane.
+            self.group_lanes.register(&group.stream_path);
+            st.publish_subscription_gauge(&self.metrics);
+        }
+        for event in events {
+            self.catalog_tx.send(event);
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> Result<bool> {
+        let members_healthy = {
+            let st = self.state.lock().await;
+            group.members.iter().all(|member| {
+                st.shapes.contains_key(&member.shape_id)
+                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
+            })
+        };
+        if !members_healthy {
+            return Ok(false);
+        }
+        match self.ds.head(&group.stream_path).await {
+            Ok(Some(head)) => Ok(!head.closed && head.next_offset.is_some()),
+            Ok(None) => Ok(false),
+            Err(error) => Err(anyhow::Error::new(GroupStreamUnavailable).context(error)),
+        }
+    }
+
+    /// Remove the public group record after its members have been released and its GroupDropped
+    /// catalog event is durable. The caller performs member releases outside the state lock.
+    pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
+        let mut st = self.state.lock().await;
+        let record = st.group_claims.release_if_matches(subscription, group_id);
+        if record.is_some() {
+            self.group_fence.deactivate();
+        }
+        record
+    }
+
+    pub(crate) async fn finish_group_release(&self, subscription: &str, group_id: &str) -> Result<()> {
+        self.catalog_tx
+            .send_durable(CatalogEvent::GroupDropped {
+                subscription: subscription.to_string(),
+                group_id: Some(group_id.to_string()),
+            })
+            .await?;
+        let _ = self.take_group(subscription, group_id).await;
+        Ok(())
+    }
+
+    /// Validate a subset read without opening Postgres or changing engine state.
+    ///
+    /// HTTP compound loads use this before creating their changes-only feed so a malformed
+    /// page (for example an unknown `orderBy` column) cannot leave a subscription claim behind.
+    pub(crate) async fn validate_subset(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<()> {
+        self.plan_subset(None, table, where_, columns, order_by, limit, offset).await.map(|_| ())
+    }
+
+    /// Several one-shot subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the
+    /// scope load). The snapshot settles against every table any read depends on, so the pages are
+    /// mutually consistent and share one set of fences.
+    pub async fn query_subset_batch(&self, reads: Vec<SubsetReadReq>) -> Result<SubsetBatchPage> {
+        anyhow::ensure!(!reads.is_empty(), "a batch needs at least one table");
+        let mut plans = Vec::with_capacity(reads.len());
+        for r in reads {
+            plans.push(self.plan_subset(None, &r.table, r.where_, r.columns, r.order_by, r.limit, r.offset).await?);
+        }
+        let mut scope = plans[0].scope.clone();
+        for p in &plans[1..] {
+            scope = scope.with(p.scope_tables.iter());
+        }
+        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+        let batch_reads: Vec<crate::pg::SubsetRead<'_>> = plans
+            .iter()
+            .map(|p| crate::pg::SubsetRead {
+                ts: &p.ts,
+                where_sql: p.where_sql.clone(),
+                order: p.order,
+                limit: p.limit,
+                offset: p.offset,
+            })
+            .collect();
+        let bq = crate::pg::query_subset_batch_where(&mut client, batch_reads, &scope).await?;
+        let pages = plans.iter().zip(bq.pages.iter()).map(|(p, rows)| p.project(rows)).collect();
+        Ok(SubsetBatchPage { pages, lsn: bq.lsn, snapshot: bq.snapshot, horizon: bq.horizon })
+    }
+
+    /// Validate a subset read and build its SQL, projection and settle scope without touching Postgres.
+    ///
+    /// `log`, when given, records the moment the engine-state lock is held.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_subset(
+        &self,
+        log: Option<&mut subset_query_log::SubsetQueryLog>,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        order_by: Option<(String, bool)>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<SubsetPlan> {
         let (ts, schemas) = {
             let st = self.state.lock().await;
-            log.state_held();
+            if let Some(log) = log {
+                log.state_held();
+            }
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
             // Clone the table schemas so the subquery SQL emitter can cast each leaf's param to its
             // column's native Postgres type (query_subset is one-shot; the clone is off the hot path).
@@ -2850,16 +3277,10 @@ impl Engine {
         // the inner tables of any subquery in its predicate.
         let scope = crate::pg::SettleScope::request(table)
             .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
-        let pool = self.pg_pool.as_ref().context("Postgres pool unavailable")?;
-        log.pool = Some((pool.in_use(), pool.size()));
-        let mut client = pool.get_timed(&mut log.checkout).await?;
-        let sq =
-            crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset, &mut log.query)
-                .await?;
-        log.rows = sq.rows.len();
-        let proj = out_cols.as_deref().map(Vec::as_slice);
-        let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
-        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
+        let scope_tables: Vec<TableRef> = std::iter::once(table.clone())
+            .chain(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default())
+            .collect();
+        Ok(SubsetPlan { ts, out_cols, where_sql, scope, scope_tables, order, limit, offset })
     }
 
     /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the
