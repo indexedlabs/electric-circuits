@@ -73,6 +73,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupRetryRenews => group_retry_renews(&fixture).await,
             Case::GroupRenewalRelease => group_renewal_rechecks_a_racing_release(&fixture, false).await,
             Case::GroupRenewalReleaseOpen => group_renewal_rechecks_a_racing_release(&fixture, true).await,
+            Case::GroupRenewalReplaced => group_renewal_follows_a_replacement(&fixture).await,
             Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
             Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
@@ -110,6 +111,7 @@ enum Case {
     GroupRetryRenews,
     GroupRenewalRelease,
     GroupRenewalReleaseOpen,
+    GroupRenewalReplaced,
     GroupReleaseDuringAssembly,
     GroupRetirementDuringAssembly,
     GroupMembersMax,
@@ -248,6 +250,12 @@ fn group_renewal_rechecks_a_release_that_has_not_closed_the_stream() -> Result<(
         "ownership::group_renewal_rechecks_a_release_that_has_not_closed_the_stream",
         Case::GroupRenewalReleaseOpen,
     )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_renews_a_same_members_replacement() -> Result<()> {
+    isolated("ownership::group_renewal_renews_a_same_members_replacement", Case::GroupRenewalReplaced)
 }
 
 #[test]
@@ -1813,6 +1821,55 @@ async fn group_renewal_rechecks_a_racing_release(f: &Fixture, before_close: bool
             events.iter().any(|event| event_key(event).as_deref() == Some("7")),
             "fresh group missed live output: {events:?}"
         );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// A retried load whose group is released and replaced by a load with the same members while
+/// the retry is still building its answer renews the replacement: it never answers the released
+/// stream, and never a `409` against a group with its own members (`#g-group-retry-renews`).
+async fn group_renewal_follows_a_replacement(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let subscription = "group-renewal-replaced";
+        let (status, first) = post_group(&app, group_body(f, subscription, true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("group stream path")?.to_owned();
+        let first_shape = first["results"][0]["shapeId"].as_str().context("first group member")?.to_owned();
+
+        // Hold the retry at its stream-tail read, after it has renewed the first group.
+        *f.ds.hold_group_head_after.lock().await = Some(2);
+        let renew_app = app.clone();
+        let renew_body = group_body(f, subscription, true);
+        let renew = tokio::spawn(async move { post_group(&renew_app, renew_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+            .await
+            .context("renewal did not reach its stream-tail read")?;
+
+        let (status, body) =
+            json(&app, Method::DELETE, &format!("/v1/shapes/{first_shape}?subscription={subscription}"), Body::empty())
+                .await?;
+        ensure!(status == StatusCode::OK, "group release failed: {status} {body}");
+        wait_group_stream_retired(f, &old_path).await?;
+        let (status, replacement) = post_group(&app, group_body(f, subscription, true)).await?;
+        ensure!(status == StatusCode::OK, "replacement load failed: {status} {replacement}");
+        let new_path = replacement["streamPath"].as_str().context("replacement stream path")?.to_owned();
+        ensure!(new_path != old_path, "replacement reused the released stream");
+
+        f.ds.group_head_release.notify_one();
+        let (status, renewed) = tokio::time::timeout(Duration::from_secs(15), renew)
+            .await
+            .context("held renewal did not finish")?
+            .context("renewal task failed")??;
+        ensure!(status == StatusCode::OK, "held renewal did not renew the replacement: {status} {renewed}");
+        ensure!(
+            renewed["streamPath"].as_str() == Some(new_path.as_str()),
+            "held renewal answered another stream than the replacement's {new_path}: {renewed}"
+        );
+        ensure!(renewed["groupId"] == replacement["groupId"], "held renewal answered another group: {renewed}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
