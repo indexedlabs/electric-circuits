@@ -419,9 +419,16 @@ async function runSteadyPhase(client: pgpkg.Client, enginePid: number | undefine
     const deliveredAt = performance.now()
     const next = response.headers.get('stream-next-offset')
     // A 204 is DS's long-poll timeout: nothing was delivered, so its wait isn't a latency.
-    if (response.status === 204 || !next || next === offset) missed_deliveries++
-    else delivery_latency_ms.push(deliveredAt - committedAt)
-    if (next) offset = next
+    if (response.status === 204 || !next || next === offset) {
+      missed_deliveries++
+      // The missed update is still unread past `offset`; without resyncing, the next poll would
+      // return it at once and every later sample would be timed against the wrong update.
+      const tail = await fetch(streamUrl, { method: 'HEAD' })
+      offset = tail.headers.get('stream-next-offset') ?? next ?? offset
+    } else {
+      delivery_latency_ms.push(deliveredAt - committedAt)
+      offset = next
+    }
     if (i + 1 < STEADY_UPDATES) await sleep(STEADY_INTERVAL_MS)
     const ticks = procCpuTicks(enginePid)
     const at = performance.now()
