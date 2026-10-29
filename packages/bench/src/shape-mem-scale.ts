@@ -167,6 +167,10 @@ async function spawnEngine(dsUrl: string, pgUrl: string): Promise<{ url: string;
     env: {
       ...process.env,
       ELECTRIC_CIRCUITS_DS_URL: dsUrl,
+      // The DS test server is plain loopback HTTP with no store identity; without this the
+      // engine refuses to boot for want of ELECTRIC_CIRCUITS_DS_STORE_ID and friends. Needs an
+      // engine built with `--features test-support`.
+      ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST: '1',
       ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
       ELECTRIC_CIRCUITS_LOG: 'warn',
       ELECTRIC_CIRCUITS_PG_URL: pgUrl,
