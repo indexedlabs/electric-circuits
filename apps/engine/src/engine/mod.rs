@@ -2845,9 +2845,10 @@ impl Engine {
         self.ds.stream_url(path)
     }
 
-    /// A stream's current tail offset (`stream-next-offset` of a `HEAD`); `None` if it is gone.
+    /// A stream's current tail offset (`stream-next-offset` of a `HEAD`); `None` if it is gone or
+    /// closed, since nothing more can be appended after a closed tail.
     pub async fn stream_tail(&self, path: &str) -> Result<Option<String>> {
-        Ok(self.ds.head(path).await?.and_then(|h| h.next_offset))
+        Ok(self.ds.head(path).await?.filter(|h| !h.closed).and_then(|h| h.next_offset))
     }
 
     /// Define a library-mode schema. PostgreSQL mode configures schemas through introspection.
@@ -3128,6 +3129,19 @@ impl Engine {
             self.catalog_tx.send(event);
         }
         Ok(true)
+    }
+
+    /// Whether `group` is still its subscription's record, no release of it has begun, and every
+    /// member still owns its claim. `begin_group_release` records a release under this same state
+    /// lock, so a release this check misses starts after it.
+    pub(crate) async fn group_is_current(&self, group: &GroupRecord) -> bool {
+        let st = self.state.lock().await;
+        st.group_claims.get(&group.subscription).is_some_and(|current| current.id == group.id)
+            && !self.group_releases.lock().unwrap().contains_key(&group.id)
+            && group.members.iter().all(|member| {
+                st.shapes.contains_key(&member.shape_id)
+                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
+            })
     }
 
     pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> Result<bool> {

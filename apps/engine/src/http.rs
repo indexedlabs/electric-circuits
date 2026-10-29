@@ -1240,36 +1240,36 @@ async fn subset_load_group(
             let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
             let renewed_healthy = renewed && engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
             if renewed_healthy {
-                let offset = engine
-                    .stream_tail(&existing.stream_path)
-                    .await
-                    .map_err(|error| {
-                        AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error))
-                    })?
-                    .ok_or_else(|| AppError {
-                        status: StatusCode::CONFLICT,
-                        msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
-                        retry_after: false,
-                    })?;
-                let reads = existing
-                    .members
-                    .iter()
-                    .map(|m| crate::engine::SubsetReadReq {
-                        table: TableRef::parse(&m.table).expect("validated table reference"),
-                        where_: m.where_.clone(),
-                        columns: m.columns.clone(),
-                        order_by: None,
-                        limit: None,
-                        offset: None,
-                    })
-                    .collect();
-                let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
-                return Ok(Json(group_answer(engine, &existing, &offset, page)));
+                // `None` once the stream has closed: a release that began after the renewal can
+                // have retired it while this request was between its probes.
+                let tail = engine.stream_tail(&existing.stream_path).await.map_err(|error| {
+                    AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error))
+                })?;
+                if let Some(offset) = tail {
+                    let reads = existing
+                        .members
+                        .iter()
+                        .map(|m| crate::engine::SubsetReadReq {
+                            table: TableRef::parse(&m.table).expect("validated table reference"),
+                            where_: m.where_.clone(),
+                            columns: m.columns.clone(),
+                            order_by: None,
+                            limit: None,
+                            offset: None,
+                        })
+                        .collect();
+                    let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
+                    // Recheck under the state lock, where a release begins: a release that has
+                    // not begun by now is ordered after this answer (#g-group-recheck).
+                    if engine.group_is_current(&existing).await {
+                        return Ok(Json(group_answer(engine, &existing, &offset, page)));
+                    }
+                }
             }
-            // A member claim can lapse between the health probe and the renewal lock, or the
-            // renewal can succeed while its stream closes. Treat either outcome as an
-            // unhealthy existing group, release its durable record, and let this request
-            // reserve a fresh group rather than returning a conflict.
+            // A member claim can lapse between the health probe and the renewal lock, the
+            // stream can close, or a release can begin before the answer. Treat each as an
+            // unhealthy existing group: join or start its release, and let this request reserve
+            // a fresh group rather than answering the old stream or a conflict.
             engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         }
     }
