@@ -118,6 +118,22 @@ impl GroupClaims {
         self.records.remove(subscription)
     }
 
+    /// Compensate one load attempt without being able to remove a replacement group that
+    /// subsequently claimed the same subscription.  A cancellation can finish after its
+    /// durable `GroupDropped` event has been queued, so the cleanup path must be bound to the
+    /// group incarnation it started with.
+    pub(crate) fn abort_if_matches(&mut self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
+        if self.records.get(subscription).is_some_and(|record| record.id == group_id) {
+            return self.release_if_matches(subscription, group_id);
+        }
+        let legacy = format!("group {subscription}");
+        if self.reserved.get(subscription).is_some_and(|owner| owner == group_id || owner == &legacy) {
+            self.reserved.remove(subscription);
+            self.private_members.retain(|_, owner| owner != subscription);
+        }
+        None
+    }
+
     pub(crate) fn release_if_matches(&mut self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         if self.records.get(subscription).is_some_and(|record| record.id == group_id) {
             self.reserved.remove(subscription);
@@ -230,6 +246,24 @@ mod tests {
             replay_fence: "0".into(),
         });
         assert!(claims.release_if_matches("scope-1", "stream/two").is_none());
+        assert_eq!(claims.get("scope-1").map(|group| group.id.as_str()), Some("stream/one"));
+    }
+
+    #[test]
+    fn an_old_abort_cannot_remove_a_replacement_group() {
+        let mut claims = GroupClaims::default();
+        claims.reserve("scope-1", "group:scope-1").unwrap();
+        claims.complete(GroupRecord {
+            id: "stream/one".into(),
+            stream_path: "stream/one".into(),
+            subscription: "scope-1".into(),
+            members: Vec::new(),
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        });
+        assert!(claims.abort_if_matches("scope-1", "stream/two").is_none());
         assert_eq!(claims.get("scope-1").map(|group| group.id.as_str()), Some("stream/one"));
     }
 

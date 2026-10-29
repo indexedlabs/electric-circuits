@@ -733,6 +733,9 @@ pub(crate) struct PurgeBarrier {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct PurgeTestHook {
+    pub(crate) pause_before_remove: std::sync::atomic::AtomicBool,
+    pub(crate) before_remove: tokio::sync::Notify,
+    pub(crate) release_before_remove: tokio::sync::Notify,
     pub(crate) pause_after_remove: std::sync::atomic::AtomicBool,
     pub(crate) removed: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
@@ -2949,6 +2952,17 @@ impl Engine {
     /// subscription map and the group map are checked while holding one state lock, so a
     /// concurrent single-shape create cannot win the same claim between member creates.
     pub(crate) async fn reserve_group(&self, subscription: &str, member_subscriptions: &[String]) -> Result<()> {
+        self.reserve_group_with_id(subscription, member_subscriptions, &format!("group {subscription}")).await
+    }
+
+    /// Reserve a group with its stream/incarnation id. Cancellation compensation uses this token
+    /// so a late abort cannot remove a newer reservation under the same subscription.
+    pub(crate) async fn reserve_group_with_id(
+        &self,
+        subscription: &str,
+        member_subscriptions: &[String],
+        reservation_id: &str,
+    ) -> Result<()> {
         let mut st = self.state.lock().await;
         // Checked first: while assembling, member 0 already owns the subscription, and a retry
         // must hear "retry" rather than a conflict with its own in-flight load.
@@ -2989,14 +3003,46 @@ impl Engine {
                 }));
             }
         }
-        st.group_claims.reserve(subscription, &format!("group {subscription}"))?;
+        st.group_claims.reserve(subscription, reservation_id)?;
         st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
         Ok(())
     }
 
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
+        let mut tables = Vec::new();
+        for member in &record.members {
+            if let Ok(table) = TableRef::parse(&member.table) {
+                tables.push(table);
+            }
+            if let Some(where_) = &member.where_ {
+                tables.extend(referenced_tables(where_));
+            }
+        }
+        tables.sort();
+        tables.dedup();
+        let gens = self.capture_schema_gens(&tables).await;
+        self.complete_group_with_gens(record, &gens).await
+    }
+
+    /// Complete a group with the schema/epoch snapshot captured before member creation began.
+    /// The catalog durability wait is an interval: the same health, generation, epoch,
+    /// registration and stream checks must run after it, before the group is made visible.
+    pub(crate) async fn complete_group_with_gens(&self, record: GroupRecord, gens: &SchemaGens) -> Result<()> {
         self.group_lanes.register(&record.stream_path);
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        if let Err(error) = self.recheck_group_after_durability(&record, gens).await {
+            self.remove_group_lane(&record.stream_path);
+            // GroupCreated may already be in the durable catalog.  Leave a durable compensating
+            // intent behind before the caller's cancellation guard is allowed to disappear.
+            let _ = self
+                .catalog_tx
+                .send_durable(CatalogEvent::GroupDropped {
+                    subscription: record.subscription.clone(),
+                    group_id: Some(record.id.clone()),
+                })
+                .await;
+            return Err(error);
+        }
         let (valid, renewals) = {
             let mut st = self.state.lock().await;
             let valid = record.members.iter().all(|member| {
@@ -3025,6 +3071,7 @@ impl Engine {
             }
         };
         if !valid {
+            self.remove_group_lane(&record.stream_path);
             let _ = self
                 .catalog_tx
                 .send_durable(CatalogEvent::GroupDropped {
@@ -3047,8 +3094,29 @@ impl Engine {
                 group_id: Some(group_id.to_string()),
             })
             .await?;
-        self.state.lock().await.group_claims.release(subscription);
+        self.state.lock().await.group_claims.abort_if_matches(subscription, group_id);
         Ok(())
+    }
+
+    /// Capture the generations for all tables a group reads.  The caller takes this before its
+    /// first member create so a drift or epoch reset during any later await is observable by the
+    /// closing check in `complete_group_with_gens`.
+    pub(crate) async fn capture_schema_gens(&self, tables: &[TableRef]) -> SchemaGens {
+        self.state.lock().await.capture_gens(tables)
+    }
+
+    async fn recheck_group_after_durability(&self, record: &GroupRecord, gens: &SchemaGens) -> Result<()> {
+        for member in &record.members {
+            self.recheck_after_durability(&member.shape_id, &record.stream_path, gens).await?;
+        }
+        match self.ds.head(&record.stream_path).await {
+            Ok(Some(head)) if !head.closed && head.next_offset.is_some() => Ok(()),
+            Ok(_) => Err(anyhow::Error::new(CreateRaced(format!(
+                "group stream '{}' was closed during its catalog durability wait",
+                record.stream_path
+            )))),
+            Err(error) => Err(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error)),
+        }
     }
 
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {

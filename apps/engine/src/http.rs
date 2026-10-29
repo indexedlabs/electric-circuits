@@ -1208,6 +1208,18 @@ async fn subset_load_group(
                 retry_after: false,
             })?;
     }
+    // Capture every table the group reads before member creation begins. The completion path
+    // rechecks this generation/epoch snapshot after GroupCreated is durable.
+    let mut group_tables = Vec::new();
+    for member in &members {
+        group_tables.push(member.table.clone());
+        if let Some(where_) = &member.where_ {
+            group_tables.extend(crate::subquery::referenced_tables(where_));
+        }
+    }
+    group_tables.sort();
+    group_tables.dedup();
+    let group_gens = engine.capture_schema_gens(&group_tables).await;
     let _control = engine.admit_control()?;
     let group_sub = engine.resolve_subscription(subscription).await;
     if let Some(existing) = engine.group_record(&group_sub).await {
@@ -1279,7 +1291,7 @@ async fn subset_load_group(
     // single-shape create cannot win the name between member creates.
     let member_subscriptions: Vec<String> =
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
-    engine.reserve_group(&group_sub, &member_subscriptions).await?;
+    engine.reserve_group_with_id(&group_sub, &member_subscriptions, &group_path).await?;
     engine.register_group_lane(&group_path);
     let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     let mut created = Vec::with_capacity(members.len());
@@ -1360,7 +1372,7 @@ async fn subset_load_group(
         horizon: page.horizon.clone(),
         replay_fence: offset.clone(),
     };
-    if let Err(error) = engine.complete_group(group_record.clone()).await {
+    if let Err(error) = engine.complete_group_with_gens(group_record.clone(), &group_gens).await {
         reservation.rollback().await;
         return Err(AppError::from(error));
     }

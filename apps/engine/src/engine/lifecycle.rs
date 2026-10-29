@@ -1304,6 +1304,11 @@ impl Engine {
         };
         drop(st);
         #[cfg(test)]
+        if durable && self.purge_test_hook.pause_before_remove.load(std::sync::atomic::Ordering::Acquire) {
+            self.purge_test_hook.before_remove.notify_one();
+            self.purge_test_hook.release_before_remove.notified().await;
+        }
+        #[cfg(test)]
         if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
             self.purge_test_hook.removed.notify_one();
             self.purge_test_hook.release.notified().await;
@@ -4201,6 +4206,42 @@ mod cancellation_tests {
         }
         assert!(engine.complete_group(invalid).await.is_err());
         assert!(engine.group_record("scope-invalid").await.is_none());
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    /// A purge takes its guard before removing the member. If completion wins in that gap, the
+    /// purge must still observe the completed incarnation after removal and release it; a group
+    /// record may never outlive the member it names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_and_complete_group_leave_no_claim_record() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-purge-complete-order".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        engine.ds.ensure_stream(&group.stream_path).await.unwrap();
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+            for member in &group.members {
+                st.shapes.get_mut(&member.shape_id).unwrap().stream_path = group.stream_path.clone();
+            }
+        }
+        engine.purge_test_hook.pause_before_remove.store(true, Ordering::Release);
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            let member = group.members[0].shape_id.clone();
+            async move { engine.purge_shape_durable(&member).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.purge_test_hook.before_remove.notified())
+            .await
+            .expect("purge did not reach the pre-removal gap");
+        engine.complete_group(group.clone()).await.unwrap();
+        assert!(engine.group_record("scope").await.is_some(), "completion should publish before removal");
+        engine.purge_test_hook.pause_before_remove.store(false, Ordering::Release);
+        engine.purge_test_hook.release_before_remove.notify_one();
+        purging.await.unwrap().unwrap();
+        assert!(engine.group_record("scope").await.is_none(), "purge must release the completed group");
         engine.close(std::time::Duration::from_secs(1)).await;
     }
 
