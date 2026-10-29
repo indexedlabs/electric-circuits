@@ -462,12 +462,16 @@ cleanup after shutdown. `15950a2` (`40785359963`, job `123157072806`) was compil
 the integration hook was private. `0d6aff0` (`40792037118`, job `123179345889`) was red in
 rustfmt, group contracts and Rust engine tests; `feadedb` added CI diagnostics. `a5c66a5`
 (`40795789456`, job `123191825709`) was rustfmt-green but group-contract-red in both modes;
-its hosted reviews required the failing child output before another rollback change. `07a8899`
-(`40797741254`, job `123198188564`) and current docs-only head `670d566` (`40798069270`, job
-`123199260461`) were also rustfmt-green but group-contract-red in both modes. The arm-after-barrier
-hypothesis in `93c1428` did not make the contracts green. No head containing the compensation
-change has a green qualification. The benchmark production tree remains the one preserved by
-`1d7bbbc`, while this candidate's compensation path still requires its own green test job.
+`07a8899` (`40797741254`, job `123198188564`) and `670d566` (`40798069270`, job
+`123199260461`) were also group-contract-red. The arm-after-barrier hypothesis in `93c1428`
+did not make the contracts green. `e01f89f` temporarily skipped only
+`group_canceled_rollback_retains_unreleased_group_members`; its step-7 bisect was green in both
+modes (`40800299454`, job `123206516252`), while step 8 remained red. The same tree without
+the skip (`c45e31b`, run `40799770386`, job `123204807672`) was red, localizing the failure to
+that rollback contract. This is bisect evidence, not qualification. No head containing the
+compensation change has a green qualification. The benchmark production tree remains the one
+preserved by `1d7bbbc`, while this candidate's compensation path still requires its own green
+test job.
 Existing claim/lease, public snapshot query, group stream and commit fence code is unchanged
 apart from the compensation path;
 the candidate additionally changes durable compensation to re-enqueue `Left` when a claim is
