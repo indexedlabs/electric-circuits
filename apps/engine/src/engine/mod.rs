@@ -837,8 +837,11 @@ impl GroupLoadTestGate {
         let armed = self.stage.lock().await.as_ref() == Some(&stage);
         if armed {
             *self.stage.lock().await = None;
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             self.arrived.notify_one();
-            self.release.notified().await;
+            notified.await;
         }
     }
 }

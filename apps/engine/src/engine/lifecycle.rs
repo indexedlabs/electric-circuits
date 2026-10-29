@@ -1309,11 +1309,6 @@ impl Engine {
         };
         drop(st);
         #[cfg(test)]
-        if durable && self.purge_test_hook.pause_before_remove.load(std::sync::atomic::Ordering::Acquire) {
-            self.purge_test_hook.before_remove.notify_one();
-            self.purge_test_hook.release_before_remove.notified().await;
-        }
-        #[cfg(test)]
         if durable && self.purge_test_hook.pause_after_remove.load(std::sync::atomic::Ordering::Acquire) {
             self.purge_test_hook.removed.notify_one();
             self.purge_test_hook.release.notified().await;

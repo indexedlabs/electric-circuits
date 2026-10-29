@@ -1343,12 +1343,14 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         gate.release.notify_one();
         let (status, first_body) = first.await.context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
+        let winner_catalog = stream_events(f, "meta/catalog").await;
         gate.release.notify_one();
         let (status, second_body) = second.await.context("second group task failed")??;
         ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second_body}");
         ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
         ensure!(engine.group_id_for_test("group-overlap").await.is_some(), "winner group was lost");
         let catalog = stream_events(f, "meta/catalog").await;
+        ensure!(catalog == winner_catalog, "losing load wrote catalog events");
         ensure!(
             catalog
                 .iter()
@@ -2170,7 +2172,9 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
     let result = async {
         for (subscription, cut) in [
             ("group-cut-cancel-before-reservation", "cancel-before-reservation"),
+            ("group-cut-cancel-after-reservation", "cancel-after-reservation"),
             ("group-cut-cancel-member-create", "cancel-member-create"),
+            ("group-cut-cancel-seed", "cancel-seed"),
             ("group-cut-cancel-stream-tail", "cancel-stream-tail"),
             ("group-cut-cancel-snapshot", "cancel-snapshot"),
             ("group-cut-cancel", "cancel"),
@@ -2182,13 +2186,17 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
         ] {
             let pre_durability_stage = match cut {
                 "cancel-before-reservation" => Some(GroupLoadAwait::BeforeReservation),
+                "cancel-after-reservation" => Some(GroupLoadAwait::AfterReservation),
                 "cancel-member-create" => Some(GroupLoadAwait::MemberCreate),
                 "cancel-stream-tail" => Some(GroupLoadAwait::StreamTail),
                 "cancel-snapshot" => Some(GroupLoadAwait::Snapshot),
                 _ => None,
             };
+            let cancel_at_seed = cut == "cancel-seed";
             if let Some(stage) = pre_durability_stage {
                 engine.group_load_gate_for_test().arm(stage).await;
+            } else if cancel_at_seed {
+                engine.group_seed_gate_for_test().arm();
             } else {
                 *f.ds.hold_group_catalog.lock().await = true;
             }
@@ -2196,8 +2204,13 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let load_body = group_body(f, subscription, true);
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
             let mut pre_attempt_id = None;
-            let group_path = if pre_durability_stage.is_some() {
-                tokio::time::timeout(Duration::from_secs(10), engine.group_load_gate_for_test().arrived.notified())
+            let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
+                let arrived = if cancel_at_seed {
+                    engine.group_seed_gate_for_test().arrived.notified()
+                } else {
+                    engine.group_load_gate_for_test().arrived.notified()
+                };
+                tokio::time::timeout(Duration::from_secs(10), arrived)
                     .await
                     .context("group cut did not reach its pre-durability gate")?;
                 if cut != "cancel-before-reservation" {
@@ -2206,7 +2219,11 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     pre_attempt_id = Some(id);
                 }
                 load.abort();
-                engine.group_load_gate_for_test().release.notify_waiters();
+                if cancel_at_seed {
+                    engine.group_seed_gate_for_test().release.notify_one();
+                } else {
+                    engine.group_load_gate_for_test().release.notify_waiters();
+                }
                 None
             } else {
                 tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
@@ -2291,6 +2308,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                             .await
                             .iter()
                             .any(|(method, path)| *method == Method::POST && path.ends_with(&group_path))
+                            && engine.subscription_owner(subscription).await.is_none()
                         {
                             return Ok::<_, anyhow::Error>(());
                         }
@@ -2320,7 +2338,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .context("cancel cleanup did not reach GroupDropped durability")?;
                 f.ds.group_catalog_release.notify_one();
             }
-            if cut != "cancel" && cut != "cancel-head" && pre_durability_stage.is_none() {
+            if cut != "cancel" && cut != "cancel-head" && pre_durability_stage.is_none() && !cancel_at_seed {
                 let (status, body) = tokio::time::timeout(Duration::from_secs(15), &mut load)
                     .await
                     .context("group cut load did not finish")?
@@ -2342,7 +2360,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             .await
             .context("group cut compensation left claims behind")??;
             let catalog = stream_events(f, "meta/catalog").await;
-            if pre_durability_stage.is_some() {
+            if pre_durability_stage.is_some() || cancel_at_seed {
                 ensure!(
                     !catalog.iter().any(|event| event["t"] == "groupCreated" && event["subscription"] == subscription),
                     "pre-durability cancellation wrote GroupCreated: {subscription} events={catalog:?}"
@@ -2370,7 +2388,12 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
                 );
             }
-            if cut == "cancel" || cut == "cancel-head" || cut == "closed" || pre_durability_stage.is_some() {
+            if cut == "cancel"
+                || cut == "cancel-head"
+                || cut == "closed"
+                || pre_durability_stage.is_some()
+                || cancel_at_seed
+            {
                 let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
                 ensure!(status == StatusCode::OK, "compensated group could not be retried: {status} {body}");
             }
