@@ -1341,15 +1341,21 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
             .await
             .context("losing group did not reach its reservation gate")?;
-        gate.release.notify_one();
-        let (status, headers, in_flight_body) = second.await.context("second group task failed")??;
+        gate.release.notify_last();
+        let (status, headers, in_flight_body) = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .context("losing group did not leave its reservation gate")?
+            .context("second group task failed")??;
         ensure!(
             status == StatusCode::SERVICE_UNAVAILABLE,
             "in-flight loser was not retryable: {status} {in_flight_body}"
         );
         ensure!(headers.get("retry-after").is_some(), "in-flight loser omitted Retry-After");
         gate.release.notify_one();
-        let (status, first_body) = first.await.context("first group task failed")??;
+        let (status, first_body) = tokio::time::timeout(Duration::from_secs(15), first)
+            .await
+            .context("winning group did not finish")?
+            .context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
         let winner_catalog = stream_events(f, "meta/catalog").await;
         let (status, second_body) = post_group(&app, second_body.clone()).await?;
@@ -2228,7 +2234,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 }
                 load.abort();
                 if cancel_at_seed {
-                    engine.group_seed_gate_for_test().release.notify_one();
+                    engine.group_seed_gate_for_test().release.notify_waiters();
                 } else {
                     engine.group_load_gate_for_test().release.notify_waiters();
                 }
