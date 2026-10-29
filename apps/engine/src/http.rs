@@ -1417,8 +1417,7 @@ static TEST_RELEASE_AFTER_UNSUBSCRIBE_FIRED: std::sync::atomic::AtomicBool = std
 // The rollback contract arms this after the request has reached its first rollback barrier.  The
 // environment variables are installed before engine workers start, so the arm itself is an atomic
 // test control and never mutates libc's process environment while those workers are live.
-static TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static TEST_RELEASE_AFTER_UNSUBSCRIBE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "test-support")]
 // Each ignored ownership contract runs in a fresh child process, so this process-local switch
