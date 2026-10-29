@@ -1822,6 +1822,52 @@ pub async fn query_subset_where(
     Ok(SubsetQuery { rows, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
 }
 
+/// One read inside [`query_subset_batch_where`]: a table, its prebuilt `WHERE`, and its page bounds.
+pub struct SubsetRead<'a> {
+    pub ts: &'a TableSchema,
+    pub where_sql: Option<(String, Vec<String>)>,
+    pub order: Option<(usize, bool)>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// The pages of a batch, in request order, plus the one snapshot's fences they all share.
+pub struct SubsetBatchQuery {
+    pub pages: Vec<Vec<Row>>,
+    pub lsn: String,
+    pub snapshot: String,
+    pub horizon: String,
+}
+
+/// Run several subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the scope
+/// load). `scope` must name every table any read depends on — each read's table and the inner
+/// tables of its subqueries — so the one settle covers all of them.
+pub async fn query_subset_batch_where(
+    client: &mut PooledClient,
+    reads: Vec<SubsetRead<'_>>,
+    scope: &SettleScope,
+) -> Result<SubsetBatchQuery> {
+    let fences = begin_settled_snapshot(client, scope, 0, "subset batch").await?;
+    let mut pages = Vec::with_capacity(reads.len());
+    let mut failed = None;
+    for r in reads {
+        match query_subset_in_txn(client, r.ts, r.where_sql, r.order, r.limit, r.offset).await {
+            Ok(rows) => pages.push(rows),
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    if client.batch_execute("COMMIT").await.is_ok() {
+        client.transaction_finished();
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    Ok(SubsetBatchQuery { pages, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
+}
+
 /// One `ORDER BY` term for a subset page.
 ///
 /// A text column is ordered `COLLATE "C"` — **code-point order** — because the subset client
