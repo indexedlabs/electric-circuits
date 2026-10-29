@@ -12,7 +12,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
-use crate::engine::{Engine, ShapeRecord, TableSchemaInfo, TableStats};
+use crate::engine::{Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 use crate::table_ref::TableRef;
@@ -277,6 +277,22 @@ fn openapi_subset_feed() {}
 
 #[utoipa::path(
     post,
+    path = "/v1/subsets/load",
+    request_body = SubsetLoadRequest,
+    responses(
+        (status = 200, description = "Changes-only feed and snapshot page", body = SubsetLoadResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 415, description = "Unsupported media type", body = ErrorResponse),
+        (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
+        (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_subset_load() {}
+
+#[utoipa::path(
+    post,
     path = "/v1/aggregates",
     request_body = AggregateRequest,
     responses(
@@ -317,6 +333,7 @@ fn openapi_deployment_promote() {}
         openapi_release_shape,
         openapi_subset_query,
         openapi_subset_feed,
+        openapi_subset_load,
         openapi_aggregate,
         openapi_deployment_promote
     ),
@@ -334,6 +351,8 @@ fn openapi_deployment_promote() {}
         AggregateFunction,
         AggregateRequest,
         SubsetFeedRequest,
+        SubsetLoadRequest,
+        SubsetLoadResponse,
         DeploymentPromoteRequest,
         ErrorResponse
     ))
@@ -374,6 +393,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/shapes/{id}", get(get_shape).delete(release_shape))
         .route("/v1/subsets/query", post(query_subset))
         .route("/v1/subset-feeds", post(create_subset_feed))
+        .route("/v1/subsets/load", post(subset_load))
         .route("/v1/aggregates", post(create_aggregate))
         .route("/changes/position", get(changes_position))
         .route("/changes/{segment}", get(read_changes))
@@ -668,7 +688,7 @@ async fn normalize_extractor_rejection(request: axum::extract::Request, next: Ne
 }
 
 fn is_native_dto_path(path: &str) -> bool {
-    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/aggregates")
+    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/subsets/load" | "/v1/aggregates")
         || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
 }
 
@@ -973,7 +993,7 @@ struct DefineSchemaReq {
     schema: Schema,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct SubsetOrderByReq {
     col: String,
     #[serde(default)]
@@ -1011,6 +1031,358 @@ async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -
     let order_by = req.order_by.map(|o| (o.col, o.desc));
     let page = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
     Ok(Json(QueryResp { rows: page.rows, lsn: page.lsn, snapshot: page.snapshot, horizon: page.horizon }))
+}
+
+#[derive(Deserialize)]
+struct GroupMemberReq {
+    key: String,
+    table: TableRef,
+    #[serde(default, rename = "where")]
+    where_: Option<PredicateJson>,
+    #[serde(default)]
+    columns: Option<Vec<String>>,
+}
+struct GroupReservationGuard {
+    engine: Engine,
+    subscription: String,
+    stream_path: String,
+    created: Vec<(String, String)>,
+    armed: bool,
+}
+
+impl GroupReservationGuard {
+    fn new(engine: &Engine, subscription: &str, stream_path: &str) -> Self {
+        Self {
+            engine: engine.clone(),
+            subscription: subscription.to_string(),
+            stream_path: stream_path.to_string(),
+            created: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn member_created(&mut self, shape_id: &str, subscription: &str) {
+        self.created.push((shape_id.to_string(), subscription.to_string()));
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+
+    async fn rollback(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let engine = self.engine.clone();
+        let subscription = self.subscription.clone();
+        let task_subscription = subscription.clone();
+        let stream_path = self.stream_path.clone();
+        let created = std::mem::take(&mut self.created);
+        let done = engine
+            .shutdown_token()
+            .spawn(async move { engine.cleanup_group_reservation(&task_subscription, &stream_path, created).await });
+        if let Ok(Err(error)) = done.await {
+            tracing::warn!(%error, %subscription, "failed to compensate group reservation");
+        }
+    }
+}
+
+impl Drop for GroupReservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let engine = self.engine.clone();
+        let subscription = self.subscription.clone();
+        let stream_path = self.stream_path.clone();
+        let created = std::mem::take(&mut self.created);
+        self.armed = false;
+        engine.shutdown_token().spawn(async move {
+            if let Err(error) = engine.cleanup_group_reservation(&subscription, &stream_path, created).await {
+                tracing::warn!(%error, %subscription, "failed to compensate group reservation");
+            }
+        });
+    }
+}
+
+#[derive(Deserialize)]
+struct SubsetLoadReq {
+    #[serde(default)]
+    subscription: Option<String>,
+    members: Vec<GroupMemberReq>,
+}
+
+/// Documentation-only projection of the group load request.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadRequest {
+    subscription: Option<String>,
+    members: Vec<serde_json::Value>,
+}
+
+/// Documentation-only projection of the group load response.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetLoadResponse {
+    group_id: String,
+    subscription: String,
+    lease_seconds: u64,
+    offset: String,
+    results: Vec<serde_json::Value>,
+    stream_path: String,
+    stream_url: String,
+    lsn: String,
+    snapshot: String,
+    horizon: String,
+}
+
+/// Create or renew one group of changes-only member shapes and read its members in one settled
+/// snapshot. The route is intentionally dark: no caller creates a group until the Record scope
+/// integration is enabled.
+async fn subset_load(
+    State(engine): State<Engine>,
+    Json(req): Json<SubsetLoadReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    engine.ensure_not_degraded()?;
+    subset_load_group(&engine, req.subscription, req.members).await
+}
+
+/// One-stream group form. Members still use the existing plain and subquery shape paths, while a
+/// shared stream path and one settled page snapshot make the members comparable. The group claim
+/// and member list are durable as one catalog event; the sequencer's active-group fence orders
+/// delayed subquery emissions before the next source transaction.
+async fn subset_load_group(
+    engine: &Engine,
+    subscription: Option<String>,
+    members: Vec<GroupMemberReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    const MAX_GROUP_MEMBERS: usize = 8;
+    if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "members must contain 1..8 entries".into(),
+            retry_after: false,
+        });
+    }
+    let mut tables = std::collections::HashSet::new();
+    for member in &members {
+        if !tables.insert(member.table.clone()) {
+            return Err(AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: format!("duplicate group member table '{}'", member.table),
+                retry_after: false,
+            });
+        }
+    }
+    validate_new_subscription(subscription.clone())?;
+    for member in &members {
+        let create = CreateShapeReq {
+            table: member.table.clone(),
+            where_: member.where_.clone(),
+            columns: member.columns.clone(),
+            changes_only: true,
+            subscription: None,
+        };
+        validate_create_shape_request(engine, &create).await?;
+        engine
+            .validate_subset(&member.table, member.where_.clone(), member.columns.clone(), None, None, None)
+            .await
+            .map_err(|error| AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: format!("{error:#}"),
+                retry_after: false,
+            })?;
+    }
+    let _control = engine.admit_control()?;
+    let group_sub = engine.resolve_subscription(subscription).await;
+    if let Some(existing) = engine.group_record(&group_sub).await {
+        let same = existing.members.len() == members.len()
+            && existing.members.iter().zip(&members).all(|(old, new)| {
+                old.key == new.key.to_string()
+                    && old.table == new.table.to_string()
+                    && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
+                    && old.columns == new.columns
+            });
+        if !same {
+            return Err(AppError {
+                status: StatusCode::CONFLICT,
+                msg: format!("subscription '{}' belongs to another group", group_sub),
+                retry_after: false,
+            });
+        }
+        if let Some(release) = engine.group_release_in_flight(&existing.id) {
+            // A teardown already owns this group.  Join it before probing storage: a transient
+            // HEAD failure must not turn an in-flight release into a misleading health failure.
+            release.wait().await.map_err(AppError::from)?;
+        } else if !engine.group_is_healthy(&existing).await.map_err(AppError::from)? {
+            engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
+        } else if let Some(release) = engine.group_release_in_flight(&existing.id) {
+            // Re-check after the health probe: a release can begin between that probe and the
+            // renewal. Waiting here closes the race without re-registering the dying lane; the
+            // create path below then reserves a fresh group after teardown completes.
+            release.wait().await.map_err(AppError::from)?;
+        } else {
+            let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
+            let renewed_healthy = renewed && engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
+            if renewed_healthy {
+                let offset = engine
+                    .stream_tail(&existing.stream_path)
+                    .await
+                    .map_err(|error| {
+                        AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error))
+                    })?
+                    .ok_or_else(|| AppError {
+                        status: StatusCode::CONFLICT,
+                        msg: format!("group stream '{}' is closed; reload the scope", existing.stream_path),
+                        retry_after: false,
+                    })?;
+                let reads = existing
+                    .members
+                    .iter()
+                    .map(|m| crate::engine::SubsetReadReq {
+                        table: TableRef::parse(&m.table).expect("validated table reference"),
+                        where_: m.where_.clone(),
+                        columns: m.columns.clone(),
+                        order_by: None,
+                        limit: None,
+                        offset: None,
+                    })
+                    .collect();
+                let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
+                let results = existing
+                    .members
+                    .iter()
+                    .zip(page.pages)
+                    .map(|(member, rows)| {
+                        serde_json::json!({
+                            "key": member.key,
+                            "table": member.table,
+                            "shapeId": member.shape_id,
+                            "streamUrl": engine.stream_url(&existing.stream_path),
+                            "streamPath": existing.stream_path,
+                            "subscription": group_sub,
+                            "leaseSeconds": engine.lease_seconds(),
+                            "offset": offset,
+                            "rows": rows,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                return Ok(Json(serde_json::json!({
+                    "groupId": existing.id, "subscription": group_sub,
+                    "streamUrl": engine.stream_url(&existing.stream_path), "streamPath": existing.stream_path,
+                    "offset": offset, "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
+                })));
+            }
+            // A member claim can lapse between the health probe and the renewal lock, or the
+            // renewal can succeed while its stream closes. Treat either outcome as an
+            // unhealthy existing group, release its durable record, and let this request
+            // reserve a fresh group rather than returning a conflict.
+            engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
+        }
+    }
+    let group_path = engine.group_stream_path();
+    // Reserve the one public claim before the first member create.  This check is made
+    // under the same engine state lock as ordinary shape subscriptions, so a competing
+    // single-shape create cannot win the name between member creates.
+    let member_subscriptions: Vec<String> =
+        members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
+    engine.reserve_group(&group_sub, &member_subscriptions).await?;
+    engine.register_group_lane(&group_path);
+    let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
+    let mut created = Vec::with_capacity(members.len());
+    for (i, member) in members.iter().enumerate() {
+        let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
+        match engine
+            .create_shape_as_on_stream(
+                &member.table,
+                member.where_.clone(),
+                member.columns.clone(),
+                true,
+                Some(sub.clone()),
+                group_path.clone(),
+            )
+            .await
+        {
+            Ok((rec, _)) => {
+                reservation.member_created(&rec.id, &sub);
+                created.push((rec, sub));
+            }
+            Err(error) => {
+                reservation.rollback().await;
+                return Err(AppError::from(error));
+            }
+        }
+    }
+    let offset = match engine.stream_tail(&group_path).await {
+        Ok(Some(offset)) => offset,
+        Ok(None) => {
+            reservation.rollback().await;
+            return Err(AppError::from(anyhow::Error::new(crate::engine::GroupStreamClosed {
+                stream_path: group_path,
+            })));
+        }
+        Err(error) => {
+            reservation.rollback().await;
+            return Err(AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error)));
+        }
+    };
+    let reads = members
+        .iter()
+        .map(|m| crate::engine::SubsetReadReq {
+            table: m.table.clone(),
+            where_: m.where_.clone(),
+            columns: m.columns.clone(),
+            order_by: None,
+            limit: None,
+            offset: None,
+        })
+        .collect();
+    let page = match engine.query_subset_batch(reads).await {
+        Ok(page) => page,
+        Err(error) => {
+            reservation.rollback().await;
+            return Err(AppError::from(error));
+        }
+    };
+    let lease_seconds = engine.lease_seconds();
+    let group_id = group_path.clone();
+    let group_record = GroupRecord {
+        id: group_id.clone(),
+        stream_path: group_path.clone(),
+        subscription: group_sub.clone(),
+        members: members
+            .iter()
+            .zip(created.iter())
+            .map(|(member, (rec, sub))| GroupMember {
+                key: member.key.clone(),
+                shape_id: rec.id.clone(),
+                table: member.table.to_string(),
+                where_: member.where_.clone(),
+                columns: member.columns.clone(),
+                subscription: sub.clone(),
+                is_subquery: member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery),
+            })
+            .collect(),
+        lsn: page.lsn.clone(),
+        snapshot: page.snapshot.clone(),
+        horizon: page.horizon.clone(),
+        replay_fence: offset.clone(),
+    };
+    if let Err(error) = engine.complete_group(group_record).await {
+        reservation.rollback().await;
+        return Err(AppError::from(error));
+    }
+    reservation.complete();
+    let results: Vec<serde_json::Value> = members.into_iter().zip(created.iter()).zip(page.pages).map(|((member, (rec, _)), rows)| serde_json::json!({
+        "key": member.key, "table": member.table, "shapeId": rec.id, "streamUrl": engine.stream_url(&group_path), "streamPath": group_path,
+        "subscription": group_sub, "leaseSeconds": lease_seconds, "offset": offset, "rows": rows,
+    })).collect();
+    Ok(Json(serde_json::json!({
+        "groupId": group_id, "subscription": group_sub,
+        "streamUrl": engine.stream_url(&group_path), "streamPath": group_path, "offset": offset,
+        "lsn": page.lsn, "snapshot": page.snapshot, "horizon": page.horizon, "results": results,
+    })))
 }
 
 /// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized
@@ -1474,7 +1846,17 @@ async fn release_shape(
         engine.purge_shape_durable(&id).await?;
     } else {
         let subscription = validate_subscription(q.subscription)?;
-        engine.release_subscription_durable(&id, subscription.as_deref()).await?;
+        if let Some(subscription) = subscription.as_deref()
+            && let Some(group) = engine.group_record(subscription).await
+            && group.members.iter().any(|member| member.shape_id == id)
+        {
+            // The group claim is the only public lease.  Its private member claims are
+            // released together and each durable release is idempotent, so a cancelled or
+            // retried DELETE cannot leave a hidden member alive.
+            engine.release_group_claim(subscription, &group.id).await?;
+        } else {
+            engine.release_subscription_durable(&id, subscription.as_deref()).await?;
+        }
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1767,6 +2149,7 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
             || e.downcast_ref::<crate::engine::ControlAdmissionClosed>().is_some()
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
+            || e.downcast_ref::<crate::engine::GroupStreamUnavailable>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
@@ -1781,6 +2164,8 @@ impl From<anyhow::Error> for AppError {
         // A subscription id that already names another shape is the caller's conflict to resolve,
         // not a server fault and not something a retry changes (ADR-0008).
         } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+            || e.downcast_ref::<crate::engine::GroupConflict>().is_some()
+            || e.downcast_ref::<crate::engine::GroupStreamClosed>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::Conflict))
         {
             StatusCode::CONFLICT

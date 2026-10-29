@@ -302,21 +302,24 @@ fn standalone_index_candidates() {
 
 /// A SubqueryHandle over a fresh registry, with a live propagator task (tests run in tokio).
 fn test_subq() -> SubqueryHandle {
-    let registry =
-        Arc::new(Mutex::new(SubqueryRegistry::new(DsClient::new_for_in_process_test("http://127.0.0.1:1"), None)));
+    let ds = DsClient::new_for_in_process_test("http://127.0.0.1:1");
+    let registry = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), None)));
     let (flip_tx, flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(PendingFlips::default());
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
+    let shutdown = crate::shutdown::ShutdownToken::new();
+    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
     spawn_flip_propagator(
         registry.clone(),
         flip_rx,
         pending_flips.clone(),
         degrade.clone(),
         trace_tx,
-        crate::shutdown::ShutdownToken::new(),
+        group_lanes.clone(),
+        shutdown,
     );
-    SubqueryHandle { registry, flip_tx, pending_flips, degrade }
+    SubqueryHandle { registry, flip_tx, pending_flips, degrade, group_lanes }
 }
 
 fn agg_shape(func: AggFn, col: Option<usize>, ts: &TableSchema) -> AggShape {
@@ -1372,6 +1375,16 @@ fn translate_output_stamps_commit_lsn() {
     assert_eq!(envs[0].headers.lsn, None);
 }
 
+#[test]
+fn grouped_deletes_keep_table_identity_when_keys_collide() {
+    let ts = users();
+    let deletes = delete_envelopes(&ts, vec!["same-key".into()], Some("tx".into()));
+    assert_eq!(deletes.len(), 1);
+    assert_eq!(deletes[0].key, "same-key");
+    assert_eq!(deletes[0].type_, ts.table.to_string());
+    assert_eq!(deletes[0].headers.operation, "delete");
+}
+
 /// **Absolute emission**: in library mode an envelope with no before-image decides membership per
 /// pk from the row's CURRENT value — matches now → `upsert`, otherwise → `delete <key>`. This is the
 /// rule that lets a delete/predicate-leaving update retract at all when there is nothing to retract
@@ -2318,7 +2331,10 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
     assert_eq!(work.len(), 1, "the delete flips gid 7 out of the inner set");
 
     engine.pending_flips.add(0x10);
-    engine.flip_tx.send(FlipWork::Walk { work, txid: None, lsn: Some("0/10".into()) }).expect("propagator alive");
+    engine
+        .flip_tx
+        .send(FlipWork::Walk { work, txid: None, lsn: Some("0/10".into()), group_paths: Vec::new() })
+        .expect("propagator alive");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !engine.degraded() {
