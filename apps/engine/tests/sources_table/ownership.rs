@@ -71,6 +71,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupLapse => group_lapse_reloads_same_subscription(&fixture).await,
             Case::GroupOneSubscription => group_one_subscription_claims(&fixture).await,
             Case::GroupRetryRenews => group_retry_renews(&fixture).await,
+            Case::GroupRenewalRelease => group_renewal_rechecks_a_racing_release(&fixture).await,
             Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
             Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
@@ -106,6 +107,7 @@ enum Case {
     GroupLapse,
     GroupOneSubscription,
     GroupRetryRenews,
+    GroupRenewalRelease,
     GroupReleaseDuringAssembly,
     GroupRetirementDuringAssembly,
     GroupMembersMax,
@@ -233,6 +235,12 @@ fn group_retry_renews_after_a_dropped_response() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_never_answers_a_release_that_raced_it() -> Result<()> {
+    isolated("ownership::group_renewal_never_answers_a_release_that_raced_it", Case::GroupRenewalRelease)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_release_during_assembly_is_rejected_and_claims_survive() -> Result<()> {
     isolated(
         "ownership::group_release_during_assembly_is_rejected_and_claims_survive",
@@ -268,6 +276,11 @@ struct ObservedDs {
     /// to the real store.  The latter lets a test target the post-renew probe without turning
     /// the pre-renew probe into a malformed 200 response.
     group_head_faults: Arc<Mutex<Vec<Option<u16>>>>,
+    /// Hold one group-stream HEAD: `Some(n)` passes `n` HEADs through and holds the next until
+    /// `group_head_release`, so a test can stop a renewal at a chosen storage probe.
+    hold_group_head_after: Arc<Mutex<Option<usize>>>,
+    group_head_arrived: Arc<Notify>,
+    group_head_release: Arc<Notify>,
     hold_group_catalog: Arc<Mutex<bool>>,
     hold_group_drop_id: Arc<Mutex<Option<String>>>,
     group_catalog_arrived: Arc<Notify>,
@@ -288,6 +301,24 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
         }
     }
     if method == Method::HEAD && group_path {
+        let hold = {
+            let mut armed = ds.hold_group_head_after.lock().await;
+            match armed.as_mut() {
+                Some(0) => {
+                    *armed = None;
+                    true
+                }
+                Some(remaining) => {
+                    *remaining -= 1;
+                    false
+                }
+                None => false,
+            }
+        };
+        if hold {
+            ds.group_head_arrived.notify_one();
+            ds.group_head_release.notified().await;
+        }
         if let Some(Some(status)) = {
             let mut faults = ds.group_head_faults.lock().await;
             (!faults.is_empty()).then(|| faults.remove(0))
@@ -448,6 +479,9 @@ impl Fixture {
             fail_group_head_after_put: Arc::new(Mutex::new(false)),
             fail_next_group_head: Arc::new(Mutex::new(false)),
             group_head_faults: Arc::new(Mutex::new(Vec::new())),
+            hold_group_head_after: Arc::new(Mutex::new(None)),
+            group_head_arrived: Arc::new(Notify::new()),
+            group_head_release: Arc::new(Notify::new()),
             hold_group_catalog: Arc::new(Mutex::new(false)),
             hold_group_drop_id: Arc::new(Mutex::new(None)),
             group_catalog_arrived: Arc::new(Notify::new()),
@@ -1650,6 +1684,82 @@ async fn group_retry_renews(f: &Fixture) -> Result<()> {
         ensure!(
             !retired.iter().any(|(method, path)| *method == Method::DELETE && path.ends_with(&old_path)),
             "post-renew HEAD outage deleted the healthy group stream: {retired:?}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// A retried load renews its group, then a release starts before the renewal answers. The
+/// renewal must never answer `200` with the stream that release is retiring (`#g-group-recheck`):
+/// it waits for the release and answers a fresh group on a new stream.
+async fn group_renewal_rechecks_a_racing_release(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let subscription = "group-renewal-release";
+        let (status, first) = post_group(&app, group_body(f, subscription, true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {first}");
+        let old_path = first["streamPath"].as_str().context("group stream path")?.to_owned();
+        let first_shape = first["results"][0]["shapeId"].as_str().context("first group member")?.to_owned();
+
+        // A renewal HEADs the group stream three times: the health probe before and after the
+        // renewal, then the stream-tail read for its answer. Hold the third, after the renewal.
+        *f.ds.hold_group_head_after.lock().await = Some(2);
+        let renew_app = app.clone();
+        let renew_body = group_body(f, subscription, true);
+        let mut renew = tokio::spawn(async move { post_group(&renew_app, renew_body).await });
+        tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+            .await
+            .context("renewal did not reach its stream-tail read")?;
+
+        // Release the group while the renewal is held, and hold its teardown after the stream
+        // has closed, before the stream is deleted.
+        let gate = pause_group_delete(f, &old_path).await;
+        let release_app = app.clone();
+        let release_task = tokio::spawn(async move {
+            json(
+                &release_app,
+                Method::DELETE,
+                &format!("/v1/shapes/{first_shape}?subscription={subscription}"),
+                Body::empty(),
+            )
+            .await
+        });
+        wait_group_stream_closed(f, &old_path).await?;
+        f.ds.group_head_release.notify_one();
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut renew).await;
+        release_group_delete(f, &old_path, gate).await;
+        if let Ok(answered) = early {
+            let (status, body) = answered.context("renewal task failed")??;
+            ensure!(
+                !(status == StatusCode::OK && body["streamPath"].as_str() == Some(old_path.as_str())),
+                "renewal answered 200 with the stream its racing release is retiring: {body}"
+            );
+            anyhow::bail!("renewal answered before its racing release finished: {status} {body}");
+        }
+
+        let (release_status, release_body) = tokio::time::timeout(Duration::from_secs(15), release_task)
+            .await
+            .context("group release did not finish")?
+            .context("group release task failed")??;
+        ensure!(release_status == StatusCode::OK, "group release failed: {release_status} {release_body}");
+        let (status, fresh) = tokio::time::timeout(Duration::from_secs(15), renew)
+            .await
+            .context("renewal did not finish after the release")?
+            .context("renewal task failed")??;
+        ensure!(status == StatusCode::OK, "renewal after the release failed: {status} {fresh}");
+        let new_path = fresh["streamPath"].as_str().context("fresh group stream path")?;
+        ensure!(new_path != old_path, "renewal answered the released group's stream");
+        ensure!(engine.has_group_record(subscription).await, "fresh group has no record");
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (7, 'renewal-release')", f.outer))
+            .await?;
+        let events = wait_group_events(f, new_path, 1).await?;
+        ensure!(
+            events.iter().any(|event| event_key(event).as_deref() == Some("7")),
+            "fresh group missed live output: {events:?}"
         );
         Ok::<_, anyhow::Error>(())
     }
