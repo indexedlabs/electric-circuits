@@ -971,33 +971,60 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in group_batches {
                             subq.group_lanes.submit(&path, envs, group_lsn);
                         }
+                        // A source or runtime receipt is the one place the loop waits for group
+                        // output: its pending count covers this transaction's group batches, so the
+                        // receipt appears only once they have landed.
+                        if source_fence.is_some() || !runtime_fences.is_empty() {
+                            if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
+                                tracing::error!(
+                                    "sequencer: drain fence could not reach a receipt before shutdown/degradation"
+                                );
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
+                            }
+                        }
                         if runtime_fences.overflowed() {
                             tracing::warn!(commit_lsn = ?lsn, capacity = crate::runtime_authority::RECEIPT_CAPACITY,
                                 "runtime marker staging full; excess receipts stay unknown; application transaction processed");
                         }
-                        // Queue receipt publication after this transaction is evaluated. Its
-                        // durable effect still waits for every causally prior append, but the
-                        // source sequencer keeps reading while a group's lane is held.
-                        let marker_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX);
-                        let source_receipt = source_fence.map(|source_commit_id| SourceDrainReceipt {
-                            source_commit_id,
-                            commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
-                        });
-                        if source_receipt.is_some() || !runtime_fences.is_empty() {
-                            spawn_receipt_task(
-                                subq.clone(),
-                                shutdown.clone(),
-                                catalog_tx.clone(),
-                                source_receipts.clone(),
-                                last_source_receipt.clone(),
-                                source_receipt_progress.clone(),
-                                runtime_receipts.clone(),
-                                runtime_incarnation,
-                                runtime_fences.into_fences(),
-                                lsn.clone(),
-                                marker_lsn,
-                                source_receipt,
-                            );
+                        // Only the runtime cache consumes these markers. In particular, runtime
+                        // traffic never advances deployment closure progress or catalog receipts.
+                        if !runtime_fences.is_empty() {
+                            if let Some(commit_lsn) = lsn.as_deref() {
+                                runtime_receipts.lock().unwrap().publish(
+                                    runtime_incarnation, runtime_fences.into_fences(), commit_lsn,
+                                    std::time::Instant::now(),
+                                );
+                            }
+                        }
+                        if let Some(source_commit_id) = source_fence {
+                            let receipt = SourceDrainReceipt {
+                                source_commit_id: source_commit_id.clone(),
+                                commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
+                            };
+                            // This lock is the receipt/closure linearization point. Advance it
+                            // before awaiting catalog durability so a source fence already being
+                            // sequenced when admission closes is conservatively pre-closure. A
+                            // failed append never reaches `source_receipts`, so it still cannot
+                            // satisfy quiesce.
+                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
+                            if let Err(error) = catalog_tx
+                                .send_durable(CatalogEvent::SourceDrained(receipt.clone()))
+                                .await
+                            {
+                                tracing::error!(
+                                    source_commit_id,
+                                    error = %error,
+                                    "sequencer: source fence catalog receipt was not acknowledged"
+                                );
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
+                            }
+                            source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
+                            *last_source_receipt.lock().unwrap() = Some(receipt);
+                            tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
                         }
                     }
                     if processing_failed {
@@ -1230,52 +1257,6 @@ async fn wait_for_source_effects(
             _ = shutdown.wait() => return false,
         }
     }
-}
-
-fn spawn_receipt_task(
-    subq: SubqueryHandle,
-    shutdown: crate::shutdown::ShutdownToken,
-    catalog_tx: CatalogWriter,
-    source_receipts: Arc<std::sync::Mutex<HashMap<String, SourceDrainReceipt>>>,
-    last_source_receipt: Arc<std::sync::Mutex<Option<SourceDrainReceipt>>>,
-    source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
-    runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
-    runtime_incarnation: uuid::Uuid,
-    runtime_fences: Vec<crate::runtime_authority::RuntimeFence>,
-    commit_lsn: Option<String>,
-    marker_lsn: u64,
-    source_receipt: Option<SourceDrainReceipt>,
-) {
-    shutdown.clone().spawn_background(async move {
-        if !wait_for_source_effects(&subq, &shutdown, marker_lsn).await {
-            tracing::warn!(commit_lsn = ?commit_lsn, "receipt effects did not drain before shutdown or degradation");
-            return;
-        }
-        // Runtime markers are consumed only by the runtime cache. They never advance deployment
-        // closure progress or write a catalog receipt.
-        if !runtime_fences.is_empty() {
-            if let Some(commit_lsn) = commit_lsn.as_deref() {
-                runtime_receipts.lock().unwrap().publish(
-                    runtime_incarnation,
-                    runtime_fences,
-                    commit_lsn,
-                    std::time::Instant::now(),
-                );
-            }
-        }
-        let Some(receipt) = source_receipt else { return };
-        let source_commit_id = receipt.source_commit_id.clone();
-        // This is the receipt/closure linearization point. The effect barrier has landed, and the
-        // catalog append below is now the only remaining durable step.
-        source_receipt_progress.lock().unwrap().record(&source_commit_id);
-        if let Err(error) = catalog_tx.send_durable(CatalogEvent::SourceDrained(receipt.clone())).await {
-            tracing::error!(%error, %source_commit_id, "source fence catalog receipt was not acknowledged");
-            return;
-        }
-        source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
-        *last_source_receipt.lock().unwrap() = Some(receipt);
-        tracing::info!(%source_commit_id, commit_lsn = ?commit_lsn, "source transaction durably drained");
-    });
 }
 
 /// The replay boundary while group output is still landing. A completed batch publishes its
