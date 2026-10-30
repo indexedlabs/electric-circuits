@@ -2391,11 +2391,38 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 );
                 continue;
             }
-            if cut == "cancel-head" {
+            if cut == "cancel-head" || cut == "truncate" {
                 *f.ds.hold_group_head_after.lock().await = Some(0);
             } else if cut == "closed" {
                 f.ds.closed.lock().await.insert(group_path.clone());
-            } else if cut == "truncate" {
+            } else if cut == "degraded" {
+                engine.force_degraded();
+            }
+            if cut == "cancel" {
+                load.abort();
+            }
+            // Release only a GroupCreated this cut actually held. `Notify` stores a permit when no
+            // request is waiting, so an unmatched release would let the next cut's held catalog
+            // write pass straight through and its load answer before the cut is applied.
+            if pre_durability_stage.is_none() && !cancel_at_seed {
+                *f.ds.hold_group_catalog.lock().await = false;
+                f.ds.group_catalog_release.notify_one();
+            }
+            if cut == "cancel-head" {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+                    .await
+                    .context("post-durability HEAD did not reach its gate")?;
+                load.abort();
+                f.ds.group_head_release.notify_one();
+            }
+            if cut == "truncate" {
+                // TRUNCATE at the post-durability HEAD, not inside the GroupCreated hold: retiring
+                // the inner table also releases every completed group with a member on it, and
+                // each release waits on the catalog writer that a held GroupCreated would block.
+                // The final locked recheck after this HEAD must still refuse the group.
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+                    .await
+                    .context("post-durability HEAD did not reach its gate")?;
                 f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
                 let mut changed = f.ds.changed.subscribe();
                 tokio::time::timeout(Duration::from_secs(15), async {
@@ -2415,24 +2442,6 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 })
                 .await
                 .context("truncate did not retire the group stream")??;
-            } else if cut == "degraded" {
-                engine.force_degraded();
-            }
-            if cut == "cancel" {
-                load.abort();
-            }
-            // Release only a GroupCreated this cut actually held. `Notify` stores a permit when no
-            // request is waiting, so an unmatched release would let the next cut's held catalog
-            // write pass straight through and its load answer before the cut is applied.
-            if pre_durability_stage.is_none() && !cancel_at_seed {
-                *f.ds.hold_group_catalog.lock().await = false;
-                f.ds.group_catalog_release.notify_one();
-            }
-            if cut == "cancel-head" {
-                tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
-                    .await
-                    .context("post-durability HEAD did not reach its gate")?;
-                load.abort();
                 f.ds.group_head_release.notify_one();
             }
             if cut == "cancel" || cut == "cancel-head" {
