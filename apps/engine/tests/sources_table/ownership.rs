@@ -379,8 +379,12 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
             }
         };
         if hold {
+            // Register for the release before announcing the arrival: the test task runs on another
+            // worker and may release as soon as it hears the arrival.
+            let mut release = std::pin::pin!(ds.group_head_release.notified());
+            release.as_mut().enable();
             ds.group_head_arrived.notify_one();
-            ds.group_head_release.notified().await;
+            release.await;
         }
         if let Some(Some(status)) = {
             let mut faults = ds.group_head_faults.lock().await;
@@ -418,8 +422,12 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
             false
         };
         if hold {
+            // Register for the release before announcing the arrival: the test task runs on another
+            // worker and may release as soon as it hears the arrival.
+            let mut release = std::pin::pin!(ds.group_catalog_release.notified());
+            release.as_mut().enable();
             ds.group_catalog_arrived.notify_one();
-            ds.group_catalog_release.notified().await;
+            release.await;
         }
         request = AxumRequest::from_parts(parts, Body::from(bytes));
     }
@@ -2523,6 +2531,17 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             {
                 let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
                 ensure!(status == StatusCode::OK, "compensated group could not be retried: {status} {body}");
+            }
+            if cut == "truncate" {
+                // The TRUNCATE handler holds the inner table's resolve lock while it retires every
+                // group earlier cuts left on that table, and refuses loads on it meanwhile. Let it
+                // finish before the next cut loads that table.
+                let inner = electric_circuits_engine::table_ref::TableRef::parse(&format!("public.{}", f.inner))?;
+                drop(
+                    tokio::time::timeout(Duration::from_secs(15), engine.force_resolve_lock(&inner))
+                        .await
+                        .context("the TRUNCATE resolution did not finish")?,
+                );
             }
         }
         Ok::<_, anyhow::Error>(())
