@@ -2426,8 +2426,13 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             if cut == "cancel" {
                 load.abort();
             }
-            *f.ds.hold_group_catalog.lock().await = false;
-            f.ds.group_catalog_release.notify_one();
+            // Release only a GroupCreated this cut actually held. `Notify` stores a permit when no
+            // request is waiting, so an unmatched release would let the next cut's held catalog
+            // write pass straight through and its load answer before the cut is applied.
+            if pre_durability_stage.is_none() && !cancel_at_seed {
+                *f.ds.hold_group_catalog.lock().await = false;
+                f.ds.group_catalog_release.notify_one();
+            }
             if cut == "cancel-head" {
                 tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
                     .await
