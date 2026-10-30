@@ -1412,7 +1412,10 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
                     Some("joined") | Some("left") => first_body["results"]
                         .as_array()
                         .is_some_and(|members| { members.iter().any(|member| member["shapeId"] == event["id"]) }),
-                    Some("groupCreated") => event["group"]["id"] == first_body["groupId"],
+                    Some("groupCreated") => {
+                        event["group"]["subscription"] == "group-overlap"
+                            && event["group"]["id"] == first_body["groupId"]
+                    }
                     _ => false,
                 },
                 _ => true,
@@ -1422,7 +1425,7 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         ensure!(
             catalog
                 .iter()
-                .filter(|event| event["t"] == "groupCreated" && event["subscription"] == "group-overlap")
+                .filter(|event| event["t"] == "groupCreated" && event["group"]["subscription"] == "group-overlap")
                 .count()
                 == 1,
             "loser wrote a group catalog event: {catalog:?}"
@@ -2455,7 +2458,9 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let catalog = stream_events(f, "meta/catalog").await;
             if pre_durability_stage.is_some() || cancel_at_seed {
                 ensure!(
-                    !catalog.iter().any(|event| event["t"] == "groupCreated" && event["subscription"] == subscription),
+                    !catalog.iter().any(|event| {
+                        event["t"] == "groupCreated" && event["group"]["subscription"] == subscription
+                    }),
                     "pre-durability cancellation wrote GroupCreated: {subscription} events={catalog:?}"
                 );
                 if let Some(attempt_id) = pre_attempt_id {
@@ -2598,7 +2603,7 @@ async fn group_reconnect_burst(f: &Fixture) -> Result<()> {
         let mut tasks = Vec::new();
         for i in 0..30 {
             let app = app.clone();
-            let body = group_body(f, &format!("group-burst-{i}"), true);
+            let body = group_body(f, &format!("group-burst-{i}"), false);
             tasks.push(tokio::spawn(async move { post_group(&app, body).await }));
         }
         let mut first = Vec::new();
@@ -2617,7 +2622,7 @@ async fn group_reconnect_burst(f: &Fixture) -> Result<()> {
             ));
         }
         for i in 0..30 {
-            let (status, body) = post_group(&app, group_body(f, &format!("group-burst-{i}"), true)).await?;
+            let (status, body) = post_group(&app, group_body(f, &format!("group-burst-{i}"), false)).await?;
             ensure!(status == StatusCode::OK, "burst renewal {i} was not idempotent: {status} {body}");
             ensure!(
                 body["groupId"] == first[i].0 && body["streamPath"] == first[i].1,
