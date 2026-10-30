@@ -2413,7 +2413,10 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .await
                     .context("post-durability HEAD did not reach its gate")?;
                 load.abort();
-                f.ds.group_head_release.notify_one();
+                // `notify_waiters`, not `notify_one`: the aborted request's handler can be dropped
+                // before it polls a `notify_one`, which tokio would then store as a permit and let
+                // the truncate cut's held HEAD straight through.
+                f.ds.group_head_release.notify_waiters();
             }
             if cut == "truncate" {
                 // TRUNCATE at the post-durability HEAD, not inside the GroupCreated hold: retiring
