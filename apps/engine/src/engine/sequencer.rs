@@ -2234,9 +2234,9 @@ pub(crate) async fn process_envelope(
         };
         let work = match result {
             Ok(work) => {
-                for handle in staged_group_emissions {
-                    handle.wait().await;
-                }
+                // Reserved in commit order under the registry lock; the lane admits them in that
+                // order, so the sequencer never waits on a group's window.
+                subq.group_lanes.spawn_wait(staged_group_emissions);
                 work
             }
             Err(error) => {
