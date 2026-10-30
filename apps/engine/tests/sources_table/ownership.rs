@@ -2258,6 +2258,7 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             ("group-cut-truncate", "truncate"),
             ("group-cut-degraded", "degraded"),
         ] {
+            eprintln!("group cut {cut}: start");
             let pre_durability_stage = match cut {
                 "cancel-before-reservation" => Some(GroupLoadAwait::BeforeReservation),
                 "cancel-after-reservation" => Some(GroupLoadAwait::AfterReservation),
@@ -2302,9 +2303,18 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 }
                 None
             } else {
-                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
-                    .await
-                    .context("group cut did not reach GroupCreated durability")?;
+                if tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified()).await.is_err() {
+                    let load_state = if load.is_finished() {
+                        match (&mut load).await {
+                            Ok(Ok((status, body))) => format!("the load already answered {status} {body}"),
+                            Ok(Err(error)) => format!("the load failed: {error:#}"),
+                            Err(error) => format!("the load task ended: {error}"),
+                        }
+                    } else {
+                        "the load is still running".to_string()
+                    };
+                    anyhow::bail!("group cut {cut} did not reach GroupCreated durability; {load_state}");
+                }
                 let member_id =
                     engine.subscription_owner(subscription).await.context("group cut has no public member")?;
                 Some(
