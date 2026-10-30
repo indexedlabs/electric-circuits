@@ -418,7 +418,8 @@ impl GroupEmissionLanes {
                 if commit_lsn <= oldest.entry.commit_lsn {
                     continue;
                 }
-                let waited = oldest.entry.enqueued_at.elapsed();
+                let enqueued_at = oldest.entry.enqueued_at;
+                let waited = enqueued_at.elapsed();
                 state.longest_wait = state.longest_wait.max(waited);
                 for (i, fraction) in [0.5, 0.9].into_iter().enumerate() {
                     if self.config.max_stall > std::time::Duration::ZERO
@@ -431,7 +432,7 @@ impl GroupEmissionLanes {
                 }
                 if waited >= std::time::Duration::from_secs(1) && !state.replay_held {
                     state.replay_held = true;
-                    state.replay_held_since = Some(oldest.entry.enqueued_at + std::time::Duration::from_secs(1));
+                    state.replay_held_since = Some(enqueued_at + std::time::Duration::from_secs(1));
                 }
                 (self.config.max_stall > std::time::Duration::ZERO && waited > self.config.max_stall, waited)
             };
