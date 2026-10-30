@@ -2786,6 +2786,9 @@ async fn group_lane_isolation(f: &Fixture) -> Result<()> {
         let (status, group) = post_group(&app, group_body(f, "group-lane-held", true)).await?;
         ensure!(status == StatusCode::OK, "held group create failed: {status} {group}");
         let stream_path = group["streamPath"].as_str().context("held group stream path")?.to_owned();
+        let (other_status, other_group) = post_group(&app, group_body(f, "group-lane-independent", true)).await?;
+        ensure!(other_status == StatusCode::OK, "independent group create failed: {other_status} {other_group}");
+        let other_path = other_group["streamPath"].as_str().context("independent group stream path")?.to_owned();
 
         let plain_body = serde_json::json!({
             "table": format!("public.{}", f.outer),
@@ -2812,6 +2815,16 @@ async fn group_lane_isolation(f: &Fixture) -> Result<()> {
         })
         .await
         .context("plain shape output waited behind a held group's lane")??;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if stream_events(f, &other_path).await.iter().any(|event| event_key(event).as_deref() == Some("9")) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                changed.changed().await.context("independent group observation channel closed")?;
+            }
+        })
+        .await
+        .context("independent group output waited behind a held group's lane")??;
 
         f.ds.group_append_release.notify_waiters();
         Ok::<_, anyhow::Error>(())

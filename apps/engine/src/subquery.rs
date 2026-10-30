@@ -2412,7 +2412,7 @@ async fn move_shape_for_value(
     // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
     // (candidates from a query-back all still exist), filtered against the live decisions taken
     // since `gate`'s snapshot.
-    let (emitted, staged) = {
+    let (emitted, staged, group_lanes) = {
         let mut reg = registry.lock().await;
         let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
         let emitted = reg
@@ -2424,12 +2424,14 @@ async fn move_shape_for_value(
             )
             .await;
         reg.end_queryback(shape_id);
-        (emitted, reg.take_group_emissions())
+        (emitted, reg.take_group_emissions(), reg.group_lanes.clone())
     };
     let emitted = match emitted {
         Ok(emitted) => {
-            for handle in staged {
-                handle.wait().await;
+            if let Some(lanes) = group_lanes {
+                lanes.spawn_wait(staged);
+            } else {
+                drop(staged);
             }
             emitted
         }
@@ -2556,7 +2558,7 @@ async fn rederive_shape(
     };
     // Full re-derive: every row is a candidate; the ONE emission tail decides — except for pks a
     // live commit decided after this read's snapshot, which it drops.
-    let (emitted, staged) = {
+    let (emitted, staged, group_lanes) = {
         let mut reg = registry.lock().await;
         let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
         let emitted = reg
@@ -2568,12 +2570,14 @@ async fn rederive_shape(
             )
             .await;
         reg.end_queryback(shape_id);
-        (emitted, reg.take_group_emissions())
+        (emitted, reg.take_group_emissions(), reg.group_lanes.clone())
     };
     match emitted {
         Ok(_) => {
-            for handle in staged {
-                handle.wait().await;
+            if let Some(lanes) = group_lanes {
+                lanes.spawn_wait(staged);
+            } else {
+                drop(staged);
             }
         }
         Err(error) => {

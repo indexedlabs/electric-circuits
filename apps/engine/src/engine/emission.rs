@@ -301,6 +301,10 @@ impl GroupEmissionLanes {
         self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
     }
 
+    pub(crate) fn has_origin_before(&self, paths: &HashSet<String>, marker_lsn: u64) -> bool {
+        self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn < marker_lsn && paths.contains(path))
+    }
+
     pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {
         self.origins
             .lock()
@@ -364,6 +368,18 @@ impl GroupEmissionLanes {
     pub(crate) async fn enqueue(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if let Some(handle) = self.reserve(path, envs, commit_lsn) {
             handle.wait().await;
+        }
+    }
+
+    /// Keep a reserved batch's admission wait off the source sequencer. The lane still admits
+    /// batches in reservation order and retains the bounded payload window; only the producer's
+    /// task is allowed to wait when this group's window is full.
+    pub(crate) fn spawn_wait(&self, handles: impl IntoIterator<Item = GroupBatchHandle>) {
+        for handle in handles {
+            let shutdown = self.shutdown.clone();
+            shutdown.spawn_background(async move {
+                handle.wait().await;
+            });
         }
     }
 

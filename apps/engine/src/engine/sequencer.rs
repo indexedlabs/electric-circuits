@@ -531,13 +531,6 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
-    // Groups add one cross-lane fence: before the next source transaction is allowed to
-    // publish, all deferred subquery effects from the previous transaction must have landed.
-    // This is enabled only while at least one group lease is active; ordinary single-table
-    // shapes keep their existing throughput path.
-    let mut last_group_lsn: Option<u64> = None;
-    let mut last_group_paths = HashSet::new();
-
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
         if pending_read.is_none() && !paused && !sequencer_read_failed {
@@ -784,14 +777,6 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if group_fence.active()
-                            && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
-                        {
-                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
-                            processing_failed = true;
-                            break;
-                        }
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -967,24 +952,48 @@ pub(crate) async fn sequencer_loop(
                             .filter(|path| path.starts_with("shape/group-"))
                             .cloned()
                             .collect();
-                        let direct_group_paths: HashSet<String> = group_paths.iter().cloned().collect();
+                        let mut direct_group_handles = Vec::new();
                         for path in group_paths {
                             if let Some(envs) = txn_pending.remove(&path) {
-                                subq.group_lanes.enqueue(&path, envs, group_lsn).await;
+                                let path_set = HashSet::from([path.clone()]);
+                                if group_lsn != 0
+                                    && !wait_for_group_effects_before(
+                                        &subq.group_lanes,
+                                        &path_set,
+                                        &shutdown,
+                                        group_lsn,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(group_lsn, %path, "group transaction barrier could not drain before enqueue");
+                                    processing_failed = true;
+                                    break;
+                                }
+                                if let Some(handle) = subq.group_lanes.reserve(&path, envs, group_lsn) {
+                                    direct_group_handles.push(handle);
+                                }
                             }
                         }
+                        if processing_failed {
+                            drop(direct_group_handles);
+                            highwater = txn_highwater;
+                            break;
+                        }
                         // Transaction boundary: every append of this commit lands before the next
-                        // commit is processed.
+                        // plain append is processed. Group admission and append are lane-owned, so
+                        // a saturated group cannot hold unrelated shape output on the sequencer.
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
                             tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
                             highwater = txn_highwater;
                             processing_failed = true;
                             break;
                         }
-                        if !direct_group_paths.is_empty()
+                        subq.group_lanes.spawn_wait(direct_group_handles);
+                        let group_paths = subq.group_lanes.paths_at_or_before(group_lsn);
+                        if !group_paths.is_empty()
                             && !wait_for_group_effects(
                                 &subq.group_lanes,
-                                &direct_group_paths,
+                                &group_paths,
                                 &shutdown,
                                 group_lsn,
                             )
@@ -1046,18 +1055,6 @@ pub(crate) async fn sequencer_loop(
                             source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
-                        }
-                        if group_fence.active()
-                            && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
-                        {
-                            let paths = subq.group_lanes.paths_at_or_before(commit_lsn);
-                            if !paths.is_empty() {
-                                last_group_lsn = Some(commit_lsn);
-                                last_group_paths = paths;
-                            } else {
-                                last_group_lsn = None;
-                                last_group_paths.clear();
-                            }
                         }
                     }
                     if processing_failed {
@@ -1270,6 +1267,33 @@ async fn wait_for_source_effects(
         }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            _ = shutdown.wait() => return false,
+        }
+    }
+}
+
+/// Wait only for effects from an earlier transaction on the group paths about to receive direct
+/// output. A saturated unrelated group therefore does not delay this transaction's plain shapes or
+/// another group's lane.
+async fn wait_for_group_effects_before(
+    lanes: &crate::engine::emission::GroupEmissionLanes,
+    paths: &HashSet<String>,
+    shutdown: &crate::shutdown::ShutdownToken,
+    marker_lsn: u64,
+) -> bool {
+    loop {
+        if shutdown.is_shutting_down() {
+            return false;
+        }
+        let wake = lanes.wake();
+        let notified = wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !lanes.has_origin_before(paths, marker_lsn) {
+            return true;
+        }
+        tokio::select! {
+            _ = notified => {}
             _ = shutdown.wait() => return false,
         }
     }
