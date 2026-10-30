@@ -1246,6 +1246,11 @@ impl Engine {
             }));
         }
         drop(st);
+        #[cfg(test)]
+        if self.purge_test_hook.pause_before_remove.load(std::sync::atomic::Ordering::Acquire) {
+            self.purge_test_hook.before_remove.notify_one();
+            self.purge_test_hook.release_before_remove.notified().await;
+        }
         self.purge_shape_member(id, durable).await?;
         // Look the group up only once the member is gone: a `complete_group` that took the lock
         // first has completed a record naming this member, and one that comes after finds the
@@ -2439,6 +2444,12 @@ impl Engine {
             if needs_seed && admission.seed_slot.is_none() {
                 if let Ok(slot) = self.subquery_init.seed_slots.clone().try_acquire_owned() {
                     admission.seed_slot = Some(slot);
+                    #[cfg(feature = "test-support")]
+                    {
+                        drop(registry);
+                        self.wait_group_seed_gate_for_test().await;
+                        continue;
+                    }
                 } else {
                     drop(registry);
                     tracing::info!(
@@ -4099,10 +4110,6 @@ mod cancellation_tests {
         engine.state.lock().await.feed_shares.get(id).map(FeedShare::refcount).unwrap_or(0)
     }
 
-    async fn engine_with_group_claim() -> (Engine, GroupRecord) {
-        engine_with_group_claim_ds(DsClient::new_for_in_process_test("http://127.0.0.1:1")).await
-    }
-
     async fn engine_with_group_claim_ds(ds: DsClient) -> (Engine, GroupRecord) {
         let engine = Engine::new_for_in_process_test(ds);
         let now = crate::changelog::now_secs();
@@ -4182,7 +4189,7 @@ mod cancellation_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn complete_group_rejects_a_missing_member_claim() {
         let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
-        let ds = DsClient::with_test_store("scripted://group-invalid-completion".into(), store);
+        let ds = DsClient::with_test_store("scripted://group-invalid-completion".into(), store.clone());
         let (engine, group) = engine_with_group_claim_ds(ds).await;
         let mut invalid = group.clone();
         invalid.subscription = "scope-invalid".into();
@@ -4199,8 +4206,100 @@ mod cancellation_tests {
             st.subscribe("member-1", "scope-invalid:member:1".into(), crate::changelog::now_secs());
             st.unsubscribe("member-1", "scope-invalid:member:1");
         }
-        assert!(engine.complete_group(invalid).await.is_err());
+        for member in &invalid.members {
+            engine.state.lock().await.shapes.get_mut(&member.shape_id).unwrap().stream_path =
+                invalid.stream_path.clone();
+        }
+        engine.ds.ensure_stream(&invalid.stream_path).await.unwrap();
+        let error =
+            engine.complete_group(invalid.clone()).await.expect_err("missing member claim must reject completion");
+        assert!(error.downcast_ref::<crate::engine::GroupStreamClosed>().is_some(), "wrong error: {error:#}");
         assert!(engine.group_record("scope-invalid").await.is_none());
+        let appended = store.appended.lock().unwrap().clone();
+        assert!(
+            appended
+                .iter()
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap_or_default())
+                .any(|event| event["t"] == "groupDropped" && event["subscription"] == "scope-invalid")
+        );
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    /// A purge takes its guard before removing the member. If completion wins in that gap, the
+    /// purge must still observe the completed incarnation after removal and release it; a group
+    /// record may never outlive the member it names.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn purge_and_complete_group_leave_no_claim_record() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-purge-complete-order".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        engine.ds.ensure_stream(&group.stream_path).await.unwrap();
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+        }
+        for member in &group.members {
+            engine.state.lock().await.shapes.get_mut(&member.shape_id).unwrap().stream_path = group.stream_path.clone();
+        }
+        engine.purge_test_hook.pause_before_remove.store(true, Ordering::Release);
+        let purging = tokio::spawn({
+            let engine = engine.clone();
+            let member = group.members[0].shape_id.clone();
+            async move { engine.purge_shape(&member).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.purge_test_hook.before_remove.notified())
+            .await
+            .expect("purge did not reach the pre-removal gap");
+        engine.complete_group(group.clone()).await.unwrap();
+        assert!(engine.group_record("scope").await.is_some(), "completion should publish before removal");
+        engine.purge_test_hook.pause_before_remove.store(false, Ordering::Release);
+        engine.purge_test_hook.release_before_remove.notify_one();
+        purging.await.unwrap().unwrap();
+        assert!(engine.group_record("scope").await.is_none(), "purge must release the completed group");
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    /// The group activation check runs after the final stream HEAD. Degrading during that HEAD
+    /// must produce a retryable refusal and a compensating durable GroupDropped, never a 200.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn group_completion_rechecks_health_after_stream_head() {
+        let gate = std::sync::Arc::new(crate::ds::BodyGate::default());
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+            head_gate: std::sync::Mutex::new(Some(gate.clone())),
+            head_gate_path: std::sync::Mutex::new(None),
+            ..Default::default()
+        });
+        let ds = DsClient::with_test_store("scripted://group-recheck-health".into(), store.clone());
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        engine.ds.ensure_stream(&group.stream_path).await.unwrap();
+        *store.head_gate_path.lock().unwrap() = Some(group.stream_path.clone());
+        {
+            let mut st = engine.state.lock().await;
+            for member in &group.members {
+                st.shapes.get_mut(&member.shape_id).unwrap().stream_path = group.stream_path.clone();
+            }
+        }
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+        }
+        let task = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.complete_group(group).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("group stream HEAD did not reach its gate");
+        engine.force_degraded();
+        gate.released.notify_one();
+        let error = task.await.unwrap().expect_err("degradation during HEAD must refuse completion");
+        assert!(error.downcast_ref::<Degraded>().is_some(), "wrong completion error: {error:#}");
+        assert!(engine.group_record("scope").await.is_none(), "failed completion left a group claim");
+        assert!(engine.subscription_owner("scope").await.is_some(), "the reservation guard still owns its claim");
         engine.close(std::time::Duration::from_secs(1)).await;
     }
 

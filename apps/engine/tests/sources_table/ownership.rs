@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::ensure;
 use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::{Engine, PostgresSetup};
+use electric_circuits_engine::engine::{Engine, GroupLoadAwait, PostgresSetup};
 use electric_circuits_engine::http::router_with_introspection;
 use electric_circuits_engine::table_ref::TableSelector;
 use tokio::sync::{Notify, watch};
@@ -77,6 +77,11 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupReleaseDuringAssembly => group_release_during_assembly(&fixture).await,
             Case::GroupRetirementDuringAssembly => group_retirement_during_assembly(&fixture).await,
             Case::GroupMembersMax => group_members_max(&fixture).await,
+            Case::GroupCompletionCuts => group_completion_cuts(&fixture).await,
+            Case::GroupReleaseCancellation => group_release_cancellation(&fixture).await,
+            Case::GroupRenewalCancellation => group_renewal_cancellation(&fixture).await,
+            Case::GroupReconnectBurst => group_reconnect_burst(&fixture).await,
+            Case::GroupAdmission => group_admission_gate(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -115,6 +120,11 @@ enum Case {
     GroupReleaseDuringAssembly,
     GroupRetirementDuringAssembly,
     GroupMembersMax,
+    GroupCompletionCuts,
+    GroupReleaseCancellation,
+    GroupRenewalCancellation,
+    GroupReconnectBurst,
+    GroupAdmission,
 }
 
 #[test]
@@ -282,6 +292,36 @@ fn group_rejects_more_than_eight_members_without_partial_state() -> Result<()> {
     isolated("ownership::group_rejects_more_than_eight_members_without_partial_state", Case::GroupMembersMax)
 }
 
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_completion_cuts_leave_no_claims_or_durable_group() -> Result<()> {
+    isolated("ownership::group_completion_cuts_leave_no_claims_or_durable_group", Case::GroupCompletionCuts)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_release_cancelled_after_durability_still_completes() -> Result<()> {
+    isolated("ownership::group_release_cancelled_after_durability_still_completes", Case::GroupReleaseCancellation)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_renewal_cancelled_at_each_renewal_await_keeps_the_group() -> Result<()> {
+    isolated("ownership::group_renewal_cancelled_at_each_renewal_await_keeps_the_group", Case::GroupRenewalCancellation)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn thirty_group_reconnects_claim_and_renew_without_conflicts() -> Result<()> {
+    isolated("ownership::thirty_group_reconnects_claim_and_renew_without_conflicts", Case::GroupReconnectBurst)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_admission_does_not_block_other_loads_or_plain_shapes() -> Result<()> {
+    isolated("ownership::group_admission_does_not_block_other_loads_or_plain_shapes", Case::GroupAdmission)
+}
+
 #[derive(Clone)]
 struct ObservedDs {
     store: FeedDs,
@@ -339,8 +379,12 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
             }
         };
         if hold {
+            // Register for the release before announcing the arrival: the test task runs on another
+            // worker and may release as soon as it hears the arrival.
+            let mut release = std::pin::pin!(ds.group_head_release.notified());
+            release.as_mut().enable();
             ds.group_head_arrived.notify_one();
-            ds.group_head_release.notified().await;
+            release.await;
         }
         if let Some(Some(status)) = {
             let mut faults = ds.group_head_faults.lock().await;
@@ -378,8 +422,12 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
             false
         };
         if hold {
+            // Register for the release before announcing the arrival: the test task runs on another
+            // worker and may release as soon as it hears the arrival.
+            let mut release = std::pin::pin!(ds.group_catalog_release.notified());
+            release.as_mut().enable();
             ds.group_catalog_arrived.notify_one();
-            ds.group_catalog_release.notified().await;
+            release.await;
         }
         request = AxumRequest::from_parts(parts, Body::from(bytes));
     }
@@ -416,7 +464,7 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
     if closing {
         ds.closed.lock().await.insert(path.clone());
     }
-    if method == Method::HEAD && ds.closed.lock().await.contains(&path) {
+    if method == Method::HEAD && ds.closed.lock().await.iter().any(|suffix| path.ends_with(suffix)) {
         response.headers_mut().insert("stream-closed", "true".parse().unwrap());
     }
     if closing || (method == Method::DELETE && delete_gate.is_none()) {
@@ -1290,12 +1338,108 @@ async fn group_equal_key_delete(f: &Fixture) -> Result<()> {
 async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
-        let (status, first) = post_group(&app, group_body(f, "group-overlap", false)).await?;
-        ensure!(status == StatusCode::OK, "first group create failed: {status} {first}");
-        let (status, second) = post_group(&app, group_body(f, "group-overlap", true)).await?;
-        ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second}");
-        let (status, third) = post_group(&app, group_body(f, "group-overlap-2", true)).await?;
-        ensure!(status == StatusCode::OK, "failed group left reservation behind: {status} {third}");
+        // Hold the first request immediately after its atomic reservation. The second request
+        // must not create either member while that reservation is in flight; after the winner
+        // completes, the same request (with different members) is the ordinary 409 conflict.
+        let gate = engine.group_load_gate_for_test();
+        gate.arm(GroupLoadAwait::AfterReservation).await;
+        let first_app = app.clone();
+        let first_body = group_body(f, "group-overlap", false);
+        let first = tokio::spawn(async move { post_group(&first_app, first_body).await });
+        tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+            .await
+            .context("first group did not reach its reservation gate")?;
+        let second_app = app.clone();
+        let second_body = group_body(f, "group-overlap", true);
+        let loser_body = second_body.clone();
+        gate.arm(GroupLoadAwait::BeforeReservation).await;
+        let second = tokio::spawn(async move { post_group_response(&second_app, loser_body).await });
+        tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+            .await
+            .context("losing group did not reach its reservation gate")?;
+        let winner_id = engine.group_id_for_test("group-overlap").await.context("winner reservation id")?;
+        gate.release.notify_last();
+        let (status, headers, in_flight_body) = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .context("losing group did not leave its reservation gate")?
+            .context("second group task failed")??;
+        ensure!(
+            status == StatusCode::SERVICE_UNAVAILABLE,
+            "in-flight loser was not retryable: {status} {in_flight_body}"
+        );
+        ensure!(headers.get("retry-after").is_some(), "in-flight loser omitted Retry-After");
+        ensure!(
+            engine.group_id_for_test("group-overlap").await.as_deref() == Some(winner_id.as_str())
+                && engine.subscription_owner("group-overlap").await.is_none()
+                && engine.subscription_owner("group-overlap:member:1").await.is_none(),
+            "in-flight loser left a claim or replaced the reservation"
+        );
+        ensure!(
+            !stream_events(f, "meta/catalog")
+                .await
+                .iter()
+                .any(|event| event["subscription"].as_str().is_some_and(|s| s.starts_with("group-overlap"))),
+            "in-flight loser wrote a catalog event"
+        );
+        gate.release.notify_one();
+        let (status, first_body) = tokio::time::timeout(Duration::from_secs(15), first)
+            .await
+            .context("winning group did not finish")?
+            .context("first group task failed")??;
+        ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
+        let mut changed = f.ds.changed.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = stream_events(f, "meta/catalog").await;
+                let joined = events
+                    .iter()
+                    .filter(|event| {
+                        event["t"] == "joined"
+                            && event["subscription"].as_str().is_some_and(|s| s.starts_with("group-overlap"))
+                    })
+                    .count();
+                if joined >= 2 {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                changed.changed().await.context("catalog observation channel closed")?;
+            }
+        })
+        .await
+        .context("winner Joined events did not become durable")??;
+        let (status, second_body) = post_group(&app, second_body.clone()).await?;
+        ensure!(status == StatusCode::CONFLICT, "overlapping group claim was not 409: {status} {second_body}");
+        ensure!(!engine.group_reservation_for_test("group-overlap").await, "loser left a group reservation");
+        ensure!(engine.group_id_for_test("group-overlap").await.is_some(), "winner group was lost");
+        let catalog = stream_events(f, "meta/catalog").await;
+        ensure!(
+            catalog.iter().all(|event| {
+                if event["t"] == "groupCreated" {
+                    return event["group"]["subscription"] == "group-overlap"
+                        && event["group"]["id"] == first_body["groupId"];
+                }
+                match event["subscription"].as_str() {
+                    Some(subscription) if subscription.starts_with("group-overlap") => match event["t"].as_str() {
+                        Some("created") => first_body["results"].as_array().is_some_and(|members| {
+                            members.iter().any(|member| member["shapeId"] == event["rec"]["id"])
+                        }),
+                        Some("joined") | Some("left") => first_body["results"]
+                            .as_array()
+                            .is_some_and(|members| members.iter().any(|member| member["shapeId"] == event["id"])),
+                        _ => false,
+                    },
+                    _ => true,
+                }
+            }),
+            "losing load wrote an unexpected catalog event: {catalog:?}"
+        );
+        ensure!(
+            catalog
+                .iter()
+                .filter(|event| event["t"] == "groupCreated" && event["group"]["subscription"] == "group-overlap")
+                .count()
+                == 1,
+            "loser wrote a group catalog event: {catalog:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -2094,6 +2238,507 @@ async fn group_members_max(f: &Fixture) -> Result<()> {
         );
         let (status, body) = post_group(&app, group_body(f, "group-partial-rollback", true)).await?;
         ensure!(status == StatusCode::OK, "partial rollback left a claim behind: {status} {body}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// Exercise the public group-load boundary at the post-GroupCreated cuts. Each variant must
+/// compensate its durable GroupCreated with GroupDropped and release both the public and private
+/// claims before the subscription can be loaded again.
+async fn group_completion_cuts(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        for (subscription, cut) in [
+            ("group-cut-cancel-before-reservation", "cancel-before-reservation"),
+            ("group-cut-cancel-after-reservation", "cancel-after-reservation"),
+            ("group-cut-cancel-member-create", "cancel-member-create-0"),
+            ("group-cut-cancel-member-create-1", "cancel-member-create-1"),
+            ("group-cut-cancel-seed", "cancel-seed"),
+            ("group-cut-cancel-stream-tail", "cancel-stream-tail"),
+            ("group-cut-cancel-snapshot", "cancel-snapshot"),
+            ("group-cut-cancel", "cancel"),
+            ("group-cut-cancel-head", "cancel-head"),
+            ("group-cut-replacement", "replacement"),
+            ("group-cut-closed", "closed"),
+            ("group-cut-truncate", "truncate"),
+            ("group-cut-degraded", "degraded"),
+        ] {
+            eprintln!("group cut {cut}: start");
+            let pre_durability_stage = match cut {
+                "cancel-before-reservation" => Some(GroupLoadAwait::BeforeReservation),
+                "cancel-after-reservation" => Some(GroupLoadAwait::AfterReservation),
+                "cancel-member-create-0" => Some(GroupLoadAwait::MemberCreate(0)),
+                "cancel-member-create-1" => Some(GroupLoadAwait::MemberCreate(1)),
+                "cancel-stream-tail" => Some(GroupLoadAwait::StreamTail),
+                "cancel-snapshot" => Some(GroupLoadAwait::Snapshot),
+                _ => None,
+            };
+            let cancel_at_seed = cut == "cancel-seed";
+            if let Some(stage) = pre_durability_stage {
+                engine.group_load_gate_for_test().arm(stage).await;
+            } else if cancel_at_seed {
+                engine.group_seed_gate_for_test().arm();
+            } else {
+                *f.ds.hold_group_catalog.lock().await = true;
+            }
+            let load_app = app.clone();
+            let load_body = group_body(f, subscription, cut != "cancel-seed");
+            let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
+            let mut pre_attempt_id = None;
+            let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
+                if cancel_at_seed {
+                    tokio::time::timeout(Duration::from_secs(10), engine.group_seed_gate_for_test().arrived.notified())
+                        .await
+                        .context("group cut did not reach its pre-durability gate")?;
+                } else {
+                    tokio::time::timeout(Duration::from_secs(10), engine.group_load_gate_for_test().arrived.notified())
+                        .await
+                        .context("group cut did not reach its pre-durability gate")?;
+                }
+                if cut != "cancel-before-reservation" {
+                    let id = engine.group_id_for_test(subscription).await.context("pre-durability reservation id")?;
+                    *f.ds.hold_group_drop_id.lock().await = Some(id.clone());
+                    pre_attempt_id = Some(id);
+                }
+                load.abort();
+                if cancel_at_seed {
+                    engine.group_seed_gate_for_test().release.notify_waiters();
+                } else {
+                    engine.group_load_gate_for_test().release.notify_waiters();
+                }
+                None
+            } else {
+                if tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified()).await.is_err() {
+                    let load_state = if load.is_finished() {
+                        match (&mut load).await {
+                            Ok(Ok((status, body))) => format!("the load already answered {status} {body}"),
+                            Ok(Err(error)) => format!("the load failed: {error:#}"),
+                            Err(error) => format!("the load task ended: {error}"),
+                        }
+                    } else {
+                        "the load is still running".to_string()
+                    };
+                    anyhow::bail!("group cut {cut} did not reach GroupCreated durability; {load_state}");
+                }
+                let member_id =
+                    engine.subscription_owner(subscription).await.context("group cut has no public member")?;
+                Some(
+                    engine
+                        .get_shape(&member_id)
+                        .await
+                        .map(|shape| shape.stream_path)
+                        .context("group cut did not install its member stream")?,
+                )
+            };
+            let group_path = group_path.unwrap_or_default();
+            if pre_attempt_id.is_some() {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("pre-durability cleanup did not reach GroupDropped durability")?;
+                f.ds.group_catalog_release.notify_one();
+            }
+            if cut == "cancel" || cut == "cancel-head" {
+                *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
+            }
+            if cut == "replacement" {
+                let abort_gate = engine.group_abort_gate_for_test();
+                abort_gate.arm();
+                *f.ds.hold_group_drop_id.lock().await = Some(group_path.clone());
+                load.abort();
+                *f.ds.hold_group_catalog.lock().await = false;
+                f.ds.group_catalog_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("old cleanup did not reach GroupDropped durability")?;
+                f.ds.group_catalog_release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), abort_gate.arrived.notified())
+                    .await
+                    .context("old cleanup did not reach its abort gate")?;
+                let replacement_gate = engine.group_load_gate_for_test();
+                replacement_gate.arm(GroupLoadAwait::AfterReservation).await;
+                let replacement_app = app.clone();
+                let replacement_body = group_body(f, subscription, true);
+                let replacement_task =
+                    tokio::spawn(async move { post_group(&replacement_app, replacement_body).await });
+                tokio::time::timeout(Duration::from_secs(10), replacement_gate.arrived.notified())
+                    .await
+                    .context("replacement did not reach its reservation")?;
+                let replacement_id =
+                    engine.group_id_for_test(subscription).await.context("replacement reservation id")?;
+                abort_gate.release.notify_one();
+                tokio::time::timeout(Duration::from_secs(10), abort_gate.finished.notified())
+                    .await
+                    .context("old abort did not finish")?;
+                ensure!(
+                    engine.group_reservation_for_test(subscription).await
+                        && engine.group_id_for_test(subscription).await.as_deref() == Some(replacement_id.as_str()),
+                    "old abort removed replacement reservation"
+                );
+                replacement_gate.release.notify_one();
+                let (status, replacement) = replacement_task.await.context("replacement task failed")??;
+                ensure!(
+                    status == StatusCode::OK,
+                    "replacement load did not survive old cleanup: {status} {replacement}"
+                );
+                ensure!(replacement["groupId"] == replacement_id, "replacement changed its reservation id");
+                ensure!(replacement_id != group_path, "replacement reused the old group id");
+                ensure!(
+                    engine.group_id_for_test(subscription).await.as_deref() == Some(replacement_id.as_str()),
+                    "old abort removed the replacement group"
+                );
+                for member in replacement["results"].as_array().context("replacement members")? {
+                    let member_subscription =
+                        member["subscription"].as_str().context("replacement member subscription")?;
+                    let member_id = member["shapeId"].as_str().context("replacement member id")?;
+                    ensure!(
+                        engine.subscription_owner(member_subscription).await.as_deref() == Some(member_id),
+                        "old abort removed replacement member claim {member_subscription}"
+                    );
+                }
+                let catalog = stream_events(f, "meta/catalog").await;
+                ensure!(
+                    catalog.iter().any(|event| event["t"] == "groupDropped" && event["group_id"] == group_path),
+                    "old cleanup did not drop its own group"
+                );
+                ensure!(
+                    !catalog.iter().any(|event| event["t"] == "groupDropped" && event["group_id"] == replacement_id),
+                    "old cleanup dropped replacement group"
+                );
+                continue;
+            }
+            if cut == "cancel-head" || cut == "truncate" {
+                *f.ds.hold_group_head_after.lock().await = Some(0);
+            } else if cut == "closed" {
+                f.ds.closed.lock().await.insert(group_path.clone());
+            } else if cut == "degraded" {
+                engine.force_degraded();
+            }
+            if cut == "cancel" {
+                load.abort();
+            }
+            // Release only a GroupCreated this cut actually held. `Notify` stores a permit when no
+            // request is waiting, so an unmatched release would let the next cut's held catalog
+            // write pass straight through and its load answer before the cut is applied.
+            if pre_durability_stage.is_none() && !cancel_at_seed {
+                *f.ds.hold_group_catalog.lock().await = false;
+                f.ds.group_catalog_release.notify_one();
+            }
+            if cut == "cancel-head" {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+                    .await
+                    .context("post-durability HEAD did not reach its gate")?;
+                load.abort();
+                // `notify_waiters`, not `notify_one`: the aborted request's handler can be dropped
+                // before it polls a `notify_one`, which tokio would then store as a permit and let
+                // the truncate cut's held HEAD straight through.
+                f.ds.group_head_release.notify_waiters();
+            }
+            if cut == "truncate" {
+                // TRUNCATE at the post-durability HEAD, not inside the GroupCreated hold: retiring
+                // the inner table also releases every completed group with a member on it, and
+                // each release waits on the catalog writer that a held GroupCreated would block.
+                // The final locked recheck after this HEAD must still refuse the group.
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_head_arrived.notified())
+                    .await
+                    .context("post-durability HEAD did not reach its gate")?;
+                f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
+                let mut changed = f.ds.changed.subscribe();
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    loop {
+                        if f.ds
+                            .retired
+                            .lock()
+                            .await
+                            .iter()
+                            .any(|(method, path)| *method == Method::POST && path.ends_with(&group_path))
+                            && engine.subscription_owner(&format!("{subscription}:member:1")).await.is_none()
+                        {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        changed.changed().await.context("truncate retirement observation channel closed")?;
+                    }
+                })
+                .await
+                .context("truncate did not retire the group stream")??;
+                f.ds.group_head_release.notify_one();
+            }
+            if cut == "cancel" || cut == "cancel-head" {
+                tokio::time::timeout(Duration::from_secs(10), f.ds.group_catalog_arrived.notified())
+                    .await
+                    .context("cancel cleanup did not reach GroupDropped durability")?;
+                f.ds.group_catalog_release.notify_one();
+            }
+            if cut != "cancel" && cut != "cancel-head" && pre_durability_stage.is_none() && !cancel_at_seed {
+                let (status, body) = tokio::time::timeout(Duration::from_secs(15), &mut load)
+                    .await
+                    .context("group cut load did not finish")?
+                    .context("group cut load task failed")??;
+                ensure!(status != StatusCode::OK, "group cut answered 200: {status} {body}");
+            }
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if engine.subscription_owner(subscription).await.is_none()
+                        && engine.subscription_owner(&format!("{subscription}:member:1")).await.is_none()
+                        && !engine.group_reservation_for_test(subscription).await
+                        && !engine.has_group_record(subscription).await
+                    {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .context("group cut compensation left claims behind")??;
+            let catalog = stream_events(f, "meta/catalog").await;
+            if pre_durability_stage.is_some() || cancel_at_seed {
+                ensure!(
+                    !catalog.iter().any(|event| {
+                        event["t"] == "groupCreated" && event["group"]["subscription"] == subscription
+                    }),
+                    "pre-durability cancellation wrote GroupCreated: {subscription} events={catalog:?}"
+                );
+                if let Some(attempt_id) = pre_attempt_id {
+                    ensure!(
+                        catalog.iter().any(|event| {
+                            event["t"] == "groupDropped"
+                                && event["subscription"] == subscription
+                                && event["group_id"] == attempt_id
+                        }),
+                        "pre-durability cancellation dropped the wrong group: {subscription} events={catalog:?}"
+                    );
+                } else {
+                    ensure!(
+                        !catalog
+                            .iter()
+                            .any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
+                        "before-reservation cancellation wrote GroupDropped: {subscription} events={catalog:?}"
+                    );
+                }
+            } else {
+                ensure!(
+                    catalog.iter().any(|event| event["t"] == "groupDropped" && event["subscription"] == subscription),
+                    "group cut did not durably compensate GroupCreated: {subscription} events={catalog:?}"
+                );
+            }
+            if cut == "cancel"
+                || cut == "cancel-head"
+                || cut == "closed"
+                || pre_durability_stage.is_some()
+                || cancel_at_seed
+            {
+                let (status, body) = post_group(&app, group_body(f, subscription, true)).await?;
+                ensure!(status == StatusCode::OK, "compensated group could not be retried: {status} {body}");
+            }
+            if cut == "truncate" {
+                // The TRUNCATE handler holds the inner table's resolve lock while it retires every
+                // group earlier cuts left on that table, and refuses loads on it meanwhile. Let it
+                // finish before the next cut loads that table.
+                let inner = electric_circuits_engine::table_ref::TableRef::parse(&format!("public.{}", f.inner))?;
+                drop(
+                    tokio::time::timeout(Duration::from_secs(15), engine.force_resolve_lock(&inner))
+                        .await
+                        .context("the TRUNCATE resolution did not finish")?,
+                );
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// The release acknowledgement is durable before the engine-owned teardown is allowed to
+/// remove the group record. Dropping the HTTP DELETE at that exact point must not cancel the
+/// teardown; a retry can then reuse the subscription without a hidden member claim.
+async fn group_release_cancellation(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-release-cancel", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        let member_id = first["results"][0]["shapeId"].as_str().context("release cancellation member")?.to_owned();
+        let gate = engine.group_release_gate_for_test();
+        gate.arm();
+        let delete_app = app.clone();
+        let delete = tokio::spawn(async move {
+            json(
+                &delete_app,
+                Method::DELETE,
+                &format!("/v1/shapes/{member_id}?subscription=group-release-cancel"),
+                Body::empty(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+            .await
+            .context("release did not reach its post-durability gate")?;
+        delete.abort();
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if engine.subscription_owner("group-release-cancel").await.is_none()
+                    && engine.subscription_owner("group-release-cancel:member:1").await.is_none()
+                    && !engine.group_reservation_for_test("group-release-cancel").await
+                    && !engine.has_group_record("group-release-cancel").await
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("cancelled release did not complete")??;
+        let (status, replacement) = post_group(&app, group_body(f, "group-release-cancel", true)).await?;
+        ensure!(
+            status == StatusCode::OK,
+            "subscription was not reusable after cancelled release: {status} {replacement}"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+async fn group_renewal_cancellation(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, first) = post_group(&app, group_body(f, "group-renewal-cancel", true)).await?;
+        ensure!(status == StatusCode::OK, "initial group create failed: {status} {first}");
+        for stage in [GroupLoadAwait::RenewalHealth, GroupLoadAwait::RenewalStreamTail, GroupLoadAwait::RenewalSnapshot]
+        {
+            let gate = engine.group_load_gate_for_test();
+            gate.arm(stage).await;
+            let renew_app = app.clone();
+            let renew_body = group_body(f, "group-renewal-cancel", true);
+            let renew = tokio::spawn(async move { post_group(&renew_app, renew_body).await });
+            tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
+                .await
+                .context("renewal did not reach its cancellation gate")?;
+            renew.abort();
+            gate.release.notify_waiters();
+            ensure!(
+                tokio::time::timeout(Duration::from_secs(10), renew)
+                    .await
+                    .context("cancelled renewal did not terminate")
+                    .is_ok_and(|result| result.is_err()),
+                "renewal cancellation was not observed"
+            );
+            ensure!(engine.has_group_record("group-renewal-cancel").await, "cancelled renewal lost the group");
+            ensure!(
+                engine.subscription_owner("group-renewal-cancel").await.is_some()
+                    && engine.subscription_owner("group-renewal-cancel:member:1").await.is_some(),
+                "cancelled renewal lost a member claim"
+            );
+            let (status, retried) = post_group(&app, group_body(f, "group-renewal-cancel", true)).await?;
+            ensure!(status == StatusCode::OK && retried["groupId"] == first["groupId"], "renewal retry changed group");
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// Production gate #v-gate-reconnect-burst: independent scopes sharing the same member tables
+/// claim concurrently, then every reconnect retries the same named load as a renewal.
+async fn group_reconnect_burst(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let mut tasks = Vec::new();
+        for i in 0..30 {
+            let app = app.clone();
+            let body = group_body(f, &format!("group-burst-{i}"), false);
+            tasks.push(tokio::spawn(async move { post_group(&app, body).await }));
+        }
+        let mut first = Vec::new();
+        for (i, task) in tasks.into_iter().enumerate() {
+            let (status, body) = task.await.context("burst load task failed")??;
+            ensure!(status == StatusCode::OK, "burst load {i} was not admitted: {status} {body}");
+            first.push((
+                body["groupId"].as_str().unwrap_or_default().to_owned(),
+                body["streamPath"].as_str().unwrap_or_default().to_owned(),
+                body["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|member| member["shapeId"].as_str().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>(),
+            ));
+        }
+        for i in 0..30 {
+            let (status, body) = post_group(&app, group_body(f, &format!("group-burst-{i}"), false)).await?;
+            ensure!(status == StatusCode::OK, "burst renewal {i} was not idempotent: {status} {body}");
+            ensure!(
+                body["groupId"] == first[i].0 && body["streamPath"] == first[i].1,
+                "burst renewal changed group identity: {body}"
+            );
+            let members = body["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|member| member["shapeId"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>();
+            ensure!(members == first[i].2, "burst renewal changed member identities: {body}");
+        }
+        ensure!(
+            engine.graph().await.shapes.iter().filter(|shape| shape.stream_path.contains("shape/group-")).count() == 60,
+            "burst changed exact shape count"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// Production gate #v-gate-admission: one held group completion must not block another group or
+/// a plain shape create from making progress.
+async fn group_admission_gate(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let seed_gate = engine.group_seed_gate_for_test();
+        seed_gate.arm();
+        let first_app = app.clone();
+        let first_body = group_body(f, "group-admission-held", false);
+        let first = tokio::spawn(async move { post_group(&first_app, first_body).await });
+        tokio::time::timeout(Duration::from_secs(10), seed_gate.arrived.notified())
+            .await
+            .context("held group seed did not reach its gate")?;
+        let second_app = app.clone();
+        let second_body = group_body(f, "group-admission-independent", true);
+        let second = tokio::spawn(async move { post_group(&second_app, second_body).await });
+        let plain_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "changesOnly": true,
+            "subscription": "group-admission-plain",
+        });
+        let plain = tokio::time::timeout(
+            Duration::from_secs(2),
+            json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())),
+        )
+        .await
+        .context("plain create waited behind held group admission")??;
+        ensure!(
+            plain.0 == StatusCode::OK,
+            "plain create failed during independent admission: {} {:?}",
+            plain.0,
+            plain.1
+        );
+        let (status, body) = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .context("independent group load waited behind held admission")?
+            .context("independent group task failed")??;
+        ensure!(status == StatusCode::OK, "independent group load failed: {status} {body}");
+        seed_gate.release.notify_one();
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), first)
+            .await
+            .context("held admission group did not finish")?
+            .context("held admission task failed")??;
+        ensure!(status == StatusCode::OK, "held admission group failed: {status} {body}");
         Ok::<_, anyhow::Error>(())
     }
     .await;

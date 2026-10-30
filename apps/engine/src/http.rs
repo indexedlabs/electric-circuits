@@ -12,6 +12,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 
+#[cfg(feature = "test-support")]
+use crate::engine::GroupLoadAwait;
 use crate::engine::{Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
@@ -1208,6 +1210,18 @@ async fn subset_load_group(
                 retry_after: false,
             })?;
     }
+    // Capture every table the group reads before member creation begins. The completion path
+    // rechecks this generation/epoch snapshot after GroupCreated is durable.
+    let mut group_tables = Vec::new();
+    for member in &members {
+        group_tables.push(member.table.clone());
+        if let Some(where_) = &member.where_ {
+            group_tables.extend(crate::subquery::referenced_tables(where_));
+        }
+    }
+    group_tables.sort();
+    group_tables.dedup();
+    let group_gens = engine.capture_schema_gens(&group_tables).await;
     let _control = engine.admit_control()?;
     let group_sub = engine.resolve_subscription(subscription).await;
     // Each pass either answers, or waits for a release of the group it read to finish and then
@@ -1232,7 +1246,11 @@ async fn subset_load_group(
             // A teardown already owns this group.  Join it before probing storage: a transient
             // HEAD failure must not turn an in-flight release into a misleading health failure.
             release.wait().await.map_err(AppError::from)?;
-        } else if !engine.group_is_healthy(&existing).await.map_err(AppError::from)? {
+        } else if {
+            #[cfg(feature = "test-support")]
+            engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalHealth).await;
+            !engine.group_is_healthy(&existing).await.map_err(AppError::from)?
+        } {
             engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         } else if let Some(release) = engine.group_release_in_flight(&existing.id) {
             // Re-check after the health probe: a release can begin between that probe and the
@@ -1245,6 +1263,8 @@ async fn subset_load_group(
             if renewed_healthy {
                 // `None` once the stream has closed: a release that began after the renewal can
                 // have retired it while this request was between its probes.
+                #[cfg(feature = "test-support")]
+                engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalStreamTail).await;
                 let tail = engine.stream_tail(&existing.stream_path).await.map_err(|error| {
                     AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error))
                 })?;
@@ -1261,6 +1281,8 @@ async fn subset_load_group(
                             offset: None,
                         })
                         .collect();
+                    #[cfg(feature = "test-support")]
+                    engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalSnapshot).await;
                     let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
                     // Recheck under the state lock, where a release begins: a release that has
                     // not begun by now is ordered after this answer (#g-group-recheck).
@@ -1282,12 +1304,18 @@ async fn subset_load_group(
     // single-shape create cannot win the name between member creates.
     let member_subscriptions: Vec<String> =
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
-    engine.reserve_group(&group_sub, &member_subscriptions).await?;
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
+    engine.reserve_group_with_id(&group_sub, &member_subscriptions, &group_path).await?;
     engine.register_group_lane(&group_path);
     let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::AfterReservation).await;
     let mut created = Vec::with_capacity(members.len());
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
+        #[cfg(feature = "test-support")]
+        engine.wait_group_load_gate_for_test(GroupLoadAwait::MemberCreate(i)).await;
         match engine
             .create_shape_as_on_stream(
                 &member.table,
@@ -1309,6 +1337,8 @@ async fn subset_load_group(
             }
         }
     }
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::StreamTail).await;
     let offset = match engine.stream_tail(&group_path).await {
         Ok(Some(offset)) => offset,
         Ok(None) => {
@@ -1333,6 +1363,10 @@ async fn subset_load_group(
             offset: None,
         })
         .collect();
+    #[cfg(feature = "test-support")]
+    engine.wait_group_seed_gate_for_test().await;
+    #[cfg(feature = "test-support")]
+    engine.wait_group_load_gate_for_test(GroupLoadAwait::Snapshot).await;
     let page = match engine.query_subset_batch(reads).await {
         Ok(page) => page,
         Err(error) => {
@@ -1363,7 +1397,7 @@ async fn subset_load_group(
         horizon: page.horizon.clone(),
         replay_fence: offset.clone(),
     };
-    if let Err(error) = engine.complete_group(group_record.clone()).await {
+    if let Err(error) = engine.complete_group_with_gens(group_record.clone(), &group_gens).await {
         reservation.rollback().await;
         return Err(AppError::from(error));
     }

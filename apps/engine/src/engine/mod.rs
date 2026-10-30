@@ -636,6 +636,14 @@ pub struct Engine {
     purge_barriers: Arc<std::sync::Mutex<HashMap<String, Arc<PurgeBarrier>>>>,
     #[cfg(test)]
     pub(crate) purge_test_hook: Arc<PurgeTestHook>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_seed_test_gate: Arc<GroupSeedTestGate>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_abort_test_gate: Arc<GroupAbortTestGate>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_load_test_gate: Arc<GroupLoadTestGate>,
+    #[cfg(feature = "test-support")]
+    pub(crate) group_release_test_gate: Arc<GroupReleaseTestGate>,
     /// The segmented change log (ADR-0006): which segment the ingestor appends to, when each
     /// segment began, and the rotation policy. Held by the engine (not just the ingestor) because
     /// the retention sweeper deletes segments and the epoch reset rotates one.
@@ -733,9 +741,171 @@ pub(crate) struct PurgeBarrier {
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct PurgeTestHook {
+    pub(crate) pause_before_remove: std::sync::atomic::AtomicBool,
+    pub(crate) before_remove: tokio::sync::Notify,
+    pub(crate) release_before_remove: tokio::sync::Notify,
     pub(crate) pause_after_remove: std::sync::atomic::AtomicBool,
     pub(crate) removed: tokio::sync::Notify,
     pub(crate) release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupSeedTestGate {
+    armed: std::sync::atomic::AtomicBool,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupAbortTestGate {
+    armed: std::sync::atomic::AtomicBool,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+    pub finished: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GroupLoadAwait {
+    BeforeReservation,
+    AfterReservation,
+    MemberCreate(usize),
+    RenewalHealth,
+    RenewalStreamTail,
+    RenewalSnapshot,
+    StreamTail,
+    Snapshot,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupLoadTestGate {
+    stage: tokio::sync::Mutex<Option<GroupLoadAwait>>,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+pub struct GroupReleaseTestGate {
+    armed: std::sync::atomic::AtomicBool,
+    pub arrived: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupAbortTestGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupAbortTestGate {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_if_armed(&self) -> bool {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.arrived.notify_one();
+            notified.await;
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupLoadTestGate {
+    fn default() -> Self {
+        Self {
+            stage: tokio::sync::Mutex::new(None),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupLoadTestGate {
+    pub async fn arm(&self, stage: GroupLoadAwait) {
+        *self.stage.lock().await = Some(stage);
+    }
+
+    async fn wait_if_armed(&self, stage: GroupLoadAwait) {
+        let armed = self.stage.lock().await.as_ref() == Some(&stage);
+        if armed {
+            *self.stage.lock().await = None;
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.arrived.notify_one();
+            notified.await;
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupReleaseTestGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupReleaseTestGate {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_if_armed(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.arrived.notify_one();
+            notified.await;
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Default for GroupSeedTestGate {
+    fn default() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl GroupSeedTestGate {
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::Release);
+    }
+
+    async fn wait_if_armed(&self) {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            let notified = self.release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            self.arrived.notify_one();
+            notified.await;
+        }
+    }
 }
 
 impl PurgeBarrier {
@@ -1673,6 +1843,14 @@ impl Engine {
             purge_barriers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             purge_test_hook: Arc::new(PurgeTestHook::default()),
+            #[cfg(feature = "test-support")]
+            group_seed_test_gate: Arc::new(GroupSeedTestGate::default()),
+            #[cfg(feature = "test-support")]
+            group_abort_test_gate: Arc::new(GroupAbortTestGate::default()),
+            #[cfg(feature = "test-support")]
+            group_load_test_gate: Arc::new(GroupLoadTestGate::default()),
+            #[cfg(feature = "test-support")]
+            group_release_test_gate: Arc::new(GroupReleaseTestGate::default()),
             changes,
             consumers: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             seq_start: Arc::new(std::sync::Mutex::new(LogPosition::start())),
@@ -2950,6 +3128,17 @@ impl Engine {
     /// subscription map and the group map are checked while holding one state lock, so a
     /// concurrent single-shape create cannot win the same claim between member creates.
     pub(crate) async fn reserve_group(&self, subscription: &str, member_subscriptions: &[String]) -> Result<()> {
+        self.reserve_group_with_id(subscription, member_subscriptions, &format!("group {subscription}")).await
+    }
+
+    /// Reserve a group with its stream/incarnation id. Cancellation compensation uses this token
+    /// so a late abort cannot remove a newer reservation under the same subscription.
+    pub(crate) async fn reserve_group_with_id(
+        &self,
+        subscription: &str,
+        member_subscriptions: &[String],
+        reservation_id: &str,
+    ) -> Result<()> {
         let mut st = self.state.lock().await;
         // Checked first: while assembling, member 0 already owns the subscription, and a retry
         // must hear "retry" rather than a conflict with its own in-flight load.
@@ -2990,16 +3179,84 @@ impl Engine {
                 }));
             }
         }
-        st.group_claims.reserve(subscription, &format!("group {subscription}"))?;
+        st.group_claims.reserve(subscription, reservation_id)?;
         st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
         Ok(())
     }
 
     pub(crate) async fn complete_group(&self, record: GroupRecord) -> Result<()> {
+        let mut tables = Vec::new();
+        for member in &record.members {
+            if let Ok(table) = TableRef::parse(&member.table) {
+                tables.push(table);
+            }
+            if let Some(where_) = &member.where_ {
+                tables.extend(referenced_tables(where_));
+            }
+        }
+        tables.sort();
+        tables.dedup();
+        let gens = self.capture_schema_gens(&tables).await;
+        self.complete_group_with_gens(record, &gens).await
+    }
+
+    /// Complete a group with the schema/epoch snapshot captured before member creation began.
+    /// The catalog durability wait is an interval: the same health, generation, epoch,
+    /// registration and stream checks must run after it, before the group is made visible.
+    pub(crate) async fn complete_group_with_gens(&self, record: GroupRecord, gens: &SchemaGens) -> Result<()> {
         self.group_lanes.register(&record.stream_path);
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
+        let stream_open = match self.recheck_group_after_durability(&record, gens).await {
+            Ok(open) => open,
+            Err(error) => {
+                self.remove_group_lane(&record.stream_path);
+                // GroupCreated may already be in the durable catalog.  Leave a durable compensating
+                // intent behind before the caller's cancellation guard is allowed to disappear.
+                let _ = self
+                    .catalog_tx
+                    .send_durable(CatalogEvent::GroupDropped {
+                        subscription: record.subscription.clone(),
+                        group_id: Some(record.id.clone()),
+                    })
+                    .await;
+                return Err(error);
+            }
+        };
         let (valid, renewals) = {
             let mut st = self.state.lock().await;
+            let closing_error = if let Err(error) = self.ensure_not_degraded() {
+                Some(error)
+            } else if st.epoch_reset_since(gens) {
+                Some(anyhow::Error::new(CreateRaced(
+                    "the replication epoch was reset during group creation".to_string(),
+                )))
+            } else if let Some(table) = st.drifted_since(gens) {
+                Some(anyhow::Error::new(CreateRaced(format!("schema of '{table}' changed during group creation"))))
+            } else if !stream_open {
+                Some(anyhow::Error::new(CreateRaced(format!(
+                    "group stream '{}' closed during group activation",
+                    record.stream_path
+                ))))
+            } else if self.group_retirement_started(&record.id) {
+                Some(anyhow::Error::new(CreateRaced(format!(
+                    "group '{}' began retirement during group activation",
+                    record.id
+                ))))
+            } else {
+                None
+            };
+            if let Some(error) = closing_error {
+                drop(st);
+                self.remove_group_lane(&record.stream_path);
+                let _ = self
+                    .catalog_tx
+                    .send_durable(CatalogEvent::GroupDropped {
+                        subscription: record.subscription.clone(),
+                        group_id: Some(record.id.clone()),
+                    })
+                    .await;
+                return Err(error);
+            }
             let valid = record.members.iter().all(|member| {
                 st.shapes.contains_key(&member.shape_id)
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
@@ -3026,6 +3283,7 @@ impl Engine {
             }
         };
         if !valid {
+            self.remove_group_lane(&record.stream_path);
             let _ = self
                 .catalog_tx
                 .send_durable(CatalogEvent::GroupDropped {
@@ -3048,8 +3306,36 @@ impl Engine {
                 group_id: Some(group_id.to_string()),
             })
             .await?;
-        self.state.lock().await.group_claims.release(subscription);
+        self.state.lock().await.group_claims.release_reservation_if_matches(subscription, group_id);
+        #[cfg(feature = "test-support")]
+        let abort_was_gated = self.group_abort_test_gate.wait_if_armed().await;
+        self.state.lock().await.group_claims.abort_if_matches(subscription, group_id);
+        #[cfg(feature = "test-support")]
+        if abort_was_gated {
+            self.group_abort_test_gate.finished.notify_one();
+        }
         Ok(())
+    }
+
+    /// Capture the generations for all tables a group reads.  The caller takes this before its
+    /// first member create so a drift or epoch reset during any later await is observable by the
+    /// closing check in `complete_group_with_gens`.
+    pub(crate) async fn capture_schema_gens(&self, tables: &[TableRef]) -> SchemaGens {
+        self.state.lock().await.capture_gens(tables)
+    }
+
+    async fn recheck_group_after_durability(&self, record: &GroupRecord, gens: &SchemaGens) -> Result<bool> {
+        for member in &record.members {
+            self.recheck_after_durability(&member.shape_id, &record.stream_path, gens).await?;
+        }
+        match self.ds.head(&record.stream_path).await {
+            Ok(Some(head)) => Ok(!head.closed && head.next_offset.is_some()),
+            Ok(None) => Err(anyhow::Error::new(CreateRaced(format!(
+                "group stream '{}' disappeared during its catalog durability wait",
+                record.stream_path
+            )))),
+            Err(error) => Err(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error)),
+        }
     }
 
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
@@ -3059,6 +3345,50 @@ impl Engine {
     #[cfg(feature = "test-support")]
     pub async fn has_group_record(&self, subscription: &str) -> bool {
         self.state.lock().await.group_claims.get(subscription).is_some()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn group_id_for_test(&self, subscription: &str) -> Option<String> {
+        let st = self.state.lock().await;
+        st.group_claims
+            .get(subscription)
+            .map(|record| record.id.clone())
+            .or_else(|| st.group_claims.reservation_id(subscription).cloned())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn group_reservation_for_test(&self, subscription: &str) -> bool {
+        self.state.lock().await.group_claims.is_reserved(subscription)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_seed_gate_for_test(&self) -> Arc<GroupSeedTestGate> {
+        self.group_seed_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_abort_gate_for_test(&self) -> Arc<GroupAbortTestGate> {
+        self.group_abort_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_load_gate_for_test(&self) -> Arc<GroupLoadTestGate> {
+        self.group_load_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn group_release_gate_for_test(&self) -> Arc<GroupReleaseTestGate> {
+        self.group_release_test_gate.clone()
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_group_load_gate_for_test(&self, stage: GroupLoadAwait) {
+        self.group_load_test_gate.wait_if_armed(stage).await;
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_group_seed_gate_for_test(&self) {
+        self.group_seed_test_gate.wait_if_armed().await;
     }
 
     pub(crate) async fn begin_group_release(
@@ -3078,6 +3408,12 @@ impl Engine {
         let release = GroupRelease::new();
         releases.insert(group.id.clone(), release.clone());
         Some((group, release, false))
+    }
+
+    /// The single retirement mark used by renewal and fresh group activation. Callers hold the
+    /// engine state lock before invoking this helper, matching `group_is_current`'s ordering.
+    fn group_retirement_started(&self, group_id: &str) -> bool {
+        self.group_releases.lock().unwrap().contains_key(group_id)
     }
 
     pub(crate) fn group_release_in_flight(&self, group_id: &str) -> Option<Arc<GroupRelease>> {
@@ -3137,7 +3473,7 @@ impl Engine {
     pub(crate) async fn group_is_current(&self, group: &GroupRecord) -> bool {
         let st = self.state.lock().await;
         st.group_claims.get(&group.subscription).is_some_and(|current| current.id == group.id)
-            && !self.group_releases.lock().unwrap().contains_key(&group.id)
+            && !self.group_retirement_started(&group.id)
             && group.members.iter().all(|member| {
                 st.shapes.contains_key(&member.shape_id)
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
@@ -3180,6 +3516,8 @@ impl Engine {
                 group_id: Some(group_id.to_string()),
             })
             .await?;
+        #[cfg(feature = "test-support")]
+        self.group_release_test_gate.wait_if_armed().await;
         let _ = self.take_group(subscription, group_id).await;
         Ok(())
     }

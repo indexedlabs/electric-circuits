@@ -2644,6 +2644,10 @@ mod tests {
         /// One transient HEAD response for a matching path suffix.
         pub(crate) head_fault: std::sync::Mutex<Option<(String, u16)>>,
         pub(crate) head_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, u16)>>>,
+        /// Hold a scripted HEAD after its response is determined, exposing the final
+        /// post-durability recheck window to deterministic engine tests.
+        pub(crate) head_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
+        pub(crate) head_gate_path: std::sync::Mutex<Option<String>>,
         /// One fault at the nth matching append, consumed before it is executed.
         pub(crate) append_fault: std::sync::Mutex<Option<(String, usize, AppendFault)>>,
         pub(crate) read_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>>,
@@ -3065,12 +3069,21 @@ mod tests {
                         Some(closed) => res.closed = *closed,
                     }
                 }
-                let mut fault = self.head_fault.lock().unwrap();
-                if fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
-                    res.status = fault.take().unwrap().1;
+                {
+                    let mut fault = self.head_fault.lock().unwrap();
+                    if fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
+                        res.status = fault.take().unwrap().1;
+                    }
                 }
                 if let Some(observer) = self.head_observer.lock().unwrap().as_ref() {
                     let _ = observer.send((path.to_string(), res.status));
+                }
+                let gate = self.head_gate.lock().unwrap().clone();
+                let gate_path = self.head_gate_path.lock().unwrap().clone();
+                if let Some(gate) = gate
+                    && gate_path.as_deref().is_none_or(|suffix| path.ends_with(suffix))
+                {
+                    gate.hold().await;
                 }
                 if self.read_appended {
                     let end = self.appended.lock().unwrap().iter().filter(|(p, _, _)| p == path).count();
