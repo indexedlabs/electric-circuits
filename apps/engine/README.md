@@ -58,6 +58,8 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_LOG_JSON` | `1` | Emit structured JSON logs (recommended for CloudWatch/Logfire); set `0` for human-readable text |
 | `ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS` | `5` | Emit a cheap structured process/cgroup/cardinality memory snapshot at this interval; `0` disables it |
 | `ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS` | `30` | Include the expensive owned-heap breakdown in a memory snapshot at this interval; `0` disables byte walks |
+| `ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES` | `67108864` (64 MiB) | Group lanes: bytes of committed output queued behind the append currently in progress. The in-flight transaction is governed by the 512 MiB Durable Streams ceiling and is excluded from this cap. `0` disables the byte cap |
+| `ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS` | `60` | Group lanes: active seconds the oldest pending output may wait after later commits pass it while other stream appends continue to land. Durable Streams outages do not consume this budget. `0` disables the wait cap |
 | `OTEL_SERVICE_NAME` | *(unset)* | OTel resource service name; used by the OTLP metrics exporter when set |
 | `OTEL_RESOURCE_ATTRIBUTES` | *(unset)* | Comma-separated OTel resource attributes (for example, `deployment.environment=prod`) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | *(unset)* | When set, export the engine's OTel metrics over HTTP/protobuf in addition to `/metrics/prometheus` |

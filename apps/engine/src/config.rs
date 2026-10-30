@@ -13,8 +13,8 @@
 //! | Setting | Default | Meaning |
 //! | --- | --- | --- |
 //! | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in shared transient byte admission: a positive value enables it; unset or `0` disables it and logs once, regardless of cgroup limits. |
-//! | `ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES` | `67108864` | Bytes queued behind the group append in progress before that group is retired. |
-//! | `ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS` | `60` | Seconds the oldest pending group output may wait while other commits advance. |
+//! | `ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES` | `67108864` | Bytes queued behind the group append in progress before that group is retired; `0` disables this cap. |
+//! | `ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS` | `60` | Active seconds the oldest pending group output may wait while other stream appends advance; `0` disables this cap. |
 //!
 //! Configuration clones share one lazily initialized budget, including supervised sources.
 //! Reservations cover transient inputs, not retained fold maps, decoded backfill rows, allocator

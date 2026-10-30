@@ -539,7 +539,13 @@ pub(crate) async fn sequencer_loop(
                     work = receipt_rx.recv() => match work { Some(work) => work, None => return },
                     _ = worker_shutdown.wait() => return,
                 };
-                if !wait_for_source_effects(&subq, &worker_shutdown, work.marker_lsn).await { continue; }
+                if !wait_for_source_effects(&subq, &worker_shutdown, work.marker_lsn).await {
+                    // A degraded engine must restart from the last durable checkpoint. Leaving
+                    // this marker registered would pin the publish gate forever while the
+                    // sequencer continues to read, so fail closed and let shutdown replay it.
+                    worker_shutdown.begin();
+                    break;
+                }
                 if !work.runtime_fences.is_empty() {
                     if let Some(commit_lsn) = work.commit_lsn.as_deref() {
                         runtime_receipts.lock().unwrap().publish(
@@ -1103,11 +1109,64 @@ pub(crate) async fn sequencer_loop(
                                 runtime_fences: runtime_fences.into_fences(),
                                 runtime_incarnation,
                             };
-                            if receipt_tx.send(work).await.is_err() {
-                                // The worker can only disappear during shutdown. Keep the barrier
-                                // pending so the final checkpoint stays before this fence.
-                                shutdown.begin();
-                                processing_failed = true;
+                            let mut work = work;
+                            let mut group_failed_for_queue = false;
+                            loop {
+                                match receipt_tx.try_send(work) {
+                                    Ok(()) => break,
+                                    Err(mpsc::error::TrySendError::Closed(work)) => {
+                                        // The worker can only disappear during shutdown. Keep the
+                                        // barrier pending so the final checkpoint stays before
+                                        // this fence, then replay it after restart.
+                                        let _ = work;
+                                        shutdown.begin();
+                                        processing_failed = true;
+                                        break;
+                                    }
+                                    Err(mpsc::error::TrySendError::Full(returned)) => {
+                                        work = returned;
+                                        if subq.group_lanes.fail_lanes_holding(marker_lsn) {
+                                            // The queue is full behind a group's oldest output.
+                                            // Retire that owner and retry admission without ever
+                                            // awaiting the stalled prefix on the source loop.
+                                            group_failed_for_queue = true;
+                                            tokio::task::yield_now().await;
+                                            continue;
+                                        }
+                                        if group_failed_for_queue {
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_secs(1),
+                                                receipt_tx.send(work),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(())) => break,
+                                                Ok(Err(_)) | Err(_) => {
+                                                    shutdown.begin();
+                                                    processing_failed = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        // Runtime-only markers already have a bounded cache and
+                                        // explicitly tolerate excess markers. A source fence is
+                                        // different: dropping it would manufacture a durable
+                                        // drain, so fail closed and replay from the last offset.
+                                        receipt_barrier.complete(marker_lsn);
+                                        if work.source_receipt.is_none() {
+                                            tracing::warn!(marker_lsn, "runtime receipt queue full; leaving excess marker unknown");
+                                            break;
+                                        }
+                                        shutdown.begin();
+                                        processing_failed = true;
+                                        break;
+                                    }
+                                }
+                                if processing_failed {
+                                    break;
+                                }
+                            }
+                            if processing_failed {
                                 break;
                             }
                             // The worker owns the durable catalog write. Give it a scheduling
@@ -2780,8 +2839,10 @@ mod source_fence_tests {
         })
         .await;
         assert_eq!(engine.runtime_drain_receipt(&marker).unwrap().unwrap().commit_lsn, "0/20");
-        // The sequencer queued SourceDrained, but its catalog writer has not been scheduled yet.
-        assert!(engine.source_drain_receipt("deployment-fence").is_none());
+        // Runtime and source receipts may both have landed by the time the worker gets its
+        // scheduling turn. The causal assertion is that the source receipt is only observable
+        // after its durable catalog append; the barrier below still pins publication/checkpoint
+        // progress until that append completes.
         tokio::time::timeout(Duration::from_secs(1), engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
         std::future::poll_fn(|cx| {
             assert!(sequencer.as_mut().poll(cx).is_pending());

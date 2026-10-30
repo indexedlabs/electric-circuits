@@ -1896,27 +1896,40 @@ impl Engine {
         let overflow_engine = engine.clone();
         engine.shutdown.spawn_background(async move {
             while let Some(notice) = overflow_rx.recv().await {
-                let terminal = crate::ds::Envelope {
-                    type_: "electric.group_error".into(),
-                    key: notice.group_id.clone(),
-                    value: Some(serde_json::json!({ "code": "group_backlog_overflow" })),
-                    old: None,
-                    headers: crate::ds::EnvelopeHeaders {
-                        operation: "error".into(),
-                        txid: None,
-                        offset: None,
-                        lsn: None,
-                        seq: None,
-                        last: None,
-                    },
-                };
-                if let Err(error) = overflow_engine.ds.append_reliable(&notice.stream_path, &[terminal]).await {
-                    tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow terminal append failed");
-                }
-                if let Err(error) = overflow_engine.release_group_claim(&notice.subscription, &notice.group_id).await {
-                    tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow retirement failed");
-                    overflow_engine.retirements.enqueue(&notice.stream_path, None);
-                }
+                let group_engine = overflow_engine.clone();
+                group_engine.shutdown.spawn_background(async move {
+                    let terminal = crate::ds::Envelope {
+                        type_: "electric.group_error".into(),
+                        key: notice.group_id.clone(),
+                        value: Some(serde_json::json!({ "code": "group_backlog_overflow" })),
+                        old: None,
+                        headers: crate::ds::EnvelopeHeaders {
+                            operation: "error".into(),
+                            txid: None,
+                            offset: None,
+                            lsn: None,
+                            seq: None,
+                            last: None,
+                        },
+                    };
+                    // A failed lane must never wait forever on its own terminal append. The
+                    // retirement path is independent, so later overflows can still retire and
+                    // publish their reload reason while this stream is unavailable.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        group_engine.ds.append_reliable(&notice.stream_path, &[terminal]),
+                    )
+                    .await
+                    {
+                        Ok(Err(error)) => tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow terminal append failed"),
+                        Err(_) => tracing::warn!(stream_path = %notice.stream_path, "group backlog overflow terminal append timed out"),
+                        Ok(Ok(_)) => {}
+                    }
+                    if let Err(error) = group_engine.release_group_claim(&notice.subscription, &notice.group_id).await {
+                        tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow retirement failed");
+                        group_engine.retirements.enqueue(&notice.stream_path, None);
+                    }
+                });
             }
         });
         // The streams client must be able to ask the engine whether a terminal append answer is
