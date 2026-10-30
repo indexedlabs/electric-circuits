@@ -351,13 +351,16 @@ impl GroupEmissionLanes {
                     continue;
                 };
                 let append = {
-                    let cancelled = ticket.state.load(std::sync::atomic::Ordering::Acquire) == TICKET_CANCELLED;
-                    if cancelled {
+                    // Arm the notification before observing the state. `Notify::notify_waiters`
+                    // does not retain a permit, so checking first would lose a cancellation that
+                    // lands between the load and `enable()` and leave a failed lane stuck in its
+                    // append forever.
+                    let cancelled_wait = ticket.cancelled.notified();
+                    tokio::pin!(cancelled_wait);
+                    cancelled_wait.as_mut().enable();
+                    if ticket.state.load(std::sync::atomic::Ordering::Acquire) == TICKET_CANCELLED {
                         None
                     } else {
-                        let cancelled_wait = ticket.cancelled.notified();
-                        tokio::pin!(cancelled_wait);
-                        cancelled_wait.as_mut().enable();
                         let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs);
                         tokio::pin!(append);
                         tokio::select! {
@@ -466,14 +469,16 @@ impl GroupEmissionLanes {
         self.origins.lock().unwrap().keys().any(|(_, lsn)| *lsn <= marker_lsn)
     }
 
-    /// Retire only lanes that are holding the oldest receipt prefix. This is the bounded
-    /// rejection policy for a full receipt work queue: a stalled group is the owner of the
-    /// blocked prefix, so its wait cap is enforced before receipt admission can slow the source.
+    /// Retire the single lane that owns the oldest receipt prefix after its wait cap has actually
+    /// elapsed. A full receipt queue by itself is not evidence that any group is stalled: healthy
+    /// groups can be appending concurrently, and retiring them would violate the per-group cap.
     pub(crate) fn fail_lanes_holding(&self, marker_lsn: u64) -> bool {
         let lanes = self.lanes.lock().unwrap().values().cloned().collect::<Vec<_>>();
-        let mut failed = false;
+        let mut oldest: Option<u64> = None;
+        let mut candidates = Vec::new();
         for lane in lanes {
-            if lane.config.max_stall == std::time::Duration::ZERO {
+            let state = lane.state.lock().unwrap();
+            if lane.config.max_stall == std::time::Duration::ZERO || state.active_wait < lane.config.max_stall {
                 continue;
             }
             let path = lane.metadata.lock().unwrap().stream_path.clone();
@@ -484,11 +489,26 @@ impl GroupEmissionLanes {
                 .keys()
                 .any(|(origin_path, lsn)| origin_path == &path && *lsn <= marker_lsn);
             if holds_prefix {
-                failed = true;
-                Self::fail_lane(&lane, "wait", lane.config.max_stall, marker_lsn);
+                let oldest_lsn = state
+                    .in_flight
+                    .as_ref()
+                    .or_else(|| state.admitted.front())
+                    .or_else(|| state.waiting.front())
+                    .map(|ticket| ticket.entry.commit_lsn)
+                    .unwrap_or(marker_lsn);
+                if oldest.is_none_or(|current| oldest_lsn < current) {
+                    oldest = Some(oldest_lsn);
+                    candidates.clear();
+                }
+                if oldest == Some(oldest_lsn) {
+                    candidates.push((lane.clone(), state.active_wait));
+                }
             }
         }
-        failed
+        for (lane, waited) in candidates {
+            Self::fail_lane(&lane, "wait", waited, marker_lsn);
+        }
+        oldest.is_some()
     }
 
     pub(crate) fn wake(&self) -> Arc<tokio::sync::Notify> {
@@ -748,11 +768,12 @@ fn progress_lane_set(lanes: Vec<Arc<GroupLane>>, commit_lsn: u64) {
                 state.threshold_wait = [false; 2];
             } else if let Some(previous) = state.progress_at {
                 let delta = now.saturating_duration_since(previous);
-                // A long gap contains no evidence that another stream was landing. Preserve the
-                // accumulated active time, but do not charge the outage/idle interval to this
-                // group's oldest output. Short gaps are the interval during which progress was
-                // demonstrably continuing and count toward the cap.
-                if lane.config.max_stall == std::time::Duration::ZERO || delta < lane.config.max_stall {
+                // A progress call is a point observation, so a long gap cannot tell us that
+                // another stream kept landing during the whole interval. Keep the accumulated
+                // active time, but charge only closely-spaced observations; an outage or an idle
+                // source therefore does not consume the group's wait budget when it recovers.
+                let progress_gap = lane.config.max_stall / 4;
+                if lane.config.max_stall == std::time::Duration::ZERO || delta <= progress_gap {
                     state.active_wait = state.active_wait.saturating_add(delta);
                 }
                 state.progress_at = Some(now);
@@ -1213,11 +1234,13 @@ mod tests {
         lanes.register("shape/group-telemetry");
         lanes.set_metadata("shape/group-telemetry", "group-telemetry", "sub-telemetry", vec!["public.items".into()]);
         let first = lanes.reserve("shape/group-telemetry", vec![failure_test_envelope()], 1).unwrap();
+        let first_task = tokio::spawn(first.wait());
         tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
         let second = lanes.reserve("shape/group-telemetry", vec![failure_test_envelope()], 2).unwrap();
+        let second_task = tokio::spawn(second.wait());
         assert!(lanes.reserve("shape/group-telemetry", vec![failure_test_envelope()], 3).is_none());
-        drop(first);
-        drop(second);
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_task).await.unwrap().unwrap();
 
         lanes.register("shape/group-held-telemetry");
         lanes.set_metadata(
@@ -1230,12 +1253,26 @@ mod tests {
         *store.append_fault.lock().unwrap() =
             Some(("shape/group-held-telemetry".into(), 0, crate::ds::AppendFault::Hold(held_gate.clone())));
         let held = lanes.reserve("shape/group-held-telemetry", vec![failure_test_envelope()], 10).unwrap();
+        let held_task = tokio::spawn(held.wait());
         tokio::time::timeout(std::time::Duration::from_secs(1), held_gate.entered.notified()).await.unwrap();
         lanes.progress(11);
         tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
         lanes.progress(12);
-        drop(held);
         lanes.remove("shape/group-held-telemetry");
+        tokio::time::timeout(std::time::Duration::from_secs(1), held_task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !output
+                .0
+                .lock()
+                .unwrap()
+                .windows(b"group_replay_held".len())
+                .any(|window| window == b"group_replay_held")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         let lines = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
         let events = lines

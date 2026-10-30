@@ -1110,7 +1110,6 @@ pub(crate) async fn sequencer_loop(
                                 runtime_incarnation,
                             };
                             let mut work = work;
-                            let mut group_failed_for_queue = false;
                             loop {
                                 match receipt_tx.try_send(work) {
                                     Ok(()) => break,
@@ -1118,6 +1117,7 @@ pub(crate) async fn sequencer_loop(
                                         // The worker can only disappear during shutdown. Keep the
                                         // barrier pending so the final checkpoint stays before
                                         // this fence, then replay it after restart.
+                                        highwater = txn_highwater;
                                         let _ = work;
                                         shutdown.begin();
                                         processing_failed = true;
@@ -1129,37 +1129,22 @@ pub(crate) async fn sequencer_loop(
                                             // The queue is full behind a group's oldest output.
                                             // Retire that owner and retry admission without ever
                                             // awaiting the stalled prefix on the source loop.
-                                            group_failed_for_queue = true;
                                             tokio::task::yield_now().await;
                                             continue;
                                         }
-                                        if group_failed_for_queue {
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_secs(1),
-                                                receipt_tx.send(work),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Ok(())) => break,
-                                                Ok(Err(_)) | Err(_) => {
-                                                    shutdown.begin();
-                                                    processing_failed = true;
-                                                    break;
-                                                }
+                                        // A full queue with no lane that has crossed its wait cap
+                                        // is ordinary receipt backpressure. Preserve ordering and
+                                        // every marker by waiting for the worker rather than
+                                        // dropping work or restarting a healthy engine.
+                                        match receipt_tx.send(work).await {
+                                            Ok(()) => break,
+                                            Err(_) => {
+                                                highwater = txn_highwater;
+                                                shutdown.begin();
+                                                processing_failed = true;
+                                                break;
                                             }
                                         }
-                                        // Runtime-only markers already have a bounded cache and
-                                        // explicitly tolerate excess markers. A source fence is
-                                        // different: dropping it would manufacture a durable
-                                        // drain, so fail closed and replay from the last offset.
-                                        receipt_barrier.complete(marker_lsn);
-                                        if work.source_receipt.is_none() {
-                                            tracing::warn!(marker_lsn, "runtime receipt queue full; leaving excess marker unknown");
-                                            break;
-                                        }
-                                        shutdown.begin();
-                                        processing_failed = true;
-                                        break;
                                     }
                                 }
                                 if processing_failed {
@@ -1253,7 +1238,11 @@ pub(crate) async fn sequencer_loop(
                         }
                     }
                     publish_gate.release(&subq.group_lanes, &processed, &shutdown);
-                    let (ckpt, ckpt_highwater) = publish_gate.checkpoint(published(&pos, &held_from), highwater);
+                    let (ckpt, ckpt_highwater) = publish_gate.checkpoint(
+                        &subq.group_lanes,
+                        published(&pos, &held_from),
+                        highwater,
+                    );
                     // Either half moving is progress worth persisting: the position, or — while the
                     // position is pinned behind a held run — the de-duplication highwater.
                     let ckpt_moved = ckpt != ckpt_pos || ckpt_highwater != ckpt_hw;
@@ -1345,7 +1334,11 @@ pub(crate) async fn sequencer_loop(
             // timeout covers a completion that fired before this wait was registered.
             _ = tokio::time::timeout(std::time::Duration::from_millis(100), group_wake.notified()), if publish_gate.is_waiting() => {
                 if publish_gate.release(&subq.group_lanes, &processed, &shutdown) {
-                    let (ckpt, ckpt_highwater) = publish_gate.checkpoint(published(&pos, &held_from), highwater);
+                    let (ckpt, ckpt_highwater) = publish_gate.checkpoint(
+                        &subq.group_lanes,
+                        published(&pos, &held_from),
+                        highwater,
+                    );
                     let crossed = ckpt.segment != ckpt_pos.segment;
                     if crossed || ((ckpt != ckpt_pos || ckpt_highwater != ckpt_hw)
                         && last_ckpt.elapsed() >= std::time::Duration::from_secs(2))
@@ -1369,7 +1362,7 @@ pub(crate) async fn sequencer_loop(
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
     if !paused && completed_read {
-        let (ckpt, highwater) = publish_gate.checkpoint(published(&pos, &held_from), highwater);
+        let (ckpt, highwater) = publish_gate.checkpoint(&subq.group_lanes, published(&pos, &held_from), highwater);
         catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
         tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
     } else if paused {
@@ -1475,8 +1468,17 @@ impl PublishGate {
 
     /// What a checkpoint may carry: the live boundary when nothing waits, else the last
     /// published one.
-    fn checkpoint(&self, pos: LogPosition, highwater: Option<(u64, u64)>) -> (LogPosition, Option<(u64, u64)>) {
-        if self.waiting.is_empty() && !self.receipts.has_at_or_before(highwater.map_or(u64::MAX, |(lsn, _)| lsn)) {
+    fn checkpoint(
+        &self,
+        lanes: &crate::engine::emission::GroupEmissionLanes,
+        pos: LogPosition,
+        highwater: Option<(u64, u64)>,
+    ) -> (LogPosition, Option<(u64, u64)>) {
+        let marker = highwater.map_or(u64::MAX, |(lsn, _)| lsn);
+        if self.waiting.is_empty()
+            && !lanes.has_any_origin_at_or_before(marker)
+            && !self.receipts.has_at_or_before(marker)
+        {
             (pos, highwater)
         } else {
             self.published.clone()
@@ -2656,7 +2658,15 @@ mod source_fence_tests {
         let mut gate = PublishGate::new(start.clone(), None, receipts.clone());
         gate.publish(&subq.group_lanes, &processed, next.clone(), Some((0x20, 0)));
         assert_eq!(*processed.lock().unwrap(), start);
-        assert_eq!(gate.checkpoint(next.clone(), Some((0x20, 0))), (start.clone(), None));
+        let lanes = crate::engine::emission::GroupEmissionLanes::new(
+            crate::ds::DsClient::with_test_store(
+                "scripted://publish-gate".into(),
+                Arc::new(crate::ds::ScriptedStore::default()),
+            ),
+            crate::shutdown::ShutdownToken::new(),
+            Arc::new(PendingFlips::default()),
+        );
+        assert_eq!(gate.checkpoint(&lanes, next.clone(), Some((0x20, 0))), (start.clone(), None));
         receipts.complete(0x20);
         assert!(gate.release(&subq.group_lanes, &processed, &crate::shutdown::ShutdownToken::new()));
         assert_eq!(*processed.lock().unwrap(), next);

@@ -1897,7 +1897,8 @@ impl Engine {
         engine.shutdown.spawn_background(async move {
             while let Some(notice) = overflow_rx.recv().await {
                 let group_engine = overflow_engine.clone();
-                group_engine.shutdown.spawn_background(async move {
+                let group_shutdown = group_engine.shutdown.clone();
+                group_shutdown.spawn_background(async move {
                     let terminal = crate::ds::Envelope {
                         type_: "electric.group_error".into(),
                         key: notice.group_id.clone(),
