@@ -28,6 +28,52 @@ struct ReceiptWork {
     runtime_incarnation: uuid::Uuid,
 }
 
+#[derive(Default)]
+struct ReceiptBarrier {
+    pending: std::sync::Mutex<BTreeMap<u64, usize>>,
+    wake: tokio::sync::Notify,
+}
+
+impl ReceiptBarrier {
+    fn register(&self, marker: u64) {
+        *self.pending.lock().unwrap().entry(marker).or_default() += 1;
+    }
+
+    fn complete(&self, marker: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(count) = pending.get_mut(&marker) {
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&marker);
+            }
+        }
+        drop(pending);
+        self.wake.notify_waiters();
+    }
+
+    fn has_at_or_before(&self, marker: u64) -> bool {
+        self.pending.lock().unwrap().keys().any(|value| *value <= marker)
+    }
+
+    async fn wait_until(&self, marker: u64, shutdown: &crate::shutdown::ShutdownToken) {
+        loop {
+            if !self.has_at_or_before(marker) || shutdown.is_shutting_down() {
+                return;
+            }
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.has_at_or_before(marker) || shutdown.is_shutting_down() {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = shutdown.wait() => return,
+            }
+        }
+    }
+}
+
 pub(crate) enum SequencerCmd {
     /// Phase 1 of shape creation: register a PENDING shape that buffers this table's deltas while
     /// the creator runs the Postgres backfill concurrently — the sequencer itself never blocks on
@@ -476,7 +522,8 @@ pub(crate) async fn sequencer_loop(
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
-    let (receipt_tx, mut receipt_rx) = mpsc::unbounded_channel::<ReceiptWork>();
+    let receipt_barrier = Arc::new(ReceiptBarrier::default());
+    let (receipt_tx, mut receipt_rx) = mpsc::channel::<ReceiptWork>(128);
     {
         let subq = subq.clone();
         let source_receipts = source_receipts.clone();
@@ -485,6 +532,7 @@ pub(crate) async fn sequencer_loop(
         let runtime_receipts = runtime_receipts.clone();
         let worker_shutdown = shutdown.clone();
         let catalog_tx = catalog_tx.clone();
+        let receipt_barrier = receipt_barrier.clone();
         shutdown.clone().spawn_background(async move {
             loop {
                 let work = tokio::select! {
@@ -502,16 +550,24 @@ pub(crate) async fn sequencer_loop(
                         );
                     }
                 }
-                let Some(receipt) = work.source_receipt else { continue };
+                let Some(receipt) = work.source_receipt else {
+                    receipt_barrier.complete(work.marker_lsn);
+                    continue;
+                };
                 let source_commit_id = receipt.source_commit_id.clone();
                 source_receipt_progress.lock().unwrap().record(&source_commit_id);
                 if let Err(error) = catalog_tx.send_durable(CatalogEvent::SourceDrained(receipt.clone())).await {
                     tracing::error!(%error, %source_commit_id, "sequencer: source fence catalog receipt was not acknowledged");
-                    continue;
+                    // Keep the receipt barrier held when the durable catalog did not accept it.
+                    // Shutdown preserves the earlier checkpoint and the next boot replays this
+                    // transaction rather than claiming a durable source fence.
+                    worker_shutdown.begin();
+                    break;
                 }
                 source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
                 *last_source_receipt.lock().unwrap() = Some(receipt);
                 tracing::info!(%source_commit_id, commit_lsn = ?work.commit_lsn, "source transaction durably drained");
+                receipt_barrier.complete(work.marker_lsn);
             }
         });
     }
@@ -579,7 +635,8 @@ pub(crate) async fn sequencer_loop(
     // so a full or stalled group never holds another group or a plain shape. What waits instead is
     // what a restart, a convergence barrier and the segment-deletion floor read: `processed` and
     // the checkpoint never pass a transaction whose group output has not landed.
-    let mut publish_gate = PublishGate::new(processed.lock().unwrap().clone(), restore_highwater);
+    let mut publish_gate =
+        PublishGate::new(processed.lock().unwrap().clone(), restore_highwater, receipt_barrier.clone());
     let group_wake = subq.group_lanes.wake();
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -696,6 +753,9 @@ pub(crate) async fn sequencer_loop(
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::Barrier { done }) => {
+                    receipt_barrier
+                        .wait_until(highwater.map_or(u64::MAX, |(lsn, _)| lsn), &shutdown)
+                        .await;
                     let _ = done.send(());
                 }
                 Some(SequencerCmd::ResumeReads { done }) => {
@@ -1009,6 +1069,7 @@ pub(crate) async fn sequencer_loop(
                         // Transaction boundary: every plain append of this commit lands before the
                         // next commit is processed. Group output is handed to its lanes only once
                         // that flush succeeded, so a transaction that must be replayed leaves none.
+                        let other_stream_output = !txn_pending.is_empty();
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
                             tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
                             highwater = txn_highwater;
@@ -1018,7 +1079,12 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in group_batches {
                             subq.group_lanes.submit(&path, envs, group_lsn);
                         }
-                        subq.group_lanes.progress(group_lsn);
+                        // A wait-cap clock advances only after a successful append to a plain
+                        // stream. If storage is down and every append is stopped, no progress
+                        // event is emitted and no group consumes its wait budget.
+                        if other_stream_output {
+                            subq.group_lanes.progress(group_lsn);
+                        }
                         if runtime_fences.overflowed() {
                             tracing::warn!(commit_lsn = ?lsn, capacity = crate::runtime_authority::RECEIPT_CAPACITY,
                                 "runtime marker staging full; excess receipts stay unknown; application transaction processed");
@@ -1028,13 +1094,26 @@ pub(crate) async fn sequencer_loop(
                             commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
                         });
                         if source_receipt.is_some() || !runtime_fences.is_empty() {
-                            let _ = receipt_tx.send(ReceiptWork {
-                                marker_lsn: lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX),
+                            let marker_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX);
+                            receipt_barrier.register(marker_lsn);
+                            let work = ReceiptWork {
+                                marker_lsn,
                                 commit_lsn: lsn.clone(),
                                 source_receipt,
                                 runtime_fences: runtime_fences.into_fences(),
                                 runtime_incarnation,
-                            });
+                            };
+                            if receipt_tx.send(work).await.is_err() {
+                                // The worker can only disappear during shutdown. Keep the barrier
+                                // pending so the final checkpoint stays before this fence.
+                                shutdown.begin();
+                                processing_failed = true;
+                                break;
+                            }
+                            // The worker owns the durable catalog write. Give it a scheduling
+                            // turn before the sequencer continues to the next command/read so the
+                            // existing command barrier observes the same receipt ordering.
+                            tokio::task::yield_now().await;
                         }
                     }
                     if processing_failed {
@@ -1276,11 +1355,12 @@ async fn wait_for_source_effects(
 struct PublishGate {
     waiting: std::collections::VecDeque<(u64, LogPosition, Option<(u64, u64)>)>,
     published: (LogPosition, Option<(u64, u64)>),
+    receipts: Arc<ReceiptBarrier>,
 }
 
 impl PublishGate {
-    fn new(pos: LogPosition, highwater: Option<(u64, u64)>) -> Self {
-        Self { waiting: std::collections::VecDeque::new(), published: (pos, highwater) }
+    fn new(pos: LogPosition, highwater: Option<(u64, u64)>, receipts: Arc<ReceiptBarrier>) -> Self {
+        Self { waiting: std::collections::VecDeque::new(), published: (pos, highwater), receipts }
     }
 
     fn is_waiting(&self) -> bool {
@@ -1297,7 +1377,10 @@ impl PublishGate {
         highwater: Option<(u64, u64)>,
     ) {
         let marker = highwater.map_or(u64::MAX, |(lsn, _)| lsn);
-        if self.waiting.is_empty() && !lanes.has_any_origin_at_or_before(marker) {
+        if self.waiting.is_empty()
+            && !lanes.has_any_origin_at_or_before(marker)
+            && !self.receipts.has_at_or_before(marker)
+        {
             *processed.lock().unwrap() = pos.clone();
             self.published = (pos, highwater);
         } else {
@@ -1318,7 +1401,7 @@ impl PublishGate {
         }
         let mut advanced = false;
         while let Some((marker, _, _)) = self.waiting.front() {
-            if lanes.has_any_origin_at_or_before(*marker) {
+            if lanes.has_any_origin_at_or_before(*marker) || self.receipts.has_at_or_before(*marker) {
                 break;
             }
             let (_, pos, highwater) = self.waiting.pop_front().expect("front exists");
@@ -1334,7 +1417,11 @@ impl PublishGate {
     /// What a checkpoint may carry: the live boundary when nothing waits, else the last
     /// published one.
     fn checkpoint(&self, pos: LogPosition, highwater: Option<(u64, u64)>) -> (LogPosition, Option<(u64, u64)>) {
-        if self.waiting.is_empty() { (pos, highwater) } else { self.published.clone() }
+        if self.waiting.is_empty() && !self.receipts.has_at_or_before(highwater.map_or(u64::MAX, |(lsn, _)| lsn)) {
+            (pos, highwater)
+        } else {
+            self.published.clone()
+        }
     }
 }
 
@@ -2497,6 +2584,23 @@ mod source_fence_tests {
 
     fn complete_commit(subq: &SubqueryHandle, position: u64) {
         subq.pending_flips.complete(position);
+    }
+
+    #[test]
+    fn replay_boundary_waits_for_durable_receipt_before_publishing() {
+        let subq = handle(0);
+        let receipts = Arc::new(ReceiptBarrier::default());
+        receipts.register(0x20);
+        let start = LogPosition::start();
+        let next = LogPosition::start_of(1);
+        let processed = Arc::new(std::sync::Mutex::new(start.clone()));
+        let mut gate = PublishGate::new(start.clone(), None, receipts.clone());
+        gate.publish(&subq.group_lanes, &processed, next.clone(), Some((0x20, 0)));
+        assert_eq!(*processed.lock().unwrap(), start);
+        assert_eq!(gate.checkpoint(next.clone(), Some((0x20, 0))), (start.clone(), None));
+        receipts.complete(0x20);
+        assert!(gate.release(&subq.group_lanes, &processed, &crate::shutdown::ShutdownToken::new()));
+        assert_eq!(*processed.lock().unwrap(), next);
     }
 
     #[tokio::test(start_paused = true)]

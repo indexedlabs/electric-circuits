@@ -1760,6 +1760,7 @@ impl Engine {
             pending_flips.clone(),
             group_config,
         );
+        let (overflow_tx, mut overflow_rx) = mpsc::unbounded_channel::<emission::GroupOverflowNotice>();
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1888,16 +1889,36 @@ impl Engine {
             shutdown,
             sub_nonce: crate::engine::catalog::process_nonce().into(),
         };
-        let overflow_engine = engine.clone();
-        engine.group_lanes.set_overflow_handler(Arc::new(move |stream_path| {
-            let engine = overflow_engine.clone();
-            engine.shutdown.spawn_background(async move {
-                if let Err(error) = engine.ds.retire_stream(&stream_path).await {
-                    tracing::warn!(%error, %stream_path, "group backlog overflow retirement failed");
-                    engine.retirements.enqueue(&stream_path, None);
-                }
-            });
+        let overflow_sender = overflow_tx.clone();
+        engine.group_lanes.set_overflow_handler(Arc::new(move |notice| {
+            let _ = overflow_sender.send(notice);
         }));
+        let overflow_engine = engine.clone();
+        engine.shutdown.spawn_background(async move {
+            while let Some(notice) = overflow_rx.recv().await {
+                let terminal = crate::ds::Envelope {
+                    type_: "electric.group_error".into(),
+                    key: notice.group_id.clone(),
+                    value: Some(serde_json::json!({ "code": "group_backlog_overflow" })),
+                    old: None,
+                    headers: crate::ds::EnvelopeHeaders {
+                        operation: "error".into(),
+                        txid: None,
+                        offset: None,
+                        lsn: None,
+                        seq: None,
+                        last: None,
+                    },
+                };
+                if let Err(error) = overflow_engine.ds.append_reliable(&notice.stream_path, &[terminal]).await {
+                    tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow terminal append failed");
+                }
+                if let Err(error) = overflow_engine.release_group_claim(&notice.subscription, &notice.group_id).await {
+                    tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow retirement failed");
+                    overflow_engine.retirements.enqueue(&notice.stream_path, None);
+                }
+            }
+        });
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
@@ -1957,6 +1978,7 @@ impl Engine {
             return outcome;
         }
         self.shutdown.begin();
+        self.group_lanes.clear_overflow_handler();
         self.close_control_admission();
         let remaining = || grace.saturating_sub(self.shutdown.elapsed().unwrap_or_default());
         let mut outcome = if self.shutdown.wait_for_parties(remaining()).await {
