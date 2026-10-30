@@ -1349,6 +1349,7 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(10), gate.arrived.notified())
             .await
             .context("losing group did not reach its reservation gate")?;
+        let winner_id = engine.group_id_for_test("group-overlap").await.context("winner reservation id")?;
         gate.release.notify_last();
         let (status, headers, in_flight_body) = tokio::time::timeout(Duration::from_secs(10), second)
             .await
@@ -1360,15 +1361,16 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         );
         ensure!(headers.get("retry-after").is_some(), "in-flight loser omitted Retry-After");
         ensure!(
-            engine.group_id_for_test("group-overlap").await.is_some()
+            engine.group_id_for_test("group-overlap").await.as_deref() == Some(winner_id.as_str())
+                && engine.subscription_owner("group-overlap").await.is_none()
                 && engine.subscription_owner("group-overlap:member:1").await.is_none(),
-            "in-flight loser left a private claim"
+            "in-flight loser left a claim or replaced the reservation"
         );
         ensure!(
             !stream_events(f, "meta/catalog")
                 .await
                 .iter()
-                .any(|event| event["subscription"] == "group-overlap:member:1"),
+                .any(|event| event["subscription"].as_str().is_some_and(|s| s.starts_with("group-overlap"))),
             "in-flight loser wrote a catalog event"
         );
         gate.release.notify_one();
@@ -1378,7 +1380,7 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
             .context("first group task failed")??;
         ensure!(status == StatusCode::OK, "first group create failed: {status} {first_body}");
         let mut changed = f.ds.changed.subscribe();
-        let _winner_catalog = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let events = stream_events(f, "meta/catalog").await;
                 let joined = events
@@ -1389,7 +1391,7 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
                     })
                     .count();
                 if joined >= 2 {
-                    return Ok::<_, anyhow::Error>(events);
+                    return Ok::<_, anyhow::Error>(());
                 }
                 changed.changed().await.context("catalog observation channel closed")?;
             }
@@ -1402,10 +1404,18 @@ async fn group_claim_overlap_is_atomic(f: &Fixture) -> Result<()> {
         ensure!(engine.group_id_for_test("group-overlap").await.is_some(), "winner group was lost");
         let catalog = stream_events(f, "meta/catalog").await;
         ensure!(
-            catalog.iter().all(|event| {
-                event["subscription"].as_str().is_none_or(|subscription| {
-                    subscription == "group-overlap" || subscription == "group-overlap:member:1"
-                })
+            catalog.iter().all(|event| match event["subscription"].as_str() {
+                Some(subscription) if subscription.starts_with("group-overlap") => match event["t"].as_str() {
+                    Some("created") => first_body["results"].as_array().is_some_and(|members| {
+                        members.iter().any(|member| member["shapeId"] == event["rec"]["id"])
+                    }),
+                    Some("joined") | Some("left") => first_body["results"]
+                        .as_array()
+                        .is_some_and(|members| { members.iter().any(|member| member["shapeId"] == event["id"]) }),
+                    Some("groupCreated") => event["group"]["id"] == first_body["groupId"],
+                    _ => false,
+                },
+                _ => true,
             }),
             "losing load wrote an unexpected catalog event: {catalog:?}"
         );
@@ -2264,7 +2274,6 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let load_body = group_body(f, subscription, cut != "cancel-seed");
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
             let mut pre_attempt_id = None;
-            let mut member_id_for_cut = None;
             let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
                 if cancel_at_seed {
                     tokio::time::timeout(Duration::from_secs(10), engine.group_seed_gate_for_test().arrived.notified())
@@ -2293,7 +2302,6 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .context("group cut did not reach GroupCreated durability")?;
                 let member_id =
                     engine.subscription_owner(subscription).await.context("group cut has no public member")?;
-                member_id_for_cut = Some(member_id.clone());
                 Some(
                     engine
                         .get_shape(&member_id)
@@ -2387,18 +2395,13 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 let mut changed = f.ds.changed.subscribe();
                 tokio::time::timeout(Duration::from_secs(15), async {
                     loop {
-                        let member_gone = match member_id_for_cut.as_deref() {
-                            Some(id) => engine.get_shape(id).await.is_none(),
-                            None => true,
-                        };
                         if f.ds
                             .retired
                             .lock()
                             .await
                             .iter()
                             .any(|(method, path)| *method == Method::POST && path.ends_with(&group_path))
-                            && engine.subscription_owner(subscription).await.is_none()
-                            && member_gone
+                            && engine.subscription_owner(&format!("{subscription}:member:1")).await.is_none()
                         {
                             return Ok::<_, anyhow::Error>(());
                         }
