@@ -2279,7 +2279,6 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
             let load_body = group_body(f, subscription, cut != "cancel-seed");
             let mut load = tokio::spawn(async move { post_group(&load_app, load_body).await });
             let mut pre_attempt_id = None;
-            let mut member_id_for_cut = None;
             let group_path = if pre_durability_stage.is_some() || cancel_at_seed {
                 if cancel_at_seed {
                     tokio::time::timeout(Duration::from_secs(10), engine.group_seed_gate_for_test().arrived.notified())
@@ -2308,7 +2307,6 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                     .context("group cut did not reach GroupCreated durability")?;
                 let member_id =
                     engine.subscription_owner(subscription).await.context("group cut has no public member")?;
-                member_id_for_cut = Some(member_id.clone());
                 Some(
                     engine
                         .get_shape(&member_id)
@@ -2399,9 +2397,6 @@ async fn group_completion_cuts(f: &Fixture) -> Result<()> {
                 f.ds.closed.lock().await.insert(group_path.clone());
             } else if cut == "truncate" {
                 f.client.batch_execute(&format!("TRUNCATE public.{}", f.inner)).await?;
-                if let Some(member_id) = member_id_for_cut.as_deref() {
-                    engine.purge_shape(member_id).await.context("truncate retirement did not purge member")?;
-                }
                 let mut changed = f.ds.changed.subscribe();
                 tokio::time::timeout(Duration::from_secs(15), async {
                     loop {
