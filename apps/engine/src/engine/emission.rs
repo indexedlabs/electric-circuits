@@ -24,6 +24,9 @@
 //! remains the total across all origins. The origin is internal accounting, not a wire LSN.
 
 use super::*;
+use std::io::Read;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Batch {
     commit_lsn: u64,
@@ -95,6 +98,46 @@ impl EmissionLanes {
 
 const GROUP_LANE_CAPACITY: usize = 64;
 
+static NEXT_GROUP_SPILL: AtomicU64 = AtomicU64::new(0);
+
+struct SpilledBatch {
+    path: PathBuf,
+}
+
+enum BatchPayload {
+    Memory(Vec<Envelope>),
+    Spilled(SpilledBatch),
+}
+
+impl SpilledBatch {
+    fn write(envs: &[Envelope]) -> std::io::Result<Self> {
+        let serial = NEXT_GROUP_SPILL.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("electric-circuits-group-spill-{}-{serial}", std::process::id()));
+        let bytes = serde_json::to_vec(envs).map_err(std::io::Error::other)?;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        std::io::Write::write_all(&mut file, &bytes)?;
+        file.sync_data()?;
+        Ok(Self { path })
+    }
+
+    fn read(self) -> std::io::Result<Vec<Envelope>> {
+        let result = (|| {
+            let mut file = std::fs::File::open(&self.path)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+        })();
+        let _ = std::fs::remove_file(&self.path);
+        result
+    }
+}
+
+impl Drop for SpilledBatch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 struct GroupLane {
     state: std::sync::Mutex<GroupLaneState>,
     wake: tokio::sync::Notify,
@@ -127,7 +170,7 @@ struct GroupLaneState {
 struct GroupBatchEntry {
     commit_lsn: u64,
     stream_path: String,
-    envs: std::sync::Mutex<Option<Vec<Envelope>>>,
+    envs: std::sync::Mutex<Option<BatchPayload>>,
     accounted: std::sync::atomic::AtomicBool,
 }
 
@@ -139,7 +182,7 @@ struct GroupTicket {
 pub(crate) struct GroupBatchHandle {
     lane: Arc<GroupLane>,
     ticket: Arc<GroupTicket>,
-    batch: Option<Vec<Envelope>>,
+    batch: Option<BatchPayload>,
 }
 
 const TICKET_WAITING: u8 = 0;
@@ -223,8 +266,8 @@ impl GroupEmissionLanes {
                     notified.await;
                     continue;
                 };
-                let envs = ticket.entry.envs.lock().unwrap().take();
-                let Some(envs) = envs else {
+                let payload = ticket.entry.envs.lock().unwrap().take();
+                let Some(payload) = payload else {
                     let mut state = worker_lane.state.lock().unwrap();
                     if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
                         state.in_flight = None;
@@ -232,6 +275,28 @@ impl GroupEmissionLanes {
                     drop(state);
                     worker_lane.wake.notify_waiters();
                     continue;
+                };
+                let envs = match payload {
+                    BatchPayload::Memory(envs) => envs,
+                    BatchPayload::Spilled(spilled) => match spilled.read() {
+                        Ok(envs) => envs,
+                        Err(error) => {
+                            tracing::error!(%error, "could not read a spilled group emission batch");
+                            let mut state = worker_lane.state.lock().unwrap();
+                            let closed = state.closed;
+                            if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
+                                state.in_flight = None;
+                            }
+                            if !closed {
+                                state.held_failed = Some(ticket.clone());
+                            }
+                            drop(state);
+                            if closed {
+                                complete_group_entry(&worker_lane, &ticket.entry);
+                            }
+                            return;
+                        }
+                    },
                 };
                 let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs).await;
                 if append.is_err() {
@@ -342,6 +407,21 @@ impl GroupEmissionLanes {
         envs: Vec<Envelope>,
         commit_lsn: u64,
     ) -> Option<GroupBatchHandle> {
+        let spill = {
+            let state = lane.state.lock().unwrap();
+            state.waiting.len() + state.admitted.len() >= GROUP_LANE_CAPACITY
+        };
+        let batch = if spill {
+            match SpilledBatch::write(&envs) {
+                Ok(spilled) => BatchPayload::Spilled(spilled),
+                Err(error) => {
+                    tracing::warn!(path, %error, "group lane spill failed; retaining this batch in memory");
+                    BatchPayload::Memory(envs)
+                }
+            }
+        } else {
+            BatchPayload::Memory(envs)
+        };
         self.pending.add(commit_lsn);
         self.begin_origin(path, commit_lsn);
         let entry = Arc::new(GroupBatchEntry {
@@ -363,7 +443,7 @@ impl GroupEmissionLanes {
         let at = state.waiting.iter().rposition(|queued| queued.entry.commit_lsn <= commit_lsn).map_or(0, |i| i + 1);
         state.waiting.insert(at, ticket.clone());
         drop(state);
-        Some(GroupBatchHandle { lane, ticket, batch: Some(envs) })
+        Some(GroupBatchHandle { lane, ticket, batch: Some(batch) })
     }
 
     /// Queue one complete group batch and await its queue-position admission. The queue entry is
