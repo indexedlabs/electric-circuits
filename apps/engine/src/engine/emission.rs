@@ -297,6 +297,7 @@ impl GroupEmissionLanes {
         complete_origin_entry(&self.origins, &self.wake, path, commit_lsn);
     }
 
+    #[cfg(test)]
     pub(crate) fn has_origin_at_or_before(&self, paths: &HashSet<String>, marker_lsn: u64) -> bool {
         self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
     }
@@ -305,14 +306,10 @@ impl GroupEmissionLanes {
         self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn < marker_lsn && paths.contains(path))
     }
 
-    pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {
-        self.origins
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((_, lsn), _)| *lsn <= marker_lsn)
-            .map(|((path, _), _)| path.clone())
-            .collect()
+    /// Whether any group output originating at or before `marker_lsn` has yet to land, on any
+    /// group. The sequencer's published replay position waits on this; its loop never does.
+    pub(crate) fn has_any_origin_at_or_before(&self, marker_lsn: u64) -> bool {
+        self.origins.lock().unwrap().keys().any(|(_, lsn)| *lsn <= marker_lsn)
     }
 
     pub(crate) fn wake(&self) -> Arc<tokio::sync::Notify> {
@@ -369,6 +366,56 @@ impl GroupEmissionLanes {
         if let Some(handle) = self.reserve(path, envs, commit_lsn) {
             handle.wait().await;
         }
+    }
+
+    /// Hand one source transaction's direct output for a group to that group's lane without
+    /// waiting on the caller, so a slow or full group never holds the source sequencer.
+    ///
+    /// Commit order per group still holds. While output from an earlier transaction is still
+    /// outstanding on this group (a deferred flip not yet enqueued, or an earlier batch not yet
+    /// landed), the batch waits in a background task until that output lands, then reserves its
+    /// place. Its pending count and origin are registered here, synchronously, so the next
+    /// transaction for this group, a source receipt and the published replay position all see it
+    /// at once. A task stopped by shutdown leaves them held: the engine is going away, and the
+    /// replay position must not pass output that never landed.
+    pub(crate) fn submit(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
+        if envs.is_empty() {
+            return;
+        }
+        let Some(lane) = self.existing_lane(path) else {
+            return;
+        };
+        let paths = HashSet::from([path.to_string()]);
+        if !self.has_origin_before(&paths, commit_lsn) {
+            if let Some(handle) = self.reserve_on_lane(lane, path, envs, commit_lsn) {
+                self.spawn_wait([handle]);
+            }
+            return;
+        }
+        self.pending.add(commit_lsn);
+        self.begin_origin(path, commit_lsn);
+        let lanes = self.clone();
+        let path = path.to_string();
+        self.shutdown.spawn_background(async move {
+            loop {
+                let notified = lanes.wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !lanes.has_origin_before(&paths, commit_lsn) {
+                    break;
+                }
+                notified.await;
+            }
+            // The reservation carries its own pending count and origin; release the placeholder
+            // only after it exists, so nothing observes this batch as landed in between.
+            let handle =
+                lanes.existing_lane(&path).and_then(|lane| lanes.reserve_on_lane(lane, &path, envs, commit_lsn));
+            lanes.pending.complete(commit_lsn);
+            lanes.complete_origin(&path, commit_lsn);
+            if let Some(handle) = handle {
+                handle.wait().await;
+            }
+        });
     }
 
     /// Keep a reserved batch's admission wait off the source sequencer. The lane still admits
@@ -597,6 +644,78 @@ mod tests {
         assert!(lanes.reserve_on_lane(lane, "shape/group", vec![envelope], 0x42).is_none());
         assert_eq!(pending.count(), 0);
         assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 0x42));
+    }
+
+    /// `submit` never waits on its caller. A batch behind an earlier commit's outstanding output on
+    /// the same group (here a deferred flip still propagating) waits off the caller, counts toward
+    /// the replay and receipt barriers at once, and lands after that output; another group's batch
+    /// lands meanwhile.
+    #[tokio::test]
+    async fn a_submitted_batch_waits_behind_earlier_output_on_its_own_group_only() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new(
+            DsClient::with_test_store("scripted://group-submit".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+        );
+        lanes.register("shape/group-held");
+        lanes.register("shape/group-free");
+        let env = |key: &str| Envelope {
+            type_: "public.items".into(),
+            key: key.into(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        };
+        let keys_on = |suffix: &str| {
+            store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _, _)| path.ends_with(suffix))
+                .map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"].clone())
+                .collect::<Vec<_>>()
+        };
+        // Commit 1's flip is still propagating on the held group, as the flip propagator records it.
+        pending.add(1);
+        lanes.begin_origin("shape/group-held", 1);
+        lanes.submit("shape/group-held", vec![env("commit-2")], 2);
+        lanes.submit("shape/group-free", vec![env("commit-2")], 2);
+        assert!(lanes.has_any_origin_at_or_before(2), "the waiting batch holds the replay boundary");
+        assert!(pending.has_at_or_before(2), "the waiting batch holds a receipt at its commit");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while keys_on("shape/group-free").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("another group's batch waited behind the held group");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(keys_on("shape/group-held").is_empty(), "commit 2 overtook commit 1's flip");
+        // The flip enqueues its effect, then finishes propagating.
+        lanes.enqueue("shape/group-held", vec![env("commit-1-flip")], 1).await;
+        lanes.complete_origin("shape/group-held", 1);
+        pending.complete(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while lanes.has_any_origin_at_or_before(2) || pending.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the held group's output never landed");
+        assert_eq!(
+            keys_on("shape/group-held"),
+            vec![serde_json::json!("commit-1-flip"), serde_json::json!("commit-2")]
+        );
     }
 
     #[tokio::test]

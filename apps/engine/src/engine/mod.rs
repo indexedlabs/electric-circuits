@@ -91,8 +91,7 @@ pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub(crate) use group::{
-    GroupClaims, GroupConflict, GroupFence, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease,
-    GroupStreamClosed,
+    GroupClaims, GroupConflict, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease, GroupStreamClosed,
 };
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
@@ -607,8 +606,6 @@ pub struct Engine {
     pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
-    /// Per-engine group transaction fence. It must never be process-global.
-    group_fence: GroupFence,
     group_lanes: crate::engine::emission::GroupEmissionLanes,
     /// Group teardowns keyed by group identity. A reload waits for an in-flight release instead of
     /// renewing the dying record or allowing a stale task to drop a replacement under the same name.
@@ -1751,7 +1748,6 @@ impl Engine {
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
         let degrade = DegradeState::new();
-        let group_fence = GroupFence::default();
         let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
@@ -1833,7 +1829,6 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
-            group_fence,
             group_lanes,
             group_releases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2566,7 +2561,6 @@ impl Engine {
                 self.source_receipt_progress.clone(),
                 self.runtime_receipts.clone(),
                 self.subquery_handle(),
-                self.group_fence.clone(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
@@ -3276,7 +3270,6 @@ impl Engine {
                     })
                     .collect::<Vec<_>>();
                 st.group_claims.complete(record.clone());
-                self.group_fence.activate();
                 (true, renewals)
             } else {
                 (false, Vec::new())
@@ -3502,11 +3495,7 @@ impl Engine {
     /// catalog event is durable. The caller performs member releases outside the state lock.
     pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         let mut st = self.state.lock().await;
-        let record = st.group_claims.release_if_matches(subscription, group_id);
-        if record.is_some() {
-            self.group_fence.deactivate();
-        }
-        record
+        st.group_claims.release_if_matches(subscription, group_id)
     }
 
     pub(crate) async fn finish_group_release(&self, subscription: &str, group_id: &str) -> Result<()> {

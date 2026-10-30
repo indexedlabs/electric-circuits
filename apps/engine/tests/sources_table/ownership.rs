@@ -2777,10 +2777,14 @@ async fn group_admission_gate(f: &Fixture) -> Result<()> {
     result
 }
 
-/// A held append on one group's stream must not stop the source sequencer from completing an
-/// unrelated plain shape create. The group append is released only after that independent create
-/// has answered, so the assertion distinguishes per-group backpressure from a global fence.
+/// Hold one append on a group's stream, then keep committing: the held group's later output
+/// queues behind it (its lane is full) while every later transaction still reaches a plain shape
+/// and another group, and the engine stays healthy. Released, the held group's output lands whole
+/// and in commit order. A global fence fails at the first later commit: it never reaches the plain
+/// shape or the other group until the release.
 async fn group_lane_isolation(f: &Fixture) -> Result<()> {
+    const FIRST: i64 = 9;
+    const LAST: i64 = 9 + 80;
     let (engine, app) = group_engine(f).await?;
     let result = async {
         let (status, group) = post_group(&app, group_body(f, "group-lane-held", true)).await?;
@@ -2798,35 +2802,62 @@ async fn group_lane_isolation(f: &Fixture) -> Result<()> {
         let (plain_status, plain) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
         ensure!(plain_status == StatusCode::OK, "independent plain shape failed: {plain_status} {plain}");
         let plain_path = plain["streamPath"].as_str().context("plain shape stream path")?.to_owned();
-        *f.ds.hold_group_append.lock().await = Some(stream_path);
+        *f.ds.hold_group_append.lock().await = Some(stream_path.clone());
 
-        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (9, 'held-group')", f.outer)).await?;
+        f.client
+            .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES ({FIRST}, 'held-group')", f.outer))
+            .await?;
         tokio::time::timeout(Duration::from_secs(10), f.ds.group_append_arrived.notified())
             .await
             .context("held group append did not reach its gate")?;
+        // Each later row is its own source transaction, so every one of them is a commit the held
+        // group's lane must queue and the sequencer must pass.
+        for id in FIRST + 1..=LAST {
+            f.client
+                .batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES ({id}, 'later')", f.outer))
+                .await?;
+        }
+        let keys = |events: Vec<serde_json::Value>| {
+            // Only this test's commits: a group stream also starts with its load's snapshot rows.
+            events
+                .iter()
+                .filter_map(event_key)
+                .filter_map(|key| key.parse::<i64>().ok())
+                .filter(|id| *id >= FIRST)
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<i64> = (FIRST..=LAST).collect();
         let mut changed = f.ds.changed.subscribe();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if stream_events(f, &plain_path).await.iter().any(|event| event_key(event).as_deref() == Some("9")) {
-                    return Ok::<_, anyhow::Error>(());
+        for (label, path) in [("plain shape", &plain_path), ("independent group", &other_path)] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if keys(stream_events(f, path).await) == expected {
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    changed.changed().await.context("stream observation channel closed")?;
                 }
-                changed.changed().await.context("plain stream observation channel closed")?;
-            }
-        })
-        .await
-        .context("plain shape output waited behind a held group's lane")??;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if stream_events(f, &other_path).await.iter().any(|event| event_key(event).as_deref() == Some("9")) {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                changed.changed().await.context("independent group observation channel closed")?;
-            }
-        })
-        .await
-        .context("independent group output waited behind a held group's lane")??;
+            })
+            .await
+            .with_context(|| format!("{label} output waited behind a held group's lane"))??;
+        }
+        let held = keys(stream_events(f, &stream_path).await);
+        ensure!(held.is_empty(), "the held group's later commits overtook its held append: {held:?}");
+        ensure!(!engine.degraded(), "a full group lane degraded the engine");
 
         f.ds.group_append_release.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if keys(stream_events(f, &stream_path).await).len() >= expected.len() {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                changed.changed().await.context("held group observation channel closed")?;
+            }
+        })
+        .await
+        .context("the held group's output did not land after release")??;
+        let landed = keys(stream_events(f, &stream_path).await);
+        ensure!(landed == expected, "the held group's output landed out of commit order: {landed:?}");
+        ensure!(!engine.degraded(), "the released group lane degraded the engine");
         Ok::<_, anyhow::Error>(())
     }
     .await;

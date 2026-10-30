@@ -1742,7 +1742,6 @@ impl Engine {
                 if restorable && lease_live {
                     self.group_lanes.register(&group.stream_path);
                     st.group_claims.complete(group);
-                    self.group_fence.activate();
                 } else {
                     tracing::info!(
                         %subscription,
