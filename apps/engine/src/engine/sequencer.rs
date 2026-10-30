@@ -20,6 +20,14 @@ pub(crate) struct SequencerHandle {
     pub(crate) node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
 }
 
+struct ReceiptWork {
+    marker_lsn: u64,
+    commit_lsn: Option<String>,
+    source_receipt: Option<SourceDrainReceipt>,
+    runtime_fences: Vec<crate::runtime_authority::RuntimeFence>,
+    runtime_incarnation: uuid::Uuid,
+}
+
 pub(crate) enum SequencerCmd {
     /// Phase 1 of shape creation: register a PENDING shape that buffers this table's deltas while
     /// the creator runs the Postgres backfill concurrently — the sequencer itself never blocks on
@@ -468,6 +476,45 @@ pub(crate) async fn sequencer_loop(
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
+    let (receipt_tx, mut receipt_rx) = mpsc::unbounded_channel::<ReceiptWork>();
+    {
+        let subq = subq.clone();
+        let source_receipts = source_receipts.clone();
+        let last_source_receipt = last_source_receipt.clone();
+        let source_receipt_progress = source_receipt_progress.clone();
+        let runtime_receipts = runtime_receipts.clone();
+        let worker_shutdown = shutdown.clone();
+        let catalog_tx = catalog_tx.clone();
+        shutdown.clone().spawn_background(async move {
+            loop {
+                let work = tokio::select! {
+                    work = receipt_rx.recv() => match work { Some(work) => work, None => return },
+                    _ = worker_shutdown.wait() => return,
+                };
+                if !wait_for_source_effects(&subq, &worker_shutdown, work.marker_lsn).await { continue; }
+                if !work.runtime_fences.is_empty() {
+                    if let Some(commit_lsn) = work.commit_lsn.as_deref() {
+                        runtime_receipts.lock().unwrap().publish(
+                            work.runtime_incarnation,
+                            work.runtime_fences,
+                            commit_lsn,
+                            std::time::Instant::now(),
+                        );
+                    }
+                }
+                let Some(receipt) = work.source_receipt else { continue };
+                let source_commit_id = receipt.source_commit_id.clone();
+                source_receipt_progress.lock().unwrap().record(&source_commit_id);
+                if let Err(error) = catalog_tx.send_durable(CatalogEvent::SourceDrained(receipt.clone())).await {
+                    tracing::error!(%error, %source_commit_id, "sequencer: source fence catalog receipt was not acknowledged");
+                    continue;
+                }
+                source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
+                *last_source_receipt.lock().unwrap() = Some(receipt);
+                tracing::info!(%source_commit_id, commit_lsn = ?work.commit_lsn, "source transaction durably drained");
+            }
+        });
+    }
     let mut paused = start_paused;
     // A missing segment or unrecoverable body breach is terminal for this live loop. Keep reads
     // halted while the fatal restart request shuts it down at the safe checkpoint boundary.
@@ -971,60 +1018,23 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in group_batches {
                             subq.group_lanes.submit(&path, envs, group_lsn);
                         }
-                        // A source or runtime receipt is the one place the loop waits for group
-                        // output: its pending count covers this transaction's group batches, so the
-                        // receipt appears only once they have landed.
-                        if source_fence.is_some() || !runtime_fences.is_empty() {
-                            if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
-                                tracing::error!(
-                                    "sequencer: drain fence could not reach a receipt before shutdown/degradation"
-                                );
-                                highwater = txn_highwater;
-                                processing_failed = true;
-                                break;
-                            }
-                        }
+                        subq.group_lanes.progress(group_lsn);
                         if runtime_fences.overflowed() {
                             tracing::warn!(commit_lsn = ?lsn, capacity = crate::runtime_authority::RECEIPT_CAPACITY,
                                 "runtime marker staging full; excess receipts stay unknown; application transaction processed");
                         }
-                        // Only the runtime cache consumes these markers. In particular, runtime
-                        // traffic never advances deployment closure progress or catalog receipts.
-                        if !runtime_fences.is_empty() {
-                            if let Some(commit_lsn) = lsn.as_deref() {
-                                runtime_receipts.lock().unwrap().publish(
-                                    runtime_incarnation, runtime_fences.into_fences(), commit_lsn,
-                                    std::time::Instant::now(),
-                                );
-                            }
-                        }
-                        if let Some(source_commit_id) = source_fence {
-                            let receipt = SourceDrainReceipt {
-                                source_commit_id: source_commit_id.clone(),
-                                commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
-                            };
-                            // This lock is the receipt/closure linearization point. Advance it
-                            // before awaiting catalog durability so a source fence already being
-                            // sequenced when admission closes is conservatively pre-closure. A
-                            // failed append never reaches `source_receipts`, so it still cannot
-                            // satisfy quiesce.
-                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
-                            if let Err(error) = catalog_tx
-                                .send_durable(CatalogEvent::SourceDrained(receipt.clone()))
-                                .await
-                            {
-                                tracing::error!(
-                                    source_commit_id,
-                                    error = %error,
-                                    "sequencer: source fence catalog receipt was not acknowledged"
-                                );
-                                highwater = txn_highwater;
-                                processing_failed = true;
-                                break;
-                            }
-                            source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
-                            *last_source_receipt.lock().unwrap() = Some(receipt);
-                            tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
+                        let source_receipt = source_fence.map(|source_commit_id| SourceDrainReceipt {
+                            source_commit_id,
+                            commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
+                        });
+                        if source_receipt.is_some() || !runtime_fences.is_empty() {
+                            let _ = receipt_tx.send(ReceiptWork {
+                                marker_lsn: lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX),
+                                commit_lsn: lsn.clone(),
+                                source_receipt,
+                                runtime_fences: runtime_fences.into_fences(),
+                                runtime_incarnation,
+                            });
                         }
                     }
                     if processing_failed {

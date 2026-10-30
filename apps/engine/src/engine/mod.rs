@@ -1748,7 +1748,18 @@ impl Engine {
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
         let degrade = DegradeState::new();
-        let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());
+        let group_config = config
+            .map(|c| emission::GroupLaneConfig {
+                max_backlog_bytes: c.group_backlog_max_bytes,
+                max_stall: Duration::from_secs(c.group_stall_max_secs),
+            })
+            .unwrap_or_default();
+        let group_lanes = emission::GroupEmissionLanes::new_with_config(
+            ds.clone(),
+            shutdown.clone(),
+            pending_flips.clone(),
+            group_config,
+        );
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1877,6 +1888,16 @@ impl Engine {
             shutdown,
             sub_nonce: crate::engine::catalog::process_nonce().into(),
         };
+        let overflow_engine = engine.clone();
+        engine.group_lanes.set_overflow_handler(Arc::new(move |stream_path| {
+            let engine = overflow_engine.clone();
+            engine.shutdown.spawn_background(async move {
+                if let Err(error) = engine.ds.retire_stream(&stream_path).await {
+                    tracing::warn!(%error, %stream_path, "group backlog overflow retirement failed");
+                    engine.retirements.enqueue(&stream_path, None);
+                }
+            });
+        }));
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
@@ -3199,6 +3220,12 @@ impl Engine {
     /// registration and stream checks must run after it, before the group is made visible.
     pub(crate) async fn complete_group_with_gens(&self, record: GroupRecord, gens: &SchemaGens) -> Result<()> {
         self.group_lanes.register(&record.stream_path);
+        self.group_lanes.set_metadata(
+            &record.stream_path,
+            &record.id,
+            &record.subscription,
+            record.members.iter().map(|member| member.table.clone()).collect(),
+        );
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         let stream_open = match self.recheck_group_after_durability(&record, gens).await {
             Ok(open) => open,
