@@ -473,6 +473,9 @@ impl GroupEmissionLanes {
         let lanes = self.lanes.lock().unwrap().values().cloned().collect::<Vec<_>>();
         let mut failed = false;
         for lane in lanes {
+            if lane.config.max_stall == std::time::Duration::ZERO {
+                continue;
+            }
             let path = lane.metadata.lock().unwrap().stream_path.clone();
             let holds_prefix = self
                 .origins
