@@ -138,9 +138,14 @@ pub(crate) struct GroupLaneConfig {
     /// detaches. Doubles with each detach up to `detach_after_max`.
     pub(crate) detach_after: std::time::Duration,
     pub(crate) detach_after_max: std::time::Duration,
-    /// Queued bytes behind the in-flight append past which a lane detaches. One commit's output
-    /// alone never trips it, however large, so an oversized transaction still arrives whole.
+    /// Queued bytes past which a lane detaches, not counting the oldest queued commit (nor the
+    /// in-flight append): one commit's output never trips it, however large and however many
+    /// batches it arrives in, so an oversized transaction still arrives whole.
     pub(crate) memory_bytes: u64,
+    /// The slowest append throughput a lane waits out before it counts an in-flight append as
+    /// stalled: an append of `b` bytes gets `b / append_min_bytes_per_sec` beyond the stall cap,
+    /// so a transaction near the 512 MiB ceiling is never abandoned while it is still sending.
+    pub(crate) append_min_bytes_per_sec: u64,
     /// The most queued bytes one coalesced append carries (a single larger batch goes alone).
     pub(crate) append_bytes: u64,
     /// How often the monitor measures stalls and probes detached lanes.
@@ -155,6 +160,7 @@ impl Default for GroupLaneConfig {
             detach_after: std::time::Duration::from_secs(10),
             detach_after_max: std::time::Duration::from_secs(300),
             memory_bytes: 8 << 20,
+            append_min_bytes_per_sec: 1 << 20,
             append_bytes: 1 << 20,
             tick: std::time::Duration::from_secs(1),
             probe_timeout: std::time::Duration::from_secs(3),
@@ -327,6 +333,31 @@ struct GroupLaneState {
 impl GroupLaneState {
     fn has_work(&self) -> bool {
         !self.queued.is_empty() || self.in_flight.is_some() || self.marker.is_some()
+    }
+
+    /// Whether the lane is waiting on its stream: an append is in flight, or one could start.
+    /// Queued batches held behind the group's own work in production (a deferred flip's
+    /// query-back) are not waiting on the stream, so they accrue no stall time.
+    fn waiting_on_stream(&self) -> bool {
+        let barrier = self.producing.keys().next().copied().unwrap_or(u64::MAX);
+        self.in_flight.is_some()
+            || self.marker.is_some()
+            || self.queued.keys().next().is_some_and(|(lsn, _)| *lsn <= barrier)
+    }
+
+    /// Queued bytes the memory cap counts: everything after the oldest queued commit.
+    fn capped_bytes(&self) -> u64 {
+        let Some(&(oldest, _)) = self.queued.keys().next() else { return 0 };
+        let oldest_bytes: u64 =
+            self.queued.range((oldest, 0)..=(oldest, u64::MAX)).map(|(_, queued)| queued.bytes).sum();
+        self.queued_bytes - oldest_bytes
+    }
+
+    /// The stall cap now in force: the lane's backed-off cap, plus the time an in-flight append
+    /// of its size may take at the slowest throughput the lane waits out.
+    fn stall_cap(&self, config: &GroupLaneConfig) -> std::time::Duration {
+        let in_flight = self.in_flight.as_ref().map_or(0, |flight| flight.bytes);
+        self.detach_after + std::time::Duration::from_secs(in_flight / config.append_min_bytes_per_sec.max(1))
     }
 
     /// The oldest commit whose output for this group is not on its stream, if any.
@@ -637,10 +668,11 @@ impl GroupLane {
         state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
         self.backlog_changed(bytes as i64, 1);
         let limit = self.shared.config.memory_bytes;
-        if state.queued.len() > 1 && state.queued_bytes > limit {
+        let capped = state.capped_bytes();
+        if capped > limit {
             self.detach(&mut state, Cap::Bytes);
         } else {
-            let fraction = state.queued_bytes as f64 / limit as f64;
+            let fraction = capped as f64 / limit as f64;
             self.threshold(&mut state, Cap::Bytes, fraction);
             drop(state);
             self.worker_wake.notify_one();
@@ -741,13 +773,14 @@ impl GroupLane {
         }
         if state.landed || !state.has_work() {
             state.behind = std::time::Duration::ZERO;
-        } else if engine_moved {
+        } else if engine_moved && state.waiting_on_stream() {
             state.behind += config.tick;
             state.longest_stall = state.longest_stall.max(state.behind);
         }
         state.landed = false;
-        let fraction = state.behind.as_secs_f64() / state.detach_after.as_secs_f64();
-        if state.behind >= state.detach_after {
+        let cap = state.stall_cap(config);
+        let fraction = state.behind.as_secs_f64() / cap.as_secs_f64();
+        if state.behind >= cap {
             self.detach(&mut state, Cap::Stall);
             return false;
         }
@@ -803,7 +836,11 @@ impl GroupLane {
         let config = &self.shared.config;
         let detached_after = state.detach_after;
         state.detach_after = (state.detach_after * 2).min(config.detach_after_max);
-        state.probe = Probe { running: false, next_at: tokio::time::Instant::now() + config.tick, delay: config.tick };
+        // The first detach since a healthy spell probes at once. A repeat waits out the cap it
+        // just hit, so a stream whose `HEAD` answers while its appends still hang cannot cycle
+        // detach and reattach faster than the stall backoff.
+        let first_probe = if detached_after > config.detach_after { detached_after } else { config.tick };
+        state.probe = Probe { running: false, next_at: tokio::time::Instant::now() + first_probe, delay: config.tick };
         state.armed = [[true; 2]; 2];
         self.shared.metrics.group_detaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
@@ -1274,7 +1311,7 @@ mod tests {
         };
         let reattach = |lanes: GroupEmissionLanes, hold: tokio::sync::watch::Sender<bool>| async move {
             hold.send_replace(false);
-            tokio::time::advance(std::time::Duration::from_secs(5)).await;
+            tokio::time::advance(std::time::Duration::from_secs(7)).await;
             lanes.tick_for_test(true).await;
             settle().await;
             // Let one tick see the marker land, so the next stall starts from zero.
@@ -1305,22 +1342,109 @@ mod tests {
         assert_eq!(detaches(&lanes), 3);
     }
 
+    fn big_env(key: &str) -> Envelope {
+        let mut env = group_env(key);
+        env.value = Some(serde_json::json!({ "id": key, "payload": "x".repeat(16 * 1024) }));
+        env
+    }
+
     #[tokio::test]
     async fn the_memory_cap_detaches_but_one_oversized_commit_never_does() {
         let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
         let (lanes, _store, _hold) = held_lanes(config);
-        let big = |key: &str| {
-            let mut env = group_env(key);
-            env.value = Some(serde_json::json!({ "id": key, "payload": "x".repeat(16 * 1024) }));
-            env
-        };
-        lanes.push(GROUP, vec![big("in-flight")], 1);
+        lanes.push(GROUP, vec![big_env("in-flight")], 1);
         settle().await;
-        lanes.push(GROUP, vec![big("queued")], 2);
+        // The oldest queued commit is never counted, however many batches it arrives in.
+        lanes.push(GROUP, vec![big_env("queued")], 2);
+        lanes.push(GROUP, vec![big_env("queued-flip")], 2);
         assert_eq!(detaches(&lanes), 0, "one commit's output alone must never trip the memory cap");
-        lanes.push(GROUP, vec![big("over")], 3);
+        lanes.push(GROUP, vec![big_env("over")], 3);
         assert_eq!(detaches(&lanes), 1);
         assert_eq!(lanes.drain(GROUP, 3).unwrap().resume_lsn.as_deref(), Some("0/1"));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_commit_followed_at_once_by_a_small_one_lands_whole() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            config,
+        );
+        lanes.register(GROUP);
+        // Both are queued before the writer runs: the sequencer never waits between them.
+        lanes.push(GROUP, vec![big_env("oversized")], 1);
+        lanes.push(GROUP, vec![group_env("next")], 2);
+        let (keys, _) = wait_appended(&store, 2).await;
+        assert_eq!(keys, ["oversized", "next"]);
+        assert_eq!(detaches(&lanes), 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_on_its_own_deferred_flip_is_not_a_stall() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            test_config(),
+        );
+        lanes.register(GROUP);
+        // T's query-back is slow; T+1's output waits behind it while the stream is healthy.
+        lanes.begin_origin(GROUP, 5);
+        lanes.push(GROUP, vec![group_env("t+1")], 6);
+        for _ in 0..30 {
+            lanes.tick_for_test(true).await;
+        }
+        assert_eq!(detaches(&lanes), 0, "a slow flip detached a group whose stream answers");
+        lanes.complete_origin(GROUP, 5);
+        wait_appended(&store, 1).await;
+    }
+
+    #[tokio::test]
+    async fn an_append_still_sending_gets_time_for_its_size() {
+        // 16 KiB at 1 KiB/s: the in-flight append gets 16 s beyond the 3 s stall cap.
+        let config = GroupLaneConfig { append_min_bytes_per_sec: 1024, ..test_config() };
+        let (lanes, _store, _hold) = held_lanes(config);
+        lanes.push(GROUP, vec![big_env("large")], 1);
+        settle().await;
+        for _ in 0..10 {
+            lanes.tick_for_test(true).await;
+        }
+        assert_eq!(detaches(&lanes), 0, "a large append was abandoned while it could still be sending");
+        for _ in 0..20 {
+            lanes.tick_for_test(true).await;
+        }
+        assert_eq!(detaches(&lanes), 1, "a hung append must still detach in the end");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeat_detach_waits_out_its_cap_before_probing() {
+        let (lanes, store, hold) = held_lanes(test_config());
+        lanes.push(GROUP, vec![group_env("a")], 1);
+        settle().await;
+        for _ in 0..3 {
+            lanes.tick_for_test(true).await;
+        }
+        assert_eq!(detaches(&lanes), 1);
+        hold.send_replace(false);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        lanes.tick_for_test(true).await;
+        wait_appended(&store, 1).await;
+        lanes.tick_for_test(true).await;
+        // The stream stops again: the second detach does not probe for the 3 s cap it hit.
+        hold.send_replace(true);
+        lanes.push(GROUP, vec![group_env("b")], 2);
+        settle().await;
+        for _ in 0..6 {
+            lanes.tick_for_test(true).await;
+        }
+        assert_eq!(detaches(&lanes), 2);
+        hold.send_replace(false);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        lanes.tick_for_test(true).await;
+        assert_eq!(lanes.shared.metrics.group_reattaches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        lanes.tick_for_test(true).await;
+        assert_eq!(lanes.shared.metrics.group_reattaches.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

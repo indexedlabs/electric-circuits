@@ -1202,8 +1202,8 @@ async fn subset_load(
 
 /// One-stream group form. Members still use the existing plain and subquery shape paths, while a
 /// shared stream path and one settled page snapshot make the members comparable. The group claim
-/// and member list are durable as one catalog event; the sequencer's active-group fence orders
-/// delayed subquery emissions before the next source transaction.
+/// and member list are durable as one catalog event; the group's own lane orders delayed subquery
+/// emissions before the next source transaction's output for the group.
 async fn subset_load_group(
     engine: &Engine,
     subscription: Option<String>,

@@ -980,8 +980,9 @@ pub(crate) enum FlipWork {
         /// propagation — letting the activity log group them as one write (see
         /// `subquery::emit_flip_trace`).
         lsn: Option<String>,
-        /// Group stream paths reachable from this walk. Registered before the work is sent so a
-        /// following source transaction cannot pass the group fence while this walk is in flight.
+        /// Group stream paths reachable from this walk. Registered with each group's lane before the
+        /// work is sent, so no later commit's output for that group is appended while this walk is
+        /// in flight (the per-group barrier, OTTO-11131).
         group_paths: Vec<String>,
     },
     /// Work that reached a shape while it was still being created, run against that one shape now
