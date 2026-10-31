@@ -69,7 +69,7 @@ Per-row summaries: [`harness/otto-10992/raw/main-41215671062/`](../../harness/ot
 
 ## Variants
 
-Each variant ran the same ten scenarios on the same `ubuntu-latest` image. The per-row table includes the runner, write rate, hold, unaffected delivery, faulted delivery, recovery, lane and receipt peaks, replay lag, retained WAL, RSS, host load, and a box-limit flag for the 1,000 txn/s rows. `a`, `a:1000`, `b-*`, `c-*`, and `d` write the same four-table Record workload; at 200 txn/s for 299 s that is 45.9 MiB of source rows (measured by the harness), at 1,000 txn/s it is approximately 229.8 MiB, and at the 899 s outage it is approximately 137.9 MiB. The source write continues during a Durable Streams outage.
+Each variant ran the same ten scenarios on the same `ubuntu-latest` image. The per-row table includes the runner, write rate, hold, unaffected delivery, faulted delivery, recovery, lane and receipt peaks, replay lag, retained WAL, RSS, host load, and a box-limit flag for the 1,000 txn/s rows. `a`, `a:1000`, `b-*`, `c-*`, and `d` write the same four-table Record workload; at 200 txn/s for 59 s / 299 s / 899 s that is approximately 9.1 / 45.9 / 137.9 MiB of source rows (45.96 MiB was measured for the 299 s case), and at 1,000 txn/s for 299 s it is approximately 229.8 MiB. The source write continues during a Durable Streams outage.
 
 | variant | scenario | rate | hold | env/s hold | unaffected env | faulted env | resume | lane bytes / batches | receipt depth | proc−checkpoint lag | WAL start → peak | RSS peak | load1 | box-limited | raw |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
