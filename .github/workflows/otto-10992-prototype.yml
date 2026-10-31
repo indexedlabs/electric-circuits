@@ -1,0 +1,69 @@
+name: OTTO-10992 backlog prototype
+
+on:
+  push:
+    branches: ['proto/otto-10992-*']
+
+jobs:
+  experiment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read experiment selection
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          source prototype/run.env
+          echo "engine_ref=$ENGINE_REF" >> "$GITHUB_OUTPUT"
+          echo "scenarios=$SCENARIOS" >> "$GITHUB_OUTPUT"
+          echo "sample_interval_s=$SAMPLE_INTERVAL_S" >> "$GITHUB_OUTPUT"
+          echo "scenario_seconds=$SCENARIO_SECONDS" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve harness and check engine ref
+        shell: bash
+        env:
+          ENGINE_REF: ${{ steps.config.outputs.engine_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$ENGINE_REF"
+          tar -czf /tmp/otto-harness.tgz harness prototype .github/workflows/otto-10992-prototype.yml
+          git checkout --detach "$ENGINE_REF"
+          tar -xzf /tmp/otto-harness.tgz
+
+      - name: Start PostgreSQL and Durable Streams
+        run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d postgres ds
+
+      - name: Seed schema
+        run: |
+          for i in $(seq 1 90); do docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml exec -T postgres pg_isready -U postgres -d electric && break; sleep 2; done
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml exec -T postgres psql -U postgres -d electric < harness/otto-10992/schema.sql
+
+      - name: Build and start engine, proxy and API
+        run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d --build ds-proxy engine api
+
+      - name: Run selected scenarios
+        env:
+          SCENARIOS: ${{ steps.config.outputs.scenarios }}
+          SAMPLE_INTERVAL_S: ${{ steps.config.outputs.sample_interval_s }}
+          SCENARIO_SECONDS: ${{ steps.config.outputs.scenario_seconds }}
+          OUT_DIR: ${{ github.workspace }}/harness/otto-10992/results
+        run: |
+          set -euo pipefail
+          ./prototype/experiment.sh
+          python3 prototype/summarize.py "$OUT_DIR"
+
+      - name: Upload raw time series and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: otto-10992-${{ github.sha }}
+          path: |
+            harness/otto-10992/results
+            docker/compose*.log
+          if-no-files-found: warn
+          retention-days: 30
