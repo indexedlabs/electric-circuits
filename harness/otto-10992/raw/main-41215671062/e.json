@@ -1,0 +1,78 @@
+{
+  "catchup_estimate_s": null,
+  "change_log_lag_at_clear_bytes": 4855311,
+  "change_log_lag_end_bytes": 5481393,
+  "change_log_lag_peak_bytes": 8888458,
+  "checkpoint_lag_peak_bytes": 157049,
+  "confirmed_flush_hold": [
+    "0/2AB1EF0",
+    "0/4063298"
+  ],
+  "delivery_errors": {
+    "faulted": null,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "ac685974052b3554549a2965a7f7e41bc294454e",
+  "envelopes_per_s_hold": 113.3163020380485,
+  "envelopes_per_s_recovery": 100.41888274759273,
+  "envelopes_per_s_warmup": 792.5753904146472,
+  "fault": "",
+  "faulted_group_envelopes_hold": null,
+  "faulted_resume_ms": null,
+  "health_ms_p50_hold": 1.074,
+  "hold_s": 299,
+  "host_load1_peak_hold": 4.85,
+  "lane_backlog_peak_batches": 53,
+  "lane_backlog_peak_bytes": 44573,
+  "marker_after_ms": {
+    "group": null,
+    "plain": null
+  },
+  "marker_during_ms": {
+    "group": 2210,
+    "plain": 2207
+  },
+  "pgbench_tps": 199.708186,
+  "plain_resume_ms": 262,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "",
+    "forwarded": 844064,
+    "hang": false,
+    "held": 0,
+    "outage": false,
+    "released": 0,
+    "targeted": 0,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 53,
+  "retained_wal_end_bytes": 190718488,
+  "retained_wal_hold_start_bytes": 1245976,
+  "retained_wal_peak_bytes": 190718488,
+  "rss_peak_bytes": 550211584,
+  "rss_peak_hold_bytes": 460759040,
+  "rss_peak_recovery_bytes": 550211584,
+  "rss_warmup_bytes": 46624768,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760348672,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065355",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 95,
+    "recovery": 35,
+    "warmup": 23
+  },
+  "scenario": "e",
+  "unaffected_group_envelopes_hold": 8523,
+  "unaffected_plain_envelopes_hold": 8524,
+  "unaffected_plain_envelopes_recovery": 3018,
+  "unaffected_plain_envelopes_warmup": 5926
+}
