@@ -29,9 +29,23 @@ struct Source {
 
 impl Source {
     async fn new(base: &str) -> Self {
+        Self::with_ds(base, |ds| ds).await
+    }
+
+    /// A source whose shape folds read under the memory budget, so [`Self::hold_after_read`] can
+    /// hold a fold page after the store has fixed its contents.
+    async fn budgeted(base: &str) -> Self {
+        let config = crate::config::Config::resolve(|key| {
+            (key == "ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES").then(|| (1u64 << 30).to_string())
+        })
+        .unwrap();
+        Self::with_ds(base, |ds| ds.with_memory_budget(&config)).await
+    }
+
+    async fn with_ds(base: &str, ds: impl FnOnce(DsClient) -> DsClient) -> Self {
         let store =
             Arc::new(ScriptedStore { read_appended: true, streams: Some(Default::default()), ..Default::default() });
-        let engine = Engine::new_for_in_process_test(DsClient::with_test_store(base.into(), store.clone()));
+        let engine = Engine::new_for_in_process_test(ds(DsClient::with_test_store(base.into(), store.clone())));
         let schema: crate::schema::Schema = serde_json::from_value(serde_json::json!({
             "tables": { "items": { "columns": {
                 "id": { "type": "text" }, "n": { "type": "int" }, "f": { "type": "float" },
@@ -82,6 +96,19 @@ impl Source {
 
     fn open(&self, gate: &BodyGate) {
         *self.store.read_gate.lock().unwrap() = None;
+        gate.released.notify_waiters();
+    }
+
+    /// Hold every budgeted read AFTER the store has decided what the page contains: a write
+    /// appended while it is held is not in that page.
+    fn hold_after_read(&self) -> Arc<BodyGate> {
+        let gate = Arc::new(BodyGate::default());
+        *self.store.body_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    fn open_after_read(&self, gate: &BodyGate) {
+        *self.store.body_gate.lock().unwrap() = None;
         gate.released.notify_waiters();
     }
 
@@ -189,6 +216,11 @@ async fn concurrent_snapshots_of_one_shape_await_one_fold() {
         assert_eq!(std::str::from_utf8(&body).unwrap(), ROWS_BODY);
     }
     assert_eq!(source.folds(), 1);
+    let metrics = &source.engine.metrics;
+    assert_eq!(metrics.electric_snapshot_builds.load(SeqCst), 1);
+    assert_eq!(metrics.electric_snapshot_joins.load(SeqCst), 4);
+    get(source.app.clone(), SNAPSHOT.into()).await;
+    assert_eq!(metrics.electric_snapshot_reuses.load(SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -373,4 +405,34 @@ async fn shutdown_mid_build_tells_every_waiter_to_retry() {
         assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "1");
     }
     assert!(source.engine.electric_handles.snapshots.lock().unwrap().is_empty(), "an abandoned build is not kept");
+}
+
+/// A request that arrives while a build is in flight, after a write the build's fold has already
+/// read past, must not be answered with that build: its first response would be older than the
+/// stream was when it asked (a client that writes, drains and subscribes would miss its write).
+#[tokio::test(start_paused = true)]
+async fn a_request_joining_a_build_that_missed_a_newer_write_gets_a_fresh_build() {
+    let source = Source::budgeted("scripted://late-joiner").await;
+    source.append(rows()).await;
+    let gate = source.hold_after_read();
+    let first = source.spawn_get(SNAPSHOT);
+    quiesce().await;
+    assert_eq!(source.folds(), 1, "the first build has read its page");
+    source.append(vec![upsert("c", serde_json::json!({"id": "c"}))]).await;
+    let late = source.spawn_get(SNAPSHOT);
+    quiesce().await;
+    source.open_after_read(&gate);
+
+    let (status, first_headers, body) = first.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(std::str::from_utf8(&body).unwrap(), ROWS_BODY, "the first request predates the write");
+    let (status, late_headers, body) = late.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        ops(&body),
+        [("insert".into(), "a".into()), ("insert".into(), "q\"k".into()), ("insert".into(), "c".into())],
+        "a request must see every write appended before it arrived"
+    );
+    assert_ne!(late_headers.get("electric-offset"), first_headers.get("electric-offset"));
+    assert_eq!(source.folds(), 2);
 }

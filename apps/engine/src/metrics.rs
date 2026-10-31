@@ -160,6 +160,12 @@ pub struct Metrics {
     /// of chunk POSTs those backfills made (a backfill that fits in one append contributes 0, same
     /// accounting as `txn_chunked_appends`).
     pub backfill_chunked_appends: AtomicU64,
+    /// `/v1/shape` `offset=-1` answers (OTTO-11109), by how each was served: a build this request
+    /// started, a build already in flight that it joined, or a finished build it reused at an
+    /// unchanged tail. Builds stay at one per shape and tail however many clients ask.
+    pub electric_snapshot_builds: AtomicU64,
+    pub electric_snapshot_joins: AtomicU64,
+    pub electric_snapshot_reuses: AtomicU64,
     /// ADR-0003: incomplete transaction fragments the sequencer discarded because a DIFFERENT
     /// transaction followed them on the log (a reconnect re-delivering earlier complete commits
     /// first, or an epoch reset abandoning the fragment). Never zero-cost silence: the fragment is
@@ -253,6 +259,9 @@ impl Metrics {
             retirement_retries: AtomicU64::new(0),
             retirements_pending: AtomicU64::new(0),
             backfill_chunked_appends: AtomicU64::new(0),
+            electric_snapshot_builds: AtomicU64::new(0),
+            electric_snapshot_joins: AtomicU64::new(0),
+            electric_snapshot_reuses: AtomicU64::new(0),
             sequencer_orphan_fragments: AtomicU64::new(0),
             sequencer_held_run: AtomicU64::new(0),
             sequencer_held_bytes: AtomicU64::new(0),
@@ -279,6 +288,21 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
+        let mut snapshot = self.snapshot_core();
+        // Added outside the literal below, which is at `json!`'s macro recursion limit.
+        if let Some(counters) = snapshot["counters"].as_object_mut() {
+            for (name, counter) in [
+                ("electric_snapshot_builds_total", &self.electric_snapshot_builds),
+                ("electric_snapshot_joins_total", &self.electric_snapshot_joins),
+                ("electric_snapshot_reuses_total", &self.electric_snapshot_reuses),
+            ] {
+                counters.insert(name.into(), counter.load(Ordering::Relaxed).into());
+            }
+        }
+        snapshot
+    }
+
+    fn snapshot_core(&self) -> serde_json::Value {
         serde_json::json!({
             "counters": {
                 "envelopes_processed": self.envelopes.load(Ordering::Relaxed),
@@ -379,6 +403,9 @@ impl Metrics {
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
         self.txn_chunked_appends.store(0, Ordering::Relaxed);
         self.backfill_chunked_appends.store(0, Ordering::Relaxed);
+        self.electric_snapshot_builds.store(0, Ordering::Relaxed);
+        self.electric_snapshot_joins.store(0, Ordering::Relaxed);
+        self.electric_snapshot_reuses.store(0, Ordering::Relaxed);
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
         // (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `sequencer_held_bytes`,

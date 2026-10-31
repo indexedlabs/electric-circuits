@@ -759,8 +759,10 @@ enum SnapshotEntry {
 
 /// The current snapshot of the shape whose stream is `path`, built at most once per stream tail.
 ///
-/// Concurrent requests await one build. A finished build is reused while the stream's tail (a
-/// `HEAD`) is still the tail it was built at, for up to [`SNAPSHOT_REUSE_TTL`]; a moved, closed or
+/// Every request first `HEAD`s the stream and is answered by a build at least as fresh as the tail
+/// it found. Concurrent requests await one build; a request whose tail the in-flight build had
+/// already folded past waits for it and then starts a newer one. A finished build is reused for up
+/// to [`SNAPSHOT_REUSE_TTL`] while it is no older than the requester's tail; a moved, closed or
 /// missing stream gets a new build, which answers exactly as an unshared one would. The build runs
 /// in its own task, so a requester that disconnects never cancels work other requesters wait on;
 /// a build every requester abandoned still finishes and is kept, because clients that time out in
@@ -768,17 +770,31 @@ enum SnapshotEntry {
 /// request waiting on it gets its error, and the next request starts a new one.
 async fn shared_snapshot(engine: &Engine, path: &str) -> Result<Arc<Snapshot>, ApiError> {
     enum Step {
-        Wait(watch::Receiver<SnapshotSlot>),
+        Join(watch::Receiver<SnapshotSlot>),
         Build(u64, watch::Sender<SnapshotSlot>, watch::Receiver<SnapshotSlot>),
-        Reuse(u64, Arc<Snapshot>),
+        Reuse(Arc<Snapshot>),
     }
+    // The stream as this request found it. Every answer is at least this fresh: a build that was
+    // already in flight may have folded past its last page before a write this request must see,
+    // and a request that arrives after that write is answered by a newer build instead. A data
+    // read like any other, so a dormant shape reactivates first and a degraded engine refuses.
+    let ds = engine.shape_fold_input(path).await?;
+    let head = ds.head(path).await?;
+    let open = head.as_ref().is_some_and(|h| !h.closed);
+    let floor = head.and_then(|h| h.next_offset);
+    let fresh = |snapshot: &Snapshot| floor.as_deref().is_none_or(|floor| !offset_after(floor, &snapshot.tail));
+    let counters = &engine.metrics;
     loop {
         let step = {
             let mut snapshots = engine.electric_handles.snapshots.lock().unwrap();
             match snapshots.get(path) {
-                Some(SnapshotEntry::Building { result, .. }) => Step::Wait(result.clone()),
-                Some(SnapshotEntry::Ready { build, snapshot, built }) if built.elapsed() < SNAPSHOT_REUSE_TTL => {
-                    Step::Reuse(*build, snapshot.clone())
+                Some(SnapshotEntry::Building { result, .. }) => Step::Join(result.clone()),
+                // A closed or missing stream is never served from a kept result: a new build
+                // answers it exactly as an unshared one would.
+                Some(SnapshotEntry::Ready { snapshot, built, .. })
+                    if open && built.elapsed() < SNAPSHOT_REUSE_TTL && fresh(snapshot) =>
+                {
+                    Step::Reuse(snapshot.clone())
                 }
                 _ => {
                     let build = next_cursor();
@@ -789,23 +805,24 @@ async fn shared_snapshot(engine: &Engine, path: &str) -> Result<Arc<Snapshot>, A
             }
         };
         match step {
-            Step::Wait(rx) => return await_snapshot(engine, rx).await,
+            Step::Reuse(snapshot) => {
+                counters.electric_snapshot_reuses.fetch_add(1, Ordering::Relaxed);
+                return Ok(snapshot);
+            }
             Step::Build(build, tx, rx) => {
+                // Started after this request's HEAD, so its fold reads at least to `floor`.
+                counters.electric_snapshot_builds.fetch_add(1, Ordering::Relaxed);
                 spawn_snapshot_build(engine, path, build, tx);
                 return await_snapshot(engine, rx).await;
             }
-            Step::Reuse(build, snapshot) => {
-                // A data read like any other: a dormant shape reactivates first (its replay moves
-                // the tail, so the result is rebuilt) and a degraded engine refuses.
-                let ds = engine.shape_fold_input(path).await?;
-                let head = ds.head(path).await?;
-                if head.is_some_and(|h| !h.closed && h.next_offset.as_deref() == Some(snapshot.tail.as_str())) {
+            Step::Join(rx) => {
+                let snapshot = await_snapshot(engine, rx).await?;
+                if fresh(&snapshot) {
+                    counters.electric_snapshot_joins.fetch_add(1, Ordering::Relaxed);
                     return Ok(snapshot);
                 }
-                let mut snapshots = engine.electric_handles.snapshots.lock().unwrap();
-                if matches!(snapshots.get(path), Some(SnapshotEntry::Ready { build: b, .. }) if *b == build) {
-                    snapshots.remove(path);
-                }
+                // That build finished behind this request's tail; the loop finds it kept and
+                // stale, and starts (or joins) a newer one.
             }
         }
     }

@@ -954,7 +954,10 @@ change messages preserve the source xid as `headers.txid` and, when numeric, the
 boundary, so they omit both.
 An `offset=-1` snapshot is **built once per shape and stream tail** (OTTO-11109): concurrent requests
 for one shape await one build, and a finished build is reused while a `HEAD` still finds the tail it
-was built at, for up to 30 s. The build runs in its own Engine-tracked task (a disconnecting client
+was built at, for up to 30 s. Every request `HEAD`s the stream on arrival and is answered only by a
+build at least that fresh: one that joined a build whose fold had already read past an earlier tail
+starts a newer build. The `/metrics` counters `electric_snapshot_{builds,joins,reuses}_total` show
+how each answer was served. The build runs in its own Engine-tracked task (a disconnecting client
 never cancels it; a failed build is not kept), folds the stream keeping each row as raw JSON text, and
 writes the response body into one buffer that every client is sent a slice of — byte-for-byte the body
 an unshared build produced. Each client still gets its own handle and its own copy of the key set.

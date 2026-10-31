@@ -4,7 +4,8 @@
 // `offset=-1` within seconds. Many clients per shape, a third of them disconnecting mid-request,
 // must each end with exactly PostgreSQL's rows, and every client of one shape at one tail must be
 // sent the same bytes. Each client then catches up on later writes with its own handle and key
-// set. How many folds the engine ran is not observable here; the engine's unit tests count them.
+// set. The engine's `/metrics` counters show the storm was served by at most one build per shape
+// and tail, not one per client.
 import type { Schema } from '@electric-circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -42,6 +43,19 @@ async function sourceRows(pg: pgpkg.Client, grp: number): Promise<Map<string, Ro
 
 function shapeUrl(h: Harness, grp: number, extra = ''): string {
   return `${h.engineUrl}/v1/shape?table=storm_items&where=${encodeURIComponent(`grp = ${grp}`)}${extra}`
+}
+
+type SnapshotCounters = { builds: number; joins: number; reuses: number }
+
+async function snapshotCounters(h: Harness): Promise<SnapshotCounters> {
+  const res = await fetch(`${h.engineUrl}/metrics`)
+  if (!res.ok) throw new Error(`GET /metrics -> ${res.status}`)
+  const counters = ((await res.json()) as { counters: Record<string, number> }).counters
+  return {
+    builds: counters.electric_snapshot_builds_total ?? 0,
+    joins: counters.electric_snapshot_joins_total ?? 0,
+    reuses: counters.electric_snapshot_reuses_total ?? 0,
+  }
 }
 
 type Client = { grp: number; handle: string; offset: string; rows: Map<string, Row> }
@@ -96,6 +110,7 @@ describe('conformance: /v1/shape reconnect storm', () => {
 
   it('serves every client of a storm PostgreSQL rows, the same bytes per shape, and its own key set', async () => {
     type Outcome = { grp: number; status: number; handle: string | null; offset: string | null; body: string } | null
+    const before = await snapshotCounters(harness)
     const requests: Promise<Outcome>[] = []
     for (let n = 0; n < SHAPES * CLIENTS_PER_SHAPE; n++) {
       const grp = n % SHAPES
@@ -139,6 +154,16 @@ describe('conformance: /v1/shape reconnect storm', () => {
       clients.push(client)
     }
     expect(new Set(clients.map((c) => c.handle)).size, 'every client gets its own handle').toBe(clients.length)
+
+    // Nothing was written during the storm, so every shape has one tail: at most one build each,
+    // and every other answered client joined or reused one. (A client that aborted may still have
+    // started or joined a build, so the served clients bound the shared answers from below.)
+    const after = await snapshotCounters(harness)
+    const builds = after.builds - before.builds
+    const shared = after.joins - before.joins + (after.reuses - before.reuses)
+    expect(builds, 'snapshot builds must be one per shape and tail, not one per client').toBeLessThanOrEqual(SHAPES)
+    expect(builds + shared).toBeGreaterThanOrEqual(clients.length)
+    expect(shared).toBeGreaterThanOrEqual(clients.length - SHAPES)
 
     const expected = new Map<number, Map<string, Row>>()
     for (let grp = 0; grp < SHAPES; grp++) expected.set(grp, await sourceRows(pg, grp))
