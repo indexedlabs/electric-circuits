@@ -794,8 +794,17 @@ async fn shared_snapshot(engine: &Engine, path: &str) -> Result<Arc<Snapshot>, A
     // already in flight may have folded past its last page before a write this request must see,
     // and a request that arrives after that write is answered by a newer build instead. A data
     // read like any other, so a dormant shape reactivates first and a degraded engine refuses.
-    let ds = engine.shape_fold_input(path).await?;
-    let head = ds.head(path).await?;
+    // Joins the shutdown token for the same reason the wait below does: a stalled store would
+    // otherwise hold this request, and with it the server's graceful stop, past the grace.
+    let shutdown = engine.shutdown_token();
+    let head = tokio::select! {
+        biased;
+        head = async {
+            let ds = engine.shape_fold_input(path).await?;
+            ds.head(path).await
+        } => head?,
+        _ = shutdown.wait() => return Err(ApiError::draining()),
+    };
     let open = head.as_ref().is_some_and(|h| !h.closed);
     let floor = head.and_then(|h| h.next_offset);
     let fresh = |snapshot: &Snapshot| floor.as_deref().is_none_or(|floor| !offset_after(floor, &snapshot.tail));

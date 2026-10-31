@@ -459,6 +459,27 @@ async fn a_catch_up_fold_interrupted_by_shutdown_is_told_to_retry() {
     source.open(&gate);
 }
 
+/// The `HEAD` a snapshot request makes on arrival joins the shutdown token too: a store that stalls
+/// it must not hold the request, and with it the server's graceful stop, past the grace.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_stalled_in_its_arrival_head_is_told_to_retry_at_shutdown() {
+    let source = Source::new("scripted://head-shutdown").await;
+    source.append(rows()).await;
+    let gate = Arc::new(BodyGate::default());
+    *source.store.head_gate_path.lock().unwrap() = Some(source.stream.clone());
+    *source.store.head_gate.lock().unwrap() = Some(gate.clone());
+    let (engine, stream) = (source.engine.clone(), source.stream.clone());
+    let request = tokio::spawn(async move { shared_snapshot(&engine, &stream).await.map(|_| ()) });
+    quiesce().await;
+    assert_eq!(gate.arrived.load(SeqCst), 1, "the request is in its arrival HEAD");
+    source.engine.shutdown_token().begin();
+    let error = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap().unwrap_err();
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.retry_after, Some(1));
+    *source.store.head_gate.lock().unwrap() = None;
+    gate.released.notify_waiters();
+}
+
 #[tokio::test(start_paused = true)]
 async fn engine_close_tells_the_waiters_of_an_unfinished_build_to_retry() {
     let source = Source::new("scripted://close").await;
