@@ -94,7 +94,7 @@ def read(label, known_markers):
         if s["offset"] is None:
             return
     for _ in range(50):
-        url = base + s["path"] + "?offset=" + urllib.parse.quote(s["offset"], safe="") + "&live=false"
+        url = base + s["path"] + "?offset=" + urllib.parse.quote(s["offset"], safe="") + "&live=long-poll"
         try:
             status, headers, body = request(url)
         except urllib.error.HTTPError as exc:
