@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 51290,
+  "change_log_lag_peak_bytes": 63073,
+  "checkpoint_lag_peak_bytes": 896197,
+  "confirmed_flush_hold": [
+    "0/2ADE068",
+    "0/2ADE068"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "cc4d78da95990cf0c35093ed87234163a5ff4ed4",
+  "envelopes_per_s_hold": 0.41749295480638765,
+  "envelopes_per_s_recovery": 825.8594727036063,
+  "envelopes_per_s_warmup": 802.006552006552,
+  "fault": "outage=1",
+  "faulted_group_envelopes_hold": 87,
+  "faulted_resume_ms": 701,
+  "health_ms_p50_hold": 0.889,
+  "hold_s": 59,
+  "host_load1_peak_hold": 4.01,
+  "lane_backlog_peak_batches": 32,
+  "lane_backlog_peak_bytes": 19940,
+  "marker_after_ms": {
+    "group": 58556,
+    "plain": 58553
+  },
+  "marker_during_ms": {
+    "group": 60719,
+    "plain": 60717
+  },
+  "pgbench_tps": 199.783435,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "",
+    "forwarded": 55654,
+    "hang": false,
+    "held": 8,
+    "outage": false,
+    "released": 8,
+    "targeted": 0,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 32,
+  "retained_wal_end_bytes": 33644512,
+  "retained_wal_hold_start_bytes": 2247312,
+  "retained_wal_peak_bytes": 46397848,
+  "rss_peak_bytes": 43327488,
+  "rss_warmup_bytes": 54444032,
+  "runner": {
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760340480,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065380",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 18,
+    "recovery": 78,
+    "warmup": 20
+  },
+  "scenario": "b-1",
+  "unaffected_group_envelopes_hold": 26,
+  "unaffected_plain_envelopes_hold": 26,
+  "unaffected_plain_envelopes_warmup": 5978
+}

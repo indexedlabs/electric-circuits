@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 48099598,
+  "change_log_lag_peak_bytes": 48114388,
+  "checkpoint_lag_peak_bytes": 102224,
+  "confirmed_flush_hold": [
+    "0/29A7580",
+    "0/573D340"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "cc4d78da95990cf0c35093ed87234163a5ff4ed4",
+  "envelopes_per_s_hold": 275.6220584017949,
+  "envelopes_per_s_recovery": 126.57568759185386,
+  "envelopes_per_s_warmup": 683.0534351145038,
+  "fault": "match=/shape/group-e7ea29a216e039e5-e8009bb6-678e-49d2-a78c-933db7395f52&hang=1",
+  "faulted_group_envelopes_hold": 70,
+  "faulted_resume_ms": 2681,
+  "health_ms_p50_hold": 4.117,
+  "hold_s": 299,
+  "host_load1_peak_hold": 6.91,
+  "lane_backlog_peak_batches": 66692,
+  "lane_backlog_peak_bytes": 38908451,
+  "marker_after_ms": {
+    "group": null,
+    "plain": null
+  },
+  "marker_during_ms": {
+    "group": null,
+    "plain": null
+  },
+  "pgbench_tps": 999.647966,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e7ea29a216e039e5-e8009bb6-678e-49d2-a78c-933db7395f52",
+    "forwarded": 176847,
+    "hang": true,
+    "held": 10,
+    "outage": false,
+    "released": 0,
+    "targeted": 10,
+    "upstream_errors": 0
+  },
+  "rate_tps": 1000,
+  "receipt_queue_peak_depth": 66692,
+  "retained_wal_end_bytes": 1056358016,
+  "retained_wal_hold_start_bytes": 72701896,
+  "retained_wal_peak_bytes": 1056358016,
+  "rss_peak_bytes": 128143360,
+  "rss_warmup_bytes": 55750656,
+  "runner": {
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065379",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 146,
+    "recovery": 52,
+    "warmup": 19
+  },
+  "scenario": "a:1000",
+  "unaffected_group_envelopes_hold": 20722,
+  "unaffected_plain_envelopes_hold": 20723,
+  "unaffected_plain_envelopes_warmup": 5099
+}

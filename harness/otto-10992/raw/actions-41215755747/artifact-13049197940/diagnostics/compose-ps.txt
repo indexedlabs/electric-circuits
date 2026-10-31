@@ -1,0 +1,6 @@
+NAME                           IMAGE                        COMMAND                   SERVICE    CREATED          STATUS                    PORTS
+electric-circuits-api-1        electric-circuits-api        "docker-entrypoint.s…"    api        17 minutes ago   Up 17 minutes             0.0.0.0:8790->8790/tcp, [::]:8790->8790/tcp
+electric-circuits-ds-1         electric-circuits-ds         "sh -c 'mkdir -p \"$D…"   ds         17 minutes ago   Up 17 minutes (healthy)   0.0.0.0:8791->8791/tcp, [::]:8791->8791/tcp
+electric-circuits-ds-proxy-1   electric-circuits-ds-proxy   "python /proxy.py"        ds-proxy   17 minutes ago   Up 17 minutes             0.0.0.0:8792->8792/tcp, [::]:8792->8792/tcp
+electric-circuits-engine-1     electric-circuits-engine     "electric-circuits-e…"    engine     17 minutes ago   Up 17 minutes (healthy)   0.0.0.0:7010->7010/tcp, [::]:7010->7010/tcp
+electric-circuits-postgres-1   postgres:18.6                "docker-entrypoint.s…"    postgres   24 minutes ago   Up 24 minutes (healthy)   0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp

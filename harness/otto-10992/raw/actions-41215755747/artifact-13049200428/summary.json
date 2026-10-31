@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 16581,
+  "change_log_lag_peak_bytes": 52098378,
+  "checkpoint_lag_peak_bytes": 927283,
+  "confirmed_flush_hold": [
+    "0/2B2CBF0",
+    "0/B252328"
+  ],
+  "delivery_errors": {
+    "faulted": 239,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "56f3dd1b768426a859dbaa27414d192600c0e498",
+  "envelopes_per_s_hold": 797.5792833573203,
+  "envelopes_per_s_recovery": 797.9503667236008,
+  "envelopes_per_s_warmup": 793.5483870967741,
+  "fault": "match=/shape/group-e73cc1d66327e167-76abd80d-509d-472e-8ab0-e1f22a9f60f2&hang=1",
+  "faulted_group_envelopes_hold": 36,
+  "faulted_resume_ms": null,
+  "health_ms_p50_hold": 0.924,
+  "hold_s": 299,
+  "host_load1_peak_hold": 3.67,
+  "lane_backlog_peak_batches": 35380,
+  "lane_backlog_peak_bytes": 20625150,
+  "marker_after_ms": {
+    "group": 160,
+    "plain": 158
+  },
+  "marker_during_ms": {
+    "group": 262,
+    "plain": 261
+  },
+  "pgbench_tps": 199.462277,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e73cc1d66327e167-76abd80d-509d-472e-8ab0-e1f22a9f60f2",
+    "forwarded": 427910,
+    "hang": true,
+    "held": 17,
+    "outage": false,
+    "released": 0,
+    "targeted": 17,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 35380,
+  "retained_wal_end_bytes": 6670016,
+  "retained_wal_hold_start_bytes": 1433896,
+  "retained_wal_peak_bytes": 16211168,
+  "rss_peak_bytes": 193007616,
+  "rss_warmup_bytes": 56111104,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065363",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 222,
+    "recovery": 90,
+    "warmup": 23
+  },
+  "scenario": "a",
+  "unaffected_group_envelopes_hold": 59645,
+  "unaffected_plain_envelopes_hold": 59645,
+  "unaffected_plain_envelopes_warmup": 5944
+}
