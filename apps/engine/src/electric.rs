@@ -1879,3 +1879,6 @@ mod tests {
         assert!(entry.live_inflight.lock().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+mod snapshot_tests;
