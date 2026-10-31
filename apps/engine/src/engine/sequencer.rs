@@ -545,8 +545,8 @@ pub(crate) async fn sequencer_loop(
     // publish, all deferred subquery effects from the previous transaction must have landed.
     // This is enabled only while at least one group lease is active; ordinary single-table
     // shapes keep their existing throughput path.
-    let mut last_group_lsn: Option<u64> = None;
-    let mut last_group_paths = HashSet::new();
+    let last_group_lsn: Option<u64> = None;
+    let last_group_paths: HashSet<String> = HashSet::new();
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -1045,18 +1045,8 @@ pub(crate) async fn sequencer_loop(
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
                         }
-                        if group_fence.active()
-                            && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
-                        {
-                            let paths = subq.group_lanes.paths_at_or_before(commit_lsn);
-                            if !paths.is_empty() {
-                                last_group_lsn = Some(commit_lsn);
-                                last_group_paths = paths;
-                            } else {
-                                last_group_lsn = None;
-                                last_group_paths.clear();
-                            }
-                        }
+                        // S1: no cross-commit group barrier, so no per-commit scan of unlanded paths.
+                        let _ = &group_fence;
                     }
                     if processing_failed {
                         // The read cursor advances before processing; rewind it to the page that

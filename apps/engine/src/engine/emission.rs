@@ -165,7 +165,7 @@ struct GroupLane {
     worker_wake: tokio::sync::Notify,
     worker_done: tokio::sync::Notify,
     pending: Arc<PendingFlips>,
-    origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
+    origins: Arc<std::sync::Mutex<BTreeMap<(u64, String), usize>>>,
     origin_wake: Arc<tokio::sync::Notify>,
     metrics: Arc<crate::metrics::Metrics>,
     #[cfg(test)]
@@ -223,7 +223,7 @@ pub(crate) struct GroupEmissionLanes {
     ds: DsClient,
     shutdown: crate::shutdown::ShutdownToken,
     pending: Arc<PendingFlips>,
-    origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
+    origins: Arc<std::sync::Mutex<BTreeMap<(u64, String), usize>>>,
     wake: Arc<tokio::sync::Notify>,
     metrics: Arc<crate::metrics::Metrics>,
 }
@@ -367,7 +367,7 @@ impl GroupEmissionLanes {
     }
 
     pub(crate) fn begin_origin(&self, path: &str, commit_lsn: u64) {
-        *self.origins.lock().unwrap().entry((path.to_string(), commit_lsn)).or_default() += 1;
+        *self.origins.lock().unwrap().entry((commit_lsn, path.to_string())).or_default() += 1;
     }
 
     pub(crate) fn complete_origin(&self, path: &str, commit_lsn: u64) {
@@ -375,12 +375,12 @@ impl GroupEmissionLanes {
     }
 
     pub(crate) fn has_origin_at_or_before(&self, paths: &HashSet<String>, marker_lsn: u64) -> bool {
-        self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
+        self.origins.lock().unwrap().iter().any(|((lsn, path), _)| *lsn <= marker_lsn && paths.contains(path))
     }
 
     /// S1: the oldest commit with group output that has not landed, the progress-epoch pin.
     pub(crate) fn oldest_outstanding_origin(&self) -> Option<u64> {
-        self.origins.lock().unwrap().keys().map(|(_, lsn)| *lsn).min()
+        self.origins.lock().unwrap().keys().next().map(|(lsn, _)| *lsn)
     }
 
     pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {
@@ -388,8 +388,8 @@ impl GroupEmissionLanes {
             .lock()
             .unwrap()
             .iter()
-            .filter(|((_, lsn), _)| *lsn <= marker_lsn)
-            .map(|((path, _), _)| path.clone())
+            .filter(|((lsn, _), _)| *lsn <= marker_lsn)
+            .map(|((_, path), _)| path.clone())
             .collect()
     }
 
@@ -632,13 +632,13 @@ fn complete_group_entry(lane: &GroupLane, entry: &GroupBatchEntry) {
 }
 
 fn complete_origin_entry(
-    origins: &std::sync::Mutex<BTreeMap<(String, u64), usize>>,
+    origins: &std::sync::Mutex<BTreeMap<(u64, String), usize>>,
     wake: &tokio::sync::Notify,
     path: &str,
     commit_lsn: u64,
 ) {
     let mut origins = origins.lock().unwrap();
-    let key = (path.to_string(), commit_lsn);
+    let key = (commit_lsn, path.to_string());
     if let Some(count) = origins.get_mut(&key) {
         *count -= 1;
         if *count == 0 {
