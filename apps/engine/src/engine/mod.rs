@@ -1030,9 +1030,20 @@ impl FlipWork {
 #[derive(Default)]
 pub(crate) struct PendingFlips {
     state: std::sync::Mutex<(i64, BTreeMap<u64, usize>)>,
+    metrics: std::sync::Mutex<Option<std::sync::Weak<crate::metrics::Metrics>>>,
 }
 
 impl PendingFlips {
+    pub(crate) fn attach_metrics(&self, metrics: &Arc<crate::metrics::Metrics>) {
+        *self.metrics.lock().unwrap() = Some(Arc::downgrade(metrics));
+    }
+
+    fn publish_depth(&self, depth: i64) {
+        if let Some(metrics) = self.metrics.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
+            metrics.receipt_queue_depth.store(depth.max(0) as u64, Ordering::Relaxed);
+        }
+    }
+
     fn add(&self, commit_lsn: u64) {
         self.add_all(std::iter::once(commit_lsn));
     }
@@ -1045,6 +1056,9 @@ impl PendingFlips {
             state.0 += 1;
             *state.1.entry(commit_lsn).or_default() += 1;
         }
+        let depth = state.0;
+        drop(state);
+        self.publish_depth(depth);
     }
 
     fn complete(&self, commit_lsn: u64) {
@@ -1055,6 +1069,9 @@ impl PendingFlips {
             state.1.remove(&commit_lsn);
         }
         state.0 -= 1;
+        let depth = state.0;
+        drop(state);
+        self.publish_depth(depth);
     }
 
     fn count(&self) -> i64 {
@@ -1750,6 +1767,7 @@ impl Engine {
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
+        pending_flips.attach_metrics(ds.metrics());
         let degrade = DegradeState::new();
         let group_fence = GroupFence::default();
         let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());

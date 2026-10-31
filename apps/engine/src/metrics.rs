@@ -2,6 +2,7 @@
 //! via `GET /metrics`. Used by the benchmark harness to attribute bottlenecks (per-envelope
 //! fan-out, family-step, and shape-append latencies) under sustained load.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const NB: usize = 40; // buckets cover [2^0, 2^40) microseconds (~12 days) — plenty of headroom.
@@ -83,6 +84,12 @@ fn bucket(us: u64) -> usize {
 pub struct Timer<'a> {
     hist: &'a Hist,
     start: std::time::Instant,
+}
+
+#[derive(Default)]
+struct LaneBacklog {
+    bytes: u64,
+    batches: u64,
 }
 impl<'a> Timer<'a> {
     pub fn new(hist: &'a Hist) -> Self {
@@ -201,6 +208,12 @@ pub struct Metrics {
     /// GAUGE: 1 while a walsender holds the slot (i.e. this engine is streaming), 0 when it is not
     /// — and 0 when the slot does not exist at all, which is the epoch-break case.
     pub replication_slot_active: AtomicU64,
+    /// Observation-only backlog of grouped output lanes, keyed by stream path.
+    pub(crate) group_lane_backlog: std::sync::Mutex<BTreeMap<String, LaneBacklog>>,
+    /// Observation-only count of outstanding receipt/barrier batches.
+    pub(crate) receipt_queue_depth: AtomicU64,
+    pub(crate) sequencer_processed: std::sync::Mutex<serde_json::Value>,
+    pub(crate) sequencer_checkpoint: std::sync::Mutex<serde_json::Value>,
     pub process_envelope: Hist, // end-to-end fan-out latency per table envelope
     pub family_step: Hist,      // one family circuit transaction
     pub append: Hist,           // one shape-stream append (durable-streams round-trip)
@@ -263,6 +276,10 @@ impl Metrics {
             replication_slot_retained_wal_bytes: AtomicU64::new(0),
             replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
             replication_slot_active: AtomicU64::new(0),
+            group_lane_backlog: std::sync::Mutex::new(BTreeMap::new()),
+            receipt_queue_depth: AtomicU64::new(0),
+            sequencer_processed: std::sync::Mutex::new(serde_json::json!(null)),
+            sequencer_checkpoint: std::sync::Mutex::new(serde_json::json!(null)),
             txn_spills: AtomicU64::new(0),
             txn_spill_bytes: AtomicU64::new(0),
             txn_chunked_appends: AtomicU64::new(0),
@@ -279,6 +296,11 @@ impl Metrics {
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
+        let group_lane_backlog = self.group_lane_backlog.lock().unwrap();
+        let group_lane_backlog = group_lane_backlog
+            .iter()
+            .map(|(path, value)| (path.clone(), serde_json::json!({"bytes": value.bytes, "batches": value.batches})))
+            .collect::<serde_json::Map<_, _>>();
         serde_json::json!({
             "counters": {
                 "envelopes_processed": self.envelopes.load(Ordering::Relaxed),
@@ -334,11 +356,42 @@ impl Metrics {
                 "replication_slot_retained_wal_bytes": self.replication_slot_retained_wal_bytes.load(Ordering::Relaxed),
                 "replication_confirmed_flush_lag_bytes": self.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed),
                 "replication_slot_active": self.replication_slot_active.load(Ordering::Relaxed),
+                "receipt_queue_depth": self.receipt_queue_depth.load(Ordering::Relaxed),
+            },
+            "group_lane_backlog": group_lane_backlog,
+            "sequencer": {
+                "processed": self.sequencer_processed.lock().unwrap().clone(),
+                "checkpoint": self.sequencer_checkpoint.lock().unwrap().clone(),
             },
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
             "append_us": self.append.snapshot(),
         })
+    }
+
+    pub(crate) fn group_lane_add(&self, path: &str, bytes: u64) {
+        let mut lanes = self.group_lane_backlog.lock().unwrap();
+        let lane = lanes.entry(path.to_owned()).or_default();
+        lane.bytes = lane.bytes.saturating_add(bytes);
+        lane.batches = lane.batches.saturating_add(1);
+    }
+
+    pub(crate) fn group_lane_complete(&self, path: &str, bytes: u64) {
+        let mut lanes = self.group_lane_backlog.lock().unwrap();
+        let Some(lane) = lanes.get_mut(path) else { return };
+        lane.bytes = lane.bytes.saturating_sub(bytes);
+        lane.batches = lane.batches.saturating_sub(1);
+        if lane.batches == 0 {
+            lanes.remove(path);
+        }
+    }
+
+    pub(crate) fn set_sequencer_processed(&self, segment: u32, offset: &str) {
+        *self.sequencer_processed.lock().unwrap() = serde_json::json!({"segment": segment, "offset": offset});
+    }
+
+    pub(crate) fn set_sequencer_checkpoint(&self, segment: u32, offset: &str) {
+        *self.sequencer_checkpoint.lock().unwrap() = serde_json::json!({"segment": segment, "offset": offset});
     }
 
     /// Zero all counters and histograms — the benchmark calls this after shape registration so the
