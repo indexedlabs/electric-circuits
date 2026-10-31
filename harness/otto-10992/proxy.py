@@ -10,15 +10,21 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TARGET_HOST = os.getenv("TARGET_HOST", "ds")
 TARGET_PORT = int(os.getenv("TARGET_PORT", "8791"))
-MATCH = os.getenv("FAULT_MATCH", "")
-DELAY_MS = int(os.getenv("DELAY_MS", "0"))
-HANG = os.getenv("HANG", "0") == "1"
-OUTAGE = os.getenv("OUTAGE", "0") == "1"
-STATS = {"targeted": 0, "held": 0, "forwarded": 0, "upstream_errors": 0}
+# The fault is switched in place through /__fault (never by recreating the proxy, which would
+# drop every unrelated engine connection at the start and end of a fault).
+FAULT = {
+    "match": os.getenv("FAULT_MATCH", ""),
+    "delay_ms": int(os.getenv("DELAY_MS", "0")),
+    "hang": os.getenv("HANG", "0") == "1",
+    "outage": os.getenv("OUTAGE", "0") == "1",
+    "generation": 0,
+}
+STATS = {"targeted": 0, "held": 0, "released": 0, "forwarded": 0, "upstream_errors": 0}
 STATS_LOCK = threading.Lock()
 
 
@@ -71,9 +77,24 @@ class Proxy(BaseHTTPRequestHandler):
         self.forward()
 
     def forward(self):
+        if self.path.startswith("/__fault?") or self.path == "/__fault_clear":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            with STATS_LOCK:
+                FAULT.update({
+                    "match": query.get("match", [""])[0],
+                    "delay_ms": int(query.get("delay_ms", ["0"])[0]),
+                    "hang": query.get("hang", ["0"])[0] == "1",
+                    "outage": query.get("outage", ["0"])[0] == "1",
+                    "generation": FAULT["generation"] + 1,
+                })
+                if query:
+                    for key in ("targeted", "held", "released"):
+                        STATS[key] = 0
+            self.path = "/__fault_stats"
         if self.path == "/__fault_stats":
             with STATS_LOCK:
-                payload = json.dumps({**STATS, "fault_match": MATCH, "hang": HANG, "outage": OUTAGE}).encode()
+                payload = json.dumps({**STATS, "fault_match": FAULT["match"], "hang": FAULT["hang"],
+                                      "outage": FAULT["outage"], "delay_ms": FAULT["delay_ms"]}).encode()
             self.send_response(200, "OK")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -88,18 +109,28 @@ class Proxy(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
             return
-        targeted = not MATCH or MATCH in self.path
+        with STATS_LOCK:
+            fault = dict(FAULT)
+        targeted = bool(fault["match"]) and fault["match"] in self.path
         if targeted:
             with STATS_LOCK:
                 STATS["targeted"] += 1
-        if OUTAGE or (targeted and HANG):
+        if fault["outage"] or (targeted and fault["hang"]):
             with STATS_LOCK:
                 STATS["held"] += 1
             # Keep the TCP request open so the engine experiences a real stalled append/read.
+            # When the fault is cleared the held request is dropped unanswered (the engine sees a
+            # closed connection and retries), never forwarded late as a duplicate.
             while True:
-                time.sleep(60)
-        if targeted and DELAY_MS:
-            time.sleep(DELAY_MS / 1000)
+                time.sleep(0.2)
+                with STATS_LOCK:
+                    if FAULT["generation"] != fault["generation"]:
+                        STATS["released"] += 1
+                        break
+            self.close_connection = True
+            return
+        if targeted and fault["delay_ms"]:
+            time.sleep(fault["delay_ms"] / 1000)
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else None
         headers = {k: v for k, v in self.headers.items() if k.lower() not in {"host", "connection"}}

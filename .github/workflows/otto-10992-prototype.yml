@@ -65,7 +65,12 @@ jobs:
           # A variant may carry its own adaptation of the same observation-only patch.
           patch=harness/otto-10992/measurement.patch
           [ -f "harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch" ] && patch="harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch"
-          git apply "$patch"
+          # Spike branches carry the same patch as their first commit on main.
+          if grep -q group_lane_backlog apps/engine/src/metrics.rs; then
+            patch="already applied in $ENGINE_REF"
+          else
+            git apply "$patch"
+          fi
           printf '%s\n' "$patch" > harness/otto-10992/results/measurement-patch.txt
 
       - name: Start PostgreSQL and Durable Streams
