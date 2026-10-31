@@ -99,6 +99,15 @@ jobs:
       - name: Build and start engine, proxy and API
         run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d --build ds-proxy engine api
 
+      - name: Link workspace clients for measurement readers
+        run: |
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml exec -T api sh -eu -c '
+            mkdir -p /repo/node_modules/@electric-circuits
+            ln -sfn /repo/packages/client /repo/node_modules/@electric-circuits/client
+            ln -sfn /repo/packages/protocol /repo/node_modules/@electric-circuits/protocol
+            ln -sfn /repo/apps/api /repo/node_modules/@electric-circuits/api
+          '
+
       - name: Run selected scenarios
         env:
           SCENARIOS: ${{ steps.config.outputs.scenarios }}
