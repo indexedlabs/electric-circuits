@@ -32,7 +32,8 @@ group_bytes() {
 }
 
 group_stream_offset() {
-  local logical=$1 url="http://127.0.0.1:8791/circuits/v1/${ELECTRIC_CIRCUITS_DS_NAMESPACE}/stores/${ELECTRIC_CIRCUITS_DS_STORE_GENERATION}/queries/${ELECTRIC_CIRCUITS_QUERY_GENERATION}/${logical}"
+  local logical=$1
+  local url="http://127.0.0.1:8791/circuits/v1/${ELECTRIC_CIRCUITS_DS_NAMESPACE}/stores/${ELECTRIC_CIRCUITS_DS_STORE_GENERATION}/queries/${ELECTRIC_CIRCUITS_QUERY_GENERATION}/${logical}"
   curl --max-time 5 -sS -D - "$url?offset=0000000000000000_0000000000000000&live=false" -o /dev/null 2>/dev/null \
     | awk 'tolower($1)=="stream-next-offset:" {print $2}' | tr -d '\r' | tail -1
 }
