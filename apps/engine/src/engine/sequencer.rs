@@ -1574,9 +1574,9 @@ pub(crate) async fn activate_shape(
                     let val = agg.value();
                     if agg.last.as_ref() != Some(&val) {
                         agg.last = Some(val.clone());
-                        let mut out = agg.envelope(&exec.ts, txid, lsn);
-                        out.headers.commit_ts = env.headers.commit_ts;
-                        outs.push(out);
+                        outs.push(agg.envelope(&exec.ts, txid, lsn));
+                        let last = outs.len() - 1;
+                        carry_commit_time(&mut outs[last..], env.headers.commit_ts);
                     }
                 }
             }
@@ -2339,10 +2339,6 @@ pub(crate) fn emit_storage_txn_metrics(
     metrics.emitter().storage_txn(ops, bytes, txn_pending.len() as u64);
 }
 
-/// Carry a transaction's commit time onto every output envelope it produced (`headers.commit_ts`),
-/// so a client can measure time to data. Subquery emissions are stamped by the registry instead
-/// ([`crate::subquery::SubqueryRegistry::note_commit_time`]), since they may land after this
-/// transaction's own appends.
 /// Give the envelopes built from one buffered or replayed source change that change's commit time:
 /// an activation drain and a dormant shape's replay emit live changes outside a transaction's
 /// `txn_pending`, so [`stamp_commit_time`] never sees them.
@@ -2354,6 +2350,10 @@ fn carry_commit_time(outs: &mut [Envelope], commit_ts: Option<i64>) {
     }
 }
 
+/// Carry a transaction's commit time onto every output envelope it produced (`headers.commit_ts`),
+/// so a client can measure time to data. Subquery emissions are stamped by the registry instead
+/// ([`crate::subquery::SubqueryRegistry::note_commit_time`]), since they may land after this
+/// transaction's own appends.
 pub(crate) fn stamp_commit_time(pending: &mut HashMap<String, Vec<Envelope>>, commit_ts: Option<i64>) {
     let Some(commit_ts) = commit_ts else { return };
     for env in pending.values_mut().flatten() {
@@ -2910,6 +2910,47 @@ mod pending_buffer_tests {
         assert_eq!(
             appended.iter().map(|e| (e.key.as_str(), e.headers.commit_ts)).collect::<Vec<_>>(),
             vec![("1", Some(1_793_404_800_123)), ("2", None)]
+        );
+    }
+
+    /// The same for an aggregate created while matching rows commit: its seed value carries no
+    /// commit time, and each value a buffered change moves carries that change's.
+    #[tokio::test]
+    async fn an_aggregate_activation_drain_carries_each_buffered_changes_commit_time() {
+        let ts = users();
+        let mut stamped = envelope(1, 1);
+        stamped.headers.commit_ts = Some(1_793_404_800_123);
+        let mut shape = pending(&ts, vec![stamped, envelope(2, 1)]);
+        shape.kind = CreateKind::Aggregate { func: AggFn::Count, col: None };
+        let mut exec = TableExec::new(ts.clone());
+        exec.pending.insert("s1".to_string(), shape);
+        let mut execs = HashMap::from([(ts.table.to_string(), exec)]);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        activate_shape(
+            &ds,
+            &mut execs,
+            &ts.table,
+            "s1",
+            crate::pg::SnapshotGate::passthrough(),
+            None,
+            0,
+            &mut HashMap::new(),
+            &crate::shutdown::ShutdownToken::new(),
+        )
+        .await
+        .unwrap();
+        let appended: Vec<Envelope> = serde_json::from_slice(&store.appended.lock().unwrap()[0].2).unwrap();
+        assert_eq!(
+            appended
+                .iter()
+                .map(|e| (e.value.as_ref().map(|v| v["n"].clone()), e.headers.commit_ts))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(serde_json::json!(0)), None),
+                (Some(serde_json::json!(1)), Some(1_793_404_800_123)),
+                (Some(serde_json::json!(2)), None),
+            ]
         );
     }
 
