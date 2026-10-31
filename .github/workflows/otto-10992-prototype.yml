@@ -39,6 +39,20 @@ jobs:
             --exclude .github/workflows/otto-10992-prototype.yml \
             /tmp/otto-baseline/ ./
 
+      - name: Apply measurement instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p harness/otto-10992/results
+          git diff 135c183^ 135c183 -- \
+            apps/engine/src/metrics.rs \
+            apps/engine/src/engine/emission.rs \
+            apps/engine/src/engine/mod.rs \
+            apps/engine/src/engine/sequencer.rs > /tmp/otto-10992-measurement.patch
+          git apply /tmp/otto-10992-measurement.patch
+          printf '%s\n' '135c183 Add observation-only backlog instrumentation' \
+            > harness/otto-10992/results/measurement-patch.txt
+
       - name: Start PostgreSQL and Durable Streams
         env:
           DS_MEMORY: ''
