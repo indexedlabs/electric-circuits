@@ -164,6 +164,12 @@ describe('conformance: /v1/shape reconnect storm', () => {
     expect(builds, 'snapshot builds must be one per shape and tail, not one per client').toBeLessThanOrEqual(SHAPES)
     expect(builds + shared).toBeGreaterThanOrEqual(clients.length)
     expect(shared).toBeGreaterThanOrEqual(clients.length - SHAPES)
+    // The same counters reach the Prometheus scrape, where a post-restart storm is watched.
+    const prom = await (await fetch(`${harness.engineUrl}/metrics/prometheus`)).text()
+    const scraped = (name: string) => Number(prom.match(new RegExp(`^${name}\\{[^}]*\\} (\\S+)`, 'm'))?.[1] ?? NaN)
+    expect(scraped('engine_electric_snapshot_builds_total')).toBe(after.builds)
+    expect(scraped('engine_electric_snapshot_joins_total')).toBe(after.joins)
+    expect(scraped('engine_electric_snapshot_reuses_total')).toBe(after.reuses)
 
     const expected = new Map<number, Map<string, Row>>()
     for (let grp = 0; grp < SHAPES; grp++) expected.set(grp, await sourceRows(pg, grp))

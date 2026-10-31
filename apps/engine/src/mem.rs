@@ -728,6 +728,24 @@ pub(crate) fn init_otel(
         ""
     );
     engine_counter!(
+        "engine_electric_snapshot_builds",
+        "/v1/shape offset=-1 answers served by a build the request started",
+        electric_snapshot_builds,
+        ""
+    );
+    engine_counter!(
+        "engine_electric_snapshot_joins",
+        "/v1/shape offset=-1 answers served by joining a build already in flight",
+        electric_snapshot_joins,
+        ""
+    );
+    engine_counter!(
+        "engine_electric_snapshot_reuses",
+        "/v1/shape offset=-1 answers served by a finished build at an unchanged tail",
+        electric_snapshot_reuses,
+        ""
+    );
+    engine_counter!(
         "engine_sequencer_orphan_fragments",
         "Incomplete transaction fragments discarded by the sequencer",
         sequencer_orphan_fragments,
