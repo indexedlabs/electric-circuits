@@ -93,7 +93,71 @@ impl EmissionLanes {
     }
 }
 
+#[allow(dead_code)]
 const GROUP_LANE_CAPACITY: usize = 64;
+
+/// OTTO-10992 spike S1: group lanes never make a producer wait. Each lane keeps up to this many
+/// bytes of admitted output in memory and spills the rest to a per-lane file; the sequencer's
+/// progress epochs (not the lane) hold the replay position behind unlanded work.
+fn group_lane_memory_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("ELECTRIC_CIRCUITS_GROUP_LANE_MEMORY_BYTES").ok().and_then(|v| v.parse().ok()).unwrap_or(8 << 20)
+    })
+}
+
+struct LaneSpill {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    end: u64,
+    outstanding: u64,
+}
+
+impl LaneSpill {
+    fn open(stream_path: &str) -> std::io::Result<Self> {
+        let dir = std::env::var_os("ELECTRIC_CIRCUITS_TXN_SPILL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("otto-10992-group-spill");
+        std::fs::create_dir_all(&dir)?;
+        let name: String =
+            stream_path.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
+        let path = dir.join(format!("{name}-{}.spill", std::process::id()));
+        let file = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(&path)?;
+        Ok(Self { file, path, end: 0, outstanding: 0 })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<(u64, u64)> {
+        use std::os::unix::fs::FileExt;
+        let at = self.end;
+        self.file.write_all_at(bytes, at)?;
+        self.end += bytes.len() as u64;
+        self.outstanding += 1;
+        Ok((at, bytes.len() as u64))
+    }
+
+    fn read(&mut self, at: u64, len: u64) -> std::io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0; len as usize];
+        self.file.read_exact_at(&mut buf, at)?;
+        self.release();
+        Ok(buf)
+    }
+
+    fn release(&mut self) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        if self.outstanding == 0 && self.end > 0 {
+            let _ = self.file.set_len(0);
+            self.end = 0;
+        }
+    }
+}
+
+impl Drop for LaneSpill {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 struct GroupLane {
     state: std::sync::Mutex<GroupLaneState>,
@@ -122,12 +186,17 @@ struct GroupLaneState {
     next_seq: u64,
     taken: u64,
     closed: bool,
+    /// S1: admitted payload bytes held in memory, and the lane's spill file for the rest.
+    memory_bytes: u64,
+    spill: Option<LaneSpill>,
 }
 
 struct GroupBatchEntry {
     commit_lsn: u64,
     stream_path: String,
     envs: std::sync::Mutex<Option<Vec<Envelope>>>,
+    /// S1: where an admitted payload was spilled, when it did not fit in the lane's memory.
+    spilled: std::sync::Mutex<Option<(u64, u64)>>,
     accounted: std::sync::atomic::AtomicBool,
     bytes: u64,
 }
@@ -187,6 +256,8 @@ impl GroupEmissionLanes {
                 next_seq: 0,
                 taken: 0,
                 closed: false,
+                memory_bytes: 0,
+                spill: None,
             }),
             wake: tokio::sync::Notify::new(),
             worker_wake: tokio::sync::Notify::new(),
@@ -231,7 +302,7 @@ impl GroupEmissionLanes {
                     notified.await;
                     continue;
                 };
-                let envs = ticket.entry.envs.lock().unwrap().take();
+                let envs = take_payload(&worker_lane, &ticket.entry);
                 let Some(envs) = envs else {
                     let mut state = worker_lane.state.lock().unwrap();
                     if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
@@ -307,6 +378,11 @@ impl GroupEmissionLanes {
         self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
     }
 
+    /// S1: the oldest commit with group output that has not landed, the progress-epoch pin.
+    pub(crate) fn oldest_outstanding_origin(&self) -> Option<u64> {
+        self.origins.lock().unwrap().keys().map(|(_, lsn)| *lsn).min()
+    }
+
     pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {
         self.origins
             .lock()
@@ -347,6 +423,7 @@ impl GroupEmissionLanes {
             commit_lsn,
             stream_path: path.to_string(),
             envs: std::sync::Mutex::new(None),
+            spilled: std::sync::Mutex::new(None),
             accounted: std::sync::atomic::AtomicBool::new(false),
             bytes,
         });
@@ -430,12 +507,34 @@ impl GroupBatchHandle {
                         self.ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
                         Admission::Cancelled
                     }
-                    _ if state.waiting.front().is_some_and(|front| Arc::ptr_eq(front, &self.ticket))
-                        && state.admitted.len() < GROUP_LANE_CAPACITY
-                        && self.ticket.seq < state.taken.saturating_add(GROUP_LANE_CAPACITY as u64) =>
-                    {
+                    _ if state.waiting.front().is_some_and(|front| Arc::ptr_eq(front, &self.ticket)) => {
                         let batch = self.batch.take().expect("a waiting handle owns its batch");
-                        *self.ticket.entry.envs.lock().unwrap() = Some(batch);
+                        let bytes = self.ticket.entry.bytes;
+                        if state.memory_bytes.saturating_add(bytes) <= group_lane_memory_bytes() {
+                            state.memory_bytes += bytes;
+                            *self.ticket.entry.envs.lock().unwrap() = Some(batch);
+                        } else {
+                            let spilled = serde_json::to_vec(&batch).map_err(std::io::Error::other).and_then(|body| {
+                                if state.spill.is_none() {
+                                    state.spill = Some(LaneSpill::open(&self.ticket.entry.stream_path)?);
+                                }
+                                state.spill.as_mut().unwrap().write(&body)
+                            });
+                            match spilled {
+                                Ok(at) => {
+                                    self.lane
+                                        .metrics
+                                        .group_spill_bytes
+                                        .fetch_add(at.1, std::sync::atomic::Ordering::Relaxed);
+                                    *self.ticket.entry.spilled.lock().unwrap() = Some(at);
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, "group lane spill failed; keeping the batch in memory");
+                                    state.memory_bytes += bytes;
+                                    *self.ticket.entry.envs.lock().unwrap() = Some(batch);
+                                }
+                            }
+                        }
                         state.waiting.pop_front();
                         self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);
                         state.admitted.push_back(self.ticket.clone());
@@ -483,11 +582,50 @@ impl Drop for GroupBatchHandle {
     }
 }
 
+/// S1: take an admitted payload for the worker, from memory or from the lane's spill file.
+fn take_payload(lane: &GroupLane, entry: &GroupBatchEntry) -> Option<Vec<Envelope>> {
+    let taken = entry.envs.lock().unwrap().take();
+    if let Some(envs) = taken {
+        let mut state = lane.state.lock().unwrap();
+        state.memory_bytes = state.memory_bytes.saturating_sub(entry.bytes);
+        return Some(envs);
+    }
+    let spilled = entry.spilled.lock().unwrap().take();
+    let (at, len) = spilled?;
+    let mut state = lane.state.lock().unwrap();
+    let body = state.spill.as_mut()?.read(at, len);
+    drop(state);
+    lane.metrics.group_spill_bytes.fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
+    match body.map(|body| serde_json::from_slice::<Vec<Envelope>>(&body)) {
+        Ok(Ok(envs)) => Some(envs),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "group lane spill could not be decoded");
+            None
+        }
+        Err(error) => {
+            tracing::error!(%error, "group lane spill could not be read");
+            None
+        }
+    }
+}
+
 fn complete_group_entry(lane: &GroupLane, entry: &GroupBatchEntry) {
     if entry.accounted.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    let _ = entry.envs.lock().unwrap().take();
+    if entry.envs.lock().unwrap().take().is_some() {
+        let mut state = lane.state.lock().unwrap();
+        state.memory_bytes = state.memory_bytes.saturating_sub(entry.bytes);
+    }
+    let spilled = entry.spilled.lock().unwrap().take();
+    if let Some((_, len)) = spilled {
+        let mut state = lane.state.lock().unwrap();
+        if let Some(spill) = state.spill.as_mut() {
+            spill.release();
+        }
+        drop(state);
+        lane.metrics.group_spill_bytes.fetch_sub(len, std::sync::atomic::Ordering::Relaxed);
+    }
     lane.metrics.group_lane_complete(&entry.stream_path, entry.bytes);
     lane.pending.complete(entry.commit_lsn);
     complete_origin_entry(&lane.origins, &lane.origin_wake, &entry.stream_path, entry.commit_lsn);

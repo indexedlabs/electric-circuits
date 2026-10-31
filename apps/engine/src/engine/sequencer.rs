@@ -510,6 +510,13 @@ pub(crate) async fn sequencer_loop(
     // increasing on the single ordered log, so anything at/below the highwater has already been
     // applied and is skipped. Envelopes without both stamps (library mode) bypass this.
     let mut highwater: Option<(u64, u64)> = restore_highwater;
+    // OTTO-10992 spike S1 — progress epochs. Group output no longer holds the loop; instead each
+    // commit processed while some group output is unlanded records where a replay of it must
+    // start and the highwater before it. `processed` and the checkpoint never pass the epoch of
+    // the oldest unlanded group commit, so a restart still re-derives everything not on every
+    // stream, while unaffected streams keep receiving output.
+    let mut group_epochs: std::collections::BTreeMap<u64, (LogPosition, Option<(u64, u64)>)> =
+        std::collections::BTreeMap::new();
 
     // The TRAILING RUN of a page whose last envelope is not marked `headers.last` (ADR-0003).
     //
@@ -787,14 +794,8 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if group_fence.active()
-                            && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
-                        {
-                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
-                            processing_failed = true;
-                            break;
-                        }
+                        // S1: the cross-commit group barrier is replaced by progress epochs.
+                        let _ = (&last_group_lsn, &last_group_paths);
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -984,20 +985,14 @@ pub(crate) async fn sequencer_loop(
                             processing_failed = true;
                             break;
                         }
-                        if !direct_group_paths.is_empty()
-                            && !wait_for_group_effects(
-                                &subq.group_lanes,
-                                &direct_group_paths,
-                                &shutdown,
-                                group_lsn,
-                            )
-                            .await
-                        {
-                            tracing::error!(group_lsn, "group output could not land before advancing the processed position");
-                            highwater = txn_highwater;
-                            processing_failed = true;
-                            break;
+                        // S1: record this commit's epoch instead of waiting for its group output.
+                        if subq.group_lanes.oldest_outstanding_origin().is_some() {
+                            let start = held_replay_from
+                                .clone()
+                                .unwrap_or_else(|| LogPosition { segment: pos.segment, offset: read_off.clone() });
+                            group_epochs.entry(group_lsn).or_insert((start, txn_highwater));
                         }
+                        let _ = &direct_group_paths;
                         if source_fence.is_some() || !runtime_fences.is_empty() {
                             if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
                                 tracing::error!(
@@ -1080,8 +1075,9 @@ pub(crate) async fn sequencer_loop(
                     // flushed — and never past a run still being HELD (ADR-0003): a restart must
                     // re-read the whole incomplete transaction, and `processed` is also what
                     // `GET /tables/{name}/offset` and the segment-deletion floor read.
+                    let pin = group_pin(&subq.group_lanes, &mut group_epochs);
                     if next.is_some() {
-                        let published_pos = published(&pos, &held_from);
+                        let published_pos = published_pinned(&pos, &held_from, &pin);
                         *processed.lock().unwrap() = published_pos.clone();
                         metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
                     }
@@ -1146,7 +1142,12 @@ pub(crate) async fn sequencer_loop(
                             }
                         }
                     }
-                    let ckpt = published(&pos, &held_from);
+                    let ckpt = published_pinned(&pos, &held_from, &pin);
+                    // S1: a checkpoint pinned to a group epoch carries the highwater from before it.
+                    let highwater = match &pin {
+                        Some((start, before)) if *start == ckpt => *before,
+                        _ => highwater,
+                    };
                     // Either half moving is progress worth persisting: the position, or — while the
                     // position is pinned behind a held run — the de-duplication highwater.
                     let ckpt_moved = ckpt != ckpt_pos || highwater != ckpt_hw;
@@ -1247,7 +1248,12 @@ pub(crate) async fn sequencer_loop(
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
     if !paused && completed_read {
-        let ckpt = published(&pos, &held_from);
+        let pin = group_pin(&subq.group_lanes, &mut group_epochs);
+        let ckpt = published_pinned(&pos, &held_from, &pin);
+        let highwater = match &pin {
+            Some((start, before)) if *start == ckpt => *before,
+            _ => highwater,
+        };
         catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
         tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
     } else if paused {
@@ -1330,6 +1336,32 @@ const HELD_RUN_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(
 /// regardless; only what is published is pinned.
 fn published(pos: &LogPosition, held_from: &Option<LogPosition>) -> LogPosition {
     held_from.clone().unwrap_or_else(|| pos.clone())
+}
+
+/// S1: the replay pin of the oldest unlanded group commit, pruning epochs that have landed.
+fn group_pin(
+    lanes: &crate::engine::emission::GroupEmissionLanes,
+    epochs: &mut std::collections::BTreeMap<u64, (LogPosition, Option<(u64, u64)>)>,
+) -> Option<(LogPosition, Option<(u64, u64)>)> {
+    let Some(oldest) = lanes.oldest_outstanding_origin() else {
+        epochs.clear();
+        return None;
+    };
+    *epochs = epochs.split_off(&oldest);
+    epochs.values().next().cloned()
+}
+
+/// S1: `published`, held behind the oldest unlanded group commit's epoch.
+fn published_pinned(
+    pos: &LogPosition,
+    held_from: &Option<LogPosition>,
+    pin: &Option<(LogPosition, Option<(u64, u64)>)>,
+) -> LogPosition {
+    let base = published(pos, held_from);
+    match pin {
+        Some((start, _)) if *start < base => start.clone(),
+        _ => base,
+    }
 }
 
 /// The `(txid, lsn)` pair identifying the transaction an envelope belongs to — the key the change
