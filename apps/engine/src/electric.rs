@@ -699,23 +699,6 @@ impl<V: FoldValue> StreamFold<V> {
     }
 }
 
-/// Drive a [`StreamFold`] with catch-up reads until it completes. Pages are read as text and folded
-/// straight from it, so a page is never held as decoded envelopes.
-async fn drive_fold<V: FoldValue>(engine: &Engine, path: &str, fold: StreamFold<V>) -> anyhow::Result<StreamFold<V>> {
-    drive_fold_with(engine, path, fold, Interrupt::OnShutdown).await
-}
-
-/// Whether a budgeted fold gives up when shutdown begins.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Interrupt {
-    /// A fold inside a request (a catch-up's key set): it must not hold the drain open while it
-    /// waits for memory, so it ends with [`FoldInterrupted`] and the client is told to retry.
-    OnShutdown,
-    /// The shared snapshot build, an Engine-tracked task: requests the engine already accepted
-    /// are served during the drain, and Engine close aborts the task after it.
-    AtClose,
-}
-
 /// A budgeted fold ended because shutdown began; the client is told to retry, not handed a 500.
 #[derive(Debug)]
 struct FoldInterrupted;
@@ -728,11 +711,13 @@ impl std::fmt::Display for FoldInterrupted {
 
 impl std::error::Error for FoldInterrupted {}
 
-async fn drive_fold_with<V: FoldValue>(
+/// Drive a [`StreamFold`] with catch-up reads until it completes. Pages are read as text and folded
+/// straight from it, so a page is never held as decoded envelopes. Under the memory budget a fold
+/// that is waiting for its page when shutdown begins ends with [`FoldInterrupted`].
+async fn drive_fold<V: FoldValue>(
     engine: &Engine,
     path: &str,
     mut fold: StreamFold<V>,
-    interrupt: Interrupt,
 ) -> anyhow::Result<StreamFold<V>> {
     let ds = engine.shape_fold_input(path).await?;
     if !ds.memory_budget().enabled() {
@@ -749,9 +734,7 @@ async fn drive_fold_with<V: FoldValue>(
         // need memory, so perform this check only after releasing the previous page owner.
         engine.shape_fold_input(path).await?;
         let (page, permit) = tokio::select! {
-            _ = shutdown.wait(), if interrupt == Interrupt::OnShutdown => {
-                return Err(anyhow::Error::new(FoldInterrupted));
-            }
+            _ = shutdown.wait() => return Err(anyhow::Error::new(FoldInterrupted)),
             page = ds.read_raw_budgeted(path, &fold.offset) => page?,
         };
         fold.apply_page(page)?;
@@ -861,17 +844,27 @@ async fn shared_snapshot(engine: &Engine, path: &str) -> Result<Arc<Snapshot>, A
     }
 }
 
+/// Wait for a build's result. Joins the shutdown token like the live long-poll: the HTTP server's
+/// graceful stop waits for every in-flight request, and on the standalone host Engine close (which
+/// would abort the build) runs only after that, so a waiter that outlived the token could hold the
+/// whole shutdown past its grace. A waiter still waiting when shutdown begins is told to retry.
 async fn await_snapshot(engine: &Engine, mut rx: watch::Receiver<SnapshotSlot>) -> Result<Arc<Snapshot>, ApiError> {
+    let shutdown = engine.shutdown_token();
     loop {
         if let Some(result) = rx.borrow_and_update().clone() {
             return result;
         }
-        if rx.changed().await.is_err() {
+        let changed = tokio::select! {
+            biased;
+            changed = rx.changed() => changed,
+            _ = shutdown.wait() => return Err(ApiError::draining()),
+        };
+        if changed.is_err() {
             if let Some(result) = rx.borrow().clone() {
                 return result;
             }
             // The build task ended without an answer: Engine close aborted it, or it panicked.
-            if engine.shutdown_token().is_shutting_down() {
+            if shutdown.is_shutting_down() {
                 return Err(ApiError::draining());
             }
             return Err(anyhow::anyhow!("shape snapshot build ended without a result").into());
@@ -928,11 +921,11 @@ impl Drop for BuildEntryGuard {
     }
 }
 
-/// Run one build detached from every request, as an Engine-tracked task. Like a request the
-/// engine has already accepted, it is NOT cut off when shutdown begins: the drain window exists so
-/// accepted (non-live) requests are still served. It ends at Engine close, which aborts every
-/// tracked task after the drain, and its waiters are then told to retry. After publishing, the
-/// task keeps the result for [`SNAPSHOT_REUSE_TTL`] and then drops it.
+/// Run one build detached from every request, as an Engine-tracked task, so a disconnecting client
+/// never cancels work others wait on. Its waiters stop waiting when shutdown begins (see
+/// [`await_snapshot`]); the build itself ends there too under the memory budget, and otherwise at
+/// Engine close, which aborts every tracked task. After publishing, the task keeps the result for
+/// [`SNAPSHOT_REUSE_TTL`] and then drops it.
 fn spawn_snapshot_build(engine: &Engine, path: &str, build: u64, tx: watch::Sender<SnapshotSlot>) {
     let mut guard =
         BuildEntryGuard { registry: engine.electric_handles.clone(), path: path.to_string(), build, armed: true };
@@ -956,8 +949,7 @@ fn spawn_snapshot_build(engine: &Engine, path: &str, build: u64, tx: watch::Send
 /// bytes are exactly what serializing those messages as one JSON array produces (`respond`), so a
 /// shared build answers byte-for-byte what an unshared one did.
 async fn build_snapshot(engine: &Engine, path: &str) -> anyhow::Result<Snapshot> {
-    let fold: StreamFold<Box<RawValue>> =
-        drive_fold_with(engine, path, StreamFold::to_tail(), Interrupt::AtClose).await?;
+    let fold: StreamFold<Box<RawValue>> = drive_fold(engine, path, StreamFold::to_tail()).await?;
     // An upper bound, so the buffer never doubles mid-write: per row the message framing (53
     // bytes), the key (escaping at most doubles it) and the encoded row, which at most doubles the
     // raw text (quoting turns each number or boolean into a string, at least two characters each).

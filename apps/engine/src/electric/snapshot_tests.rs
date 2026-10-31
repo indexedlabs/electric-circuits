@@ -401,48 +401,62 @@ async fn every_client_of_a_shared_build_gets_its_own_handle_and_key_set() {
     }
 }
 
-/// Shutdown begins a drain in which requests the engine has already accepted are still served, so
-/// a build in flight finishes for its waiters. Engine close (after the drain) ends a build that is
-/// still running; its waiters are then told to retry.
-#[tokio::test(start_paused = true)]
-async fn a_draining_engine_serves_snapshots_until_it_closes() {
-    let source = Source::new("scripted://shutdown").await;
+/// A request waiting on a build when shutdown begins is told to retry at once, like a parked live
+/// long-poll: the HTTP server's graceful stop waits for it, and on the standalone host Engine close
+/// (which would end the build) runs only after that, so waiting on could hold the whole shutdown
+/// past its grace. A NEW snapshot is refused too, at control admission (unchanged by OTTO-11109).
+async fn check_shutdown_tells_snapshot_waiters_to_retry(source: Source) {
     source.append(rows()).await;
     let gate = source.hold();
     let requests: Vec<_> = (0..3).map(|_| source.spawn_get(SNAPSHOT)).collect();
     quiesce().await;
     assert_eq!(gate.arrived.load(SeqCst), 1);
     source.engine.shutdown_token().begin();
-    // A NEW snapshot must create or join its shape, a control mutation, and control admission
-    // closes when shutdown begins (unchanged by OTTO-11109): it is told to retry elsewhere.
+    for request in requests {
+        // Answered without the build: its read is still held.
+        let (status, headers, body) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "1");
+    }
     let (status, _, body) = get(source.app.clone(), SNAPSHOT.into()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
     source.open(&gate);
-    for request in requests {
-        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
-        assert_eq!(status, StatusCode::OK, "a draining engine still serves the snapshots it accepted");
-        assert_eq!(std::str::from_utf8(&body).unwrap(), ROWS_BODY);
-    }
 }
 
-/// The same drain under the memory budget, whose fold reads are admitted by the budget: the shared
-/// build is still not cut off when shutdown begins.
 #[tokio::test(start_paused = true)]
-async fn a_draining_engine_serves_budgeted_snapshots_it_accepted() {
-    let source = Source::budgeted("scripted://shutdown-budgeted").await;
+async fn shutdown_tells_snapshot_waiters_to_retry() {
+    check_shutdown_tells_snapshot_waiters_to_retry(Source::new("scripted://shutdown").await).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_tells_budgeted_snapshot_waiters_to_retry() {
+    check_shutdown_tells_snapshot_waiters_to_retry(Source::budgeted("scripted://shutdown-budgeted").await).await;
+}
+
+/// A catch-up that must rebuild its key set (a client resuming at an older offset) folds the stream
+/// inside its request; under the memory budget, shutdown ends that fold and the client is told to
+/// retry rather than handed a 500 or left holding the drain.
+#[tokio::test(start_paused = true)]
+async fn a_catch_up_fold_interrupted_by_shutdown_is_told_to_retry() {
+    let source = Source::budgeted("scripted://catch-up-shutdown").await;
     source.append(rows()).await;
+    let (_, headers, _) = get(source.app.clone(), SNAPSHOT.into()).await;
+    let handle = headers.get("electric-handle").unwrap().to_str().unwrap().to_string();
+    let offset = headers.get("electric-offset").unwrap().to_str().unwrap().to_string();
+    let positioned = format!("/v1/shape?table=items&handle={handle}&offset={offset}");
+    source.append(vec![upsert("c", serde_json::json!({"id": "c"}))]).await;
+    let (status, _, _) = get(source.app.clone(), positioned.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    // The handle has moved on; resuming at the older offset rebuilds its key set from the start.
     let gate = source.hold();
-    let requests: Vec<_> = (0..3).map(|_| source.spawn_get(SNAPSHOT)).collect();
+    let retry = source.spawn_get(&positioned);
     quiesce().await;
-    assert_eq!(gate.arrived.load(SeqCst), 1);
+    assert_eq!(gate.arrived.load(SeqCst), 1, "the catch-up fold is reading");
     source.engine.shutdown_token().begin();
-    quiesce().await;
+    let (status, headers, body) = tokio::time::timeout(Duration::from_secs(5), retry).await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "1");
     source.open(&gate);
-    for request in requests {
-        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
-        assert_eq!(status, StatusCode::OK, "a draining engine still serves the snapshots it accepted: {body:?}");
-        assert_eq!(std::str::from_utf8(&body).unwrap(), ROWS_BODY);
-    }
 }
 
 #[tokio::test(start_paused = true)]
