@@ -963,9 +963,12 @@ claim is renewed rather than duplicated. It must resolve to the handle's shape i
 re-minted, so that is the stream the client's offset points into. The key set is then rebuilt as of that
 offset, shared by every resume of the same stream at the same offset, from pages read as text. Items
 carry no offset of their own and a read runs to the tail, so the rebuild counts bytes to the cut, and a
-page that does not add up to its own `stream-next-offset` is refused. Everything else answers `409
-must-refetch`, and gives the claim back: another source's handle, an older handle format, a retired
-shape, a definition that now resolves elsewhere, an offset the stream does not have, or any error.
+page that does not add up to its own `stream-next-offset` is refused before any of it is folded. A
+handle that cannot resume answers `409 must-refetch` and gives the claim back: another source's handle,
+an older handle format, a retired shape, a definition that now resolves elsewhere, or an offset the
+stream does not have. A failure that says nothing about the handle (storage unavailable, a deferred
+reactivation, closed admission) keeps its retryable `5xx`, so the client comes back with the same handle
+rather than downloading the shape again; the claim goes back meanwhile and the retry takes it again.
 Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay

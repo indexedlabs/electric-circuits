@@ -42,6 +42,8 @@ struct ByteStore {
     /// The rebuild reads that had arrived when the last hold was released. Counted then, because a
     /// request that lost the race to read afterwards is a retry at an older offset, not a resume.
     reads_held: Arc<AtomicUsize>,
+    /// This many rebuild reads answer 503 before the store recovers.
+    failing_rebuilds: Arc<AtomicUsize>,
 }
 
 impl Default for ByteStore {
@@ -51,6 +53,7 @@ impl Default for ByteStore {
             rebuild_reads: Arc::default(),
             hold_rebuilds: Arc::new(watch::channel(false).0),
             reads_held: Arc::default(),
+            failing_rebuilds: Arc::default(),
         }
     }
 }
@@ -99,6 +102,10 @@ async fn byte_store(State(store): State<ByteStore>, request: Request) -> Respons
     if offset == "-1" && path.contains("/shape/") {
         store.rebuild_reads.fetch_add(1, Ordering::SeqCst);
         let _ = store.hold_rebuilds.subscribe().wait_for(|held| !held).await;
+        let failing = store.failing_rebuilds.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if failing.is_ok() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     let start = if offset == "-1" { 0 } else { crate::changelog::offset_bytes(&offset).unwrap() as usize };
     let streams = store.streams.lock().unwrap();
@@ -457,6 +464,30 @@ async fn a_cancelled_resume_hands_over_to_the_next_and_leaves_no_stale_state() {
     let answers = stack.finish(vec![waiter]).await;
     assert_eq!(answers[0].status, StatusCode::OK, "{:?}", answers[0].body);
     assert_eq!(registered(&source), 1);
+    assert_eq!(claims(&source, "s1").await, 1);
+}
+
+/// The moment after a restart is when storage is most contended. A client whose handle and offset are
+/// good must not be told to throw away its rows because a read failed: it retries, and resumes.
+#[tokio::test]
+async fn a_storage_failure_during_a_resume_is_retried_with_the_same_handle() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    forget_handles(&source);
+    source.ds.append("shape/s1", &[delete("k1")]).await.unwrap();
+
+    stack.store.failing_rebuilds.store(1, Ordering::SeqCst);
+    let failed = get(&source.app, at(&handle, &offset)).await;
+    assert!(failed.status.is_server_error(), "{} {:?}", failed.status, failed.body);
+    assert!(!failed.must_refetch());
+    assert_eq!(registered(&source), 0);
+
+    let resumed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    assert_eq!(resumed.changes(), [("delete".to_string(), "k1".to_string())]);
     assert_eq!(claims(&source, "s1").await, 1);
 }
 

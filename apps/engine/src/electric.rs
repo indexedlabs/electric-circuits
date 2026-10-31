@@ -33,8 +33,9 @@
 //!   does not know (after a restart or idle eviction) **resumes** when that is safe
 //!   ([`resume_handle`]): the definition the client resent must resolve to the handle's shape id — ids
 //!   are never re-minted, so that is the stream its offset points into — and the offset must be a
-//!   position in that stream. Anything else is the standard `409 must-refetch`, and the re-snapshot
-//!   rejoins the retained shape (reactivating it if dormant) rather than rebuilding from Postgres.
+//!   position in that stream. A handle that cannot resume gets the standard `409 must-refetch`, and the
+//!   re-snapshot rejoins the retained shape (reactivating it if dormant) rather than rebuilding from
+//!   Postgres. A failure that says nothing about the handle stays retryable, as on every other path.
 //! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600). This is
 //!   **handle-state cleanup only**: the per-handle cursor state is dropped and the shape subscription
 //!   released — the underlying engine shape and its durable stream are retained and follow the
@@ -140,6 +141,10 @@ struct HandleState {
     offset: String,
 }
 
+/// Where a resume stands: `Ok(None)` is a definite refusal, `409 must-refetch`, because the handle
+/// cannot resume. An `Err` says nothing about the handle: the client keeps it and retries.
+type ResumeOutcome<T> = Result<Option<T>, ApiError>;
+
 /// Concurrent callers of one key share one run of its work. A cancelled runner hands over to the next
 /// caller, and nothing is kept once the last caller has its answer.
 struct Flights<K, V> {
@@ -184,10 +189,10 @@ impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
 pub(crate) struct HandleRegistry {
     entries: std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>,
     /// One resume at a time per handle, so concurrent ones end in one entry and one claim renewal.
-    resumes: Flights<String, Option<Arc<HandleEntry>>>,
+    resumes: Flights<String, ResumeOutcome<Arc<HandleEntry>>>,
     /// One key-set rebuild at a time per (stream path, offset). The registry belongs to one Engine,
     /// which is what makes the path enough: `shape/s5` repeats across sources.
-    rebuilds: Flights<(String, String), Option<Arc<HashSet<String>>>>,
+    rebuilds: Flights<(String, String), ResumeOutcome<Arc<HashSet<String>>>>,
     started: OnceLock<()>,
 }
 
@@ -673,28 +678,24 @@ enum KeyFold {
 /// to stop at a position is to count to it. A stream is stored as its literal wire bytes, `item,` per
 /// item, and a page starting at byte `start` is `[` + those bytes without the last comma + `]`. An item
 /// that ends `n` bytes into the page's items therefore ends at stream byte `start + n + 1`, which is
-/// what an offset names. `next` is the check on that arithmetic: a page that does not add up to it is
-/// refused rather than trusted.
-fn fold_keys_page(
-    keys: &mut HashSet<String>,
-    body: &str,
-    start: u64,
-    next: u64,
-    target: u64,
-) -> anyhow::Result<KeyFold> {
-    let items = body
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .ok_or_else(|| anyhow::anyhow!("stream page is not a JSON array"))?;
+/// what an offset names. `next` is the check on that arithmetic, made before any item is folded: a
+/// page that does not add up to it is refused rather than trusted, wherever the target falls in it.
+fn fold_keys_page(keys: &mut HashSet<String>, body: &str, start: u64, next: u64, target: u64) -> KeyFold {
+    let Some(items) = body.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) else {
+        return KeyFold::Misframed;
+    };
+    let framed_end = if items.is_empty() { start } else { start + items.len() as u64 + 1 };
+    if next != framed_end {
+        return KeyFold::Misframed;
+    }
     let mut position = 0;
-    let mut end = start;
     while position < items.len() {
         let mut stream = serde_json::Deserializer::from_str(&items[position..]).into_iter::<KeyItem>();
-        let item = stream.next().ok_or_else(|| anyhow::anyhow!("stream page ended inside an item"))??;
+        let Some(Ok(item)) = stream.next() else { return KeyFold::Misframed };
         position += stream.byte_offset();
-        end = start + position as u64 + 1;
+        let end = start + position as u64 + 1;
         if end > target {
-            return Ok(KeyFold::NotAPosition);
+            return KeyFold::NotAPosition;
         }
         if item.headers.operation == "delete" {
             keys.remove(item.key.as_ref());
@@ -702,15 +703,15 @@ fn fold_keys_page(
             keys.insert(item.key.into_owned());
         }
         if end == target {
-            return Ok(KeyFold::Reached);
+            return KeyFold::Reached;
         }
         match items.as_bytes().get(position) {
             Some(b',') => position += 1,
             None => break,
-            Some(_) => return Ok(KeyFold::Misframed),
+            Some(_) => return KeyFold::Misframed,
         }
     }
-    if end != next { Ok(KeyFold::Misframed) } else { Ok(KeyFold::Continue(next)) }
+    KeyFold::Continue(next)
 }
 
 /// The key set a client holds when positioned at `offset`, or `None` when the stream has no such
@@ -738,7 +739,7 @@ async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result
         if page.closed || next <= start {
             return Ok(None);
         }
-        match fold_keys_page(&mut keys, &page.body, start, next, target)? {
+        match fold_keys_page(&mut keys, &page.body, start, next, target) {
             KeyFold::Reached => break,
             KeyFold::Continue(byte) => start = byte,
             KeyFold::NotAPosition => return Ok(None),
@@ -1214,21 +1215,25 @@ struct ResumeRequest<'a> {
     offset: &'a str,
 }
 
-/// Bring back a handle the registry does not know, or `None` for `409 must-refetch`: every failure
-/// here, including a storage error, is one the client's refetch recovers from, and is never a reason
-/// to serve rows from a stream the client was not reading.
-async fn resume_handle(engine: &Engine, request: ResumeRequest<'_>) -> Option<Arc<HandleEntry>> {
+/// Sort a failure the way [`ApiError`] already does: what is the client's or the handle's doing is a
+/// refusal, and anything retryable stays retryable. Telling a client to drop its rows and download the
+/// shape again because storage hiccupped is the reconnect storm a resume exists to prevent, and the
+/// refetch would meet the same failure.
+fn refused_or_retryable<T>(error: ApiError) -> ResumeOutcome<T> {
+    if error.status.is_server_error() { Err(error) } else { Ok(None) }
+}
+
+/// Bring back a handle the registry does not know. Never serves rows from a stream the client was not
+/// reading: see [`ResumeOutcome`] for what else can come of it.
+async fn resume_handle(engine: &Engine, request: ResumeRequest<'_>) -> ResumeOutcome<Arc<HandleEntry>> {
     let scope = engine.stream_scope_tag();
-    let (shape_id, subscription) = parse_handle(request.handle, &scope)?;
+    let Some((shape_id, subscription)) = parse_handle(request.handle, &scope) else { return Ok(None) };
     let work = || async {
         // A resume that finished between this request's lookup and its flight left the entry here.
         if let Some(entry) = engine.electric_handles.entries.lock().unwrap().get(request.handle) {
-            return Some(entry.clone());
+            return Ok(Some(entry.clone()));
         }
-        try_resume(engine, &request, shape_id, subscription).await.unwrap_or_else(|error| {
-            tracing::warn!("/v1/shape resume of handle {} refused: {error:#}", request.handle);
-            None
-        })
+        try_resume(engine, &request, shape_id, subscription).await
     };
     engine.electric_handles.resumes.run(request.handle.to_string(), work).await
 }
@@ -1238,23 +1243,40 @@ async fn try_resume(
     request: &ResumeRequest<'_>,
     shape_id: &str,
     subscription: &str,
-) -> anyhow::Result<Option<Arc<HandleEntry>>> {
+) -> ResumeOutcome<Arc<HandleEntry>> {
     let ResumeRequest { params, ts, columns, raw_pairs, handle, offset } = *request;
     let _control = engine.admit_control()?;
-    let pred = resolve_definition(params, ts, columns, raw_pairs).map_err(|error| anyhow::anyhow!(error.message))?;
+    // A definition that no longer validates cannot be the handle's shape; the refetch says why.
+    let Ok(pred) = resolve_definition(params, ts, columns, raw_pairs) else { return Ok(None) };
     // Exactly the snapshot's create, naming the handle's claim: a claim the catalog restored is
     // renewed, one that lapsed is taken again, and one this handle holds on another shape is refused.
-    let (rec, _) = engine
-        .create_shape_as(&params.table, pred, columns.clone(), false, true, Some(subscription.to_string()))
-        .await?;
+    let created =
+        engine.create_shape_as(&params.table, pred, columns.clone(), false, true, Some(subscription.to_string())).await;
+    let rec = match created {
+        Ok((rec, _)) => rec,
+        Err(error)
+            if error.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+                || error.downcast_ref::<crate::engine::GroupConflict>().is_some() =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return refused_or_retryable(error.into()),
+    };
     let claim = ResumeClaim { engine, shape_id: rec.id.clone(), subscription: subscription.to_string(), armed: true };
     if rec.id != shape_id {
         claim.give_back().await;
         return Ok(None);
     }
-    let Some(keys) = shared_keys_as_of(engine, &rec.stream_path, offset).await else {
-        claim.give_back().await;
-        return Ok(None);
+    let keys = match shared_keys_as_of(engine, &rec.stream_path, offset).await {
+        Ok(Some(keys)) => keys,
+        Ok(None) => {
+            claim.give_back().await;
+            return Ok(None);
+        }
+        Err(error) => {
+            claim.give_back().await;
+            return refused_or_retryable(error);
+        }
     };
     let entry = handle_entry(&rec, subscription.to_string(), &params.table, ts, (*keys).clone(), offset.to_string());
     let entry = engine.electric_handles.entries.lock().unwrap().entry(handle.to_string()).or_insert(entry).clone();
@@ -1264,11 +1286,11 @@ async fn try_resume(
 
 /// [`keys_as_of`], shared by every resume of one stream at one offset. A stream is append-only, so the
 /// answer is the same for all of them; a reconnecting fleet at the same offset is one rebuild.
-async fn shared_keys_as_of(engine: &Engine, path: &str, offset: &str) -> Option<Arc<HashSet<String>>> {
+async fn shared_keys_as_of(engine: &Engine, path: &str, offset: &str) -> ResumeOutcome<Arc<HashSet<String>>> {
     let rebuild = || async {
-        keys_as_of(engine, path, offset).await.map(|keys| keys.map(Arc::new)).unwrap_or_else(|error| {
+        keys_as_of(engine, path, offset).await.map(|keys| keys.map(Arc::new)).map_err(|error| {
             tracing::warn!("/v1/shape key-set rebuild of {path} at {offset} failed: {error:#}");
-            None
+            ApiError::from(error)
         })
     };
     engine.electric_handles.rebuilds.run((path.to_string(), offset.to_string()), rebuild).await
@@ -1368,7 +1390,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         None => {
             let request =
                 ResumeRequest { params: &p, ts: &ts, columns: &columns, raw_pairs, handle: &handle, offset: &offset };
-            match resume_handle(&engine, request).await {
+            match resume_handle(&engine, request).await? {
                 Some(entry) => entry,
                 None => return Ok(must_refetch()),
             }
@@ -1892,12 +1914,12 @@ mod tests {
         let expected: [&[&str]; 4] = [&["雪"], &["k\"2", "雪"], &["k\"2"], &["k\"2", "k4"]];
         for (end, expected) in ends.iter().zip(expected) {
             let mut keys = HashSet::new();
-            assert_eq!(fold_keys_page(&mut keys, &body, 40, next, *end).unwrap(), KeyFold::Reached);
+            assert_eq!(fold_keys_page(&mut keys, &body, 40, next, *end), KeyFold::Reached);
             let mut expected = expected.to_vec();
             expected.sort();
             assert_eq!(keys_of(&keys), expected);
             // One byte short of a boundary is inside the item that ends there.
-            assert_eq!(fold_keys_page(&mut HashSet::new(), &body, 40, next, *end - 1).unwrap(), KeyFold::NotAPosition);
+            assert_eq!(fold_keys_page(&mut HashSet::new(), &body, 40, next, *end - 1), KeyFold::NotAPosition);
         }
     }
 
@@ -1908,7 +1930,7 @@ mod tests {
         let items = [env("upsert", "k1", ""), env("upsert", "k2", ""), env("delete", "k2", "")];
         let (body, ends) = wire_page(&items, 0);
         let mut keys = HashSet::new();
-        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[2], ends[1]).unwrap(), KeyFold::Reached);
+        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[2], ends[1]), KeyFold::Reached);
         assert_eq!(keys_of(&keys), ["k1", "k2"]);
         let messages = apply_changes(&mut keys, &["id".into()], vec![env("delete", "k2", "")]);
         assert_eq!(op_and_key(&messages[0]), ("delete".into(), "k2".into()));
@@ -1921,7 +1943,7 @@ mod tests {
         let items = [env("upsert", "k1", ""), env("delete", "k1", ""), env("upsert", "k1", "")];
         let (body, ends) = wire_page(&items, 0);
         let mut keys = HashSet::new();
-        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[2], ends[1]).unwrap(), KeyFold::Reached);
+        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[2], ends[1]), KeyFold::Reached);
         assert!(keys.is_empty());
         let messages = apply_changes(&mut keys, &["id".into()], vec![env("upsert", "k1", "")]);
         assert_eq!(op_and_key(&messages[0]), ("insert".into(), "k1".into()));
@@ -1933,23 +1955,56 @@ mod tests {
         let (second, second_ends) = wire_page(&[env("upsert", "k2", "")], first_ends[0]);
         let target = second_ends[0];
         let mut keys = HashSet::new();
-        assert_eq!(
-            fold_keys_page(&mut keys, &first, 0, first_ends[0], target).unwrap(),
-            KeyFold::Continue(first_ends[0])
-        );
-        assert_eq!(fold_keys_page(&mut keys, &second, first_ends[0], target, target).unwrap(), KeyFold::Reached);
+        assert_eq!(fold_keys_page(&mut keys, &first, 0, first_ends[0], target), KeyFold::Continue(first_ends[0]));
+        assert_eq!(fold_keys_page(&mut keys, &second, first_ends[0], target, target), KeyFold::Reached);
         assert_eq!(keys_of(&keys), ["k1", "k2"]);
     }
 
     /// The arithmetic rests on how the store frames a page. A store that frames one differently is
     /// found out by its own next offset, and a resume falls back to a refetch rather than cut wrongly.
+    /// The check comes first: a target inside the page, where a cut would land, is the usual case.
     #[test]
     fn key_fold_refuses_a_page_whose_length_disagrees_with_its_next_offset() {
-        let (body, ends) = wire_page(&[env("upsert", "k1", "")], 0);
-        let spaced = body.replacen("{", " {", 1);
-        let far = ends[0] + 100;
-        assert_eq!(fold_keys_page(&mut HashSet::new(), &body, 0, ends[0] + 1, far).unwrap(), KeyFold::Misframed);
-        assert_eq!(fold_keys_page(&mut HashSet::new(), &spaced, 0, ends[0], far).unwrap(), KeyFold::Misframed);
+        let (body, ends) = wire_page(&[env("upsert", "k1", ""), env("upsert", "k2", "")], 0);
+        let spaced = body.replacen("},{", "}, {", 1);
+        for target in [ends[0], ends[1], ends[1] + 100] {
+            let mut keys = HashSet::new();
+            // A store that counts one more byte per item than it serves.
+            assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[1] + 2, target), KeyFold::Misframed);
+            assert_eq!(fold_keys_page(&mut keys, &spaced, 0, ends[1], target), KeyFold::Misframed);
+            assert!(keys.is_empty(), "a misframed page must contribute nothing");
+        }
+        // Same length as its next offset says, but not items separated by commas.
+        let semicolons = body.replacen("},{", "};{", 1);
+        assert_eq!(fold_keys_page(&mut HashSet::new(), &semicolons, 0, ends[1], ends[1]), KeyFold::Misframed);
+        assert_eq!(fold_keys_page(&mut HashSet::new(), "not a page", 0, 10, 10), KeyFold::Misframed);
+    }
+
+    /// A definite refusal is the protocol's 409. Everything retryable stays what it is everywhere else
+    /// on this surface: the client keeps its handle and comes back.
+    #[test]
+    fn a_resume_refuses_only_what_is_about_the_handle() {
+        let refused = [
+            ApiError::must_refetch(),
+            ApiError::bad_request("no such column"),
+            anyhow::Error::new(crate::engine::ReactivationRecreate {
+                shape: "s1".into(),
+                reason: crate::engine::RecreateReason::OverBudget,
+            })
+            .into(),
+        ];
+        for error in refused {
+            assert!(matches!(refused_or_retryable::<()>(error), Ok(None)));
+        }
+        let retryable = [
+            anyhow::Error::new(crate::engine::ReactivationDeferred::new("s1", "change-log HEAD unavailable")),
+            anyhow::Error::new(crate::engine::DeploymentNotReady),
+            anyhow::anyhow!("GET shape/s1: 503"),
+        ];
+        for error in retryable {
+            let outcome = refused_or_retryable::<()>(error.into());
+            assert!(outcome.is_err_and(|error| error.status.is_server_error() && !error.must_refetch));
+        }
     }
 
     #[test]
@@ -1958,7 +2013,7 @@ mod tests {
         bare.value = None;
         let (body, ends) = wire_page(&[bare], 0);
         let mut keys = HashSet::new();
-        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[0], ends[0]).unwrap(), KeyFold::Reached);
+        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[0], ends[0]), KeyFold::Reached);
         assert!(keys.is_empty());
     }
 
