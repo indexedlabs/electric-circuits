@@ -77,11 +77,13 @@ async function within<T>(label: string, wait: () => Promise<T | undefined>): Pro
   }
 }
 
-/** Holds and counts the engine's `offset=-1` catch-up reads of shape streams while armed. */
+/** Counts the engine's `offset=-1` catch-up reads of shape streams (one per fold) while armed,
+ *  and holds them until released; counting continues after the release until `disarm`. */
 async function foldGate(upstreamUrl: string) {
   const upstream = new URL(upstreamUrl)
   const shapePrefix = `/${testPhysicalPath('shape/')}`
   let armed = false
+  let holding = false
   const folds: string[] = []
   let release!: () => void
   let released = new Promise<void>((resolve) => { release = resolve })
@@ -93,7 +95,7 @@ async function foldGate(upstreamUrl: string) {
         && target.searchParams.get('offset') === '-1' && !target.searchParams.has('live')
       ) {
         folds.push(target.pathname)
-        await released
+        if (holding) await released
       }
       const forwarded = request(target, {
         method: incoming.method, headers: { ...incoming.headers, host: upstream.host },
@@ -122,11 +124,13 @@ async function foldGate(upstreamUrl: string) {
     url: `http://127.0.0.1:${address.port}`,
     arm: () => {
       armed = true
+      holding = true
       folds.length = 0
       released = new Promise<void>((resolve) => { release = resolve })
     },
     folds: () => [...folds],
-    release: () => { armed = false; release() },
+    release: () => { holding = false; release() },
+    disarm: () => { armed = false },
     close: async () => {
       release()
       server.closeAllConnections()
@@ -247,11 +251,12 @@ describe('conformance: /v1/shape reconnect storm', () => {
     expect(new Set(await Promise.all(leaving.map((l) => l.result))), 'the leaving clients got no answer').toEqual(
       new Set(['AbortError']),
     )
-    const folds = gate.folds()
     gate.release()
     const outcomes = await Promise.all(staying)
-    expect(folds.length, 'one fold per shape for the whole storm, not one per client').toBe(SHAPES)
-    expect(gate.folds()).toEqual(folds)
+    // Still counted after the release: a client that rebuilt instead of joining would add a fold.
+    expect(gate.folds().length, 'one fold per shape for the whole storm, not one per client').toBe(SHAPES)
+    expect(new Set(gate.folds()).size).toBe(SHAPES)
+    gate.disarm()
 
     const bytesByTail = new Map<string, string>()
     const clients: Client[] = []
@@ -269,13 +274,16 @@ describe('conformance: /v1/shape reconnect storm', () => {
     }
     expect(new Set(clients.map((c) => c.handle)).size, 'every client gets its own handle').toBe(clients.length)
 
-    // The engine's own counters agree: one build per shape, every client that stayed was answered
-    // by joining one (a build's starter that left is answered by nobody).
+    // The engine's own counters agree: one build per shape, and every client that stayed was
+    // answered by joining one. A leaving client that joined (rather than built) may still be
+    // counted when the engine had not yet seen its disconnect as the build published, so joins are
+    // bounded by the leaving joiners rather than pinned.
     const after = await snapshotCounters(harness)
     const builds = after.builds - before.builds
     const shared = after.joins - before.joins + (after.reuses - before.reuses)
     expect(builds, 'snapshot builds must be one per shape and tail, not one per client').toBe(SHAPES)
-    expect(shared).toBe(clients.length)
+    expect(shared).toBeGreaterThanOrEqual(clients.length)
+    expect(shared).toBeLessThanOrEqual(clients.length + SHAPES * (LEAVING_PER_SHAPE - 1))
     // The same counters reach the Prometheus scrape, where a post-restart storm is watched.
     const prom = await (await fetch(`${harness.engineUrl}/metrics/prometheus`)).text()
     const scraped = (name: string) => Number(prom.match(new RegExp(`^${name}\\{[^}]*\\} (\\S+)`, 'm'))?.[1] ?? NaN)
