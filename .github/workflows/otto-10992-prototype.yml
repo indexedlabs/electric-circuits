@@ -58,26 +58,26 @@ jobs:
           test -n "${ready:-}" || { echo 'Durable Streams readiness did not answer'; exit 1; }
           printf '%s\n' "$ready" > harness/otto-10992/results/ds-readiness.json
           python3 - "$ready" >> "$GITHUB_ENV" <<'PY'
-import json, sys
-body = json.loads(sys.argv[1])
-manifest = body.get('manifest', body.get('store', body))
-mapping = {
-  'store_id': 'ELECTRIC_CIRCUITS_DS_STORE_ID',
-  'store_generation': 'ELECTRIC_CIRCUITS_DS_STORE_GENERATION',
-  'protocol_version': 'ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION',
-  'layout_version': 'ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION',
-  'durability_mode': 'ELECTRIC_CIRCUITS_DS_DURABILITY_MODE',
-  'wal_shard_count': 'ELECTRIC_CIRCUITS_DS_WAL_SHARDS',
-  'stream_lane_count': 'ELECTRIC_CIRCUITS_DS_STREAM_LANES',
-  'filesystem_uuid': 'ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID',
-}
-for source, target in mapping.items():
-    if source not in manifest: raise SystemExit(f'missing {source} in DS readiness manifest')
-    print(f'{target}={manifest[source]}')
-print('ELECTRIC_CIRCUITS_DS_NAMESPACE=otto-10992')
-print('ELECTRIC_CIRCUITS_QUERY_GENERATION=otto-10992')
-print('ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1')
-PY
+          import json, sys
+          body = json.loads(sys.argv[1])
+          manifest = body.get('manifest', body.get('store', body))
+          mapping = {
+            'store_id': 'ELECTRIC_CIRCUITS_DS_STORE_ID',
+            'store_generation': 'ELECTRIC_CIRCUITS_DS_STORE_GENERATION',
+            'protocol_version': 'ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION',
+            'layout_version': 'ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION',
+            'durability_mode': 'ELECTRIC_CIRCUITS_DS_DURABILITY_MODE',
+            'wal_shard_count': 'ELECTRIC_CIRCUITS_DS_WAL_SHARDS',
+            'stream_lane_count': 'ELECTRIC_CIRCUITS_DS_STREAM_LANES',
+            'filesystem_uuid': 'ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID',
+          }
+          for source, target in mapping.items():
+              if source not in manifest: raise SystemExit(f'missing {source} in DS readiness manifest')
+              print(f'{target}={manifest[source]}')
+          print('ELECTRIC_CIRCUITS_DS_NAMESPACE=otto-10992')
+          print('ELECTRIC_CIRCUITS_QUERY_GENERATION=otto-10992')
+          print('ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1')
+          PY
 
       - name: Seed schema
         run: |
