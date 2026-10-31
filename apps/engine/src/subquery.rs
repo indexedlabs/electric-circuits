@@ -575,9 +575,6 @@ pub struct SubqueryRegistry {
     /// falls back to a direct reliable append.
     lanes: Option<crate::engine::emission::EmissionLanes>,
     group_lanes: Option<crate::engine::emission::GroupEmissionLanes>,
-    /// Group batches evaluated under this registry lock. Callers drain this immediately after
-    /// releasing the lock and await the bounded lane send outside the critical section.
-    staged_group_emissions: Vec<crate::engine::emission::GroupBatchHandle>,
 }
 
 impl HeapSize for SubqueryRegistry {
@@ -647,7 +644,6 @@ impl SubqueryRegistry {
             schemas: Arc::new(HashMap::new()),
             lanes: None,
             group_lanes: None,
-            staged_group_emissions: Vec::new(),
         }
     }
 
@@ -750,9 +746,7 @@ impl SubqueryRegistry {
     async fn deliver(&mut self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
         if stream_path.starts_with("shape/group-") {
             if let Some(lanes) = &self.group_lanes {
-                if let Some(handle) = lanes.reserve(stream_path, envs, commit_lsn) {
-                    self.staged_group_emissions.push(handle);
-                }
+                lanes.push(stream_path, envs, commit_lsn);
                 return Ok(());
             }
         }
@@ -763,10 +757,6 @@ impl SubqueryRegistry {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn take_group_emissions(&mut self) -> Vec<crate::engine::emission::GroupBatchHandle> {
-        std::mem::take(&mut self.staged_group_emissions)
     }
 
     pub fn set_schemas(&mut self, schemas: SchemaMap) {
@@ -2412,7 +2402,7 @@ async fn move_shape_for_value(
     // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
     // (candidates from a query-back all still exist), filtered against the live decisions taken
     // since `gate`'s snapshot.
-    let (emitted, staged) = {
+    let emitted = {
         let mut reg = registry.lock().await;
         let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
         let emitted = reg
@@ -2424,19 +2414,7 @@ async fn move_shape_for_value(
             )
             .await;
         reg.end_queryback(shape_id);
-        (emitted, reg.take_group_emissions())
-    };
-    let emitted = match emitted {
-        Ok(emitted) => {
-            for handle in staged {
-                handle.wait().await;
-            }
-            emitted
-        }
-        Err(error) => {
-            drop(staged);
-            return Err(error);
-        }
+        emitted?
     };
     Ok(match emitted.first() {
         Some((_, true, net)) => Some((ts.table.clone(), *net)),
@@ -2556,7 +2534,7 @@ async fn rederive_shape(
     };
     // Full re-derive: every row is a candidate; the ONE emission tail decides — except for pks a
     // live commit decided after this read's snapshot, which it drops.
-    let (emitted, staged) = {
+    {
         let mut reg = registry.lock().await;
         let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
         let emitted = reg
@@ -2568,18 +2546,7 @@ async fn rederive_shape(
             )
             .await;
         reg.end_queryback(shape_id);
-        (emitted, reg.take_group_emissions())
-    };
-    match emitted {
-        Ok(_) => {
-            for handle in staged {
-                handle.wait().await;
-            }
-        }
-        Err(error) => {
-            drop(staged);
-            return Err(error);
-        }
+        emitted?;
     }
     Ok(())
 }

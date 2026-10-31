@@ -309,7 +309,7 @@ fn test_subq() -> SubqueryHandle {
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
     let shutdown = crate::shutdown::ShutdownToken::new();
-    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
+    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), Default::default());
     spawn_flip_propagator(
         registry.clone(),
         flip_rx,

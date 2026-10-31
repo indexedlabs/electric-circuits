@@ -59,7 +59,7 @@ fn checkpoints(store: &ScriptedStore) -> Vec<(LogPosition, Option<(u64, u64)>)> 
     events(store, CATALOG_STREAM)
         .into_iter()
         .filter_map(|ev| match serde_json::from_value::<CatalogEvent>(ev).unwrap() {
-            CatalogEvent::Offset { pos, highwater } => Some((pos, highwater)),
+            CatalogEvent::Offset { pos, highwater, .. } => Some((pos, highwater)),
             _ => None,
         })
         .collect()
@@ -505,7 +505,11 @@ async fn crashsim_catalog_503_at_every_append_retries_without_reordering() {
                 if ambiguous { AppendFault::CommitThenUnavailable } else { AppendFault::Unavailable },
             ));
             for (pos, highwater) in &writes {
-                run.engine.catalog_tx.send(CatalogEvent::Offset { pos: pos.clone(), highwater: *highwater });
+                run.engine.catalog_tx.send(CatalogEvent::Offset {
+                    pos: pos.clone(),
+                    highwater: *highwater,
+                    groups: Default::default(),
+                });
             }
             bounded("catalog retry drain", run.engine.catalog_tx.wait_durable()).await.unwrap();
             assert_checkpoint_order(&storage);
@@ -942,7 +946,11 @@ async fn closed_tail_snapshot() -> (Arc<ScriptedStore>, Arc<std::sync::Mutex<Ora
     assert!(head.closed);
     let tail = LogPosition { segment: 0, offset: head.next_offset.unwrap() };
     assert_ne!(tail.offset, "-1", "checkpoint must be beyond the rotation pointer");
-    seed.engine.catalog_tx.send_durable(CatalogEvent::Offset { pos: tail.clone(), highwater: None }).await.unwrap();
+    seed.engine
+        .catalog_tx
+        .send_durable(CatalogEvent::Offset { pos: tail.clone(), highwater: None, groups: Default::default() })
+        .await
+        .unwrap();
     assert!(seed.engine.ds.head("changes/2").await.unwrap().is_some());
     let oracle = seed.oracle.clone();
     (seed.crash().await, oracle, tail)

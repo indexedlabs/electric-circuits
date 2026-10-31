@@ -26,6 +26,9 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             .env("ELECTRIC_CIRCUITS_SUBQ_STORAGE", "1")
             .env_remove("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR")
             .env("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0");
+        if matches!(case, Case::GroupStall) {
+            command.env("ELECTRIC_CIRCUITS_GROUP_DETACH_AFTER_SECS", "2");
+        }
         if matches!(case, Case::GroupLapse | Case::GroupRestoreExpired | Case::GroupReleaseDuringAssembly) {
             command
                 .env("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "5")
@@ -82,6 +85,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupRenewalCancellation => group_renewal_cancellation(&fixture).await,
             Case::GroupReconnectBurst => group_reconnect_burst(&fixture).await,
             Case::GroupAdmission => group_admission_gate(&fixture).await,
+            Case::GroupStall => group_stall_holds_back_no_other_stream(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -125,6 +129,7 @@ enum Case {
     GroupRenewalCancellation,
     GroupReconnectBurst,
     GroupAdmission,
+    GroupStall,
 }
 
 #[test]
@@ -322,6 +327,12 @@ fn group_admission_does_not_block_other_loads_or_plain_shapes() -> Result<()> {
     isolated("ownership::group_admission_does_not_block_other_loads_or_plain_shapes", Case::GroupAdmission)
 }
 
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_stall_holds_back_no_other_stream_and_the_group_resumes() -> Result<()> {
+    isolated("ownership::group_stall_holds_back_no_other_stream_and_the_group_resumes", Case::GroupStall)
+}
+
 #[derive(Clone)]
 struct ObservedDs {
     store: FeedDs,
@@ -348,6 +359,9 @@ struct ObservedDs {
     hold_group_drop_id: Arc<Mutex<Option<String>>>,
     group_catalog_arrived: Arc<Notify>,
     group_catalog_release: Arc<Notify>,
+    /// While `true`, every append to and HEAD of a group stream is held unanswered, as the
+    /// prototype's fault proxy holds a stalled group's stream (OTTO-11131 scenario `a`).
+    hold_group_stream: watch::Sender<bool>,
 }
 
 async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Response {
@@ -356,6 +370,10 @@ async fn observed_ds(State(ds): State<ObservedDs>, request: AxumRequest) -> Resp
     let mut request = request;
     let closing = method == Method::POST && request.headers().contains_key("stream-closed");
     let group_path = path.contains("shape/group-");
+    if group_path && (method == Method::HEAD || (method == Method::POST && !closing)) {
+        let mut held = ds.hold_group_stream.subscribe();
+        let _ = held.wait_for(|held| !*held).await;
+    }
     if method == Method::PUT && group_path {
         let mut armed = ds.fail_group_head_after_put.lock().await;
         if *armed {
@@ -573,6 +591,7 @@ impl Fixture {
             hold_group_drop_id: Arc::new(Mutex::new(None)),
             group_catalog_arrived: Arc::new(Notify::new()),
             group_catalog_release: Arc::new(Notify::new()),
+            hold_group_stream: watch::channel(false).0,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let ds_url = format!("http://{}", listener.local_addr()?);
@@ -1214,11 +1233,36 @@ async fn wait_source_receipt(engine: &Engine, f: &Fixture, commit: uuid::Uuid) -
             if engine.source_drain_receipt(&commit.to_string()).is_some() {
                 return Ok::<_, anyhow::Error>(());
             }
-            changed.changed().await.context("source receipt observation channel closed")?;
+            // The receipt is published after its catalog append, the last storage change it
+            // makes, so poll as well as listening for storage changes.
+            tokio::select! {
+                changed = changed.changed() => changed.context("source receipt observation channel closed")?,
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
         }
     })
     .await
     .context("waiting for source drain receipt")??;
+    Ok(())
+}
+
+async fn wait_group_receipt(engine: &Engine, f: &Fixture, commit: uuid::Uuid, group: &str) -> Result<()> {
+    let mut changed = f.ds.changed.subscribe();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if engine.group_drain_receipt(&commit.to_string(), group).is_some_and(|drain| drain.drained) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::select! {
+                changed = changed.changed() => changed.context("group receipt observation channel closed")?,
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    })
+    .await
+    .with_context(|| {
+        format!("waiting for {group}'s receipt: {:?}", engine.group_drain_receipt(&commit.to_string(), group))
+    })??;
     Ok(())
 }
 
@@ -1287,8 +1331,11 @@ async fn group_source_drain_receipt(f: &Fixture) -> Result<()> {
         wait_source_receipt(&engine, f, commit).await?;
         let receipt = engine.source_drain_receipt(&commit.to_string()).context("source receipt disappeared")?;
         ensure!(receipt.source_commit_id == commit.to_string(), "wrong source receipt: {receipt:?}");
-        let events = wait_group_events(f, &stream_path, baseline + 1).await?;
-        ensure!(events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")), "group lane did not emit before receipt: {events:?}");
+        // The shared receipt never waits for a group (OTTO-11131); the group's own receipt covers
+        // its deferred lane.
+        wait_group_receipt(&engine, f, commit, &stream_path).await?;
+        let events = stream_events(f, &stream_path).await;
+        ensure!(events.iter().skip(baseline).any(|event| event_key(event).as_deref() == Some("2")), "group lane did not emit before its group receipt: {events:?}");
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -2885,5 +2932,125 @@ async fn changed_version_fetch_failure_does_not_retry_cached_rows(f: &Fixture) -
     .await;
     stop(&host).await;
     f.client.batch_execute(&format!("ALTER TABLE {unavailable} RENAME TO {}", f.sources_table)).await?;
+    result
+}
+
+async fn stall_commit(f: &Fixture, id: i64) -> Result<uuid::Uuid> {
+    let fence = uuid::Uuid::new_v4();
+    f.client
+        .batch_execute(&format!(
+            "BEGIN; INSERT INTO public.{} (id, body) VALUES ({id}, 'row-{id}'); \
+             INSERT INTO public.circuits_source_fence VALUES ('{fence}'); COMMIT",
+            f.outer
+        ))
+        .await?;
+    Ok(fence)
+}
+
+/// OTTO-11131, the contract of `dec-circuits-group-per-group-barriers`: with one group's stream
+/// held, the shared source receipt and another stream keep moving; the group detaches after its
+/// backoff with a resume point, and once its stream answers it reattaches behind a must-refetch
+/// marker and delivers live output again.
+async fn group_stall_holds_back_no_other_stream(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, body) = post_group(&app, group_body(f, "group-stall", true)).await?;
+        ensure!(status == StatusCode::OK, "group create failed: {status} {body}");
+        let group_path = body["streamPath"].as_str().context("group stream path")?.to_owned();
+        let plain_body = serde_json::json!({
+            "table": format!("public.{}", f.outer),
+            "changesOnly": true,
+            "subscription": "group-stall-plain",
+        });
+        let (status, plain) = json(&app, Method::POST, "/v1/shapes", Body::from(plain_body.to_string())).await?;
+        ensure!(status == StatusCode::OK, "plain create failed: {status} {plain}");
+        let plain_path = plain["streamPath"].as_str().context("plain stream path")?.to_owned();
+        f.ds.hold_group_stream.send_replace(true);
+        let held = stall_commit(f, 100).await?;
+        // The sequencer must not wait for the held group: the shared receipt lands and the plain
+        // shape delivers the same commit while the group's append is still held.
+        let receipt = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(receipt) = engine.source_drain_receipt(&held.to_string()) {
+                    return receipt;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        ensure!(receipt.is_ok(), "a held group held back the shared source receipt");
+        let plain_events = wait_group_events(f, &plain_path, 1).await?;
+        ensure!(
+            plain_events.iter().any(|event| event_key(event).as_deref() == Some("100")),
+            "the plain shape did not deliver while a group was held: {plain_events:?}"
+        );
+        let drain = engine.group_drain_receipt(&held.to_string(), &group_path).context("group receipt")?;
+        ensure!(!drain.drained, "the held group's receipt claimed its output landed: {drain:?}");
+
+        // Keep the engine moving until the held group detaches (its backoff is 2 s here).
+        let mut id = 101;
+        let detached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let fence = stall_commit(f, id).await?;
+                id += 1;
+                wait_source_receipt(&engine, f, fence).await?;
+                if engine.group_drain_receipt(&held.to_string(), &group_path).is_some_and(|drain| drain.must_refetch) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        ensure!(
+            matches!(detached, Ok(Ok(()))),
+            "the held group never detached: {:?}",
+            engine.group_drain_receipt(&held.to_string(), &group_path)
+        );
+        let plain_events = stream_events(f, &plain_path).await;
+        ensure!(
+            plain_events.iter().any(|event| event_key(event) == Some((id - 1).to_string())),
+            "the plain shape stopped delivering while the group was detached"
+        );
+
+        // The stream answers again: the group reattaches behind a must-refetch marker, then
+        // delivers live output after it.
+        f.ds.hold_group_stream.send_replace(false);
+        let after = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let fence = stall_commit(f, id).await?;
+                let live = id;
+                id += 1;
+                wait_source_receipt(&engine, f, fence).await?;
+                let events = stream_events(f, &group_path).await;
+                if let Some(marker) = events.iter().position(|event| event["type"] == "__circuits.control") {
+                    if events[marker + 1..].iter().any(|event| event_key(event) == Some(live.to_string())) {
+                        return Ok::<_, anyhow::Error>((events[marker].clone(), fence));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        let (marker, fence) = match after {
+            Ok(Ok(found)) => found,
+            other => anyhow::bail!(
+                "the group did not reattach behind a marker ({other:?}): {:?}",
+                stream_events(f, &group_path).await
+            ),
+        };
+        ensure!(marker["value"]["control"] == "must-refetch", "unexpected marker: {marker}");
+        ensure!(marker["value"]["groupId"] == group_path.as_str(), "marker names another group: {marker}");
+        wait_group_receipt(&engine, f, fence, &group_path).await?;
+        ensure!(
+            !engine.group_drain_receipt(&fence.to_string(), &group_path).context("group receipt")?.must_refetch,
+            "a reattached group still asks its readers to refetch"
+        );
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.ds.hold_group_stream.send_replace(false);
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
     result
 }

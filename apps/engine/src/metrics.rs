@@ -173,6 +173,16 @@ pub struct Metrics {
     /// segment-deletion floor — so a hold that does not end must be visible as a level, not only as
     /// a once-a-minute log line.
     pub sequencer_held_run: AtomicU64,
+    /// COUNTER: group lanes that detached because their stream fell behind (OTTO-11131).
+    pub group_detaches: AtomicU64,
+    /// COUNTER: detached group lanes whose stream answered again and that reattached behind a
+    /// must-refetch marker.
+    pub group_reattaches: AtomicU64,
+    /// GAUGE: group lanes currently detached.
+    pub group_lanes_detached: AtomicU64,
+    /// GAUGE: bytes and batches queued on group lanes behind their in-flight append.
+    pub group_lane_backlog_bytes: AtomicU64,
+    pub group_lane_backlog_batches: AtomicU64,
     /// GAUGE: estimated in-memory held envelope bytes; excludes spilled data and file I/O buffers.
     pub sequencer_held_bytes: AtomicU64,
     /// COUNTER: held transactions that crossed their memory cap and spilled.
@@ -255,6 +265,11 @@ impl Metrics {
             backfill_chunked_appends: AtomicU64::new(0),
             sequencer_orphan_fragments: AtomicU64::new(0),
             sequencer_held_run: AtomicU64::new(0),
+            group_detaches: AtomicU64::new(0),
+            group_reattaches: AtomicU64::new(0),
+            group_lanes_detached: AtomicU64::new(0),
+            group_lane_backlog_bytes: AtomicU64::new(0),
+            group_lane_backlog_batches: AtomicU64::new(0),
             sequencer_held_bytes: AtomicU64::new(0),
             sequencer_held_spills: AtomicU64::new(0),
             sequencer_read_cap_failures: AtomicU64::new(0),
@@ -319,6 +334,8 @@ impl Metrics {
                 "txn_chunked_appends_total": self.txn_chunked_appends.load(Ordering::Relaxed),
                 "backfill_chunked_appends_total": self.backfill_chunked_appends.load(Ordering::Relaxed),
                 "sequencer_orphan_fragments_total": self.sequencer_orphan_fragments.load(Ordering::Relaxed),
+                "group_detaches_total": self.group_detaches.load(Ordering::Relaxed),
+                "group_reattaches_total": self.group_reattaches.load(Ordering::Relaxed),
             },
             "gauges": {
                 "catalog_bytes": self.catalog_bytes.load(Ordering::Relaxed),
@@ -334,6 +351,9 @@ impl Metrics {
                 "replication_slot_retained_wal_bytes": self.replication_slot_retained_wal_bytes.load(Ordering::Relaxed),
                 "replication_confirmed_flush_lag_bytes": self.replication_confirmed_flush_lag_bytes.load(Ordering::Relaxed),
                 "replication_slot_active": self.replication_slot_active.load(Ordering::Relaxed),
+                "group_lanes_detached": self.group_lanes_detached.load(Ordering::Relaxed),
+                "group_lane_backlog_bytes": self.group_lane_backlog_bytes.load(Ordering::Relaxed),
+                "group_lane_backlog_batches": self.group_lane_backlog_batches.load(Ordering::Relaxed),
             },
             "process_envelope_us": self.process_envelope.snapshot(),
             "family_step_us": self.family_step.snapshot(),
