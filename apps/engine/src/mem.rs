@@ -116,8 +116,9 @@ pub struct Cardinalities {
     /// forward/reverse index — the append-only cost of keying the circuit by `u32` pk ids instead
     /// of heap strings. See `SubqueryRegistry::pk_dict_bytes`.
     pub bytes_pk_dict: usize,
-    /// The `/v1/shape` (Electric-protocol) adapter's TTL handle registry: per-handle cursor
-    /// state (known-keys sets, in-flight live-poll map).
+    /// The `/v1/shape` (Electric-protocol) adapter: its TTL handle registry (per-handle cursor
+    /// state — known-keys sets, in-flight live-poll map) plus the finished snapshot builds it keeps
+    /// for reuse (one body and key list per shape, each for at most 30 s).
     pub bytes_electric_adapter: usize,
 }
 

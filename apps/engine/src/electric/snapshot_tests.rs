@@ -246,7 +246,18 @@ async fn a_finished_snapshot_is_reused_until_the_tail_moves_or_it_expires() {
     );
     assert_ne!(third.get("electric-offset"), second.get("electric-offset"));
 
+    // The kept body is counted in the memory probe while it is kept, and released at its expiry
+    // by the build's own task — not only skipped by the next request — so an idle shape does not
+    // pin its body (these bytes are outside the memory budget).
+    let kept = crate::electric::snapshot_cache_heap_bytes(&source.engine);
+    assert!(kept > 0, "a kept body must be reported in the memory probe");
+    assert!(source.engine.mem_bytes().await.bytes_electric_adapter >= kept);
     tokio::time::sleep(Duration::from_secs(31)).await;
+    assert!(
+        source.engine.electric_handles.snapshots.lock().unwrap().is_empty(),
+        "a kept body must be released when it expires"
+    );
+    assert_eq!(crate::electric::snapshot_cache_heap_bytes(&source.engine), 0);
     let (status, fourth, _) = get(source.app.clone(), SNAPSHOT.into()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(source.folds(), 3, "a finished build is kept for a short time only");
