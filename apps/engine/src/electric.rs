@@ -479,6 +479,9 @@ impl From<anyhow::Error> for ApiError {
                 must_refetch: false,
             };
         }
+        if e.downcast_ref::<FoldInterrupted>().is_some() {
+            return ApiError::draining();
+        }
         if e.downcast_ref::<crate::schema::UnknownColumn>().is_some() {
             return ApiError::bad_request(format!("{e:#}"));
         }
@@ -698,10 +701,38 @@ impl<V: FoldValue> StreamFold<V> {
 
 /// Drive a [`StreamFold`] with catch-up reads until it completes. Pages are read as text and folded
 /// straight from it, so a page is never held as decoded envelopes.
-async fn drive_fold<V: FoldValue>(
+async fn drive_fold<V: FoldValue>(engine: &Engine, path: &str, fold: StreamFold<V>) -> anyhow::Result<StreamFold<V>> {
+    drive_fold_with(engine, path, fold, Interrupt::OnShutdown).await
+}
+
+/// Whether a budgeted fold gives up when shutdown begins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interrupt {
+    /// A fold inside a request (a catch-up's key set): it must not hold the drain open while it
+    /// waits for memory, so it ends with [`FoldInterrupted`] and the client is told to retry.
+    OnShutdown,
+    /// The shared snapshot build, an Engine-tracked task: requests the engine already accepted
+    /// are served during the drain, and Engine close aborts the task after it.
+    AtClose,
+}
+
+/// A budgeted fold ended because shutdown began; the client is told to retry, not handed a 500.
+#[derive(Debug)]
+struct FoldInterrupted;
+
+impl std::fmt::Display for FoldInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("shape fold interrupted by shutdown")
+    }
+}
+
+impl std::error::Error for FoldInterrupted {}
+
+async fn drive_fold_with<V: FoldValue>(
     engine: &Engine,
     path: &str,
     mut fold: StreamFold<V>,
+    interrupt: Interrupt,
 ) -> anyhow::Result<StreamFold<V>> {
     let ds = engine.shape_fold_input(path).await?;
     if !ds.memory_budget().enabled() {
@@ -718,7 +749,9 @@ async fn drive_fold<V: FoldValue>(
         // need memory, so perform this check only after releasing the previous page owner.
         engine.shape_fold_input(path).await?;
         let (page, permit) = tokio::select! {
-            _ = shutdown.wait() => anyhow::bail!("shape fold interrupted by shutdown"),
+            _ = shutdown.wait(), if interrupt == Interrupt::OnShutdown => {
+                return Err(anyhow::Error::new(FoldInterrupted));
+            }
             page = ds.read_raw_budgeted(path, &fold.offset) => page?,
         };
         fold.apply_page(page)?;
@@ -837,7 +870,7 @@ async fn await_snapshot(engine: &Engine, mut rx: watch::Receiver<SnapshotSlot>) 
             if let Some(result) = rx.borrow().clone() {
                 return result;
             }
-            // The build task ended without an answer: shutdown dropped it, or it panicked.
+            // The build task ended without an answer: Engine close aborted it, or it panicked.
             if engine.shutdown_token().is_shutting_down() {
                 return Err(ApiError::draining());
             }
@@ -846,7 +879,7 @@ async fn await_snapshot(engine: &Engine, mut rx: watch::Receiver<SnapshotSlot>) 
     }
 }
 
-/// Removes a build's in-flight entry if its task ends without publishing — shutdown drops it, a
+/// Removes a build's in-flight entry if its task ends without publishing — Engine close aborts it, a
 /// panic unwinds it, or a closed task set never runs it — so later requests start a new build
 /// instead of waiting on one that will never answer.
 struct BuildEntryGuard {
@@ -923,7 +956,8 @@ fn spawn_snapshot_build(engine: &Engine, path: &str, build: u64, tx: watch::Send
 /// bytes are exactly what serializing those messages as one JSON array produces (`respond`), so a
 /// shared build answers byte-for-byte what an unshared one did.
 async fn build_snapshot(engine: &Engine, path: &str) -> anyhow::Result<Snapshot> {
-    let fold: StreamFold<Box<RawValue>> = drive_fold(engine, path, StreamFold::to_tail()).await?;
+    let fold: StreamFold<Box<RawValue>> =
+        drive_fold_with(engine, path, StreamFold::to_tail(), Interrupt::AtClose).await?;
     // An upper bound, so the buffer never doubles mid-write: per row the message framing (53
     // bytes), the key (escaping at most doubles it) and the encoded row, which at most doubles the
     // raw text (quoting turns each number or boolean into a string, at least two characters each).
@@ -1708,6 +1742,15 @@ mod tests {
         assert!(!error.must_refetch, "the shape is still there; refetching would discard a live stream");
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.retry_after, Some(1));
+    }
+
+    /// A catch-up fold that gave up because shutdown began is a "come back" answer, not a fault.
+    #[test]
+    fn an_interrupted_fold_is_an_electric_retryable_response() {
+        let error: ApiError = anyhow::Error::new(FoldInterrupted).into();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(1));
+        assert!(!error.must_refetch);
     }
 
     #[test]

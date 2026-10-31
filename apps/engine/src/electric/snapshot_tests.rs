@@ -425,6 +425,26 @@ async fn a_draining_engine_serves_snapshots_until_it_closes() {
     }
 }
 
+/// The same drain under the memory budget, whose fold reads are admitted by the budget: the shared
+/// build is still not cut off when shutdown begins.
+#[tokio::test(start_paused = true)]
+async fn a_draining_engine_serves_budgeted_snapshots_it_accepted() {
+    let source = Source::budgeted("scripted://shutdown-budgeted").await;
+    source.append(rows()).await;
+    let gate = source.hold();
+    let requests: Vec<_> = (0..3).map(|_| source.spawn_get(SNAPSHOT)).collect();
+    quiesce().await;
+    assert_eq!(gate.arrived.load(SeqCst), 1);
+    source.engine.shutdown_token().begin();
+    quiesce().await;
+    source.open(&gate);
+    for request in requests {
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK, "a draining engine still serves the snapshots it accepted: {body:?}");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), ROWS_BODY);
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn engine_close_tells_the_waiters_of_an_unfinished_build_to_retry() {
     let source = Source::new("scripted://close").await;
