@@ -53,6 +53,17 @@ load_group() {
     | tee "$OUT/$name-load.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
 }
 
+load_unaffected() {
+  curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/shapes \
+    -d '{"table":"public.plain_events"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
+}
+
+load_unaffected_group() {
+  curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
+    -d '{"subscription":"otto-unaffected","members":[{"table":"public.plain_events"},{"table":"public.sparse_events"}]}' \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
+}
+
 write_loop() {
   local table=$1 delay=${2:-0.05} end=$(( $(date +%s) + ${3:-60} )) n=0
   while [ "$(date +%s)" -lt "$end" ]; do
@@ -71,6 +82,8 @@ run_one() {
   local rate=0 groups=0 start_bytes=0
   start_bytes=$(group_bytes)
   group_offset_start=""
+  export UNAFFECTED_PLAIN_PATH=$(load_unaffected)
+  export UNAFFECTED_GROUP_PATH=$(load_unaffected_group)
   case "$scenario" in
     a-200) rate=200; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
     a-2000) rate=2000; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
@@ -97,10 +110,18 @@ run_one() {
     b-*) load_group outage >/dev/null; export OUTAGE=1; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     *) echo "unknown scenario $scenario" >&2; return 2;;
   esac
+  marker="otto-marker-$scenario-$(date +%s%N)"
+  marker_commit_ms=$(date +%s%3N)
+  MARKER="$marker" MARKER_COMMIT_MS="$marker_commit_ms" MARKER_TIMEOUT_MS="$((seconds * 1000 + 120000))" \
+    LIVE_MODE=long-poll "${BASE[@]}" exec -T api pnpm exec tsx /repo/prototype/marker-client.ts >"$OUT/$scenario-marker.json" 2>&1 &
+  marker_reader=$!
+  sleep 1
+  psql -c "INSERT INTO plain_events(group_id,body) VALUES (1, '$marker')" >/dev/null
   "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario" "$seconds"
   group_offset_end=$(group_stream_offset "$stream_path")
   clear_fault
   if [ -n "$writer" ]; then wait "$writer" 2>/dev/null || true; fi
+  wait "$marker_reader" 2>/dev/null || true
   end_bytes=$(group_bytes)
   if [ "$end_bytes" -eq "$start_bytes" ] && [ "$rate" -gt 0 ]; then
     transactions=$(awk '/number of transactions actually processed:/{print $NF}' "$OUT/pgbench-${rate}cps-${seconds}s.log" 2>/dev/null || echo 0)
