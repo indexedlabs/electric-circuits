@@ -36,6 +36,8 @@ write_loop() {
 
 run_one() {
   local scenario=$1 seconds=${2:-60} stream_path=""
+  export INTERVAL_S=1
+  case "$scenario" in b-*) export INTERVAL_S=5;; esac
   echo "running $scenario for ${seconds}s"
   seed
   case "$scenario" in
