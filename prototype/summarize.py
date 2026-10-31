@@ -1,50 +1,161 @@
 #!/usr/bin/env python3
-import datetime, json, pathlib, statistics, sys
+"""Summarize one scenario's results directory into summary.json (one row)."""
+import json
+import pathlib
+import re
+import sys
 
 root = pathlib.Path(sys.argv[1])
-rows = []
-for path in sorted(root.glob("*/samples.jsonl")):
-    vals = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    if not vals: continue
-    rss = [x.get("engine_memory", {}).get("process", {}).get("rss_bytes") for x in vals]
-    rss = [x for x in rss if isinstance(x, int)]
-    lat = [x.get("latency_ms") for x in vals if isinstance(x.get("latency_ms"), (int,float))]
-    lane_bytes = [sum(v.get("bytes", 0) for v in x.get("engine_metrics", {}).get("group_lane_backlog", {}).values()) for x in vals]
-    lane_batches = [sum(v.get("batches", 0) for v in x.get("engine_metrics", {}).get("group_lane_backlog", {}).values()) for x in vals]
-    receipt_depth = [x.get("engine_metrics", {}).get("gauges", {}).get("receipt_queue_depth", 0) for x in vals]
-    def offset(value):
-        try: return int(value["offset"].split("_")[-1], 16)
-        except (KeyError, TypeError, ValueError, AttributeError): return None
-    processed = [offset(x.get("engine_metrics", {}).get("sequencer", {}).get("processed")) for x in vals]
-    checkpoint = [offset(x.get("engine_metrics", {}).get("sequencer", {}).get("checkpoint")) for x in vals]
-    lag = [p - c for p, c in zip(processed, checkpoint) if p is not None and c is not None]
-    workload_path = root / f"{path.parent.name.split('-2026')[0]}-workload.json"
-    workload = json.loads(workload_path.read_text()) if workload_path.exists() else {}
-    processed = [x.get("engine_metrics", {}).get("counters", {}).get("envelopes_processed") for x in vals]
-    processed = [x for x in processed if isinstance(x, int)]
-    plain_counts = [x.get("unaffected_plain_envelopes") for x in vals if isinstance(x.get("unaffected_plain_envelopes"), int)]
-    group_counts = [x.get("unaffected_group_envelopes") for x in vals if isinstance(x.get("unaffected_group_envelopes"), int)]
-    marker_path = root / f"{path.parent.name.split('-2026')[0]}-marker.json"
-    marker = {}
-    if marker_path.exists():
-        try: marker = json.loads(marker_path.read_text().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError): pass
-    elapsed_s = (datetime.datetime.fromisoformat(vals[-1]["ts"].replace("Z", "+00:00")) - datetime.datetime.fromisoformat(vals[0]["ts"].replace("Z", "+00:00"))).total_seconds() if len(vals) > 1 else 0
-    rows.append({"scenario": path.parent.name, "samples": len(vals), "rss_peak_bytes": max(rss, default=None),
-                 "lane_backlog_peak_bytes": max(lane_bytes, default=0), "lane_backlog_peak_batches": max(lane_batches, default=0),
-                 "receipt_queue_peak_depth": max(receipt_depth, default=0), "processed_checkpoint_lag_peak_bytes": max(lag, default=None),
-                 **workload, "latency_p50_ms": statistics.median(lat) if lat else None,
-                 "latency_p99_ms": sorted(lat)[max(0, int(len(lat)*.99)-1)] if lat else None,
-                 "envelopes_processed_start": processed[0] if processed else None,
-                 "envelopes_processed_end": processed[-1] if processed else None,
-                 "envelopes_processed_per_s": ((processed[-1] - processed[0]) / max(1, elapsed_s)) if len(processed) > 1 else None,
-                 "unaffected_plain_envelopes": plain_counts[-1] if plain_counts else None,
-                 "unaffected_group_envelopes": group_counts[-1] if group_counts else None,
-                 "unaffected_plain_offset_start": vals[0].get("unaffected_plain_offset"),
-                 "unaffected_plain_offset_end": vals[-1].get("unaffected_plain_offset"),
-                 "unaffected_group_offset_start": vals[0].get("unaffected_group_offset"),
-                 "unaffected_group_offset_end": vals[-1].get("unaffected_group_offset"),
-                 "marker": marker,
-                 "first": vals[0], "last": vals[-1]})
-(root / "summary.json").write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n")
-print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def load_jsonl(name):
+    path = root / name
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return rows
+
+
+def load_json(name, default=None):
+    try:
+        return json.loads((root / name).read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def offset(value):
+    try:
+        return int(str(value["offset"]).split("_")[-1])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def get(row, *keys):
+    for key in keys:
+        if not isinstance(row, dict):
+            return None
+        row = row.get(key)
+    return row
+
+
+workload = load_json("workload.json", {})
+runner = load_json("runner.json", {})
+samples = load_jsonl("samples.jsonl")
+delivery = load_jsonl("delivery.jsonl")
+seen = load_json("markers-seen.json", {})
+hold_start, clear = workload.get("hold_start_ms"), workload.get("clear_ms")
+hold = [s for s in samples if hold_start and clear and hold_start <= s.get("ts_ms", 0) <= clear]
+warm = [s for s in samples if hold_start and s.get("ts_ms", 0) < hold_start]
+after = [s for s in samples if clear and s.get("ts_ms", 0) > clear]
+
+
+def series(rows, fn):
+    out = []
+    for row in rows:
+        try:
+            value = fn(row)
+        except (KeyError, TypeError, AttributeError):
+            value = None
+        if isinstance(value, (int, float)):
+            out.append(value)
+    return out
+
+
+def rate(rows, fn):
+    pts = [(r["ts_ms"], fn(r)) for r in rows if isinstance(get(r, "ts_ms"), int)]
+    pts = [(t, v) for t, v in pts if isinstance(v, (int, float))]
+    if len(pts) < 2 or pts[-1][0] == pts[0][0]:
+        return None
+    return (pts[-1][1] - pts[0][1]) / ((pts[-1][0] - pts[0][0]) / 1000)
+
+
+envelopes = lambda r: get(r, "engine_metrics", "counters", "envelopes_processed")
+rss = lambda r: get(r, "engine_memory", "process", "rss_bytes") or r.get("rss_bytes")
+lane_bytes = lambda r: sum(v.get("bytes", 0) for v in (get(r, "engine_metrics", "group_lane_backlog") or {}).values())
+lane_batches = lambda r: sum(v.get("batches", 0) for v in (get(r, "engine_metrics", "group_lane_backlog") or {}).values())
+receipts = lambda r: get(r, "engine_metrics", "gauges", "receipt_queue_depth")
+ckpt_lag = lambda r: offset(get(r, "engine_metrics", "sequencer", "processed")) - offset(get(r, "engine_metrics", "sequencer", "checkpoint"))
+log_lag = lambda r: offset(get(r, "replication_lsn", "changes")) - offset(get(r, "engine_metrics", "sequencer", "processed"))
+wal = lambda r: max(int(s.get("retained_wal_bytes") or 0) for s in r["slot_stats"])
+load1 = lambda r: r.get("host_load1")
+
+
+def delivered(label, start, end):
+    """Envelopes a client tailing `label` received between two wall-clock instants."""
+    pts = [(d["ts_ms"], get(d, "streams", label, "envelopes")) for d in delivery]
+    pts = [(t, v) for t, v in pts if isinstance(v, int)]
+    before = [v for t, v in pts if t <= start]
+    upto = [v for t, v in pts if t <= end]
+    if not pts or not upto:
+        return None
+    return upto[-1] - (before[-1] if before else pts[0][1])
+
+
+def first_growth_after(label, instant):
+    pts = [(d["ts_ms"], get(d, "streams", label, "envelopes")) for d in delivery]
+    pts = [(t, v) for t, v in pts if isinstance(v, int)]
+    base = [v for t, v in pts if t <= instant]
+    if not base:
+        return None
+    for t, v in pts:
+        if t > instant and v > base[-1]:
+            return t - instant
+    return None
+
+
+def marker(stream, name):
+    hit = seen.get(f"{stream}:{name}")
+    return hit["latency_ms"] if hit else None
+
+
+def slot_field(rows, field):
+    vals = [s.get(field) for r in rows for s in (r.get("slot_stats") or []) if isinstance(r.get("slot_stats"), list)]
+    return vals
+
+
+pgbench = (root / "pgbench.log").read_text() if (root / "pgbench.log").exists() else ""
+tps = re.search(r"tps = ([0-9.]+)", pgbench)
+hold_s = (clear - hold_start) / 1000 if hold_start and clear else None
+row = {
+    "scenario": workload.get("scenario"),
+    "engine_ref": workload.get("engine_ref"),
+    "runner": runner,
+    "rate_tps": workload.get("rate_tps"),
+    "pgbench_tps": float(tps.group(1)) if tps else None,
+    "hold_s": round(hold_s) if hold_s else None,
+    "fault": workload.get("fault"),
+    "samples": {"warmup": len(warm), "hold": len(hold), "recovery": len(after)},
+    "envelopes_per_s_warmup": rate(warm, envelopes),
+    "envelopes_per_s_hold": rate(hold, envelopes),
+    "envelopes_per_s_recovery": rate(after, envelopes),
+    "unaffected_plain_envelopes_hold": delivered("plain", hold_start, clear) if hold_start else None,
+    "unaffected_group_envelopes_hold": delivered("group", hold_start, clear) if hold_start else None,
+    "faulted_group_envelopes_hold": delivered("faulted", hold_start, clear) if hold_start else None,
+    "unaffected_plain_envelopes_warmup": delivered("plain", 0, hold_start) if hold_start else None,
+    "marker_during_ms": {"plain": marker("plain", "during"), "group": marker("group", "during")},
+    "marker_after_ms": {"plain": marker("plain", "after"), "group": marker("group", "after")},
+    "faulted_resume_ms": first_growth_after("faulted", clear) if clear else None,
+    "rss_peak_bytes": max(series(hold + after, rss), default=None),
+    "rss_warmup_bytes": max(series(warm, rss), default=None),
+    "lane_backlog_peak_bytes": max(series(hold + after, lane_bytes), default=None),
+    "lane_backlog_peak_batches": max(series(hold + after, lane_batches), default=None),
+    "receipt_queue_peak_depth": max(series(hold + after, receipts), default=None),
+    "checkpoint_lag_peak_bytes": max(series(hold + after, ckpt_lag), default=None),
+    "change_log_lag_peak_bytes": max(series(hold + after, log_lag), default=None),
+    "change_log_lag_end_bytes": (series(after, log_lag) or [None])[-1],
+    "retained_wal_hold_start_bytes": (series(hold, wal) or [None])[0],
+    "retained_wal_peak_bytes": max(series(hold + after, wal), default=None),
+    "retained_wal_end_bytes": (series(after, wal) or [None])[-1],
+    "confirmed_flush_hold": [x for x in (slot_field(hold[:1], "confirmed_flush_lsn") + slot_field(hold[-1:], "confirmed_flush_lsn"))],
+    "host_load1_peak_hold": max(series(hold, load1), default=None),
+    "health_ms_p50_hold": sorted(series(hold, lambda r: r.get("health_ms")))[len(hold) // 2] if series(hold, lambda r: r.get("health_ms")) else None,
+    "proxy_stats_end_hold": (hold[-1].get("proxy_stats") if hold else None),
+    "delivery_errors": {k: get(delivery[-1], "streams", k, "errors") for k in ("plain", "group", "faulted")} if delivery else None,
+}
+(root / "summary.json").write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
+print(json.dumps(row, indent=2, sort_keys=True))

@@ -18,6 +18,9 @@ services:
       DS_WAL_SHARDS: "${ELECTRIC_CIRCUITS_DS_WAL_SHARDS:-2}"
       DS_STREAM_LANES: "${ELECTRIC_CIRCUITS_DS_STREAM_LANES:-1}"
       DS_FILESYSTEM_UUID: "${ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID:-253f14d5-cbee-4df8-9e3c-e44c6e41501b}"
+    sysctls:
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: "1"
     ports:
       - "${PROXY_PORT:-8792}:8792"
     depends_on:

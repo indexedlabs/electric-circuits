@@ -5,9 +5,26 @@ on:
     branches: ['proto/otto-10992-*']
 
 jobs:
-  experiment:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    outputs:
+      scenarios: ${{ steps.plan.outputs.scenarios }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        shell: bash
+        run: |
+          source prototype/run.env
+          echo "scenarios=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split(",")))' "$SCENARIOS")" >> "$GITHUB_OUTPUT"
+
+  experiment:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.plan.outputs.scenarios) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,8 +38,7 @@ jobs:
           source prototype/run.env
           echo "engine_ref=$ENGINE_REF" >> "$GITHUB_OUTPUT"
           echo "scenarios=$SCENARIOS" >> "$GITHUB_OUTPUT"
-          echo "sample_interval_s=$SAMPLE_INTERVAL_S" >> "$GITHUB_OUTPUT"
-          echo "scenario_seconds=$SCENARIO_SECONDS" >> "$GITHUB_OUTPUT"
+          echo "rate=$RATE" >> "$GITHUB_OUTPUT"
 
       - name: Preserve harness and check engine ref
         shell: bash
@@ -41,12 +57,16 @@ jobs:
 
       - name: Apply measurement instrumentation
         shell: bash
+        env:
+          ENGINE_REF: ${{ steps.config.outputs.engine_ref }}
         run: |
           set -euo pipefail
           mkdir -p harness/otto-10992/results
-          git apply harness/otto-10992/measurement.patch
-          printf '%s\n' '135c183 Add observation-only backlog instrumentation' \
-            > harness/otto-10992/results/measurement-patch.txt
+          # A variant may carry its own adaptation of the same observation-only patch.
+          patch=harness/otto-10992/measurement.patch
+          [ -f "harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch" ] && patch="harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch"
+          git apply "$patch"
+          printf '%s\n' "$patch" > harness/otto-10992/results/measurement-patch.txt
 
       - name: Start PostgreSQL and Durable Streams
         env:
@@ -108,15 +128,15 @@ jobs:
             ln -sfn /repo/apps/api /repo/node_modules/@electric-circuits/api
           '
 
-      - name: Run selected scenarios
+      - name: Run scenario
         env:
-          SCENARIOS: ${{ steps.config.outputs.scenarios }}
-          SAMPLE_INTERVAL_S: ${{ steps.config.outputs.sample_interval_s }}
-          SCENARIO_SECONDS: ${{ steps.config.outputs.scenario_seconds }}
+          SCENARIO: ${{ matrix.scenario }}
+          RATE: ${{ steps.config.outputs.rate }}
+          ENGINE_REF: ${{ steps.config.outputs.engine_ref }}
           OUT_DIR: ${{ github.workspace }}/harness/otto-10992/results
         run: |
           set -euo pipefail
-          ./prototype/experiment.sh
+          bash ./prototype/experiment.sh
           python3 prototype/summarize.py "$OUT_DIR"
 
       - name: Capture stack diagnostics
@@ -130,7 +150,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: otto-10992-${{ github.sha }}
+          name: otto-10992-${{ github.sha }}-${{ strategy.job-index }}
           path: |
             harness/otto-10992/results
             docker/compose*.log

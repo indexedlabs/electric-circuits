@@ -18,7 +18,7 @@ MATCH = os.getenv("FAULT_MATCH", "")
 DELAY_MS = int(os.getenv("DELAY_MS", "0"))
 HANG = os.getenv("HANG", "0") == "1"
 OUTAGE = os.getenv("OUTAGE", "0") == "1"
-STATS = {"targeted": 0, "held": 0, "forwarded": 0}
+STATS = {"targeted": 0, "held": 0, "forwarded": 0, "upstream_errors": 0}
 STATS_LOCK = threading.Lock()
 
 
@@ -102,26 +102,54 @@ class Proxy(BaseHTTPRequestHandler):
             time.sleep(DELAY_MS / 1000)
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length) if length else None
-        conn = http.client.HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=300)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in {"host", "connection"}}
-        try:
-            with STATS_LOCK:
-                STATS["forwarded"] += 1
-            conn.request(self.command, self.path, body=body, headers=headers)
-            response = conn.getresponse()
-            payload = response.read()
-            self.send_response(response.status, response.reason)
-            for key, value in response.getheaders():
-                if key.lower() not in {"connection", "transfer-encoding"}:
-                    self.send_header(key, value)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
+        with STATS_LOCK:
+            STATS["forwarded"] += 1
+        # One upstream keep-alive connection per downstream connection. A fresh TCP connection
+        # per request exhausted the proxy's ephemeral ports (EADDRNOTAVAIL) within a minute at
+        # a few hundred requests per second and broke the no-fault controls.
+        for attempt in range(2):
+            conn = getattr(self, "upstream", None)
+            if conn is None:
+                conn = self.upstream = http.client.HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=300)
+            try:
+                conn.request(self.command, self.path, body=body, headers=headers)
+                response = conn.getresponse()
+                payload = response.read()
+                break
+            except (OSError, http.client.HTTPException):
+                conn.close()
+                self.upstream = None
+                with STATS_LOCK:
+                    STATS["upstream_errors"] += 1
+                if attempt:
+                    raise
+        if response.getheader("connection", "").lower() == "close":
+            conn.close()
+            self.upstream = None
+        self.send_response(response.status, response.reason)
+        for key, value in response.getheaders():
+            if key.lower() not in {"connection", "transfer-encoding", "content-length"}:
+                self.send_header(key, value)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if self.command != "HEAD":
             self.wfile.write(payload)
-        finally:
+
+    def finish(self):
+        super().finish()
+        conn = getattr(self, "upstream", None)
+        if conn is not None:
             conn.close()
 
     def log_message(self, fmt, *args):
-        print(fmt % args, flush=True)
+        if os.getenv("PROXY_ACCESS_LOG") == "1":
+            print(fmt % args, flush=True)
 
 
-ThreadingHTTPServer(("0.0.0.0", 8792), Proxy).serve_forever()
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 1024
+
+
+Server(("0.0.0.0", 8792), Proxy).serve_forever()
