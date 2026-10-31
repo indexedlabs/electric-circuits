@@ -142,6 +142,7 @@ fn upsert(key: &str, value: serde_json::Value) -> Envelope {
             lsn: None,
             seq: None,
             last: None,
+            commit_ts: None,
         },
     }
 }
