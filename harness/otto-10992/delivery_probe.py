@@ -3,7 +3,7 @@
 
 usage: delivery_probe.py OUT_DIR STOP_FILE label=stream/path [label=stream/path ...]
 
-Each tick reads every stream from its last offset (`live=false`, following pages until
+Each tick reads every stream from its last offset (a catch-up read, following pages until
 `stream-up-to-date`), counts envelopes and bytes, and looks for marker strings listed in
 OUT_DIR/markers.tsv (`name<TAB>commit_ms<TAB>marker`). It reads DS directly, not through
 the fault proxy: the faults are on the engine's write path, and a client's read path is
@@ -94,7 +94,8 @@ def read(label, known_markers):
         if s["offset"] is None:
             return
     for _ in range(50):
-        url = base + s["path"] + "?offset=" + urllib.parse.quote(s["offset"], safe="") + "&live=false"
+        # A catch-up read is one without `live`; DS 0.1.5 answers `live=false` with 400.
+        url = base + s["path"] + "?offset=" + urllib.parse.quote(s["offset"], safe="")
         try:
             status, headers, body = request(url)
         except urllib.error.HTTPError as exc:

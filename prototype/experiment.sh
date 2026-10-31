@@ -22,7 +22,7 @@ mkdir -p "$OUT"
 cd "$ROOT"
 
 psql() { "${BASE[@]}" exec -T postgres psql -U postgres -d electric "$@"; }
-proxy() { "${BASE[@]}" up -d --no-deps --force-recreate ds-proxy >/dev/null; }
+fault() { curl --max-time 5 -fsS "http://127.0.0.1:8792/__fault?$1" > "$OUT/fault-$2.json"; }
 wait_http() { for _ in $(seq 1 120); do curl --max-time 5 -fsS http://127.0.0.1:7010/v1/health >/dev/null && return; sleep 1; done; return 1; }
 now_ms() { date +%s%3N; }
 phase() { printf '%s' "$1" > "$OUT/phase"; printf '%s\t%s\n' "$1" "$(now_ms)" >> "$OUT/phases.tsv"; }
@@ -65,15 +65,14 @@ UNAFFECTED_PLAIN=$(curl --max-time 60 -fsS -H content-type:application/json -X P
   -d '{"table":"public.plain_events","subscription":"otto-unaffected-plain"}' | tee "$OUT/unaffected-plain-load.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])')
 UNAFFECTED_GROUP=$(load_group unaffected '[{"table":"public.plain_events"},{"table":"public.sparse_events"}]')
 
-hold=300; faulted=""; sparse=0; burst=0
-fault_env=()
+hold=300; faulted=""; sparse=0; burst=0; fault_q=""
 case "$NAME" in
   control) ;;
   control-900) hold=900 ;;
-  a) faulted=$(load_group stalled "$RECORD_MEMBERS"); fault_env=(FAULT_MATCH="/$faulted" HANG=1) ;;
-  b-*) hold=$(( ${NAME#b-} * 60 )); faulted=$(load_group outage "$RECORD_MEMBERS"); fault_env=(OUTAGE=1) ;;
-  c-*) faulted=$(load_group delayed "$RECORD_MEMBERS"); fault_env=(FAULT_MATCH="/$faulted" DELAY_MS="${NAME#c-}") ;;
-  d) sparse=1; faulted=$(load_group sparse '[{"table":"public.sparse_events","where":{"col":"group_id","op":"eq","value":1}}]'); fault_env=(FAULT_MATCH="/$faulted" HANG=1) ;;
+  a) faulted=$(load_group stalled "$RECORD_MEMBERS"); fault_q="match=/$faulted&hang=1" ;;
+  b-*) hold=$(( ${NAME#b-} * 60 )); faulted=$(load_group outage "$RECORD_MEMBERS"); fault_q="outage=1" ;;
+  c-*) faulted=$(load_group delayed "$RECORD_MEMBERS"); fault_q="match=/$faulted&delay_ms=${NAME#c-}" ;;
+  d) sparse=1; faulted=$(load_group sparse '[{"table":"public.sparse_events","where":{"col":"group_id","op":"eq","value":1}}]'); fault_q="match=/$faulted&hang=1" ;;
   e) burst=200 ;;
   *) echo "unknown scenario $NAME" >&2; exit 2 ;;
 esac
@@ -102,7 +101,7 @@ fi
 sleep "$WARMUP_S"
 phase hold
 hold_start=$(now_ms)
-if [ ${#fault_env[@]} -gt 0 ]; then env "${fault_env[@]}" "${BASE[@]}" up -d --no-deps --force-recreate ds-proxy >/dev/null; fi
+if [ -n "$fault_q" ]; then fault "$fault_q" set; fi
 burst_pid=""
 if [ "$burst" -gt 0 ]; then
   ( for i in $(seq 1 "$burst"); do
@@ -116,7 +115,7 @@ marker during
 sleep $(( hold - 1 - ($(now_ms) - hold_start) / 1000 > 0 ? hold - 1 - ($(now_ms) - hold_start) / 1000 : 0 ))
 phase recovery
 clear_ms=$(now_ms)
-[ ${#fault_env[@]} -gt 0 ] && proxy
+if [ -n "$fault_q" ]; then fault "" clear; fi
 marker after
 sleep "$RECOVER_S"
 touch "$stop"
@@ -128,4 +127,4 @@ phase done
 
 printf '{"scenario":"%s","name":"%s","rate_tps":%s,"rows_per_txn":4,"warmup_s":%s,"hold_s":%s,"recover_s":%s,"hold_start_ms":%s,"clear_ms":%s,"faulted_stream":"%s","unaffected_plain_stream":"%s","unaffected_group_stream":"%s","fault":"%s","burst_groups":%s,"engine_ref":"%s"}\n' \
   "$SPEC" "$NAME" "$RATE" "$WARMUP_S" "$hold" "$RECOVER_S" "$hold_start" "$clear_ms" "$faulted" "$UNAFFECTED_PLAIN" "$UNAFFECTED_GROUP" \
-  "${fault_env[*]:-}" "$burst" "${ENGINE_REF:-}" > "$OUT/workload.json"
+  "$fault_q" "$burst" "${ENGINE_REF:-}" > "$OUT/workload.json"
