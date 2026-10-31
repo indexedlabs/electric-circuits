@@ -31,6 +31,12 @@ group_bytes() {
   psql -At -c "SELECT coalesce((SELECT sum(length(body)) FROM record),0) + coalesce((SELECT sum(length(body)) FROM record_items),0) + coalesce((SELECT sum(length(body)) FROM record_meta),0)" 2>/dev/null || echo 0
 }
 
+group_stream_offset() {
+  local logical=$1 url="http://127.0.0.1:8791/circuits/v1/${ELECTRIC_CIRCUITS_DS_NAMESPACE}/stores/${ELECTRIC_CIRCUITS_DS_STORE_GENERATION}/queries/${ELECTRIC_CIRCUITS_QUERY_GENERATION}/${logical}"
+  curl --max-time 5 -sS -D - "$url?offset=0000000000000000_0000000000000000&live=false" -o /dev/null 2>/dev/null \
+    | awk 'tolower($1)=="stream-next-offset:" {print $2}' | tr -d '\r' | tail -1
+}
+
 seed() {
   psql -c "INSERT INTO record(group_id,body) SELECT 1, repeat('r', 256) FROM generate_series(1,1000) ON CONFLICT DO NOTHING" >/dev/null
   psql -c "INSERT INTO record_items(record_id,body) SELECT id, repeat('i', 128) FROM record ON CONFLICT DO NOTHING" >/dev/null
@@ -63,10 +69,11 @@ run_one() {
   seed
   local rate=0 groups=0 start_bytes=0
   start_bytes=$(group_bytes)
+  group_offset_start=""
   case "$scenario" in
-    a-200) rate=200; seconds=300; stream_path=$(load_group stalled); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    a-2000) rate=2000; seconds=300; stream_path=$(load_group stalled); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    a-1000) rate=1000; seconds=300; stream_path=$(load_group stalled); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
+    a-200) rate=200; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
+    a-2000) rate=2000; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
+    a-1000) rate=1000; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
     d-200) rate=200; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
     d-2000) rate=2000; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
     d-1000) rate=1000; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
@@ -90,6 +97,7 @@ run_one() {
     *) echo "unknown scenario $scenario" >&2; return 2;;
   esac
   "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario" "$seconds"
+  group_offset_end=$(group_stream_offset "$stream_path")
   clear_fault
   if [ -n "$writer" ]; then wait "$writer" 2>/dev/null || true; fi
   end_bytes=$(group_bytes)
@@ -97,8 +105,8 @@ run_one() {
     transactions=$(awk '/number of transactions actually processed:/{print $NF}' "$OUT/pgbench-${rate}cps-${seconds}s.log" 2>/dev/null || echo 0)
     end_bytes=$((start_bytes + transactions * 1280))
   fi
-  printf '{"write_rate_cps":%s,"hold_seconds":%s,"groups":%s,"group_bytes_written":%s}\n' \
-    "$rate" "$seconds" "$groups" "$((end_bytes - start_bytes))" > "$OUT/$scenario-workload.json"
+  printf '{"write_rate_cps":%s,"hold_seconds":%s,"groups":%s,"group_bytes_written":%s,"group_stream_path":"%s","group_stream_offset_start":"%s","group_stream_offset_end":"%s"}\n' \
+    "$rate" "$seconds" "$groups" "$((end_bytes - start_bytes))" "$stream_path" "$group_offset_start" "$group_offset_end" > "$OUT/$scenario-workload.json"
   case "$scenario" in b-*) "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario-recovery" 60;; esac
 }
 
