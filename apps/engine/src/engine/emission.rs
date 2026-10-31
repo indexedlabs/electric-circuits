@@ -138,9 +138,10 @@ pub(crate) struct GroupLaneConfig {
     /// detaches. Doubles with each detach up to `detach_after_max`.
     pub(crate) detach_after: std::time::Duration,
     pub(crate) detach_after_max: std::time::Duration,
-    /// Queued bytes past which a lane detaches, not counting the oldest queued commit (nor the
-    /// in-flight append): one commit's output never trips it, however large and however many
-    /// batches it arrives in, so an oversized transaction still arrives whole.
+    /// Queued bytes past which a lane detaches, not counting the largest queued commit (nor the
+    /// in-flight append): one commit's output never trips it, however large, wherever it sits in
+    /// the queue and however many batches it arrives in, so an oversized transaction still
+    /// arrives whole.
     pub(crate) memory_bytes: u64,
     /// The slowest append throughput a lane waits out before it counts an in-flight append as
     /// stalled: an append of `b` bytes gets `b / append_min_bytes_per_sec` beyond the stall cap,
@@ -345,12 +346,26 @@ impl GroupLaneState {
             || self.queued.keys().next().is_some_and(|(lsn, _)| *lsn <= barrier)
     }
 
-    /// Queued bytes the memory cap counts: everything after the oldest queued commit.
+    /// Queued bytes the memory cap counts: everything but the largest queued commit. A walk of
+    /// the queue, so callers take it only once the total could matter (`queued_bytes` above a
+    /// quarter of the cap, where threshold events re-arm).
     fn capped_bytes(&self) -> u64 {
-        let Some(&(oldest, _)) = self.queued.keys().next() else { return 0 };
-        let oldest_bytes: u64 =
-            self.queued.range((oldest, 0)..=(oldest, u64::MAX)).map(|(_, queued)| queued.bytes).sum();
-        self.queued_bytes - oldest_bytes
+        let mut largest = 0u64;
+        let mut current: Option<(u64, u64)> = None;
+        for (&(lsn, _), queued) in &self.queued {
+            current = match current {
+                Some((commit, bytes)) if commit == lsn => Some((commit, bytes + queued.bytes)),
+                Some((_, bytes)) => {
+                    largest = largest.max(bytes);
+                    Some((lsn, queued.bytes))
+                }
+                None => Some((lsn, queued.bytes)),
+            };
+        }
+        if let Some((_, bytes)) = current {
+            largest = largest.max(bytes);
+        }
+        self.queued_bytes - largest
     }
 
     /// The stall cap now in force: the lane's backed-off cap, plus the time an in-flight append
@@ -668,7 +683,7 @@ impl GroupLane {
         state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
         self.backlog_changed(bytes as i64, 1);
         let limit = self.shared.config.memory_bytes;
-        let capped = state.capped_bytes();
+        let capped = if state.queued_bytes >= limit / 4 { state.capped_bytes() } else { state.queued_bytes };
         if capped > limit {
             self.detach(&mut state, Cap::Bytes);
         } else {
@@ -1378,6 +1393,22 @@ mod tests {
         let (keys, _) = wait_appended(&store, 2).await;
         assert_eq!(keys, ["oversized", "next"]);
         assert_eq!(detaches(&lanes), 0);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_commit_queued_behind_smaller_ones_lands_whole() {
+        let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
+        let (lanes, store, hold) = held_lanes(config);
+        lanes.push(GROUP, vec![group_env("in-flight")], 1);
+        settle().await;
+        // T-1 is queued behind the held append when T's oversized output arrives.
+        lanes.push(GROUP, vec![group_env("t-1")], 2);
+        lanes.push(GROUP, vec![big_env("t-oversized")], 3);
+        lanes.push(GROUP, vec![group_env("t+1")], 4);
+        assert_eq!(detaches(&lanes), 0, "an oversized commit behind a smaller one tripped the cap");
+        hold.send_replace(false);
+        let (keys, _) = wait_appended(&store, 4).await;
+        assert_eq!(keys, ["in-flight", "t-1", "t-oversized", "t+1"]);
     }
 
     #[tokio::test]
