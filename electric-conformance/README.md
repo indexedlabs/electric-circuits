@@ -37,8 +37,9 @@ Tunables: `ORACLE_RUNS`, `ORACLE_SHAPE_COUNT`, `ORACLE_BATCH_COUNT`, `ORACLE_MUT
   shared shape id). Handles idle longer than **`ELECTRIC_HANDLE_TTL`** seconds (default `600`) have
   their handle state evicted by a background task; the shape and its stream are retained under the
   engine's retention lifecycle (idle shapes go dormant and are eventually evicted — see
-  `apps/engine/README.md`). A later request on an evicted handle gets the standard `409` +
-  `must-refetch` control (the client re-snapshots, rejoining the retained shape). Set the env var on
+  `apps/engine/README.md`). A later request on an evicted handle resumes it when it still names
+  that shape, and otherwise gets the standard `409` + `must-refetch` control (the client
+  re-snapshots, rejoining the retained shape). Set the env var on
   the engine process to tune it (e.g. `ELECTRIC_HANDLE_TTL=60`).
 - **Errors.** Validation failures (bad `where`, unknown table/column, `offset` without a `handle`,
   table not matching the handle's shape) are `400` with an Electric-style `{"message": …}` body;

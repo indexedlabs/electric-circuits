@@ -110,13 +110,19 @@ struct FeedDs {
     streams: Arc<Mutex<HashMap<String, Vec<serde_json::Value>>>>,
 }
 
+/// A stream's position, as durable-streams names it: the bytes of `item,` up to there.
+fn feed_offset(values: &[serde_json::Value]) -> String {
+    let bytes: usize = values.iter().map(|value| value.to_string().len() + 1).sum();
+    format!("{:016}_{bytes:016}", 0)
+}
+
 async fn feed_ds_handler(State(store): State<FeedDs>, request: AxumRequest) -> Response {
     let path = request.uri().path().to_string();
     match *request.method() {
         Method::HEAD => {
             let streams = store.streams.lock().await;
-            let next = streams.get(&path).map_or(0, Vec::len);
-            ([("stream-next-offset", next.to_string())], StatusCode::OK).into_response()
+            let next = feed_offset(streams.get(&path).map_or(&[], Vec::as_slice));
+            ([("stream-next-offset", next)], StatusCode::OK).into_response()
         }
         Method::PUT => {
             store.streams.lock().await.entry(path).or_default();
@@ -136,22 +142,23 @@ async fn feed_ds_handler(State(store): State<FeedDs>, request: AxumRequest) -> R
             let mut streams = store.streams.lock().await;
             let stream = streams.entry(path).or_default();
             stream.extend(values);
-            ([("stream-next-offset", stream.len().to_string())], StatusCode::OK).into_response()
+            ([("stream-next-offset", feed_offset(stream))], StatusCode::OK).into_response()
         }
         Method::GET => {
             let offset = request
                 .uri()
                 .query()
                 .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("offset=")))
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
+                .map(str::to_string);
             let streams = store.streams.lock().await;
             let values = streams.get(&path).cloned().unwrap_or_default();
-            let page = values.get(offset..).unwrap_or_default();
+            let start = offset.as_deref().filter(|offset| *offset != "-1").map_or(0, |offset| {
+                (0..=values.len()).find(|count| feed_offset(&values[..*count]) == offset).unwrap_or(values.len())
+            });
+            let page = &values[start..];
             let mut response =
-                ([("stream-next-offset", values.len().to_string())], serde_json::to_string(page).unwrap())
-                    .into_response();
-            if offset >= values.len() {
+                ([("stream-next-offset", feed_offset(&values))], serde_json::to_string(page).unwrap()).into_response();
+            if start >= values.len() {
                 response.headers_mut().insert("stream-up-to-date", "1".parse().unwrap());
             }
             response

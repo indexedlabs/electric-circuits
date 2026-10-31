@@ -3810,6 +3810,11 @@ impl Engine {
         self.ds.read(path, offset, live).await
     }
 
+    /// The stream scope this Engine's shape ids and offsets mean anything in.
+    pub(crate) fn stream_scope_tag(&self) -> String {
+        self.ds.scope_tag()
+    }
+
     /// Resolve lifecycle before holding a fold reservation: wake/replay can itself need budget.
     pub(crate) async fn shape_fold_input(&self, path: &str) -> Result<DsClient> {
         self.ensure_active(sid_of_path(path)).await?;

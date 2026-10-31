@@ -25,9 +25,9 @@ const schema: Schema = {
 const whereOwnerA = 'parent_id IN (SELECT id FROM parent WHERE owner = 100)'
 const whereOwnerB = 'parent_id IN (SELECT id FROM parent WHERE owner = 200)'
 
-/** A `/v1/shape` handle is `<shapeId>h<seq>` — strip the per-client suffix to address the
+/** A `/v1/shape` handle is `<shapeId>h<scope>.<claim>` — strip the per-client suffix to address the
  * underlying shape via the engine's introspection routes. */
-const shapeIdOfHandle = (handle: string) => handle.replace(/h\d+$/, '')
+const shapeIdOfHandle = (handle: string) => handle.split('h')[0]!
 
 async function snapshotHandle(engineUrl: string, where: string): Promise<string> {
   const q = new URLSearchParams({ table: 'child', offset: '-1', where })

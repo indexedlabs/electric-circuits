@@ -273,8 +273,8 @@ describe('shape retention lifecycle (active / dormant / evicted)', () => {
     )
     await sleep(250) // let the long-poll park on the durable-streams server
 
-    // A handle is `<shapeId>h<seq>` over a shared engine shape; purge the shape underneath it.
-    await fetch(`${h.engineUrl}/shapes/${handle.replace(/h\d+$/, '')}?purge=true`, { method: 'DELETE' })
+    // A handle is `<shapeId>h<scope>.<claim>` over a shared engine shape; purge the shape underneath it.
+    await fetch(`${h.engineUrl}/shapes/${handle.split('h')[0]}?purge=true`, { method: 'DELETE' })
 
     const res = await live
     const elapsed = Date.now() - started

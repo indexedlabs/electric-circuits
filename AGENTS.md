@@ -702,7 +702,7 @@ canvas update, screenshot.
   candidate rows. If you add a backfill site, take chunks; if you find yourself building a
   `Vec<Row>` of a whole table, that is the bug. The same rule governs stream folds: `/v1/shape`'s
   snapshot must materialise (the body *is* every row), the key set it rebuilds for a catch-up must
-  not (`StreamFold::up_to` is keys-only by construction).
+  not (`keys_as_of` reads pages as text and keeps keys only).
 - **`SIGTERM` drains; it never retires anything** (`src/shutdown.rs`). Order: `/ready` → 503
   `shutting_down` FIRST (so a load balancer drains) and the port stays open for the drain window;
   stop accepting; the ingestor completes a commit it is *appending* and records its position

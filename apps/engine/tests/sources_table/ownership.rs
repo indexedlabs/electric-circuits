@@ -55,6 +55,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::Restarts => repeated_restarts(&fixture).await,
             Case::StaleHandle => stale_handle(&fixture).await,
             Case::ForeignHandle => foreign_handle(&fixture).await,
+            Case::RestartedSourceResumes => restarted_source_resumes(&fixture).await,
             Case::ReaderSnapshots => reader_snapshots(&fixture).await,
             Case::Eviction => every_live_engine_evicts(&fixture).await,
             Case::Single => single_engine_controls(&fixture).await,
@@ -98,6 +99,7 @@ enum Case {
     Restarts,
     StaleHandle,
     ForeignHandle,
+    RestartedSourceResumes,
     ReaderSnapshots,
     Eviction,
     Single,
@@ -143,6 +145,12 @@ fn replacement_refuses_the_stopped_sources_handle() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn a_source_refuses_another_sources_handle() -> Result<()> {
     isolated("ownership::a_source_refuses_another_sources_handle", Case::ForeignHandle)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn a_restarted_source_resumes_its_handles_and_no_other_sources() -> Result<()> {
+    isolated("ownership::a_restarted_source_resumes_its_handles_and_no_other_sources", Case::RestartedSourceResumes)
 }
 
 #[test]
@@ -685,6 +693,29 @@ impl Fixture {
         ))
     }
 
+    /// The request `snapshot` makes, from a handle's position: an Electric client resends its definition.
+    async fn resume(
+        &self,
+        app: &Router,
+        prefix: &str,
+        handle: &(String, String),
+    ) -> Result<(StatusCode, String, Vec<serde_json::Value>)> {
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("table", &format!("public.{}", self.outer))
+            .append_pair("columns", "id,body")
+            .append_pair("handle", &handle.0)
+            .append_pair("offset", &handle.1)
+            .finish();
+        let response = app
+            .clone()
+            .oneshot(axum::http::Request::get(format!("{prefix}/v1/shape?{query}")).body(Body::empty())?)
+            .await?;
+        let code = response.status();
+        let offset = response.headers().get("electric-offset").context("missing offset")?.to_str()?.to_string();
+        let bytes = to_bytes(response.into_body(), 64 * 1024).await?;
+        Ok((code, offset, serde_json::from_slice(&bytes).unwrap_or_default()))
+    }
+
     async fn read_handle(
         &self,
         app: &Router,
@@ -814,10 +845,11 @@ async fn stale_handle(f: &Fixture) -> Result<()> {
         // not accidentally make a process-global stale handle look correctly rejected.
         let old = f.snapshot(&app, "/sources/alpha", false).await?;
         f.restart(&host, 2).await?;
+        // `read_handle` does not resend `columns`: this definition is a different shape.
         let (code, body) = f.read_handle(&app, "/sources/alpha", &old).await?;
         ensure!(
             code == StatusCode::CONFLICT && body[0]["headers"]["control"] == "must-refetch",
-            "replacement must refuse the old Engine's handle with 409 must-refetch, got {code}: {body}"
+            "replacement must refuse the old Engine's handle for another definition with 409 must-refetch, got {code}: {body}"
         );
         Ok(())
     }
@@ -841,6 +873,71 @@ async fn foreign_handle(f: &Fixture) -> Result<()> {
             code == StatusCode::CONFLICT && body[0]["headers"]["control"] == "must-refetch",
             "source beta must refuse source alpha's handle with 409 must-refetch, got {code}: {body}"
         );
+        Ok(())
+    }
+    .await;
+    stop(&host).await;
+    result
+}
+
+/// The mode production runs in: one source's Engine is replaced, the same request brings its client
+/// back into the same stream, and the two sources, which mint the same shape ids, stay apart.
+async fn restarted_source_resumes(f: &Fixture) -> Result<()> {
+    let host = f.host().await?;
+    let app = host.router();
+    let result = async {
+        let mut alpha = f.snapshot(&app, "/sources/alpha", false).await?;
+        let beta = f.snapshot(&app, "/sources/beta", false).await?;
+        let shape = alpha.0.split('h').next().context("shape id in handle")?.to_string();
+        ensure!(beta.0.starts_with(&format!("{shape}h")), "sources must share a shape id: {alpha:?} {beta:?}");
+        ensure!(alpha.1 == beta.1, "the sources must stand at one offset: {alpha:?} {beta:?}");
+        f.restart(&host, 2).await?;
+
+        for (prefix, handle) in [("/sources/beta", &alpha), ("/sources/alpha", &beta)] {
+            let (code, _, body) = f.resume(&app, prefix, handle).await?;
+            ensure!(
+                code == StatusCode::CONFLICT && body[0]["headers"]["control"] == "must-refetch",
+                "{prefix} must refuse the other source's handle with 409 must-refetch, got {code}: {body:?}"
+            );
+        }
+
+        // Landed behind the client's offset: the delete is only right if the key set is as of there.
+        f.client
+            .batch_execute(&format!(
+                "DELETE FROM {outer} WHERE id = 2; INSERT INTO {outer} VALUES (3, 'later');",
+                outer = f.outer
+            ))
+            .await?;
+        let expected: BTreeSet<String> = f
+            .client
+            .query(&format!("SELECT id::text FROM {}", f.outer), &[])
+            .await?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+
+        let mut held: BTreeSet<String> = ["1".to_string(), "2".to_string()].into();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while held != expected {
+            ensure!(tokio::time::Instant::now() < deadline, "resume never converged: held={held:?}, SQL={expected:?}");
+            let (code, offset, messages) = f.resume(&app, "/sources/alpha", &alpha).await?;
+            ensure!(code == StatusCode::OK, "the old handle must resume, got {code}: {messages:?}");
+            alpha.1 = offset;
+            for message in &messages {
+                let Some(key) = message["key"].as_str() else { continue };
+                let operation = message["headers"]["operation"].as_str().unwrap_or_default();
+                let correct = match operation {
+                    "insert" => held.insert(key.to_string()),
+                    "delete" => held.remove(key),
+                    _ => held.contains(key),
+                };
+                ensure!(correct, "{operation} of {key} does not fit the {held:?} this client holds");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let (code, status) = json(&app, Method::GET, &format!("/sources/alpha/shapes/{shape}"), Body::empty()).await?;
+        ensure!(code == StatusCode::OK && status["subscriptions"] == 1, "the claim must be renewed: {code} {status}");
         Ok(())
     }
     .await;

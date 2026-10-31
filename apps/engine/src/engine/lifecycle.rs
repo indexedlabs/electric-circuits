@@ -1429,11 +1429,11 @@ impl Engine {
     /// `subscriptions_live` keeps describing reality rather than decaying to zero under a client
     /// that is plainly still there.
     ///
-    /// Nothing is recorded because there is nothing a restart could use it for: an Electric handle
-    /// does not survive one (the registry is in-memory, and a returning client gets `must-refetch`
-    /// and re-snapshots, which takes a fresh claim). A claim that lapsed before this call is
-    /// re-taken here for the same reason — the handle is demonstrably live — and if the shape is
-    /// gone entirely this is a no-op, which is exactly the `must-refetch` path.
+    /// Nothing is recorded because a restart does not need it: the claim is in the catalog from the
+    /// create that took it, and a returning client's resume renews it durably, or takes it again if
+    /// it lapsed. A claim that lapsed before this call is re-taken here for the same reason — the
+    /// handle is demonstrably live — and if the shape is gone entirely this is a no-op, which is
+    /// exactly the `must-refetch` path.
     pub(crate) async fn renew_subscription_local(&self, id: &str, sub: &str) {
         let mut st = self.state.lock().await;
         st.subscribe(id, sub.to_string(), crate::changelog::now_secs());
