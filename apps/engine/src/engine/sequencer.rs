@@ -816,6 +816,8 @@ pub(crate) async fn sequencer_loop(
                         // flush partial output or publish partial highwater.
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        // The commit time the ingestor stamped on this transaction's changes.
+                        let mut commit_ts: Option<i64> = None;
                         loop {
                             // Finish ready input on shutdown. Only a pending spill read or its
                             // admission wait yields the page back to the replay boundary.
@@ -857,6 +859,7 @@ pub(crate) async fn sequencer_loop(
                                         continue;
                                     }
                                 }
+                                commit_ts = commit_ts.or(env.headers.commit_ts);
                                 if env.type_ == crate::runtime_authority::ENVELOPE_TYPE {
                                     runtime_fences.stage(&env, runtime_incarnation);
                                     touched = true;
@@ -953,6 +956,7 @@ pub(crate) async fn sequencer_loop(
                                 &trace_tx,
                             );
                         }
+                        stamp_commit_time(&mut txn_pending, commit_ts);
                         emit_storage_txn_metrics(ds.metrics(), &txn_pending);
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
@@ -1972,6 +1976,7 @@ pub(crate) async fn process_envelope(
     library_mode: bool,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
+    let commit_ts = env.headers.commit_ts;
     // No before-image (library mode only — see `needs_absolute_emission`): the plain tiers below
     // decide membership ABSOLUTELY per pk instead of from the delta, so a delete with no delta at
     // all still has work to do.
@@ -2178,6 +2183,9 @@ pub(crate) async fn process_envelope(
         let (result, staged_group_emissions) = {
             let mut reg = subq.registry.lock().await;
             let result = if reg.touches(&ts.table) {
+                if let Some(commit_ts) = commit_ts {
+                    reg.note_commit_time(lsn_u64, commit_ts);
+                }
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
                 if let Ok(result_work) = result.as_ref() {
@@ -2325,6 +2333,17 @@ pub(crate) fn emit_storage_txn_metrics(
     metrics.emitter().storage_txn(ops, bytes, txn_pending.len() as u64);
 }
 
+/// Carry a transaction's commit time onto every output envelope it produced (`headers.commit_ts`),
+/// so a client can measure time to data. Subquery emissions are stamped by the registry instead
+/// ([`crate::subquery::SubqueryRegistry::note_commit_time`]), since they may land after this
+/// transaction's own appends.
+pub(crate) fn stamp_commit_time(pending: &mut HashMap<String, Vec<Envelope>>, commit_ts: Option<i64>) {
+    let Some(commit_ts) = commit_ts else { return };
+    for env in pending.values_mut().flatten() {
+        env.headers.commit_ts = Some(commit_ts);
+    }
+}
+
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so
 /// `awaitTxId` semantics are preserved; only the HTTP round-trips are coalesced + parallelized.
 ///
@@ -2375,6 +2394,7 @@ mod txn_boundary_tests {
                 lsn: Some(lsn.into()),
                 seq: Some(seq),
                 last: last.then_some(true),
+                commit_ts: None,
             },
         }
     }
@@ -2393,6 +2413,7 @@ mod txn_boundary_tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -2804,6 +2825,7 @@ mod pending_buffer_tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -3204,6 +3226,7 @@ mod held_spill_tests {
                 seq: Some(seq),
                 last: last.then_some(true),
                 offset: None,
+                commit_ts: None,
             },
         }
     }

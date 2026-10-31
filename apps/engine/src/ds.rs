@@ -179,6 +179,13 @@ pub struct EnvelopeHeaders {
     /// incomplete transaction, by definition — never a transaction that opted out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<bool>,
+    /// Postgres commit time of the change's transaction, in milliseconds since the Unix epoch, read
+    /// from the pgoutput `Commit` message by the replication ingestor and carried onto every live
+    /// output envelope of that commit. Telemetry only: clients use it to measure time to data, and
+    /// nothing in the engine orders, fences or de-duplicates on it. Absent on snapshot rows, on
+    /// library-mode writes, and on change-log envelopes written before the ingestor stamped it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_ts: Option<i64>,
 }
 
 /// Envelope framing used by the replay reader. Row bodies stay as raw JSON until the envelope's
@@ -3145,6 +3152,7 @@ mod tests {
                 lsn: None,
                 seq: Some(7),
                 last: Some(true),
+                commit_ts: None,
             },
         };
         let expected = serde_json::to_vec(&[envelope.clone()]).unwrap();

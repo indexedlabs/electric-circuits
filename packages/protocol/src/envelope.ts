@@ -40,6 +40,13 @@ export interface StreamEnvelope {
      * (each call is a one-envelope transaction).
      */
     last?: boolean
+    /**
+     * Postgres commit time of the change's transaction, in milliseconds since the Unix epoch (the
+     * source's clock), stamped by the replication ingestor and carried onto every live shape/feed
+     * envelope of that commit. Telemetry only — for measuring time to data; nothing orders or
+     * fences on it. Absent on backfill rows and in library (no-Postgres) mode.
+     */
+    commit_ts?: number
   }
 }
 

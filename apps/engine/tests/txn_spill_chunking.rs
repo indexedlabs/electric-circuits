@@ -111,6 +111,7 @@ fn env_of(key: &str, payload: usize) -> Envelope {
             lsn: None,
             seq: None,
             last: None,
+            commit_ts: None,
         },
     }
 }
@@ -155,7 +156,9 @@ async fn a_spilled_commit_lands_as_contiguous_chunks_on_the_current_segment() {
     assert!(buf.spilled(), "the 1 KiB cap must have been crossed");
     let spill = buf.spill_path().expect("a spill file").to_path_buf();
 
-    let chunks = append_commit_chunked(&log, &mut buf, "0/3A2B1C0", std::time::Instant::now()).await.unwrap();
+    let commit_ts = Some(1_793_404_800_123);
+    let chunks =
+        append_commit_chunked(&log, &mut buf, "0/3A2B1C0", commit_ts, std::time::Instant::now()).await.unwrap();
     assert!(chunks > 1, "the append budget forced chunking (got {chunks})");
 
     let appends = state.appends.lock().unwrap().clone();
@@ -182,6 +185,7 @@ async fn a_spilled_commit_lands_as_contiguous_chunks_on_the_current_segment() {
         assert_eq!(env.headers.seq, Some(i as u64), "seq is contiguous 0..n ACROSS chunk boundaries");
         assert_eq!(env.headers.lsn.as_deref(), Some("0/3A2B1C0"));
         assert_eq!(env.headers.txid.as_deref(), Some("3141"));
+        assert_eq!(env.headers.commit_ts, commit_ts, "every chunk carries the commit time");
         // The transaction-end marker is on the last envelope of the last chunk and nowhere else;
         // without it the sequencer would hold this run forever, with it on any earlier envelope it
         // would flush a fragment.
@@ -214,7 +218,7 @@ async fn a_small_commit_is_still_a_single_append() {
     }
     assert!(!buf.spilled());
 
-    let chunks = append_commit_chunked(&log, &mut buf, "0/1", std::time::Instant::now()).await.unwrap();
+    let chunks = append_commit_chunked(&log, &mut buf, "0/1", None, std::time::Instant::now()).await.unwrap();
     assert_eq!(chunks, 1);
     assert_eq!(state.appends.lock().unwrap().len(), 1);
     assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0, "and nothing touched the disk");
@@ -229,7 +233,7 @@ async fn an_empty_commit_appends_nothing() {
     let cfg =
         TxnBufferConfig { memory_bytes: 1024, append_bytes: 4096, spill_dir: dir.0.clone(), ..Default::default() };
     let mut buf = TxnBuffer::new(1, cfg);
-    assert_eq!(append_commit_chunked(&log, &mut buf, "0/1", std::time::Instant::now()).await.unwrap(), 0);
+    assert_eq!(append_commit_chunked(&log, &mut buf, "0/1", None, std::time::Instant::now()).await.unwrap(), 0);
     assert!(state.appends.lock().unwrap().is_empty());
 }
 
@@ -244,7 +248,7 @@ async fn a_failure_mid_commit_propagates_so_the_slot_is_never_acknowledged() {
     let log = writer(ds);
 
     let mut buf = spilled_buffer(&dir.0, 300, 1024, 4096);
-    let err = append_commit_chunked(&log, &mut buf, "0/9", std::time::Instant::now())
+    let err = append_commit_chunked(&log, &mut buf, "0/9", None, std::time::Instant::now())
         .await
         .expect_err("a refused chunk must fail the whole commit");
     assert!(format!("{err:#}").contains("append changes"), "{err:#}");

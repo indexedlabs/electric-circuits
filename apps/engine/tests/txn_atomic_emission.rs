@@ -81,6 +81,11 @@ fn env_json(txid: u32, lsn: &str, key: &str, seq: u32, last: bool) -> String {
     )
 }
 
+/// [`env_json`] with the commit time the ingestor stamps from the pgoutput `Commit` message.
+fn env_json_at(txid: u32, lsn: &str, key: &str, seq: u32, last: bool, commit_ts: i64) -> String {
+    env_json(txid, lsn, key, seq, last).replacen(r#""seq":"#, &format!(r#""commit_ts":{commit_ts},"seq":"#), 1)
+}
+
 async fn ds_handler(State(log): State<FakeLog>, req: Request) -> Response {
     let path = req
         .uri()
@@ -358,4 +363,25 @@ async fn a_failure_after_a_held_prefix_rewinds_to_the_held_boundary() {
         log.checkpoints()
     );
     engine.shutdown_token().begin();
+}
+
+/// Every shape envelope a commit produces carries that commit's time (`headers.commit_ts`), across
+/// the chunks of a held transaction; a commit whose changes carry none emits none.
+#[tokio::test]
+async fn shape_output_carries_the_commit_time_of_its_transaction() {
+    let (_engine, log, stream, _t) = boot().await;
+    const AT: i64 = 1_793_404_800_123;
+    log.serve("-1", "01", &[env_json_at(500, "0/50", "1", 0, false, AT)]);
+    log.serve("01", "02", &[env_json_at(500, "0/50", "2", 1, true, AT), env_json(501, "0/51", "3", 0, true)]);
+    wait_for(|| log.shape_flushes(&stream).len() >= 2, "both transactions to be flushed").await;
+
+    let stamps: Vec<Vec<(String, Option<i64>)>> = log
+        .shape_flushes(&stream)
+        .iter()
+        .map(|f| f.iter().map(|e| (e.key.clone(), e.headers.commit_ts)).collect())
+        .collect();
+    assert_eq!(
+        stamps,
+        vec![vec![("1".to_string(), Some(AT)), ("2".to_string(), Some(AT))], vec![("3".to_string(), None)]]
+    );
 }
