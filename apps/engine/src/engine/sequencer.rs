@@ -1530,7 +1530,9 @@ pub(crate) async fn activate_shape(
                 if matched.is_empty() {
                     continue;
                 }
+                let first = outs.len();
                 outs.extend(translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)));
+                carry_commit_time(&mut outs[first..], env.headers.commit_ts);
             }
             if !outs.is_empty() {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
@@ -1572,7 +1574,9 @@ pub(crate) async fn activate_shape(
                     let val = agg.value();
                     if agg.last.as_ref() != Some(&val) {
                         agg.last = Some(val.clone());
-                        outs.push(agg.envelope(&exec.ts, txid, lsn));
+                        let mut out = agg.envelope(&exec.ts, txid, lsn);
+                        out.headers.commit_ts = env.headers.commit_ts;
+                        outs.push(out);
                     }
                 }
             }
@@ -1717,6 +1721,7 @@ pub(crate) async fn replay_changes_for_targets(
                 if target.gate.should_skip(lsn_u64, xid) {
                     continue;
                 }
+                let first = outs.len();
                 if absolute {
                     let held =
                         delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| target.pred.matches(r));
@@ -1742,6 +1747,7 @@ pub(crate) async fn replay_changes_for_targets(
                         ));
                     }
                 }
+                carry_commit_time(&mut outs[first..], env.headers.commit_ts);
             }
             if !outs.is_empty() {
                 emitted[idx] += outs.len() as u64;
@@ -2337,6 +2343,17 @@ pub(crate) fn emit_storage_txn_metrics(
 /// so a client can measure time to data. Subquery emissions are stamped by the registry instead
 /// ([`crate::subquery::SubqueryRegistry::note_commit_time`]), since they may land after this
 /// transaction's own appends.
+/// Give the envelopes built from one buffered or replayed source change that change's commit time:
+/// an activation drain and a dormant shape's replay emit live changes outside a transaction's
+/// `txn_pending`, so [`stamp_commit_time`] never sees them.
+fn carry_commit_time(outs: &mut [Envelope], commit_ts: Option<i64>) {
+    if let Some(commit_ts) = commit_ts {
+        for env in outs {
+            env.headers.commit_ts = Some(commit_ts);
+        }
+    }
+}
+
 pub(crate) fn stamp_commit_time(pending: &mut HashMap<String, Vec<Envelope>>, commit_ts: Option<i64>) {
     let Some(commit_ts) = commit_ts else { return };
     for env in pending.values_mut().flatten() {
@@ -2860,6 +2877,39 @@ mod pending_buffer_tests {
         assert!(
             !buffer_pending(&mut pending_shape, &envelope(101, 1), cap),
             "an overflowed buffer stays overflowed; it cannot half-recover"
+        );
+    }
+
+    /// A change that committed while the shape was being created is drained from its buffer at
+    /// activation and appended outside any transaction's `txn_pending`; it still carries its
+    /// commit time (`#g-commit-time`).
+    #[tokio::test]
+    async fn an_activation_drain_carries_each_buffered_changes_commit_time() {
+        let ts = users();
+        let mut stamped = envelope(1, 1);
+        stamped.headers.commit_ts = Some(1_793_404_800_123);
+        let mut exec = TableExec::new(ts.clone());
+        exec.pending.insert("s1".to_string(), pending(&ts, vec![stamped, envelope(2, 1)]));
+        let mut execs = HashMap::from([(ts.table.to_string(), exec)]);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        activate_shape(
+            &ds,
+            &mut execs,
+            &ts.table,
+            "s1",
+            crate::pg::SnapshotGate::passthrough(),
+            None,
+            0,
+            &mut HashMap::new(),
+            &crate::shutdown::ShutdownToken::new(),
+        )
+        .await
+        .unwrap();
+        let appended: Vec<Envelope> = serde_json::from_slice(&store.appended.lock().unwrap()[0].2).unwrap();
+        assert_eq!(
+            appended.iter().map(|e| (e.key.as_str(), e.headers.commit_ts)).collect::<Vec<_>>(),
+            vec![("1", Some(1_793_404_800_123)), ("2", None)]
         );
     }
 

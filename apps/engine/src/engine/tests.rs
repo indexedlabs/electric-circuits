@@ -2840,3 +2840,89 @@ async fn shutdown_append_cannot_be_reported_as_a_completed_flush() {
 }
 
 mod review_r1;
+
+/// The sequencer records a live commit's time with the subquery registry before the registry
+/// evaluates the change (`process_envelope`), so a subquery shape's live output carries the
+/// commit's `headers.commit_ts` (`#g-commit-time`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subquery_shapes_live_output_carries_the_commit_time() {
+    use crate::subquery::tests as sq;
+    let ts = sq::issues_ts();
+    let (ds_url, store) = sq::spawn_fake_ds().await;
+    let ds = DsClient::new_for_in_process_test(&ds_url);
+    let mut reg = SubqueryRegistry::new(ds.clone(), None);
+    let sig: crate::predicate::SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+    sq::insert_test_node(&mut reg, &sig);
+    reg.assert_seed_row_for_test(&sig, "pm-1", Value::Int(100)).await;
+    sq::insert_outer_shape(&mut reg, "s100", "issues", sq::keyed_membership_pred(100, &sig));
+    let (flip_tx, _flip_rx) = mpsc::unbounded_channel();
+    let pending_flips = Arc::new(PendingFlips::default());
+    let group_lanes =
+        emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), pending_flips.clone());
+    let subq = SubqueryHandle {
+        registry: Arc::new(Mutex::new(reg)),
+        flip_tx,
+        pending_flips,
+        degrade: DegradeState::new(),
+        group_lanes,
+    };
+    let (trace_tx, _) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+    let mut env = env("insert", "1", Some(serde_json::json!({ "id": 1, "project_id": 100 })), None);
+    env.headers.lsn = Some("0/10".into());
+    env.headers.txid = Some("42".into());
+    env.headers.commit_ts = Some(1_793_404_800_123);
+    let mut pending = HashMap::new();
+    process_envelope(
+        &crate::metrics::Metrics::default(),
+        &ts,
+        &HashMap::new(),
+        &StandaloneIndex::default(),
+        &HashMap::new(),
+        &mut HashMap::new(),
+        &StandaloneIndex::default(),
+        env,
+        &mut pending,
+        &subq,
+        &trace_tx,
+        false,
+    )
+    .await
+    .unwrap();
+    let delivered = store.0.lock().unwrap().get("shape/s100").cloned().unwrap_or_default();
+    assert_eq!(delivered.iter().map(|e| e.headers.commit_ts).collect::<Vec<_>>(), vec![Some(1_793_404_800_123)]);
+}
+
+/// A dormant shape's replay of the change log carries each replayed change's commit time onto
+/// the envelopes it appends, outside any transaction's `txn_pending` (`#g-commit-time`).
+#[tokio::test]
+async fn a_dormant_replay_carries_each_changes_commit_time() {
+    let body = r#"[{"type":"public.users","key":"1","value":{"id":1},"headers":{"operation":"insert","commit_ts":1793404800123}},{"type":"public.users","key":"2","value":{"id":2},"headers":{"operation":"insert"}}]"#;
+    let store = std::sync::Arc::new(crate::ds::ScriptedStore {
+        read_pages: std::sync::Mutex::new(vec![("0000000000000000_0000000000000100".into(), true, body.into())]),
+        ..Default::default()
+    });
+    let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+    let ts = users();
+    let target = crate::engine::sequencer::ReplayTarget {
+        shape_id: "s1".into(),
+        purged: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ts: ts.clone(),
+        table: ts.table.clone(),
+        pred: std::sync::Arc::new(CompiledPredicate::compile_opt(None, &ts).unwrap()),
+        out_cols: None,
+        gate: crate::pg::SnapshotGate::passthrough(),
+        stream_path: "shape/replayed".into(),
+        from: LogPosition { segment: 0, offset: "0000000000000000_0000000000000000".into() },
+        library_mode: true,
+        until: None,
+    };
+    let result =
+        crate::engine::sequencer::replay_changes_for_targets(&ds, vec![target], &crate::shutdown::ShutdownToken::new())
+            .await;
+    assert!(result[0].is_ok());
+    let appended: Vec<Envelope> = serde_json::from_slice(&store.appended.lock().unwrap()[0].2).unwrap();
+    assert_eq!(
+        appended.iter().map(|e| (e.key.as_str(), e.headers.commit_ts)).collect::<Vec<_>>(),
+        vec![("1", Some(1_793_404_800_123)), ("2", None)]
+    );
+}

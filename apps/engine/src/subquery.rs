@@ -2831,7 +2831,7 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<TableRef> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A registry with one MatchAll node registered the way `collect()` would: node map,
@@ -2843,7 +2843,7 @@ mod tests {
         reg
     }
 
-    fn insert_test_node(reg: &mut SubqueryRegistry, sig: &str) {
+    pub(crate) fn insert_test_node(reg: &mut SubqueryRegistry, sig: &str) {
         let node_id = reg.next_node_id;
         reg.next_node_id += 1;
         let mut node = SubqueryNode::new(sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), node_id);
@@ -3606,7 +3606,7 @@ mod tests {
     // only the `emitted` counter.
 
     #[derive(Clone, Default)]
-    struct DsStore(Arc<std::sync::Mutex<HashMap<String, Vec<Envelope>>>>);
+    pub(crate) struct DsStore(pub(crate) Arc<std::sync::Mutex<HashMap<String, Vec<Envelope>>>>);
 
     async fn fake_ds_handler(
         axum::extract::State(store): axum::extract::State<DsStore>,
@@ -3634,7 +3634,7 @@ mod tests {
 
     /// Boots the fake server on an ephemeral port; returns its base URL and the shared store of
     /// every envelope POSTed to it, keyed by stream path (e.g. `"shape/s1"`).
-    async fn spawn_fake_ds() -> (String, DsStore) {
+    pub(crate) async fn spawn_fake_ds() -> (String, DsStore) {
         let store = DsStore::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3658,7 +3658,7 @@ mod tests {
 
     /// `issues(id, project_id)`, matching the brief's example shape:
     /// `issues WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = ...)`.
-    fn issues_ts() -> TableSchema {
+    pub(crate) fn issues_ts() -> TableSchema {
         use crate::schema::TableDef;
         let def: TableDef = serde_json::from_value(serde_json::json!({
             "columns": { "id": {"type":"int"}, "project_id": {"type":"int"} },
@@ -3668,7 +3668,7 @@ mod tests {
         TableSchema::from_def(&"issues".into(), &def).unwrap()
     }
 
-    fn issue(id: i64, project_id: i64) -> Row {
+    pub(crate) fn issue(id: i64, project_id: i64) -> Row {
         Row(vec![Value::Int(id), Value::Int(project_id)])
     }
 
@@ -3686,7 +3686,12 @@ mod tests {
     /// Register an outer shape with an arbitrary predicate through the SAME installation path
     /// production uses (`install_shape`), so the necessary-conjunct index is populated exactly as
     /// `finish_create` would populate it.
-    fn insert_outer_shape(reg: &mut SubqueryRegistry, shape_id: &str, outer_table: &str, pred: CompiledPredicate) {
+    pub(crate) fn insert_outer_shape(
+        reg: &mut SubqueryRegistry,
+        shape_id: &str,
+        outer_table: &str,
+        pred: CompiledPredicate,
+    ) {
         let feed_id = reg.next_feed_id;
         reg.next_feed_id += 1;
         reg.install_shape(SubqueryShape {
@@ -3706,7 +3711,7 @@ mod tests {
     /// A realistic LinearLite-style outer predicate: `project_id = k AND project_id IN (SELECT …)`.
     /// `access_leaf` lifts the equality as the necessary conjunct; the `IN` leaf is not row-local
     /// and can never be one.
-    fn keyed_membership_pred(project_id: i64, sig: &SubquerySig) -> CompiledPredicate {
+    pub(crate) fn keyed_membership_pred(project_id: i64, sig: &SubquerySig) -> CompiledPredicate {
         CompiledPredicate::And(vec![
             CompiledPredicate::Cmp { col: 1, op: crate::predicate::LeafOp::Eq, value: Value::Int(project_id) },
             CompiledPredicate::InSubquery { col: 1, sig: sig.clone(), negated: false },
@@ -3787,6 +3792,19 @@ mod tests {
         // Commit 0x20 has no recorded time (an older change log, or it was evicted).
         reg.on_table_delta(&ts, &[Tup2(issue(2, 100), 1)], 0x20, None, None, None).await.unwrap();
         assert_eq!(commit_ts_for("shape/s100"), vec![Some(1_793_404_800_123), None]);
+
+        // A deferred query-back delivers under the LSN of the commit that triggered it.
+        reg.note_commit_time(0x30, 1_793_404_800_456);
+        let gate = crate::pg::SnapshotGate::passthrough();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s100".to_string(), vec![(issue(3, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &gate, commit_lsn: 0x30 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(commit_ts_for("shape/s100"), vec![Some(1_793_404_800_123), None, Some(1_793_404_800_456)]);
 
         // Only the newest COMMIT_TIMES_RETAINED commits are kept.
         for lsn in 0..=COMMIT_TIMES_RETAINED as u64 {
