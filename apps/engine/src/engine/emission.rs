@@ -812,14 +812,20 @@ impl GroupLane {
 
     /// Detach: drop what has not landed, abandon a hung append and keep the resume point.
     fn detach(&self, state: &mut GroupLaneState, cap: Cap) {
+        // A byte-cap detach is about what queued behind the in-flight append, not the append
+        // itself: an append of whole commits that is still sending (the stall cap, which gives it
+        // time for its size, decides when it is hung) finishes, and the gap starts after it, so
+        // an oversized transaction in flight still arrives whole.
+        let keep_in_flight = cap == Cap::Bytes && state.in_flight.as_ref().is_some_and(|flight| !flight.marker);
         let mut lsns: Vec<u64> = state.queued.keys().map(|(lsn, _)| *lsn).collect();
         lsns.extend(state.producing.keys().copied());
-        if let Some((oldest, newest)) = state.in_flight.as_ref().and_then(|flight| flight.lsns) {
+        if !keep_in_flight && let Some((oldest, newest)) = state.in_flight.as_ref().and_then(|flight| flight.lsns) {
             lsns.extend([oldest, newest]);
         }
         let progress = self.shared.progress.lsn.load(std::sync::atomic::Ordering::Relaxed);
         let (backlog_batches, backlog_bytes) = (state.queued.len() as u64, state.queued_bytes);
-        let dropped = backlog_batches + state.in_flight.as_ref().map_or(0, |flight| flight.batches);
+        let dropped = backlog_batches
+            + if keep_in_flight { 0 } else { state.in_flight.as_ref().map_or(0, |flight| flight.batches) };
         let mut gap = match state.phase {
             Phase::Reattaching(gap) => gap,
             _ => Gap {
@@ -838,9 +844,11 @@ impl GroupLane {
         state.queued.clear();
         state.queued_bytes = 0;
         state.marker = None;
-        state.in_flight = None;
-        state.epoch += 1;
-        self.epoch.send_replace(state.epoch);
+        if !keep_in_flight {
+            state.in_flight = None;
+            state.epoch += 1;
+            self.epoch.send_replace(state.epoch);
+        }
         if matches!(state.phase, Phase::Attached) {
             self.shared.metrics.group_lanes_detached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1369,13 +1377,14 @@ mod tests {
         let (lanes, _store, _hold) = held_lanes(config);
         lanes.push(GROUP, vec![big_env("in-flight")], 1);
         settle().await;
-        // The oldest queued commit is never counted, however many batches it arrives in.
+        // The largest queued commit is never counted, however many batches it arrives in.
         lanes.push(GROUP, vec![big_env("queued")], 2);
         lanes.push(GROUP, vec![big_env("queued-flip")], 2);
         assert_eq!(detaches(&lanes), 0, "one commit's output alone must never trip the memory cap");
         lanes.push(GROUP, vec![big_env("over")], 3);
         assert_eq!(detaches(&lanes), 1);
-        assert_eq!(lanes.drain(GROUP, 3).unwrap().resume_lsn.as_deref(), Some("0/1"));
+        // The in-flight append is whole commits still sending: it finishes, and the gap starts after it.
+        assert_eq!(lanes.drain(GROUP, 3).unwrap().resume_lsn.as_deref(), Some("0/2"));
     }
 
     #[tokio::test]
@@ -1409,6 +1418,28 @@ mod tests {
         hold.send_replace(false);
         let (keys, _) = wait_appended(&store, 4).await;
         assert_eq!(keys, ["in-flight", "t-1", "t-oversized", "t+1"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_byte_cap_detach_lets_an_oversized_append_in_flight_finish() {
+        let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
+        let (lanes, store, hold) = held_lanes(config);
+        lanes.push(GROUP, vec![big_env("oversized")], 1);
+        settle().await;
+        // Ordinary writes keep coming behind the oversized append until they pass the cap.
+        for i in 0..8u64 {
+            lanes.push(GROUP, vec![big_env(&format!("small-{i}"))], 2 + i);
+        }
+        assert_eq!(detaches(&lanes), 1);
+        assert_eq!(lanes.drain(GROUP, 2).unwrap().resume_lsn.as_deref(), Some("0/2"));
+        hold.send_replace(false);
+        let (keys, _) = wait_appended(&store, 1).await;
+        assert_eq!(keys, ["oversized"], "the oversized append in flight must still land whole");
+        assert!(lanes.drain(GROUP, 1).unwrap().drained, "the gap starts after the commit that landed");
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        lanes.tick_for_test(true).await;
+        let (keys, _) = wait_appended(&store, 2).await;
+        assert_eq!(keys, ["oversized", MUST_REFETCH]);
     }
 
     #[tokio::test]
