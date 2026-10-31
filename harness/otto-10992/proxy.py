@@ -8,6 +8,7 @@ network path; no engine or DS call is mocked.
 import http.client
 import json
 import os
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -17,6 +18,8 @@ MATCH = os.getenv("FAULT_MATCH", "")
 DELAY_MS = int(os.getenv("DELAY_MS", "0"))
 HANG = os.getenv("HANG", "0") == "1"
 OUTAGE = os.getenv("OUTAGE", "0") == "1"
+STATS = {"targeted": 0, "held": 0, "forwarded": 0}
+STATS_LOCK = threading.Lock()
 
 
 def readiness_body():
@@ -68,6 +71,15 @@ class Proxy(BaseHTTPRequestHandler):
         self.forward()
 
     def forward(self):
+        if self.path == "/__fault_stats":
+            with STATS_LOCK:
+                payload = json.dumps({**STATS, "fault_match": MATCH, "hang": HANG, "outage": OUTAGE}).encode()
+            self.send_response(200, "OK")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
         if self.path == "/_admin/ready":
             payload = readiness_body()
             self.send_response(200, "OK")
@@ -77,7 +89,12 @@ class Proxy(BaseHTTPRequestHandler):
             self.wfile.write(payload)
             return
         targeted = not MATCH or MATCH in self.path
+        if targeted:
+            with STATS_LOCK:
+                STATS["targeted"] += 1
         if OUTAGE or (targeted and HANG):
+            with STATS_LOCK:
+                STATS["held"] += 1
             # Keep the TCP request open so the engine experiences a real stalled append/read.
             while True:
                 time.sleep(60)
@@ -88,6 +105,8 @@ class Proxy(BaseHTTPRequestHandler):
         conn = http.client.HTTPConnection(TARGET_HOST, TARGET_PORT, timeout=300)
         headers = {k: v for k, v in self.headers.items() if k.lower() not in {"host", "connection"}}
         try:
+            with STATS_LOCK:
+                STATS["forwarded"] += 1
             conn.request(self.command, self.path, body=body, headers=headers)
             response = conn.getresponse()
             payload = response.read()

@@ -20,18 +20,19 @@ while [ "$(date +%s)" -lt "$end" ]; do
   repl=$(curl --max-time 1 -fsS "$base/replication/lsn" 2>/dev/null || echo '{}')
   roff=$(curl --max-time 1 -fsS "$base/tables/public.record/offset" 2>/dev/null || echo '{}')
   poff=$(curl --max-time 1 -fsS "$base/tables/public.plain_events/offset" 2>/dev/null || echo '{}')
+  proxy_stats=$(curl --max-time 1 -fsS http://127.0.0.1:8792/__fault_stats 2>/dev/null || echo '{}')
   slots=$($compose exec -T postgres psql -U postgres -d electric -At -c "SELECT coalesce(json_agg(x),'[]') FROM (SELECT slot_name,active,pg_current_wal_lsn() AS current_lsn,confirmed_flush_lsn,pg_wal_lsn_diff(pg_current_wal_lsn(),restart_lsn) AS retained_wal_bytes FROM pg_replication_slots) x" 2>/dev/null || echo '[]')
   latency=$(curl --max-time 1 -sS -o /dev/null -w '%{time_total}' "$base/v1/health" 2>/dev/null || echo null)
   host_load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo null)
   host_mem_available=$(awk '/MemAvailable:/{print $2*1024}' /proc/meminfo 2>/dev/null || echo null)
   host_mem_total=$(awk '/MemTotal:/{print $2*1024}' /proc/meminfo 2>/dev/null || echo null)
   host_nproc=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo null)
-  python3 - "$ts" "$rss" "$ds_bytes" "$memory" "$metrics" "$repl" "$roff" "$poff" "$slots" "$latency" "$host_load1" "$host_mem_available" "$host_mem_total" "$host_nproc" >>"$out/samples.jsonl" <<'PY'
+  python3 - "$ts" "$rss" "$ds_bytes" "$memory" "$metrics" "$repl" "$roff" "$poff" "$slots" "$latency" "$host_load1" "$host_mem_available" "$host_mem_total" "$host_nproc" "$proxy_stats" >>"$out/samples.jsonl" <<'PY'
 import json, sys
-keys = ('ts','rss_bytes','ds_bytes','engine_memory','engine_metrics','replication_lsn','source_record_offset','source_plain_offset','slot_stats','latency_ms','host_load1','host_mem_available_bytes','host_mem_total_bytes','host_nproc')
+keys = ('ts','rss_bytes','ds_bytes','engine_memory','engine_metrics','replication_lsn','source_record_offset','source_plain_offset','slot_stats','latency_ms','host_load1','host_mem_available_bytes','host_mem_total_bytes','host_nproc','proxy_stats')
 row = dict(zip(keys, sys.argv[1:]))
 for key in keys[1:]:
-    if key in ('engine_memory','engine_metrics','replication_lsn','source_record_offset','source_plain_offset','slot_stats'):
+    if key in ('engine_memory','engine_metrics','replication_lsn','source_record_offset','source_plain_offset','slot_stats','proxy_stats'):
         try: row[key] = json.loads(row[key])
         except Exception: pass
     elif key in ('rss_bytes','ds_bytes','host_mem_available_bytes','host_mem_total_bytes','host_nproc'):
