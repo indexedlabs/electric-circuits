@@ -4,7 +4,6 @@ const mode = (process.env.LIVE_MODE ?? 'long-poll') as 'long-poll' | 'sse'
 const seconds = Number(process.env.CLIENT_SECONDS ?? 60)
 const client = createClient({
   apiUrl: process.env.API_URL ?? 'http://api:8790',
-  dsBaseUrl: process.env.DS_URL ?? 'http://ds:8791',
   liveMode: mode,
   schema: {
     tables: {
@@ -16,7 +15,7 @@ const client = createClient({
 const sub = await client.subset({ table: 'public.plain_events', limit: 100, orderBy: { col: 'id' } })
 const started = Date.now()
 let changes = 0
-sub.collection.subscribe(() => { changes += 1 })
+sub.collection.subscribeChanges(() => { changes += 1 }, { includeInitialState: true })
 await new Promise((resolve) => setTimeout(resolve, seconds * 1000))
 console.log(JSON.stringify({ mode, seconds, changes, hasMore: sub.hasMore(), elapsedMs: Date.now() - started }))
 await sub.close()
