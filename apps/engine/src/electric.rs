@@ -661,8 +661,10 @@ enum KeyFold {
     Continue(u64),
     /// The target is the boundary after the item just folded.
     Reached,
-    /// The target falls inside an item, or the page is not framed as `next` says it should be.
+    /// The target falls inside an item.
     NotAPosition,
+    /// The page does not add up to its own next offset, so no count over it can be trusted.
+    Misframed,
 }
 
 /// Fold one page of a stream into `keys`, stopping exactly at byte `target`.
@@ -705,10 +707,10 @@ fn fold_keys_page(
         match items.as_bytes().get(position) {
             Some(b',') => position += 1,
             None => break,
-            Some(_) => return Ok(KeyFold::NotAPosition),
+            Some(_) => return Ok(KeyFold::Misframed),
         }
     }
-    if end != next { Ok(KeyFold::NotAPosition) } else { Ok(KeyFold::Continue(next)) }
+    if end != next { Ok(KeyFold::Misframed) } else { Ok(KeyFold::Continue(next)) }
 }
 
 /// The key set a client holds when positioned at `offset`, or `None` when the stream has no such
@@ -740,6 +742,11 @@ async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result
             KeyFold::Reached => break,
             KeyFold::Continue(byte) => start = byte,
             KeyFold::NotAPosition => return Ok(None),
+            KeyFold::Misframed => {
+                // Not a client's mistake: on this store no resume can work, and each one refetches.
+                tracing::warn!("/v1/shape key-set rebuild of {path}: page at byte {start} is not framed as its offset");
+                return Ok(None);
+            }
         }
         from = page.next_offset.unwrap_or_default();
     }
@@ -1941,8 +1948,8 @@ mod tests {
         let (body, ends) = wire_page(&[env("upsert", "k1", "")], 0);
         let spaced = body.replacen("{", " {", 1);
         let far = ends[0] + 100;
-        assert_eq!(fold_keys_page(&mut HashSet::new(), &body, 0, ends[0] + 1, far).unwrap(), KeyFold::NotAPosition);
-        assert_eq!(fold_keys_page(&mut HashSet::new(), &spaced, 0, ends[0], far).unwrap(), KeyFold::NotAPosition);
+        assert_eq!(fold_keys_page(&mut HashSet::new(), &body, 0, ends[0] + 1, far).unwrap(), KeyFold::Misframed);
+        assert_eq!(fold_keys_page(&mut HashSet::new(), &spaced, 0, ends[0], far).unwrap(), KeyFold::Misframed);
     }
 
     #[test]
