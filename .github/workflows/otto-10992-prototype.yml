@@ -31,9 +31,13 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --no-tags origin "$ENGINE_REF"
-          tar -czf /tmp/otto-harness.tgz harness prototype .github/workflows/otto-10992-prototype.yml
-          git checkout --detach "$ENGINE_REF"
-          tar -xzf /tmp/otto-harness.tgz
+          mkdir /tmp/otto-baseline
+          git archive "$ENGINE_REF" | tar -x -C /tmp/otto-baseline
+          rsync -a --delete \
+            --exclude harness \
+            --exclude prototype \
+            --exclude .github/workflows/otto-10992-prototype.yml \
+            /tmp/otto-baseline/ ./
 
       - name: Start PostgreSQL and Durable Streams
         run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d postgres ds
