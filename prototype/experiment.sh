@@ -67,6 +67,8 @@ run_one() {
     d-2000) rate=2000; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
     e-200-2000) rate=2000; groups=200; seconds=300 ;;
     e-1000-2000) rate=2000; groups=1000; seconds=300 ;;
+    control-200) rate=200; seconds=300; stream_path=$(load_group control); write_rate "$rate" "$seconds" ;;
+    control-1000) rate=1000; seconds=300; stream_path=$(load_group control); write_rate "$rate" "$seconds" ;;
     a) stream_path=$(load_group stalled); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     c-200) stream_path=$(load_group delayed-200); export FAULT_MATCH="/$stream_path" DELAY_MS=200; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     c-2000) stream_path=$(load_group delayed-2000); export FAULT_MATCH="/$stream_path" DELAY_MS=2000; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;

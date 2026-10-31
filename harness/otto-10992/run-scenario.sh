@@ -28,10 +28,10 @@ while [ "$(date +%s)" -lt "$end" ]; do
   host_nproc=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo null)
   python3 - "$ts" "$rss" "$ds_bytes" "$memory" "$metrics" "$repl" "$roff" "$poff" "$slots" "$latency" "$host_load1" "$host_mem_available" "$host_mem_total" "$host_nproc" >>"$out/samples.jsonl" <<'PY'
 import json, sys
-keys = ('ts','rss_bytes','ds_bytes','engine_memory','engine_metrics','replication_lsn','record_offset','plain_offset','slot_stats','latency_ms','host_load1','host_mem_available_bytes','host_mem_total_bytes','host_nproc')
+keys = ('ts','rss_bytes','ds_bytes','engine_memory','engine_metrics','replication_lsn','source_record_offset','source_plain_offset','slot_stats','latency_ms','host_load1','host_mem_available_bytes','host_mem_total_bytes','host_nproc')
 row = dict(zip(keys, sys.argv[1:]))
 for key in keys[1:]:
-    if key in ('engine_memory','engine_metrics','replication_lsn','record_offset','plain_offset','slot_stats'):
+    if key in ('engine_memory','engine_metrics','replication_lsn','source_record_offset','source_plain_offset','slot_stats'):
         try: row[key] = json.loads(row[key])
         except Exception: pass
     elif key in ('rss_bytes','ds_bytes','host_mem_available_bytes','host_mem_total_bytes','host_nproc'):
