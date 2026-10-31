@@ -297,6 +297,15 @@ struct InFlight {
     bytes: u64,
     batches: u64,
     marker: bool,
+    started: tokio::time::Instant,
+}
+
+impl InFlight {
+    /// How long this append may take before it counts as hung: the base stall cap plus time for
+    /// its size at the slowest throughput a lane waits out.
+    fn allowance(&self, config: &GroupLaneConfig) -> std::time::Duration {
+        config.detach_after + std::time::Duration::from_secs(self.bytes / config.append_min_bytes_per_sec.max(1))
+    }
 }
 
 struct Probe {
@@ -720,7 +729,8 @@ impl GroupLane {
             return None;
         }
         if let Some(marker) = state.marker.take() {
-            state.in_flight = Some(InFlight { lsns: None, bytes: 0, batches: 0, marker: true });
+            state.in_flight =
+                Some(InFlight { lsns: None, bytes: 0, batches: 0, marker: true, started: tokio::time::Instant::now() });
             return Some((vec![marker], state.epoch));
         }
         let barrier = state.producing.keys().next().copied().unwrap_or(u64::MAX);
@@ -743,8 +753,13 @@ impl GroupLane {
         }
         state.queued_bytes -= bytes;
         self.backlog_changed(-(bytes as i64), -(keys.len() as i64));
-        state.in_flight =
-            Some(InFlight { lsns: Some((first, last)), bytes, batches: keys.len() as u64, marker: false });
+        state.in_flight = Some(InFlight {
+            lsns: Some((first, last)),
+            bytes,
+            batches: keys.len() as u64,
+            marker: false,
+            started: tokio::time::Instant::now(),
+        });
         Some((envs, state.epoch))
     }
 
@@ -779,7 +794,34 @@ impl GroupLane {
             return false;
         }
         let now = tokio::time::Instant::now();
-        if let Phase::Detached(_) = state.phase {
+        if let Phase::Detached(mut gap) = state.phase {
+            // An append a byte-cap detach kept is still sending whole commits. It is abandoned
+            // once past the time its size allows, and until it lands or is abandoned the lane
+            // does not probe: reattaching would only queue output behind it again.
+            if let Some((started, allowance, lsns, batches)) = state
+                .in_flight
+                .as_ref()
+                .map(|flight| (flight.started, flight.allowance(config), flight.lsns, flight.batches))
+            {
+                if now.duration_since(started) < allowance {
+                    return false;
+                }
+                if let Some((oldest, newest)) = lsns {
+                    gap.widen(oldest);
+                    gap.widen(newest);
+                }
+                gap.dropped_batches += batches;
+                state.phase = Phase::Detached(gap);
+                state.in_flight = None;
+                state.epoch += 1;
+                self.epoch.send_replace(state.epoch);
+                tracing::warn!(
+                    event = "group_append_abandoned",
+                    group_id = %self.path,
+                    resume_lsn = %lsn_text(gap.resume_lsn),
+                    "a detached group's kept append did not land within the time its size allows; abandoned"
+                );
+            }
             if !state.probe.running && now >= state.probe.next_at {
                 state.probe.running = true;
                 return true;
@@ -816,7 +858,11 @@ impl GroupLane {
         // itself: an append of whole commits that is still sending (the stall cap, which gives it
         // time for its size, decides when it is hung) finishes, and the gap starts after it, so
         // an oversized transaction in flight still arrives whole.
-        let keep_in_flight = cap == Cap::Bytes && state.in_flight.as_ref().is_some_and(|flight| !flight.marker);
+        let config = &self.shared.config;
+        let keep_in_flight = cap == Cap::Bytes
+            && state.in_flight.as_ref().is_some_and(|flight| {
+                !flight.marker && tokio::time::Instant::now().duration_since(flight.started) < flight.allowance(config)
+            });
         let mut lsns: Vec<u64> = state.queued.keys().map(|(lsn, _)| *lsn).collect();
         lsns.extend(state.producing.keys().copied());
         if !keep_in_flight && let Some((oldest, newest)) = state.in_flight.as_ref().and_then(|flight| flight.lsns) {
@@ -1422,7 +1468,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_byte_cap_detach_lets_an_oversized_append_in_flight_finish() {
-        let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
+        // 16 KiB at 1 KiB/s: the oversized append may take 19 s before it counts as hung.
+        let config = GroupLaneConfig { memory_bytes: 4096, append_min_bytes_per_sec: 1024, ..test_config() };
         let (lanes, store, hold) = held_lanes(config);
         lanes.push(GROUP, vec![big_env("oversized")], 1);
         settle().await;
@@ -1432,6 +1479,14 @@ mod tests {
         }
         assert_eq!(detaches(&lanes), 1);
         assert_eq!(lanes.drain(GROUP, 2).unwrap().resume_lsn.as_deref(), Some("0/2"));
+        // While it is still sending, the lane does not reattach, so nothing queues behind it
+        // again and the one transaction costs one detach.
+        for i in 0..5u64 {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            lanes.tick_for_test(true).await;
+            lanes.push(GROUP, vec![big_env(&format!("more-{i}"))], 20 + i);
+        }
+        assert_eq!(lanes.shared.metrics.group_reattaches.load(std::sync::atomic::Ordering::Relaxed), 0);
         hold.send_replace(false);
         let (keys, _) = wait_appended(&store, 1).await;
         assert_eq!(keys, ["oversized"], "the oversized append in flight must still land whole");
@@ -1439,7 +1494,38 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         lanes.tick_for_test(true).await;
         let (keys, _) = wait_appended(&store, 2).await;
-        assert_eq!(keys, ["oversized", MUST_REFETCH]);
+        assert_eq!(keys, ["oversized", MUST_REFETCH], "the marker follows the landed append promptly");
+        assert_eq!(detaches(&lanes), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_append_that_never_lands_is_abandoned_at_its_allowance() {
+        // The stream's HEAD answers but its appends never land: the kept append is given time
+        // for its size (16 KiB at 1 KiB/s plus the 3 s cap) and then abandoned, so the marker
+        // goes out instead of the lane cycling forever.
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        *store.append_delay.lock().unwrap() = Some((GROUP.into(), std::time::Duration::from_secs(24 * 3600)));
+        let config = GroupLaneConfig { memory_bytes: 4096, append_min_bytes_per_sec: 1024, ..test_config() };
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            config,
+        );
+        lanes.register(GROUP);
+        lanes.push(GROUP, vec![big_env("stuck")], 1);
+        settle().await;
+        for i in 0..2u64 {
+            lanes.push(GROUP, vec![big_env(&format!("behind-{i}"))], 2 + i);
+        }
+        assert_eq!(detaches(&lanes), 1);
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        lanes.tick_for_test(true).await;
+        assert_eq!(lanes.shared.metrics.group_reattaches.load(std::sync::atomic::Ordering::Relaxed), 0);
+        tokio::time::advance(std::time::Duration::from_secs(15)).await;
+        lanes.tick_for_test(true).await;
+        lanes.tick_for_test(true).await;
+        assert_eq!(lanes.shared.metrics.group_reattaches.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let drain = lanes.drain(GROUP, 1).unwrap();
+        assert!(drain.must_refetch && drain.resume_lsn.as_deref() == Some("0/1"), "{drain:?}");
     }
 
     #[tokio::test]
