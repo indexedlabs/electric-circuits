@@ -50,11 +50,13 @@ jobs:
           set -euo pipefail
           mkdir -p harness/otto-10992/results
           set +e
-          curl -sS -D harness/otto-10992/results/ds-readiness.headers \
+          curl -sS --retry 60 --retry-all-errors --retry-delay 2 \
+            -D harness/otto-10992/results/ds-readiness.headers \
             http://127.0.0.1:8791/_admin/ready \
             -o harness/otto-10992/results/ds-readiness.body
           ready_rc=$?
           set -e
+          test -f harness/otto-10992/results/ds-readiness.body || : > harness/otto-10992/results/ds-readiness.body
           printf '{"endpoint":"/_admin/ready","curl_exit":%s,"body":' "$ready_rc" \
             > harness/otto-10992/results/ds-readiness.json
           python3 - <<'PY' >> harness/otto-10992/results/ds-readiness.json
