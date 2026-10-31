@@ -40,7 +40,44 @@ jobs:
             /tmp/otto-baseline/ ./
 
       - name: Start PostgreSQL and Durable Streams
+        env:
+          DS_MEMORY: ''
         run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d postgres ds
+
+      - name: Bind engine to the real DS store identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p harness/otto-10992/results
+          for i in $(seq 1 90); do
+            ready=$(curl -fsS http://127.0.0.1:8791/_admin/ready 2>/dev/null || true)
+            status=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status", ""))' "$ready" 2>/dev/null || true)
+            [ "$status" = ready ] && break
+            sleep 2
+          done
+          test -n "${ready:-}" || { echo 'Durable Streams readiness did not answer'; exit 1; }
+          printf '%s\n' "$ready" > harness/otto-10992/results/ds-readiness.json
+          python3 - "$ready" >> "$GITHUB_ENV" <<'PY'
+import json, sys
+body = json.loads(sys.argv[1])
+manifest = body.get('manifest', body.get('store', body))
+mapping = {
+  'store_id': 'ELECTRIC_CIRCUITS_DS_STORE_ID',
+  'store_generation': 'ELECTRIC_CIRCUITS_DS_STORE_GENERATION',
+  'protocol_version': 'ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION',
+  'layout_version': 'ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION',
+  'durability_mode': 'ELECTRIC_CIRCUITS_DS_DURABILITY_MODE',
+  'wal_shard_count': 'ELECTRIC_CIRCUITS_DS_WAL_SHARDS',
+  'stream_lane_count': 'ELECTRIC_CIRCUITS_DS_STREAM_LANES',
+  'filesystem_uuid': 'ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID',
+}
+for source, target in mapping.items():
+    if source not in manifest: raise SystemExit(f'missing {source} in DS readiness manifest')
+    print(f'{target}={manifest[source]}')
+print('ELECTRIC_CIRCUITS_DS_NAMESPACE=otto-10992')
+print('ELECTRIC_CIRCUITS_QUERY_GENERATION=otto-10992')
+print('ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1')
+PY
 
       - name: Seed schema
         run: |
