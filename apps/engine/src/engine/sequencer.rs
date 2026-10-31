@@ -816,6 +816,8 @@ pub(crate) async fn sequencer_loop(
                         // flush partial output or publish partial highwater.
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        // The commit time the ingestor stamped on this transaction's changes.
+                        let mut commit_ts: Option<i64> = None;
                         loop {
                             // Finish ready input on shutdown. Only a pending spill read or its
                             // admission wait yields the page back to the replay boundary.
@@ -857,6 +859,7 @@ pub(crate) async fn sequencer_loop(
                                         continue;
                                     }
                                 }
+                                commit_ts = commit_ts.or(env.headers.commit_ts);
                                 if env.type_ == crate::runtime_authority::ENVELOPE_TYPE {
                                     runtime_fences.stage(&env, runtime_incarnation);
                                     touched = true;
@@ -953,6 +956,7 @@ pub(crate) async fn sequencer_loop(
                                 &trace_tx,
                             );
                         }
+                        stamp_commit_time(&mut txn_pending, commit_ts);
                         emit_storage_txn_metrics(ds.metrics(), &txn_pending);
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
@@ -1526,7 +1530,9 @@ pub(crate) async fn activate_shape(
                 if matched.is_empty() {
                     continue;
                 }
+                let first = outs.len();
                 outs.extend(translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)));
+                carry_commit_time(&mut outs[first..], env.headers.commit_ts);
             }
             if !outs.is_empty() {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
@@ -1569,6 +1575,8 @@ pub(crate) async fn activate_shape(
                     if agg.last.as_ref() != Some(&val) {
                         agg.last = Some(val.clone());
                         outs.push(agg.envelope(&exec.ts, txid, lsn));
+                        let last = outs.len() - 1;
+                        carry_commit_time(&mut outs[last..], env.headers.commit_ts);
                     }
                 }
             }
@@ -1713,6 +1721,7 @@ pub(crate) async fn replay_changes_for_targets(
                 if target.gate.should_skip(lsn_u64, xid) {
                     continue;
                 }
+                let first = outs.len();
                 if absolute {
                     let held =
                         delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| target.pred.matches(r));
@@ -1738,6 +1747,7 @@ pub(crate) async fn replay_changes_for_targets(
                         ));
                     }
                 }
+                carry_commit_time(&mut outs[first..], env.headers.commit_ts);
             }
             if !outs.is_empty() {
                 emitted[idx] += outs.len() as u64;
@@ -1972,6 +1982,7 @@ pub(crate) async fn process_envelope(
     library_mode: bool,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
+    let commit_ts = env.headers.commit_ts;
     // No before-image (library mode only — see `needs_absolute_emission`): the plain tiers below
     // decide membership ABSOLUTELY per pk instead of from the delta, so a delete with no delta at
     // all still has work to do.
@@ -2178,6 +2189,9 @@ pub(crate) async fn process_envelope(
         let (result, staged_group_emissions) = {
             let mut reg = subq.registry.lock().await;
             let result = if reg.touches(&ts.table) {
+                if let Some(commit_ts) = commit_ts {
+                    reg.note_commit_time(lsn_u64, commit_ts);
+                }
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
                 if let Ok(result_work) = result.as_ref() {
@@ -2325,6 +2339,28 @@ pub(crate) fn emit_storage_txn_metrics(
     metrics.emitter().storage_txn(ops, bytes, txn_pending.len() as u64);
 }
 
+/// Give the envelopes built from one buffered or replayed source change that change's commit time:
+/// an activation drain and a dormant shape's replay emit live changes outside a transaction's
+/// `txn_pending`, so [`stamp_commit_time`] never sees them.
+fn carry_commit_time(outs: &mut [Envelope], commit_ts: Option<i64>) {
+    if let Some(commit_ts) = commit_ts {
+        for env in outs {
+            env.headers.commit_ts = Some(commit_ts);
+        }
+    }
+}
+
+/// Carry a transaction's commit time onto every output envelope it produced (`headers.commit_ts`),
+/// so a client can measure time to data. Subquery emissions are stamped by the registry instead
+/// ([`crate::subquery::SubqueryRegistry::note_commit_time`]), since they may land after this
+/// transaction's own appends.
+pub(crate) fn stamp_commit_time(pending: &mut HashMap<String, Vec<Envelope>>, commit_ts: Option<i64>) {
+    let Some(commit_ts) = commit_ts else { return };
+    for env in pending.values_mut().flatten() {
+        env.headers.commit_ts = Some(commit_ts);
+    }
+}
+
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so
 /// `awaitTxId` semantics are preserved; only the HTTP round-trips are coalesced + parallelized.
 ///
@@ -2375,6 +2411,7 @@ mod txn_boundary_tests {
                 lsn: Some(lsn.into()),
                 seq: Some(seq),
                 last: last.then_some(true),
+                commit_ts: None,
             },
         }
     }
@@ -2393,6 +2430,7 @@ mod txn_boundary_tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -2804,6 +2842,7 @@ mod pending_buffer_tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -2838,6 +2877,80 @@ mod pending_buffer_tests {
         assert!(
             !buffer_pending(&mut pending_shape, &envelope(101, 1), cap),
             "an overflowed buffer stays overflowed; it cannot half-recover"
+        );
+    }
+
+    /// A change that committed while the shape was being created is drained from its buffer at
+    /// activation and appended outside any transaction's `txn_pending`; it still carries its
+    /// commit time (`#g-commit-time`).
+    #[tokio::test]
+    async fn an_activation_drain_carries_each_buffered_changes_commit_time() {
+        let ts = users();
+        let mut stamped = envelope(1, 1);
+        stamped.headers.commit_ts = Some(1_793_404_800_123);
+        let mut exec = TableExec::new(ts.clone());
+        exec.pending.insert("s1".to_string(), pending(&ts, vec![stamped, envelope(2, 1)]));
+        let mut execs = HashMap::from([(ts.table.to_string(), exec)]);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        activate_shape(
+            &ds,
+            &mut execs,
+            &ts.table,
+            "s1",
+            crate::pg::SnapshotGate::passthrough(),
+            None,
+            0,
+            &mut HashMap::new(),
+            &crate::shutdown::ShutdownToken::new(),
+        )
+        .await
+        .unwrap();
+        let appended: Vec<Envelope> = serde_json::from_slice(&store.appended.lock().unwrap()[0].2).unwrap();
+        assert_eq!(
+            appended.iter().map(|e| (e.key.as_str(), e.headers.commit_ts)).collect::<Vec<_>>(),
+            vec![("1", Some(1_793_404_800_123)), ("2", None)]
+        );
+    }
+
+    /// The same for an aggregate created while matching rows commit: its seed value carries no
+    /// commit time, and each value a buffered change moves carries that change's.
+    #[tokio::test]
+    async fn an_aggregate_activation_drain_carries_each_buffered_changes_commit_time() {
+        let ts = users();
+        let mut stamped = envelope(1, 1);
+        stamped.headers.commit_ts = Some(1_793_404_800_123);
+        let mut shape = pending(&ts, vec![stamped, envelope(2, 1)]);
+        shape.kind = CreateKind::Aggregate { func: AggFn::Count, col: None };
+        let mut exec = TableExec::new(ts.clone());
+        exec.pending.insert("s1".to_string(), shape);
+        let mut execs = HashMap::from([(ts.table.to_string(), exec)]);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        activate_shape(
+            &ds,
+            &mut execs,
+            &ts.table,
+            "s1",
+            crate::pg::SnapshotGate::passthrough(),
+            None,
+            0,
+            &mut HashMap::new(),
+            &crate::shutdown::ShutdownToken::new(),
+        )
+        .await
+        .unwrap();
+        let appended: Vec<Envelope> = serde_json::from_slice(&store.appended.lock().unwrap()[0].2).unwrap();
+        assert_eq!(
+            appended
+                .iter()
+                .map(|e| (e.value.as_ref().map(|v| v["n"].clone()), e.headers.commit_ts))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(serde_json::json!(0)), None),
+                (Some(serde_json::json!(1)), Some(1_793_404_800_123)),
+                (Some(serde_json::json!(2)), None),
+            ]
         );
     }
 
@@ -3204,6 +3317,7 @@ mod held_spill_tests {
                 seq: Some(seq),
                 last: last.then_some(true),
                 offset: None,
+                commit_ts: None,
             },
         }
     }
