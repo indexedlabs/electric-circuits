@@ -28,6 +28,13 @@ struct ReceiptWork {
     runtime_incarnation: uuid::Uuid,
 }
 
+/// Receipt work is small (runtime fences are bounded per transaction), but it must not be allowed
+/// to park the source sequencer behind a group whose output is waiting on the same sequencer. The
+/// ingress is therefore non-blocking and explicitly bounded by this count; source fences fail
+/// closed and replay when the bound is exhausted, while runtime markers become unknown as allowed by
+/// their bounded authority cache.
+const MAX_PENDING_RECEIPTS: usize = 4096;
+
 #[derive(Default)]
 struct ReceiptBarrier {
     pending: std::sync::Mutex<BTreeMap<u64, usize>>,
@@ -523,7 +530,8 @@ pub(crate) async fn sequencer_loop(
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let receipt_barrier = Arc::new(ReceiptBarrier::default());
-    let (receipt_tx, mut receipt_rx) = mpsc::channel::<ReceiptWork>(128);
+    let (receipt_tx, mut receipt_rx) = mpsc::unbounded_channel::<ReceiptWork>();
+    let pending_receipts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let subq = subq.clone();
         let source_receipts = source_receipts.clone();
@@ -533,12 +541,14 @@ pub(crate) async fn sequencer_loop(
         let worker_shutdown = shutdown.clone();
         let catalog_tx = catalog_tx.clone();
         let receipt_barrier = receipt_barrier.clone();
+        let pending_receipts = pending_receipts.clone();
         shutdown.clone().spawn_background(async move {
             loop {
                 let work = tokio::select! {
                     work = receipt_rx.recv() => match work { Some(work) => work, None => return },
                     _ = worker_shutdown.wait() => return,
                 };
+                pending_receipts.fetch_sub(1, Ordering::AcqRel);
                 if !wait_for_source_effects(&subq, &worker_shutdown, work.marker_lsn).await {
                     // A degraded engine must restart from the last durable checkpoint. Leaving
                     // this marker registered would pin the publish gate forever while the
@@ -1109,47 +1119,29 @@ pub(crate) async fn sequencer_loop(
                                 runtime_fences: runtime_fences.into_fences(),
                                 runtime_incarnation,
                             };
-                            let mut work = work;
-                            loop {
-                                match receipt_tx.try_send(work) {
-                                    Ok(()) => break,
-                                    Err(mpsc::error::TrySendError::Closed(work)) => {
-                                        // The worker can only disappear during shutdown. Keep the
-                                        // barrier pending so the final checkpoint stays before
-                                        // this fence, then replay it after restart.
-                                        highwater = txn_highwater;
-                                        let _ = work;
-                                        shutdown.begin();
-                                        processing_failed = true;
-                                        break;
-                                    }
-                                    Err(mpsc::error::TrySendError::Full(returned)) => {
-                                        work = returned;
-                                        if subq.group_lanes.fail_lanes_holding(marker_lsn) {
-                                            // The queue is full behind a group's oldest output.
-                                            // Retire that owner and retry admission without ever
-                                            // awaiting the stalled prefix on the source loop.
-                                            tokio::task::yield_now().await;
-                                            continue;
-                                        }
-                                        // A full queue with no lane that has crossed its wait cap
-                                        // is ordinary receipt backpressure. Preserve ordering and
-                                        // every marker by waiting for the worker rather than
-                                        // dropping work or restarting a healthy engine.
-                                        match receipt_tx.send(work).await {
-                                            Ok(()) => break,
-                                            Err(_) => {
-                                                highwater = txn_highwater;
-                                                shutdown.begin();
-                                                processing_failed = true;
-                                                break;
-                                            }
-                                        }
-                                    }
+                            let reserved = pending_receipts
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                                    (pending < MAX_PENDING_RECEIPTS).then_some(pending + 1)
+                                })
+                                .is_ok();
+                            if !reserved {
+                                if work.source_receipt.is_some() {
+                                    // Never acknowledge a source fence that could not enter the
+                                    // durable receipt worker. Keep its highwater at the previous
+                                    // transaction and replay it after restart.
+                                    highwater = txn_highwater;
+                                    shutdown.begin();
+                                    processing_failed = true;
+                                } else {
+                                    receipt_barrier.complete(marker_lsn);
+                                    tracing::warn!(marker_lsn, capacity = MAX_PENDING_RECEIPTS,
+                                        "runtime receipt queue full; leaving excess marker unknown");
                                 }
-                                if processing_failed {
-                                    break;
-                                }
+                            } else if receipt_tx.send(work).is_err() {
+                                pending_receipts.fetch_sub(1, Ordering::AcqRel);
+                                highwater = txn_highwater;
+                                shutdown.begin();
+                                processing_failed = true;
                             }
                             if processing_failed {
                                 break;

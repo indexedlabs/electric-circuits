@@ -1929,6 +1929,8 @@ impl Engine {
                     if let Err(error) = group_engine.release_group_claim(&notice.subscription, &notice.group_id).await {
                         tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow retirement failed");
                         group_engine.retirements.enqueue(&notice.stream_path, None);
+                    } else {
+                        group_engine.group_lanes.release_overflow_hold(&notice.stream_path);
                     }
                 });
             }
@@ -3488,6 +3490,9 @@ impl Engine {
     /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
     /// to the same wall-clock instant.
     pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+        if self.group_lanes.is_closed(&group.stream_path) {
+            return Ok(false);
+        }
         let now = crate::changelog::now_secs();
         let mut events = Vec::with_capacity(group.members.len());
         {
@@ -3545,6 +3550,12 @@ impl Engine {
             })
         };
         if !members_healthy {
+            return Ok(false);
+        }
+        if self.group_lanes.is_closed(&group.stream_path) {
+            // An overflowed lane is already terminal. Do not renew its member claims into a
+            // closed worker while the engine-owned retirement task is publishing the reload
+            // reason and dropping the group record.
             return Ok(false);
         }
         match self.ds.head(&group.stream_path).await {

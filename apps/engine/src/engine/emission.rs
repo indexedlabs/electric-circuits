@@ -137,6 +137,7 @@ struct GroupLane {
     worker_done: tokio::sync::Notify,
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
+    retirement_holds: Arc<std::sync::Mutex<BTreeMap<String, u64>>>,
     origin_wake: Arc<tokio::sync::Notify>,
     config: GroupLaneConfig,
     metadata: std::sync::Mutex<GroupMetadata>,
@@ -217,6 +218,7 @@ pub(crate) struct GroupEmissionLanes {
     shutdown: crate::shutdown::ShutdownToken,
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
+    retirement_holds: Arc<std::sync::Mutex<BTreeMap<String, u64>>>,
     wake: Arc<tokio::sync::Notify>,
     config: GroupLaneConfig,
     overflow_handler: Arc<std::sync::Mutex<Option<Arc<dyn Fn(GroupOverflowNotice) + Send + Sync>>>>,
@@ -239,6 +241,7 @@ impl GroupEmissionLanes {
             shutdown,
             pending,
             origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            retirement_holds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             wake: Arc::new(tokio::sync::Notify::new()),
             config,
             overflow_handler: Arc::new(std::sync::Mutex::new(None)),
@@ -284,6 +287,7 @@ impl GroupEmissionLanes {
             worker_done: tokio::sync::Notify::new(),
             pending: self.pending.clone(),
             origins: self.origins.clone(),
+            retirement_holds: self.retirement_holds.clone(),
             origin_wake: self.wake.clone(),
             config: self.config,
             metadata: std::sync::Mutex::new(GroupMetadata {
@@ -437,6 +441,10 @@ impl GroupEmissionLanes {
         self.lanes.lock().unwrap().get(path).cloned()
     }
 
+    pub(crate) fn is_closed(&self, path: &str) -> bool {
+        self.existing_lane(path).is_some_and(|lane| lane.state.lock().unwrap().closed)
+    }
+
     #[cfg(test)]
     fn set_failure_gate(&self, path: &str, gate: Arc<crate::ds::BodyGate>) {
         if let Some(lane) = self.existing_lane(path) {
@@ -467,6 +475,15 @@ impl GroupEmissionLanes {
     /// group. The sequencer's published replay position waits on this; its loop never does.
     pub(crate) fn has_any_origin_at_or_before(&self, marker_lsn: u64) -> bool {
         self.origins.lock().unwrap().keys().any(|(_, lsn)| *lsn <= marker_lsn)
+            || self.retirement_holds.lock().unwrap().values().any(|lsn| *lsn <= marker_lsn)
+    }
+
+    /// Keep the replay/checkpoint boundary behind an overflowed group's dropped prefix until its
+    /// durable GroupDropped event has been accepted. The lane's tickets can be released immediately
+    /// for memory and receipt progress, but a restart must not restore the group past a gap.
+    pub(crate) fn release_overflow_hold(&self, path: &str) {
+        self.retirement_holds.lock().unwrap().remove(path);
+        self.wake.notify_waiters();
     }
 
     /// Retire the single lane that owns the oldest receipt prefix after its wait cap has actually
@@ -573,6 +590,7 @@ impl GroupEmissionLanes {
                     subscription: meta.subscription.clone(),
                 })
             };
+            lane.retirement_holds.lock().unwrap().insert(meta.stream_path.clone(), oldest_lsn);
             if let Some(ticket) = state.held_failed.take() {
                 dropped.push(ticket);
             }
@@ -768,14 +786,10 @@ fn progress_lane_set(lanes: Vec<Arc<GroupLane>>, commit_lsn: u64) {
                 state.threshold_wait = [false; 2];
             } else if let Some(previous) = state.progress_at {
                 let delta = now.saturating_duration_since(previous);
-                // A progress call is a point observation, so a long gap cannot tell us that
-                // another stream kept landing during the whole interval. Keep the accumulated
-                // active time, but charge only closely-spaced observations; an outage or an idle
-                // source therefore does not consume the group's wait budget when it recovers.
-                let progress_gap = lane.config.max_stall / 4;
-                if lane.config.max_stall == std::time::Duration::ZERO || delta <= progress_gap {
-                    state.active_wait = state.active_wait.saturating_add(delta);
-                }
+                // Every call is made only after a successful append to another stream. A total
+                // Durable Streams outage produces no call at all, so it contributes no wait time;
+                // sparse but real progress still advances the oldest output's clock.
+                state.active_wait = state.active_wait.saturating_add(delta);
                 state.progress_at = Some(now);
             } else {
                 state.progress_at = Some(now);
