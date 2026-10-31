@@ -36,7 +36,13 @@ def readiness_body():
                 "filesystem_uuid": os.getenv("DS_FILESYSTEM_UUID"),
                 "creation_time": "2026-08-27T19:00:00Z",
             },
-            "recovery": {"completed": True, "wal_shards": []},
+            "recovery": {
+                "completed": True,
+                "wal_shards": [
+                    {"shard": 0, "durable_lsn": 0, "checkpoint_lsn": 0},
+                    {"shard": 1, "durable_lsn": 0, "checkpoint_lsn": 0},
+                ],
+            },
             "reserve": {"free_bytes": 0, "free_inodes": 0, "minimum_free_bytes": 0, "minimum_free_inodes": 0, "satisfied": True},
         },
         separators=(",", ":"),
