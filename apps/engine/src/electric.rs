@@ -1223,6 +1223,24 @@ fn refused_or_retryable<T>(error: ApiError) -> ResumeOutcome<T> {
     if error.status.is_server_error() { Err(error) } else { Ok(None) }
 }
 
+/// A resume's failure as the client should hear it. Storage being unavailable and the engine draining
+/// are `503` with `Retry-After` here: the handle is good and the answer is "come back", which a client
+/// reconnecting into a restart must not read as anything more.
+fn resume_failure(engine: &Engine, error: anyhow::Error) -> ApiError {
+    if engine.shutdown_token().is_shutting_down() {
+        return ApiError::draining();
+    }
+    if crate::ds::is_unavailable(&error) {
+        return ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("{error:#}"),
+            retry_after: Some(1),
+            must_refetch: false,
+        };
+    }
+    error.into()
+}
+
 /// Bring back a handle the registry does not know. Never serves rows from a stream the client was not
 /// reading: see [`ResumeOutcome`] for what else can come of it.
 async fn resume_handle(engine: &Engine, request: ResumeRequest<'_>) -> ResumeOutcome<Arc<HandleEntry>> {
@@ -1260,7 +1278,7 @@ async fn try_resume(
         {
             return Ok(None);
         }
-        Err(error) => return refused_or_retryable(error.into()),
+        Err(error) => return refused_or_retryable(resume_failure(engine, error)),
     };
     let claim = ResumeClaim { engine, shape_id: rec.id.clone(), subscription: subscription.to_string(), armed: true };
     if rec.id != shape_id {
@@ -1290,7 +1308,7 @@ async fn shared_keys_as_of(engine: &Engine, path: &str, offset: &str) -> ResumeO
     let rebuild = || async {
         keys_as_of(engine, path, offset).await.map(|keys| keys.map(Arc::new)).map_err(|error| {
             tracing::warn!("/v1/shape key-set rebuild of {path} at {offset} failed: {error:#}");
-            ApiError::from(error)
+            resume_failure(engine, error)
         })
     };
     engine.electric_handles.rebuilds.run((path.to_string(), offset.to_string()), rebuild).await

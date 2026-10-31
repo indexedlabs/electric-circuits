@@ -967,8 +967,9 @@ page that does not add up to its own `stream-next-offset` is refused before any 
 handle that cannot resume answers `409 must-refetch` and gives the claim back: another source's handle,
 an older handle format, a retired shape, a definition that now resolves elsewhere, or an offset the
 stream does not have. A failure that says nothing about the handle (storage unavailable, a deferred
-reactivation, closed admission) keeps its retryable `5xx`, so the client comes back with the same handle
-rather than downloading the shape again; the claim goes back meanwhile and the retry takes it again.
+reactivation, closed admission, a draining engine) answers `503` with `Retry-After`, so the client comes
+back with the same handle rather than downloading the shape again; the claim goes back meanwhile and the
+retry takes it again.
 Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay

@@ -44,6 +44,8 @@ struct ByteStore {
     reads_held: Arc<AtomicUsize>,
     /// This many rebuild reads answer 503 before the store recovers.
     failing_rebuilds: Arc<AtomicUsize>,
+    /// This many change-log HEADs answer 503 before the store recovers.
+    failing_heads: Arc<AtomicUsize>,
 }
 
 impl Default for ByteStore {
@@ -54,6 +56,7 @@ impl Default for ByteStore {
             hold_rebuilds: Arc::new(watch::channel(false).0),
             reads_held: Arc::default(),
             failing_rebuilds: Arc::default(),
+            failing_heads: Arc::default(),
         }
     }
 }
@@ -90,6 +93,11 @@ async fn byte_store(State(store): State<ByteStore>, request: Request) -> Respons
         return StatusCode::NO_CONTENT.into_response();
     }
     if method == Method::HEAD {
+        if path.contains("/changes/")
+            && store.failing_heads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let streams = store.streams.lock().unwrap();
         let Some(wire) = streams.get(&path) else { return StatusCode::NOT_FOUND.into_response() };
         let mut response = ([("stream-next-offset", format_offset(wire.bytes.len()))], "").into_response();
@@ -481,14 +489,57 @@ async fn a_storage_failure_during_a_resume_is_retried_with_the_same_handle() {
 
     stack.store.failing_rebuilds.store(1, Ordering::SeqCst);
     let failed = get(&source.app, at(&handle, &offset)).await;
-    assert!(failed.status.is_server_error(), "{} {:?}", failed.status, failed.body);
-    assert!(!failed.must_refetch());
+    assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", failed.body);
+    assert_eq!(failed.header("retry-after"), "1");
     assert_eq!(registered(&source), 0);
+    assert_eq!(claims(&source, "s1").await, 0, "a failed resume gives its claim back");
 
     let resumed = get(&source.app, at(&handle, &offset)).await;
     assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
     assert_eq!(resumed.changes(), [("delete".to_string(), "k1".to_string())]);
     assert_eq!(claims(&source, "s1").await, 1);
+}
+
+/// A reactivation that cannot finish yet leaves the shape where it was: the client comes back.
+#[tokio::test]
+async fn a_deferred_reactivation_during_a_resume_is_retried_with_the_same_handle() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, offset) = snapshot(&source).await;
+    forget_handles(&source);
+    let unreadable = crate::changelog::LogPosition { segment: 0, offset: "-1".into() };
+    source.engine.park_dormant_shape_for_test("s1", "public.items", unreadable).await;
+    stack.store.failing_heads.store(1, Ordering::SeqCst);
+
+    let failed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", failed.body);
+    assert_eq!(failed.header("retry-after"), "1");
+    assert!(failed.body["message"].as_str().unwrap().contains("reactivation was deferred"), "{:?}", failed.body);
+
+    let resumed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    assert_eq!(resumed.header("electric-handle"), handle);
+}
+
+/// A draining engine's answer to a resume it cannot finish is the one every new long-poll gets.
+#[tokio::test]
+async fn a_resume_interrupted_by_shutdown_is_retried_on_the_next_process() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    forget_handles(&source);
+
+    stack.hold_rebuilds();
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let resume = tokio::spawn(async move { get(&app, uri).await });
+    stack.rebuild_reads_arrived(1, std::slice::from_ref(&resume)).await;
+    source.engine.shutdown_token().begin();
+    let answer = tokio::time::timeout(Duration::from_secs(10), resume).await.unwrap().unwrap();
+    stack.store.hold_rebuilds.send_replace(false);
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", answer.body);
+    assert_eq!(answer.header("retry-after"), "1");
 }
 
 #[tokio::test]
