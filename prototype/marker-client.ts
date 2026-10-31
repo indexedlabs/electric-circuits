@@ -22,7 +22,7 @@ const check = () => {
 const unsubscribe = sub.collection.subscribeChanges(() => check(), { includeInitialState: true })
 check()
 await Promise.race([seen, new Promise((resolve) => setTimeout(resolve, timeoutMs))])
-unsubscribe()
+if (typeof unsubscribe === 'function') unsubscribe()
 console.log(JSON.stringify({ marker, commitMs, seenMs, latencyMs: seenMs === null ? null : seenMs - commitMs }))
 await sub.close()
 await client.close()
