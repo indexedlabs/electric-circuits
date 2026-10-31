@@ -1,7 +1,7 @@
 services:
   ds-proxy:
     build:
-      context: .
+      context: ..
       dockerfile: harness/otto-10992/Dockerfile.proxy
     environment:
       TARGET_HOST: ds
