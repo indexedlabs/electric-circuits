@@ -39,6 +39,9 @@ struct ByteStore {
     rebuild_reads: Arc<AtomicUsize>,
     /// While true, those reads park until it is false again.
     hold_rebuilds: Arc<watch::Sender<bool>>,
+    /// The rebuild reads that had arrived when the last hold was released. Counted then, because a
+    /// request that lost the race to read afterwards is a retry at an older offset, not a resume.
+    reads_held: Arc<AtomicUsize>,
 }
 
 impl Default for ByteStore {
@@ -47,6 +50,7 @@ impl Default for ByteStore {
             streams: Arc::default(),
             rebuild_reads: Arc::default(),
             hold_rebuilds: Arc::new(watch::channel(false).0),
+            reads_held: Arc::default(),
         }
     }
 }
@@ -283,6 +287,7 @@ impl Stack {
     async fn finish(&self, requests: Vec<tokio::task::JoinHandle<Answer>>) -> Vec<Answer> {
         self.rebuild_reads_arrived(1, &requests).await;
         let_requests_settle().await;
+        self.store.reads_held.store(self.store.rebuild_reads.load(Ordering::SeqCst), Ordering::SeqCst);
         self.store.hold_rebuilds.send_replace(false);
         let mut answers = Vec::new();
         for request in requests {
@@ -398,7 +403,7 @@ async fn concurrent_resumes_of_one_handle_are_one_rebuild_one_entry_one_claim() 
     }
     assert_eq!(registered(&source), 1);
     assert_eq!(claims(&source, "s1").await, 1);
-    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 1, "every resume must share one rebuild");
+    assert_eq!(stack.store.reads_held.load(Ordering::SeqCst), 1, "every resume must share one rebuild");
 }
 
 #[tokio::test]
@@ -428,7 +433,7 @@ async fn different_clients_at_one_offset_share_a_rebuild_and_keep_their_own_clai
     }
     assert_eq!(registered(&source), 2);
     assert_eq!(claims(&source, "s1").await, 2);
-    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 1, "same shape and offset must share one rebuild");
+    assert_eq!(stack.store.reads_held.load(Ordering::SeqCst), 1, "same shape and offset must share one rebuild");
 }
 
 #[tokio::test]

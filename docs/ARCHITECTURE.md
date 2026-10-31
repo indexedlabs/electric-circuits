@@ -951,18 +951,29 @@ handle is the shared shape id), the shape stream is folded into the Electric mes
 change messages preserve the source xid as `headers.txid` and, when numeric, the singleton
 `headers.txids`; synthetic snapshot inserts represent folded state rather than one source transaction
 boundary, so they omit both.
-Each Engine owns its handle registry and TTL evictor. A handle minted by another source or an earlier
-Engine receives `409 must-refetch`; snapshot-only readers are evicted like any other idle handle.
-Closing an Engine drops the registry without per-handle catalog appends; durable subscriptions retain
-their existing lease and lapse after restart.
+Each Engine owns its handle registry and TTL evictor; snapshot-only readers are evicted like any other
+idle handle. Closing an Engine drops the registry without per-handle catalog appends; durable
+subscriptions retain their existing lease and lapse after restart unless the handle comes back.
+
+A handle outlives its registry entry. It reads `<shape id>h<stream scope>.<claim>`: the claim's nonce
+makes it unique across boots, and the scope ties it to one source's streams, because shape ids repeat
+across sources. A request whose handle the registry does not know **resumes** when that is safe. The
+definition the client resent is resolved exactly as a snapshot's is, naming the handle's claim, so the
+claim is renewed rather than duplicated. It must resolve to the handle's shape id: ids are never
+re-minted, so that is the stream the client's offset points into. The key set is then rebuilt as of that
+offset, shared by every resume of the same stream at the same offset, from pages read as text. Items
+carry no offset of their own and a read runs to the tail, so the rebuild counts bytes to the cut, and a
+page that does not add up to its own `stream-next-offset` is refused. Everything else answers `409
+must-refetch`, and gives the claim back: another source's handle, an older handle format, a retired
+shape, a definition that now resolves elsewhere, an offset the stream does not have, or any error.
 Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay
 from the captured resume offset (through the sequencer's two-phase pending-buffer handshake);
 eviction **retires** the stream: closed, then deleted (§5.6), so a client tailing it is released
 with `stream-closed` and must re-subscribe; see `apps/engine/src/retention.rs`). A request with an
-evicted handle gets `409 must-refetch`,
-which the Electric client handles by re-syncing onto the retained shape. Conformance against Electric's own oracle + integration tests lives in
+evicted handle resumes like any other unknown handle; a `409 must-refetch` is handled by the Electric
+client re-syncing onto the retained shape. Conformance against Electric's own oracle + integration tests lives in
 `electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
 absolute membership emission makes them unnecessary for convergence).
 
@@ -995,7 +1006,7 @@ later appends or estimate heap usage. The catalog remains append-only and uncomp
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
-| subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
+| subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads, and durably by the resume that follows a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
 | catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
 | subset page ↔ live tail | settled page snapshot (§4) + per-pk versions (page snapshot visibility, then delta commit LSN) + delete tombstones | no double-count, no lost commit, no resurrections/ghosts across the seam |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |

@@ -82,7 +82,8 @@ class Client {
   }
 
   async snapshot(): Promise<void> {
-    expect((await this.poll()).status).toBe(200)
+    const response = await this.poll()
+    expect(response.status, await response.clone().text()).toBe(200)
   }
 
   async catchUp(): Promise<void> {
@@ -256,7 +257,8 @@ describe('conformance: Electric handles survive an engine restart', () => {
 
     await expectMustRefetch(await fetch(client.url()))
     const fresh = new Client(h, 'retired')
-    await fresh.snapshot()
+    // The boot's reconciler may still be settling this table: a 5xx is the protocol's "come back".
+    await waitFor(async () => (await fresh.poll()).status === 200, 'the refetch')
     expect(fresh.shapeId()).not.toBe(client.shapeId())
     expect([...fresh.rows.keys()]).toEqual(['1'])
     // The refused resume resolved the definition and gave its claim back: only the refetch holds it.

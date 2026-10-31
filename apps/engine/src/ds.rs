@@ -245,6 +245,13 @@ pub struct ReadResult {
     pub closed: bool,
 }
 
+/// One page of a stream as the store sent it, for a reader that decodes only part of each item.
+pub(crate) struct RawPage {
+    pub body: String,
+    pub next_offset: Option<String>,
+    pub closed: bool,
+}
+
 /// What a `HEAD` found: the stream's tail offset and whether it is closed. `None` from
 /// [`DsClient::head`] means the stream is not there (404) or soft-deleted (410).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1810,6 +1817,31 @@ impl DsClient {
             serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
         };
         Ok((ReadResult { envelopes, next_offset, up_to_date, closed }, permit))
+    }
+
+    /// Read one page without decoding it. The answers mean what they mean for [`Self::read`]; an empty
+    /// page's body is `[]`. The permit covers the body, for a budget that is enabled.
+    pub(crate) async fn read_raw(&self, path: &str, offset: &str) -> Result<(RawPage, crate::memory_budget::Permit)> {
+        let physical_path = self.physical_path(path)?;
+        let mut res = self
+            .store
+            .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
+            .await?;
+        if res.status == 404 || res.status == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
+        }
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
+        }
+        let (next_offset, closed) = (res.next_offset.clone(), res.closed);
+        let permit = std::mem::take(&mut res.permit);
+        let body = if res.status == 204 { "[]".to_string() } else { res.required_body()? };
+        Ok((RawPage { body, next_offset, closed }, permit))
+    }
+
+    /// A short name for this client's stream scope. See [`StreamScope::tag`].
+    pub(crate) fn scope_tag(&self) -> String {
+        self.scope.tag()
     }
 
     /// Read one page while decoding row bodies only for `table` and change-log control envelopes.
