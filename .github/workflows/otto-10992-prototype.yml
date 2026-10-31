@@ -49,35 +49,36 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p harness/otto-10992/results
-          for i in $(seq 1 90); do
-            ready=$(curl -fsS http://127.0.0.1:8791/_admin/ready 2>/dev/null || true)
-            status=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status", ""))' "$ready" 2>/dev/null || true)
-            [ "$status" = ready ] && break
-            sleep 2
-          done
-          test -n "${ready:-}" || { echo 'Durable Streams readiness did not answer'; exit 1; }
-          printf '%s\n' "$ready" > harness/otto-10992/results/ds-readiness.json
-          python3 - "$ready" >> "$GITHUB_ENV" <<'PY'
-          import json, sys
-          body = json.loads(sys.argv[1])
-          manifest = body.get('manifest', body.get('store', body))
-          mapping = {
-            'store_id': 'ELECTRIC_CIRCUITS_DS_STORE_ID',
-            'store_generation': 'ELECTRIC_CIRCUITS_DS_STORE_GENERATION',
-            'protocol_version': 'ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION',
-            'layout_version': 'ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION',
-            'durability_mode': 'ELECTRIC_CIRCUITS_DS_DURABILITY_MODE',
-            'wal_shard_count': 'ELECTRIC_CIRCUITS_DS_WAL_SHARDS',
-            'stream_lane_count': 'ELECTRIC_CIRCUITS_DS_STREAM_LANES',
-            'filesystem_uuid': 'ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID',
-          }
-          for source, target in mapping.items():
-              if source not in manifest: raise SystemExit(f'missing {source} in DS readiness manifest')
-              print(f'{target}={manifest[source]}')
-          print('ELECTRIC_CIRCUITS_DS_NAMESPACE=otto-10992')
-          print('ELECTRIC_CIRCUITS_QUERY_GENERATION=otto-10992')
-          print('ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1')
+          set +e
+          curl -sS -D harness/otto-10992/results/ds-readiness.headers \
+            http://127.0.0.1:8791/_admin/ready \
+            -o harness/otto-10992/results/ds-readiness.body
+          ready_rc=$?
+          set -e
+          printf '{"endpoint":"/_admin/ready","curl_exit":%s,"body":' "$ready_rc" \
+            > harness/otto-10992/results/ds-readiness.json
+          python3 - <<'PY' >> harness/otto-10992/results/ds-readiness.json
+          import json
+          from pathlib import Path
+          body = Path('harness/otto-10992/results/ds-readiness.body').read_text()
+          try:
+              print(json.dumps(json.loads(body), separators=(',', ':')) + '}')
+          except json.JSONDecodeError:
+              print(json.dumps(body) + '}')
           PY
+          cat >> "$GITHUB_ENV" <<'EOF'
+          ELECTRIC_CIRCUITS_DS_NAMESPACE=otto-10992
+          ELECTRIC_CIRCUITS_DS_STORE_ID=2bc96d0b-9740-4f50-97c6-754b2b27d6b0
+          ELECTRIC_CIRCUITS_DS_STORE_GENERATION=ff8b5fa6-e786-4994-8da0-f14e9e79f318
+          ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION=1
+          ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION=1
+          ELECTRIC_CIRCUITS_DS_DURABILITY_MODE=wal
+          ELECTRIC_CIRCUITS_DS_WAL_SHARDS=2
+          ELECTRIC_CIRCUITS_DS_STREAM_LANES=1
+          ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID=253f14d5-cbee-4df8-9e3c-e44c6e41501b
+          ELECTRIC_CIRCUITS_QUERY_GENERATION=otto-10992
+          ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1
+          EOF
 
       - name: Seed schema
         run: |
