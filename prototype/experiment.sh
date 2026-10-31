@@ -54,6 +54,7 @@ write_loop() {
 
 run_one() {
   local scenario=$1 seconds=${2:-60} stream_path=""
+  local writer=""
   export INTERVAL_S=1
   case "$scenario" in b-*) export INTERVAL_S=5;; esac
   echo "running $scenario for ${seconds}s"
@@ -88,7 +89,7 @@ run_one() {
   esac
   "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario" "$seconds"
   clear_fault
-  wait "$writer" 2>/dev/null || true
+  if [ -n "$writer" ]; then wait "$writer" 2>/dev/null || true; fi
   end_bytes=$(group_bytes)
   printf '{"write_rate_cps":%s,"hold_seconds":%s,"groups":%s,"group_bytes_written":%s}\n' \
     "$rate" "$seconds" "$groups" "$((end_bytes - start_bytes))" > "$OUT/$scenario-workload.json"
