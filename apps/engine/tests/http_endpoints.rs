@@ -435,8 +435,10 @@ async fn an_electric_snapshot_while_control_admission_is_closed_is_retryable() {
     let _ = stop.send(());
 }
 
-/// ...and a NON-live request is not: the drain window exists precisely so requests the engine has
-/// already accepted still get served.
+/// ...and a NON-live request is not turned away for being non-live: the drain window exists so
+/// requests the engine has already accepted still get served. (A snapshot is the exception on both
+/// counts: a new one needs control admission, which the flip closes, and one still waiting on a
+/// shared build is told to retry — see `apps/engine/src/electric/snapshot_tests.rs`.)
 #[tokio::test]
 async fn a_non_live_request_during_the_drain_is_served_normally() {
     let engine = library_engine();
