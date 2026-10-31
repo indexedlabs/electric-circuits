@@ -30,10 +30,9 @@ struct ReceiptWork {
 
 /// Receipt work is small (runtime fences are bounded per transaction), but it must not be allowed
 /// to park the source sequencer behind a group whose output is waiting on the same sequencer. The
-/// ingress is therefore non-blocking and explicitly bounded by this count; source fences fail
-/// closed and replay when the bound is exhausted, while runtime markers become unknown as allowed by
-/// their bounded authority cache.
-const MAX_PENDING_RECEIPTS: usize = 4096;
+/// ingress is therefore non-blocking. Receipt work remains pending until the group's lane lands
+/// or the lane's cap retires it; neither a source fence nor a runtime marker is dropped because a
+/// different group's output is temporarily holding the replay boundary.
 
 #[derive(Default)]
 struct ReceiptBarrier {
@@ -531,7 +530,6 @@ pub(crate) async fn sequencer_loop(
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let receipt_barrier = Arc::new(ReceiptBarrier::default());
     let (receipt_tx, mut receipt_rx) = mpsc::unbounded_channel::<ReceiptWork>();
-    let pending_receipts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     {
         let subq = subq.clone();
         let source_receipts = source_receipts.clone();
@@ -541,14 +539,12 @@ pub(crate) async fn sequencer_loop(
         let worker_shutdown = shutdown.clone();
         let catalog_tx = catalog_tx.clone();
         let receipt_barrier = receipt_barrier.clone();
-        let pending_receipts = pending_receipts.clone();
         shutdown.clone().spawn_background(async move {
             loop {
                 let work = tokio::select! {
                     work = receipt_rx.recv() => match work { Some(work) => work, None => return },
                     _ = worker_shutdown.wait() => return,
                 };
-                pending_receipts.fetch_sub(1, Ordering::AcqRel);
                 if !wait_for_source_effects(&subq, &worker_shutdown, work.marker_lsn).await {
                     // A degraded engine must restart from the last durable checkpoint. Leaving
                     // this marker registered would pin the publish gate forever while the
@@ -1119,26 +1115,7 @@ pub(crate) async fn sequencer_loop(
                                 runtime_fences: runtime_fences.into_fences(),
                                 runtime_incarnation,
                             };
-                            let reserved = pending_receipts
-                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                                    (pending < MAX_PENDING_RECEIPTS).then_some(pending + 1)
-                                })
-                                .is_ok();
-                            if !reserved {
-                                if work.source_receipt.is_some() {
-                                    // Never acknowledge a source fence that could not enter the
-                                    // durable receipt worker. Keep its highwater at the previous
-                                    // transaction and replay it after restart.
-                                    highwater = txn_highwater;
-                                    shutdown.begin();
-                                    processing_failed = true;
-                                } else {
-                                    receipt_barrier.complete(marker_lsn);
-                                    tracing::warn!(marker_lsn, capacity = MAX_PENDING_RECEIPTS,
-                                        "runtime receipt queue full; leaving excess marker unknown");
-                                }
-                            } else if receipt_tx.send(work).is_err() {
-                                pending_receipts.fetch_sub(1, Ordering::AcqRel);
+                            if receipt_tx.send(work).is_err() {
                                 highwater = txn_highwater;
                                 shutdown.begin();
                                 processing_failed = true;

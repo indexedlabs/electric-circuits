@@ -486,48 +486,6 @@ impl GroupEmissionLanes {
         self.wake.notify_waiters();
     }
 
-    /// Retire the single lane that owns the oldest receipt prefix after its wait cap has actually
-    /// elapsed. A full receipt queue by itself is not evidence that any group is stalled: healthy
-    /// groups can be appending concurrently, and retiring them would violate the per-group cap.
-    pub(crate) fn fail_lanes_holding(&self, marker_lsn: u64) -> bool {
-        let lanes = self.lanes.lock().unwrap().values().cloned().collect::<Vec<_>>();
-        let mut oldest: Option<u64> = None;
-        let mut candidates = Vec::new();
-        for lane in lanes {
-            let state = lane.state.lock().unwrap();
-            if lane.config.max_stall == std::time::Duration::ZERO || state.active_wait < lane.config.max_stall {
-                continue;
-            }
-            let path = lane.metadata.lock().unwrap().stream_path.clone();
-            let holds_prefix = self
-                .origins
-                .lock()
-                .unwrap()
-                .keys()
-                .any(|(origin_path, lsn)| origin_path == &path && *lsn <= marker_lsn);
-            if holds_prefix {
-                let oldest_lsn = state
-                    .in_flight
-                    .as_ref()
-                    .or_else(|| state.admitted.front())
-                    .or_else(|| state.waiting.front())
-                    .map(|ticket| ticket.entry.commit_lsn)
-                    .unwrap_or(marker_lsn);
-                if oldest.is_none_or(|current| oldest_lsn < current) {
-                    oldest = Some(oldest_lsn);
-                    candidates.clear();
-                }
-                if oldest == Some(oldest_lsn) {
-                    candidates.push((lane.clone(), state.active_wait));
-                }
-            }
-        }
-        for (lane, waited) in candidates {
-            Self::fail_lane(&lane, "wait", waited, marker_lsn);
-        }
-        oldest.is_some()
-    }
-
     pub(crate) fn wake(&self) -> Arc<tokio::sync::Notify> {
         self.wake.clone()
     }
@@ -786,10 +744,17 @@ fn progress_lane_set(lanes: Vec<Arc<GroupLane>>, commit_lsn: u64) {
                 state.threshold_wait = [false; 2];
             } else if let Some(previous) = state.progress_at {
                 let delta = now.saturating_duration_since(previous);
-                // Every call is made only after a successful append to another stream. A total
-                // Durable Streams outage produces no call at all, so it contributes no wait time;
-                // sparse but real progress still advances the oldest output's clock.
-                state.active_wait = state.active_wait.saturating_add(delta);
+                // Every call is made only after a successful append to another stream. A gap can
+                // therefore contain either a sparse source or a Durable Streams outage; a point
+                // observation cannot distinguish those cases. Charge at most one quarter of the
+                // cap per observation so recovery from a long outage cannot fail a group on its
+                // first landing, while repeated real progress still ages a genuinely stuck lane.
+                let charge = if lane.config.max_stall == std::time::Duration::ZERO {
+                    delta
+                } else {
+                    delta.min(lane.config.max_stall / 4)
+                };
+                state.active_wait = state.active_wait.saturating_add(charge);
                 state.progress_at = Some(now);
             } else {
                 state.progress_at = Some(now);
@@ -1196,8 +1161,12 @@ mod tests {
         let waiter =
             tokio::spawn(lanes.reserve("shape/group-outage", vec![failure_test_envelope()], 1).unwrap().wait());
         tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
+        // Observe one successful append before the outage, then observe the first landing after
+        // it. The recovery observation must not charge the whole silent interval to the group.
+        lanes.progress(2);
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert!(failed.lock().unwrap().is_empty(), "a total storage outage has no progress events");
+        lanes.progress(3);
+        assert!(failed.lock().unwrap().is_empty(), "recovery from a silent outage must not fail the group");
         gate.released.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

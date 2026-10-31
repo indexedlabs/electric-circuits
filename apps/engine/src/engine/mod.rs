@@ -1929,9 +1929,13 @@ impl Engine {
                     if let Err(error) = group_engine.release_group_claim(&notice.subscription, &notice.group_id).await {
                         tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow retirement failed");
                         group_engine.retirements.enqueue(&notice.stream_path, None);
-                    } else {
-                        group_engine.group_lanes.release_overflow_hold(&notice.stream_path);
                     }
+                    // `release_group_claim` writes the durable GroupDropped intent before it
+                    // reports member/stream cleanup errors, and the retirement queue retries any
+                    // physical stream deletion. Once that intent is durable, keeping the replay
+                    // hold would freeze every table forever behind a failed DELETE. Shutdown
+                    // prevents publication when the catalog write itself was not accepted.
+                    group_engine.group_lanes.release_overflow_hold(&notice.stream_path);
                 });
             }
         });
