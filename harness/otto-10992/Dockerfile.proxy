@@ -1,0 +1,3 @@
+FROM python:3.12-alpine
+COPY harness/otto-10992/proxy.py /proxy.py
+CMD ["python", "/proxy.py"]
