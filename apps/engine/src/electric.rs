@@ -1166,6 +1166,10 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
 }
 
 #[cfg(test)]
+#[path = "electric_resume_tests.rs"]
+mod resume_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ds::EnvelopeHeaders;
