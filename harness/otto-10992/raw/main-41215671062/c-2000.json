@@ -1,0 +1,78 @@
+{
+  "catchup_estimate_s": 246,
+  "change_log_lag_at_clear_bytes": 129624141,
+  "change_log_lag_end_bytes": 180711729,
+  "change_log_lag_peak_bytes": 180711729,
+  "checkpoint_lag_peak_bytes": 0,
+  "confirmed_flush_hold": [
+    "0/2BC3D18",
+    "0/B5760A8"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "ac685974052b3554549a2965a7f7e41bc294454e",
+  "envelopes_per_s_hold": 0.6657812114514369,
+  "envelopes_per_s_recovery": 1772.158942407406,
+  "envelopes_per_s_warmup": 798.7259837665673,
+  "fault": "match=/shape/group-e6a462d9f58e0688-61b84092-1c34-4e8a-977b-0e55376bc2aa&delay_ms=2000",
+  "faulted_group_envelopes_hold": 149,
+  "faulted_resume_ms": 1342,
+  "health_ms_p50_hold": 0.929,
+  "hold_s": 299,
+  "host_load1_peak_hold": 3.54,
+  "lane_backlog_peak_batches": 1,
+  "lane_backlog_peak_bytes": 842,
+  "marker_after_ms": {
+    "group": null,
+    "plain": null
+  },
+  "marker_during_ms": {
+    "group": 299856,
+    "plain": 299854
+  },
+  "pgbench_tps": 199.800946,
+  "plain_resume_ms": 1342,
+  "proxy_stats_end_hold": {
+    "delay_ms": 2000,
+    "fault_match": "/shape/group-e6a462d9f58e0688-61b84092-1c34-4e8a-977b-0e55376bc2aa",
+    "forwarded": 294669,
+    "hang": false,
+    "held": 0,
+    "outage": false,
+    "released": 0,
+    "targeted": 150,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 1,
+  "retained_wal_end_bytes": 670392,
+  "retained_wal_hold_start_bytes": 1915664,
+  "retained_wal_peak_bytes": 16361728,
+  "rss_peak_bytes": 701161472,
+  "rss_peak_hold_bytes": 45891584,
+  "rss_peak_recovery_bytes": 701161472,
+  "rss_warmup_bytes": 55283712,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065352",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 90,
+    "recovery": 36,
+    "warmup": 22
+  },
+  "scenario": "c-2000",
+  "unaffected_group_envelopes_hold": 49,
+  "unaffected_plain_envelopes_hold": 50,
+  "unaffected_plain_envelopes_recovery": 52356,
+  "unaffected_plain_envelopes_warmup": 5966
+}

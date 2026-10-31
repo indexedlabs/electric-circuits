@@ -120,6 +120,30 @@ def slot_field(rows, field):
 
 pgbench = (root / "pgbench.log").read_text() if (root / "pgbench.log").exists() else ""
 tps = re.search(r"tps = ([0-9.]+)", pgbench)
+
+
+def catchup_estimate():
+    """Seconds after the clear until the engine has processed everything committed during the
+    hold, from envelope rates: backlog = warmup rate x hold - processed in hold, drained at
+    (recovery rate - warmup rate). The after-marker latency is the measured value when seen."""
+    seen_after = marker("plain", "after")
+    if seen_after is not None:
+        return round(seen_after / 1000)
+    # Incoming is what the writers produced (4 rows per transaction), not what the engine kept up with.
+    incoming = float(tps.group(1)) * 4 if tps else None
+    recovery = rate(after, envelopes)
+    held = rate(hold, envelopes)
+    if None in (incoming, recovery, held, hold_s):
+        return None
+    backlog = max(0.0, (incoming - held) * hold_s)
+    if backlog == 0:
+        return 0
+    drain = recovery - incoming
+    if drain <= 0:
+        return None
+    return round(backlog / drain)
+
+
 hold_s = (clear - hold_start) / 1000 if hold_start and clear else None
 row = {
     "scenario": workload.get("scenario"),
@@ -140,7 +164,13 @@ row = {
     "marker_during_ms": {"plain": marker("plain", "during"), "group": marker("group", "during")},
     "marker_after_ms": {"plain": marker("plain", "after"), "group": marker("group", "after")},
     "faulted_resume_ms": first_growth_after("faulted", clear) if clear else None,
+    "plain_resume_ms": first_growth_after("plain", clear) if clear else None,
+    "unaffected_plain_envelopes_recovery": delivered("plain", clear, 10**15) if clear else None,
+    "change_log_lag_at_clear_bytes": (series(hold, log_lag) or [None])[-1],
+    "catchup_estimate_s": catchup_estimate(),
     "rss_peak_bytes": max(series(hold + after, rss), default=None),
+    "rss_peak_hold_bytes": max(series(hold, rss), default=None),
+    "rss_peak_recovery_bytes": max(series(after, rss), default=None),
     "rss_warmup_bytes": max(series(warm, rss), default=None),
     "lane_backlog_peak_bytes": max(series(hold + after, lane_bytes), default=None),
     "lane_backlog_peak_batches": max(series(hold + after, lane_batches), default=None),
