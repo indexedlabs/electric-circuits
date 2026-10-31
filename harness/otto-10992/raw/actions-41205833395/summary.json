@@ -1,0 +1,440 @@
+[
+  {
+    "envelopes_processed_end": 10003,
+    "envelopes_processed_per_s": 0.0,
+    "envelopes_processed_start": 10003,
+    "first": {
+      "ds_bytes": 541777301,
+      "engine_memory": {},
+      "engine_metrics": {
+        "append_us": {
+          "count": 0,
+          "max_us": 0,
+          "mean_us": 0,
+          "p50_us": 0,
+          "p999_us": 0,
+          "p99_us": 0
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 0,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 10003,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 1,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 0,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 0,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 10003,
+          "max_us": 772,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 1
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 1,
+          "replication_confirmed_flush_lag_bytes": 2017336,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 4195336,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 0
+        },
+        "group_lane_backlog": {
+          "shape/group-e62624a12702c740-4a3e0668-d0e4-4eca-881d-fc719bc8750b": {
+            "batches": 1,
+            "bytes": 832
+          }
+        },
+        "process_envelope_us": {
+          "count": 10003,
+          "max_us": 772,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 1
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000002036655",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000003847362",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 3.41,
+      "host_mem_available_bytes": 15235518464,
+      "host_mem_total_bytes": 16760336384,
+      "host_nproc": 4,
+      "latency_ms": 1.3470000000000002,
+      "proxy_stats": {
+        "fault_match": "/shape/group-e62624a12702c740-4a3e0668-d0e4-4eca-881d-fc719bc8750b",
+        "forwarded": 1412,
+        "hang": true,
+        "held": 1,
+        "outage": false,
+        "targeted": 1
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000004591523",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T13:21:01.709Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702818797603000362",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/213B960",
+        "pendingFlips": 1,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 6,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 11,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 1,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2172E08",
+          "current_lsn": "0/21D9D30",
+          "retained_wal_bytes": 1118024,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000003847362",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000003847362",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T13:21:17Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000000000000",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000000837786"
+    },
+    "group_bytes_written": 45955584,
+    "group_stream_offset_end": "0000000000000000_0000000000000000",
+    "group_stream_offset_start": "0000000000000000_0000000000000000",
+    "group_stream_path": "shape/group-e62624a12702c740-4a3e0668-d0e4-4eca-881d-fc719bc8750b",
+    "groups": 0,
+    "hold_seconds": 300,
+    "lane_backlog_peak_batches": 1,
+    "lane_backlog_peak_bytes": 832,
+    "last": {
+      "ds_bytes": 614126520,
+      "engine_memory": {},
+      "engine_metrics": {
+        "append_us": {
+          "count": 0,
+          "max_us": 0,
+          "mean_us": 0,
+          "p50_us": 0,
+          "p999_us": 0,
+          "p99_us": 0
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 0,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 10003,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 1,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 0,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 0,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 10003,
+          "max_us": 772,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 1
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 1,
+          "replication_confirmed_flush_lag_bytes": 60748256,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 64802960,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 9
+        },
+        "group_lane_backlog": {
+          "shape/group-e62624a12702c740-4a3e0668-d0e4-4eca-881d-fc719bc8750b": {
+            "batches": 1,
+            "bytes": 832
+          }
+        },
+        "process_envelope_us": {
+          "count": 10003,
+          "max_us": 772,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 1
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000002036655",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000003847362",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 2.98,
+      "host_mem_available_bytes": 15248592896,
+      "host_mem_total_bytes": 16760336384,
+      "host_nproc": 4,
+      "latency_ms": 1.867,
+      "proxy_stats": {
+        "fault_match": "/shape/group-e62624a12702c740-4a3e0668-d0e4-4eca-881d-fc719bc8750b",
+        "forwarded": 134665,
+        "hang": true,
+        "held": 10,
+        "outage": false,
+        "targeted": 10
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000076574713",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T13:21:01.709Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702818797603000362",
+          "timelineId": 1
+        },
+        "failingAppends": 1,
+        "flipFailures": 0,
+        "lsn": "0/65188B8",
+        "pendingFlips": 1,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 6,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 11,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 1,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/6522B50",
+          "current_lsn": "0/9FF16D0",
+          "retained_wal_bytes": 66756344,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000003847362",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000003847362",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T13:26:15Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000000000000",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000000837786"
+    },
+    "latency_p50_ms": 1.118,
+    "latency_p99_ms": 1.975,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 25234701,
+    "receipt_queue_peak_depth": 1,
+    "rss_peak_bytes": null,
+    "samples": 101,
+    "scenario": "a-200-20261031T132117Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000000000000",
+    "unaffected_group_offset_start": "0000000000000000_0000000000000000",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000000837786",
+    "unaffected_plain_offset_start": "0000000000000000_0000000000837786",
+    "write_rate_cps": 200
+  }
+]

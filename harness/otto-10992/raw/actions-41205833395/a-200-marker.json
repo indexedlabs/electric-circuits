@@ -1,0 +1,9 @@
+/repo/prototype/marker-client.ts:23
+const unsubscribe = sub.collection.subscribe(() => check())
+                                   ^
+
+TypeError: sub.collection.subscribe is not a function
+    at <anonymous> (/repo/prototype/marker-client.ts:23:36)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+
+Node.js v22.23.4

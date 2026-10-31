@@ -1,0 +1,3029 @@
+[
+  {
+    "envelopes_processed_end": 10002,
+    "envelopes_processed_per_s": 0.0,
+    "envelopes_processed_start": 10002,
+    "first": {
+      "ds_bytes": 541599830,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6800,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2618,
+          "bytes_shape_records": 6439,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 8,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 13137008,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 22503424,
+          "allocator_retained_bytes": 69705728,
+          "rss_bytes": 40071168,
+          "rss_mib": 38,
+          "virtual_bytes": 1003704320
+        },
+        "samples": 34
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 0,
+          "max_us": 0,
+          "mean_us": 0,
+          "p50_us": 0,
+          "p999_us": 0,
+          "p99_us": 0
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 0,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 10002,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 0,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 0,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 0,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 10002,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 2
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 2017336,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 4195336,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 0
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 10002,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000002037655",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000003849361",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 3.53,
+      "host_mem_available_bytes": 14779072512,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 1.175,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 0,
+        "hang": false,
+        "held": 5,
+        "outage": true,
+        "targeted": 5
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000003849361",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2080668",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 5,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 10,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 1,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2080698",
+          "current_lsn": "0/2081DB0",
+          "retained_wal_bytes": 4201248,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000003849361",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000003849361",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T14:53:08Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000000000000",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000000839786"
+    },
+    "group_bytes_written": 0,
+    "group_stream_offset_end": "",
+    "group_stream_offset_start": "",
+    "group_stream_path": "",
+    "groups": 0,
+    "hold_seconds": 180,
+    "lane_backlog_peak_batches": 0,
+    "lane_backlog_peak_bytes": 0,
+    "last": {
+      "ds_bytes": 541599830,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 14343544,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 23728128,
+          "allocator_retained_bytes": 68734976,
+          "rss_bytes": 41099264,
+          "rss_mib": 39,
+          "virtual_bytes": 1003692032
+        },
+        "samples": 415
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 0,
+          "max_us": 0,
+          "mean_us": 0,
+          "p50_us": 0,
+          "p999_us": 0,
+          "p99_us": 0
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 5,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 10002,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 0,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 1,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 0,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 10002,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 2
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 756464,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 4951800,
+          "retirements_pending": 1,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 6
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 10002,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000002037655",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000003849361",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 3.03,
+      "host_mem_available_bytes": 15030030336,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.934,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 0,
+        "hang": false,
+        "held": 24,
+        "outage": true,
+        "targeted": 24
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000003849361",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2080668",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 5,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 10,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 1,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2080698",
+          "current_lsn": "0/213AFE0",
+          "retained_wal_bytes": 4959568,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000003849361",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000003849361",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T14:56:04Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000000000000",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000000839786"
+    },
+    "latency_p50_ms": 0.9359999999999999,
+    "latency_p99_ms": 1.2080000000000002,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 25238796,
+    "receipt_queue_peak_depth": 0,
+    "rss_peak_bytes": 41189376,
+    "samples": 31,
+    "scenario": "b-1-20261031T145308Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000000000000",
+    "unaffected_group_offset_start": "0000000000000000_0000000000000000",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000000839786",
+    "unaffected_plain_offset_start": "0000000000000000_0000000000839786",
+    "write_rate_cps": 0
+  },
+  {
+    "envelopes_processed_end": 10829,
+    "envelopes_processed_per_s": 14.508771929824562,
+    "envelopes_processed_start": 10002,
+    "first": {
+      "ds_bytes": 541599830,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 13518536,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 23625728,
+          "allocator_retained_bytes": 68653056,
+          "rss_bytes": 41246720,
+          "rss_mib": 39,
+          "virtual_bytes": 1003692032
+        },
+        "samples": 449
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 0,
+          "max_us": 0,
+          "mean_us": 0,
+          "p50_us": 0,
+          "p999_us": 0,
+          "p99_us": 0
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 7,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 10002,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 0,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 3,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 0,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 10002,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 2
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 766344,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 4961680,
+          "retirements_pending": 1,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 6
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 10002,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000002037655",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000003849361",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 2.36,
+      "host_mem_available_bytes": 15102144512,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 1.1260000000000001,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 1,
+        "hang": false,
+        "held": 0,
+        "outage": false,
+        "targeted": 1
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000003849361",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2080668",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 5,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 10,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 1,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2080698",
+          "current_lsn": "0/213C7E8",
+          "retained_wal_bytes": 4965720,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000003849361",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000003849361",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T14:56:21Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000000022884",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000000844973"
+    },
+    "lane_backlog_peak_batches": 0,
+    "lane_backlog_peak_bytes": 0,
+    "last": {
+      "ds_bytes": 543960129,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 12519472,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 21901312,
+          "allocator_retained_bytes": 70561792,
+          "rss_bytes": 39604224,
+          "rss_mib": 37,
+          "virtual_bytes": 1003692032
+        },
+        "samples": 574
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 1654,
+          "max_us": 8471,
+          "mean_us": 2513,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 7,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 10829,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 0,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 3,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 1654,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 10829,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 0,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 56,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 6
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 10829,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 128,
+          "p99_us": 32
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000004451484",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000004451484",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.67,
+      "host_mem_available_bytes": 15383257088,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.8989999999999999,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 3335,
+        "hang": false,
+        "held": 0,
+        "outage": false,
+        "targeted": 3335
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000004451484",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/213B7F0",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 5,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 36,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/213C820",
+          "current_lsn": "0/213C820",
+          "retained_wal_bytes": 56,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000004451484",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000004451484",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T14:57:18Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000000585583",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000001425369"
+    },
+    "latency_p50_ms": 0.879,
+    "latency_p99_ms": 0.903,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 25238796,
+    "receipt_queue_peak_depth": 0,
+    "rss_peak_bytes": 41246720,
+    "samples": 11,
+    "scenario": "b-1-recovery-20261031T145620Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000000585583",
+    "unaffected_group_offset_start": "0000000000000000_0000000000022884",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000001425369",
+    "unaffected_plain_offset_start": "0000000000000000_0000000000844973"
+  },
+  {
+    "envelopes_processed_end": 30744,
+    "envelopes_processed_per_s": 0.0,
+    "envelopes_processed_start": 30744,
+    "first": {
+      "ds_bytes": 564214842,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6802,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2619,
+          "bytes_shape_records": 6443,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 8,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 13188472,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 26099712,
+          "allocator_retained_bytes": 173395968,
+          "rss_bytes": 42491904,
+          "rss_mib": 40,
+          "virtual_bytes": 1252749312
+        },
+        "samples": 1716
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 5484,
+          "max_us": 8471,
+          "mean_us": 2415,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 21,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 30744,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 2000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 9,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 5484,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 30744,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 144,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 5055848,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 8
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 30744,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 32
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000009254884",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000012429596",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.59,
+      "host_mem_available_bytes": 15097692160,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.9940000000000001,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 0,
+        "hang": false,
+        "held": 4,
+        "outage": true,
+        "targeted": 4
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000012429596",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2D70B68",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 9,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 100,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2D70C28",
+          "current_lsn": "0/2D74290",
+          "retained_wal_bytes": 5069776,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000012429596",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000012429596",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:06:09Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000002847603",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000003686997"
+    },
+    "group_bytes_written": 0,
+    "group_stream_offset_end": "",
+    "group_stream_offset_start": "",
+    "group_stream_path": "",
+    "groups": 0,
+    "hold_seconds": 1020,
+    "lane_backlog_peak_batches": 0,
+    "lane_backlog_peak_bytes": 0,
+    "last": {
+      "ds_bytes": 564214842,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 15376768,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 28024832,
+          "allocator_retained_bytes": 171966464,
+          "rss_bytes": 43905024,
+          "rss_mib": 41,
+          "virtual_bytes": 1252737024
+        },
+        "samples": 3923
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 5484,
+          "max_us": 8471,
+          "mean_us": 2415,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 51,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 30744,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 2000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 24,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 5484,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 30744,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 5726992,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 10782840,
+          "retirements_pending": 1,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 8
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 30744,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 32
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000009254884",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000012429596",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.29,
+      "host_mem_available_bytes": 15291691008,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.897,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 0,
+        "hang": false,
+        "held": 118,
+        "outage": true,
+        "targeted": 118
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000012429596",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2D70B68",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 9,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 100,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2D70C28",
+          "current_lsn": "0/32E9428",
+          "retained_wal_bytes": 10792296,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000012429596",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000012429596",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:23:08Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000002847603",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000003686997"
+    },
+    "latency_p50_ms": 0.982,
+    "latency_p99_ms": 1.488,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 152915218,
+    "receipt_queue_peak_depth": 0,
+    "rss_peak_bytes": 46350336,
+    "samples": 174,
+    "scenario": "b-15-20261031T150608Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000002847603",
+    "unaffected_group_offset_start": "0000000000000000_0000000002847603",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000003686997",
+    "unaffected_plain_offset_start": "0000000000000000_0000000003686997",
+    "write_rate_cps": 0
+  },
+  {
+    "envelopes_processed_end": 35355,
+    "envelopes_processed_per_s": 85.38888888888889,
+    "envelopes_processed_start": 30744,
+    "first": {
+      "ds_bytes": 564214842,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 12689304,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 27832320,
+          "allocator_retained_bytes": 171945984,
+          "rss_bytes": 43958272,
+          "rss_mib": 41,
+          "virtual_bytes": 1252737024
+        },
+        "samples": 3958
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 5484,
+          "max_us": 8471,
+          "mean_us": 2415,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 52,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 30744,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 2000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 25,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 5484,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 30744,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 5736504,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 10792352,
+          "retirements_pending": 1,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 8
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 30744,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 32
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000009254884",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000012429596",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.09,
+      "host_mem_available_bytes": 15325646848,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 1.2409999999999999,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 1,
+        "hang": false,
+        "held": 0,
+        "outage": false,
+        "targeted": 1
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000012429596",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2D70B68",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 9,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 100,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2D70C28",
+          "current_lsn": "0/32EFB80",
+          "retained_wal_bytes": 10818752,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000012429596",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000012429596",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:23:25Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000002847603",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000003686997"
+    },
+    "lane_backlog_peak_batches": 1,
+    "lane_backlog_peak_bytes": 838,
+    "last": {
+      "ds_bytes": 577392487,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 12759024,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 25575424,
+          "allocator_retained_bytes": 174415872,
+          "rss_bytes": 41652224,
+          "rss_mib": 39,
+          "virtual_bytes": 1252737024
+        },
+        "samples": 4074
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 14706,
+          "max_us": 10581,
+          "mean_us": 2955,
+          "p50_us": 4096,
+          "p999_us": 16384,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 52,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 35355,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 2000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 25,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 14706,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 1,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 35355,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 8
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 0,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 56,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 7
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 35355,
+          "max_us": 952,
+          "mean_us": 3,
+          "p50_us": 1,
+          "p999_us": 128,
+          "p99_us": 64
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000015792708",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000015792708",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.76,
+      "host_mem_available_bytes": 15328600064,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.887,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 18483,
+        "hang": false,
+        "held": 0,
+        "outage": false,
+        "targeted": 18483
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000015792708",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/32E93F8",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 9,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 273,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/32EFBB8",
+          "current_lsn": "0/32EFBB8",
+          "retained_wal_bytes": 56,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000015792708",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000015792708",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:24:19Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000006118495",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000006957889"
+    },
+    "latency_p50_ms": 0.969,
+    "latency_p99_ms": 1.2409999999999999,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 152915218,
+    "receipt_queue_peak_depth": 1,
+    "rss_peak_bytes": 45273088,
+    "samples": 10,
+    "scenario": "b-15-recovery-20261031T152324Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000006118495",
+    "unaffected_group_offset_start": "0000000000000000_0000000002847603",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000006957889",
+    "unaffected_plain_offset_start": "0000000000000000_0000000003686997"
+  },
+  {
+    "envelopes_processed_end": 18830,
+    "envelopes_processed_per_s": 0.0,
+    "envelopes_processed_start": 18830,
+    "first": {
+      "ds_bytes": 550688487,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6800,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2618,
+          "bytes_shape_records": 6439,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 8,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 12989368,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 23027712,
+          "allocator_retained_bytes": 128077824,
+          "rss_bytes": 40882176,
+          "rss_mib": 38,
+          "virtual_bytes": 1061900288
+        },
+        "samples": 613
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 1656,
+          "max_us": 8471,
+          "mean_us": 2518,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 7,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 18830,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 1000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 3,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 1656,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 18830,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 304,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 3252120,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 7
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 18830,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 16
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000004908386",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000007404094",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.35,
+      "host_mem_available_bytes": 15150862336,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.9890000000000001,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 0,
+        "hang": false,
+        "held": 4,
+        "outage": true,
+        "targeted": 4
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000007404094",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2456718",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 7,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 41,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2456780",
+          "current_lsn": "0/2457EC8",
+          "retained_wal_bytes": 3258080,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000007404094",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000007404094",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T14:57:37Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000001038779",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000001878369"
+    },
+    "group_bytes_written": 0,
+    "group_stream_offset_end": "",
+    "group_stream_offset_start": "",
+    "group_stream_path": "",
+    "groups": 0,
+    "hold_seconds": 420,
+    "lane_backlog_peak_batches": 0,
+    "lane_backlog_peak_bytes": 0,
+    "last": {
+      "ds_bytes": 550688487,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 14531600,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 24399872,
+          "allocator_retained_bytes": 126709760,
+          "rss_bytes": 42184704,
+          "rss_mib": 40,
+          "virtual_bytes": 1061888000
+        },
+        "samples": 1518
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 1656,
+          "max_us": 8471,
+          "mean_us": 2518,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 19,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 18830,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 1000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 8,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 1656,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 18830,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 4352912,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 7605032,
+          "retirements_pending": 1,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 7
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 18830,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 16
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000004908386",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000007404094",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 2.46,
+      "host_mem_available_bytes": 15281287168,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.8809999999999999,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 0,
+        "hang": false,
+        "held": 51,
+        "outage": true,
+        "targeted": 51
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000007404094",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/2456718",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 7,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 41,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2456780",
+          "current_lsn": "0/287F750",
+          "retained_wal_bytes": 7614312,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000007404094",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000007404094",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:04:35Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000001038779",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000001878369"
+    },
+    "latency_p50_ms": 0.9885,
+    "latency_p99_ms": 1.624,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 45071630,
+    "receipt_queue_peak_depth": 0,
+    "rss_peak_bytes": 42270720,
+    "samples": 72,
+    "scenario": "b-5-20261031T145737Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000001038779",
+    "unaffected_group_offset_start": "0000000000000000_0000000001038779",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000001878369",
+    "unaffected_plain_offset_start": "0000000000000000_0000000001878369",
+    "write_rate_cps": 0
+  },
+  {
+    "envelopes_processed_end": 20743,
+    "envelopes_processed_per_s": 33.56140350877193,
+    "envelopes_processed_start": 18830,
+    "first": {
+      "ds_bytes": 550692384,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 13048568,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 24223744,
+          "allocator_retained_bytes": 126652416,
+          "rss_bytes": 42176512,
+          "rss_mib": 40,
+          "virtual_bytes": 1061888000
+        },
+        "samples": 1552
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 1656,
+          "max_us": 8471,
+          "mean_us": 2518,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 21,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 18830,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 1000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 9,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 1656,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 18830,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 4362192,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 7614312,
+          "retirements_pending": 1,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 7
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 18830,
+          "max_us": 952,
+          "mean_us": 1,
+          "p50_us": 1,
+          "p999_us": 64,
+          "p99_us": 16
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000004908386",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000007404094",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.99,
+      "host_mem_available_bytes": 15349944320,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 1.145,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 44,
+        "hang": false,
+        "held": 0,
+        "outage": false,
+        "targeted": 44
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000007424026",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/245B340",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 7,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 41,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/2456780",
+          "current_lsn": "0/28853A0",
+          "retained_wal_bytes": 7637944,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000007404094",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000007404094",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:04:52Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000001041615",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000001878369"
+    },
+    "lane_backlog_peak_batches": 0,
+    "lane_backlog_peak_bytes": 0,
+    "last": {
+      "ds_bytes": 556150476,
+      "engine_memory": {
+        "cardinalities": {
+          "bytes_circuit_integral": 0,
+          "bytes_circuit_snapshots": 0,
+          "bytes_electric_adapter": 0,
+          "bytes_executors": 6790,
+          "bytes_feed_sets": 0,
+          "bytes_membership_circuit": 0,
+          "bytes_pk_dict": 0,
+          "bytes_retention": 2616,
+          "bytes_shape_records": 6341,
+          "bytes_subquery_registry": 51,
+          "families": 1,
+          "family_shapes": 1,
+          "shapes": 7,
+          "shapes_dormant": 0,
+          "standalone": 6,
+          "subquery_contributors": 0,
+          "subquery_distinct_values": 0,
+          "subquery_edges": 0,
+          "subquery_feed_entries": 0,
+          "subquery_nodes": 0,
+          "subquery_shapes": 0,
+          "tables": 5,
+          "tailers": 5
+        },
+        "process": {
+          "allocator_allocated_bytes": 12781480,
+          "allocator_config": {
+            "background_thread": true,
+            "dirty_decay_ms": 1000,
+            "muzzy_decay_ms": 1000
+          },
+          "allocator_resident_bytes": 25067520,
+          "allocator_retained_bytes": 132530176,
+          "rss_bytes": 40833024,
+          "rss_mib": 38,
+          "virtual_bytes": 1208696832
+        },
+        "samples": 1677
+      },
+      "engine_metrics": {
+        "append_us": {
+          "count": 5482,
+          "max_us": 8471,
+          "mean_us": 2414,
+          "p50_us": 4096,
+          "p999_us": 8192,
+          "p99_us": 8192
+        },
+        "counters": {
+          "backfill_chunked_appends_total": 0,
+          "catalog_append_retries_total": 21,
+          "catalog_restore_retired_total": 0,
+          "changes_rotations_total": 0,
+          "changes_segments_deleted_total": 0,
+          "envelopes_processed": 20743,
+          "epoch_breaks_total": 0,
+          "epoch_resets_total": 0,
+          "family_steps": 1000,
+          "memory_permit_waits_total": 0,
+          "pending_buffer_overflows": 0,
+          "reactivation_bytes_scanned": 0,
+          "reactivation_joins_timed_out": 0,
+          "reactivation_scans_coalesced": 0,
+          "reactivation_spans": 0,
+          "reactivations_coalesced": 0,
+          "reactivations_completed": 0,
+          "reactivations_evicted_unresumable": 0,
+          "reactivations_failed": 0,
+          "reactivations_recreated": 0,
+          "reactivations_replayed": 0,
+          "reactivations_started": 0,
+          "retention_pressure": 0,
+          "retirement_retries_total": 9,
+          "schema_drift_total": 0,
+          "schema_unresolved_total": 0,
+          "sequencer_held_spills_total": 0,
+          "sequencer_orphan_fragments_total": 0,
+          "sequencer_read_cap_raised": 0,
+          "sequencer_stream_gone_failures_total": 0,
+          "shape_appends": 5482,
+          "shapes_dormanted": 0,
+          "shapes_evicted": 0,
+          "shapes_reactivated": 0,
+          "subscriptions_lapsed_total": 0,
+          "txn_chunked_appends_total": 0,
+          "txn_spill_bytes": 0,
+          "txn_spills_total": 0
+        },
+        "family_step_us": {
+          "count": 20743,
+          "max_us": 952,
+          "mean_us": 0,
+          "p50_us": 1,
+          "p999_us": 32,
+          "p99_us": 4
+        },
+        "gauges": {
+          "catalog_bytes": 417,
+          "changes_segments_retained": 1,
+          "memory_budget_bytes": 0,
+          "memory_permits_held_bytes": 0,
+          "receipt_queue_depth": 0,
+          "replication_confirmed_flush_lag_bytes": 0,
+          "replication_slot_active": 1,
+          "replication_slot_retained_wal_bytes": 56,
+          "retirements_pending": 0,
+          "sequencer_held_bytes": 0,
+          "sequencer_held_run": 0,
+          "sequencer_read_cap_failures_total": 0,
+          "shutdown_in_progress": 0,
+          "subscriptions_live": 7
+        },
+        "group_lane_backlog": {},
+        "process_envelope_us": {
+          "count": 20743,
+          "max_us": 952,
+          "mean_us": 2,
+          "p50_us": 1,
+          "p999_us": 128,
+          "p99_us": 32
+        },
+        "sequencer": {
+          "checkpoint": {
+            "offset": "0000000000000000_0000000008797982",
+            "segment": 0
+          },
+          "processed": {
+            "offset": "0000000000000000_0000000008797982",
+            "segment": 0
+          }
+        }
+      },
+      "host_load1": 1.22,
+      "host_mem_available_bytes": 15364182016,
+      "host_mem_total_bytes": 16760344576,
+      "host_nproc": 4,
+      "latency_ms": 0.839,
+      "proxy_stats": {
+        "fault_match": "",
+        "forwarded": 7668,
+        "hang": false,
+        "held": 0,
+        "outage": false,
+        "targeted": 7668
+      },
+      "replication_lsn": {
+        "changes": {
+          "offset": "0000000000000000_0000000008797982",
+          "path": "changes/0",
+          "segment": 0
+        },
+        "epoch": {
+          "boundAt": "2026-10-31T14:52:52.703Z",
+          "reason": null,
+          "slot": "electric_circuits",
+          "state": "ok",
+          "systemIdentifier": "7702842471368249387",
+          "timelineId": 1
+        },
+        "failingAppends": 0,
+        "flipFailures": 0,
+        "lsn": "0/287F720",
+        "pendingFlips": 0,
+        "replayFailed": false,
+        "settle": {
+          "boundHits": 0,
+          "checks": 7,
+          "fencedTables": 0,
+          "forgotten": 0,
+          "overflowRefusals": 0,
+          "pollerFailures": 0,
+          "pollerTicks": 95,
+          "recordBytes": 0,
+          "rejections": 0,
+          "retakes": 0,
+          "sequencedXids": 0,
+          "sequencedXidsPeak": 47,
+          "tables": 0,
+          "timeouts": 0,
+          "waitMs": {
+            "buckets": {
+              "le_10000ms": 0,
+              "le_1000ms": 0,
+              "le_100ms": 0,
+              "le_10ms": 0,
+              "le_1ms": 0,
+              "le_2500ms": 0,
+              "le_250ms": 0,
+              "le_25ms": 0,
+              "le_2ms": 0,
+              "le_30000ms": 0,
+              "le_5000ms": 0,
+              "le_500ms": 0,
+              "le_50ms": 0,
+              "le_5ms": 0,
+              "le_infms": 0
+            },
+            "count": 0,
+            "maxMs": 0,
+            "p50Ms": null,
+            "p90Ms": null,
+            "p99Ms": null,
+            "sumMs": 0
+          },
+          "waiting": 0,
+          "xidsDropped": 0
+        },
+        "sync": 0,
+        "visibilityWaits": 0
+      },
+      "rss_bytes": "",
+      "slot_stats": [
+        {
+          "active": true,
+          "confirmed_flush_lsn": "0/289E6F8",
+          "current_lsn": "0/289E6F8",
+          "retained_wal_bytes": 56,
+          "slot_name": "electric_circuits"
+        }
+      ],
+      "source_plain_offset": {
+        "offset": "0000000000000000_0000000008797982",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "source_record_offset": {
+        "offset": "0000000000000000_0000000008797982",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "ts": "2026-10-31T15:05:49Z",
+      "unaffected_group_envelopes": 0,
+      "unaffected_group_offset": "0000000000000000_0000000002394407",
+      "unaffected_plain_envelopes": 0,
+      "unaffected_plain_offset": "0000000000000000_0000000003233997"
+    },
+    "latency_p50_ms": 0.86,
+    "latency_p99_ms": 1.145,
+    "marker": {},
+    "processed_checkpoint_lag_peak_bytes": 45071630,
+    "receipt_queue_peak_depth": 0,
+    "rss_peak_bytes": 42250240,
+    "samples": 11,
+    "scenario": "b-5-recovery-20261031T150452Z",
+    "unaffected_group_envelopes": 0,
+    "unaffected_group_offset_end": "0000000000000000_0000000002394407",
+    "unaffected_group_offset_start": "0000000000000000_0000000001041615",
+    "unaffected_plain_envelopes": 0,
+    "unaffected_plain_offset_end": "0000000000000000_0000000003233997",
+    "unaffected_plain_offset_start": "0000000000000000_0000000001878369"
+  }
+]

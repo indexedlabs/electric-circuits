@@ -1,0 +1,9 @@
+/repo/prototype/client.ts:19
+sub.collection.subscribe(() => { changes += 1 })
+               ^
+
+TypeError: sub.collection.subscribe is not a function
+    at <anonymous> (/repo/prototype/client.ts:19:16)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+
+Node.js v22.23.4

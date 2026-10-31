@@ -1,0 +1,130 @@
+/repo/node_modules/.pnpm/@trpc+client@11.18.0_@trpc+server@11.18.0_typescript@7.0.2__typescript@7.0.2/node_modules/@trpc/client/src/TRPCClientError.ts:104
+      return new TRPCClientError(cause.error.message, {
+             ^
+
+TRPCClientError: engine /v1/subset-feeds -> 500: {"error":"shape 's9' creation failed: creating shape stream: PUT circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9: error sending request for url (http://ds-proxy:8792/circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9): operation timed out"}
+    at Function.from (/repo/node_modules/.pnpm/@trpc+client@11.18.0_@trpc+server@11.18.0_typescript@7.0.2__typescript@7.0.2/node_modules/@trpc/client/src/TRPCClientError.ts:104:14)
+    at <anonymous> (/repo/node_modules/.pnpm/@trpc+client@11.18.0_@trpc+server@11.18.0_typescript@7.0.2__typescript@7.0.2/node_modules/@trpc/client/src/links/httpBatchLink.ts:115:33)
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5) {
+  cause: undefined,
+  shape: {
+    message: `engine /v1/subset-feeds -> 500: {"error":"shape 's9' creation failed: creating shape stream: PUT circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9: error sending request for url (http://ds-proxy:8792/circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9): operation timed out"}`,
+    code: -32603,
+    data: {
+      code: 'INTERNAL_SERVER_ERROR',
+      httpStatus: 500,
+      stack: `Error: engine /v1/subset-feeds -> 500: {"error":"shape 's9' creation failed: creating shape stream: PUT circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9: error sending request for url (http://ds-proxy:8792/circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9): operation timed out"}\n` +
+        '    at engineJson (/repo/apps/api/src/core.ts:101:24)\n' +
+        '    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n' +
+        '    at async resolveMiddleware (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:576:22)\n' +
+        '    at async callRecursive (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:642:20)\n' +
+        '    at async callRecursive (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:642:20)\n' +
+        '    at async procedure (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:682:20)\n' +
+        '    at async <anonymous> (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/http/resolveResponse.ts:375:31)\n' +
+        '    at async Promise.all (index 0)\n' +
+        '    at async resolveResponse (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/http/resolveResponse.ts:681:35)\n' +
+        '    at async <anonymous> (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/adapters/node-http/nodeHTTPRequestHandler.ts:100:26)',
+      path: 'subset.live'
+    }
+  },
+  data: {
+    code: 'INTERNAL_SERVER_ERROR',
+    httpStatus: 500,
+    stack: `Error: engine /v1/subset-feeds -> 500: {"error":"shape 's9' creation failed: creating shape stream: PUT circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9: error sending request for url (http://ds-proxy:8792/circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9): operation timed out"}\n` +
+      '    at engineJson (/repo/apps/api/src/core.ts:101:24)\n' +
+      '    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n' +
+      '    at async resolveMiddleware (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:576:22)\n' +
+      '    at async callRecursive (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:642:20)\n' +
+      '    at async callRecursive (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:642:20)\n' +
+      '    at async procedure (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:682:20)\n' +
+      '    at async <anonymous> (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/http/resolveResponse.ts:375:31)\n' +
+      '    at async Promise.all (index 0)\n' +
+      '    at async resolveResponse (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/http/resolveResponse.ts:681:35)\n' +
+      '    at async <anonymous> (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/adapters/node-http/nodeHTTPRequestHandler.ts:100:26)',
+    path: 'subset.live'
+  },
+  meta: {
+    response: Response {
+      [Symbol(state)]: {
+        aborted: false,
+        rangeRequested: false,
+        timingAllowPassed: true,
+        requestIncludesCredentials: true,
+        type: 'default',
+        status: 500,
+        timingInfo: {
+          startTime: 577.902648,
+          redirectStartTime: 0,
+          redirectEndTime: 0,
+          postRedirectStartTime: 577.902648,
+          finalServiceWorkerStartTime: 0,
+          finalNetworkResponseStartTime: 60614.284448,
+          finalNetworkRequestStartTime: 599.011587,
+          endTime: 0,
+          encodedBodySize: 2294,
+          decodedBodySize: 2294,
+          finalConnectionTimingInfo: {
+            domainLookupStartTime: 577.902648,
+            domainLookupEndTime: 577.902648,
+            connectionStartTime: 577.902648,
+            connectionEndTime: 577.902648,
+            secureConnectionStartTime: 577.902648,
+            ALPNNegotiatedProtocol: undefined
+          }
+        },
+        cacheState: '',
+        statusText: 'Internal Server Error',
+        headersList: HeadersList {
+          cookies: null,
+          [Symbol(headers map)]: Map(6) {
+            'content-type' => [Object],
+            'vary' => [Object],
+            'date' => [Object],
+            'connection' => [Object],
+            'keep-alive' => [Object],
+            'transfer-encoding' => [Object]
+          },
+          [Symbol(headers map sorted)]: null
+        },
+        urlList: [ http://api:8790/subset.live?batch=1 ],
+        body: {
+          stream: ReadableStream {
+            [Symbol(kType)]: 'ReadableStream',
+            [Symbol(kState)]: [Object: null prototype],
+            [Symbol(nodejs.webstream.isClosedPromise)]: [Object],
+            [Symbol(nodejs.webstream.controllerErrorFunction)]: [Function (anonymous)]
+          },
+          source: null,
+          length: null
+        }
+      },
+      [Symbol(headers)]: Headers {}
+    },
+    responseJSON: [
+      {
+        error: {
+          message: `engine /v1/subset-feeds -> 500: {"error":"shape 's9' creation failed: creating shape stream: PUT circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9: error sending request for url (http://ds-proxy:8792/circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9): operation timed out"}`,
+          code: -32603,
+          data: {
+            code: 'INTERNAL_SERVER_ERROR',
+            httpStatus: 500,
+            stack: `Error: engine /v1/subset-feeds -> 500: {"error":"shape 's9' creation failed: creating shape stream: PUT circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9: error sending request for url (http://ds-proxy:8792/circuits/v1/otto-10992/stores/ff8b5fa6-e786-4994-8da0-f14e9e79f318/queries/otto-10992/shape/s9): operation timed out"}\n` +
+              '    at engineJson (/repo/apps/api/src/core.ts:101:24)\n' +
+              '    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n' +
+              '    at async resolveMiddleware (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:576:22)\n' +
+              '    at async callRecursive (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:642:20)\n' +
+              '    at async callRecursive (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:642:20)\n' +
+              '    at async procedure (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/procedureBuilder.ts:682:20)\n' +
+              '    at async <anonymous> (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/http/resolveResponse.ts:375:31)\n' +
+              '    at async Promise.all (index 0)\n' +
+              '    at async resolveResponse (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/unstable-core-do-not-import/http/resolveResponse.ts:681:35)\n' +
+              '    at async <anonymous> (/repo/node_modules/.pnpm/@trpc+server@11.18.0_typescript@7.0.2/node_modules/@trpc/server/src/adapters/node-http/nodeHTTPRequestHandler.ts:100:26)',
+            path: 'subset.live'
+          }
+        }
+      }
+    ]
+  }
+}
+
+Node.js v22.23.4
