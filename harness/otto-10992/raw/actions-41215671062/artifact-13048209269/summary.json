@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 180158630,
+  "change_log_lag_peak_bytes": 180158630,
+  "checkpoint_lag_peak_bytes": 0,
+  "confirmed_flush_hold": [
+    "0/2C342C0",
+    "0/AE64EF0"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "ac685974052b3554549a2965a7f7e41bc294454e",
+  "envelopes_per_s_hold": 6.584751635202056,
+  "envelopes_per_s_recovery": 1070.2162947176653,
+  "envelopes_per_s_warmup": 818.019318689629,
+  "fault": "match=/shape/group-e7a5c073104a5c24-530555ea-b3fb-4d81-af18-8cdc1ca1ba00&delay_ms=200",
+  "faulted_group_envelopes_hold": 1555,
+  "faulted_resume_ms": 263,
+  "health_ms_p50_hold": 1.035,
+  "hold_s": 299,
+  "host_load1_peak_hold": 3.38,
+  "lane_backlog_peak_batches": 1,
+  "lane_backlog_peak_bytes": 842,
+  "marker_after_ms": {
+    "group": null,
+    "plain": null
+  },
+  "marker_during_ms": {
+    "group": 155233,
+    "plain": 155232
+  },
+  "pgbench_tps": 200.488211,
+  "proxy_stats_end_hold": {
+    "delay_ms": 200,
+    "fault_match": "/shape/group-e7a5c073104a5c24-530555ea-b3fb-4d81-af18-8cdc1ca1ba00",
+    "forwarded": 296634,
+    "hang": false,
+    "held": 0,
+    "outage": false,
+    "released": 0,
+    "targeted": 1471,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 1,
+  "retained_wal_end_bytes": 7102736,
+  "retained_wal_hold_start_bytes": 9152152,
+  "retained_wal_peak_bytes": 13745992,
+  "rss_peak_bytes": 670830592,
+  "rss_warmup_bytes": 53792768,
+  "runner": {
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760340480,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065351",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 87,
+    "recovery": 34,
+    "warmup": 20
+  },
+  "scenario": "c-200",
+  "unaffected_group_envelopes_hold": 519,
+  "unaffected_plain_envelopes_hold": 519,
+  "unaffected_plain_envelopes_warmup": 6106
+}
