@@ -401,8 +401,11 @@ async fn every_client_of_a_shared_build_gets_its_own_handle_and_key_set() {
     }
 }
 
+/// Shutdown begins a drain in which requests the engine has already accepted are still served, so
+/// a build in flight finishes for its waiters. Engine close (after the drain) ends a build that is
+/// still running; its waiters are then told to retry.
 #[tokio::test(start_paused = true)]
-async fn shutdown_mid_build_tells_every_waiter_to_retry() {
+async fn a_draining_engine_serves_snapshots_until_it_closes() {
     let source = Source::new("scripted://shutdown").await;
     source.append(rows()).await;
     let gate = source.hold();
@@ -410,11 +413,30 @@ async fn shutdown_mid_build_tells_every_waiter_to_retry() {
     quiesce().await;
     assert_eq!(gate.arrived.load(SeqCst), 1);
     source.engine.shutdown_token().begin();
+    // A NEW snapshot must create or join its shape, a control mutation, and control admission
+    // closes when shutdown begins (unchanged by OTTO-11109): it is told to retry elsewhere.
+    let (status, _, body) = get(source.app.clone(), SNAPSHOT.into()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    source.open(&gate);
     for request in requests {
-        let (status, headers, _) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a draining engine's waiters must be told to retry");
-        assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "1");
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK, "a draining engine still serves the snapshots it accepted");
+        assert_eq!(std::str::from_utf8(&body).unwrap(), ROWS_BODY);
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn engine_close_tells_the_waiters_of_an_unfinished_build_to_retry() {
+    let source = Source::new("scripted://close").await;
+    source.append(rows()).await;
+    let gate = source.hold();
+    let request = source.spawn_get(SNAPSHOT);
+    quiesce().await;
+    assert_eq!(gate.arrived.load(SeqCst), 1);
+    source.engine.close(Duration::from_secs(1)).await;
+    let (status, headers, _) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a closed engine's waiters must be told to retry");
+    assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "1");
     assert!(source.engine.electric_handles.snapshots.lock().unwrap().is_empty(), "an abandoned build is not kept");
 }
 

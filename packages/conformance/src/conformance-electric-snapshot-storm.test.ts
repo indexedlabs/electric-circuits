@@ -1,7 +1,8 @@
 // A reconnect storm on `GET /v1/shape?offset=-1` (OTTO-11109, #v-shared-first-response).
 //
 // After an engine restart every Electric client's handle is gone, so all of them re-request
-// `offset=-1` within seconds. Many clients per shape, a third of them disconnecting mid-request,
+// `offset=-1` within seconds. The shapes already exist (the restart restores them); many clients
+// per shape, about a third of every shape's clients disconnecting while the engine is answering,
 // must each end with exactly PostgreSQL's rows, and every client of one shape at one tail must be
 // sent the same bytes. Each client then catches up on later writes with its own handle and key
 // set. The engine's `/metrics` counters show the storm was served by at most one build per shape
@@ -109,14 +110,26 @@ describe('conformance: /v1/shape reconnect storm', () => {
   })
 
   it('serves every client of a storm PostgreSQL rows, the same bytes per shape, and its own key set', async () => {
+    // The shapes exist before the storm, as they do after a restart: clients had subscribed, the
+    // engine went down, and every handle went with it.
+    await Promise.all(
+      Array.from({ length: SHAPES }, async (_, grp) => {
+        const res = await fetch(shapeUrl(harness, grp, '&offset=-1'))
+        expect(res.status, await res.text()).toBe(200)
+      }),
+    )
+    await harness.restartEngine()
+
     type Outcome = { grp: number; status: number; handle: string | null; offset: string | null; body: string } | null
     const before = await snapshotCounters(harness)
+    const aborts: { n: number; abort: AbortController }[] = []
     const requests: Promise<Outcome>[] = []
     for (let n = 0; n < SHAPES * CLIENTS_PER_SHAPE; n++) {
       const grp = n % SHAPES
       const abort = new AbortController()
-      const cancels = n % 3 === 0
-      if (cancels) setTimeout(() => abort.abort(), n % 20)
+      // Independent of the shape: every shape has clients that disconnect and clients that stay.
+      const cancels = Math.floor(n / SHAPES) % 3 === 0
+      if (cancels) aborts.push({ n, abort })
       requests.push(
         (async () => {
           try {
@@ -136,8 +149,14 @@ describe('conformance: /v1/shape reconnect storm', () => {
         })(),
       )
     }
+    // Disconnect only once the engine is answering, so the aborted requests are in flight there
+    // (a timer set before the loop above fires only after every request was issued, and before
+    // any reached the engine). Each one leaves at its own moment over the next 50 ms.
+    await Promise.race(requests.filter((_, n) => Math.floor(n / SHAPES) % 3 !== 0))
+    for (const { n, abort } of aborts) setTimeout(() => abort.abort(), (n * 7) % 50)
     const outcomes = (await Promise.all(requests)).filter((o): o is NonNullable<Outcome> => o !== null)
-    expect(outcomes.length).toBeGreaterThanOrEqual((SHAPES * CLIENTS_PER_SHAPE * 2) / 3)
+    expect(outcomes.length).toBeGreaterThanOrEqual(SHAPES * CLIENTS_PER_SHAPE - aborts.length)
+    expect(outcomes.length, 'some clients must actually disconnect').toBeLessThan(SHAPES * CLIENTS_PER_SHAPE)
 
     const bytesByTail = new Map<string, string>()
     const clients: Client[] = []
@@ -156,13 +175,17 @@ describe('conformance: /v1/shape reconnect storm', () => {
     expect(new Set(clients.map((c) => c.handle)).size, 'every client gets its own handle').toBe(clients.length)
 
     // Nothing was written during the storm, so every shape has one tail: at most one build each,
-    // and every other answered client joined or reused one. (A client that aborted may still have
-    // started or joined a build, so the served clients bound the shared answers from below.)
+    // and every other answered client joined or reused one. A client that disconnected after its
+    // request reached the snapshot stage is counted by the engine but has no outcome here, so the
+    // engine's answers exceed the served clients exactly when some disconnects landed mid-request.
     const after = await snapshotCounters(harness)
     const builds = after.builds - before.builds
     const shared = after.joins - before.joins + (after.reuses - before.reuses)
     expect(builds, 'snapshot builds must be one per shape and tail, not one per client').toBeLessThanOrEqual(SHAPES)
     expect(builds + shared).toBeGreaterThanOrEqual(clients.length)
+    expect(builds + shared, 'some disconnects must land while their snapshot is in flight').toBeGreaterThan(
+      clients.length,
+    )
     expect(shared).toBeGreaterThanOrEqual(clients.length - SHAPES)
     // The same counters reach the Prometheus scrape, where a post-restart storm is watched.
     const prom = await (await fetch(`${harness.engineUrl}/metrics/prometheus`)).text()

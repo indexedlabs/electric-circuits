@@ -895,14 +895,16 @@ impl Drop for BuildEntryGuard {
     }
 }
 
-/// Run one build detached from every request, under the engine's shutdown token (shutdown drops
-/// it, and its waiters are told to retry). After publishing, the task keeps the result for
-/// [`SNAPSHOT_REUSE_TTL`] and then drops it.
+/// Run one build detached from every request, as an Engine-tracked task. Like a request the
+/// engine has already accepted, it is NOT cut off when shutdown begins: the drain window exists so
+/// accepted (non-live) requests are still served. It ends at Engine close, which aborts every
+/// tracked task after the drain, and its waiters are then told to retry. After publishing, the
+/// task keeps the result for [`SNAPSHOT_REUSE_TTL`] and then drops it.
 fn spawn_snapshot_build(engine: &Engine, path: &str, build: u64, tx: watch::Sender<SnapshotSlot>) {
     let mut guard =
         BuildEntryGuard { registry: engine.electric_handles.clone(), path: path.to_string(), build, armed: true };
     let task_engine = engine.clone();
-    engine.shutdown_token().spawn_background(async move {
+    let _ = engine.shutdown_token().spawn(async move {
         let result = build_snapshot(&task_engine, &guard.path).await.map(Arc::new).map_err(ApiError::from);
         drop(task_engine);
         guard.settle(&result);
@@ -922,8 +924,13 @@ fn spawn_snapshot_build(engine: &Engine, path: &str, build: u64, tx: watch::Send
 /// shared build answers byte-for-byte what an unshared one did.
 async fn build_snapshot(engine: &Engine, path: &str) -> anyhow::Result<Snapshot> {
     let fold: StreamFold<Box<RawValue>> = drive_fold(engine, path, StreamFold::to_tail()).await?;
-    let estimate = fold.ordered_rows().map(|(key, raw)| 48 + 2 * key.len() + raw.get().len()).sum::<usize>() + 80;
-    let mut body = Vec::with_capacity(estimate);
+    // An upper bound, so the buffer never doubles mid-write: per row the message framing (53
+    // bytes), the key (escaping at most doubles it) and the encoded row, which at most doubles the
+    // raw text (quoting turns each number or boolean into a string, at least two characters each).
+    // Pages of a large allocation that are never written are never made resident, and the buffer
+    // is shrunk to its length before it is kept, so the kept body costs what the probe reports.
+    let bound = fold.ordered_rows().map(|(key, raw)| 64 + 2 * key.len() + 2 * raw.get().len()).sum::<usize>() + 80;
+    let mut body = Vec::with_capacity(bound);
     let mut keys = Vec::with_capacity(fold.rows.len());
     body.push(b'[');
     for (key, raw) in fold.ordered_rows() {
@@ -934,6 +941,7 @@ async fn build_snapshot(engine: &Engine, path: &str) -> anyhow::Result<Snapshot>
     }
     serde_json::to_writer(&mut body, &control_msg("up-to-date"))?;
     body.push(b']');
+    body.shrink_to_fit();
     Ok(Snapshot { body: Bytes::from(body), keys, tail: fold.offset })
 }
 
