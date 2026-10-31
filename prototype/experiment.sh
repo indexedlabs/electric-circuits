@@ -112,8 +112,10 @@ run_one() {
   esac
   marker="otto-marker-$scenario-$(date +%s%N)"
   marker_commit_ms=$(date +%s%3N)
-  MARKER="$marker" MARKER_COMMIT_MS="$marker_commit_ms" MARKER_TIMEOUT_MS="$((seconds * 1000 + 120000))" \
-    LIVE_MODE=long-poll "${BASE[@]}" exec -T api pnpm exec tsx /repo/prototype/marker-client.ts >"$OUT/$scenario-marker.json" 2>&1 &
+  "${BASE[@]}" exec -T \
+    -e "MARKER=$marker" -e "MARKER_COMMIT_MS=$marker_commit_ms" \
+    -e "MARKER_TIMEOUT_MS=$((seconds * 1000 + 120000))" -e LIVE_MODE=long-poll \
+    api pnpm exec tsx /repo/prototype/marker-client.ts >"$OUT/$scenario-marker.json" 2>&1 &
   marker_reader=$!
   sleep 1
   psql -c "INSERT INTO plain_events(group_id,body) VALUES (1, '$marker')" >/dev/null
