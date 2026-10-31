@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 165476965,
+  "change_log_lag_peak_bytes": 165476965,
+  "checkpoint_lag_peak_bytes": 625688,
+  "confirmed_flush_hold": [
+    "0/2BE8360",
+    "0/B301BA8"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "04e04ca90d304b71362874d1a0250b764c7b7013",
+  "envelopes_per_s_hold": 6.624151270051668,
+  "envelopes_per_s_recovery": 1720.28013836102,
+  "envelopes_per_s_warmup": 798.4330973816233,
+  "fault": "match=/shape/group-e7c3482e15ae7940-e54f9bba-d6df-4f49-a84d-c27a78ac488f&delay_ms=200",
+  "faulted_group_envelopes_hold": 1519,
+  "faulted_resume_ms": 322,
+  "health_ms_p50_hold": 0.958,
+  "hold_s": 299,
+  "host_load1_peak_hold": 3.95,
+  "lane_backlog_peak_batches": 1,
+  "lane_backlog_peak_bytes": 842,
+  "marker_after_ms": {
+    "group": null,
+    "plain": null
+  },
+  "marker_during_ms": {
+    "group": 149289,
+    "plain": 149288
+  },
+  "pgbench_tps": 199.14421,
+  "proxy_stats_end_hold": {
+    "delay_ms": 200,
+    "fault_match": "/shape/group-e7c3482e15ae7940-e54f9bba-d6df-4f49-a84d-c27a78ac488f",
+    "forwarded": 295047,
+    "hang": false,
+    "held": 0,
+    "outage": false,
+    "released": 0,
+    "targeted": 1482,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 1,
+  "retained_wal_end_bytes": 27003888,
+  "retained_wal_hold_start_bytes": 2007408,
+  "retained_wal_peak_bytes": 27003888,
+  "rss_peak_bytes": 678277120,
+  "rss_warmup_bytes": 54870016,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065403",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 90,
+    "recovery": 36,
+    "warmup": 22
+  },
+  "scenario": "c-200",
+  "unaffected_group_envelopes_hold": 508,
+  "unaffected_plain_envelopes_hold": 508,
+  "unaffected_plain_envelopes_warmup": 5961
+}

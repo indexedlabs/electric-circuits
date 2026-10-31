@@ -1,0 +1,30 @@
+{
+  "group:after": {
+    "commit_ms": 1793464961336,
+    "latency_ms": 524,
+    "marker": "after",
+    "seen_ms": 1793464961860,
+    "stream": "group"
+  },
+  "group:during": {
+    "commit_ms": 1793464663087,
+    "latency_ms": 172,
+    "marker": "during",
+    "seen_ms": 1793464663259,
+    "stream": "group"
+  },
+  "plain:after": {
+    "commit_ms": 1793464961336,
+    "latency_ms": 520,
+    "marker": "after",
+    "seen_ms": 1793464961856,
+    "stream": "plain"
+  },
+  "plain:during": {
+    "commit_ms": 1793464663087,
+    "latency_ms": 171,
+    "marker": "during",
+    "seen_ms": 1793464663258,
+    "stream": "plain"
+  }
+}

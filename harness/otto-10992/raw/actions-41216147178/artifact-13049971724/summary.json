@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 9753,
+  "change_log_lag_peak_bytes": 39732,
+  "checkpoint_lag_peak_bytes": 922277,
+  "confirmed_flush_hold": [
+    "0/2B70848",
+    "0/B2D95D8"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "a72a5fe2d69aaa326b59e42b131b674d3eab0a75",
+  "envelopes_per_s_hold": 805.5629478166254,
+  "envelopes_per_s_recovery": 804.4187713454485,
+  "envelopes_per_s_warmup": 806.6867689452931,
+  "fault": "match=/shape/group-e7472e6a5427831c-5e83bc7c-1a31-4926-8960-007a72f31bf0&hang=1",
+  "faulted_group_envelopes_hold": 77,
+  "faulted_resume_ms": 1263,
+  "health_ms_p50_hold": 1.137,
+  "hold_s": 299,
+  "host_load1_peak_hold": 3.67,
+  "lane_backlog_peak_batches": 6190,
+  "lane_backlog_peak_bytes": 3604226,
+  "marker_after_ms": {
+    "group": 531,
+    "plain": 530
+  },
+  "marker_during_ms": {
+    "group": 182,
+    "plain": 181
+  },
+  "pgbench_tps": 201.380299,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e7472e6a5427831c-5e83bc7c-1a31-4926-8960-007a72f31bf0",
+    "forwarded": 433363,
+    "hang": true,
+    "held": 97,
+    "outage": false,
+    "released": 0,
+    "targeted": 97,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 6190,
+  "retained_wal_end_bytes": 6916768,
+  "retained_wal_hold_start_bytes": 1768880,
+  "retained_wal_peak_bytes": 15308184,
+  "rss_peak_bytes": 54435840,
+  "rss_warmup_bytes": 54009856,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760336384,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065427",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 204,
+    "recovery": 80,
+    "warmup": 21
+  },
+  "scenario": "a",
+  "unaffected_group_envelopes_hold": 60228,
+  "unaffected_plain_envelopes_hold": 60228,
+  "unaffected_plain_envelopes_warmup": 6015
+}

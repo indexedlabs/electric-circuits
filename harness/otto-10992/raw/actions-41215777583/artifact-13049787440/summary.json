@@ -1,0 +1,72 @@
+{
+  "change_log_lag_end_bytes": 15872,
+  "change_log_lag_peak_bytes": 14182110,
+  "checkpoint_lag_peak_bytes": 1901344,
+  "confirmed_flush_hold": [
+    "0/2B7CAE0",
+    "0/B206490"
+  ],
+  "delivery_errors": {
+    "faulted": 240,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "04e04ca90d304b71362874d1a0250b764c7b7013",
+  "envelopes_per_s_hold": 798.8102040130408,
+  "envelopes_per_s_recovery": 808.3146521936995,
+  "envelopes_per_s_warmup": 790.4694215994856,
+  "fault": "match=/shape/group-e7a530d5fe6640de-30f37660-1dd3-4928-bbd5-66c5bc8fcce8&hang=1",
+  "faulted_group_envelopes_hold": 0,
+  "faulted_resume_ms": null,
+  "health_ms_p50_hold": 0.9079999999999999,
+  "hold_s": 299,
+  "host_load1_peak_hold": 2.65,
+  "lane_backlog_peak_batches": 1,
+  "lane_backlog_peak_bytes": 842,
+  "marker_after_ms": {
+    "group": 198,
+    "plain": 197
+  },
+  "marker_during_ms": {
+    "group": 29781,
+    "plain": 29780
+  },
+  "pgbench_tps": 200.143738,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e7a530d5fe6640de-30f37660-1dd3-4928-bbd5-66c5bc8fcce8",
+    "forwarded": 409181,
+    "hang": true,
+    "held": 12,
+    "outage": false,
+    "released": 0,
+    "targeted": 12,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 1,
+  "retained_wal_end_bytes": 6557128,
+  "retained_wal_hold_start_bytes": 1993560,
+  "retained_wal_peak_bytes": 15889864,
+  "rss_peak_bytes": 100130816,
+  "rss_warmup_bytes": 46276608,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V45 96-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065414",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 216,
+    "recovery": 90,
+    "warmup": 23
+  },
+  "scenario": "d",
+  "unaffected_group_envelopes_hold": 59693,
+  "unaffected_plain_envelopes_hold": 59664,
+  "unaffected_plain_envelopes_warmup": 5914
+}
