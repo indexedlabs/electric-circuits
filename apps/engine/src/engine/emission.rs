@@ -95,6 +95,18 @@ impl EmissionLanes {
 
 const GROUP_LANE_CAPACITY: usize = 64;
 
+/// OTTO-10992 spike S3: how long a group lane may hold outstanding work without landing an append
+/// before a waiter retires it. The clock runs only while the lane has work (progress-gap rule): an
+/// idle lane, or a slow lane that keeps landing appends, never reaches it.
+pub(crate) fn group_progress_gap() -> std::time::Duration {
+    static GAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| {
+        std::time::Duration::from_secs(
+            std::env::var("ELECTRIC_CIRCUITS_GROUP_PROGRESS_GAP_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+        )
+    })
+}
+
 struct GroupLane {
     state: std::sync::Mutex<GroupLaneState>,
     wake: tokio::sync::Notify,
@@ -104,6 +116,11 @@ struct GroupLane {
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     origin_wake: Arc<tokio::sync::Notify>,
     metrics: Arc<crate::metrics::Metrics>,
+    /// S3: wakes the worker out of a hung append when the lane is retired.
+    cancel: tokio::sync::Notify,
+    path: String,
+    registry: std::sync::Weak<std::sync::Mutex<HashMap<String, Arc<GroupLane>>>>,
+    retired_tx: tokio::sync::mpsc::UnboundedSender<String>,
     #[cfg(test)]
     failure_gate: std::sync::Mutex<Option<Arc<crate::ds::BodyGate>>>,
 }
@@ -122,6 +139,8 @@ struct GroupLaneState {
     next_seq: u64,
     taken: u64,
     closed: bool,
+    /// S3: the last time this lane landed an append, or went from idle to holding work.
+    progress_at: std::time::Instant,
 }
 
 struct GroupBatchEntry {
@@ -157,11 +176,14 @@ pub(crate) struct GroupEmissionLanes {
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     wake: Arc<tokio::sync::Notify>,
     metrics: Arc<crate::metrics::Metrics>,
+    retired_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    retired_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>>,
 }
 
 impl GroupEmissionLanes {
     pub(crate) fn new(ds: DsClient, shutdown: crate::shutdown::ShutdownToken, pending: Arc<PendingFlips>) -> Self {
         let metrics = ds.metrics().clone();
+        let (retired_tx, retired_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             lanes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ds,
@@ -170,7 +192,23 @@ impl GroupEmissionLanes {
             origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             wake: Arc::new(tokio::sync::Notify::new()),
             metrics,
+            retired_tx,
+            retired_rx: Arc::new(std::sync::Mutex::new(Some(retired_rx))),
         }
+    }
+
+    /// S3: stream paths of lanes retired for a progress gap, for the engine to release the group.
+    pub(crate) fn take_retired_receiver(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<String>> {
+        self.retired_rx.lock().unwrap().take()
+    }
+
+    /// S3: retire every lane among `paths` that holds work and has made no progress for the gap.
+    pub(crate) fn retire_stalled(&self, paths: &HashSet<String>) -> usize {
+        let lanes: Vec<Arc<GroupLane>> = {
+            let lanes = self.lanes.lock().unwrap();
+            paths.iter().filter_map(|path| lanes.get(path).cloned()).collect()
+        };
+        lanes.into_iter().filter(|lane| lane.stalled(group_progress_gap()) && lane.retire()).count()
     }
 
     fn lane(&self, path: &str) -> Arc<GroupLane> {
@@ -187,6 +225,7 @@ impl GroupEmissionLanes {
                 next_seq: 0,
                 taken: 0,
                 closed: false,
+                progress_at: std::time::Instant::now(),
             }),
             wake: tokio::sync::Notify::new(),
             worker_wake: tokio::sync::Notify::new(),
@@ -195,6 +234,10 @@ impl GroupEmissionLanes {
             origins: self.origins.clone(),
             origin_wake: self.wake.clone(),
             metrics: self.metrics.clone(),
+            cancel: tokio::sync::Notify::new(),
+            path: path.to_string(),
+            registry: Arc::downgrade(&self.lanes),
+            retired_tx: self.retired_tx.clone(),
             #[cfg(test)]
             failure_gate: std::sync::Mutex::new(None),
         });
@@ -241,7 +284,10 @@ impl GroupEmissionLanes {
                     worker_lane.wake.notify_waiters();
                     continue;
                 };
-                let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs).await;
+                let append = tokio::select! {
+                    append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs) => append.map_err(|_| ()),
+                    _ = worker_lane.cancel.notified() => Err(()),
+                };
                 if append.is_err() {
                     #[cfg(test)]
                     let failure_gate = worker_lane.failure_gate.lock().unwrap().clone();
@@ -271,6 +317,7 @@ impl GroupEmissionLanes {
                 if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
                     state.in_flight = None;
                 }
+                state.progress_at = std::time::Instant::now();
                 drop(state);
                 complete_group_entry(&worker_lane, &ticket.entry);
                 worker_lane.wake.notify_waiters();
@@ -356,6 +403,9 @@ impl GroupEmissionLanes {
             complete_group_entry(&lane, &entry);
             return None;
         }
+        if !state.has_work() {
+            state.progress_at = std::time::Instant::now();
+        }
         let ticket = Arc::new(GroupTicket {
             seq: state.next_seq,
             entry,
@@ -379,6 +429,54 @@ impl GroupEmissionLanes {
     pub(crate) fn remove(&self, path: &str) {
         let lane = self.lanes.lock().unwrap().remove(path);
         if let Some(lane) = lane {
+            lane.close();
+        }
+    }
+}
+
+impl GroupLaneState {
+    fn has_work(&self) -> bool {
+        !self.waiting.is_empty() || !self.admitted.is_empty() || self.in_flight.is_some() || self.held_failed.is_some()
+    }
+}
+
+impl GroupLane {
+    fn stalled(&self, gap: std::time::Duration) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.closed && state.has_work() && state.progress_at.elapsed() >= gap
+    }
+
+    /// S3: close the lane, cancel its hung append, drop its queued output and hand its path to the
+    /// engine for release. Later output for the group is discarded by `reserve`.
+    fn retire(&self) -> bool {
+        if self.state.lock().unwrap().closed {
+            return false;
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            let mut lanes = registry.lock().unwrap();
+            if lanes.get(&self.path).is_some_and(|lane| std::ptr::eq(Arc::as_ptr(lane), self)) {
+                lanes.remove(&self.path);
+            }
+        }
+        let in_flight = {
+            let mut state = self.state.lock().unwrap();
+            state.in_flight.take()
+        };
+        self.close();
+        if let Some(ticket) = in_flight {
+            complete_group_entry(self, &ticket.entry);
+        }
+        self.cancel.notify_one();
+        self.metrics.group_lanes_retired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(stream_path = %self.path, gap = ?group_progress_gap(),
+            "group lane made no progress within the gap while holding work; retiring the group (OTTO-10992 S3)");
+        let _ = self.retired_tx.send(self.path.clone());
+        true
+    }
+
+    fn close(&self) {
+        let lane = self;
+        {
             let dropped = {
                 let mut state = lane.state.lock().unwrap();
                 state.closed = true;
@@ -454,7 +552,16 @@ impl GroupBatchHandle {
                     self.lane.wake.notify_waiters();
                     return;
                 }
-                Admission::Waiting => notified.await,
+                Admission::Waiting => {
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if self.lane.stalled(group_progress_gap()) {
+                                self.lane.retire();
+                            }
+                        }
+                    }
+                }
             }
         }
     }

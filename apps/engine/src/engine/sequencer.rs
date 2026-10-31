@@ -1305,6 +1305,10 @@ async fn wait_for_group_effects(
         tokio::select! {
             _ = notified => {}
             _ = shutdown.wait() => return false,
+            // S3: the receipt wait retires a group that holds it without progress for the gap.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                lanes.retire_stalled(paths);
+            }
         }
     }
 }

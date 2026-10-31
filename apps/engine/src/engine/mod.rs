@@ -1904,12 +1904,42 @@ impl Engine {
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
         engine.ensure_degrade_reaper();
+        engine.spawn_group_retirer();
         crate::electric::ensure_evictor(&engine);
         crate::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
         engine
     }
 
     /// Emit this Engine's shape counts over the shared StatsD transport.
+    /// OTTO-10992 spike S3: release the claim of every group whose lane was retired for a progress
+    /// gap, so its members are purged, its stream is retired and its clients must re-subscribe.
+    fn spawn_group_retirer(&self) {
+        let Some(mut retired) = self.group_lanes.take_retired_receiver() else { return };
+        let engine = self.clone();
+        self.shutdown.spawn_background(async move {
+            loop {
+                let path = tokio::select! {
+                    path = retired.recv() => match path { Some(path) => path, None => break },
+                    _ = engine.shutdown.wait() => break,
+                };
+                let claim = {
+                    let st = engine.state.lock().await;
+                    st.group_claims
+                        .records_iter()
+                        .find(|group| group.stream_path == path)
+                        .map(|group| (group.subscription.clone(), group.id.clone()))
+                };
+                let Some((subscription, id)) = claim else { continue };
+                let engine = engine.clone();
+                engine.shutdown.clone().spawn_background(async move {
+                    if let Err(error) = engine.release_group_claim(&subscription, &id).await {
+                        tracing::warn!(%error, stream_path = %path, "releasing a retired group failed");
+                    }
+                });
+            }
+        });
+    }
+
     pub fn spawn_statsd_shape_sampler(&self, period: Duration) {
         if !crate::statsd::enabled() {
             return;
