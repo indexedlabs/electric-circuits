@@ -1741,8 +1741,13 @@ impl Engine {
                     });
                 if restorable && lease_live {
                     self.group_lanes.register(&group.stream_path);
+                    self.group_lanes.set_metadata(
+                        &group.stream_path,
+                        &group.id,
+                        &group.subscription,
+                        group.members.iter().map(|member| member.table.clone()).collect(),
+                    );
                     st.group_claims.complete(group);
-                    self.group_fence.activate();
                 } else {
                     tracing::info!(
                         %subscription,

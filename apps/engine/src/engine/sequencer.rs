@@ -20,6 +20,66 @@ pub(crate) struct SequencerHandle {
     pub(crate) node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
 }
 
+struct ReceiptWork {
+    marker_lsn: u64,
+    commit_lsn: Option<String>,
+    source_receipt: Option<SourceDrainReceipt>,
+    runtime_fences: Vec<crate::runtime_authority::RuntimeFence>,
+    runtime_incarnation: uuid::Uuid,
+}
+
+/// Receipt work is small (runtime fences are bounded per transaction), but it must not be allowed
+/// to park the source sequencer behind a group whose output is waiting on the same sequencer. The
+/// ingress is therefore non-blocking. Receipt work remains pending until the group's lane lands
+/// or the lane's cap retires it; neither a source fence nor a runtime marker is dropped because a
+/// different group's output is temporarily holding the replay boundary.
+
+#[derive(Default)]
+struct ReceiptBarrier {
+    pending: std::sync::Mutex<BTreeMap<u64, usize>>,
+    wake: tokio::sync::Notify,
+}
+
+impl ReceiptBarrier {
+    fn register(&self, marker: u64) {
+        *self.pending.lock().unwrap().entry(marker).or_default() += 1;
+    }
+
+    fn complete(&self, marker: u64) {
+        let mut pending = self.pending.lock().unwrap();
+        if let Some(count) = pending.get_mut(&marker) {
+            *count -= 1;
+            if *count == 0 {
+                pending.remove(&marker);
+            }
+        }
+        drop(pending);
+        self.wake.notify_waiters();
+    }
+
+    fn has_at_or_before(&self, marker: u64) -> bool {
+        self.pending.lock().unwrap().keys().any(|value| *value <= marker)
+    }
+
+    async fn wait_until(&self, marker: u64, shutdown: &crate::shutdown::ShutdownToken) {
+        loop {
+            if !self.has_at_or_before(marker) || shutdown.is_shutting_down() {
+                return;
+            }
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.has_at_or_before(marker) || shutdown.is_shutting_down() {
+                return;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = shutdown.wait() => return,
+            }
+        }
+    }
+}
+
 pub(crate) enum SequencerCmd {
     /// Phase 1 of shape creation: register a PENDING shape that buffers this table's deltas while
     /// the creator runs the Postgres backfill concurrently — the sequencer itself never blocks on
@@ -144,7 +204,6 @@ pub(crate) fn spawn_sequencer(
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
     subq: SubqueryHandle,
-    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -185,7 +244,6 @@ pub(crate) fn spawn_sequencer(
         stats.clone(),
         node_states.clone(),
         subq,
-        group_fence,
         trace_tx,
         arr,
         arr_gates,
@@ -455,7 +513,6 @@ pub(crate) async fn sequencer_loop(
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
-    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -471,6 +528,61 @@ pub(crate) async fn sequencer_loop(
     _party: crate::shutdown::ShutdownParty,
 ) {
     let mut execs: HashMap<String, TableExec> = HashMap::new();
+    let receipt_barrier = Arc::new(ReceiptBarrier::default());
+    let (receipt_tx, mut receipt_rx) = mpsc::unbounded_channel::<ReceiptWork>();
+    {
+        let subq = subq.clone();
+        let source_receipts = source_receipts.clone();
+        let last_source_receipt = last_source_receipt.clone();
+        let source_receipt_progress = source_receipt_progress.clone();
+        let runtime_receipts = runtime_receipts.clone();
+        let worker_shutdown = shutdown.clone();
+        let catalog_tx = catalog_tx.clone();
+        let receipt_barrier = receipt_barrier.clone();
+        shutdown.clone().spawn_background(async move {
+            loop {
+                let work = tokio::select! {
+                    work = receipt_rx.recv() => match work { Some(work) => work, None => return },
+                    _ = worker_shutdown.wait() => return,
+                };
+                if !wait_for_source_effects(&subq, &worker_shutdown, work.marker_lsn).await {
+                    // A degraded engine must restart from the last durable checkpoint. Leaving
+                    // this marker registered would pin the publish gate forever while the
+                    // sequencer continues to read, so fail closed and let shutdown replay it.
+                    worker_shutdown.begin();
+                    break;
+                }
+                if !work.runtime_fences.is_empty() {
+                    if let Some(commit_lsn) = work.commit_lsn.as_deref() {
+                        runtime_receipts.lock().unwrap().publish(
+                            work.runtime_incarnation,
+                            work.runtime_fences,
+                            commit_lsn,
+                            std::time::Instant::now(),
+                        );
+                    }
+                }
+                let Some(receipt) = work.source_receipt else {
+                    receipt_barrier.complete(work.marker_lsn);
+                    continue;
+                };
+                let source_commit_id = receipt.source_commit_id.clone();
+                source_receipt_progress.lock().unwrap().record(&source_commit_id);
+                if let Err(error) = catalog_tx.send_durable(CatalogEvent::SourceDrained(receipt.clone())).await {
+                    tracing::error!(%error, %source_commit_id, "sequencer: source fence catalog receipt was not acknowledged");
+                    // Keep the receipt barrier held when the durable catalog did not accept it.
+                    // Shutdown preserves the earlier checkpoint and the next boot replays this
+                    // transaction rather than claiming a durable source fence.
+                    worker_shutdown.begin();
+                    break;
+                }
+                source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
+                *last_source_receipt.lock().unwrap() = Some(receipt);
+                tracing::info!(%source_commit_id, commit_lsn = ?work.commit_lsn, "source transaction durably drained");
+                receipt_barrier.complete(work.marker_lsn);
+            }
+        });
+    }
     let mut paused = start_paused;
     // A missing segment or unrecoverable body breach is terminal for this live loop. Keep reads
     // halted while the fatal restart request shuts it down at the safe checkpoint boundary.
@@ -531,13 +643,13 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
-    // Groups add one cross-lane fence: before the next source transaction is allowed to
-    // publish, all deferred subquery effects from the previous transaction must have landed.
-    // This is enabled only while at least one group lease is active; ordinary single-table
-    // shapes keep their existing throughput path.
-    let mut last_group_lsn: Option<u64> = None;
-    let mut last_group_paths = HashSet::new();
-
+    // Group output lands on its own lanes after the loop has moved on (`GroupEmissionLanes::submit`),
+    // so a full or stalled group never holds another group or a plain shape. What waits instead is
+    // what a restart, a convergence barrier and the segment-deletion floor read: `processed` and
+    // the checkpoint never pass a transaction whose group output has not landed.
+    let mut publish_gate =
+        PublishGate::new(processed.lock().unwrap().clone(), restore_highwater, receipt_barrier.clone());
+    let group_wake = subq.group_lanes.wake();
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
         if pending_read.is_none() && !paused && !sequencer_read_failed {
@@ -653,6 +765,9 @@ pub(crate) async fn sequencer_loop(
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::Barrier { done }) => {
+                    receipt_barrier
+                        .wait_until(highwater.map_or(u64::MAX, |(lsn, _)| lsn), &shutdown)
+                        .await;
                     let _ = done.send(());
                 }
                 Some(SequencerCmd::ResumeReads { done }) => {
@@ -784,14 +899,6 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if group_fence.active()
-                            && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
-                        {
-                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
-                            processing_failed = true;
-                            break;
-                        }
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -957,107 +1064,69 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
                         }
-                        // Group members, including ordinary filters, use the same bounded append
-                        // entry point as deferred subquery effects. This keeps a group's outputs
-                        // behind its source-transaction barrier and applies backpressure only to
-                        // that group's stream.
+                        // Group members, including ordinary filters, use the same bounded lane as
+                        // deferred subquery effects. The lane keeps each group's output in commit
+                        // order and applies backpressure only to that group's stream; the loop
+                        // never waits on it (`PublishGate` holds the replay boundary instead).
                         let group_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
                         let group_paths: Vec<String> = txn_pending
                             .keys()
                             .filter(|path| path.starts_with("shape/group-"))
                             .cloned()
                             .collect();
-                        let direct_group_paths: HashSet<String> = group_paths.iter().cloned().collect();
-                        for path in group_paths {
-                            if let Some(envs) = txn_pending.remove(&path) {
-                                subq.group_lanes.enqueue(&path, envs, group_lsn).await;
-                            }
-                        }
-                        // Transaction boundary: every append of this commit lands before the next
-                        // commit is processed.
+                        let group_batches: Vec<(String, Vec<Envelope>)> = group_paths
+                            .into_iter()
+                            .filter_map(|path| txn_pending.remove(&path).map(|envs| (path, envs)))
+                            .collect();
+                        // Transaction boundary: every plain append of this commit lands before the
+                        // next commit is processed. Group output is handed to its lanes only once
+                        // that flush succeeded, so a transaction that must be replayed leaves none.
+                        let other_stream_output = !txn_pending.is_empty();
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
                             tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
                             highwater = txn_highwater;
                             processing_failed = true;
                             break;
                         }
-                        if !direct_group_paths.is_empty()
-                            && !wait_for_group_effects(
-                                &subq.group_lanes,
-                                &direct_group_paths,
-                                &shutdown,
-                                group_lsn,
-                            )
-                            .await
-                        {
-                            tracing::error!(group_lsn, "group output could not land before advancing the processed position");
-                            highwater = txn_highwater;
-                            processing_failed = true;
-                            break;
+                        for (path, envs) in group_batches {
+                            subq.group_lanes.submit(&path, envs, group_lsn);
                         }
-                        if source_fence.is_some() || !runtime_fences.is_empty() {
-                            if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
-                                tracing::error!(
-                                    "sequencer: drain fence could not reach a receipt before shutdown/degradation"
-                                );
-                                highwater = txn_highwater;
-                                processing_failed = true;
-                                break;
-                            }
+                        // A wait-cap clock advances only after a successful append to a plain
+                        // stream. If storage is down and every append is stopped, no progress
+                        // event is emitted and no group consumes its wait budget.
+                        if other_stream_output {
+                            subq.group_lanes.progress(group_lsn);
                         }
                         if runtime_fences.overflowed() {
                             tracing::warn!(commit_lsn = ?lsn, capacity = crate::runtime_authority::RECEIPT_CAPACITY,
                                 "runtime marker staging full; excess receipts stay unknown; application transaction processed");
                         }
-                        // Only the runtime cache consumes these markers. In particular, runtime
-                        // traffic never advances deployment closure progress or catalog receipts.
-                        if !runtime_fences.is_empty() {
-                            if let Some(commit_lsn) = lsn.as_deref() {
-                                runtime_receipts.lock().unwrap().publish(
-                                    runtime_incarnation, runtime_fences.into_fences(), commit_lsn,
-                                    std::time::Instant::now(),
-                                );
-                            }
-                        }
-                        if let Some(source_commit_id) = source_fence {
-                            let receipt = SourceDrainReceipt {
-                                source_commit_id: source_commit_id.clone(),
-                                commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
+                        let source_receipt = source_fence.map(|source_commit_id| SourceDrainReceipt {
+                            source_commit_id,
+                            commit_lsn: lsn.clone().unwrap_or_else(|| "0/0".to_string()),
+                        });
+                        if source_receipt.is_some() || !runtime_fences.is_empty() {
+                            let marker_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX);
+                            receipt_barrier.register(marker_lsn);
+                            let work = ReceiptWork {
+                                marker_lsn,
+                                commit_lsn: lsn.clone(),
+                                source_receipt,
+                                runtime_fences: runtime_fences.into_fences(),
+                                runtime_incarnation,
                             };
-                            // This lock is the receipt/closure linearization point. Advance it
-                            // before awaiting catalog durability so a source fence already being
-                            // sequenced when admission closes is conservatively pre-closure. A
-                            // failed append never reaches `source_receipts`, so it still cannot
-                            // satisfy quiesce.
-                            source_receipt_progress.lock().unwrap().record(&source_commit_id);
-                            if let Err(error) = catalog_tx
-                                .send_durable(CatalogEvent::SourceDrained(receipt.clone()))
-                                .await
-                            {
-                                tracing::error!(
-                                    source_commit_id,
-                                    error = %error,
-                                    "sequencer: source fence catalog receipt was not acknowledged"
-                                );
+                            if receipt_tx.send(work).is_err() {
                                 highwater = txn_highwater;
+                                shutdown.begin();
                                 processing_failed = true;
+                            }
+                            if processing_failed {
                                 break;
                             }
-                            source_receipts.lock().unwrap().insert(source_commit_id.clone(), receipt.clone());
-                            *last_source_receipt.lock().unwrap() = Some(receipt);
-                            tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
-                        }
-                        if group_fence.active()
-                            && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
-                        {
-                            let paths = subq.group_lanes.paths_at_or_before(commit_lsn);
-                            if !paths.is_empty() {
-                                last_group_lsn = Some(commit_lsn);
-                                last_group_paths = paths;
-                            } else {
-                                last_group_lsn = None;
-                                last_group_paths.clear();
-                            }
+                            // The worker owns the durable catalog write. Give it a scheduling
+                            // turn before the sequencer continues to the next command/read so the
+                            // existing command barrier observes the same receipt ordering.
+                            tokio::task::yield_now().await;
                         }
                     }
                     if processing_failed {
@@ -1078,7 +1147,7 @@ pub(crate) async fn sequencer_loop(
                     // re-read the whole incomplete transaction, and `processed` is also what
                     // `GET /tables/{name}/offset` and the segment-deletion floor read.
                     if next.is_some() {
-                        *processed.lock().unwrap() = published(&pos, &held_from);
+                        publish_gate.publish(&subq.group_lanes, &processed, published(&pos, &held_from), highwater);
                     }
                     // The segment ended (ADR-0006). Cross only once a read of it comes back EMPTY
                     // (or stops advancing): "closed" can arrive alongside a page of data, and
@@ -1093,7 +1162,7 @@ pub(crate) async fn sequencer_loop(
                             Some(n) => {
                                 tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
                                 pos = LogPosition::start_of(n);
-                                *processed.lock().unwrap() = published(&pos, &held_from);
+                                publish_gate.publish(&subq.group_lanes, &processed, published(&pos, &held_from), highwater);
                                 crossed = true;
                             }
                             None => {
@@ -1111,7 +1180,7 @@ pub(crate) async fn sequencer_loop(
                                             segment_path(n)
                                         );
                                         pos = LogPosition::start_of(n);
-                                        *processed.lock().unwrap() = published(&pos, &held_from);
+                                        publish_gate.publish(&subq.group_lanes, &processed, published(&pos, &held_from), highwater);
                                         crossed = true;
                                     }
                                     Err(e) if e.is::<crate::changelog::MissingSuccessor>() => {
@@ -1137,19 +1206,24 @@ pub(crate) async fn sequencer_loop(
                             }
                         }
                     }
-                    let ckpt = published(&pos, &held_from);
+                    publish_gate.release(&subq.group_lanes, &processed, &shutdown);
+                    let (ckpt, ckpt_highwater) = publish_gate.checkpoint(
+                        &subq.group_lanes,
+                        published(&pos, &held_from),
+                        highwater,
+                    );
                     // Either half moving is progress worth persisting: the position, or — while the
                     // position is pinned behind a held run — the de-duplication highwater.
-                    let ckpt_moved = ckpt != ckpt_pos || highwater != ckpt_hw;
+                    let ckpt_moved = ckpt != ckpt_pos || ckpt_highwater != ckpt_hw;
                     if crossed || (next.is_some() && ckpt_moved && last_ckpt.elapsed() >= std::time::Duration::from_secs(2)) {
                         ckpt_pos = ckpt.clone();
-                        ckpt_hw = highwater;
+                        ckpt_hw = ckpt_highwater;
                         last_ckpt = std::time::Instant::now();
                         // The de-duplication highwater rides WITH the position (ADR-0003): a crash
                         // after a prefix of a chunked commit was applied and checkpointed would
                         // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
                         // weights are not idempotent under duplicates.
-                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater });
+                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater: ckpt_highwater });
                     }
                     if touched {
                         publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
@@ -1225,6 +1299,26 @@ pub(crate) async fn sequencer_loop(
                 }
                 }
             },
+            // Publish what group output has since landed, even while the change log is idle. The
+            // timeout covers a completion that fired before this wait was registered.
+            _ = tokio::time::timeout(std::time::Duration::from_millis(100), group_wake.notified()), if publish_gate.is_waiting() => {
+                if publish_gate.release(&subq.group_lanes, &processed, &shutdown) {
+                    let (ckpt, ckpt_highwater) = publish_gate.checkpoint(
+                        &subq.group_lanes,
+                        published(&pos, &held_from),
+                        highwater,
+                    );
+                    let crossed = ckpt.segment != ckpt_pos.segment;
+                    if crossed || ((ckpt != ckpt_pos || ckpt_highwater != ckpt_hw)
+                        && last_ckpt.elapsed() >= std::time::Duration::from_secs(2))
+                    {
+                        ckpt_pos = ckpt.clone();
+                        ckpt_hw = ckpt_highwater;
+                        last_ckpt = std::time::Instant::now();
+                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater: ckpt_highwater });
+                    }
+                }
+            }
         }
     }
     drop(pending_read);
@@ -1237,7 +1331,7 @@ pub(crate) async fn sequencer_loop(
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
     if !paused && completed_read {
-        let ckpt = published(&pos, &held_from);
+        let (ckpt, highwater) = publish_gate.checkpoint(&subq.group_lanes, published(&pos, &held_from), highwater);
         catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
         tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
     } else if paused {
@@ -1275,26 +1369,88 @@ async fn wait_for_source_effects(
     }
 }
 
-async fn wait_for_group_effects(
-    lanes: &crate::engine::emission::GroupEmissionLanes,
-    paths: &HashSet<String>,
-    shutdown: &crate::shutdown::ShutdownToken,
-    marker_lsn: u64,
-) -> bool {
-    loop {
+/// The replay boundary while group output is still landing. A completed batch publishes its
+/// position (and the de-duplication highwater riding with it) at once when no group output at or
+/// before its last commit is outstanding; otherwise it waits here, in order, behind the batches
+/// before it. Only `processed` and the checkpoint wait; the sequencer keeps reading and fanning out.
+struct PublishGate {
+    waiting: std::collections::VecDeque<(u64, LogPosition, Option<(u64, u64)>)>,
+    published: (LogPosition, Option<(u64, u64)>),
+    receipts: Arc<ReceiptBarrier>,
+}
+
+impl PublishGate {
+    fn new(pos: LogPosition, highwater: Option<(u64, u64)>, receipts: Arc<ReceiptBarrier>) -> Self {
+        Self { waiting: std::collections::VecDeque::new(), published: (pos, highwater), receipts }
+    }
+
+    fn is_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
+
+    /// The last commit covered by a batch is its highwater's LSN. Without one (library mode, or
+    /// nothing stamped yet) every outstanding group origin holds it.
+    fn publish(
+        &mut self,
+        lanes: &crate::engine::emission::GroupEmissionLanes,
+        processed: &std::sync::Mutex<LogPosition>,
+        pos: LogPosition,
+        highwater: Option<(u64, u64)>,
+    ) {
+        let marker = highwater.map_or(u64::MAX, |(lsn, _)| lsn);
+        if self.waiting.is_empty()
+            && !lanes.has_any_origin_at_or_before(marker)
+            && !self.receipts.has_at_or_before(marker)
+        {
+            *processed.lock().unwrap() = pos.clone();
+            self.published = (pos, highwater);
+        } else {
+            self.waiting.push_back((marker, pos, highwater));
+        }
+    }
+
+    /// Publish every waiting batch whose group output has landed. Nothing is published once
+    /// shutdown has begun: a lane stopped by shutdown completes its batches without landing them.
+    fn release(
+        &mut self,
+        lanes: &crate::engine::emission::GroupEmissionLanes,
+        processed: &std::sync::Mutex<LogPosition>,
+        shutdown: &crate::shutdown::ShutdownToken,
+    ) -> bool {
         if shutdown.is_shutting_down() {
             return false;
         }
-        let wake = lanes.wake();
-        let notified = wake.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !lanes.has_origin_at_or_before(paths, marker_lsn) {
-            return true;
+        let mut advanced = false;
+        while let Some((marker, _, _)) = self.waiting.front() {
+            if lanes.has_any_origin_at_or_before(*marker) || self.receipts.has_at_or_before(*marker) {
+                break;
+            }
+            let (_, pos, highwater) = self.waiting.pop_front().expect("front exists");
+            self.published = (pos, highwater);
+            advanced = true;
         }
-        tokio::select! {
-            _ = notified => {}
-            _ = shutdown.wait() => return false,
+        if advanced {
+            *processed.lock().unwrap() = self.published.0.clone();
+        }
+        advanced
+    }
+
+    /// What a checkpoint may carry: the live boundary when nothing waits, else the last
+    /// published one.
+    fn checkpoint(
+        &self,
+        lanes: &crate::engine::emission::GroupEmissionLanes,
+        pos: LogPosition,
+        highwater: Option<(u64, u64)>,
+    ) -> (LogPosition, Option<(u64, u64)>) {
+        let marker = highwater.map_or(u64::MAX, |(lsn, _)| lsn);
+        if self.waiting.is_empty()
+            && !lanes.has_any_origin_at_or_before(marker)
+            && !self.receipts.has_at_or_before(marker)
+        {
+            (pos, highwater)
+        } else {
+            self.published.clone()
         }
     }
 }
@@ -2205,9 +2361,9 @@ pub(crate) async fn process_envelope(
         };
         let work = match result {
             Ok(work) => {
-                for handle in staged_group_emissions {
-                    handle.wait().await;
-                }
+                // Reserved in commit order under the registry lock; the lane admits them in that
+                // order, so the sequencer never waits on a group's window.
+                subq.group_lanes.spawn_wait(staged_group_emissions);
                 work
             }
             Err(error) => {
@@ -2460,6 +2616,31 @@ mod source_fence_tests {
         subq.pending_flips.complete(position);
     }
 
+    #[test]
+    fn replay_boundary_waits_for_durable_receipt_before_publishing() {
+        let subq = handle(0);
+        let receipts = Arc::new(ReceiptBarrier::default());
+        receipts.register(0x20);
+        let start = LogPosition::start();
+        let next = LogPosition::start_of(1);
+        let processed = Arc::new(std::sync::Mutex::new(start.clone()));
+        let mut gate = PublishGate::new(start.clone(), None, receipts.clone());
+        gate.publish(&subq.group_lanes, &processed, next.clone(), Some((0x20, 0)));
+        assert_eq!(*processed.lock().unwrap(), start);
+        let lanes = crate::engine::emission::GroupEmissionLanes::new(
+            crate::ds::DsClient::with_test_store(
+                "scripted://publish-gate".into(),
+                Arc::new(crate::ds::ScriptedStore::default()),
+            ),
+            crate::shutdown::ShutdownToken::new(),
+            Arc::new(PendingFlips::default()),
+        );
+        assert_eq!(gate.checkpoint(&lanes, next.clone(), Some((0x20, 0))), (start.clone(), None));
+        receipts.complete(0x20);
+        assert!(gate.release(&subq.group_lanes, &processed, &crate::shutdown::ShutdownToken::new()));
+        assert_eq!(*processed.lock().unwrap(), next);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_later_flip_does_not_delay_an_earlier_marker() {
         use std::future::Future;
@@ -2608,7 +2789,6 @@ mod source_fence_tests {
             Default::default(),
             Default::default(),
             engine.subquery_handle(),
-            engine.group_fence.clone(),
             engine.trace_tx.clone(),
             None,
             HashMap::new(),
@@ -2638,8 +2818,10 @@ mod source_fence_tests {
         })
         .await;
         assert_eq!(engine.runtime_drain_receipt(&marker).unwrap().unwrap().commit_lsn, "0/20");
-        // The sequencer queued SourceDrained, but its catalog writer has not been scheduled yet.
-        assert!(engine.source_drain_receipt("deployment-fence").is_none());
+        // Runtime and source receipts may both have landed by the time the worker gets its
+        // scheduling turn. The causal assertion is that the source receipt is only observable
+        // after its durable catalog append; the barrier below still pins publication/checkpoint
+        // progress until that append completes.
         tokio::time::timeout(Duration::from_secs(1), engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
         std::future::poll_fn(|cx| {
             assert!(sequencer.as_mut().poll(cx).is_pending());
@@ -3029,7 +3211,6 @@ mod held_spill_tests {
                 Default::default(),
                 Default::default(),
                 engine.subquery_handle(),
-                engine.group_fence.clone(),
                 engine.trace_tx.clone(),
                 None,
                 HashMap::new(),

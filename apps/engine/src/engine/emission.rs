@@ -95,6 +95,41 @@ impl EmissionLanes {
 
 const GROUP_LANE_CAPACITY: usize = 64;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GroupLaneConfig {
+    pub max_backlog_bytes: u64,
+    pub max_stall: std::time::Duration,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GroupOverflowNotice {
+    pub stream_path: String,
+    pub group_id: String,
+    pub subscription: String,
+}
+
+impl Default for GroupLaneConfig {
+    fn default() -> Self {
+        Self { max_backlog_bytes: 64 * 1024 * 1024, max_stall: std::time::Duration::from_secs(60) }
+    }
+}
+
+impl GroupLaneConfig {
+    pub(crate) fn from_env() -> Self {
+        let d = Self::default();
+        let max_backlog_bytes = std::env::var("ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(d.max_backlog_bytes);
+        let max_stall = std::env::var("ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(d.max_stall);
+        Self { max_backlog_bytes, max_stall }
+    }
+}
+
 struct GroupLane {
     state: std::sync::Mutex<GroupLaneState>,
     wake: tokio::sync::Notify,
@@ -102,7 +137,12 @@ struct GroupLane {
     worker_done: tokio::sync::Notify,
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
+    retirement_holds: Arc<std::sync::Mutex<BTreeMap<String, u64>>>,
     origin_wake: Arc<tokio::sync::Notify>,
+    config: GroupLaneConfig,
+    metadata: std::sync::Mutex<GroupMetadata>,
+    overflow_handler: Arc<std::sync::Mutex<Option<Arc<dyn Fn(GroupOverflowNotice) + Send + Sync>>>>,
+    on_append_progress: Arc<dyn Fn(u64) + Send + Sync>,
     #[cfg(test)]
     failure_gate: std::sync::Mutex<Option<Arc<crate::ds::BodyGate>>>,
 }
@@ -118,9 +158,32 @@ struct GroupLaneState {
     /// A failed reliable append is held until remove() claims it, so the pending/origin entry
     /// cannot be stranded in the race between append failure and group retirement.
     held_failed: Option<Arc<GroupTicket>>,
-    next_seq: u64,
-    taken: u64,
+    pending_overflow: Option<GroupOverflowNotice>,
+    /// Reserved batches not yet landed or dropped, per commit. An origin on this path with more
+    /// entries than this is output still being produced (a flip query-back), not yet reserved.
+    live: BTreeMap<u64, usize>,
+    backlog_bytes: u64,
+    peak_batches: usize,
+    peak_bytes: u64,
+    longest_wait: std::time::Duration,
+    replay_held: bool,
+    replay_held_since: Option<std::time::Instant>,
+    /// Identity of the output whose wait budget is active. A later output gets a fresh budget
+    /// when the previous oldest entry lands, even if the lane remains busy.
+    active_oldest: Option<usize>,
+    progress_at: Option<std::time::Instant>,
+    active_wait: std::time::Duration,
+    threshold_bytes: [bool; 2],
+    threshold_wait: [bool; 2],
     closed: bool,
+}
+
+#[derive(Clone, Default)]
+struct GroupMetadata {
+    stream_path: String,
+    group_id: String,
+    subscription: String,
+    tables: Vec<String>,
 }
 
 struct GroupBatchEntry {
@@ -128,12 +191,14 @@ struct GroupBatchEntry {
     stream_path: String,
     envs: std::sync::Mutex<Option<Vec<Envelope>>>,
     accounted: std::sync::atomic::AtomicBool,
+    bytes: u64,
+    enqueued_at: std::time::Instant,
 }
 
 struct GroupTicket {
-    seq: u64,
     entry: Arc<GroupBatchEntry>,
     state: std::sync::atomic::AtomicU8,
+    cancelled: tokio::sync::Notify,
 }
 
 pub(crate) struct GroupBatchHandle {
@@ -153,19 +218,42 @@ pub(crate) struct GroupEmissionLanes {
     shutdown: crate::shutdown::ShutdownToken,
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
+    retirement_holds: Arc<std::sync::Mutex<BTreeMap<String, u64>>>,
     wake: Arc<tokio::sync::Notify>,
+    config: GroupLaneConfig,
+    overflow_handler: Arc<std::sync::Mutex<Option<Arc<dyn Fn(GroupOverflowNotice) + Send + Sync>>>>,
 }
 
 impl GroupEmissionLanes {
     pub(crate) fn new(ds: DsClient, shutdown: crate::shutdown::ShutdownToken, pending: Arc<PendingFlips>) -> Self {
+        Self::new_with_config(ds, shutdown, pending, GroupLaneConfig::from_env())
+    }
+
+    pub(crate) fn new_with_config(
+        ds: DsClient,
+        shutdown: crate::shutdown::ShutdownToken,
+        pending: Arc<PendingFlips>,
+        config: GroupLaneConfig,
+    ) -> Self {
         Self {
             lanes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ds,
             shutdown,
             pending,
             origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            retirement_holds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             wake: Arc::new(tokio::sync::Notify::new()),
+            config,
+            overflow_handler: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn set_overflow_handler(&self, handler: Arc<dyn Fn(GroupOverflowNotice) + Send + Sync>) {
+        *self.overflow_handler.lock().unwrap() = Some(handler);
+    }
+
+    pub(crate) fn clear_overflow_handler(&self) {
+        self.overflow_handler.lock().unwrap().take();
     }
 
     fn lane(&self, path: &str) -> Arc<GroupLane> {
@@ -179,8 +267,19 @@ impl GroupEmissionLanes {
                 admitted: std::collections::VecDeque::new(),
                 in_flight: None,
                 held_failed: None,
-                next_seq: 0,
-                taken: 0,
+                pending_overflow: None,
+                live: BTreeMap::new(),
+                backlog_bytes: 0,
+                peak_batches: 0,
+                peak_bytes: 0,
+                longest_wait: std::time::Duration::ZERO,
+                replay_held: false,
+                replay_held_since: None,
+                active_oldest: None,
+                progress_at: None,
+                active_wait: std::time::Duration::ZERO,
+                threshold_bytes: [false; 2],
+                threshold_wait: [false; 2],
                 closed: false,
             }),
             wake: tokio::sync::Notify::new(),
@@ -188,7 +287,24 @@ impl GroupEmissionLanes {
             worker_done: tokio::sync::Notify::new(),
             pending: self.pending.clone(),
             origins: self.origins.clone(),
+            retirement_holds: self.retirement_holds.clone(),
             origin_wake: self.wake.clone(),
+            config: self.config,
+            metadata: std::sync::Mutex::new(GroupMetadata {
+                stream_path: path.to_string(),
+                group_id: path.to_string(),
+                ..Default::default()
+            }),
+            overflow_handler: self.overflow_handler.clone(),
+            on_append_progress: {
+                let lanes = Arc::downgrade(&self.lanes);
+                Arc::new(move |commit_lsn| {
+                    if let Some(lanes) = lanes.upgrade() {
+                        let snapshot = lanes.lock().unwrap().values().cloned().collect::<Vec<_>>();
+                        progress_lane_set(snapshot, commit_lsn);
+                    }
+                })
+            },
             #[cfg(test)]
             failure_gate: std::sync::Mutex::new(None),
         });
@@ -213,7 +329,6 @@ impl GroupEmissionLanes {
                     let ticket = state.admitted.pop_front();
                     if let Some(ticket) = &ticket {
                         state.in_flight = Some(ticket.clone());
-                        state.taken = state.taken.saturating_add(1);
                     }
                     drop(state);
                     if ticket.is_some() {
@@ -231,12 +346,35 @@ impl GroupEmissionLanes {
                     if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
                         state.in_flight = None;
                     }
+                    let overflow = state.pending_overflow.take();
                     drop(state);
+                    if let Some(notice) = overflow {
+                        dispatch_overflow(&worker_lane, notice);
+                    }
                     worker_lane.wake.notify_waiters();
                     continue;
                 };
-                let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs).await;
-                if append.is_err() {
+                let append = {
+                    // Arm the notification before observing the state. `Notify::notify_waiters`
+                    // does not retain a permit, so checking first would lose a cancellation that
+                    // lands between the load and `enable()` and leave a failed lane stuck in its
+                    // append forever.
+                    let cancelled_wait = ticket.cancelled.notified();
+                    tokio::pin!(cancelled_wait);
+                    cancelled_wait.as_mut().enable();
+                    if ticket.state.load(std::sync::atomic::Ordering::Acquire) == TICKET_CANCELLED {
+                        None
+                    } else {
+                        let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs);
+                        tokio::pin!(append);
+                        tokio::select! {
+                            biased;
+                            _ = cancelled_wait => None,
+                            result = &mut append => Some(result),
+                        }
+                    }
+                };
+                if append.as_ref().is_some_and(|result| result.is_err()) {
                     #[cfg(test)]
                     let failure_gate = worker_lane.failure_gate.lock().unwrap().clone();
                     #[cfg(test)]
@@ -253,9 +391,13 @@ impl GroupEmissionLanes {
                     if !closed {
                         state.held_failed = Some(ticket.clone());
                     }
+                    let overflow = closed.then(|| state.pending_overflow.take()).flatten();
                     drop(state);
                     if closed {
                         complete_group_entry(&worker_lane, &ticket.entry);
+                    }
+                    if let Some(notice) = overflow {
+                        dispatch_overflow(&worker_lane, notice);
                     }
                     // Keep the pending count and origin held for a failed live append until
                     // remove() claims the held entry, unless removal already won the race.
@@ -265,8 +407,15 @@ impl GroupEmissionLanes {
                 if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
                     state.in_flight = None;
                 }
+                let overflow = state.pending_overflow.take();
                 drop(state);
                 complete_group_entry(&worker_lane, &ticket.entry);
+                if let Some(notice) = overflow {
+                    dispatch_overflow(&worker_lane, notice);
+                }
+                if append.as_ref().is_some_and(|result| matches!(result, Ok(true))) {
+                    (worker_lane.on_append_progress)(ticket.entry.commit_lsn);
+                }
                 worker_lane.wake.notify_waiters();
             }
         });
@@ -278,8 +427,22 @@ impl GroupEmissionLanes {
         let _ = self.lane(path);
     }
 
+    pub(crate) fn set_metadata(&self, path: &str, group_id: &str, subscription: &str, tables: Vec<String>) {
+        let lane = self.lane(path);
+        *lane.metadata.lock().unwrap() = GroupMetadata {
+            stream_path: path.to_string(),
+            group_id: group_id.to_string(),
+            subscription: subscription.to_string(),
+            tables,
+        };
+    }
+
     fn existing_lane(&self, path: &str) -> Option<Arc<GroupLane>> {
         self.lanes.lock().unwrap().get(path).cloned()
+    }
+
+    pub(crate) fn is_closed(&self, path: &str) -> bool {
+        self.existing_lane(path).is_some_and(|lane| lane.state.lock().unwrap().closed)
     }
 
     #[cfg(test)]
@@ -293,31 +456,125 @@ impl GroupEmissionLanes {
         *self.origins.lock().unwrap().entry((path.to_string(), commit_lsn)).or_default() += 1;
     }
 
+    /// Complete an origin that no reserved batch carries: a flip or create batch that has
+    /// finished reserving its output. A later commit's batch waiting on this group may now be
+    /// admitted, so this lane's waiters re-check.
     pub(crate) fn complete_origin(&self, path: &str, commit_lsn: u64) {
         complete_origin_entry(&self.origins, &self.wake, path, commit_lsn);
+        if let Some(lane) = self.existing_lane(path) {
+            lane.wake.notify_waiters();
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn has_origin_at_or_before(&self, paths: &HashSet<String>, marker_lsn: u64) -> bool {
         self.origins.lock().unwrap().iter().any(|((path, lsn), _)| *lsn <= marker_lsn && paths.contains(path))
     }
 
-    pub(crate) fn paths_at_or_before(&self, marker_lsn: u64) -> HashSet<String> {
-        self.origins
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((_, lsn), _)| *lsn <= marker_lsn)
-            .map(|((path, _), _)| path.clone())
-            .collect()
+    /// Whether any group output originating at or before `marker_lsn` has yet to land, on any
+    /// group. The sequencer's published replay position waits on this; its loop never does.
+    pub(crate) fn has_any_origin_at_or_before(&self, marker_lsn: u64) -> bool {
+        self.origins.lock().unwrap().keys().any(|(_, lsn)| *lsn <= marker_lsn)
+            || self.retirement_holds.lock().unwrap().values().any(|lsn| *lsn <= marker_lsn)
+    }
+
+    /// Keep the replay/checkpoint boundary behind an overflowed group's dropped prefix until its
+    /// durable GroupDropped event has been accepted. The lane's tickets can be released immediately
+    /// for memory and receipt progress, but a restart must not restore the group past a gap.
+    pub(crate) fn release_overflow_hold(&self, path: &str) {
+        self.retirement_holds.lock().unwrap().remove(path);
+        self.wake.notify_waiters();
     }
 
     pub(crate) fn wake(&self) -> Arc<tokio::sync::Notify> {
         self.wake.clone()
     }
 
-    /// Reserve one complete group batch in evaluation order. This is synchronous so callers can
-    /// record the order while holding the registry lock; [`GroupBatchHandle::wait`] performs the
-    /// bounded capacity wait after that lock is released.
+    /// Observe sequencer progress for the wait cap. A group only ages while another commit has
+    /// landed, so a complete Durable Streams outage remains a transport stall rather than a group
+    /// failure.
+    pub(crate) fn progress(&self, commit_lsn: u64) {
+        let lanes = self.lanes.lock().unwrap().values().cloned().collect::<Vec<_>>();
+        progress_lane_set(lanes, commit_lsn);
+    }
+
+    fn fail_lane(lane: &Arc<GroupLane>, cap: &str, stalled: std::time::Duration, sequencer_lsn: u64) {
+        let (dropped, immediate_overflow) = {
+            let mut state = lane.state.lock().unwrap();
+            if state.closed {
+                return;
+            }
+            let meta = lane.metadata.lock().unwrap().clone();
+            let oldest_lsn = state
+                .in_flight
+                .as_ref()
+                .or_else(|| state.admitted.front())
+                .or_else(|| state.waiting.front())
+                .map(|ticket| ticket.entry.commit_lsn)
+                .unwrap_or(sequencer_lsn);
+            let lag_commits = state.live.keys().filter(|lsn| **lsn <= sequencer_lsn).count() as u64;
+            tracing::event!(tracing::Level::WARN, event = "group_backlog_overflow", group_id = %meta.group_id,
+                subscription = %meta.subscription, tables = ?meta.tables, cap,
+                backlog_batches = state.waiting.len() + state.admitted.len(), backlog_bytes = queued_bytes(&state),
+                cap_bytes = lane.config.max_backlog_bytes, cap_secs = lane.config.max_stall.as_secs(),
+                stalled_secs = stalled.as_secs_f64(), lag_commits,
+                lag_lsn_bytes = sequencer_lsn.saturating_sub(oldest_lsn));
+            state.closed = true;
+            let mut dropped = Vec::new();
+            for ticket in state.waiting.drain(..) {
+                ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                ticket.cancelled.notify_waiters();
+                dropped.push(ticket);
+            }
+            for ticket in state.admitted.drain(..) {
+                ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                ticket.cancelled.notify_waiters();
+                dropped.push(ticket);
+            }
+            let immediate_overflow = if let Some(ticket) = state.in_flight.take() {
+                ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                ticket.cancelled.notify_waiters();
+                state.pending_overflow = Some(GroupOverflowNotice {
+                    stream_path: meta.stream_path.clone(),
+                    group_id: meta.group_id.clone(),
+                    subscription: meta.subscription.clone(),
+                });
+                dropped.push(ticket);
+                None
+            } else {
+                Some(GroupOverflowNotice {
+                    stream_path: meta.stream_path.clone(),
+                    group_id: meta.group_id.clone(),
+                    subscription: meta.subscription.clone(),
+                })
+            };
+            lane.retirement_holds.lock().unwrap().insert(meta.stream_path.clone(), oldest_lsn);
+            if let Some(ticket) = state.held_failed.take() {
+                dropped.push(ticket);
+            }
+            emit_group_high_water(lane, &state);
+            (dropped, immediate_overflow)
+        };
+        for ticket in dropped {
+            complete_group_entry(lane, &ticket.entry);
+        }
+        lane.wake.notify_waiters();
+        lane.worker_wake.notify_one();
+        if let Some(notice) = immediate_overflow {
+            dispatch_overflow(lane, notice);
+        }
+    }
+
+    /// Reserve one complete group batch. This is synchronous so callers can record the order while
+    /// holding the registry lock; [`GroupBatchHandle::wait`] performs the bounded capacity wait
+    /// after that lock is released.
+    ///
+    /// Every producer of a group's output (direct member output, subquery member output from the
+    /// registry, flip query-backs) reserves here, and the lane keeps commit order across them: a
+    /// batch is queued behind every batch of its own or an earlier commit, and is admitted only
+    /// when no earlier commit still has output being produced for this group (an origin no
+    /// reserved batch accounts for). A flip for commit T that reserves after a batch for T+1 is
+    /// therefore still appended first.
     pub(crate) fn reserve(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Option<GroupBatchHandle> {
         if envs.is_empty() {
             return None;
@@ -334,6 +591,7 @@ impl GroupEmissionLanes {
         envs: Vec<Envelope>,
         commit_lsn: u64,
     ) -> Option<GroupBatchHandle> {
+        let bytes = serde_json::to_vec(&envs).map(|v| v.len() as u64).unwrap_or(0);
         self.pending.add(commit_lsn);
         self.begin_origin(path, commit_lsn);
         let entry = Arc::new(GroupBatchEntry {
@@ -341,6 +599,8 @@ impl GroupEmissionLanes {
             stream_path: path.to_string(),
             envs: std::sync::Mutex::new(None),
             accounted: std::sync::atomic::AtomicBool::new(false),
+            bytes,
+            enqueued_at: std::time::Instant::now(),
         });
         let mut state = lane.state.lock().unwrap();
         if state.closed {
@@ -348,13 +608,53 @@ impl GroupEmissionLanes {
             complete_group_entry(&lane, &entry);
             return None;
         }
+        let next_bytes = state
+            .in_flight
+            .as_ref()
+            .map(|ticket| ticket.entry.bytes)
+            .or_else(|| state.admitted.front().map(|ticket| ticket.entry.bytes))
+            .or_else(|| state.waiting.front().map(|ticket| ticket.entry.bytes));
+        // The next append is governed by the durable-streams 512 MiB ceiling. Only output
+        // queued behind that append counts toward this lane's backlog cap. This check and the
+        // insertion below share the state lock, so concurrent direct and flip reservations cannot
+        // both observe the same free window.
+        let queued_after = state
+            .backlog_bytes
+            .saturating_sub(next_bytes.unwrap_or(0))
+            .saturating_add(if next_bytes.is_some() { bytes } else { 0 });
+        if self.config.max_backlog_bytes > 0 && queued_after > self.config.max_backlog_bytes {
+            drop(state);
+            complete_group_entry(&lane, &entry);
+            Self::fail_lane(&lane, "bytes", std::time::Duration::ZERO, commit_lsn);
+            return None;
+        }
+        *state.live.entry(commit_lsn).or_default() += 1;
+        state.backlog_bytes = state.backlog_bytes.saturating_add(bytes);
+        state.peak_batches = state.peak_batches.max(state.waiting.len() + state.admitted.len() + 1);
+        state.peak_bytes = state.peak_bytes.max(queued_bytes(&state));
+        for (i, fraction) in [0.5, 0.9].into_iter().enumerate() {
+            if self.config.max_backlog_bytes > 0
+                && queued_bytes(&state) as f64 >= self.config.max_backlog_bytes as f64 * fraction
+                && !state.threshold_bytes[i]
+            {
+                state.threshold_bytes[i] = true;
+                emit_group_threshold(&lane, fraction, "bytes", &state, commit_lsn);
+            }
+        }
+        if state.closed {
+            drop(state);
+            complete_group_entry(&lane, &entry);
+            return None;
+        }
         let ticket = Arc::new(GroupTicket {
-            seq: state.next_seq,
             entry,
             state: std::sync::atomic::AtomicU8::new(TICKET_WAITING),
+            cancelled: tokio::sync::Notify::new(),
         });
-        state.next_seq = state.next_seq.saturating_add(1);
-        state.waiting.push_back(ticket.clone());
+        // Commit order, then reservation order within a commit. Batches nearly always arrive in
+        // commit order, so the position is found from the back.
+        let at = state.waiting.iter().rposition(|queued| queued.entry.commit_lsn <= commit_lsn).map_or(0, |i| i + 1);
+        state.waiting.insert(at, ticket.clone());
         drop(state);
         Some(GroupBatchHandle { lane, ticket, batch: Some(envs) })
     }
@@ -367,6 +667,28 @@ impl GroupEmissionLanes {
         }
     }
 
+    /// Hand one source transaction's direct output for a group to that group's lane without
+    /// waiting on the caller, so a slow or full group never holds the source sequencer. The
+    /// reservation is synchronous, so the batch's pending count and origin are visible at once to
+    /// the next transaction, a source receipt and the published replay position.
+    pub(crate) fn submit(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
+        if let Some(handle) = self.reserve(path, envs, commit_lsn) {
+            self.spawn_wait([handle]);
+        }
+    }
+
+    /// Keep a reserved batch's admission wait off the source sequencer. The lane still admits
+    /// batches in commit order and retains the bounded payload window; only the producer's task
+    /// waits when this group's window is full.
+    pub(crate) fn spawn_wait(&self, handles: impl IntoIterator<Item = GroupBatchHandle>) {
+        for handle in handles {
+            let shutdown = self.shutdown.clone();
+            shutdown.spawn_background(async move {
+                handle.wait().await;
+            });
+        }
+    }
+
     pub(crate) fn remove(&self, path: &str) {
         let lane = self.lanes.lock().unwrap().remove(path);
         if let Some(lane) = lane {
@@ -376,12 +698,22 @@ impl GroupEmissionLanes {
                 let mut dropped = Vec::new();
                 for ticket in state.waiting.drain(..) {
                     ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                    ticket.cancelled.notify_waiters();
                     dropped.push(ticket);
                 }
-                dropped.extend(state.admitted.drain(..));
+                for ticket in state.admitted.drain(..) {
+                    ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                    ticket.cancelled.notify_waiters();
+                    dropped.push(ticket);
+                }
+                if let Some(ticket) = state.in_flight.as_ref() {
+                    ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                    ticket.cancelled.notify_waiters();
+                }
                 if let Some(ticket) = state.held_failed.take() {
                     dropped.push(ticket);
                 }
+                emit_group_high_water(&lane, &state);
                 dropped
             };
             for ticket in dropped {
@@ -390,6 +722,66 @@ impl GroupEmissionLanes {
             lane.wake.notify_waiters();
             lane.worker_wake.notify_one();
         }
+    }
+}
+
+fn progress_lane_set(lanes: Vec<Arc<GroupLane>>, commit_lsn: u64) {
+    let mut overflows = Vec::new();
+    for lane in lanes {
+        let (overflow, waited) = {
+            let mut state = lane.state.lock().unwrap();
+            let oldest = state.in_flight.as_ref().or_else(|| state.admitted.front()).or_else(|| state.waiting.front());
+            let Some(oldest) = oldest else { continue };
+            if commit_lsn <= oldest.entry.commit_lsn {
+                continue;
+            }
+            let now = std::time::Instant::now();
+            let oldest_id = Arc::as_ptr(oldest) as usize;
+            if state.active_oldest != Some(oldest_id) {
+                state.active_oldest = Some(oldest_id);
+                state.active_wait = std::time::Duration::ZERO;
+                state.progress_at = Some(now);
+                state.threshold_wait = [false; 2];
+            } else if let Some(previous) = state.progress_at {
+                let delta = now.saturating_duration_since(previous);
+                // Every call is made only after a successful append to another stream. A gap can
+                // therefore contain either a sparse source or a Durable Streams outage; a point
+                // observation cannot distinguish those cases. Charge at most one quarter of the
+                // cap per observation so recovery from a long outage cannot fail a group on its
+                // first landing, while repeated real progress still ages a genuinely stuck lane.
+                let charge = if lane.config.max_stall == std::time::Duration::ZERO {
+                    delta
+                } else {
+                    delta.min(lane.config.max_stall / 4)
+                };
+                state.active_wait = state.active_wait.saturating_add(charge);
+                state.progress_at = Some(now);
+            } else {
+                state.progress_at = Some(now);
+            }
+            let waited = state.active_wait;
+            state.longest_wait = state.longest_wait.max(waited);
+            for (i, fraction) in [0.5, 0.9].into_iter().enumerate() {
+                if lane.config.max_stall > std::time::Duration::ZERO
+                    && waited >= lane.config.max_stall.mul_f64(fraction)
+                    && !state.threshold_wait[i]
+                {
+                    state.threshold_wait[i] = true;
+                    emit_group_threshold(&lane, fraction, "wait", &state, commit_lsn);
+                }
+            }
+            if waited >= std::time::Duration::from_secs(1) && !state.replay_held {
+                state.replay_held = true;
+                state.replay_held_since = Some(now - std::time::Duration::from_secs(1));
+            }
+            (lane.config.max_stall > std::time::Duration::ZERO && waited >= lane.config.max_stall, waited)
+        };
+        if overflow {
+            overflows.push((lane, waited));
+        }
+    }
+    for (lane, waited) in overflows {
+        GroupEmissionLanes::fail_lane(&lane, "wait", waited, commit_lsn);
     }
 }
 
@@ -412,18 +804,18 @@ impl GroupBatchHandle {
                     .is_some_and(|front| front.state.load(std::sync::atomic::Ordering::Acquire) == TICKET_CANCELLED)
                 {
                     state.waiting.pop_front();
-                    state.taken = state.taken.saturating_add(1);
                 }
                 match self.ticket.state.load(std::sync::atomic::Ordering::Acquire) {
                     TICKET_CANCELLED => Admission::Cancelled,
                     TICKET_ADMITTED => Admission::Admitted,
                     _ if state.closed => {
                         self.ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                        self.ticket.cancelled.notify_waiters();
                         Admission::Cancelled
                     }
                     _ if state.waiting.front().is_some_and(|front| Arc::ptr_eq(front, &self.ticket))
                         && state.admitted.len() < GROUP_LANE_CAPACITY
-                        && self.ticket.seq < state.taken.saturating_add(GROUP_LANE_CAPACITY as u64) =>
+                        && !earlier_output_in_production(&self.lane, &state, &self.ticket.entry) =>
                     {
                         let batch = self.batch.take().expect("a waiting handle owns its batch");
                         *self.ticket.entry.envs.lock().unwrap() = Some(batch);
@@ -468,9 +860,16 @@ impl Drop for GroupBatchHandle {
             )
             .is_ok()
         {
+            self.ticket.cancelled.notify_waiters();
             complete_group_entry(&self.lane, &self.ticket.entry);
             self.lane.wake.notify_waiters();
         }
+    }
+}
+
+fn dispatch_overflow(lane: &GroupLane, notice: GroupOverflowNotice) {
+    if let Some(handler) = lane.overflow_handler.lock().unwrap().clone() {
+        handler(notice);
     }
 }
 
@@ -480,7 +879,75 @@ fn complete_group_entry(lane: &GroupLane, entry: &GroupBatchEntry) {
     }
     let _ = entry.envs.lock().unwrap().take();
     lane.pending.complete(entry.commit_lsn);
+    // The origin goes first: in between, the commit shows fewer origins than live batches, which
+    // admission reads as nothing in production, never as a phantom flip.
     complete_origin_entry(&lane.origins, &lane.origin_wake, &entry.stream_path, entry.commit_lsn);
+    let mut state = lane.state.lock().unwrap();
+    state.backlog_bytes = state.backlog_bytes.saturating_sub(entry.bytes);
+    if state.backlog_bytes < lane.config.max_backlog_bytes / 4 {
+        state.threshold_bytes = [false; 2];
+        state.threshold_wait = [false; 2];
+    }
+    if state.replay_held && state.waiting.is_empty() && state.admitted.is_empty() && state.in_flight.is_none() {
+        if let Some(since) = state.replay_held_since.take() {
+            emit_group_replay_held(lane, since.elapsed());
+        }
+        state.replay_held = false;
+    }
+    if state.longest_wait < entry.enqueued_at.elapsed() {
+        state.longest_wait = entry.enqueued_at.elapsed();
+    }
+    if let Some(count) = state.live.get_mut(&entry.commit_lsn) {
+        *count -= 1;
+        if *count == 0 {
+            state.live.remove(&entry.commit_lsn);
+        }
+    }
+}
+
+fn queued_bytes(state: &GroupLaneState) -> u64 {
+    state.backlog_bytes.saturating_sub(state.in_flight.as_ref().map(|ticket| ticket.entry.bytes).unwrap_or(0))
+}
+
+fn emit_group_threshold(lane: &GroupLane, fraction: f64, cap: &str, state: &GroupLaneState, sequencer_lsn: u64) {
+    let meta = lane.metadata.lock().unwrap().clone();
+    let oldest_lsn = state
+        .in_flight
+        .as_ref()
+        .or_else(|| state.admitted.front())
+        .or_else(|| state.waiting.front())
+        .map(|ticket| ticket.entry.commit_lsn)
+        .unwrap_or(sequencer_lsn);
+    let lag_commits = state.live.keys().filter(|lsn| **lsn <= sequencer_lsn).count() as u64;
+    tracing::event!(tracing::Level::INFO, event = "group_backlog_threshold", group_id = %meta.group_id,
+        subscription = %meta.subscription, tables = ?meta.tables, cap, fraction,
+        backlog_batches = state.waiting.len() + state.admitted.len(), backlog_bytes = queued_bytes(state),
+        cap_bytes = lane.config.max_backlog_bytes, cap_secs = lane.config.max_stall.as_secs(),
+        stalled_secs = state.active_wait.as_secs_f64(), lag_commits,
+        lag_lsn_bytes = sequencer_lsn.saturating_sub(oldest_lsn));
+}
+
+fn emit_group_high_water(lane: &GroupLane, state: &GroupLaneState) {
+    let meta = lane.metadata.lock().unwrap().clone();
+    tracing::event!(tracing::Level::INFO, event = "group_backlog_high_water", group_id = %meta.group_id,
+        tables = ?meta.tables, peak_batches = state.peak_batches, peak_bytes = state.peak_bytes,
+        longest_wait_secs = state.longest_wait.as_secs_f64());
+}
+
+fn emit_group_replay_held(lane: &GroupLane, waited: std::time::Duration) {
+    let meta = lane.metadata.lock().unwrap().clone();
+    tracing::event!(tracing::Level::INFO, event = "group_replay_held", group_id = %meta.group_id,
+        tables = ?meta.tables, held_ms = waited.as_millis() as u64);
+}
+
+/// Whether an earlier commit than `entry`'s still has output being produced for this group: an
+/// origin on the path that outnumbers the batches already reserved for that commit. Those batches
+/// are ahead of `entry` in the lane, so only unreserved output can still overtake.
+fn earlier_output_in_production(lane: &GroupLane, state: &GroupLaneState, entry: &GroupBatchEntry) -> bool {
+    let origins = lane.origins.lock().unwrap();
+    origins
+        .range((entry.stream_path.clone(), 0)..(entry.stream_path.clone(), entry.commit_lsn))
+        .any(|((_, lsn), count)| *count > state.live.get(lsn).copied().unwrap_or(0))
 }
 
 fn complete_origin_entry(
@@ -568,7 +1035,10 @@ mod tests {
     async fn enqueue_after_remove_completes_its_origin() {
         let pending = Arc::new(PendingFlips::default());
         let lanes = GroupEmissionLanes::new(
-            DsClient::new_for_in_process_test("http://127.0.0.1:1"),
+            DsClient::with_test_store(
+                "scripted://group-telemetry".into(),
+                Arc::new(crate::ds::ScriptedStore::default()),
+            ),
             crate::shutdown::ShutdownToken::new(),
             pending.clone(),
         );
@@ -581,6 +1051,382 @@ mod tests {
         assert!(lanes.reserve_on_lane(lane, "shape/group", vec![envelope], 0x42).is_none());
         assert_eq!(pending.count(), 0);
         assert!(!lanes.has_origin_at_or_before(&HashSet::from(["shape/group".to_string()]), 0x42));
+    }
+
+    #[tokio::test]
+    async fn backlog_byte_cap_closes_only_the_overflowed_lane() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new_with_config(
+            DsClient::with_test_store("scripted://group-backlog-cap".into(), store),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+            // The first batch is the append in progress and is excluded; the second batch is
+            // queued behind it and exceeds this deliberately tiny cap.
+            GroupLaneConfig { max_backlog_bytes: 1, max_stall: std::time::Duration::from_secs(60) },
+        );
+        lanes.register("shape/group-a");
+        lanes.register("shape/group-b");
+        let env = |key: &str| Envelope {
+            type_: "public.items".into(),
+            key: key.into(),
+            value: Some(serde_json::json!({"payload": "012345678901234567890123456789"})),
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        };
+        let failed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failed_copy = failed.clone();
+        lanes.set_overflow_handler(Arc::new(move |notice| failed_copy.lock().unwrap().push(notice.stream_path)));
+        let first = lanes.reserve("shape/group-a", vec![env("a")], 1).expect("first append is covered by the cap");
+        let overflow = lanes.reserve("shape/group-a", vec![env("b")], 2);
+        assert!(overflow.is_none(), "the second batch must overflow the bytes behind the first append");
+        let other = lanes.reserve("shape/group-b", vec![env("c")], 3).expect("other group unaffected");
+        drop(first);
+        drop(other);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while failed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("overflow handler did not run");
+        assert_eq!(failed.lock().unwrap().as_slice(), ["shape/group-a"]);
+        assert_eq!(pending.count(), 0, "dropping the test handle releases the unrelated group's pending output");
+    }
+
+    #[tokio::test]
+    async fn stall_cap_fails_only_after_successful_other_stream_progress() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.append_fault.lock().unwrap() =
+            Some(("shape/group-stalled".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new_with_config(
+            DsClient::with_test_store("scripted://group-stall-cap".into(), store),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+            GroupLaneConfig { max_backlog_bytes: 1024 * 1024, max_stall: std::time::Duration::from_millis(8) },
+        );
+        lanes.register("shape/group-stalled");
+        let failed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failed_copy = failed.clone();
+        lanes.set_overflow_handler(Arc::new(move |notice| failed_copy.lock().unwrap().push(notice)));
+        let envelope = failure_test_envelope();
+        let handle = lanes.reserve("shape/group-stalled", vec![envelope], 1).unwrap();
+        let waiter = tokio::spawn(handle.wait());
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
+        for _ in 0..8 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            lanes.progress(2);
+            if !failed.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while failed.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successful-progress wait cap did not fail the stalled group");
+        waiter.await.unwrap();
+        assert_eq!(failed.lock().unwrap().len(), 1);
+        assert_eq!(pending.count(), 0, "overflow releases the group's pending origin");
+    }
+
+    #[tokio::test]
+    async fn a_durable_streams_outage_does_not_age_a_group_stall_clock() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.append_fault.lock().unwrap() =
+            Some(("shape/group-outage".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new_with_config(
+            DsClient::with_test_store("scripted://group-stall-outage".into(), store),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+            GroupLaneConfig { max_backlog_bytes: 1024 * 1024, max_stall: std::time::Duration::from_millis(5) },
+        );
+        lanes.register("shape/group-outage");
+        let failed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failed_copy = failed.clone();
+        lanes.set_overflow_handler(Arc::new(move |notice| failed_copy.lock().unwrap().push(notice)));
+        let waiter =
+            tokio::spawn(lanes.reserve("shape/group-outage", vec![failure_test_envelope()], 1).unwrap().wait());
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
+        // Observe one successful append before the outage, then observe the first landing after
+        // it. The recovery observation must not charge the whole silent interval to the group.
+        lanes.progress(2);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        lanes.progress(3);
+        assert!(failed.lock().unwrap().is_empty(), "recovery from a silent outage must not fail the group");
+        gate.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while pending.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_backlog_telemetry_contains_the_contract_events_and_fields() {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Capture::default();
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.append_fault.lock().unwrap() =
+            Some(("shape/group-telemetry".into(), 0, crate::ds::AppendFault::Hold(gate.clone())));
+        let pending = Arc::new(PendingFlips::default());
+        let batch_bytes = serde_json::to_vec(&vec![failure_test_envelope()]).unwrap().len() as u64;
+        let lanes = GroupEmissionLanes::new_with_config(
+            DsClient::with_test_store("scripted://group-telemetry".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            pending,
+            GroupLaneConfig { max_backlog_bytes: batch_bytes * 2 - 1, max_stall: std::time::Duration::from_secs(60) },
+        );
+        lanes.register("shape/group-telemetry");
+        lanes.set_metadata("shape/group-telemetry", "group-telemetry", "sub-telemetry", vec!["public.items".into()]);
+        let first = lanes.reserve("shape/group-telemetry", vec![failure_test_envelope()], 1).unwrap();
+        let first_task = tokio::spawn(first.wait());
+        tokio::time::timeout(std::time::Duration::from_secs(1), gate.entered.notified()).await.unwrap();
+        let second = lanes.reserve("shape/group-telemetry", vec![failure_test_envelope()], 2).unwrap();
+        let second_task = tokio::spawn(second.wait());
+        assert!(lanes.reserve("shape/group-telemetry", vec![failure_test_envelope()], 3).is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_task).await.unwrap().unwrap();
+
+        lanes.register("shape/group-held-telemetry");
+        lanes.set_metadata(
+            "shape/group-held-telemetry",
+            "group-held-telemetry",
+            "sub-held-telemetry",
+            vec!["public.items".into()],
+        );
+        let held_gate = Arc::new(crate::ds::BodyGate::default());
+        *store.append_fault.lock().unwrap() =
+            Some(("shape/group-held-telemetry".into(), 0, crate::ds::AppendFault::Hold(held_gate.clone())));
+        let held = lanes.reserve("shape/group-held-telemetry", vec![failure_test_envelope()], 10).unwrap();
+        let held_task = tokio::spawn(held.wait());
+        tokio::time::timeout(std::time::Duration::from_secs(1), held_gate.entered.notified()).await.unwrap();
+        lanes.progress(11);
+        tokio::time::sleep(std::time::Duration::from_millis(1_050)).await;
+        lanes.progress(12);
+        lanes.remove("shape/group-held-telemetry");
+        tokio::time::timeout(std::time::Duration::from_secs(1), held_task).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !output
+                .0
+                .lock()
+                .unwrap()
+                .windows(b"group_replay_held".len())
+                .any(|window| window == b"group_replay_held")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let lines = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        let events = lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"].clone())
+            .collect::<Vec<_>>();
+        for name in
+            ["group_backlog_overflow", "group_backlog_threshold", "group_backlog_high_water", "group_replay_held"]
+        {
+            assert!(events.iter().any(|event| event["event"] == name), "missing telemetry event {name}: {events:?}");
+        }
+        let overflow = events.iter().find(|event| event["event"] == "group_backlog_overflow").unwrap();
+        for field in [
+            "group_id",
+            "subscription",
+            "tables",
+            "cap",
+            "backlog_batches",
+            "backlog_bytes",
+            "cap_bytes",
+            "cap_secs",
+            "stalled_secs",
+            "lag_commits",
+            "lag_lsn_bytes",
+        ] {
+            assert!(overflow.get(field).is_some(), "overflow event omitted {field}: {overflow}");
+        }
+        let threshold = events.iter().find(|event| event["event"] == "group_backlog_threshold").unwrap();
+        assert!(threshold.get("fraction").is_some(), "threshold event omitted fraction: {threshold}");
+        let high_water = events.iter().find(|event| event["event"] == "group_backlog_high_water").unwrap();
+        for field in ["group_id", "tables", "peak_batches", "peak_bytes", "longest_wait_secs"] {
+            assert!(high_water.get(field).is_some(), "high-water event omitted {field}: {high_water}");
+        }
+        let replay = events.iter().find(|event| event["event"] == "group_replay_held").unwrap();
+        for field in ["group_id", "tables", "held_ms"] {
+            assert!(replay.get(field).is_some(), "replay-held event omitted {field}: {replay}");
+        }
+    }
+
+    /// `submit` never waits on its caller. A batch behind an earlier commit's output still in
+    /// production on the same group (here a flip still propagating) is reserved at once, counts
+    /// toward the replay and receipt barriers, and is appended after that output even though the
+    /// flip reserves later; another group's batch lands meanwhile.
+    #[tokio::test]
+    async fn a_submitted_batch_waits_behind_earlier_output_on_its_own_group_only() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new(
+            DsClient::with_test_store("scripted://group-submit".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+        );
+        lanes.register("shape/group-held");
+        lanes.register("shape/group-free");
+        let env = |key: &str| Envelope {
+            type_: "public.items".into(),
+            key: key.into(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        };
+        let keys_on = |suffix: &str| {
+            store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _, _)| path.ends_with(suffix))
+                .map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"].clone())
+                .collect::<Vec<_>>()
+        };
+        // Commit 1's flip is still propagating on the held group, as the flip propagator records it.
+        pending.add(1);
+        lanes.begin_origin("shape/group-held", 1);
+        lanes.submit("shape/group-held", vec![env("commit-2")], 2);
+        lanes.submit("shape/group-free", vec![env("commit-2")], 2);
+        assert!(lanes.has_any_origin_at_or_before(2), "the waiting batch holds the replay boundary");
+        assert!(pending.has_at_or_before(2), "the waiting batch holds a receipt at its commit");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while keys_on("shape/group-free").is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("another group's batch waited behind the held group");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(keys_on("shape/group-held").is_empty(), "commit 2 overtook commit 1's flip");
+        // The flip enqueues its effect, then finishes propagating.
+        lanes.enqueue("shape/group-held", vec![env("commit-1-flip")], 1).await;
+        lanes.complete_origin("shape/group-held", 1);
+        pending.complete(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while lanes.has_any_origin_at_or_before(2) || pending.count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the held group's output never landed");
+        assert_eq!(
+            keys_on("shape/group-held"),
+            vec![serde_json::json!("commit-1-flip"), serde_json::json!("commit-2")]
+        );
+    }
+
+    /// Two flips in production on one group at once (the propagator runs several): the later
+    /// commit's query-back finishes and reserves first, yet the earlier commit's output, reserved
+    /// after it, is appended first. Neither is admitted while the earlier flip is still running.
+    #[tokio::test]
+    async fn concurrent_flips_land_in_commit_order_whichever_reserves_first() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let pending = Arc::new(PendingFlips::default());
+        let lanes = GroupEmissionLanes::new(
+            DsClient::with_test_store("scripted://group-flip-order".into(), store.clone()),
+            crate::shutdown::ShutdownToken::new(),
+            pending.clone(),
+        );
+        lanes.register("shape/group");
+        let env = |key: &str| Envelope {
+            type_: "public.items".into(),
+            key: key.into(),
+            value: None,
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".into(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: None,
+            },
+        };
+        let keys = || {
+            store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap()[0]["key"].clone())
+                .collect::<Vec<_>>()
+        };
+        for commit_lsn in [3, 4] {
+            pending.add(commit_lsn);
+            lanes.begin_origin("shape/group", commit_lsn);
+        }
+        let later = lanes.reserve("shape/group", vec![env("flip-4")], 4).unwrap();
+        lanes.spawn_wait([later]);
+        lanes.complete_origin("shape/group", 4);
+        pending.complete(4);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(keys().is_empty(), "commit 4's flip was admitted while commit 3's flip was still running");
+        let earlier = lanes.reserve("shape/group", vec![env("flip-3")], 3).unwrap();
+        lanes.spawn_wait([earlier]);
+        lanes.complete_origin("shape/group", 3);
+        pending.complete(3);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while keys().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the flips never landed");
+        assert_eq!(keys(), vec![serde_json::json!("flip-3"), serde_json::json!("flip-4")]);
+        assert!(!lanes.has_any_origin_at_or_before(u64::MAX));
+        assert_eq!(pending.count(), 0);
     }
 
     #[tokio::test]

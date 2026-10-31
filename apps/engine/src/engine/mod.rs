@@ -91,8 +91,7 @@ pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub(crate) use group::{
-    GroupClaims, GroupConflict, GroupFence, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease,
-    GroupStreamClosed,
+    GroupClaims, GroupConflict, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease, GroupStreamClosed,
 };
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
@@ -607,8 +606,6 @@ pub struct Engine {
     pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
-    /// Per-engine group transaction fence. It must never be process-global.
-    group_fence: GroupFence,
     group_lanes: crate::engine::emission::GroupEmissionLanes,
     /// Group teardowns keyed by group identity. A reload waits for an in-flight release instead of
     /// renewing the dying record or allowing a stale task to drop a replacement under the same name.
@@ -1751,8 +1748,19 @@ impl Engine {
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
         let degrade = DegradeState::new();
-        let group_fence = GroupFence::default();
-        let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());
+        let group_config = config
+            .map(|c| emission::GroupLaneConfig {
+                max_backlog_bytes: c.group_backlog_max_bytes,
+                max_stall: Duration::from_secs(c.group_stall_max_secs),
+            })
+            .unwrap_or_default();
+        let group_lanes = emission::GroupEmissionLanes::new_with_config(
+            ds.clone(),
+            shutdown.clone(),
+            pending_flips.clone(),
+            group_config,
+        );
+        let (overflow_tx, mut overflow_rx) = mpsc::unbounded_channel::<emission::GroupOverflowNotice>();
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1833,7 +1841,6 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
-            group_fence,
             group_lanes,
             group_releases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1882,6 +1889,56 @@ impl Engine {
             shutdown,
             sub_nonce: crate::engine::catalog::process_nonce().into(),
         };
+        let overflow_sender = overflow_tx.clone();
+        engine.group_lanes.set_overflow_handler(Arc::new(move |notice| {
+            let _ = overflow_sender.send(notice);
+        }));
+        let overflow_engine = engine.clone();
+        engine.shutdown.spawn_background(async move {
+            while let Some(notice) = overflow_rx.recv().await {
+                let group_engine = overflow_engine.clone();
+                let group_shutdown = group_engine.shutdown.clone();
+                group_shutdown.spawn_background(async move {
+                    let terminal = crate::ds::Envelope {
+                        type_: "electric.group_error".into(),
+                        key: notice.group_id.clone(),
+                        value: Some(serde_json::json!({ "code": "group_backlog_overflow" })),
+                        old: None,
+                        headers: crate::ds::EnvelopeHeaders {
+                            operation: "error".into(),
+                            txid: None,
+                            offset: None,
+                            lsn: None,
+                            seq: None,
+                            last: None,
+                        },
+                    };
+                    // A failed lane must never wait forever on its own terminal append. The
+                    // retirement path is independent, so later overflows can still retire and
+                    // publish their reload reason while this stream is unavailable.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        group_engine.ds.append_reliable(&notice.stream_path, &[terminal]),
+                    )
+                    .await
+                    {
+                        Ok(Err(error)) => tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow terminal append failed"),
+                        Err(_) => tracing::warn!(stream_path = %notice.stream_path, "group backlog overflow terminal append timed out"),
+                        Ok(Ok(_)) => {}
+                    }
+                    if let Err(error) = group_engine.release_group_claim(&notice.subscription, &notice.group_id).await {
+                        tracing::warn!(%error, stream_path = %notice.stream_path, "group backlog overflow retirement failed");
+                        group_engine.retirements.enqueue(&notice.stream_path, None);
+                    }
+                    // `release_group_claim` writes the durable GroupDropped intent before it
+                    // reports member/stream cleanup errors, and the retirement queue retries any
+                    // physical stream deletion. Once that intent is durable, keeping the replay
+                    // hold would freeze every table forever behind a failed DELETE. Shutdown
+                    // prevents publication when the catalog write itself was not accepted.
+                    group_engine.group_lanes.release_overflow_hold(&notice.stream_path);
+                });
+            }
+        });
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
@@ -1941,6 +1998,7 @@ impl Engine {
             return outcome;
         }
         self.shutdown.begin();
+        self.group_lanes.clear_overflow_handler();
         self.close_control_admission();
         let remaining = || grace.saturating_sub(self.shutdown.elapsed().unwrap_or_default());
         let mut outcome = if self.shutdown.wait_for_parties(remaining()).await {
@@ -2566,7 +2624,6 @@ impl Engine {
                 self.source_receipt_progress.clone(),
                 self.runtime_receipts.clone(),
                 self.subquery_handle(),
-                self.group_fence.clone(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
@@ -3205,6 +3262,12 @@ impl Engine {
     /// registration and stream checks must run after it, before the group is made visible.
     pub(crate) async fn complete_group_with_gens(&self, record: GroupRecord, gens: &SchemaGens) -> Result<()> {
         self.group_lanes.register(&record.stream_path);
+        self.group_lanes.set_metadata(
+            &record.stream_path,
+            &record.id,
+            &record.subscription,
+            record.members.iter().map(|member| member.table.clone()).collect(),
+        );
         self.catalog_tx.send_durable(CatalogEvent::GroupCreated { group: record.clone() }).await?;
         let stream_open = match self.recheck_group_after_durability(&record, gens).await {
             Ok(open) => open,
@@ -3276,7 +3339,6 @@ impl Engine {
                     })
                     .collect::<Vec<_>>();
                 st.group_claims.complete(record.clone());
-                self.group_fence.activate();
                 (true, renewals)
             } else {
                 (false, Vec::new())
@@ -3432,6 +3494,9 @@ impl Engine {
     /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
     /// to the same wall-clock instant.
     pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+        if self.group_lanes.is_closed(&group.stream_path) {
+            return Ok(false);
+        }
         let now = crate::changelog::now_secs();
         let mut events = Vec::with_capacity(group.members.len());
         {
@@ -3491,6 +3556,12 @@ impl Engine {
         if !members_healthy {
             return Ok(false);
         }
+        if self.group_lanes.is_closed(&group.stream_path) {
+            // An overflowed lane is already terminal. Do not renew its member claims into a
+            // closed worker while the engine-owned retirement task is publishing the reload
+            // reason and dropping the group record.
+            return Ok(false);
+        }
         match self.ds.head(&group.stream_path).await {
             Ok(Some(head)) => Ok(!head.closed && head.next_offset.is_some()),
             Ok(None) => Ok(false),
@@ -3502,11 +3573,7 @@ impl Engine {
     /// catalog event is durable. The caller performs member releases outside the state lock.
     pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         let mut st = self.state.lock().await;
-        let record = st.group_claims.release_if_matches(subscription, group_id);
-        if record.is_some() {
-            self.group_fence.deactivate();
-        }
-        record
+        st.group_claims.release_if_matches(subscription, group_id)
     }
 
     pub(crate) async fn finish_group_release(&self, subscription: &str, group_id: &str) -> Result<()> {

@@ -13,6 +13,8 @@
 //! | Setting | Default | Meaning |
 //! | --- | --- | --- |
 //! | `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES` | disabled | Opt-in shared transient byte admission: a positive value enables it; unset or `0` disables it and logs once, regardless of cgroup limits. |
+//! | `ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES` | `67108864` | Bytes queued behind the group append in progress before that group is retired; `0` disables this cap. |
+//! | `ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS` | `60` | Active seconds the oldest pending group output may wait while other stream appends advance; `0` disables this cap. |
 //!
 //! Configuration clones share one lazily initialized budget, including supervised sources.
 //! Reservations cover transient inputs, not retained fold maps, decoded backfill rows, allocator
@@ -65,6 +67,10 @@ impl StatsdTarget {
 /// Fully-resolved boot configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Group backlog byte cap (`ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES`).
+    pub group_backlog_max_bytes: u64,
+    /// Group stall wait cap (`ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS`).
+    pub group_stall_max_secs: u64,
     /// Postgres connection string (enables Postgres mode). `ELECTRIC_CIRCUITS_PG_URL` wins over `DATABASE_URL`.
     pub pg_url: Option<String>,
     /// Durable-streams base URL (`ELECTRIC_CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
@@ -542,6 +548,20 @@ impl Config {
             .unwrap_or(true);
         let memory_log_period = seconds_setting(&g, "ELECTRIC_CIRCUITS_MEMORY_LOG_PERIOD_SECS", 5)?;
         let memory_bytes_log_period = seconds_setting(&g, "ELECTRIC_CIRCUITS_MEMORY_BYTES_LOG_PERIOD_SECS", 30)?;
+        let group_backlog_max_bytes = match g("ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES") {
+            None => 64 * 1024 * 1024,
+            Some(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES must be a byte count"))?,
+        };
+        let group_stall_max_secs = match g("ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS") {
+            None => 60,
+            Some(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS must be whole seconds"))?,
+        };
 
         // The dbsp counts circuit is always built — it is mandatory infrastructure, no longer
         // gated by an on/off flag. It maintains only the configured COUNT groupings (`_COUNTS`);
@@ -702,6 +722,8 @@ impl Config {
         };
 
         Ok(Config {
+            group_backlog_max_bytes,
+            group_stall_max_secs,
             pg_url,
             ds_url,
             ds_connection,
@@ -923,6 +945,26 @@ mod tests {
         ] {
             let e = try_cfg(&[(name, bad)]).expect_err("refused");
             assert!(format!("{e:#}").contains(name), "names the knob: {e:#}");
+        }
+    }
+
+    #[test]
+    fn group_backlog_caps_have_defaults_and_parse() {
+        let defaults = cfg(&[]);
+        assert_eq!(defaults.group_backlog_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(defaults.group_stall_max_secs, 60);
+        let explicit = cfg(&[
+            ("ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES", "4096"),
+            ("ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS", "7"),
+        ]);
+        assert_eq!(explicit.group_backlog_max_bytes, 4096);
+        assert_eq!(explicit.group_stall_max_secs, 7);
+        for (name, value) in [
+            ("ELECTRIC_CIRCUITS_GROUP_BACKLOG_MAX_BYTES", "bytes"),
+            ("ELECTRIC_CIRCUITS_GROUP_STALL_MAX_SECS", "seconds"),
+        ] {
+            let error = try_cfg(&[(name, value)]).expect_err("invalid cap is refused");
+            assert!(format!("{error:#}").contains(name));
         }
     }
 

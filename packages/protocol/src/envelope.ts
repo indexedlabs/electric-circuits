@@ -6,14 +6,15 @@
 import { canonicalTable } from './sql.js'
 import type { Op, Row, Value } from './types.js'
 
-export type Operation = 'insert' | 'update' | 'delete' | 'upsert'
+/** State changes plus the terminal group-lane error envelope. */
+export type Operation = 'insert' | 'update' | 'delete' | 'upsert' | 'error'
 
 export interface StreamEnvelope {
   /** The table's canonical `schema.name` (ADR-0002); never a bare name. */
   type: string
   key: string
   /** Present for insert/update/upsert; omitted for delete. */
-  value?: Row
+  value?: Row | { code: string }
   headers: {
     operation: Operation
     txid?: string
