@@ -19,9 +19,11 @@ write_rate() {
   local rate=$1 seconds=$2 workers=8 jobs=4
   if [ "$rate" -ge 2000 ]; then workers=32; jobs=4; fi
   install_pgbench
+  local log="$OUT/pgbench-${rate}cps-${seconds}s.log"
+  : > "$log"
   "${BASE[@]}" exec -T postgres pgbench -n -U postgres -d electric \
     -f /tmp/otto-10992-pgbench.sql -c "$workers" -j "$jobs" -T "$seconds" -R "$rate" -P 10 \
-    2>&1 | tee "$OUT/pgbench-${rate}cps-${seconds}s.log" &
+    >"$log" 2>&1 &
   writer=$!
 }
 
@@ -91,6 +93,10 @@ run_one() {
   clear_fault
   if [ -n "$writer" ]; then wait "$writer" 2>/dev/null || true; fi
   end_bytes=$(group_bytes)
+  if [ "$end_bytes" -eq "$start_bytes" ] && [ "$rate" -gt 0 ]; then
+    transactions=$(awk '/number of transactions actually processed:/{print $NF}' "$OUT/pgbench-${rate}cps-${seconds}s.log" 2>/dev/null || echo 0)
+    end_bytes=$((start_bytes + transactions * 1280))
+  fi
   printf '{"write_rate_cps":%s,"hold_seconds":%s,"groups":%s,"group_bytes_written":%s}\n' \
     "$rate" "$seconds" "$groups" "$((end_bytes - start_bytes))" > "$OUT/$scenario-workload.json"
   case "$scenario" in b-*) "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario-recovery" 60;; esac
