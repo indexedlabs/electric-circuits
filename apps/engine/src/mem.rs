@@ -116,8 +116,9 @@ pub struct Cardinalities {
     /// forward/reverse index — the append-only cost of keying the circuit by `u32` pk ids instead
     /// of heap strings. See `SubqueryRegistry::pk_dict_bytes`.
     pub bytes_pk_dict: usize,
-    /// The `/v1/shape` (Electric-protocol) adapter's TTL handle registry: per-handle cursor
-    /// state (known-keys sets, in-flight live-poll map).
+    /// The `/v1/shape` (Electric-protocol) adapter: its TTL handle registry (per-handle cursor
+    /// state — known-keys sets, in-flight live-poll map) plus the finished snapshot builds it keeps
+    /// for reuse (one body and key list per shape, each for at most 30 s).
     pub bytes_electric_adapter: usize,
 }
 
@@ -725,6 +726,24 @@ pub(crate) fn init_otel(
         "engine_backfill_chunked_appends",
         "Chunk appends made by backfills too large for one append",
         backfill_chunked_appends,
+        ""
+    );
+    engine_counter!(
+        "engine_electric_snapshot_builds",
+        "/v1/shape offset=-1 answers served by a build the request started",
+        electric_snapshot_builds,
+        ""
+    );
+    engine_counter!(
+        "engine_electric_snapshot_joins",
+        "/v1/shape offset=-1 answers served by joining a build already in flight",
+        electric_snapshot_joins,
+        ""
+    );
+    engine_counter!(
+        "engine_electric_snapshot_reuses",
+        "/v1/shape offset=-1 answers served by a finished build at an unchanged tail",
+        electric_snapshot_reuses,
         ""
     );
     engine_counter!(

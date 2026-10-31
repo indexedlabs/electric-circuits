@@ -252,6 +252,15 @@ pub struct ReadResult {
     pub closed: bool,
 }
 
+/// A [`ReadResult`] whose body is still the JSON text the store sent (an array of envelopes, or
+/// empty for a 204). See [`DsClient::read_raw`].
+pub(crate) struct RawPage {
+    pub body: String,
+    pub next_offset: Option<String>,
+    pub up_to_date: bool,
+    pub closed: bool,
+}
+
 /// What a `HEAD` found: the stream's tail offset and whether it is closed. `None` from
 /// [`DsClient::head`] means the stream is not there (404) or soft-deleted (410).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1777,6 +1786,39 @@ impl DsClient {
         live: bool,
         budgeted: bool,
     ) -> Result<(ReadResult, crate::memory_budget::Permit)> {
+        let (page, permit) = self.read_raw_owned(path, offset, live, budgeted).await?;
+        let envelopes: Vec<Envelope> = if page.body.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&page.body).with_context(|| format!("parsing stream body: {}", page.body))?
+        };
+        let RawPage { next_offset, up_to_date, closed, .. } = page;
+        Ok((ReadResult { envelopes, next_offset, up_to_date, closed }, permit))
+    }
+
+    /// One catch-up page with its JSON body left undecoded, so a reader that keeps only some of
+    /// each envelope (a `/v1/shape` snapshot keeps row bodies as raw JSON text) never builds the
+    /// whole page as `serde_json::Value`s. Same status handling as [`Self::read`].
+    pub(crate) async fn read_raw(&self, path: &str, offset: &str) -> Result<RawPage> {
+        self.read_raw_owned(path, offset, false, false).await.map(|(page, _)| page)
+    }
+
+    /// [`Self::read_raw`] under the process memory budget, like [`Self::read_budgeted`].
+    pub(crate) async fn read_raw_budgeted(
+        &self,
+        path: &str,
+        offset: &str,
+    ) -> Result<(RawPage, crate::memory_budget::Permit)> {
+        self.read_raw_owned(path, offset, false, true).await
+    }
+
+    async fn read_raw_owned(
+        &self,
+        path: &str,
+        offset: &str,
+        live: bool,
+        budgeted: bool,
+    ) -> Result<(RawPage, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if budgeted {
             self.store
@@ -1790,8 +1832,8 @@ impl DsClient {
         // 204 = long-poll timeout / no new data / a close that woke this long-poll.
         if res.status == 204 {
             return Ok((
-                ReadResult {
-                    envelopes: Vec::new(),
+                RawPage {
+                    body: String::new(),
                     next_offset: res.next_offset,
                     up_to_date: res.up_to_date,
                     closed: res.closed,
@@ -1811,12 +1853,7 @@ impl DsClient {
         let up_to_date = res.up_to_date;
         let closed = res.closed;
         let body = res.required_body()?;
-        let envelopes: Vec<Envelope> = if body.trim().is_empty() {
-            Vec::new()
-        } else {
-            serde_json::from_str(&body).with_context(|| format!("parsing stream body: {body}"))?
-        };
-        Ok((ReadResult { envelopes, next_offset, up_to_date, closed }, permit))
+        Ok((RawPage { body, next_offset, up_to_date, closed }, permit))
     }
 
     /// Read one page while decoding row bodies only for `table` and change-log control envelopes.
