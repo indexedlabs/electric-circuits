@@ -103,6 +103,7 @@ struct GroupLane {
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     origin_wake: Arc<tokio::sync::Notify>,
+    metrics: Arc<crate::metrics::Metrics>,
     #[cfg(test)]
     failure_gate: std::sync::Mutex<Option<Arc<crate::ds::BodyGate>>>,
 }
@@ -128,6 +129,7 @@ struct GroupBatchEntry {
     stream_path: String,
     envs: std::sync::Mutex<Option<Vec<Envelope>>>,
     accounted: std::sync::atomic::AtomicBool,
+    bytes: u64,
 }
 
 struct GroupTicket {
@@ -154,10 +156,12 @@ pub(crate) struct GroupEmissionLanes {
     pending: Arc<PendingFlips>,
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     wake: Arc<tokio::sync::Notify>,
+    metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl GroupEmissionLanes {
     pub(crate) fn new(ds: DsClient, shutdown: crate::shutdown::ShutdownToken, pending: Arc<PendingFlips>) -> Self {
+        let metrics = ds.metrics().clone();
         Self {
             lanes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ds,
@@ -165,6 +169,7 @@ impl GroupEmissionLanes {
             pending,
             origins: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             wake: Arc::new(tokio::sync::Notify::new()),
+            metrics,
         }
     }
 
@@ -189,6 +194,7 @@ impl GroupEmissionLanes {
             pending: self.pending.clone(),
             origins: self.origins.clone(),
             origin_wake: self.wake.clone(),
+            metrics: self.metrics.clone(),
             #[cfg(test)]
             failure_gate: std::sync::Mutex::new(None),
         });
@@ -336,11 +342,13 @@ impl GroupEmissionLanes {
     ) -> Option<GroupBatchHandle> {
         self.pending.add(commit_lsn);
         self.begin_origin(path, commit_lsn);
+        let bytes = envs.iter().map(crate::ds::envelope_memory_bytes).sum();
         let entry = Arc::new(GroupBatchEntry {
             commit_lsn,
             stream_path: path.to_string(),
             envs: std::sync::Mutex::new(None),
             accounted: std::sync::atomic::AtomicBool::new(false),
+            bytes,
         });
         let mut state = lane.state.lock().unwrap();
         if state.closed {
@@ -356,6 +364,7 @@ impl GroupEmissionLanes {
         state.next_seq = state.next_seq.saturating_add(1);
         state.waiting.push_back(ticket.clone());
         drop(state);
+        self.metrics.group_lane_add(&path, bytes);
         Some(GroupBatchHandle { lane, ticket, batch: Some(envs) })
     }
 
@@ -479,6 +488,7 @@ fn complete_group_entry(lane: &GroupLane, entry: &GroupBatchEntry) {
         return;
     }
     let _ = entry.envs.lock().unwrap().take();
+    lane.metrics.group_lane_complete(&entry.stream_path, entry.bytes);
     lane.pending.complete(entry.commit_lsn);
     complete_origin_entry(&lane.origins, &lane.origin_wake, &entry.stream_path, entry.commit_lsn);
 }

@@ -470,6 +470,7 @@ pub(crate) async fn sequencer_loop(
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
 ) {
+    let metrics = ds.metrics().clone();
     let mut execs: HashMap<String, TableExec> = HashMap::new();
     let mut paused = start_paused;
     // A missing segment or unrecoverable body breach is terminal for this live loop. Keep reads
@@ -490,6 +491,8 @@ pub(crate) async fn sequencer_loop(
     // resumes on the segment the log actually moved to.
     let mut last_ckpt = std::time::Instant::now();
     let mut ckpt_pos = pos.clone();
+    metrics.set_sequencer_processed(pos.segment, &pos.offset);
+    metrics.set_sequencer_checkpoint(ckpt_pos.segment, &ckpt_pos.offset);
     // The highwater the last checkpoint carried. While a transaction is HELD the position is
     // pinned, so the position alone stops changing — but transactions completed before the hold
     // keep advancing the highwater, and that progress has to reach the catalog or a crash
@@ -1078,7 +1081,9 @@ pub(crate) async fn sequencer_loop(
                     // re-read the whole incomplete transaction, and `processed` is also what
                     // `GET /tables/{name}/offset` and the segment-deletion floor read.
                     if next.is_some() {
-                        *processed.lock().unwrap() = published(&pos, &held_from);
+                        let published_pos = published(&pos, &held_from);
+                        *processed.lock().unwrap() = published_pos.clone();
+                        metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
                     }
                     // The segment ended (ADR-0006). Cross only once a read of it comes back EMPTY
                     // (or stops advancing): "closed" can arrive alongside a page of data, and
@@ -1093,7 +1098,9 @@ pub(crate) async fn sequencer_loop(
                             Some(n) => {
                                 tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
                                 pos = LogPosition::start_of(n);
-                                *processed.lock().unwrap() = published(&pos, &held_from);
+                                let published_pos = published(&pos, &held_from);
+                                *processed.lock().unwrap() = published_pos.clone();
+                                metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
                                 crossed = true;
                             }
                             None => {
@@ -1111,7 +1118,9 @@ pub(crate) async fn sequencer_loop(
                                             segment_path(n)
                                         );
                                         pos = LogPosition::start_of(n);
-                                        *processed.lock().unwrap() = published(&pos, &held_from);
+                                        let published_pos = published(&pos, &held_from);
+                                        *processed.lock().unwrap() = published_pos.clone();
+                                        metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
                                         crossed = true;
                                     }
                                     Err(e) if e.is::<crate::changelog::MissingSuccessor>() => {
@@ -1145,6 +1154,7 @@ pub(crate) async fn sequencer_loop(
                         ckpt_pos = ckpt.clone();
                         ckpt_hw = highwater;
                         last_ckpt = std::time::Instant::now();
+                        metrics.set_sequencer_checkpoint(ckpt_pos.segment, &ckpt_pos.offset);
                         // The de-duplication highwater rides WITH the position (ADR-0003): a crash
                         // after a prefix of a chunked commit was applied and checkpointed would
                         // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
