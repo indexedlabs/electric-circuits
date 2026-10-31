@@ -1,19 +1,27 @@
 // A reconnect storm on `GET /v1/shape?offset=-1` (OTTO-11109, #v-shared-first-response).
 //
 // After an engine restart every Electric client's handle is gone, so all of them re-request
-// `offset=-1` within seconds. The shapes already exist (the restart restores them); many clients
-// per shape, about a third of every shape's clients disconnecting while the engine is answering,
-// must each end with exactly PostgreSQL's rows, and every client of one shape at one tail must be
-// sent the same bytes. Each client then catches up on later writes with its own handle and key
-// set. The engine's `/metrics` counters show the storm was served by at most one build per shape
-// and tail, not one per client.
+// `offset=-1` within seconds; the shapes themselves were restored. Each shape's stream must be
+// folded once for the whole storm, the clients that disconnect must not fail the others — including
+// the client whose request started the shared build — and every remaining client must end with
+// exactly PostgreSQL's rows, be sent the same bytes as every other client of its shape, and then
+// catch up on later writes through its own handle and key set.
+//
+// Order comes from a proxy in front of durable-streams (engine side only) that holds every
+// catch-up read of a shape stream from its beginning — one per fold — until it is released, and
+// counts them. No sleeps: each phase waits on that gate or on the engine's public state.
+import { createServer, request } from 'node:http'
 import type { Schema } from '@electric-circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { testPhysicalPath } from './ds-mtls-access.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const SHAPES = 60
-const CLIENTS_PER_SHAPE = 20
+// Per shape: the clients sent first, which start every build and then disconnect, and the clients
+// sent while those builds are held, which must be served by them.
+const LEAVING_PER_SHAPE = 7
+const STAYING_PER_SHAPE = 13
 const ROWS = 1200
 
 const schema: Schema = {
@@ -59,6 +67,74 @@ async function snapshotCounters(h: Harness): Promise<SnapshotCounters> {
   }
 }
 
+async function within<T>(label: string, wait: () => Promise<T | undefined>): Promise<T> {
+  const deadline = Date.now() + 60_000
+  for (;;) {
+    const value = await wait()
+    if (value !== undefined) return value
+    if (Date.now() > deadline) throw new Error(`deadline: ${label}`)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
+/** Holds and counts the engine's `offset=-1` catch-up reads of shape streams while armed. */
+async function foldGate(upstreamUrl: string) {
+  const upstream = new URL(upstreamUrl)
+  const shapePrefix = `/${testPhysicalPath('shape/')}`
+  let armed = false
+  const folds: string[] = []
+  let release!: () => void
+  let released = new Promise<void>((resolve) => { release = resolve })
+  const server = createServer((incoming, outgoing) => {
+    void (async () => {
+      const target = new URL(incoming.url ?? '/', upstream)
+      if (
+        armed && incoming.method === 'GET' && target.pathname.startsWith(shapePrefix)
+        && target.searchParams.get('offset') === '-1' && !target.searchParams.has('live')
+      ) {
+        folds.push(target.pathname)
+        await released
+      }
+      const forwarded = request(target, {
+        method: incoming.method, headers: { ...incoming.headers, host: upstream.host },
+      }, (response) => {
+        outgoing.writeHead(response.statusCode ?? 502, response.headers)
+        response.pipe(outgoing)
+      })
+      forwarded.on('error', (error) => {
+        if (!outgoing.headersSent) outgoing.writeHead(502)
+        outgoing.end(String(error))
+      })
+      outgoing.on('close', () => forwarded.destroy())
+      incoming.pipe(forwarded)
+    })().catch((error: unknown) => {
+      if (!outgoing.headersSent) outgoing.writeHead(502)
+      outgoing.end(String(error))
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('fold gate did not bind TCP')
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    arm: () => {
+      armed = true
+      folds.length = 0
+      released = new Promise<void>((resolve) => { release = resolve })
+    },
+    folds: () => [...folds],
+    release: () => { armed = false; release() },
+    close: async () => {
+      release()
+      server.closeAllConnections()
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+    },
+  }
+}
+
 type Client = { grp: number; handle: string; offset: string; rows: Map<string, Row> }
 
 // Apply Electric change messages the way Electric's client does: insert-of-existing and
@@ -87,9 +163,17 @@ function apply(client: Client, messages: Message[]): boolean {
 describe('conformance: /v1/shape reconnect storm', () => {
   let harness: Harness
   let pg: pgpkg.Client
+  let gate: Awaited<ReturnType<typeof foldGate>>
 
   beforeAll(async () => {
     harness = await bootHarness(schema, {
+      wrapEngineDs: async (url) => {
+        gate = await foldGate(url)
+        return gate
+      },
+      // The gate holds fold reads while every client joins; keep that hold inside the engine's
+      // read deadline on a slow runner, so a stall fails at this test's named deadlines instead.
+      engineEnv: { ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS: '120', ELECTRIC_CIRCUITS_DS_REQUEST_TIMEOUT_SECS: '180' },
       ddl: `
         CREATE TABLE storm_items (id int PRIMARY KEY, grp int NOT NULL, label text, flag bool);
         ALTER TABLE storm_items REPLICA IDENTITY FULL;
@@ -112,51 +196,62 @@ describe('conformance: /v1/shape reconnect storm', () => {
   it('serves every client of a storm PostgreSQL rows, the same bytes per shape, and its own key set', async () => {
     // The shapes exist before the storm, as they do after a restart: clients had subscribed, the
     // engine went down, and every handle went with it.
-    await Promise.all(
+    const shapeIds = await Promise.all(
       Array.from({ length: SHAPES }, async (_, grp) => {
         const res = await fetch(shapeUrl(harness, grp, '&offset=-1'))
         expect(res.status, await res.text()).toBe(200)
+        return res.headers.get('electric-handle')!.replace(/h\d+$/, '')
       }),
     )
     await harness.restartEngine()
-
-    type Outcome = { grp: number; status: number; handle: string | null; offset: string | null; body: string } | null
-    const before = await snapshotCounters(harness)
-    const aborts: { n: number; abort: AbortController }[] = []
-    const requests: Promise<Outcome>[] = []
-    for (let n = 0; n < SHAPES * CLIENTS_PER_SHAPE; n++) {
-      const grp = n % SHAPES
-      const abort = new AbortController()
-      // Independent of the shape: every shape has clients that disconnect and clients that stay.
-      const cancels = Math.floor(n / SHAPES) % 3 === 0
-      if (cancels) aborts.push({ n, abort })
-      requests.push(
-        (async () => {
-          try {
-            const res = await fetch(shapeUrl(harness, grp, '&offset=-1'), { signal: abort.signal })
-            const body = await res.text()
-            return {
-              grp,
-              status: res.status,
-              handle: res.headers.get('electric-handle'),
-              offset: res.headers.get('electric-offset'),
-              body,
-            }
-          } catch (error) {
-            if (cancels && (error as Error).name === 'AbortError') return null
-            throw error
-          }
-        })(),
+    const claims = async () =>
+      Promise.all(
+        shapeIds.map(async (id) => {
+          const res = await fetch(`${harness.engineUrl}/shapes/${id}`)
+          expect(res.status).toBe(200)
+          return ((await res.json()) as { subscriptions: number }).subscriptions
+        }),
       )
-    }
-    // Disconnect only once the engine is answering, so the aborted requests are in flight there
-    // (a timer set before the loop above fires only after every request was issued, and before
-    // any reached the engine). Each one leaves at its own moment over the next 50 ms.
-    await Promise.race(requests.filter((_, n) => Math.floor(n / SHAPES) % 3 !== 0))
-    for (const { n, abort } of aborts) setTimeout(() => abort.abort(), (n * 7) % 50)
-    const outcomes = (await Promise.all(requests)).filter((o): o is NonNullable<Outcome> => o !== null)
-    expect(outcomes.length).toBeGreaterThanOrEqual(SHAPES * CLIENTS_PER_SHAPE - aborts.length)
-    expect(outcomes.length, 'some clients must actually disconnect').toBeLessThan(SHAPES * CLIENTS_PER_SHAPE)
+    const restored = await claims()
+
+    type Outcome = { grp: number; status: number; handle: string | null; offset: string | null; body: string }
+    const snapshot = (grp: number, signal?: AbortSignal): Promise<Outcome> =>
+      fetch(shapeUrl(harness, grp, '&offset=-1'), { signal }).then(async (res) => ({
+        grp,
+        status: res.status,
+        handle: res.headers.get('electric-handle'),
+        offset: res.headers.get('electric-offset'),
+        body: await res.text(),
+      }))
+    const before = await snapshotCounters(harness)
+    gate.arm()
+
+    // 1. The clients that will leave go first, so every shape's build is started by one of them.
+    const leaving = Array.from({ length: SHAPES * LEAVING_PER_SHAPE }, (_, n) => {
+      const abort = new AbortController()
+      return { abort, result: snapshot(n % SHAPES, abort.signal).then(() => 'answered', (e: Error) => e.name) }
+    })
+    await within('every shape has one build in flight', async () => {
+      const folds = gate.folds()
+      return new Set(folds).size === SHAPES ? folds : undefined
+    })
+    // 2. The clients that stay arrive while those builds are held; wait until all of them have
+    //    their claim, i.e. are past create/join and waiting on the shared build.
+    const staying = Array.from({ length: SHAPES * STAYING_PER_SHAPE }, (_, n) => snapshot(n % SHAPES))
+    await within('every client has joined its shape', async () => {
+      const now = await claims()
+      return now.every((count, i) => count >= restored[i]! + LEAVING_PER_SHAPE + STAYING_PER_SHAPE) ? now : undefined
+    })
+    // 3. Every client that started a build disconnects while it is still held, then storage answers.
+    for (const { abort } of leaving) abort.abort()
+    expect(new Set(await Promise.all(leaving.map((l) => l.result))), 'the leaving clients got no answer').toEqual(
+      new Set(['AbortError']),
+    )
+    const folds = gate.folds()
+    gate.release()
+    const outcomes = await Promise.all(staying)
+    expect(folds.length, 'one fold per shape for the whole storm, not one per client').toBe(SHAPES)
+    expect(gate.folds()).toEqual(folds)
 
     const bytesByTail = new Map<string, string>()
     const clients: Client[] = []
@@ -174,19 +269,13 @@ describe('conformance: /v1/shape reconnect storm', () => {
     }
     expect(new Set(clients.map((c) => c.handle)).size, 'every client gets its own handle').toBe(clients.length)
 
-    // Nothing was written during the storm, so every shape has one tail: at most one build each,
-    // and every other answered client joined or reused one. A client that disconnected after its
-    // request reached the snapshot stage is counted by the engine but has no outcome here, so the
-    // engine's answers exceed the served clients exactly when some disconnects landed mid-request.
+    // The engine's own counters agree: one build per shape, every client that stayed was answered
+    // by joining one (a build's starter that left is answered by nobody).
     const after = await snapshotCounters(harness)
     const builds = after.builds - before.builds
     const shared = after.joins - before.joins + (after.reuses - before.reuses)
-    expect(builds, 'snapshot builds must be one per shape and tail, not one per client').toBeLessThanOrEqual(SHAPES)
-    expect(builds + shared).toBeGreaterThanOrEqual(clients.length)
-    expect(builds + shared, 'some disconnects must land while their snapshot is in flight').toBeGreaterThan(
-      clients.length,
-    )
-    expect(shared).toBeGreaterThanOrEqual(clients.length - SHAPES)
+    expect(builds, 'snapshot builds must be one per shape and tail, not one per client').toBe(SHAPES)
+    expect(shared).toBe(clients.length)
     // The same counters reach the Prometheus scrape, where a post-restart storm is watched.
     const prom = await (await fetch(`${harness.engineUrl}/metrics/prometheus`)).text()
     const scraped = (name: string) => Number(prom.match(new RegExp(`^${name}\\{[^}]*\\} (\\S+)`, 'm'))?.[1] ?? NaN)
