@@ -80,11 +80,11 @@ run_one() {
     d) stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_loop sparse_events 10 "$seconds" & writer=$! ;;
     e) for i in $(seq 1 30); do curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}' >"$OUT/burst-$i-load.json"; done; write_loop plain_events 0.01 "$seconds" & writer=$! ;;
     e-200-1000|e-1000-1000)
+      write_rate "$rate" "$seconds"
       for i in $(seq 1 "$groups"); do
         curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
           -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}' >/dev/null
       done
-      write_rate "$rate" "$seconds"
       ;;
     b-*) load_group outage >/dev/null; export OUTAGE=1; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     *) echo "unknown scenario $scenario" >&2; return 2;;
