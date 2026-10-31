@@ -44,7 +44,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p harness/otto-10992/results
-          git diff 135c183^ 135c183 -- \
+          git show --format= --binary 135c183 -- \
             apps/engine/src/metrics.rs \
             apps/engine/src/engine/emission.rs \
             apps/engine/src/engine/mod.rs \
