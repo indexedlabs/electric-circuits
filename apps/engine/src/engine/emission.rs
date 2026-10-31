@@ -604,6 +604,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         };
         let old = lanes.reserve("shape/group", vec![env("old")], 1).unwrap();
@@ -658,6 +659,7 @@ mod tests {
                     lsn: None,
                     seq: None,
                     last: None,
+                    commit_ts: None,
                 },
             }
         }
@@ -736,6 +738,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         };
 
@@ -816,6 +819,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -923,6 +927,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         };
         let enqueue = tokio::spawn({
@@ -981,6 +986,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         };
         let first = tokio::spawn({

@@ -113,6 +113,7 @@ fn transaction(key: &str, lsn: &str, seq: u64, last: bool) -> Envelope {
             lsn: Some(lsn.to_string()),
             seq: Some(seq),
             last: last.then_some(true),
+            commit_ts: None,
         },
     }
 }

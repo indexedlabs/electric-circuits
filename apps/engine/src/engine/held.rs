@@ -321,6 +321,7 @@ mod tests {
                 seq: Some(seq),
                 last: (seq == 3).then_some(true),
                 offset: Some(format!("original-{seq}")),
+                commit_ts: None,
             },
         }
     }

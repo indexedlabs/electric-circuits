@@ -66,9 +66,9 @@ pub const DS_MAX_BODY_BYTES: u64 = 1024 * 1024 * 1024;
 /// Upper bound on the bytes stamping adds to one serialized envelope, used when packing chunks so
 /// the POST body that `DsClient` builds from a chunk is still within the budget:
 /// `,"txid":"4294967295"` (20) + `,"lsn":"FFFFFFFF/FFFFFFFF"` (26) + `,"seq":18446744073709551615`
-/// (27) + `,"last":true` (12) = 85, rounded up for headroom. Over-counting only makes chunks
-/// slightly smaller.
-const STAMP_BYTES: u64 = 96;
+/// (27) + `,"last":true` (12) + `,"commit_ts":-9223372036854775808` (33) = 118, rounded up for
+/// headroom. Over-counting only makes chunks slightly smaller.
+const STAMP_BYTES: u64 = 128;
 
 /// Prefix of a spill file's name. The `<xid>-<pid>` suffix makes it unique: protocol v1 delivers
 /// transactions serially, so one process has at most one buffered transaction at a time.
@@ -243,6 +243,8 @@ pub struct Stamp {
     pub lsn: String,
     /// The transaction's Postgres xid, as the wire spells it.
     pub txid: String,
+    /// The transaction's Postgres commit time, ms since the Unix epoch (`headers.commit_ts`).
+    pub commit_ts: Option<i64>,
 }
 
 /// The open spill file of a transaction that outgrew its memory cap.
@@ -650,6 +652,7 @@ impl TxnDrain<'_> {
         };
         env.headers.lsn = Some(self.stamp.lsn.clone());
         env.headers.txid = Some(self.stamp.txid.clone());
+        env.headers.commit_ts = self.stamp.commit_ts;
         env.headers.seq = Some(self.seq);
         self.seq += 1;
         Ok(Some((env, len)))
@@ -695,6 +698,7 @@ fn taken() -> Envelope {
             lsn: None,
             seq: None,
             last: None,
+            commit_ts: None,
         },
     }
 }
@@ -998,6 +1002,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -1028,8 +1033,11 @@ mod tests {
         }
     }
 
+    /// The commit time `drain_all` stamps (2026-10-31T00:00:00.123Z).
+    const COMMIT_TS: i64 = 1_793_404_800_123;
+
     fn drain_all(buf: &mut TxnBuffer) -> Vec<Vec<Envelope>> {
-        let stamp = Stamp { lsn: "0/1A2B3C4".to_string(), txid: "4242".to_string() };
+        let stamp = Stamp { lsn: "0/1A2B3C4".to_string(), txid: "4242".to_string(), commit_ts: Some(COMMIT_TS) };
         let mut out = Vec::new();
         let mut drain = buf.drain(stamp).unwrap();
         while let Some(chunk) = drain.next_chunk().unwrap() {
@@ -1063,7 +1071,7 @@ mod tests {
         assert!(buf.mem.is_empty(), "the buffered envelopes moved to the file");
         assert_eq!(buf.mem_bytes, 0);
         // Every envelope is on disk, one per line, once the drain has flushed the writer.
-        drop(buf.drain(Stamp { lsn: "0/1".into(), txid: "7".into() }).unwrap());
+        drop(buf.drain(Stamp { lsn: "0/1".into(), txid: "7".into(), commit_ts: None }).unwrap());
         let lines = std::fs::read_to_string(&path).unwrap().lines().count();
         assert_eq!(lines, 40);
     }
@@ -1088,6 +1096,7 @@ mod tests {
             assert_eq!(env.headers.seq, Some(i as u64), "seq is the running index over the whole transaction");
             assert_eq!(env.headers.lsn.as_deref(), Some("0/1A2B3C4"));
             assert_eq!(env.headers.txid.as_deref(), Some("4242"));
+            assert_eq!(env.headers.commit_ts, Some(COMMIT_TS), "a spilled change carries the commit time");
         }
     }
 
@@ -1108,6 +1117,7 @@ mod tests {
         for (i, env) in flat.iter().enumerate() {
             assert_eq!(env.key, format!("k{i:03}"));
             assert_eq!(env.headers.seq, Some(i as u64));
+            assert_eq!(env.headers.commit_ts, Some(COMMIT_TS), "an in-memory change carries the commit time");
         }
     }
 
@@ -1197,7 +1207,7 @@ mod tests {
         let mut buf = TxnBuffer::new(27, cfg(dir.path(), 0, budget));
         buf.push(env_of("a", 8), 10).unwrap();
         buf.push(env_of("b", 8), 10).unwrap();
-        let mut drain = buf.drain(Stamp { lsn: "0/1".into(), txid: "27".into() }).unwrap();
+        let mut drain = buf.drain(Stamp { lsn: "0/1".into(), txid: "27".into(), commit_ts: None }).unwrap();
         let first = drain.next_chunk().unwrap().expect("a chunk");
         assert_eq!(first.len(), 2, "both fit — exactly");
         assert!(serde_json::to_vec(&first).unwrap().len() as u64 <= budget);

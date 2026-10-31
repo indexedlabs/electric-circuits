@@ -534,15 +534,16 @@ async fn stream_loop(
                     Decoded::None => {}
                 }
             }
-            ReplicationEvent::Commit { lsn, end_lsn, .. } => {
+            ReplicationEvent::Commit { lsn, end_lsn, commit_time_micros } => {
                 let Some(mut t) = txn.take() else { continue };
                 let t0 = std::time::Instant::now();
                 let commit_lsn = lsn.to_string();
+                let commit_ts = Some(pg_commit_time_to_unix_ms(commit_time_micros));
                 let (ops, raw_bytes, sync) = (t.len(), t.raw_bytes(), t.sync());
                 // Append the whole transaction — from memory, or from its spill file — in chunks,
                 // in order, to the CURRENT segment. `?` here is the ack-after-the-last-chunk rule:
                 // nothing below runs unless every chunk landed.
-                append_commit_chunked(log, &mut t, &commit_lsn, t0).await?;
+                append_commit_chunked(log, &mut t, &commit_lsn, commit_ts, t0).await?;
                 // ...and only NOW, with every chunk on the log, is the transaction acknowledged.
                 client.update_applied_lsn(end_lsn);
                 *last_lsn.lock().unwrap() = commit_lsn;
@@ -586,9 +587,10 @@ async fn stream_loop(
 ///
 /// The buffered changes are streamed out — from memory, or from the spill file if this transaction
 /// outgrew its cap — and each is stamped with the commit LSN, the transaction's xid (the backfill
-/// snapshot's xid-visibility fence) and its position within the transaction (`seq`, the sequencer's
-/// de-duplication key, contiguous `0..n` across every chunk). Chunks are appended **in order**, each
-/// small enough to be one durable-streams request body.
+/// snapshot's xid-visibility fence), its position within the transaction (`seq`, the sequencer's
+/// de-duplication key, contiguous `0..n` across every chunk) and the commit time (`commit_ts`,
+/// telemetry only). Chunks are appended **in order**, each small enough to be one durable-streams
+/// request body.
 ///
 /// The final envelope of the final chunk additionally carries the
 /// **transaction-end marker** (`headers.last`), which is what lets the sequencer recognise the run
@@ -604,11 +606,12 @@ pub async fn append_commit_chunked(
     log: &ChangeLogWriter,
     buf: &mut TxnBuffer,
     commit_lsn: &str,
+    commit_ts: Option<i64>,
     started: std::time::Instant,
 ) -> Result<u64> {
     buf.reserve_drain().await?;
     let (xid, changes, bytes, spilled) = (buf.xid(), buf.len(), buf.buffered_bytes(), buf.spilled());
-    let stamp = Stamp { lsn: commit_lsn.to_string(), txid: xid.to_string() };
+    let stamp = Stamp { lsn: commit_lsn.to_string(), txid: xid.to_string(), commit_ts };
     let mut chunks = 0u64;
     let mut drain = buf.drain(stamp).context("reading the buffered transaction")?;
     while let Some(chunk) = drain.next_chunk().context("reading the buffered transaction")? {
@@ -630,6 +633,16 @@ pub async fn append_commit_chunked(
         );
     }
     Ok(chunks)
+}
+
+/// Milliseconds from the Unix epoch to Postgres's epoch (2000-01-01T00:00:00Z).
+const PG_EPOCH_UNIX_MS: i64 = 946_684_800_000;
+
+/// A pgoutput commit timestamp (microseconds since 2000-01-01 UTC, from the source's clock) as
+/// milliseconds since the Unix epoch — the unit of `headers.commit_ts`. Floors, so a sub-millisecond
+/// commit never reads as later than it was.
+pub fn pg_commit_time_to_unix_ms(commit_time_micros: i64) -> i64 {
+    commit_time_micros.div_euclid(1000) + PG_EPOCH_UNIX_MS
 }
 
 /// What one decoded DML message amounts to for the ingestor.
@@ -820,6 +833,7 @@ fn source_fence_envelope(rel: &RelMeta, message: &Message) -> Option<Envelope> {
             lsn: None,
             seq: None,
             last: None,
+            commit_ts: None,
         },
     })
 }
@@ -848,6 +862,7 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
             lsn: None,
             seq: None,
             last: None,
+            commit_ts: None,
         },
     };
     match msg {
@@ -976,6 +991,17 @@ mod tests {
     use crate::pgoutput::{Cell, Message, OldTuple};
     use crate::schema::{ColumnDef, FingerprintColumn, TableDef};
     use std::collections::BTreeMap;
+
+    /// pgoutput's commit time counts microseconds from 2000-01-01 UTC; `headers.commit_ts` counts
+    /// milliseconds from 1970-01-01 UTC, floored.
+    #[test]
+    fn commit_time_is_converted_from_the_postgres_epoch_to_unix_milliseconds() {
+        assert_eq!(pg_commit_time_to_unix_ms(0), 946_684_800_000);
+        // 2026-10-31T00:00:00.123456Z.
+        assert_eq!(pg_commit_time_to_unix_ms(846_720_000_123_456), 1_793_404_800_123);
+        // A commit before 2000 is negative on the wire and still floors toward the past.
+        assert_eq!(pg_commit_time_to_unix_ms(-1), 946_684_799_999);
+    }
 
     /// A recording [`SchemaEvents`] sink standing in for the engine: it records what the decoder
     /// reported and, like the real handler, updates the shared schema view — which is the ONLY

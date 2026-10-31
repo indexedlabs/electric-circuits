@@ -89,7 +89,15 @@ pub(crate) fn absolute_envelope(
         key: key.to_string(),
         value,
         old: None,
-        headers: EnvelopeHeaders { operation: operation.into(), txid, offset: None, lsn, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: operation.into(),
+            txid,
+            offset: None,
+            lsn,
+            seq: None,
+            last: None,
+            commit_ts: None,
+        },
     })
 }
 
@@ -138,6 +146,7 @@ pub(crate) fn translate_output(
                 lsn: lsn.clone(),
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         });
     }
@@ -160,6 +169,7 @@ pub(crate) fn translate_output(
                 lsn: lsn.clone(),
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         });
     }
@@ -187,6 +197,7 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         })
         .collect()
@@ -208,6 +219,14 @@ pub(crate) fn agg_envelope(
         key: "agg".into(),
         value: Some(serde_json::json!({ "value": value, "n": n })),
         old: None,
-        headers: EnvelopeHeaders { operation: "upsert".into(), txid, offset: None, lsn, seq: None, last: None },
+        headers: EnvelopeHeaders {
+            operation: "upsert".into(),
+            txid,
+            offset: None,
+            lsn,
+            seq: None,
+            last: None,
+            commit_ts: None,
+        },
     }
 }
