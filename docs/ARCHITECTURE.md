@@ -391,7 +391,8 @@ set *is* the state the node will maintain; a subquery *shape's* outer backfill i
 other, keeping only the pk set the gated replay is fenced against. The `REPEATABLE READ` bracket, the
 fence capture and `row_json_expr`'s casts are unchanged. The compat adapter's `/v1/shape` snapshot is
 the one place a whole result is still held at once, and it has to be — the snapshot body *is* every
-row; its sibling fold, the client's key set for a catch-up read, drops values as it goes and keeps
+row, held once per shape and tail however many clients ask, as raw row text and then one body buffer;
+its sibling fold, the client's key set for a catch-up read, drops values as it goes and keeps
 keys only.
 
 **LSN comparison alone is not sound.** `pg_current_wal_lsn()` is a WAL *write* position, but snapshot
@@ -951,6 +952,18 @@ handle is the shared shape id), the shape stream is folded into the Electric mes
 change messages preserve the source xid as `headers.txid` and, when numeric, the singleton
 `headers.txids`; synthetic snapshot inserts represent folded state rather than one source transaction
 boundary, so they omit both.
+An `offset=-1` snapshot is **built once per shape and stream tail** (OTTO-11109): concurrent requests
+for one shape await one build, and a finished build is reused while a `HEAD` still finds the tail it
+was built at, for up to 30 s. The build runs in its own Engine-tracked task (a disconnecting client
+never cancels it; a failed build is not kept), folds the stream keeping each row as raw JSON text, and
+writes the response body into one buffer that every client is sent a slice of — byte-for-byte the body
+an unshared build produced. Each client still gets its own handle and its own copy of the key set.
+After a restart every client's handle is gone and all of them re-request `offset=-1` within seconds;
+a fold per client made memory grow with clients × shape size. Builds are keyed by stream path inside
+the Engine's own registry, so two sources that both have a `shape/s5` never see each other's result.
+There is deliberately no limit on concurrent snapshots. The retained bodies are counted in the memory
+probe's `bytes_electric_adapter`, not in `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`: that ledger admits
+transient page owners, and retained results stay outside it as fold results always have.
 Each Engine owns its handle registry and TTL evictor. A handle minted by another source or an earlier
 Engine receives `409 must-refetch`; snapshot-only readers are evicted like any other idle handle.
 Closing an Engine drops the registry without per-handle catalog appends; durable subscriptions retain

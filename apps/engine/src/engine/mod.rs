@@ -3947,7 +3947,8 @@ impl Engine {
             (reg.circuit_bytes(), reg.feed_sets_bytes(), reg.heap_bytes(), reg.pk_dict_bytes())
         };
         let bytes_retention = self.lives.lock().unwrap().heap_bytes();
-        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes(self).await;
+        let bytes_electric_adapter =
+            crate::electric::ttl_registry_heap_bytes(self).await + crate::electric::snapshot_cache_heap_bytes(self);
         crate::mem::HeapBytes {
             bytes_shape_records,
             bytes_executors,

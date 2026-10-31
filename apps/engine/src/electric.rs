@@ -9,6 +9,12 @@
 //!   shape, fold its stream to the current row set, emit every row as an `insert`, then an
 //!   `up-to-date` control. The handle is the shape id; the offset is the stream's tail. An
 //!   `offset > -1` without a handle is a 400 (Electric: "handle required").
+//! - Snapshots of one shape at one stream tail are **built once** (`shared_snapshot`): concurrent
+//!   requests await one build, and a finished build is reused while a `HEAD` still finds that tail,
+//!   for up to `SNAPSHOT_REUSE_TTL`. The build keeps rows as raw JSON text and writes the body into
+//!   one buffer that every client is sent a slice of; each client still gets its own handle and its
+//!   own copy of the key set. A restart sends every client back with `offset=-1` at once, and a
+//!   fold per client made memory grow with clients × shape size.
 //! - A `GET` with `live=true` long-polls the stream from `offset` and emits `insert`/`update`/`delete`.
 //!   Our engine emits absolute `upsert`/`delete`, so we reconstruct insert-vs-update from a per-handle
 //!   key set (Electric's client rejects insert-of-existing / update-of-missing). Requests on one handle
@@ -44,19 +50,23 @@
 //!   value-mapper only coerces int/float, leaving these as strings — matching the oracle's stringified
 //!   comparison.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
+use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use tokio::sync::watch;
 
-use crate::ds::{Envelope, ReadResult};
+use crate::ds::{Envelope, RawPage, ReadResult};
 use crate::engine::Engine;
 use crate::heap_size::HeapSize;
 use crate::schema::{ColumnType, PK_SEP, TableSchema, unescape_key_component};
@@ -138,12 +148,18 @@ struct HandleState {
 #[derive(Default)]
 pub(crate) struct HandleRegistry {
     entries: std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>,
+    /// Snapshot builds by shape stream path: in flight, or finished and kept for reuse (see
+    /// [`shared_snapshot`]). The registry belongs to one [`Engine`] — one source in sources-table
+    /// mode — so this is keyed by engine as well as by path: two sources each have a `shape/s5`.
+    /// Lock order: held only briefly, never across I/O, never together with `entries`.
+    snapshots: std::sync::Mutex<HashMap<String, SnapshotEntry>>,
     started: OnceLock<()>,
 }
 
 pub(crate) fn close_handles(engine: &Engine) {
     // Durable subscriptions retain their existing lease; shutdown adds no per-handle catalog work.
     drop(std::mem::take(&mut *engine.electric_handles.entries.lock().unwrap()));
+    drop(std::mem::take(&mut *engine.electric_handles.snapshots.lock().unwrap()));
 }
 
 /// Observe the serving Engine's registry without creating or renewing a handle.
@@ -181,6 +197,23 @@ pub(crate) async fn ttl_registry_heap_bytes(engine: &Engine) -> usize {
             total += st.keys.heap_bytes() + st.offset.heap_bytes();
         }
         total += entry.live_inflight.lock().unwrap().keys().map(HeapSize::heap_bytes).sum::<usize>();
+    }
+    total
+}
+
+/// Owned-heap estimate of the finished snapshot builds kept for reuse (see [`shared_snapshot`]):
+/// one body and key list per shape, shared by every handle minted from it, each dropped at most
+/// `SNAPSHOT_REUSE_TTL` after it was built. The memory probe adds this to `bytes_electric_adapter`;
+/// it is separate from [`ttl_registry_heap_bytes`] because it outlives no handle and expires on its
+/// own clock, not the handle TTL.
+pub(crate) fn snapshot_cache_heap_bytes(engine: &Engine) -> usize {
+    let snapshots = engine.electric_handles.snapshots.lock().unwrap();
+    let mut total = 0;
+    for (path, entry) in snapshots.iter() {
+        total += path.heap_bytes();
+        if let SnapshotEntry::Ready { snapshot, .. } = entry {
+            total += snapshot.body.len() + snapshot.keys.heap_bytes() + snapshot.tail.heap_bytes();
+        }
     }
     total
 }
@@ -358,9 +391,15 @@ fn hv(s: &str) -> HeaderValue {
     HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
-fn respond(messages: Vec<serde_json::Value>, mut headers: HeaderMap, status: StatusCode) -> Response {
-    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+fn respond(messages: Vec<serde_json::Value>, headers: HeaderMap, status: StatusCode) -> Response {
     let body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".into());
+    respond_body(Bytes::from(body), headers, status)
+}
+
+/// A JSON message-array body already serialized — for a shared snapshot, a zero-copy slice of the
+/// one body every client of the build is sent.
+fn respond_body(body: Bytes, mut headers: HeaderMap, status: StatusCode) -> Response {
+    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let len = body.len() as u64;
     let mut resp = (status, headers, body).into_response();
     resp.extensions_mut().insert(BodyLen(len));
@@ -509,6 +548,49 @@ fn offset_after(a: &str, b: &str) -> bool {
     }
 }
 
+/// A row value a [`StreamFold`] can keep: the decoded tree (the catch-up key-set fold, which never
+/// decodes it) or the row's raw JSON text (the snapshot build, which copies it into the body once).
+trait FoldValue: Sized {
+    fn from_raw(raw: &RawValue, keys_only: bool) -> anyhow::Result<Self>;
+}
+
+impl FoldValue for serde_json::Value {
+    fn from_raw(raw: &RawValue, keys_only: bool) -> anyhow::Result<Self> {
+        if keys_only {
+            return Ok(serde_json::Value::Null);
+        }
+        Ok(serde_json::from_str(raw.get())?)
+    }
+}
+
+impl FoldValue for Box<RawValue> {
+    fn from_raw(raw: &RawValue, _keys_only: bool) -> anyhow::Result<Self> {
+        Ok(raw.to_owned())
+    }
+}
+
+/// The parts of a shape-stream envelope a fold reads, borrowed from the page body: a key without
+/// escapes and the row's JSON text are never copied unless the fold keeps them.
+#[derive(Deserialize)]
+struct PageEnvelope<'a> {
+    #[serde(rename = "type")]
+    _type: serde::de::IgnoredAny,
+    #[serde(borrow)]
+    key: Cow<'a, str>,
+    #[serde(borrow, default)]
+    value: Option<&'a RawValue>,
+    #[serde(borrow)]
+    headers: PageHeaders<'a>,
+}
+
+#[derive(Deserialize)]
+struct PageHeaders<'a> {
+    #[serde(borrow)]
+    operation: Cow<'a, str>,
+    #[serde(borrow, default)]
+    offset: Option<Cow<'a, str>>,
+}
+
 /// Page-driven fold of a shape stream into its current key→row map (pure, so unit-testable).
 ///
 /// `until = Some(off)` rebuilds the state **as of** that offset: envelopes stamped after it are
@@ -517,10 +599,10 @@ fn offset_after(a: &str, b: &str) -> bool {
 /// target offset is passed, or when the next offset stops advancing; an empty page mid-stream does
 /// **not** end the fold (that truncated snapshots), but a `closed` page does: a retired stream is
 /// terminal, so there is nothing further to wait for.
-struct StreamFold {
+struct StreamFold<V = serde_json::Value> {
     /// Key → current row value. When [`Self::keys_only`] is set the values are dropped as they are
-    /// folded (stored as `Null`) — see [`Self::up_to`].
-    rows: HashMap<String, serde_json::Value>,
+    /// folded (stored as `Null`) — see [`StreamFold::up_to`].
+    rows: HashMap<String, V>,
     /// Keys in first-appearance (stream) order. `rows` alone would randomize the snapshot's
     /// row order per request (HashMap iteration), which readers observably depend on — the
     /// engine appends the backfill in a deterministic order and the adapter must not shuffle
@@ -537,17 +619,6 @@ struct StreamFold {
 }
 
 impl StreamFold {
-    fn to_tail() -> Self {
-        StreamFold {
-            rows: HashMap::new(),
-            order: Vec::new(),
-            offset: "-1".into(),
-            until: None,
-            keys_only: false,
-            done: false,
-        }
-    }
-
     /// Rebuild the KEY SET as of `offset`. Values are never retained: the only consumer
     /// ([`keys_as_of`]) throws them away, and a `/v1/shape` catch-up over a wide shape should not
     /// hold a table's worth of JSON to work out which keys the client has.
@@ -561,54 +632,83 @@ impl StreamFold {
             done: false,
         }
     }
+}
+
+impl<V: FoldValue> StreamFold<V> {
+    fn to_tail() -> Self {
+        StreamFold {
+            rows: HashMap::new(),
+            order: Vec::new(),
+            offset: "-1".into(),
+            until: None,
+            keys_only: false,
+            done: false,
+        }
+    }
 
     /// The folded rows in stream (first-appearance) order.
-    fn ordered_rows(&self) -> impl Iterator<Item = (&String, &serde_json::Value)> {
+    fn ordered_rows(&self) -> impl Iterator<Item = (&String, &V)> {
         self.order.iter().filter_map(|k| self.rows.get_key_value(k))
     }
 
-    fn apply_page(&mut self, r: ReadResult) {
-        for env in r.envelopes {
+    fn apply_page(&mut self, page: RawPage) -> anyhow::Result<()> {
+        let envelopes: Vec<PageEnvelope<'_>> = if page.body.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&page.body).with_context(|| format!("parsing stream body: {}", page.body))?
+        };
+        for env in envelopes {
             if let (Some(target), Some(stamp)) = (self.until.as_deref(), env.headers.offset.as_deref()) {
                 if offset_after(stamp, target) {
                     self.done = true;
-                    return;
+                    return Ok(());
                 }
             }
-            match env.headers.operation.as_str() {
+            match env.headers.operation.as_ref() {
                 "delete" => {
-                    self.rows.remove(&env.key);
+                    self.rows.remove(env.key.as_ref());
                 }
                 _ => {
-                    if let Some(v) = env.value {
-                        let v = if self.keys_only { serde_json::Value::Null } else { v };
-                        if self.rows.insert(env.key.clone(), v).is_none() {
-                            self.order.push(env.key);
+                    if let Some(raw) = env.value {
+                        let v = V::from_raw(raw, self.keys_only)?;
+                        if let Some(slot) = self.rows.get_mut(env.key.as_ref()) {
+                            *slot = v;
+                        } else {
+                            let key = env.key.into_owned();
+                            self.order.push(key.clone());
+                            self.rows.insert(key, v);
                         }
                     }
                 }
             }
         }
-        let advanced = match r.next_offset {
+        let advanced = match page.next_offset {
             Some(n) if n != self.offset => {
                 self.offset = n;
                 true
             }
             _ => false,
         };
-        if r.up_to_date || r.closed || !advanced {
+        if page.up_to_date || page.closed || !advanced {
             self.done = true;
         }
+        Ok(())
     }
 }
 
-/// Drive a [`StreamFold`] with catch-up reads until it completes.
-async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow::Result<StreamFold> {
+/// Drive a [`StreamFold`] with catch-up reads until it completes. Pages are read as text and folded
+/// straight from it, so a page is never held as decoded envelopes.
+async fn drive_fold<V: FoldValue>(
+    engine: &Engine,
+    path: &str,
+    mut fold: StreamFold<V>,
+) -> anyhow::Result<StreamFold<V>> {
     let ds = engine.shape_fold_input(path).await?;
     if !ds.memory_budget().enabled() {
         while !fold.done {
-            let page = engine.read_shape_stream(path, &fold.offset, false).await?;
-            fold.apply_page(page);
+            // A data read is a full retention touch: reactivate a dormant shape before every page.
+            let ds = engine.shape_fold_input(path).await?;
+            fold.apply_page(ds.read_raw(path, &fold.offset).await?)?;
         }
         return Ok(fold);
     }
@@ -619,9 +719,9 @@ async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow
         engine.shape_fold_input(path).await?;
         let (page, permit) = tokio::select! {
             _ = shutdown.wait() => anyhow::bail!("shape fold interrupted by shutdown"),
-            page = ds.read_budgeted(path, &fold.offset, false) => page?,
+            page = ds.read_raw_budgeted(path, &fold.offset) => page?,
         };
-        fold.apply_page(page);
+        fold.apply_page(page)?;
         // The page has been consumed. Retained map/order/result storage is outside the ledger.
         // Never keep this owner while requesting the next page.
         drop(permit);
@@ -629,18 +729,195 @@ async fn drive_fold(engine: &Engine, path: &str, mut fold: StreamFold) -> anyhow
     Ok(fold)
 }
 
-/// Fold a shape's whole stream (catch-up reads from `-1`) into the current key→row-value map and return
-/// it with the stream's tail offset.
-async fn materialize(engine: &Engine, path: &str) -> anyhow::Result<(Vec<(String, serde_json::Value)>, String)> {
-    let fold = drive_fold(engine, path, StreamFold::to_tail()).await?;
-    let rows = fold.ordered_rows().map(|(k, v)| (k.clone(), v.clone())).collect();
-    Ok((rows, fold.offset))
-}
-
 /// The key set a client holds when positioned at `offset` (fold `-1..=offset`).
 async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<HashSet<String>> {
     let fold = drive_fold(engine, path, StreamFold::up_to(offset)).await?;
     Ok(fold.rows.into_keys().collect())
+}
+
+/// How long a finished snapshot build is kept for reuse while its stream's tail has not moved. The
+/// clients of a restarted engine all come back within seconds; past this the body is dropped even
+/// if the shape never changed, so an idle shape does not keep its whole body in memory.
+const SNAPSHOT_REUSE_TTL: Duration = Duration::from_secs(30);
+
+/// One `offset=-1` answer for one shape at one stream tail, shared by every client that asked for
+/// it: the serialized body (each response is a zero-copy slice of it) and the keys each client's
+/// handle starts from (copied per handle, because a handle's key set changes with its live reads).
+struct Snapshot {
+    body: Bytes,
+    keys: Vec<String>,
+    tail: String,
+}
+
+/// `None` until the build publishes; then the result every waiter clones.
+type SnapshotSlot = Option<Result<Arc<Snapshot>, ApiError>>;
+
+enum SnapshotEntry {
+    Building { build: u64, result: watch::Receiver<SnapshotSlot> },
+    Ready { build: u64, snapshot: Arc<Snapshot>, built: tokio::time::Instant },
+}
+
+/// The current snapshot of the shape whose stream is `path`, built at most once per stream tail.
+///
+/// Concurrent requests await one build. A finished build is reused while the stream's tail (a
+/// `HEAD`) is still the tail it was built at, for up to [`SNAPSHOT_REUSE_TTL`]; a moved, closed or
+/// missing stream gets a new build, which answers exactly as an unshared one would. The build runs
+/// in its own task, so a requester that disconnects never cancels work other requesters wait on;
+/// a build every requester abandoned still finishes and is kept, because clients that time out in
+/// a reconnect storm come straight back for the same shape. A failed build is not kept: every
+/// request waiting on it gets its error, and the next request starts a new one.
+async fn shared_snapshot(engine: &Engine, path: &str) -> Result<Arc<Snapshot>, ApiError> {
+    enum Step {
+        Wait(watch::Receiver<SnapshotSlot>),
+        Build(u64, watch::Sender<SnapshotSlot>, watch::Receiver<SnapshotSlot>),
+        Reuse(u64, Arc<Snapshot>),
+    }
+    loop {
+        let step = {
+            let mut snapshots = engine.electric_handles.snapshots.lock().unwrap();
+            match snapshots.get(path) {
+                Some(SnapshotEntry::Building { result, .. }) => Step::Wait(result.clone()),
+                Some(SnapshotEntry::Ready { build, snapshot, built }) if built.elapsed() < SNAPSHOT_REUSE_TTL => {
+                    Step::Reuse(*build, snapshot.clone())
+                }
+                _ => {
+                    let build = next_cursor();
+                    let (tx, rx) = watch::channel(None);
+                    snapshots.insert(path.to_string(), SnapshotEntry::Building { build, result: rx.clone() });
+                    Step::Build(build, tx, rx)
+                }
+            }
+        };
+        match step {
+            Step::Wait(rx) => return await_snapshot(engine, rx).await,
+            Step::Build(build, tx, rx) => {
+                spawn_snapshot_build(engine, path, build, tx);
+                return await_snapshot(engine, rx).await;
+            }
+            Step::Reuse(build, snapshot) => {
+                // A data read like any other: a dormant shape reactivates first (its replay moves
+                // the tail, so the result is rebuilt) and a degraded engine refuses.
+                let ds = engine.shape_fold_input(path).await?;
+                let head = ds.head(path).await?;
+                if head.is_some_and(|h| !h.closed && h.next_offset.as_deref() == Some(snapshot.tail.as_str())) {
+                    return Ok(snapshot);
+                }
+                let mut snapshots = engine.electric_handles.snapshots.lock().unwrap();
+                if matches!(snapshots.get(path), Some(SnapshotEntry::Ready { build: b, .. }) if *b == build) {
+                    snapshots.remove(path);
+                }
+            }
+        }
+    }
+}
+
+async fn await_snapshot(engine: &Engine, mut rx: watch::Receiver<SnapshotSlot>) -> Result<Arc<Snapshot>, ApiError> {
+    loop {
+        if let Some(result) = rx.borrow_and_update().clone() {
+            return result;
+        }
+        if rx.changed().await.is_err() {
+            if let Some(result) = rx.borrow().clone() {
+                return result;
+            }
+            // The build task ended without an answer: shutdown dropped it, or it panicked.
+            if engine.shutdown_token().is_shutting_down() {
+                return Err(ApiError::draining());
+            }
+            return Err(anyhow::anyhow!("shape snapshot build ended without a result").into());
+        }
+    }
+}
+
+/// Removes a build's in-flight entry if its task ends without publishing — shutdown drops it, a
+/// panic unwinds it, or a closed task set never runs it — so later requests start a new build
+/// instead of waiting on one that will never answer.
+struct BuildEntryGuard {
+    registry: Arc<HandleRegistry>,
+    path: String,
+    build: u64,
+    armed: bool,
+}
+
+impl BuildEntryGuard {
+    /// Under the registry lock: keep `result` for reuse when it succeeded, otherwise drop the entry.
+    fn settle(&mut self, result: &Result<Arc<Snapshot>, ApiError>) {
+        let mut snapshots = self.registry.snapshots.lock().unwrap();
+        if matches!(snapshots.get(&self.path), Some(SnapshotEntry::Building { build, .. }) if *build == self.build) {
+            match result {
+                Ok(snapshot) => {
+                    let built = tokio::time::Instant::now();
+                    let entry = SnapshotEntry::Ready { build: self.build, snapshot: snapshot.clone(), built };
+                    snapshots.insert(self.path.clone(), entry);
+                }
+                Err(_) => {
+                    snapshots.remove(&self.path);
+                }
+            }
+        }
+        self.armed = false;
+    }
+
+    fn expire(&self) {
+        let mut snapshots = self.registry.snapshots.lock().unwrap();
+        if matches!(snapshots.get(&self.path), Some(SnapshotEntry::Ready { build, .. }) if *build == self.build) {
+            snapshots.remove(&self.path);
+        }
+    }
+}
+
+impl Drop for BuildEntryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut snapshots = self.registry.snapshots.lock().unwrap();
+            if matches!(snapshots.get(&self.path), Some(SnapshotEntry::Building { build, .. }) if *build == self.build)
+            {
+                snapshots.remove(&self.path);
+            }
+        }
+    }
+}
+
+/// Run one build detached from every request, under the engine's shutdown token (shutdown drops
+/// it, and its waiters are told to retry). After publishing, the task keeps the result for
+/// [`SNAPSHOT_REUSE_TTL`] and then drops it.
+fn spawn_snapshot_build(engine: &Engine, path: &str, build: u64, tx: watch::Sender<SnapshotSlot>) {
+    let mut guard =
+        BuildEntryGuard { registry: engine.electric_handles.clone(), path: path.to_string(), build, armed: true };
+    let task_engine = engine.clone();
+    engine.shutdown_token().spawn_background(async move {
+        let result = build_snapshot(&task_engine, &guard.path).await.map(Arc::new).map_err(ApiError::from);
+        drop(task_engine);
+        guard.settle(&result);
+        let kept = result.is_ok();
+        let _ = tx.send(Some(result));
+        drop(tx);
+        if kept {
+            tokio::time::sleep(SNAPSHOT_REUSE_TTL).await;
+            guard.expire();
+        }
+    });
+}
+
+/// Fold the shape's whole stream, keeping each row as its raw JSON text, and write the Electric
+/// `offset=-1` body straight into one buffer: every row as an `insert`, then `up-to-date`. The
+/// bytes are exactly what serializing those messages as one JSON array produces (`respond`), so a
+/// shared build answers byte-for-byte what an unshared one did.
+async fn build_snapshot(engine: &Engine, path: &str) -> anyhow::Result<Snapshot> {
+    let fold: StreamFold<Box<RawValue>> = drive_fold(engine, path, StreamFold::to_tail()).await?;
+    let estimate = fold.ordered_rows().map(|(key, raw)| 48 + 2 * key.len() + raw.get().len()).sum::<usize>() + 80;
+    let mut body = Vec::with_capacity(estimate);
+    let mut keys = Vec::with_capacity(fold.rows.len());
+    body.push(b'[');
+    for (key, raw) in fold.ordered_rows() {
+        let row: serde_json::Value = serde_json::from_str(raw.get()).context("decoding a shape row")?;
+        serde_json::to_writer(&mut body, &change_msg("insert", key, Some(encode_value(&row)), None))?;
+        body.push(b',');
+        keys.push(key.clone());
+    }
+    serde_json::to_writer(&mut body, &control_msg("up-to-date"))?;
+    body.push(b']');
+    Ok(Snapshot { body: Bytes::from(body), keys, tail: fold.offset })
 }
 
 /// Reconstruct a delete's key columns as Electric text values, matching [`encode_value`].
@@ -1050,23 +1327,20 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         // with a claim the catalog restored. The minted id comes back with the record and is kept on
         // the handle, so the idle evictor releases exactly this claim.
         let (rec, subscription) = engine.create_shape_as(&p.table, pred, columns.clone(), false, true, None).await?;
-        let (rows, tail) = match materialize(&engine, &rec.stream_path).await {
-            Ok(v) => v,
+        // Every client asking for this shape at this tail shares one build (OTTO-11109): after a
+        // restart every client reconnects at once, and a fold per client grew memory with
+        // clients × shape size.
+        let snapshot = match shared_snapshot(&engine, &rec.stream_path).await {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 // Failed after taking the create/join subscription: give it back, or the dead
                 // subscription pins the shape active forever.
                 engine.release_subscription(&rec.id, Some(&subscription)).await;
-                return Err(e.into());
+                return Err(e);
             }
         };
-
-        let mut messages = Vec::with_capacity(rows.len() + 1);
-        let mut keys = HashSet::with_capacity(rows.len());
-        for (key, value) in &rows {
-            messages.push(change_msg("insert", key, Some(encode_value(value)), None));
-            keys.insert(key.clone());
-        }
-        messages.push(control_msg("up-to-date"));
+        let keys: HashSet<String> = snapshot.keys.iter().cloned().collect();
+        let tail = snapshot.tail.clone();
 
         let schema_str = serde_json::to_string(&schema_json(&ts, &columns)).unwrap_or_default();
         // Handles are per-client even though the shape is shared: a unique handle id per snapshot
@@ -1095,7 +1369,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         headers.insert(HeaderName::from_static("electric-schema"), hv(&schema_str));
         headers.insert(HeaderName::from_static("electric-up-to-date"), hv(""));
         headers.insert(axum::http::header::CACHE_CONTROL, hv("no-store"));
-        return Ok(respond(messages, headers, StatusCode::OK));
+        return Ok(respond_body(snapshot.body.clone(), headers, StatusCode::OK));
     }
 
     // ---- Live: long-poll from `offset`, emit insert/update/delete reconstructed against the key set.
@@ -1216,8 +1490,8 @@ mod tests {
         let gate = Arc::new(crate::ds::BodyGate::default());
         *store.body_gate.lock().unwrap() = Some(gate.clone());
         let ds = engine.shape_fold_input("shape/s1").await.unwrap();
-        let mut first = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::to_tail()));
-        let mut second = Box::pin(drive_fold(&engine, "shape/s2", StreamFold::to_tail()));
+        let mut first = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::<Box<RawValue>>::to_tail()));
+        let mut second = Box::pin(drive_fold(&engine, "shape/s2", StreamFold::<Box<RawValue>>::to_tail()));
         let mut sequencer = Box::pin(ds.read_budgeted("changes/0", "-1", true));
         let mut backfill = Box::pin(async {
             let scope = crate::pg::SettleScope::internal(&pg.table.table);
@@ -1277,8 +1551,8 @@ mod tests {
         let budget = engine.metrics.memory_budget.clone();
         let gate = Arc::new(crate::ds::BodyGate::default());
         *store.body_gate.lock().unwrap() = Some(gate.clone());
-        let mut first = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::to_tail()));
-        let mut second = Box::pin(drive_fold(&engine, "shape/s2", StreamFold::to_tail()));
+        let mut first = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::<Box<RawValue>>::to_tail()));
+        let mut second = Box::pin(drive_fold(&engine, "shape/s2", StreamFold::<Box<RawValue>>::to_tail()));
         std::future::poll_fn(|cx| {
             assert!(first.as_mut().poll(cx).is_pending());
             assert!(second.as_mut().poll(cx).is_pending());
@@ -1307,8 +1581,8 @@ mod tests {
         assert_eq!(second.rows.len(), 1);
         assert_eq!(budget.held.load(Ordering::Relaxed), 0, "retained result is outside the ledger");
         *store.body_gate.lock().unwrap() = None;
-        let third = drive_fold(&engine, "shape/s3", StreamFold::to_tail()).await.unwrap();
-        assert_eq!(third.rows, second.rows);
+        let third = drive_fold(&engine, "shape/s3", StreamFold::<Box<RawValue>>::to_tail()).await.unwrap();
+        assert_eq!(raw_rows(&third), raw_rows(&second));
         assert_eq!(budget.waits.load(Ordering::Relaxed), 1, "a retained result must not delay another fold");
     }
 
@@ -1320,7 +1594,7 @@ mod tests {
             store.pages_by_offset.lock().unwrap().get_mut("-1").unwrap().1 = false;
             let gate = Arc::new(crate::ds::BodyGate::default());
             *store.body_gate.lock().unwrap() = Some(gate.clone());
-            let mut fold = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::to_tail()));
+            let mut fold = Box::pin(drive_fold(&engine, "shape/s1", StreamFold::<Box<RawValue>>::to_tail()));
             std::future::poll_fn(|cx| {
                 assert!(fold.as_mut().poll(cx).is_pending());
                 Poll::Ready(())
@@ -1371,10 +1645,13 @@ mod tests {
             row.value = Some(serde_json::json!({"id":"two"}));
             pages.insert("01".into(), ("02".into(), true, serde_json::to_string(&vec![row]).unwrap()));
         }
-        let fold = tokio::time::timeout(Duration::from_secs(5), drive_fold(&engine, "shape/s1", StreamFold::to_tail()))
-            .await
-            .expect("next page must not wait on the fold's own previous page")
-            .unwrap();
+        let fold = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_fold(&engine, "shape/s1", StreamFold::<Box<RawValue>>::to_tail()),
+        )
+        .await
+        .expect("next page must not wait on the fold's own previous page")
+        .unwrap();
         assert_eq!(fold.order, ["one", "two"]);
         assert_eq!(fold.rows.len(), 2);
         assert_eq!(fold.offset, "02");
@@ -1450,6 +1727,16 @@ mod tests {
         }
     }
 
+    /// The page a store sends for `envs`, as the text a fold reads.
+    fn raw_page(envs: Vec<Envelope>, next: &str, up_to_date: bool) -> RawPage {
+        let body = serde_json::to_string(&envs).unwrap();
+        RawPage { body, next_offset: Some(next.into()), up_to_date, closed: false }
+    }
+
+    fn raw_rows(fold: &StreamFold<Box<RawValue>>) -> Vec<(&str, &str)> {
+        fold.ordered_rows().map(|(key, raw)| (key.as_str(), raw.get())).collect()
+    }
+
     fn page(envs: Vec<Envelope>, next: &str, up_to_date: bool) -> ReadResult {
         ReadResult { envelopes: envs, next_offset: Some(next.into()), up_to_date, closed: false }
     }
@@ -1462,12 +1749,12 @@ mod tests {
     // the fold only stops on up-to-date or when the next offset stops advancing.
     #[test]
     fn fold_survives_empty_mid_stream_page() {
-        let mut fold = StreamFold::to_tail();
-        fold.apply_page(page(vec![env("upsert", "k1", "01")], "01", false));
+        let mut fold = StreamFold::<Box<RawValue>>::to_tail();
+        fold.apply_page(raw_page(vec![env("upsert", "k1", "01")], "01", false)).unwrap();
         assert!(!fold.done, "non-empty non-up-to-date page must not end the fold");
-        fold.apply_page(page(vec![], "02", false)); // empty page, but offset advanced
+        fold.apply_page(raw_page(vec![], "02", false)).unwrap(); // empty page, but offset advanced
         assert!(!fold.done, "empty page with an advancing offset must not end the fold");
-        fold.apply_page(page(vec![env("upsert", "k2", "03")], "03", true));
+        fold.apply_page(raw_page(vec![env("upsert", "k2", "03")], "03", true)).unwrap();
         assert!(fold.done);
         assert_eq!(fold.offset, "03");
         let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
@@ -1477,10 +1764,10 @@ mod tests {
 
     #[test]
     fn fold_stops_when_offset_stalls() {
-        let mut fold = StreamFold::to_tail();
-        fold.apply_page(page(vec![env("upsert", "k1", "01")], "01", false));
+        let mut fold = StreamFold::<Box<RawValue>>::to_tail();
+        fold.apply_page(raw_page(vec![env("upsert", "k1", "01")], "01", false)).unwrap();
         // Same next offset, no up-to-date: the stream is not advancing — stop (no infinite loop).
-        fold.apply_page(page(vec![], "01", false));
+        fold.apply_page(raw_page(vec![], "01", false)).unwrap();
         assert!(fold.done);
         assert_eq!(fold.offset, "01");
     }
@@ -1592,24 +1879,25 @@ mod tests {
     #[test]
     fn fold_up_to_keeps_keys_and_drops_values() {
         let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(vec![env("upsert", "k1", "01"), env("upsert", "k2", "02")], "02", true));
+        fold.apply_page(raw_page(vec![env("upsert", "k1", "01"), env("upsert", "k2", "02")], "02", true)).unwrap();
         assert_eq!(fold.rows.len(), 2);
         assert!(fold.rows.values().all(|v| v.is_null()), "a key-set fold must not retain row values: {:?}", fold.rows);
         // The snapshot fold, by contrast, keeps them — it IS the response body.
-        let mut snap = StreamFold::to_tail();
-        snap.apply_page(page(vec![env("upsert", "k1", "01")], "01", true));
-        assert!(snap.rows.values().all(|v| !v.is_null()));
+        let mut snap = StreamFold::<Box<RawValue>>::to_tail();
+        snap.apply_page(raw_page(vec![env("upsert", "k1", "01")], "01", true)).unwrap();
+        assert!(snap.rows.values().all(|v| v.get() != "null"));
     }
 
     #[test]
     fn fold_up_to_stops_at_the_requested_offset() {
         // Stream: insert k1 @01, insert k2 @02, delete k2 @03. A client at offset 02 holds {k1, k2}.
         let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(
+        fold.apply_page(raw_page(
             vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")],
             "03",
             true,
-        ));
+        ))
+        .unwrap();
         assert!(fold.done);
         let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
         keys.sort();
@@ -1624,7 +1912,7 @@ mod tests {
 
         // Rebuild as of the client's offset (02)...
         let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(all.clone(), "03", true));
+        fold.apply_page(raw_page(all.clone(), "03", true)).unwrap();
         let mut keys: HashSet<String> = fold.rows.into_keys().collect();
 
         // ...then replay everything after it.
@@ -1643,7 +1931,7 @@ mod tests {
         let all = vec![env("upsert", "k1", "01"), env("delete", "k1", "02"), env("upsert", "k1", "03")];
 
         let mut fold = StreamFold::up_to("02");
-        fold.apply_page(page(all.clone(), "03", true));
+        fold.apply_page(raw_page(all.clone(), "03", true)).unwrap();
         let mut keys: HashSet<String> = fold.rows.into_keys().collect();
         assert!(keys.is_empty(), "as of offset 02 the client holds no rows");
 

@@ -357,3 +357,20 @@ async fn every_client_of_a_shared_build_gets_its_own_handle_and_key_set() {
         assert_eq!(headers.get("electric-handle").unwrap().to_str().unwrap(), handle);
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_mid_build_tells_every_waiter_to_retry() {
+    let source = Source::new("scripted://shutdown").await;
+    source.append(rows()).await;
+    let gate = source.hold();
+    let requests: Vec<_> = (0..3).map(|_| source.spawn_get(SNAPSHOT)).collect();
+    quiesce().await;
+    assert_eq!(gate.arrived.load(SeqCst), 1);
+    source.engine.shutdown_token().begin();
+    for request in requests {
+        let (status, headers, _) = tokio::time::timeout(Duration::from_secs(5), request).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "a draining engine's waiters must be told to retry");
+        assert_eq!(headers.get(axum::http::header::RETRY_AFTER).unwrap(), "1");
+    }
+    assert!(source.engine.electric_handles.snapshots.lock().unwrap().is_empty(), "an abandoned build is not kept");
+}
