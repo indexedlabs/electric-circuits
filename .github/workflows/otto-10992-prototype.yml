@@ -136,7 +136,7 @@ jobs:
           OUT_DIR: ${{ github.workspace }}/harness/otto-10992/results
         run: |
           set -euo pipefail
-          ./prototype/experiment.sh
+          bash ./prototype/experiment.sh
           python3 prototype/summarize.py "$OUT_DIR"
 
       - name: Capture stack diagnostics
