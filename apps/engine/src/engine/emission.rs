@@ -93,7 +93,28 @@ impl EmissionLanes {
     }
 }
 
+#[allow(dead_code)]
 const GROUP_LANE_CAPACITY: usize = 64;
+
+/// OTTO-10992 spike S2 — per-group barriers. Group lanes never make a producer wait and never
+/// hold the global replay position or receipts. A lane that holds work without progress for the
+/// detach gap, or more than its memory bound, is detached: its unlanded output is dropped (its
+/// receipts complete), it keeps its own resume point (the oldest dropped commit), and later
+/// output is dropped until the stream answers again. It then reattaches with a gap marker that
+/// tells its readers to reload from a snapshot.
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn group_detach_gap() -> std::time::Duration {
+    static GAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| std::time::Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_GROUP_DETACH_GAP_SECS", 10)))
+}
+
+fn group_lane_memory_bytes() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| env_u64("ELECTRIC_CIRCUITS_GROUP_LANE_MEMORY_BYTES", 8 << 20))
+}
 
 struct GroupLane {
     state: std::sync::Mutex<GroupLaneState>,
@@ -104,6 +125,10 @@ struct GroupLane {
     origins: Arc<std::sync::Mutex<BTreeMap<(String, u64), usize>>>,
     origin_wake: Arc<tokio::sync::Notify>,
     metrics: Arc<crate::metrics::Metrics>,
+    /// S2: wakes the worker out of a hung append when the lane detaches.
+    cancel: tokio::sync::Notify,
+    probing: std::sync::atomic::AtomicBool,
+    path: String,
     #[cfg(test)]
     failure_gate: std::sync::Mutex<Option<Arc<crate::ds::BodyGate>>>,
 }
@@ -122,6 +147,12 @@ struct GroupLaneState {
     next_seq: u64,
     taken: u64,
     closed: bool,
+    /// S2 per-group state: last progress, admitted bytes in memory, and while detached the
+    /// group's own resume point (oldest dropped commit) and the newest dropped commit.
+    progress_at: std::time::Instant,
+    memory_bytes: u64,
+    detached: Option<(u64, u64)>,
+    dropped: u64,
 }
 
 struct GroupBatchEntry {
@@ -171,6 +202,49 @@ impl GroupEmissionLanes {
             wake: Arc::new(tokio::sync::Notify::new()),
             metrics,
         }
+        .with_monitor()
+    }
+
+    /// S2: one task watches every lane: it detaches stalled or oversized lanes and probes
+    /// detached ones until their stream answers.
+    fn with_monitor(self) -> Self {
+        let lanes = self.lanes.clone();
+        let ds = self.ds.clone();
+        let shutdown = self.shutdown.clone();
+        self.shutdown.clone().spawn_background(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                    _ = shutdown.wait() => return,
+                }
+                let all: Vec<Arc<GroupLane>> = lanes.lock().unwrap().values().cloned().collect();
+                for lane in all {
+                    let (detached, stalled, oversized) = {
+                        let state = lane.state.lock().unwrap();
+                        (
+                            state.detached.is_some(),
+                            !state.closed && state.has_work() && state.progress_at.elapsed() >= group_detach_gap(),
+                            state.memory_bytes > group_lane_memory_bytes(),
+                        )
+                    };
+                    if !detached && (stalled || oversized) {
+                        lane.detach(if stalled {
+                            "no progress within the detach gap"
+                        } else {
+                            "memory bound exceeded"
+                        });
+                    } else if detached && !lane.probing.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let lane = lane.clone();
+                        let ds = ds.clone();
+                        shutdown.spawn_background(async move {
+                            lane.probe_and_reattach(&ds).await;
+                            lane.probing.store(false, std::sync::atomic::Ordering::Release);
+                        });
+                    }
+                }
+            }
+        });
+        self
     }
 
     fn lane(&self, path: &str) -> Arc<GroupLane> {
@@ -187,6 +261,10 @@ impl GroupEmissionLanes {
                 next_seq: 0,
                 taken: 0,
                 closed: false,
+                progress_at: std::time::Instant::now(),
+                memory_bytes: 0,
+                detached: None,
+                dropped: 0,
             }),
             wake: tokio::sync::Notify::new(),
             worker_wake: tokio::sync::Notify::new(),
@@ -195,6 +273,9 @@ impl GroupEmissionLanes {
             origins: self.origins.clone(),
             origin_wake: self.wake.clone(),
             metrics: self.metrics.clone(),
+            cancel: tokio::sync::Notify::new(),
+            probing: std::sync::atomic::AtomicBool::new(false),
+            path: path.to_string(),
             #[cfg(test)]
             failure_gate: std::sync::Mutex::new(None),
         });
@@ -232,6 +313,10 @@ impl GroupEmissionLanes {
                     continue;
                 };
                 let envs = ticket.entry.envs.lock().unwrap().take();
+                if envs.is_some() {
+                    let mut state = worker_lane.state.lock().unwrap();
+                    state.memory_bytes = state.memory_bytes.saturating_sub(ticket.entry.bytes);
+                }
                 let Some(envs) = envs else {
                     let mut state = worker_lane.state.lock().unwrap();
                     if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
@@ -241,7 +326,16 @@ impl GroupEmissionLanes {
                     worker_lane.wake.notify_waiters();
                     continue;
                 };
-                let append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs).await;
+                let append = tokio::select! {
+                    append = worker_ds.append_reliable(&ticket.entry.stream_path, &envs) => append.map_err(|_| false),
+                    _ = worker_lane.cancel.notified() => Err(true),
+                };
+                if matches!(append, Err(true)) {
+                    // S2: detached mid-append. The entry is already completed; keep serving.
+                    complete_group_entry(&worker_lane, &ticket.entry);
+                    worker_lane.wake.notify_waiters();
+                    continue;
+                }
                 if append.is_err() {
                     #[cfg(test)]
                     let failure_gate = worker_lane.failure_gate.lock().unwrap().clone();
@@ -271,6 +365,7 @@ impl GroupEmissionLanes {
                 if state.in_flight.as_ref().is_some_and(|active| Arc::ptr_eq(active, &ticket)) {
                     state.in_flight = None;
                 }
+                state.progress_at = std::time::Instant::now();
                 drop(state);
                 complete_group_entry(&worker_lane, &ticket.entry);
                 worker_lane.wake.notify_waiters();
@@ -356,6 +451,17 @@ impl GroupEmissionLanes {
             complete_group_entry(&lane, &entry);
             return None;
         }
+        if let Some((_, newest)) = state.detached.as_mut() {
+            // S2: a detached group drops its output; its resume point stays where it detached.
+            *newest = commit_lsn.max(*newest);
+            state.dropped += 1;
+            drop(state);
+            complete_group_entry(&lane, &entry);
+            return None;
+        }
+        if !state.has_work() {
+            state.progress_at = std::time::Instant::now();
+        }
         let ticket = Arc::new(GroupTicket {
             seq: state.next_seq,
             entry,
@@ -402,6 +508,91 @@ impl GroupEmissionLanes {
     }
 }
 
+impl GroupLaneState {
+    fn has_work(&self) -> bool {
+        !self.waiting.is_empty() || !self.admitted.is_empty() || self.in_flight.is_some() || self.held_failed.is_some()
+    }
+}
+
+impl GroupLane {
+    /// S2: drop this group's unlanded output and receipts, remembering where it must resume.
+    fn detach(&self, reason: &str) {
+        let (dropped, in_flight, resume) = {
+            let mut state = self.state.lock().unwrap();
+            if state.closed || state.detached.is_some() {
+                return;
+            }
+            let mut dropped = Vec::new();
+            for ticket in state.waiting.drain(..) {
+                ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
+                dropped.push(ticket);
+            }
+            dropped.extend(state.admitted.drain(..));
+            dropped.extend(state.held_failed.take());
+            let in_flight = state.in_flight.take();
+            let resume =
+                dropped.iter().chain(in_flight.iter()).map(|ticket| ticket.entry.commit_lsn).min().unwrap_or(0);
+            let newest =
+                dropped.iter().chain(in_flight.iter()).map(|ticket| ticket.entry.commit_lsn).max().unwrap_or(0);
+            state.detached = Some((resume, newest));
+            state.dropped += dropped.len() as u64 + u64::from(in_flight.is_some());
+            state.memory_bytes = 0;
+            (dropped, in_flight, resume)
+        };
+        for ticket in &dropped {
+            complete_group_entry(self, &ticket.entry);
+        }
+        if let Some(ticket) = &in_flight {
+            complete_group_entry(self, &ticket.entry);
+            self.cancel.notify_one();
+        }
+        self.wake.notify_waiters();
+        self.metrics.group_lanes_detached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(stream_path = %self.path, resume_lsn = resume, dropped = dropped.len(), reason,
+            "group detached from the global barrier; its output is dropped until its stream answers (OTTO-10992 S2)");
+    }
+
+    /// S2: once the stream answers a HEAD again, append a gap marker naming the dropped range and
+    /// resume live output. Readers reload the group from a snapshot at the marker.
+    async fn probe_and_reattach(&self, ds: &DsClient) {
+        let head = tokio::time::timeout(std::time::Duration::from_secs(3), ds.head(&self.path)).await;
+        if !matches!(head, Ok(Ok(Some(_)))) {
+            return;
+        }
+        let Some((resume, newest)) = self.state.lock().unwrap().detached else { return };
+        let marker = Envelope {
+            type_: "control".to_string(),
+            key: "otto-10992-group-gap".to_string(),
+            value: Some(serde_json::json!({"control": "must-refetch", "reason": "group-detached",
+                "resume_lsn": format!("{:X}/{:X}", resume >> 32, resume & 0xffff_ffff),
+                "through_lsn": format!("{:X}/{:X}", newest >> 32, newest & 0xffff_ffff)})),
+            old: None,
+            headers: crate::ds::EnvelopeHeaders {
+                operation: "control".to_string(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: Some(true),
+            },
+        };
+        let appended =
+            tokio::time::timeout(std::time::Duration::from_secs(5), ds.append_reliable(&self.path, &[marker])).await;
+        if !matches!(appended, Ok(Ok(_))) {
+            return;
+        }
+        let dropped = {
+            let mut state = self.state.lock().unwrap();
+            state.detached = None;
+            state.progress_at = std::time::Instant::now();
+            state.dropped
+        };
+        self.metrics.group_lanes_reattached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(stream_path = %self.path, resume_lsn = resume, dropped,
+            "detached group's stream answers again; reattached behind a gap marker (OTTO-10992 S2)");
+    }
+}
+
 impl GroupBatchHandle {
     pub(crate) async fn wait(mut self) {
         loop {
@@ -430,11 +621,9 @@ impl GroupBatchHandle {
                         self.ticket.state.store(TICKET_CANCELLED, std::sync::atomic::Ordering::Release);
                         Admission::Cancelled
                     }
-                    _ if state.waiting.front().is_some_and(|front| Arc::ptr_eq(front, &self.ticket))
-                        && state.admitted.len() < GROUP_LANE_CAPACITY
-                        && self.ticket.seq < state.taken.saturating_add(GROUP_LANE_CAPACITY as u64) =>
-                    {
+                    _ if state.waiting.front().is_some_and(|front| Arc::ptr_eq(front, &self.ticket)) => {
                         let batch = self.batch.take().expect("a waiting handle owns its batch");
+                        state.memory_bytes += self.ticket.entry.bytes;
                         *self.ticket.entry.envs.lock().unwrap() = Some(batch);
                         state.waiting.pop_front();
                         self.ticket.state.store(TICKET_ADMITTED, std::sync::atomic::Ordering::Release);

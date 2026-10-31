@@ -212,6 +212,11 @@ pub struct Metrics {
     pub(crate) group_lane_backlog: std::sync::Mutex<BTreeMap<String, LaneBacklog>>,
     /// Observation-only count of outstanding receipt/barrier batches.
     pub(crate) receipt_queue_depth: AtomicU64,
+    /// OTTO-10992 spikes: group lanes retired (S3), detached (S2), and bytes spilled to disk (S1).
+    pub(crate) group_lanes_retired: AtomicU64,
+    pub(crate) group_lanes_detached: AtomicU64,
+    pub(crate) group_lanes_reattached: AtomicU64,
+    pub(crate) group_spill_bytes: AtomicU64,
     pub(crate) sequencer_processed: std::sync::Mutex<serde_json::Value>,
     pub(crate) sequencer_checkpoint: std::sync::Mutex<serde_json::Value>,
     pub process_envelope: Hist, // end-to-end fan-out latency per table envelope
@@ -278,6 +283,10 @@ impl Metrics {
             replication_slot_active: AtomicU64::new(0),
             group_lane_backlog: std::sync::Mutex::new(BTreeMap::new()),
             receipt_queue_depth: AtomicU64::new(0),
+            group_lanes_retired: AtomicU64::new(0),
+            group_lanes_detached: AtomicU64::new(0),
+            group_lanes_reattached: AtomicU64::new(0),
+            group_spill_bytes: AtomicU64::new(0),
             sequencer_processed: std::sync::Mutex::new(serde_json::json!(null)),
             sequencer_checkpoint: std::sync::Mutex::new(serde_json::json!(null)),
             txn_spills: AtomicU64::new(0),
@@ -359,6 +368,12 @@ impl Metrics {
                 "receipt_queue_depth": self.receipt_queue_depth.load(Ordering::Relaxed),
             },
             "group_lane_backlog": group_lane_backlog,
+            "spike": {
+                "group_lanes_retired": self.group_lanes_retired.load(Ordering::Relaxed),
+                "group_lanes_detached": self.group_lanes_detached.load(Ordering::Relaxed),
+                "group_lanes_reattached": self.group_lanes_reattached.load(Ordering::Relaxed),
+                "group_spill_bytes": self.group_spill_bytes.load(Ordering::Relaxed),
+            },
             "sequencer": {
                 "processed": self.sequencer_processed.lock().unwrap().clone(),
                 "checkpoint": self.sequencer_checkpoint.lock().unwrap().clone(),

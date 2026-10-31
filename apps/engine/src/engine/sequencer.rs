@@ -787,14 +787,8 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if group_fence.active()
-                            && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
-                        {
-                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
-                            processing_failed = true;
-                            break;
-                        }
+                        // S2: groups have their own barriers; no cross-commit group wait here.
+                        let _ = (&last_group_lsn, &last_group_paths);
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -984,20 +978,8 @@ pub(crate) async fn sequencer_loop(
                             processing_failed = true;
                             break;
                         }
-                        if !direct_group_paths.is_empty()
-                            && !wait_for_group_effects(
-                                &subq.group_lanes,
-                                &direct_group_paths,
-                                &shutdown,
-                                group_lsn,
-                            )
-                            .await
-                        {
-                            tracing::error!(group_lsn, "group output could not land before advancing the processed position");
-                            highwater = txn_highwater;
-                            processing_failed = true;
-                            break;
-                        }
+                        // S2: a group's output lands behind its own lane barrier, not the global one.
+                        let _ = &direct_group_paths;
                         if source_fence.is_some() || !runtime_fences.is_empty() {
                             if !wait_for_source_effects(&subq, &shutdown, lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(u64::MAX)).await {
                                 tracing::error!(
