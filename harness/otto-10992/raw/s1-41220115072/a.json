@@ -1,0 +1,87 @@
+{
+  "burst_registered": null,
+  "burst_timeouts": null,
+  "catchup_estimate_s": 0,
+  "change_log_lag_at_clear_bytes": 128677387,
+  "change_log_lag_end_bytes": 99050364,
+  "change_log_lag_peak_bytes": 129888748,
+  "checkpoint_lag_peak_bytes": 1438088,
+  "confirmed_flush_hold": [
+    "0/2AEFE78",
+    "0/A94C9A0"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "faa9ee1f8ad41b408efd46a1a0dc953b322192c7",
+  "envelopes_per_s_hold": 797.0922500302262,
+  "envelopes_per_s_recovery": 794.56,
+  "envelopes_per_s_warmup": 795.534257040664,
+  "fault": "match=/shape/group-e77dfbd4ea0fea9e-7149c63b-382e-479e-8320-b50bc7173152&hang=1",
+  "faulted_group_envelopes_hold": 26,
+  "faulted_resume_ms": 2289,
+  "health_ms_p50_hold": 1.117,
+  "hold_s": 299,
+  "host_load1_peak_hold": 4.19,
+  "lane_backlog_peak_batches": 179961,
+  "lane_backlog_peak_bytes": 105071390,
+  "marker_after_ms": {
+    "group": 68,
+    "plain": 66
+  },
+  "marker_during_ms": {
+    "group": 208,
+    "plain": 206
+  },
+  "pgbench_tps": 199.204543,
+  "plain_resume_ms": 289,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e77dfbd4ea0fea9e-7149c63b-382e-479e-8320-b50bc7173152",
+    "forwarded": 427811,
+    "hang": true,
+    "held": 10,
+    "outage": false,
+    "released": 0,
+    "targeted": 10,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 179961,
+  "retained_wal_end_bytes": 6491704,
+  "retained_wal_hold_start_bytes": 1199280,
+  "retained_wal_peak_bytes": 12472264,
+  "rss_peak_bytes": 201232384,
+  "rss_peak_hold_bytes": 198897664,
+  "rss_peak_recovery_bytes": 201232384,
+  "rss_warmup_bytes": 53035008,
+  "runner": {
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16759308288,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065486",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 212,
+    "recovery": 83,
+    "warmup": 21
+  },
+  "scenario": "a",
+  "spike_counters": {
+    "group_lanes_detached": 0,
+    "group_lanes_reattached": 0,
+    "group_lanes_retired": 0,
+    "group_spill_bytes": 56322407
+  },
+  "spill_peak_bytes": 76040016,
+  "unaffected_group_envelopes_hold": 59633,
+  "unaffected_plain_envelopes_hold": 59632,
+  "unaffected_plain_envelopes_recovery": 23872,
+  "unaffected_plain_envelopes_warmup": 5897
+}

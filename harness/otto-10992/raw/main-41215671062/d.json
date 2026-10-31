@@ -1,4 +1,6 @@
 {
+  "burst_registered": null,
+  "burst_timeouts": null,
   "catchup_estimate_s": 59,
   "change_log_lag_at_clear_bytes": 130062961,
   "change_log_lag_end_bytes": 10460,
@@ -71,6 +73,8 @@
     "warmup": 23
   },
   "scenario": "d",
+  "spike_counters": null,
+  "spill_peak_bytes": null,
   "unaffected_group_envelopes_hold": 179,
   "unaffected_plain_envelopes_hold": 178,
   "unaffected_plain_envelopes_recovery": 83860,

@@ -1,0 +1,87 @@
+{
+  "burst_registered": null,
+  "burst_timeouts": null,
+  "catchup_estimate_s": 0,
+  "change_log_lag_at_clear_bytes": 14429,
+  "change_log_lag_end_bytes": 20939,
+  "change_log_lag_peak_bytes": 33520,
+  "checkpoint_lag_peak_bytes": 959792,
+  "confirmed_flush_hold": [
+    "0/2ADF580",
+    "0/B225698"
+  ],
+  "delivery_errors": {
+    "faulted": 0,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "a72a5fe2d69aaa326b59e42b131b674d3eab0a75",
+  "envelopes_per_s_hold": 796.8916429408808,
+  "envelopes_per_s_recovery": 805.9459826045676,
+  "envelopes_per_s_warmup": 798.1492192018508,
+  "fault": "match=/shape/group-e762d906b7b84e14-863b4f66-edc4-4dda-b679-502d60ad16dd&hang=1",
+  "faulted_group_envelopes_hold": 0,
+  "faulted_resume_ms": 869,
+  "health_ms_p50_hold": 0.834,
+  "hold_s": 299,
+  "host_load1_peak_hold": 2.56,
+  "lane_backlog_peak_batches": 4,
+  "lane_backlog_peak_bytes": 3368,
+  "marker_after_ms": {
+    "group": 202,
+    "plain": 200
+  },
+  "marker_during_ms": {
+    "group": 306,
+    "plain": 306
+  },
+  "pgbench_tps": 199.773288,
+  "plain_resume_ms": 370,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "",
+    "forwarded": 411539,
+    "hang": false,
+    "held": 97,
+    "outage": false,
+    "released": 37,
+    "targeted": 97,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 4,
+  "retained_wal_end_bytes": 6501872,
+  "retained_wal_hold_start_bytes": 918344,
+  "retained_wal_peak_bytes": 7097712,
+  "rss_peak_bytes": 40632320,
+  "rss_peak_hold_bytes": 40632320,
+  "rss_peak_recovery_bytes": 40476672,
+  "rss_warmup_bytes": 48246784,
+  "runner": {
+    "cpu_model": "AMD EPYC 9V45 96-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065429",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 234,
+    "recovery": 93,
+    "warmup": 24
+  },
+  "scenario": "d",
+  "spike_counters": {
+    "group_lanes_detached": 1,
+    "group_lanes_reattached": 1,
+    "group_lanes_retired": 0,
+    "group_spill_bytes": 0
+  },
+  "spill_peak_bytes": 0,
+  "unaffected_group_envelopes_hold": 59626,
+  "unaffected_plain_envelopes_hold": 59596,
+  "unaffected_plain_envelopes_recovery": 24136,
+  "unaffected_plain_envelopes_warmup": 5959
+}

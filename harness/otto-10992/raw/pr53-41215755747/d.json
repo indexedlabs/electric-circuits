@@ -1,0 +1,82 @@
+{
+  "burst_registered": null,
+  "burst_timeouts": null,
+  "catchup_estimate_s": 0,
+  "change_log_lag_at_clear_bytes": 11187,
+  "change_log_lag_end_bytes": 11921,
+  "change_log_lag_peak_bytes": 52427277,
+  "checkpoint_lag_peak_bytes": 920832,
+  "confirmed_flush_hold": [
+    "0/2B07618",
+    "0/B23C848"
+  ],
+  "delivery_errors": {
+    "faulted": 239,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "56f3dd1b768426a859dbaa27414d192600c0e498",
+  "envelopes_per_s_hold": 797.6398028802064,
+  "envelopes_per_s_recovery": 794.7553186989807,
+  "envelopes_per_s_warmup": 774.9245725779417,
+  "fault": "match=/shape/group-e776612a75708fcb-5de9c836-3e59-4c4b-9165-ed15f86cdb72&hang=1",
+  "faulted_group_envelopes_hold": 0,
+  "faulted_resume_ms": null,
+  "health_ms_p50_hold": 1.074,
+  "hold_s": 299,
+  "host_load1_peak_hold": 4.43,
+  "lane_backlog_peak_batches": 8,
+  "lane_backlog_peak_bytes": 5175,
+  "marker_after_ms": {
+    "group": 486,
+    "plain": 484
+  },
+  "marker_during_ms": {
+    "group": 156,
+    "plain": 154
+  },
+  "pgbench_tps": 198.95996,
+  "plain_resume_ms": 228,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e776612a75708fcb-5de9c836-3e59-4c4b-9165-ed15f86cdb72",
+    "forwarded": 410552,
+    "hang": true,
+    "held": 13,
+    "outage": false,
+    "released": 0,
+    "targeted": 13,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 8,
+  "retained_wal_end_bytes": 112064,
+  "retained_wal_hold_start_bytes": 1496048,
+  "retained_wal_peak_bytes": 16369680,
+  "rss_peak_bytes": 42045440,
+  "rss_peak_hold_bytes": 42045440,
+  "rss_peak_recovery_bytes": 42033152,
+  "rss_warmup_bytes": 46866432,
+  "runner": {
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760336384,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065375",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 201,
+    "recovery": 80,
+    "warmup": 21
+  },
+  "scenario": "d",
+  "spike_counters": null,
+  "spill_peak_bytes": null,
+  "unaffected_group_envelopes_hold": 59667,
+  "unaffected_plain_envelopes_hold": 59637,
+  "unaffected_plain_envelopes_recovery": 23837,
+  "unaffected_plain_envelopes_warmup": 5778
+}

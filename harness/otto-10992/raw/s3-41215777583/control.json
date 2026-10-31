@@ -1,0 +1,87 @@
+{
+  "burst_registered": null,
+  "burst_timeouts": null,
+  "catchup_estimate_s": 0,
+  "change_log_lag_at_clear_bytes": 15891,
+  "change_log_lag_end_bytes": 31059,
+  "change_log_lag_peak_bytes": 40010,
+  "checkpoint_lag_peak_bytes": 915758,
+  "confirmed_flush_hold": [
+    "0/2B274F0",
+    "0/B34CD68"
+  ],
+  "delivery_errors": {
+    "faulted": null,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "04e04ca90d304b71362874d1a0250b764c7b7013",
+  "envelopes_per_s_hold": 799.7824707695096,
+  "envelopes_per_s_recovery": 796.6838676930886,
+  "envelopes_per_s_warmup": 782.8538820449129,
+  "fault": "",
+  "faulted_group_envelopes_hold": null,
+  "faulted_resume_ms": null,
+  "health_ms_p50_hold": 1.098,
+  "hold_s": 299,
+  "host_load1_peak_hold": 3.44,
+  "lane_backlog_peak_batches": 1,
+  "lane_backlog_peak_bytes": 842,
+  "marker_after_ms": {
+    "group": 478,
+    "plain": 477
+  },
+  "marker_during_ms": {
+    "group": 184,
+    "plain": 181
+  },
+  "pgbench_tps": 199.627429,
+  "plain_resume_ms": 249,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "",
+    "forwarded": 412835,
+    "hang": false,
+    "held": 0,
+    "outage": false,
+    "released": 0,
+    "targeted": 0,
+    "upstream_errors": 0
+  },
+  "rate_tps": 200,
+  "receipt_queue_peak_depth": 1,
+  "retained_wal_end_bytes": 180992,
+  "retained_wal_hold_start_bytes": 1530944,
+  "retained_wal_peak_bytes": 7136208,
+  "rss_peak_bytes": 40341504,
+  "rss_peak_hold_bytes": 40296448,
+  "rss_peak_recovery_bytes": 40341504,
+  "rss_warmup_bytes": 46415872,
+  "runner": {
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065417",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 202,
+    "recovery": 80,
+    "warmup": 21
+  },
+  "scenario": "control",
+  "spike_counters": {
+    "group_lanes_detached": 0,
+    "group_lanes_reattached": 0,
+    "group_lanes_retired": 0,
+    "group_spill_bytes": 0
+  },
+  "spill_peak_bytes": 0,
+  "unaffected_group_envelopes_hold": 59818,
+  "unaffected_plain_envelopes_hold": 59818,
+  "unaffected_plain_envelopes_recovery": 23927,
+  "unaffected_plain_envelopes_warmup": 5850
+}

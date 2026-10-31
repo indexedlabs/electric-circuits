@@ -1,0 +1,87 @@
+{
+  "burst_registered": null,
+  "burst_timeouts": null,
+  "catchup_estimate_s": null,
+  "change_log_lag_at_clear_bytes": 29613,
+  "change_log_lag_end_bytes": 27636,
+  "change_log_lag_peak_bytes": 30158128,
+  "checkpoint_lag_peak_bytes": 1406665,
+  "confirmed_flush_hold": [
+    "0/2CEF978",
+    "0/C81C250"
+  ],
+  "delivery_errors": {
+    "faulted": 241,
+    "group": 0,
+    "plain": 0
+  },
+  "engine_ref": "04e04ca90d304b71362874d1a0250b764c7b7013",
+  "envelopes_per_s_hold": 993.7569563897601,
+  "envelopes_per_s_recovery": 971.5767058605684,
+  "envelopes_per_s_warmup": 713.552116986907,
+  "fault": "match=/shape/group-e7260c9a43652c96-6191dd03-bb5f-4e04-a7f8-33916cdb75c8&hang=1",
+  "faulted_group_envelopes_hold": 40,
+  "faulted_resume_ms": null,
+  "health_ms_p50_hold": 1.42,
+  "hold_s": 299,
+  "host_load1_peak_hold": 7.67,
+  "lane_backlog_peak_batches": 1,
+  "lane_backlog_peak_bytes": 844,
+  "marker_after_ms": {
+    "group": null,
+    "plain": null
+  },
+  "marker_during_ms": {
+    "group": 101122,
+    "plain": 101120
+  },
+  "pgbench_tps": 1000.499283,
+  "plain_resume_ms": 192,
+  "proxy_stats_end_hold": {
+    "delay_ms": 0,
+    "fault_match": "/shape/group-e7260c9a43652c96-6191dd03-bb5f-4e04-a7f8-33916cdb75c8",
+    "forwarded": 502159,
+    "hang": true,
+    "held": 16,
+    "outage": false,
+    "released": 0,
+    "targeted": 16,
+    "upstream_errors": 0
+  },
+  "rate_tps": 1000,
+  "receipt_queue_peak_depth": 1,
+  "retained_wal_end_bytes": 831073832,
+  "retained_wal_hold_start_bytes": 78649520,
+  "retained_wal_peak_bytes": 831073832,
+  "rss_peak_bytes": 167682048,
+  "rss_peak_hold_bytes": 167682048,
+  "rss_peak_recovery_bytes": 47280128,
+  "rss_warmup_bytes": 54272000,
+  "runner": {
+    "cpu_model": "AMD EPYC 7763 64-Core Processor",
+    "image_os": "ubuntu24",
+    "image_version": "20261026.354.1",
+    "mem_total_bytes": 16760344576,
+    "nproc": 4,
+    "runner_arch": "X64",
+    "runner_name": "GitHub Actions 1000065406",
+    "runner_os": "Linux"
+  },
+  "samples": {
+    "hold": 165,
+    "recovery": 75,
+    "warmup": 15
+  },
+  "scenario": "a:1000",
+  "spike_counters": {
+    "group_lanes_detached": 0,
+    "group_lanes_reattached": 0,
+    "group_lanes_retired": 1,
+    "group_spill_bytes": 0
+  },
+  "spill_peak_bytes": 0,
+  "unaffected_group_envelopes_hold": 73913,
+  "unaffected_plain_envelopes_hold": 73913,
+  "unaffected_plain_envelopes_recovery": 29275,
+  "unaffected_plain_envelopes_warmup": 5249
+}

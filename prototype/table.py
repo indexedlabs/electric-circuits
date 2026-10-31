@@ -33,6 +33,14 @@ def cpu(model):
     return " ".join(words[:3])
 
 
+def spike(r):
+    c = r.get("spike_counters")
+    if not c:
+        return "–"
+    return (f"{c.get('group_lanes_retired', 0)} / {c.get('group_lanes_detached', 0)} / {c.get('group_lanes_reattached', 0)}; "
+            f"{mib(r.get('spill_peak_bytes'))}")
+
+
 def ms(v):
     if v is None:
         return "not seen"
@@ -43,7 +51,8 @@ head = ["scenario", "runner", "rate (txn/s)", "hold", "env/s warmup → hold", "
         "unaffected group env in hold", "marker during (plain / group)", "marker after (plain / group)",
         "resumes after clear (plain / faulted group)", "caught up after clear", "RSS peak MiB (hold / recovery)",
         "lane backlog peak (batches / MiB)", "receipt queue peak", "processed−checkpoint lag peak MiB",
-        "change-log lag at clear MiB", "retained WAL MiB (hold start → peak)", "host load1 peak"]
+        "change-log lag at clear MiB", "retained WAL MiB (hold start → peak)", "host load1 peak",
+        "group retired / detached / reattached; spill peak MiB"]
 print("| " + " | ".join(head) + " |")
 print("|" + "---|" * len(head))
 for r in sorted(rows, key=key):
@@ -54,8 +63,11 @@ for r in sorted(rows, key=key):
         "never (not draining)" if catchup is None else (f"{catchup:,} s" if after_seen or catchup == 0 else f"≈{catchup:,} s (est.)"))
     if r.get("fault") in (None, "") and catchup is None:
         caught = "never (not draining)"
+    label = f"`{r.get('scenario')}`"
+    if r.get("burst_registered") is not None:
+        label += f" ({r['burst_registered']} of 200 registered)"
     cells = [
-        f"`{r.get('scenario')}`",
+        label,
         f"#{str(runner.get('runner_name', '?')).split()[-1]} · {cpu(runner.get('cpu_model'))} · {runner.get('nproc', '?')} vCPU",
         n(r.get("rate_tps")),
         f"{r.get('hold_s')} s",
@@ -73,6 +85,7 @@ for r in sorted(rows, key=key):
         mib(r.get("change_log_lag_at_clear_bytes")),
         f"{mib(r.get('retained_wal_hold_start_bytes'))} → {mib(r.get('retained_wal_peak_bytes'))}",
         n(r.get("host_load1_peak_hold"), 1),
+        spike(r),
     ]
     print("| " + " | ".join(cells) + " |")
 print(f"\nRaw: {run_url}")

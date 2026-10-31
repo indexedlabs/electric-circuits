@@ -122,6 +122,17 @@ pgbench = (root / "pgbench.log").read_text() if (root / "pgbench.log").exists() 
 tps = re.search(r"tps = ([0-9.]+)", pgbench)
 
 
+def burst_stats():
+    """(groups registered, registrations that timed out) for the burst scenario."""
+    path = root / "burst.log"
+    if not path.exists():
+        return (None, None)
+    lines = path.read_text().splitlines()
+    ok = sum(1 for line in lines if line.startswith("200 "))
+    timeouts = sum(1 for line in lines if "timed out" in line)
+    return (ok, timeouts)
+
+
 def catchup_estimate():
     """Seconds after the clear until the engine has processed everything committed during the
     hold, from envelope rates: backlog = warmup rate x hold - processed in hold, drained at
@@ -185,6 +196,10 @@ row = {
     "host_load1_peak_hold": max(series(hold, load1), default=None),
     "health_ms_p50_hold": sorted(series(hold, lambda r: r.get("health_ms")))[len(hold) // 2] if series(hold, lambda r: r.get("health_ms")) else None,
     "proxy_stats_end_hold": (hold[-1].get("proxy_stats") if hold else None),
+    "spike_counters": next((get(r, "engine_metrics", "spike") for r in reversed(samples) if get(r, "engine_metrics", "spike")), None),
+    "spill_peak_bytes": max(series(samples, lambda r: get(r, "engine_metrics", "spike", "group_spill_bytes")), default=None),
+    "burst_registered": burst_stats()[0],
+    "burst_timeouts": burst_stats()[1],
     "delivery_errors": {k: get(delivery[-1], "streams", k, "errors") for k in ("plain", "group", "faulted")} if delivery else None,
 }
 (root / "summary.json").write_text(json.dumps(row, indent=2, sort_keys=True) + "\n")
