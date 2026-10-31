@@ -1,145 +1,131 @@
 #!/bin/bash
+# One scenario on a fresh stack. SCENARIO is `name` or `name:rate`:
+#   control | control-900  no fault, hold 300 s | 900 s
+#   a        one stalled group (every append to its stream held), hold 300 s
+#   b-N      DS outage for every engine request, hold N minutes
+#   c-MS     MS ms delay on every append to one group's stream, hold 300 s
+#   d        stalled group whose only source is sparse (one write per 10 s), hold 300 s
+#   e        200 groups registered as a burst, no fault, window 300 s
+# Writes run at RATE transactions/s (4 rows each) through warmup, hold and recovery.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BASE=(docker compose -f "$ROOT/docker/compose.yaml" -f "$ROOT/harness/otto-10992/compose.yaml")
 OUT=${OUT_DIR:-$ROOT/harness/otto-10992/results}
+SPEC=${SCENARIO:?SCENARIO}
+NAME=${SPEC%%:*}
+RATE=${RATE:-200}
+[ "$SPEC" != "$NAME" ] && RATE=${SPEC#*:}
+WARMUP_S=${WARMUP_S:-30}
+RECOVER_S=${RECOVER_S:-120}
 mkdir -p "$OUT"
+cd "$ROOT"
 
 psql() { "${BASE[@]}" exec -T postgres psql -U postgres -d electric "$@"; }
 proxy() { "${BASE[@]}" up -d --no-deps --force-recreate ds-proxy >/dev/null; }
-clear_fault() { unset FAULT_MATCH HANG OUTAGE DELAY_MS; proxy; }
 wait_http() { for _ in $(seq 1 120); do curl --max-time 5 -fsS http://127.0.0.1:7010/v1/health >/dev/null && return; sleep 1; done; return 1; }
-
-install_pgbench() {
-  "${BASE[@]}" exec -T postgres sh -c 'cat > /tmp/otto-10992-pgbench.sql' < "$ROOT/harness/otto-10992/pgbench.sql"
-}
-
-write_rate() {
-  local rate=$1 seconds=$2 workers=8 jobs=4
-  if [ "$rate" -ge 2000 ]; then workers=32; jobs=4; fi
-  install_pgbench
-  local log="$OUT/pgbench-${rate}cps-${seconds}s.log"
-  : > "$log"
-  "${BASE[@]}" exec -T postgres pgbench -n -U postgres -d electric \
-    -f /tmp/otto-10992-pgbench.sql -c "$workers" -j "$jobs" -T "$seconds" -R "$rate" -P 10 \
-    >"$log" 2>&1 &
-  writer=$!
-}
-
-group_bytes() {
-  psql -At -c "SELECT coalesce((SELECT sum(length(body)) FROM record),0) + coalesce((SELECT sum(length(body)) FROM record_items),0) + coalesce((SELECT sum(length(body)) FROM record_meta),0)" 2>/dev/null || echo 0
-}
-
-group_stream_offset() {
-  local logical=$1
-  local url="http://127.0.0.1:8791/circuits/v1/${ELECTRIC_CIRCUITS_DS_NAMESPACE}/stores/${ELECTRIC_CIRCUITS_DS_STORE_GENERATION}/queries/${ELECTRIC_CIRCUITS_QUERY_GENERATION}/${logical}"
-  curl --max-time 5 -sS -I "$url?offset=0000000000000000_0000000000000000&live=false" 2>/dev/null \
-    | awk 'tolower($1)=="stream-next-offset:" {print $2}' | tr -d '\r' | tail -1
-}
+now_ms() { date +%s%3N; }
+phase() { printf '%s' "$1" > "$OUT/phase"; printf '%s\t%s\n' "$1" "$(now_ms)" >> "$OUT/phases.tsv"; }
 
 seed() {
-  psql -c "INSERT INTO record(group_id,body) SELECT 1, repeat('r', 256) FROM generate_series(1,1000) ON CONFLICT DO NOTHING" >/dev/null
-  psql -c "INSERT INTO record_items(record_id,body) SELECT id, repeat('i', 128) FROM record ON CONFLICT DO NOTHING" >/dev/null
-  psql -c "INSERT INTO record_meta(record_id,body) SELECT id, repeat('m', 128) FROM record ON CONFLICT DO NOTHING" >/dev/null
-  psql -c "INSERT INTO plain_events(group_id,body) SELECT 1, repeat('p', 256) FROM generate_series(1,1000) ON CONFLICT DO NOTHING" >/dev/null
-  psql -c "INSERT INTO sparse_events(group_id,body) VALUES (1, 'seed') ON CONFLICT DO NOTHING" >/dev/null
+  psql -c "INSERT INTO record(group_id,body) SELECT 1, repeat('r', 256) FROM generate_series(1,1000)" >/dev/null
+  psql -c "INSERT INTO record_items(record_id,body) SELECT id, repeat('i', 128) FROM record" >/dev/null
+  psql -c "INSERT INTO record_meta(record_id,body) SELECT id, repeat('m', 128) FROM record" >/dev/null
+  psql -c "INSERT INTO plain_events(group_id,body) SELECT 1, repeat('p', 256) FROM generate_series(1,1000)" >/dev/null
+  psql -c "INSERT INTO sparse_events(group_id,body) VALUES (1, 'seed')" >/dev/null
 }
 
-load_group() {
-  local name=$1
-  curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
-    -d '{"subscription":"otto-'"$name"'","members":[{"table":"public.record","where":{"col":"group_id","op":"eq","value":1}},{"table":"public.record_items"},{"table":"public.record_meta"}]}' \
-    | tee "$OUT/$name-load.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
+stream_path() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["streamPath"])' "$1"; }
+
+load_group() { # name members-json
+  curl --max-time 60 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
+    -d '{"subscription":"otto-'"$1"'","members":'"$2"'}' > "$OUT/$1-load.json"
+  stream_path "$OUT/$1-load.json"
 }
 
-load_unaffected() {
-  curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/shapes \
-    -d '{"table":"public.plain_events"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
+RECORD_MEMBERS='[{"table":"public.record","where":{"col":"group_id","op":"eq","value":1}},{"table":"public.record_items"},{"table":"public.record_meta"}]'
+
+marker() { # name
+  local m="otto-marker-$NAME-$1-$(now_ms)"
+  local commit_ms
+  commit_ms=$(psql -qAt -c "INSERT INTO plain_events(group_id,body) VALUES (1, '$m') RETURNING (extract(epoch from clock_timestamp())*1000)::bigint" | head -1)
+  printf '%s\t%s\t%s\n' "$1" "$commit_ms" "$m" >> "$OUT/markers.tsv"
 }
 
-load_unaffected_group() {
-  curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
-    -d '{"subscription":"otto-unaffected","members":[{"table":"public.plain_events"},{"table":"public.sparse_events"}]}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
-}
-
-write_loop() {
-  local table=$1 delay=${2:-0.05} end=$(( $(date +%s) + ${3:-60} )) n=0
-  while [ "$(date +%s)" -lt "$end" ]; do
-    n=$((n+1)); psql -c "INSERT INTO $table(group_id,body) VALUES (1, repeat('x', 512))" >/dev/null || true
-    sleep "$delay"
-  done
-}
-
-run_one() {
-  local scenario=$1 seconds=${2:-60} stream_path=""
-  local writer=""
-  export INTERVAL_S=1
-  case "$scenario" in b-*) export INTERVAL_S=5;; esac
-  echo "running $scenario for ${seconds}s"
-  seed
-  local rate=0 groups=0 start_bytes=0
-  start_bytes=$(group_bytes)
-  group_offset_start=""
-  export UNAFFECTED_PLAIN_PATH=$(load_unaffected)
-  export UNAFFECTED_GROUP_PATH=$(load_unaffected_group)
-  case "$scenario" in
-    a-200) rate=200; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    a-2000) rate=2000; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    a-1000) rate=1000; seconds=300; stream_path=$(load_group stalled); group_offset_start=$(group_stream_offset "$stream_path"); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    d-200) rate=200; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    d-2000) rate=2000; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    d-1000) rate=1000; seconds=300; stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_rate "$rate" "$seconds" ;;
-    e-200-1000) rate=1000; groups=200; seconds=300 ;;
-    e-1000-1000) rate=1000; groups=1000; seconds=300 ;;
-    control-200) rate=200; stream_path=$(load_group control); write_rate "$rate" "$seconds" ;;
-    control-1000) rate=1000; stream_path=$(load_group control); write_rate "$rate" "$seconds" ;;
-    a) stream_path=$(load_group stalled); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
-    c-200) stream_path=$(load_group delayed-200); export FAULT_MATCH="/$stream_path" DELAY_MS=200; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
-    c-2000) stream_path=$(load_group delayed-2000); export FAULT_MATCH="/$stream_path" DELAY_MS=2000; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
-    d) stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_loop sparse_events 10 "$seconds" & writer=$! ;;
-    e) for i in $(seq 1 30); do curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}' >"$OUT/burst-$i-load.json"; done; write_loop plain_events 0.01 "$seconds" & writer=$! ;;
-    e-200-1000|e-1000-1000)
-      write_rate "$rate" "$seconds"
-      for i in $(seq 1 "$groups"); do
-        curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
-          -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}' >/dev/null
-      done
-      ;;
-    b-*) load_group outage >/dev/null; export OUTAGE=1; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
-    *) echo "unknown scenario $scenario" >&2; return 2;;
-  esac
-  marker="otto-marker-$scenario-$(date +%s%N)"
-  marker_commit_ms=$(date +%s%3N)
-  "${BASE[@]}" exec -T \
-    -e "MARKER=$marker" -e "MARKER_COMMIT_MS=$marker_commit_ms" \
-    -e "MARKER_TIMEOUT_MS=$((seconds * 1000 + 120000))" -e LIVE_MODE=long-poll \
-    api pnpm exec tsx /repo/prototype/marker-client.ts >"$OUT/$scenario-marker.json" 2>&1 &
-  marker_reader=$!
-  sleep 1
-  psql -c "INSERT INTO plain_events(group_id,body) VALUES (1, '$marker')" >/dev/null
-  "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario" "$seconds"
-  group_offset_end=$(group_stream_offset "$stream_path")
-  clear_fault
-  if [ -n "$writer" ]; then wait "$writer" 2>/dev/null || true; fi
-  wait "$marker_reader" 2>/dev/null || true
-  end_bytes=$(group_bytes)
-  if [ "$end_bytes" -eq "$start_bytes" ] && [ "$rate" -gt 0 ]; then
-    transactions=$(awk '/number of transactions actually processed:/{print $NF}' "$OUT/pgbench-${rate}cps-${seconds}s.log" 2>/dev/null || echo 0)
-    end_bytes=$((start_bytes + transactions * 1280))
-  fi
-  printf '{"write_rate_cps":%s,"hold_seconds":%s,"groups":%s,"group_bytes_written":%s,"group_stream_path":"%s","group_stream_offset_start":"%s","group_stream_offset_end":"%s"}\n' \
-    "$rate" "$seconds" "$groups" "$((end_bytes - start_bytes))" "$stream_path" "$group_offset_start" "$group_offset_end" > "$OUT/$scenario-workload.json"
-  case "$scenario" in b-*) "$ROOT/harness/otto-10992/run-scenario.sh" "$scenario-recovery" 60;; esac
-}
+{
+  printf '{"runner_name":"%s","runner_os":"%s","runner_arch":"%s","image_os":"%s","image_version":"%s","nproc":%s,"mem_total_bytes":%s,"cpu_model":"%s"}\n' \
+    "${RUNNER_NAME:-}" "${RUNNER_OS:-}" "${RUNNER_ARCH:-}" "${ImageOS:-}" "${ImageVersion:-}" "$(nproc)" \
+    "$(awk '/MemTotal:/{print $2*1024}' /proc/meminfo)" "$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo)"
+} > "$OUT/runner.json"
 
 wait_http
 seed
-for mode in long-poll sse; do
-  LIVE_MODE=$mode CLIENT_SECONDS=1800 "${BASE[@]}" exec -T api pnpm exec tsx /repo/prototype/client.ts >"$OUT/client-$mode.json" 2>&1 &
-done
-for scenario in ${SCENARIOS//,/ }; do
-  case "$scenario" in b-1) seconds=180;; b-5) seconds=420;; b-15) seconds=1020;; *) seconds=${SCENARIO_SECONDS:-60};; esac
-  run_one "$scenario" "$seconds"
-done
+: > "$OUT/markers.tsv"; : > "$OUT/phases.tsv"
+UNAFFECTED_PLAIN=$(curl --max-time 60 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/shapes \
+  -d '{"table":"public.plain_events","subscription":"otto-unaffected-plain"}' | tee "$OUT/unaffected-plain-load.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])')
+UNAFFECTED_GROUP=$(load_group unaffected '[{"table":"public.plain_events"},{"table":"public.sparse_events"}]')
+
+hold=300; faulted=""; sparse=0; burst=0
+fault_env=()
+case "$NAME" in
+  control) ;;
+  control-900) hold=900 ;;
+  a) faulted=$(load_group stalled "$RECORD_MEMBERS"); fault_env=(FAULT_MATCH="/$faulted" HANG=1) ;;
+  b-*) hold=$(( ${NAME#b-} * 60 )); faulted=$(load_group outage "$RECORD_MEMBERS"); fault_env=(OUTAGE=1) ;;
+  c-*) faulted=$(load_group delayed "$RECORD_MEMBERS"); fault_env=(FAULT_MATCH="/$faulted" DELAY_MS="${NAME#c-}") ;;
+  d) sparse=1; faulted=$(load_group sparse '[{"table":"public.sparse_events","where":{"col":"group_id","op":"eq","value":1}}]'); fault_env=(FAULT_MATCH="/$faulted" HANG=1) ;;
+  e) burst=200 ;;
+  *) echo "unknown scenario $NAME" >&2; exit 2 ;;
+esac
+
+stop="$OUT/stop"; rm -f "$stop"
+python3 "$ROOT/harness/otto-10992/delivery_probe.py" "$OUT" "$stop" \
+  "plain=$UNAFFECTED_PLAIN" "group=$UNAFFECTED_GROUP" "faulted=$faulted" > "$OUT/delivery-probe.log" 2>&1 &
+probe_pid=$!
+phase warmup
+INTERVAL_S=1 "$ROOT/harness/otto-10992/run-scenario.sh" "$OUT" "$stop" "$OUT/phase" > "$OUT/sampler.log" 2>&1 &
+sampler_pid=$!
+
+total=$((WARMUP_S + hold + RECOVER_S))
+"${BASE[@]}" exec -T postgres sh -c 'cat > /tmp/otto-10992-pgbench.sql' < "$ROOT/harness/otto-10992/pgbench.sql"
+workers=8; [ "$RATE" -ge 1000 ] && workers=16
+"${BASE[@]}" exec -T postgres pgbench -n -U postgres -d electric -f /tmp/otto-10992-pgbench.sql \
+  -c "$workers" -j 4 -T "$total" -R "$RATE" -P 10 > "$OUT/pgbench.log" 2>&1 &
+writer=$!
+sparse_writer=""
+if [ "$sparse" = 1 ]; then
+  ( end=$(( $(date +%s) + total )); while [ "$(date +%s)" -lt "$end" ]; do
+      psql -c "INSERT INTO sparse_events(group_id,body) VALUES (1, repeat('s', 256))" >/dev/null || true; sleep 10; done ) &
+  sparse_writer=$!
+fi
+
+sleep "$WARMUP_S"
+phase hold
+hold_start=$(now_ms)
+if [ ${#fault_env[@]} -gt 0 ]; then env "${fault_env[@]}" "${BASE[@]}" up -d --no-deps --force-recreate ds-proxy >/dev/null; fi
+burst_pid=""
+if [ "$burst" -gt 0 ]; then
+  ( for i in $(seq 1 "$burst"); do
+      curl --max-time 120 -sS -o /dev/null -w '%{http_code} %{time_total}\n' -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
+        -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}'
+    done > "$OUT/burst.log" 2>&1 ) &
+  burst_pid=$!
+fi
+sleep 1
+marker during
+sleep $(( hold - 1 - ($(now_ms) - hold_start) / 1000 > 0 ? hold - 1 - ($(now_ms) - hold_start) / 1000 : 0 ))
+phase recovery
+clear_ms=$(now_ms)
+[ ${#fault_env[@]} -gt 0 ] && proxy
+marker after
+sleep "$RECOVER_S"
+touch "$stop"
+wait "$writer" 2>/dev/null || true
+[ -n "$sparse_writer" ] && kill "$sparse_writer" 2>/dev/null || true
+[ -n "$burst_pid" ] && wait "$burst_pid" 2>/dev/null || true
+wait "$probe_pid" "$sampler_pid" 2>/dev/null || true
+phase done
+
+printf '{"scenario":"%s","name":"%s","rate_tps":%s,"rows_per_txn":4,"warmup_s":%s,"hold_s":%s,"recover_s":%s,"hold_start_ms":%s,"clear_ms":%s,"faulted_stream":"%s","unaffected_plain_stream":"%s","unaffected_group_stream":"%s","fault":"%s","burst_groups":%s,"engine_ref":"%s"}\n' \
+  "$SPEC" "$NAME" "$RATE" "$WARMUP_S" "$hold" "$RECOVER_S" "$hold_start" "$clear_ms" "$faulted" "$UNAFFECTED_PLAIN" "$UNAFFECTED_GROUP" \
+  "${fault_env[*]:-}" "$burst" "${ENGINE_REF:-}" > "$OUT/workload.json"
