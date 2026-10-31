@@ -433,7 +433,7 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
    returns **at once** (it joins the shutdown token in its select) instead of holding the
    termination grace for its full `ELECTRIC_LIVE_TIMEOUT_MS` window — and so does the sequencer's own
    long-poll on the change log. So does a `/v1/shape` `offset=-1` request still **waiting on a shared
-   snapshot build**: it answers `503` with `Retry-After: 1` rather than hold the grace for a build of
+   snapshot build** (or still in the `HEAD` it makes on arrival): it answers `503` with `Retry-After: 1` rather than hold the grace for a build of
    unknown length (the server's graceful stop waits for it, and Engine close runs only after that). A
    *new* `offset=-1` is already refused at control admission, which closes when the token flips.
    Under `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, a catch-up read that is rebuilding its key set
