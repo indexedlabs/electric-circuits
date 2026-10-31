@@ -9,7 +9,7 @@ mkdir -p "$OUT"
 psql() { "${BASE[@]}" exec -T postgres psql -U postgres -d electric "$@"; }
 proxy() { "${BASE[@]}" up -d --no-deps --force-recreate ds-proxy >/dev/null; }
 clear_fault() { unset FAULT_MATCH HANG OUTAGE DELAY_MS; proxy; }
-wait_http() { for _ in $(seq 1 120); do curl -fsS http://127.0.0.1:7010/v1/health >/dev/null && return; sleep 1; done; return 1; }
+wait_http() { for _ in $(seq 1 120); do curl --max-time 5 -fsS http://127.0.0.1:7010/v1/health >/dev/null && return; sleep 1; done; return 1; }
 
 seed() {
   psql -c "INSERT INTO record(group_id,body) SELECT 1, repeat('r', 256) FROM generate_series(1,1000) ON CONFLICT DO NOTHING" >/dev/null
@@ -21,7 +21,7 @@ seed() {
 
 load_group() {
   local name=$1
-  curl -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
+  curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load \
     -d '{"subscription":"otto-'"$name"'","members":[{"table":"public.record","where":{"col":"group_id","op":"eq","value":1}},{"table":"public.record_items"},{"table":"public.record_meta"}]}' \
     | tee "$OUT/$name-load.json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["streamPath"])'
 }
@@ -43,7 +43,7 @@ run_one() {
     c-200) stream_path=$(load_group delayed-200); export FAULT_MATCH="/$stream_path" DELAY_MS=200; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     c-2000) stream_path=$(load_group delayed-2000); export FAULT_MATCH="/$stream_path" DELAY_MS=2000; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     d) stream_path=$(load_group sparse); export FAULT_MATCH="/$stream_path" HANG=1; proxy; write_loop sparse_events 10 "$seconds" & writer=$! ;;
-    e) for i in $(seq 1 30); do curl -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}' >"$OUT/burst-$i-load.json"; done; write_loop plain_events 0.01 "$seconds" & writer=$! ;;
+    e) for i in $(seq 1 30); do curl --max-time 30 -fsS -H content-type:application/json -X POST http://127.0.0.1:7010/v1/subsets/load -d '{"subscription":"otto-burst-'"$i"'","members":[{"table":"public.plain_events"},{"table":"public.record"}]}' >"$OUT/burst-$i-load.json"; done; write_loop plain_events 0.01 "$seconds" & writer=$! ;;
     b-*) load_group outage >/dev/null; export OUTAGE=1; proxy; write_loop plain_events 0.05 "$seconds" & writer=$! ;;
     *) echo "unknown scenario $scenario" >&2; return 2;;
   esac
