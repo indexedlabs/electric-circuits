@@ -20,7 +20,7 @@ const check = () => {
     resolveSeen?.()
   }
 }
-const unsubscribe = sub.collection.subscribe(() => check())
+const unsubscribe = sub.collection.subscribeChanges(() => check(), { includeInitialState: true })
 check()
 await Promise.race([seen, new Promise((resolve) => setTimeout(resolve, timeoutMs))])
 unsubscribe()
