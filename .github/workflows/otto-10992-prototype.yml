@@ -50,6 +50,13 @@ jobs:
       - name: Build and start engine, proxy and API
         run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d --build ds-proxy engine api
 
+      - name: Capture stack diagnostics on failure
+        if: failure()
+        run: |
+          mkdir -p harness/otto-10992/results/diagnostics
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml ps > harness/otto-10992/results/diagnostics/compose-ps.txt || true
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml logs --no-color engine ds-proxy ds postgres > harness/otto-10992/results/diagnostics/compose.log || true
+
       - name: Run selected scenarios
         env:
           SCENARIOS: ${{ steps.config.outputs.scenarios }}
