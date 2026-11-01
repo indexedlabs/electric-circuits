@@ -5073,4 +5073,117 @@ mod subscription_tests {
         durable.await.unwrap().unwrap();
         internal.await.unwrap().unwrap();
     }
+
+    /// A group of `members` shapes that all write one stream, as `/v1/groups` builds it: every
+    /// member's record names the group's stream, and the group claim holds them privately.
+    async fn engine_with_shared_group_stream(ds: DsClient, members: usize) -> (Engine, GroupRecord) {
+        let engine = Engine::new_for_in_process_test(ds);
+        let stream_path = "shape/group-shared".to_string();
+        let now = crate::changelog::now_secs();
+        let mut group_members = Vec::with_capacity(members);
+        let mut st = engine.state.lock().await;
+        for i in 0..members {
+            let id = format!("member-{i}");
+            let subscription = if i == 0 { "scope".to_string() } else { format!("scope:member:{i}") };
+            let table = format!("items_{i}");
+            st.shapes.insert(
+                id.clone(),
+                ShapeRecord {
+                    id: id.clone(),
+                    table: crate::table_ref::TableRef::parse(&table).unwrap(),
+                    stream_path: stream_path.clone(),
+                    changes_only: true,
+                    where_json: None,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: None,
+                    fingerprint: None,
+                    backfill_rows: None,
+                    backfill_bytes: None,
+                },
+            );
+            let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+            drop(ready_tx);
+            st.feed_shares
+                .insert(id.clone(), FeedShare { sig: format!("group-{id}"), subs: Default::default(), ready });
+            st.subscribe(&id, subscription.clone(), now);
+            group_members.push(GroupMember {
+                key: format!("key-{i}"),
+                shape_id: id,
+                table,
+                where_: None,
+                columns: None,
+                subscription,
+                is_subquery: false,
+            });
+        }
+        let group = GroupRecord {
+            id: stream_path.clone(),
+            stream_path,
+            subscription: "scope".into(),
+            members: group_members,
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        st.group_claims.reserve("scope", "group:scope").unwrap();
+        st.group_claims.reserve_private_members("scope", (1..members).map(|i| format!("scope:member:{i}")));
+        st.group_claims.complete(group.clone());
+        drop(st);
+        (engine, group)
+    }
+
+    /// Prod, 2026-11-01: releasing a group retired its one stream once per member and once more for
+    /// the group, all within milliseconds. Durable-streams refuses a DELETE of a stream it is already
+    /// deleting (`503 stream retirement in progress`), so the group's own DELETE lost the race and the
+    /// release answered 500 although the stream was on its way out.
+    ///
+    /// The contract: concurrent releases of a group whose members share one stream all succeed, the
+    /// stream is retired exactly once, storage ends without it, nothing is left in the retirement
+    /// queue, and every member's `Retired` completion is recorded once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_releases_of_a_shared_group_stream_retire_it_once() {
+        let server = FakeDs::start().await;
+        server.retire_like_storage(std::time::Duration::from_millis(50));
+        let (engine, group) = engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 4).await;
+
+        let releases: Vec<_> = (0..4)
+            .map(|_| {
+                let (engine, group) = (engine.clone(), group.clone());
+                tokio::spawn(async move { engine.release_group_claim(&group.subscription, &group.id).await })
+            })
+            .collect();
+        for release in releases {
+            tokio::time::timeout(std::time::Duration::from_secs(10), release)
+                .await
+                .expect("group release did not finish")
+                .unwrap()
+                .expect("releasing a group whose members share its stream must succeed");
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine.pending_retirements() != 0 {
+            assert!(std::time::Instant::now() < deadline, "the retirement queue never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(engine.group_record("scope").await.is_none(), "the group record is released");
+        assert!(server.is_deleted(&group.stream_path), "the shared stream is gone from storage");
+        assert_eq!(server.deletes_of(&group.stream_path), 1, "the shared stream is retired exactly once");
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(5)).await);
+        let mut retired: Vec<String> = server
+            .catalog_events()
+            .iter()
+            .filter(|event| event["t"] == "retired")
+            .map(|event| event["id"].as_str().unwrap_or("?").to_string())
+            .collect();
+        retired.sort();
+        assert_eq!(
+            retired,
+            (0..4).map(|i| format!("member-{i}")).collect::<Vec<_>>(),
+            "each member's retirement is completed once, after storage accepted the delete"
+        );
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
 }

@@ -1969,7 +1969,7 @@ impl Engine {
 /// intent), and a double that returns pre-classified errors would test the test.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2023,6 +2023,13 @@ pub(crate) mod testing {
         missing_heads: Mutex<HashSet<String>>,
         closed_heads: Mutex<HashSet<String>>,
         events: Mutex<Vec<serde_json::Value>>,
+        /// Storage-like deletes (see [`FakeDs::retire_like_storage`]): `Some(latency)` holds each
+        /// DELETE that long, answers a second DELETE of a stream while one is in flight with
+        /// `503 stream retirement in progress`, and a DELETE of a deleted stream with 404.
+        storage_delete_latency: Mutex<Option<std::time::Duration>>,
+        deleting: Mutex<HashSet<String>>,
+        deleted: Mutex<HashSet<String>>,
+        deletes_by_path: Mutex<HashMap<String, u64>>,
     }
 
     pub(crate) struct FakeDs {
@@ -2123,10 +2130,29 @@ pub(crate) mod testing {
                              axum::extract::Path(path): axum::extract::Path<String>| async move {
                                 let release_generation = st.delete_release_generation.load(Ordering::SeqCst);
                                 st.deletes.fetch_add(1, Ordering::SeqCst);
+                                let logical = logical_path(&path).to_string();
+                                *st.deletes_by_path.lock().unwrap().entry(logical.clone()).or_default() += 1;
+                                let latency = *st.storage_delete_latency.lock().unwrap();
+                                if let Some(latency) = latency {
+                                    if st.deleted.lock().unwrap().contains(&logical) {
+                                        return axum::http::StatusCode::NOT_FOUND.into_response();
+                                    }
+                                    if !st.deleting.lock().unwrap().insert(logical.clone()) {
+                                        return (
+                                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                            "stream retirement in progress",
+                                        )
+                                            .into_response();
+                                    }
+                                    tokio::time::sleep(latency).await;
+                                    st.deleting.lock().unwrap().remove(&logical);
+                                    st.deleted.lock().unwrap().insert(logical);
+                                    return axum::http::StatusCode::NO_CONTENT.into_response();
+                                }
                                 // The real server answers 404 for a stream it does not have; the client's
                                 // delete tolerance (`ds::delete_stream`) is what makes that a retirement.
                                 if st.missing_heads.lock().unwrap().contains(logical_path(&path)) {
-                                    return axum::http::StatusCode::NOT_FOUND;
+                                    return axum::http::StatusCode::NOT_FOUND.into_response();
                                 }
                                 st.delete_started.notify_one();
                                 if st.pause_delete_after_start.load(Ordering::SeqCst) {
@@ -2148,9 +2174,9 @@ pub(crate) mod testing {
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
-                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                                 }
-                                axum::http::StatusCode::NO_CONTENT
+                                axum::http::StatusCode::NO_CONTENT.into_response()
                             },
                         ),
                 )
@@ -2237,6 +2263,23 @@ pub(crate) mod testing {
 
         pub(crate) fn deletes(&self) -> u64 {
             self.state.deletes.load(Ordering::SeqCst)
+        }
+
+        /// Delete like durable-streams does: each DELETE takes `latency`, a second DELETE of the
+        /// same stream while one is in flight is refused with `503 stream retirement in progress`
+        /// (prod, 2026-11-01), and a deleted stream answers 404.
+        pub(crate) fn retire_like_storage(&self, latency: std::time::Duration) {
+            *self.state.storage_delete_latency.lock().unwrap() = Some(latency);
+        }
+
+        /// DELETEs that reached `path`, whatever they were answered.
+        pub(crate) fn deletes_of(&self, path: &str) -> u64 {
+            self.state.deletes_by_path.lock().unwrap().get(path).copied().unwrap_or(0)
+        }
+
+        /// Whether a storage-like DELETE of `path` has completed.
+        pub(crate) fn is_deleted(&self, path: &str) -> bool {
+            self.state.deleted.lock().unwrap().contains(path)
         }
 
         pub(crate) fn closes(&self) -> u64 {
