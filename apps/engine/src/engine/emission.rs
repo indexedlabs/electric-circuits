@@ -289,6 +289,8 @@ impl Cap {
 struct Queued {
     envs: Vec<Envelope>,
     bytes: u64,
+    /// Part of a member's activation drain, which the byte cap never counts.
+    exempt: bool,
 }
 
 struct InFlight {
@@ -319,6 +321,8 @@ struct GroupLaneState {
     producing: BTreeMap<u64, usize>,
     queued: BTreeMap<(u64, u64), Queued>,
     queued_bytes: u64,
+    /// Queued bytes from activation drains, still queued and outside the byte cap.
+    exempt_bytes: u64,
     next_seq: u64,
     marker: Option<Envelope>,
     in_flight: Option<InFlight>,
@@ -358,13 +362,13 @@ impl GroupLaneState {
             || self.queued.keys().next().is_some_and(|(lsn, _)| *lsn <= barrier)
     }
 
-    /// Queued bytes the memory cap counts: everything but the largest queued commit. A walk of
-    /// the queue, so callers take it only once the total could matter (`queued_bytes` above a
-    /// quarter of the cap, where threshold events re-arm).
+    /// Queued bytes the byte cap counts: everything but activation drains and the largest queued
+    /// commit. A walk of the queue, so callers take it only once the total could matter (the
+    /// counted bytes above a quarter of the cap, where threshold events re-arm).
     fn capped_bytes(&self) -> u64 {
         let mut largest = 0u64;
         let mut current: Option<(u64, u64)> = None;
-        for (&(lsn, _), queued) in &self.queued {
+        for (&(lsn, _), queued) in self.queued.iter().filter(|(_, queued)| !queued.exempt) {
             current = match current {
                 Some((commit, bytes)) if commit == lsn => Some((commit, bytes + queued.bytes)),
                 Some((_, bytes)) => {
@@ -377,7 +381,7 @@ impl GroupLaneState {
         if let Some((_, bytes)) = current {
             largest = largest.max(bytes);
         }
-        self.queued_bytes - largest
+        self.queued_bytes - self.exempt_bytes - largest
     }
 
     /// The stall cap now in force: the lane's backed-off cap, plus the time an in-flight append
@@ -469,6 +473,7 @@ impl GroupEmissionLanes {
                 producing: BTreeMap::new(),
                 queued: BTreeMap::new(),
                 queued_bytes: 0,
+                exempt_bytes: 0,
                 next_seq: 0,
                 marker: None,
                 in_flight: None,
@@ -729,13 +734,14 @@ impl GroupLane {
         }
         let seq = state.next_seq;
         state.next_seq += 1;
-        state.queued.insert((commit_lsn, seq), Queued { envs, bytes });
+        state.queued.insert((commit_lsn, seq), Queued { envs, bytes, exempt: false });
         state.queued_bytes += bytes;
         state.peak_batches = state.peak_batches.max(state.queued.len() as u64);
         state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
         self.backlog_changed(bytes as i64, 1);
         let limit = self.shared.config.memory_bytes;
-        let capped = if state.queued_bytes >= limit / 4 { state.capped_bytes() } else { state.queued_bytes };
+        let counted = state.queued_bytes - state.exempt_bytes;
+        let capped = if counted >= limit / 4 { state.capped_bytes() } else { counted };
         // A push that jumps past the cap still reports the thresholds it crossed on the way.
         self.threshold(&mut state, Cap::Bytes, capped as f64 / limit as f64);
         if capped > limit {
@@ -763,8 +769,9 @@ impl GroupLane {
             let bytes: u64 = envs.iter().map(crate::ds::envelope_memory_bytes).sum();
             let seq = state.next_seq;
             state.next_seq += 1;
-            state.queued.insert((commit_lsn, seq), Queued { envs, bytes });
+            state.queued.insert((commit_lsn, seq), Queued { envs, bytes, exempt: true });
             state.queued_bytes += bytes;
+            state.exempt_bytes += bytes;
             state.peak_batches = state.peak_batches.max(state.queued.len() as u64);
             state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
             self.backlog_changed(bytes as i64, 1);
@@ -818,6 +825,9 @@ impl GroupLane {
         let mut envs = Vec::new();
         for key in &keys {
             if let Some(queued) = state.queued.remove(key) {
+                if queued.exempt {
+                    state.exempt_bytes -= queued.bytes;
+                }
                 envs.extend(queued.envs);
             }
         }
@@ -960,6 +970,7 @@ impl GroupLane {
         self.backlog_changed(-(backlog_bytes as i64), -(backlog_batches as i64));
         state.queued.clear();
         state.queued_bytes = 0;
+        state.exempt_bytes = 0;
         state.marker = None;
         if !keep_in_flight {
             state.in_flight = None;
@@ -1108,6 +1119,7 @@ impl GroupLane {
         }
         state.queued.clear();
         state.queued_bytes = 0;
+        state.exempt_bytes = 0;
         state.producing.clear();
         state.marker = None;
         state.in_flight = None;
@@ -1793,6 +1805,31 @@ mod tests {
             assert!(!restart[field].is_null(), "restart detach lacks {field}: {restart}");
         }
         assert_eq!(detaches(&lanes), 2, "a restart's detach counts as a detach");
+    }
+
+    #[tokio::test]
+    async fn live_output_behind_an_activation_drain_does_not_trip_the_byte_cap() {
+        let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
+        let (lanes, store, hold) = held_lanes(config);
+        // A member's activation drain, several commits over the cap, then live output for the
+        // group before the writer has worked any of it off.
+        let drain = (1..=6u64).map(|lsn| (lsn, vec![big_env(&format!("drained-{lsn}"))])).collect();
+        lanes.push_drain(GROUP, drain);
+        lanes.push(GROUP, vec![group_env("live-7")], 7);
+        lanes.push(GROUP, vec![group_env("live-8")], 8);
+        assert_eq!(detaches(&lanes), 0, "live output behind an activation drain tripped the byte cap");
+        hold.send_replace(false);
+        let (keys, _) = wait_appended(&store, 8).await;
+        let mut expected: Vec<String> = (1..=6).map(|lsn| format!("drained-{lsn}")).collect();
+        expected.extend(["live-7".to_string(), "live-8".to_string()]);
+        assert_eq!(keys, expected);
+        // Once the drain has landed, ordinary output is capped again.
+        hold.send_replace(true);
+        lanes.push(GROUP, vec![big_env("in-flight")], 9);
+        settle().await;
+        lanes.push(GROUP, vec![big_env("queued")], 10);
+        lanes.push(GROUP, vec![big_env("over")], 11);
+        assert_eq!(detaches(&lanes), 1);
     }
 
     #[tokio::test]

@@ -3126,6 +3126,12 @@ async fn group_restart_restores_a_behind_group_detached(f: &Fixture) -> Result<(
         // Before any new write: a pre-restart commit whose group output landed is still drained.
         let early = restarted.group_drain_receipt(&fence.to_string(), &drained_path).context("restored receipt")?;
         ensure!(early.drained && !early.must_refetch, "a landed pre-restart commit is not drained: {early:?}");
+        let behind_early = restarted.group_drain_receipt(&held.to_string(), &behind_path).context("restored receipt")?;
+        ensure!(
+            // Detached, or already healed by its marker: either way its readers must refetch.
+            behind_early.must_refetch,
+            "a restored resume point was not reported to its receipt: {behind_early:?}"
+        );
         let after = tokio::time::timeout(Duration::from_secs(20), async {
             let mut id = 401;
             loop {
