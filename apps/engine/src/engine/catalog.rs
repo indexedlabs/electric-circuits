@@ -136,6 +136,13 @@ pub(crate) enum CatalogEvent {
         pos: LogPosition,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         highwater: Option<(u64, u64)>,
+        /// Per-group resume points (OTTO-11131): every group stream with output at or before the
+        /// highwater that had not landed when this checkpoint was taken, mapped to the oldest
+        /// such commit LSN. The checkpoint never waits for a group, so a restart from it restores
+        /// these groups detached and they reattach behind a must-refetch marker. Older engines
+        /// ignore the field; an older checkpoint without it restores every group attached.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        groups: std::collections::BTreeMap<String, u64>,
     },
     /// The change log rotated (ADR-0006): `segment` became the CURRENT segment at `at` (unix
     /// seconds). Written on the first creation of segment 0 too, so every segment's start time is
@@ -452,7 +459,7 @@ pub(crate) fn spawn_catalog_writer(
             // position a restart would resume from, and treating it as one would license deleting
             // the segment underneath it.
             let checkpoint = match &ev {
-                CatalogEvent::Offset { pos, highwater } => Some((pos.clone(), *highwater)),
+                CatalogEvent::Offset { pos, highwater, .. } => Some((pos.clone(), *highwater)),
                 _ => None,
             };
             // Check at dequeue, not enqueue: earlier queued offsets may have advanced the floor.
@@ -1002,6 +1009,8 @@ pub(crate) struct CatalogFold {
     start_pos: LogPosition,
     /// The `(lsn, seq)` de-duplication highwater recorded with that checkpoint (ADR-0003).
     start_highwater: Option<(u64, u64)>,
+    /// The per-group resume points recorded with that checkpoint (OTTO-11131).
+    group_resume: std::collections::BTreeMap<String, u64>,
     /// The change log's current segment: the last `ChangesRotated`, else 0 (ADR-0006). A lower
     /// bound — a process can die between closing a segment and recording the rotation — so the
     /// boot walks forward from here (`changelog::resolve_current`).
@@ -1037,6 +1046,7 @@ impl Default for CatalogFold {
             max_shape_id: None,
             start_pos: LogPosition::start(),
             start_highwater: None,
+            group_resume: std::collections::BTreeMap::new(),
             binding: None,
             source_receipts: HashMap::new(),
             last_source_receipt: None,
@@ -1130,7 +1140,7 @@ impl CatalogFold {
             CatalogEvent::Retired { id } => {
                 self.pending_retire.remove(&id);
             }
-            CatalogEvent::Offset { pos, highwater } => {
+            CatalogEvent::Offset { pos, highwater, groups } => {
                 if (&pos, highwater) < (&self.start_pos, self.start_highwater) {
                     tracing::error!(
                         previous = %self.start_pos, checkpoint = %pos,
@@ -1140,6 +1150,7 @@ impl CatalogFold {
                 }
                 self.start_pos = pos;
                 self.start_highwater = highwater;
+                self.group_resume = groups;
             }
             // The LAST rotation is the current segment; every one of them is kept, because the
             // retain window needs to know when each segment began (see the variant).
@@ -1593,7 +1604,7 @@ impl Engine {
             self.release_restore_reads().await?;
             return Ok(());
         }
-        let CatalogFold { recs, groups, start_pos, start_highwater, .. } = fold;
+        let CatalogFold { recs, groups, start_pos, start_highwater, group_resume, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The durable floor was adopted before any restore work, including the empty fast path.
@@ -1725,6 +1736,9 @@ impl Engine {
             // contributor state is not persisted; its group is dropped as one unit and the
             // client recreates the scope.
             let now = crate::changelog::now_secs();
+            if let Some((lsn, _)) = start_highwater {
+                self.group_lanes.note_restored_highwater(lsn);
+            }
             for (subscription, group) in groups {
                 let restorable = group
                     .members
@@ -1740,9 +1754,17 @@ impl Engine {
                             })
                     });
                 if restorable && lease_live {
-                    self.group_lanes.register(&group.stream_path);
+                    let meta = crate::engine::emission::GroupMeta::of(&group);
+                    match group_resume.get(&group.stream_path) {
+                        // The checkpoint passed commits this group had not delivered: it starts
+                        // detached at its durable resume point and reattaches behind a marker.
+                        Some(resume_lsn) => self.group_lanes.register_detached(&group.stream_path, *resume_lsn, meta),
+                        None => {
+                            self.group_lanes.register(&group.stream_path);
+                            self.group_lanes.set_meta(&group.stream_path, meta);
+                        }
+                    }
                     st.group_claims.complete(group);
-                    self.group_fence.activate();
                 } else {
                     tracing::info!(
                         %subscription,
@@ -2288,7 +2310,7 @@ mod tests {
                 gate: crate::pg::SnapshotGate::passthrough(),
             },
             CatalogEvent::ChangesRotated { segment: 270, at: crate::changelog::now_secs() },
-            CatalogEvent::Offset { pos: saved.clone(), highwater: Some((0x10, 2)) },
+            CatalogEvent::Offset { pos: saved.clone(), highwater: Some((0x10, 2)), groups: Default::default() },
         ]
         .into_iter()
         .enumerate()
@@ -2401,13 +2423,13 @@ mod tests {
             (pos(1081, "-1"), None),
             (floor.clone(), highwater),
         ] {
-            engine.catalog_tx.send(CatalogEvent::Offset { pos, highwater });
+            engine.catalog_tx.send(CatalogEvent::Offset { pos, highwater, groups: Default::default() });
         }
         tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
         let offsets: Vec<CatalogCheckpoint> = boot_race_events(&store)
             .into_iter()
             .filter_map(|event| match serde_json::from_value(event).unwrap() {
-                CatalogEvent::Offset { pos, highwater } => Some((pos, highwater)),
+                CatalogEvent::Offset { pos, highwater, .. } => Some((pos, highwater)),
                 _ => None,
             })
             .collect();
@@ -2444,13 +2466,24 @@ mod tests {
         for regressed in [LogPosition::start(), pos(1080, "-1"), floor.clone()] {
             output.0.lock().unwrap().clear();
             let mut fold = fold_of(vec![
-                CatalogEvent::Offset { pos: floor.clone(), highwater: Some((8241725836464, 3)) },
+                CatalogEvent::Offset {
+                    pos: floor.clone(),
+                    highwater: Some((8241725836464, 3)),
+                    groups: Default::default(),
+                },
                 // Equal positions can legitimately advance the paired highwater.
-                CatalogEvent::Offset { pos: floor.clone(), highwater: Some((8241725836464, 4)) },
+                CatalogEvent::Offset {
+                    pos: floor.clone(),
+                    highwater: Some((8241725836464, 4)),
+                    groups: Default::default(),
+                },
             ]);
             assert!(output.0.lock().unwrap().is_empty(), "advancing/equal checkpoints are valid");
             for _ in 0..2 {
-                fold.apply_once("stale-shutdown", CatalogEvent::Offset { pos: regressed.clone(), highwater: None });
+                fold.apply_once(
+                    "stale-shutdown",
+                    CatalogEvent::Offset { pos: regressed.clone(), highwater: None, groups: Default::default() },
+                );
             }
             assert_eq!(fold.start_pos(), regressed, "diagnosis must not guess a repaired replay frontier");
             assert_eq!(fold.start_highwater, None, "keep the position/highwater pair from the last event");
@@ -2475,7 +2508,10 @@ mod tests {
         // about it yet; unlike the original regression fixture, no write can seed its floor.
         ds.append_json(
             CATALOG_STREAM,
-            &[catalog_event("previous-process", CatalogEvent::Offset { pos: floor.clone(), highwater })],
+            &[catalog_event(
+                "previous-process",
+                CatalogEvent::Offset { pos: floor.clone(), highwater, groups: Default::default() },
+            )],
         )
         .await
         .unwrap();
@@ -2483,7 +2519,7 @@ mod tests {
         *store.catalog_event_gate.lock().unwrap() = Some(("offset".into(), gate.clone()));
         let shutdown = crate::shutdown::ShutdownToken::with_supervisor(Some(Arc::new(tokio::sync::Notify::new())));
         let writer = spawn_catalog_writer(ds.clone(), shutdown.clone(), true);
-        writer.send(CatalogEvent::Offset { pos: LogPosition::start(), highwater: None });
+        writer.send(CatalogEvent::Offset { pos: LogPosition::start(), highwater: None, groups: Default::default() });
         tokio::time::timeout(OTTO_5492_DEADLINE, async {
             tokio::select! {
                 // Broken writer: the stale append is already in storage's hands.
@@ -2520,7 +2556,7 @@ mod tests {
             let old = if malformed {
                 serde_json::json!({"t":"offset", "eid":"old", "pos":null})
             } else {
-                catalog_event("old", CatalogEvent::Offset { pos: floor.clone(), highwater })
+                catalog_event("old", CatalogEvent::Offset { pos: floor.clone(), highwater, groups: Default::default() })
             };
             ds.append_json(CATALOG_STREAM, &[old]).await.unwrap();
             let engine = if configured {
@@ -2541,7 +2577,7 @@ mod tests {
             engine.sweep_change_log().await;
             let unread_retained = engine.changes.state().segments().contains_key(&0);
             for (pos, highwater) in [(LogPosition::start(), None), (floor.clone(), highwater), (floor, None)] {
-                engine.catalog_tx.send(CatalogEvent::Offset { pos, highwater });
+                engine.catalog_tx.send(CatalogEvent::Offset { pos, highwater, groups: Default::default() });
             }
             let written = tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap();
             let offsets: Vec<_> = boot_race_events(&store).into_iter().filter(|event| event["t"] == "offset").collect();
@@ -2739,7 +2775,10 @@ mod tests {
             serde_json::json!({"t": "future-event", "eid": "unknown"}),
             catalog_event("rotation", CatalogEvent::ChangesRotated { segment: 3, at: 120 }),
             catalog_event("pin", CatalogEvent::ConsumerPinned { id: "reader".into(), position: pos(2, "pin") }),
-            catalog_event("offset", CatalogEvent::Offset { pos: pos(3, "tail"), highwater: Some((42, 7)) }),
+            catalog_event(
+                "offset",
+                CatalogEvent::Offset { pos: pos(3, "tail"), highwater: Some((42, 7)), groups: Default::default() },
+            ),
         ]
     }
 
@@ -3028,7 +3067,10 @@ mod tests {
     #[tokio::test]
     async fn catalog_pages_binding_errors_match_the_collecting_validator() {
         let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
-        let offset = catalog_event("offset", CatalogEvent::Offset { pos: pos(0, "tail"), highwater: None });
+        let offset = catalog_event(
+            "offset",
+            CatalogEvent::Offset { pos: pos(0, "tail"), highwater: None, groups: Default::default() },
+        );
         let mut mismatch = expected_store_bound();
         mismatch.query_generation = "other-query".into();
         let cases = [
@@ -3334,7 +3376,8 @@ mod tests {
     /// engine to create a slot from nothing (ADR-0004).
     #[test]
     fn a_catalog_without_a_binding_folds_to_no_epoch() {
-        let fold = fold_of(vec![CatalogEvent::Offset { pos: pos(0, "42"), highwater: None }]);
+        let fold =
+            fold_of(vec![CatalogEvent::Offset { pos: pos(0, "42"), highwater: None, groups: Default::default() }]);
         assert!(fold.binding.is_none());
         assert_eq!(fold.start_pos, pos(0, "42"));
         // Nothing at all folds to the empty catalog, which the restore skips outright.
@@ -3454,8 +3497,8 @@ mod tests {
     #[test]
     fn the_dedup_highwater_is_restored_with_the_checkpoint_it_was_taken_at() {
         let fold = fold_of(vec![
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x10, 3)) },
-            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)) },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x10, 3)), groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)), groups: Default::default() },
         ]);
         assert_eq!(fold.start_pos, pos(0, "20"));
         assert_eq!(fold.start_highwater, Some((0x20, 7)), "the last checkpoint's highwater, not the first");
@@ -3463,8 +3506,8 @@ mod tests {
         // A checkpoint taken before anything was applied carries none, and CLEARS an older one:
         // last-writer-wins for the pair, never a mix of a new position and a stale highwater.
         let fold = fold_of(vec![
-            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)) },
-            CatalogEvent::Offset { pos: pos(1, "0"), highwater: None },
+            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)), groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(1, "0"), highwater: None, groups: Default::default() },
         ]);
         assert_eq!(fold.start_pos, pos(1, "0"));
         assert_eq!(fold.start_highwater, None);
@@ -3473,16 +3516,65 @@ mod tests {
         assert_eq!(CatalogFold::default().start_highwater, None);
     }
 
+    /// OTTO-11131: a checkpoint no longer waits for a group, so it carries each behind group's
+    /// resume point, and the last checkpoint's set is the one a restart restores detached. The
+    /// field is omitted when empty, so an older engine reads every checkpoint as before, and an
+    /// older checkpoint restores every group attached.
+    #[test]
+    fn a_checkpoint_carries_the_resume_point_of_every_group_it_passed() {
+        let behind = std::collections::BTreeMap::from([("shape/group-3".to_string(), 0x18u64)]);
+        let fold = fold_of(vec![CatalogEvent::Offset {
+            pos: pos(0, "10"),
+            highwater: Some((0x20, 1)),
+            groups: behind.clone(),
+        }]);
+        assert_eq!(fold.group_resume, behind);
+        let fold = fold_of(vec![
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x20, 1)), groups: behind.clone() },
+            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x30, 1)), groups: Default::default() },
+        ]);
+        assert!(fold.group_resume.is_empty(), "a later checkpoint that passed no behind group clears it");
+
+        let json = serde_json::to_value(CatalogEvent::Offset {
+            pos: pos(0, "10"),
+            highwater: Some((0x20, 1)),
+            groups: behind.clone(),
+        })
+        .unwrap();
+        assert_eq!(json["groups"], serde_json::json!({ "shape/group-3": 0x18 }));
+        let bare = serde_json::to_value(CatalogEvent::Offset {
+            pos: pos(0, "10"),
+            highwater: None,
+            groups: Default::default(),
+        })
+        .unwrap();
+        assert!(bare.get("groups").is_none(), "an empty set must keep the old wire form");
+        match serde_json::from_value::<CatalogEvent>(bare).unwrap() {
+            CatalogEvent::Offset { groups, .. } => assert!(groups.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     /// The wire form: the highwater is omitted when absent (so a checkpoint that has applied
     /// nothing is the same bytes it always was) and round-trips when present.
     #[test]
     fn the_checkpoint_wire_form_carries_the_highwater_only_when_there_is_one() {
-        let bare = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: None }).unwrap();
+        let bare = serde_json::to_value(CatalogEvent::Offset {
+            pos: pos(2, "9"),
+            highwater: None,
+            groups: Default::default(),
+        })
+        .unwrap();
         assert_eq!(bare.get("highwater"), None, "{bare}");
-        let with = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: Some((5, 6)) }).unwrap();
+        let with = serde_json::to_value(CatalogEvent::Offset {
+            pos: pos(2, "9"),
+            highwater: Some((5, 6)),
+            groups: Default::default(),
+        })
+        .unwrap();
         assert_eq!(with["highwater"], serde_json::json!([5, 6]));
         match serde_json::from_value::<CatalogEvent>(with).unwrap() {
-            CatalogEvent::Offset { pos: p, highwater } => {
+            CatalogEvent::Offset { pos: p, highwater, .. } => {
                 assert_eq!(p, pos(2, "9"));
                 assert_eq!(highwater, Some((5, 6)));
             }
@@ -3497,7 +3589,7 @@ mod tests {
     fn rotations_fold_to_the_current_segment_and_every_segments_start() {
         let fold = fold_of(vec![
             CatalogEvent::ChangesRotated { segment: 0, at: 100 },
-            CatalogEvent::Offset { pos: pos(0, "9"), highwater: None },
+            CatalogEvent::Offset { pos: pos(0, "9"), highwater: None, groups: Default::default() },
             CatalogEvent::ChangesRotated { segment: 1, at: 200 },
             CatalogEvent::ChangesRotated { segment: 2, at: 300 },
         ]);
@@ -3570,13 +3662,18 @@ mod tests {
         let fold = fold_of(vec![
             created,
             CatalogEvent::Dormant { id: "s1".to_string(), resume: pos(3, "77"), gate },
-            CatalogEvent::Offset { pos: pos(4, "12"), highwater: None },
+            CatalogEvent::Offset { pos: pos(4, "12"), highwater: None, groups: Default::default() },
         ]);
         assert_eq!(fold.start_pos, pos(4, "12"));
         assert_eq!(fold.recs.get("s1").and_then(|r| r.3.as_ref()).map(|(p, _)| p.clone()), Some(pos(3, "77")));
 
         // Wire form: an object, never a bare string.
-        let json = serde_json::to_value(CatalogEvent::Offset { pos: pos(4, "12"), highwater: None }).unwrap();
+        let json = serde_json::to_value(CatalogEvent::Offset {
+            pos: pos(4, "12"),
+            highwater: None,
+            groups: Default::default(),
+        })
+        .unwrap();
         assert_eq!(json["t"], "offset");
         assert_eq!(json["pos"]["segment"], 4);
         assert_eq!(json["pos"]["offset"], "12");
@@ -3607,7 +3704,12 @@ mod tests {
         assert!(detail.contains("s7"), "the refusal names the shape: {detail}");
 
         // The current spellings are not mistaken for the old ones.
-        let now = serde_json::to_value(CatalogEvent::Offset { pos: pos(2, "9"), highwater: None }).unwrap();
+        let now = serde_json::to_value(CatalogEvent::Offset {
+            pos: pos(2, "9"),
+            highwater: None,
+            groups: Default::default(),
+        })
+        .unwrap();
         assert!(predates_segmentation(&now).is_none());
         let gate = crate::pg::SnapshotGate::passthrough();
         let now =
@@ -3841,7 +3943,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn parking_a_broken_epoch_also_moves_the_id_counter() {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
-        let fold = fold_of(vec![created, CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }]);
+        let fold = fold_of(vec![
+            created,
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
+        ]);
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         engine.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
         engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Park).await.unwrap();
@@ -4003,7 +4108,7 @@ mod tests {
                 resume: pos(0, "5"),
                 gate: crate::pg::SnapshotGate::passthrough(),
             },
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
         ]);
         let server = FakeDs::start().await;
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
@@ -4058,7 +4163,7 @@ mod tests {
                 .into_iter()
                 .chain(dormant("s2", "shape/s2", "public.accounts"))
                 .chain(dormant("s3", "shape/s3", "public.events"))
-                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
+                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() }])
                 .collect(),
         );
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(missing_server.url()));
@@ -4109,7 +4214,7 @@ mod tests {
                 .into_iter()
                 .chain(dormant("s2", "public.accounts"))
                 .chain(dormant("s3", "public.events"))
-                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None }])
+                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() }])
                 .collect(),
         );
         let closed_engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(closed_server.url()));
@@ -4240,7 +4345,7 @@ mod tests {
                 resume: pos(0, "5"),
                 gate: crate::pg::SnapshotGate::passthrough(),
             },
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
         ]);
         let (store, _reads) = boot_race_store();
         let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://dead-reader".into(), store));

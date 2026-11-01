@@ -2279,7 +2279,7 @@ impl Engine {
                 // Both halves move together, in memory and durably, so a sequencer spawned later
                 // starts from exactly what the catalog says (ADR-0003).
                 *self.seq_highwater.lock().unwrap() = None;
-                self.catalog_tx.send(CatalogEvent::Offset { pos: target, highwater: None });
+                self.catalog_tx.send(CatalogEvent::Offset { pos: target, highwater: None, groups: Default::default() });
             }
         }
         // The floor. `None` = nothing durable yet (a first boot that has not checkpointed), which
@@ -2571,22 +2571,9 @@ impl Engine {
         // the caller's create rollback (which reaches the registry via `abort_create`), so there is
         // exactly one undo path whether the create failed or was cancelled.
         let (node_seeds, outer_gate, seeded, seeded_pks) = phase_b?;
-        let (finished, staged_group_emissions) = {
+        let finished = {
             let mut registry = self.subqueries.lock().await;
-            let finished = registry.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await;
-            (finished, registry.take_group_emissions())
-        };
-        let finished = match finished {
-            Ok(finished) => {
-                for handle in staged_group_emissions {
-                    handle.wait().await;
-                }
-                finished
-            }
-            Err(error) => {
-                drop(staged_group_emissions);
-                return Err(error);
-            }
+            registry.finish_create(id, node_seeds, outer_gate, seeded, seeded_pks).await?
         };
         tracing::info!(
             target: "electric_circuits_engine::shape_create",

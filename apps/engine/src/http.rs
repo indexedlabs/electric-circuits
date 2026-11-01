@@ -802,10 +802,33 @@ async fn open_control_admission(
     Ok(Json(serde_json::json!({ "controlAdmission": "open" })))
 }
 
+/// `?group=<groupId>` asks for the per-group receipt as well (OTTO-11131): the shared receipt
+/// never waits for a group, so `drained` is then true only once that group's own output through
+/// the commit is on its stream, and `group.mustRefetch` says the group dropped output there and
+/// its readers reload from a snapshot at its must-refetch marker.
+#[derive(Deserialize, Default)]
+struct GroupDrainQuery {
+    group: Option<String>,
+}
+
+fn group_drain_json(
+    engine: &Engine,
+    group: Option<&str>,
+    commit_lsn: Option<&str>,
+) -> Result<Option<crate::engine::GroupDrain>, AppError> {
+    let (Some(group), Some(commit_lsn)) = (group, commit_lsn) else { return Ok(None) };
+    engine.group_drain_at(group, commit_lsn).map(Some).ok_or_else(|| AppError {
+        status: StatusCode::NOT_FOUND,
+        msg: format!("group '{group}' is not served by this engine"),
+        retry_after: false,
+    })
+}
+
 async fn drained_through(
     State(engine): State<Engine>,
     headers: HeaderMap,
     Path(source_commit_id): Path<String>,
+    Query(query): Query<GroupDrainQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_private_admin(&headers)?;
     let parsed = uuid::Uuid::parse_str(&source_commit_id).map_err(|_| AppError {
@@ -822,12 +845,19 @@ async fn drained_through(
     }
     let receipt = engine.source_drain_receipt(&source_commit_id);
     let last_receipt = engine.last_source_drain_receipt();
-    Ok(Json(serde_json::json!({
+    let group =
+        group_drain_json(&engine, query.group.as_deref(), receipt.as_ref().map(|receipt| receipt.commit_lsn.as_str()))?;
+    let drained = receipt.is_some() && (query.group.is_none() || group.as_ref().is_some_and(|group| group.drained));
+    let mut body = serde_json::json!({
         "sourceCommitId": source_commit_id,
-        "drained": receipt.is_some(),
+        "drained": drained,
         "receipt": receipt,
         "lastReceipt": last_receipt,
-    })))
+    });
+    if query.group.is_some() {
+        body["group"] = serde_json::to_value(&group).unwrap_or_default();
+    }
+    Ok(Json(body))
 }
 
 fn require_runtime_gateway(
@@ -861,6 +891,9 @@ fn require_runtime_gateway(
 struct RuntimeDrainQuery {
     user_id: String,
     generation: String,
+    /// The per-group receipt as well, as on the deployment drained-through route.
+    #[serde(default)]
+    group: Option<String>,
 }
 
 async fn runtime_drained_through(
@@ -884,13 +917,16 @@ async fn runtime_drained_through(
         });
     }
     let receipt = engine.runtime_drain_receipt(&marker)?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(serde_json::json!({
-            "sourceCommitId": source_commit_id, "drained": receipt.is_some(), "receipt": receipt,
-        })),
-    )
-        .into_response())
+    let group =
+        group_drain_json(&engine, query.group.as_deref(), receipt.as_ref().map(|receipt| receipt.commit_lsn.as_str()))?;
+    let drained = receipt.is_some() && (query.group.is_none() || group.as_ref().is_some_and(|group| group.drained));
+    let mut body = serde_json::json!({
+        "sourceCommitId": source_commit_id, "drained": drained, "receipt": receipt,
+    });
+    if query.group.is_some() {
+        body["group"] = serde_json::to_value(&group).unwrap_or_default();
+    }
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(body)).into_response())
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1166,8 +1202,8 @@ async fn subset_load(
 
 /// One-stream group form. Members still use the existing plain and subquery shape paths, while a
 /// shared stream path and one settled page snapshot make the members comparable. The group claim
-/// and member list are durable as one catalog event; the sequencer's active-group fence orders
-/// delayed subquery emissions before the next source transaction.
+/// and member list are durable as one catalog event; the group's own lane orders delayed subquery
+/// emissions before the next source transaction's output for the group.
 async fn subset_load_group(
     engine: &Engine,
     subscription: Option<String>,

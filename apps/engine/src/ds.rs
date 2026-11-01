@@ -2657,6 +2657,11 @@ mod tests {
         pub(crate) head_gate_path: std::sync::Mutex<Option<String>>,
         /// One fault at the nth matching append, consumed before it is executed.
         pub(crate) append_fault: std::sync::Mutex<Option<(String, usize, AppendFault)>>,
+        /// Hold every append and HEAD on a matching path suffix while the receiver reads `true`:
+        /// a stream that stops answering, as a fault proxy holding its requests would.
+        pub(crate) stream_hold: std::sync::Mutex<Option<(String, tokio::sync::watch::Receiver<bool>)>>,
+        /// Delay every append on a matching path suffix: a slow but healthy stream.
+        pub(crate) append_delay: std::sync::Mutex<Option<(String, std::time::Duration)>>,
         pub(crate) read_observer: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<(String, String, bool)>>>,
         pub(crate) read_gate: std::sync::Mutex<Option<(String, bool, Arc<BodyGate>)>>,
         pub(crate) appended_changed: tokio::sync::Notify,
@@ -2719,6 +2724,17 @@ mod tests {
         Unavailable,
         /// The append is atomic, but its acknowledgement is lost (an ambiguous failure).
         CommitThenUnavailable,
+    }
+
+    impl ScriptedStore {
+        async fn wait_stream_hold(&self, path: &str) {
+            let hold = self.stream_hold.lock().unwrap().clone();
+            if let Some((suffix, mut held)) = hold
+                && path.ends_with(suffix.as_str())
+            {
+                let _ = held.wait_for(|held| !*held).await;
+            }
+        }
     }
 
     impl BodyGate {
@@ -2796,6 +2812,13 @@ mod tests {
             _response_body: BodyRead,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
+                self.wait_stream_hold(path).await;
+                let delay = self.append_delay.lock().unwrap().clone();
+                if let Some((suffix, delay)) = delay
+                    && path.ends_with(suffix.as_str())
+                {
+                    tokio::time::sleep(delay).await;
+                }
                 let terminal = self.terminal_append_status.load(std::sync::atomic::Ordering::Relaxed);
                 if terminal != 0 {
                     let mut res = response(terminal);
@@ -3065,6 +3088,7 @@ mod tests {
 
         fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a> {
             Box::pin(async move {
+                self.wait_stream_hold(path).await;
                 if self.head_error {
                     return Err(anyhow::anyhow!("scripted HEAD transport failure"));
                 }

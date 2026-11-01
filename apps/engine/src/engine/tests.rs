@@ -309,7 +309,7 @@ fn test_subq() -> SubqueryHandle {
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
     let shutdown = crate::shutdown::ShutdownToken::new();
-    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
+    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), Default::default());
     spawn_flip_propagator(
         registry.clone(),
         flip_rx,
@@ -2857,8 +2857,7 @@ async fn a_subquery_shapes_live_output_carries_the_commit_time() {
     sq::insert_outer_shape(&mut reg, "s100", "issues", sq::keyed_membership_pred(100, &sig));
     let (flip_tx, _flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(PendingFlips::default());
-    let group_lanes =
-        emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), pending_flips.clone());
+    let group_lanes = emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), Default::default());
     let subq = SubqueryHandle {
         registry: Arc::new(Mutex::new(reg)),
         flip_tx,
