@@ -1063,6 +1063,7 @@ fn must_refetch_marker(path: &str, gap: &Gap) -> Envelope {
             lsn: None,
             seq: None,
             last: Some(true),
+            commit_ts: None,
         },
     }
 }
@@ -1179,6 +1180,7 @@ mod tests {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }
@@ -1277,6 +1279,32 @@ mod tests {
         let (keys, appends) = wait_appended(&store, 50).await;
         assert_eq!(keys, (0..50).map(|i| i.to_string()).collect::<Vec<_>>());
         assert!(appends <= 2, "50 queued commits took {appends} appends instead of coalescing");
+    }
+
+    #[tokio::test]
+    async fn coalesced_appends_keep_each_commits_commit_time() {
+        let (lanes, store, hold) = held_lanes(test_config());
+        let at = |key: &str, commit_ts: i64| {
+            let mut env = group_env(key);
+            env.headers.commit_ts = Some(commit_ts);
+            env
+        };
+        lanes.push(GROUP, vec![at("first", 1_793_404_800_001)], 1);
+        settle().await;
+        lanes.push(GROUP, vec![at("second", 1_793_404_800_002)], 2);
+        lanes.push(GROUP, vec![at("third", 1_793_404_800_003)], 3);
+        hold.send_replace(false);
+        wait_appended(&store, 3).await;
+        let stamps = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path.ends_with(GROUP))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+            .map(|event| event["headers"]["commit_ts"].as_i64())
+            .collect::<Vec<_>>();
+        assert_eq!(stamps, [Some(1_793_404_800_001), Some(1_793_404_800_002), Some(1_793_404_800_003)]);
     }
 
     #[tokio::test(start_paused = true)]

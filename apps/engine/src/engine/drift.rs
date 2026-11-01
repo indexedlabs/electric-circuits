@@ -849,6 +849,7 @@ mod tests {
                     seq: Some(0),
                     last: None,
                     offset: None,
+                    commit_ts: None,
                 },
             };
             let mut fence = row.clone();

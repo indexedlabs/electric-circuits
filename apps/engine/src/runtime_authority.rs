@@ -66,6 +66,7 @@ impl RuntimeFence {
                 lsn: None,
                 seq: None,
                 last: None,
+                commit_ts: None,
             },
         }
     }

@@ -1305,6 +1305,12 @@ async fn group_delayed_subquery_flip(f: &Fixture) -> Result<()> {
         let first_txid: u64 = flips[0]["headers"]["txid"].as_str().unwrap_or_default().parse().unwrap_or(0);
         let last_txid: u64 = flips.last().and_then(|event| event["headers"]["txid"].as_str()).unwrap_or_default().parse().unwrap_or(0);
         ensure!(first_txid > 0 && first_txid < last_txid, "T+1 output crossed the T fence: {events:?}");
+        // Both the deferred flip and the plain output reach the group through its lane with their
+        // commit's time (OTTO-11098).
+        ensure!(
+            flips.iter().all(|event| event["headers"]["commit_ts"].as_i64().is_some()),
+            "a group delivery lost commit_ts: {flips:?}"
+        );
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -3040,6 +3046,15 @@ async fn group_stall_holds_back_no_other_stream(f: &Fixture) -> Result<()> {
             ),
         };
         ensure!(marker["value"]["control"] == "must-refetch", "unexpected marker: {marker}");
+        ensure!(marker["headers"].get("commit_ts").is_none(), "the marker is not a commit's output: {marker}");
+        // Output delivered after the reattach still carries its commit's time (OTTO-11098).
+        let events = stream_events(f, &group_path).await;
+        let live = events
+            .iter()
+            .rev()
+            .find(|event| event["type"] != "__circuits.control")
+            .context("no live output after the marker")?;
+        ensure!(live["headers"]["commit_ts"].as_i64().is_some(), "a reattached group delivery lost commit_ts: {live}");
         ensure!(marker["value"]["groupId"] == group_path.as_str(), "marker names another group: {marker}");
         wait_group_receipt(&engine, f, fence, &group_path).await?;
         ensure!(

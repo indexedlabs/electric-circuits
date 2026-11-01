@@ -332,6 +332,7 @@ impl Run {
                 seq: Some(0),
                 last: Some(true),
                 offset: None,
+                commit_ts: None,
             },
         };
         // Match an ingestor reconnect: retry the identical committed source transaction after
@@ -615,6 +616,7 @@ fn transaction_row(seq: u64, last: bool, table: &str) -> Envelope {
             seq: Some(seq),
             last: last.then_some(true),
             offset: None,
+            commit_ts: None,
         },
     }
 }

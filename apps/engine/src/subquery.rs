@@ -15,7 +15,7 @@
 //! `on_table_delta`, added in a later step). This file (step 6) is the pure in-memory core: node
 //! maintenance + the [`SubqueryEval`] read view. No Postgres, no streams yet.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::value::{Tup2, ZWeight};
@@ -575,7 +575,16 @@ pub struct SubqueryRegistry {
     /// falls back to a direct reliable append.
     lanes: Option<crate::engine::emission::EmissionLanes>,
     group_lanes: Option<crate::engine::emission::GroupEmissionLanes>,
+    /// Postgres commit time (ms since the Unix epoch) of recent live commits, by commit LSN, so a
+    /// delivery stamps `headers.commit_ts` on the envelopes a commit caused — including a deferred
+    /// query-back's, which carries its triggering commit's LSN. The newest
+    /// [`COMMIT_TIMES_RETAINED`] commits are kept; a delivery for an older one goes unstamped,
+    /// which costs only its telemetry.
+    commit_times: BTreeMap<u64, i64>,
 }
+
+/// How many live commits' times [`SubqueryRegistry`] keeps for stamping deliveries (16 bytes each).
+const COMMIT_TIMES_RETAINED: usize = 4096;
 
 impl HeapSize for SubqueryRegistry {
     /// `circuit` (the dbsp membership relation) is accounted separately — see
@@ -601,6 +610,7 @@ impl HeapSize for SubqueryRegistry {
             + self.pending_shapes.heap_bytes()
             + self.collect_log.heap_bytes()
             + self.pg_url.heap_bytes()
+            + self.commit_times.heap_bytes()
     }
 }
 
@@ -644,6 +654,16 @@ impl SubqueryRegistry {
             schemas: Arc::new(HashMap::new()),
             lanes: None,
             group_lanes: None,
+            commit_times: BTreeMap::new(),
+        }
+    }
+
+    /// Record a live commit's time before its delta is evaluated, so every delivery it causes — now
+    /// or from a later query-back — carries `headers.commit_ts`.
+    pub(crate) fn note_commit_time(&mut self, commit_lsn: u64, commit_ts: i64) {
+        self.commit_times.insert(commit_lsn, commit_ts);
+        while self.commit_times.len() > COMMIT_TIMES_RETAINED {
+            self.commit_times.pop_first();
         }
     }
 
@@ -743,7 +763,12 @@ impl SubqueryRegistry {
     /// stream's emission lane while the caller holds this registry's lock (per-stream FIFO ⇒
     /// append order = eval order — the "data in the right place" invariant). Without lanes
     /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
-    async fn deliver(&mut self, stream_path: &str, envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
+    async fn deliver(&mut self, stream_path: &str, mut envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
+        if let Some(&commit_ts) = self.commit_times.get(&commit_lsn) {
+            for env in &mut envs {
+                env.headers.commit_ts = Some(commit_ts);
+            }
+        }
         if stream_path.starts_with("shape/group-") {
             if let Some(lanes) = &self.group_lanes {
                 lanes.push(stream_path, envs, commit_lsn);
@@ -2773,7 +2798,7 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<TableRef> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A registry with one MatchAll node registered the way `collect()` would: node map,
@@ -2785,7 +2810,7 @@ mod tests {
         reg
     }
 
-    fn insert_test_node(reg: &mut SubqueryRegistry, sig: &str) {
+    pub(crate) fn insert_test_node(reg: &mut SubqueryRegistry, sig: &str) {
         let node_id = reg.next_node_id;
         reg.next_node_id += 1;
         let mut node = SubqueryNode::new(sig.into(), "t".into(), 0, 1, Arc::new(CompiledPredicate::MatchAll), node_id);
@@ -3548,7 +3573,7 @@ mod tests {
     // only the `emitted` counter.
 
     #[derive(Clone, Default)]
-    struct DsStore(Arc<std::sync::Mutex<HashMap<String, Vec<Envelope>>>>);
+    pub(crate) struct DsStore(pub(crate) Arc<std::sync::Mutex<HashMap<String, Vec<Envelope>>>>);
 
     async fn fake_ds_handler(
         axum::extract::State(store): axum::extract::State<DsStore>,
@@ -3576,7 +3601,7 @@ mod tests {
 
     /// Boots the fake server on an ephemeral port; returns its base URL and the shared store of
     /// every envelope POSTed to it, keyed by stream path (e.g. `"shape/s1"`).
-    async fn spawn_fake_ds() -> (String, DsStore) {
+    pub(crate) async fn spawn_fake_ds() -> (String, DsStore) {
         let store = DsStore::default();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3600,7 +3625,7 @@ mod tests {
 
     /// `issues(id, project_id)`, matching the brief's example shape:
     /// `issues WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = ...)`.
-    fn issues_ts() -> TableSchema {
+    pub(crate) fn issues_ts() -> TableSchema {
         use crate::schema::TableDef;
         let def: TableDef = serde_json::from_value(serde_json::json!({
             "columns": { "id": {"type":"int"}, "project_id": {"type":"int"} },
@@ -3610,7 +3635,7 @@ mod tests {
         TableSchema::from_def(&"issues".into(), &def).unwrap()
     }
 
-    fn issue(id: i64, project_id: i64) -> Row {
+    pub(crate) fn issue(id: i64, project_id: i64) -> Row {
         Row(vec![Value::Int(id), Value::Int(project_id)])
     }
 
@@ -3628,7 +3653,12 @@ mod tests {
     /// Register an outer shape with an arbitrary predicate through the SAME installation path
     /// production uses (`install_shape`), so the necessary-conjunct index is populated exactly as
     /// `finish_create` would populate it.
-    fn insert_outer_shape(reg: &mut SubqueryRegistry, shape_id: &str, outer_table: &str, pred: CompiledPredicate) {
+    pub(crate) fn insert_outer_shape(
+        reg: &mut SubqueryRegistry,
+        shape_id: &str,
+        outer_table: &str,
+        pred: CompiledPredicate,
+    ) {
         let feed_id = reg.next_feed_id;
         reg.next_feed_id += 1;
         reg.install_shape(SubqueryShape {
@@ -3648,7 +3678,7 @@ mod tests {
     /// A realistic LinearLite-style outer predicate: `project_id = k AND project_id IN (SELECT …)`.
     /// `access_leaf` lifts the equality as the necessary conjunct; the `IN` leaf is not row-local
     /// and can never be one.
-    fn keyed_membership_pred(project_id: i64, sig: &SubquerySig) -> CompiledPredicate {
+    pub(crate) fn keyed_membership_pred(project_id: i64, sig: &SubquerySig) -> CompiledPredicate {
         CompiledPredicate::And(vec![
             CompiledPredicate::Cmp { col: 1, op: crate::predicate::LeafOp::Eq, value: Value::Int(project_id) },
             CompiledPredicate::InSubquery { col: 1, sig: sig.clone(), negated: false },
@@ -3698,6 +3728,57 @@ mod tests {
             "the move-out delete must still be emitted after the index skips non-candidates"
         );
         assert_eq!(ops_for(&store, "shape/s200"), vec!["upsert"], "and the move-in upsert lands");
+    }
+
+    /// A subquery shape's live emission carries the commit time of the commit that caused it
+    /// (`headers.commit_ts`), looked up by commit LSN; a commit the registry no longer remembers
+    /// (or never had a time for) delivers unstamped rather than with another commit's time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivery_carries_its_commits_time() {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        insert_outer_shape(&mut reg, "s100", "issues", keyed_membership_pred(100, &sig));
+        let commit_ts_for = |path: &str| -> Vec<Option<i64>> {
+            store
+                .0
+                .lock()
+                .unwrap()
+                .get(path)
+                .map(|v| v.iter().map(|e| e.headers.commit_ts).collect())
+                .unwrap_or_default()
+        };
+
+        reg.note_commit_time(0x10, 1_793_404_800_123);
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 0x10, None, None, None).await.unwrap();
+        assert_eq!(commit_ts_for("shape/s100"), vec![Some(1_793_404_800_123)]);
+
+        // Commit 0x20 has no recorded time (an older change log, or it was evicted).
+        reg.on_table_delta(&ts, &[Tup2(issue(2, 100), 1)], 0x20, None, None, None).await.unwrap();
+        assert_eq!(commit_ts_for("shape/s100"), vec![Some(1_793_404_800_123), None]);
+
+        // A deferred query-back delivers under the LSN of the commit that triggered it.
+        reg.note_commit_time(0x30, 1_793_404_800_456);
+        let gate = crate::pg::SnapshotGate::passthrough();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s100".to_string(), vec![(issue(3, 100), true)])],
+            None,
+            EmissionSource::QueryBack { gate: &gate, commit_lsn: 0x30 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(commit_ts_for("shape/s100"), vec![Some(1_793_404_800_123), None, Some(1_793_404_800_456)]);
+
+        // Only the newest COMMIT_TIMES_RETAINED commits are kept.
+        for lsn in 0..=COMMIT_TIMES_RETAINED as u64 {
+            reg.note_commit_time(0x100 + lsn, 1);
+        }
+        assert_eq!(reg.commit_times.len(), COMMIT_TIMES_RETAINED);
+        assert!(!reg.commit_times.contains_key(&0x10), "the oldest commit is evicted first");
     }
 
     /// bead dbsp-ds-g5p, regression 2/2 — per-change cost is `O(candidates)`, not
