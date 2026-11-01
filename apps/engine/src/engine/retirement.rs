@@ -94,10 +94,13 @@ impl RetirementCompletion {
     }
 }
 
-/// The one retirement of a group's shared stream, which every member's purge waits on: a member's
-/// [`crate::engine::PurgeBarrier`] completes only once this settles, exactly as an owned stream's
-/// does once its own retirement lands. Settled by [`Engine::retire_group_stream`]; dropped
-/// unsettled (the teardown task was cancelled), it fails its waiters rather than stranding them.
+/// The one retirement attempt on a group's shared stream, which every member's purge waits on: a
+/// member's [`crate::engine::PurgeBarrier`] completes once the group has tried the delete (landed or
+/// queued), exactly as an owned stream's durable purge completes after its own first attempt.
+/// Waiting for a queued delete to land would let an ordinary drift that meets the barrier stall
+/// ingest for a whole storage outage (ADR-0007). Settled by [`Engine::retire_group_stream`];
+/// dropped unsettled (the teardown task was cancelled), it fails its waiters rather than stranding
+/// them.
 pub(crate) struct SharedRetirement {
     completion: Option<Arc<RetirementCompletion>>,
 }
@@ -163,13 +166,8 @@ impl RetirementQueue {
     }
 
     /// Hand a stream shared by several shapes to the queue: one retirement, completing each.
-    pub(crate) fn enqueue_shared(
-        &self,
-        stream_path: &str,
-        shape_ids: &[String],
-        completion: Option<Arc<RetirementCompletion>>,
-    ) {
-        self.push(stream_path, shape_ids.to_vec(), completion);
+    pub(crate) fn enqueue_shared(&self, stream_path: &str, shape_ids: &[String]) {
+        self.push(stream_path, shape_ids.to_vec(), None);
     }
 
     pub(crate) fn enqueue_with_completion(
@@ -358,8 +356,8 @@ impl Engine {
     /// member's retirement (ADR-0007) when storage accepts the delete. Callers have made each
     /// member's `Dropped` durable first, so a storage failure is queued rather than reported: the
     /// queue retries it until it lands, and a restart before then finds the members' `Dropped`
-    /// records and retires the stream again. `shared` settles when the delete lands, inline or
-    /// from the queue, which is when the members' purge barriers complete.
+    /// records and retires the stream again. `shared` settles once the delete has been tried,
+    /// landed or queued, which is when the members' purge barriers complete.
     pub(crate) async fn retire_group_stream(
         &self,
         stream_path: &str,
@@ -376,7 +374,8 @@ impl Engine {
             }
             Err(error) => {
                 tracing::warn!(%error, %stream_path, members = members.len(), "group stream retirement failed; queued");
-                self.retirements.enqueue_shared(stream_path, members, Some(completion));
+                self.retirements.enqueue_shared(stream_path, members);
+                completion.complete();
             }
         }
     }
@@ -391,6 +390,21 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::catalog::testing::FakeDs;
+
+    /// A group teardown cancelled before its retirement attempt releases the members' barriers as
+    /// failed instead of stranding them.
+    #[tokio::test]
+    async fn an_unsettled_shared_retirement_fails_its_waiters_when_dropped() {
+        let shared = SharedRetirement::new();
+        let (first, second) = (shared.settled(), shared.settled());
+        drop(shared);
+        for waiter in [first, second] {
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(1), waiter.wait())
+                .await
+                .expect("a dropped shared retirement must release its waiters");
+            assert!(settled.is_err(), "an unattempted retirement is not reported as settled");
+        }
+    }
 
     #[test]
     fn the_retirement_schedule_climbs_to_five_seconds_and_stays() {

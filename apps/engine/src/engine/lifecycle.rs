@@ -1358,8 +1358,9 @@ impl Engine {
                     StreamRetirement::Owned => None,
                 };
                 let _ = engine.finish_purge(&owned, removed, false, None, stream).await;
-                // A group member's stream is retired by its group: the barrier stays open until
-                // that one retirement lands, as an owned stream's stays open over its own.
+                // A group member's stream is retired by its group: the barrier stays open until the
+                // group has tried that one delete (landed or queued), as an owned stream's durable
+                // purge stays open over its own first attempt.
                 if let Some(settled) = shared
                     && settled.wait().await.is_err()
                 {
@@ -2830,7 +2831,7 @@ enum StreamRetirement {
     /// after every member's `Dropped` is durable, and completes each member's retirement then.
     /// A member retiring it too sends storage one DELETE per member, which durable-streams answers
     /// with `503 stream retirement in progress` for all but the first. Carries what the member's
-    /// purge barrier waits on: that one retirement settling.
+    /// purge barrier waits on: the group's one attempt at that delete, landed or queued.
     Group(Arc<crate::engine::retirement::RetirementCompletion>),
 }
 
@@ -5308,9 +5309,8 @@ mod subscription_tests {
         engine.close(std::time::Duration::from_secs(1)).await;
     }
 
-    /// A group member's purge barrier stays open until the group's one retirement of the shared
-    /// stream lands, as an owned stream's does over its own: drift's ingest-columns witness waits
-    /// on these barriers for completed dependent retirements (ADR-0012).
+    /// A group member's purge barrier stays open while the group's one delete of the shared stream
+    /// is in flight, as an owned stream's durable purge does over its own first attempt.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_group_members_purge_barrier_waits_for_the_shared_retirement() {
         let server = FakeDs::start().await;
@@ -5343,6 +5343,29 @@ mod subscription_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(server.deletes_of(&group.stream_path), 1);
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    /// Drift over several members of one group must not wait for a refused shared DELETE to land:
+    /// the drift callback is awaited by the ingestor, so waiting on the retry queue would stall
+    /// replication for as long as storage refuses (ADR-0007: ordinary drift queues the failure and
+    /// keeps ingest moving).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drift_over_a_groups_members_does_not_wait_for_a_queued_shared_retirement() {
+        let server = FakeDs::start().await;
+        server.fail_deletes(1_000);
+        let (engine, group) =
+            engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 2, true).await;
+        let table = crate::table_ref::TableRef::parse("items_0").unwrap();
+        for rec in engine.state.lock().await.shapes.values_mut() {
+            rec.table = table.clone();
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), engine.force_retire_dependents(&table))
+            .await
+            .expect("drift over a group's members waited for the retirement queue");
+        assert!(engine.group_record(&group.subscription).await.is_none(), "the group is released");
+        assert!(engine.pending_retirements() >= 1, "the refused DELETE is owned by the retry queue");
         engine.close(std::time::Duration::from_secs(1)).await;
     }
 }
