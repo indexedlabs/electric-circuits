@@ -1502,10 +1502,11 @@ pub(crate) async fn activate_shape(
             {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
                 let mut drained = outs.into_iter();
-                for (commit_lsn, range) in by_commit {
-                    let envs: Vec<Envelope> = drained.by_ref().take(range.len()).collect();
-                    lanes.push(&p.stream_path, envs, commit_lsn);
-                }
+                let batches = by_commit
+                    .into_iter()
+                    .map(|(commit_lsn, range)| (commit_lsn, drained.by_ref().take(range.len()).collect()))
+                    .collect();
+                lanes.push_drain(&p.stream_path, batches);
             } else if !outs.is_empty() {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
                 ds.append_reliable(&p.stream_path, &outs)
@@ -2836,6 +2837,83 @@ mod pending_buffer_tests {
             !buffer_pending(&mut pending_shape, &envelope(101, 1), cap),
             "an overflowed buffer stays overflowed; it cannot half-recover"
         );
+    }
+
+    /// OTTO-11131: a group member's activation drain goes to the group's lane, so a group stream
+    /// that stops answering while a member is created never holds the sequencer, and a drain
+    /// larger than the lane's byte cap queues whole instead of detaching the new group.
+    #[tokio::test]
+    async fn a_group_members_activation_drain_goes_to_its_lane_without_tripping_the_byte_cap() {
+        let ts = users();
+        let path = "shape/group-9";
+        let buffered: Vec<Envelope> = (1..=20u64)
+            .map(|key| {
+                let mut env = envelope(key, 1024);
+                env.headers.lsn = Some(format!("0/{key:X}"));
+                env
+            })
+            .collect();
+        let mut exec = TableExec::new(ts.clone());
+        let mut member = pending(&ts, buffered);
+        member.stream_path = path.to_string();
+        exec.pending.insert("s1".to_string(), member);
+        let mut execs = HashMap::from([(ts.table.to_string(), exec)]);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (hold, held) = tokio::sync::watch::channel(true);
+        *store.stream_hold.lock().unwrap() = Some((path.into(), held));
+        let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        let config = crate::engine::emission::GroupLaneConfig { memory_bytes: 4096, ..Default::default() };
+        let lanes =
+            crate::engine::emission::GroupEmissionLanes::new(ds.clone(), crate::shutdown::ShutdownToken::new(), config);
+        lanes.register(path);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            activate_shape(
+                &ds,
+                &mut execs,
+                &ts.table,
+                "s1",
+                crate::pg::SnapshotGate::passthrough(),
+                None,
+                0,
+                &mut HashMap::new(),
+                &crate::shutdown::ShutdownToken::new(),
+                Some(&lanes),
+            ),
+        )
+        .await
+        .expect("a held group stream held the activation")
+        .unwrap();
+        assert_eq!(ds.metrics().group_detaches.load(Ordering::Relaxed), 0, "the activation drain tripped the byte cap");
+        hold.send_replace(false);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let landed: usize = store
+                    .appended
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(p, _, _)| p.ends_with(path))
+                    .map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap().len())
+                    .sum();
+                if landed == 20 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the activation drain did not land");
+        let keys: Vec<String> = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| p.ends_with(path))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+            .map(|env| env.key)
+            .collect();
+        assert_eq!(keys, (1..=20).map(|key| key.to_string()).collect::<Vec<_>>());
     }
 
     /// A change that committed while the shape was being created is drained from its buffer at

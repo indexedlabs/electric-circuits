@@ -1736,6 +1736,9 @@ impl Engine {
             // contributor state is not persisted; its group is dropped as one unit and the
             // client recreates the scope.
             let now = crate::changelog::now_secs();
+            if let Some((lsn, _)) = start_highwater {
+                self.group_lanes.note_restored_highwater(lsn);
+            }
             for (subscription, group) in groups {
                 let restorable = group
                     .members

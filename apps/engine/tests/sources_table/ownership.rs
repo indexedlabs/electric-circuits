@@ -3123,6 +3123,9 @@ async fn group_restart_restores_a_behind_group_detached(f: &Fixture) -> Result<(
         f.ds.hold_group_stream.send_replace(false);
         let (restarted, _restarted_app) =
             tokio::time::timeout(Duration::from_secs(30), group_engine(f)).await.context("restart timed out")??;
+        // Before any new write: a pre-restart commit whose group output landed is still drained.
+        let early = restarted.group_drain_receipt(&fence.to_string(), &drained_path).context("restored receipt")?;
+        ensure!(early.drained && !early.must_refetch, "a landed pre-restart commit is not drained: {early:?}");
         let after = tokio::time::timeout(Duration::from_secs(20), async {
             let mut id = 401;
             loop {

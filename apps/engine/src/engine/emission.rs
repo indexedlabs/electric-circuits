@@ -594,6 +594,22 @@ impl GroupEmissionLanes {
         lane.push(envs, commit_lsn);
     }
 
+    /// Queue a group member's activation drain: the changes that committed while the member was
+    /// being created, by commit. They are bounded by the pending buffer's own cap and arrive in one
+    /// burst before the lane's writer can run, so they are queued outside the byte cap; a lane
+    /// that then cannot deliver them still detaches at its stall cap.
+    pub(crate) fn push_drain(&self, path: &str, batches: Vec<(u64, Vec<Envelope>)>) {
+        let Some(lane) = self.existing_lane(path) else { return };
+        lane.push_uncapped(batches);
+    }
+
+    /// The restored checkpoint's highwater: every commit at or before it was sequenced by an
+    /// earlier process, and its group output has either landed or been recorded as a resume point
+    /// and restored detached, so a per-group receipt for it need not wait for a new commit.
+    pub(crate) fn note_restored_highwater(&self, commit_lsn: u64) {
+        self.shared.progress.lsn.fetch_max(commit_lsn, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn remove(&self, path: &str) {
         let lane = self.lanes.lock().unwrap().remove(path);
         if let Some(lane) = lane {
@@ -728,6 +744,33 @@ impl GroupLane {
             drop(state);
             self.worker_wake.notify_one();
         }
+    }
+
+    fn push_uncapped(&self, batches: Vec<(u64, Vec<Envelope>)>) {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        for (commit_lsn, envs) in batches {
+            if envs.is_empty() {
+                continue;
+            }
+            if let Phase::Detached(gap) = &mut state.phase {
+                gap.widen(commit_lsn);
+                gap.dropped_batches += 1;
+                continue;
+            }
+            let bytes: u64 = envs.iter().map(crate::ds::envelope_memory_bytes).sum();
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            state.queued.insert((commit_lsn, seq), Queued { envs, bytes });
+            state.queued_bytes += bytes;
+            state.peak_batches = state.peak_batches.max(state.queued.len() as u64);
+            state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
+            self.backlog_changed(bytes as i64, 1);
+        }
+        drop(state);
+        self.worker_wake.notify_one();
     }
 
     fn backlog_changed(&self, bytes: i64, batches: i64) {
@@ -1004,19 +1047,22 @@ impl GroupLane {
             *armed = [true; 2];
             return;
         }
-        let crossed = if fraction >= 0.9 && armed[1] {
+        let mut crossed = Vec::new();
+        if fraction >= 0.5 && armed[0] {
             armed[0] = false;
+            crossed.push(0.5);
+        }
+        if fraction >= 0.9 && armed[1] {
             armed[1] = false;
-            0.9
-        } else if fraction >= 0.5 && armed[0] {
-            armed[0] = false;
-            0.5
-        } else {
+            crossed.push(0.9);
+        }
+        if crossed.is_empty() {
             return;
-        };
+        }
         let progress = self.shared.progress.lsn.load(std::sync::atomic::Ordering::Relaxed);
         let oldest = state.oldest_outstanding();
-        tracing::warn!(
+        for crossed in crossed {
+            tracing::warn!(
             event = "group_backlog_threshold",
             group_id = %self.path,
             subscription = %state.meta.subscription,
@@ -1031,7 +1077,8 @@ impl GroupLane {
             lag_commits = state.lag_commits(),
             lag_lsn_bytes = oldest.map_or(0, |oldest| progress.saturating_sub(oldest)),
             "group lane is approaching a detach cap"
-        );
+            );
+        }
     }
 
     fn high_water(&self, state: &GroupLaneState, ended_by: &str) {
