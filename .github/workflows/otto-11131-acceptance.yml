@@ -1,0 +1,165 @@
+name: OTTO-11131 acceptance
+
+on:
+  push:
+    branches: ['proto/otto-11131-acceptance']
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      scenarios: ${{ steps.plan.outputs.scenarios }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        shell: bash
+        run: |
+          source prototype/run.env
+          echo "scenarios=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1].split(",")))' "$SCENARIOS")" >> "$GITHUB_OUTPUT"
+
+  experiment:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.plan.outputs.scenarios) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read experiment selection
+        id: config
+        shell: bash
+        run: |
+          set -euo pipefail
+          source prototype/run.env
+          echo "engine_ref=$ENGINE_REF" >> "$GITHUB_OUTPUT"
+          echo "scenarios=$SCENARIOS" >> "$GITHUB_OUTPUT"
+          echo "rate=$RATE" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve harness and check engine ref
+        shell: bash
+        env:
+          ENGINE_REF: ${{ steps.config.outputs.engine_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "$ENGINE_REF"
+          mkdir /tmp/otto-baseline
+          git archive "$ENGINE_REF" | tar -x -C /tmp/otto-baseline
+          rsync -a --delete \
+            --exclude harness \
+            --exclude prototype \
+            --exclude .github/workflows/otto-11131-acceptance.yml \
+            /tmp/otto-baseline/ ./
+
+      - name: Apply measurement instrumentation
+        shell: bash
+        env:
+          ENGINE_REF: ${{ steps.config.outputs.engine_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p harness/otto-10992/results
+          # A variant may carry its own adaptation of the same observation-only patch.
+          patch=harness/otto-10992/measurement.patch
+          [ -f "harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch" ] && patch="harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch"
+          # Spike branches carry the same patch as their first commit on main.
+          if [ -f "harness/otto-10992/measurement-${ENGINE_REF:0:7}.patch" ]; then
+            git apply "$patch"
+          elif grep -q 'group_lane_backlog:' apps/engine/src/metrics.rs; then
+            patch="already applied in $ENGINE_REF"
+          else
+            git apply "$patch"
+          fi
+          printf '%s\n' "$patch" > harness/otto-10992/results/measurement-patch.txt
+
+      - name: Start PostgreSQL and Durable Streams
+        env:
+          DS_MEMORY: ''
+        run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d postgres ds
+
+      - name: Bind engine to the real DS store identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p harness/otto-10992/results
+          set +e
+          curl -sS --retry 60 --retry-all-errors --retry-delay 2 \
+            -D harness/otto-10992/results/ds-readiness.headers \
+            http://127.0.0.1:8791/_admin/ready \
+            -o harness/otto-10992/results/ds-readiness.body
+          ready_rc=$?
+          set -e
+          test -f harness/otto-10992/results/ds-readiness.body || : > harness/otto-10992/results/ds-readiness.body
+          printf '{"endpoint":"/_admin/ready","curl_exit":%s,"body":' "$ready_rc" \
+            > harness/otto-10992/results/ds-readiness.json
+          python3 - <<'PY' >> harness/otto-10992/results/ds-readiness.json
+          import json
+          from pathlib import Path
+          body = Path('harness/otto-10992/results/ds-readiness.body').read_text()
+          try:
+              print(json.dumps(json.loads(body), separators=(',', ':')) + '}')
+          except json.JSONDecodeError:
+              print(json.dumps(body) + '}')
+          PY
+          cat >> "$GITHUB_ENV" <<'EOF'
+          ELECTRIC_CIRCUITS_DS_NAMESPACE=otto-10992
+          ELECTRIC_CIRCUITS_DS_STORE_ID=2bc96d0b-9740-4f50-97c6-754b2b27d6b0
+          ELECTRIC_CIRCUITS_DS_STORE_GENERATION=ff8b5fa6-e786-4994-8da0-f14e9e79f318
+          ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION=1
+          ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION=1
+          ELECTRIC_CIRCUITS_DS_DURABILITY_MODE=wal
+          ELECTRIC_CIRCUITS_DS_WAL_SHARDS=2
+          ELECTRIC_CIRCUITS_DS_STREAM_LANES=1
+          ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID=253f14d5-cbee-4df8-9e3c-e44c6e41501b
+          ELECTRIC_CIRCUITS_QUERY_GENERATION=otto-10992
+          ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE=1
+          EOF
+
+      - name: Seed schema
+        run: |
+          for i in $(seq 1 90); do docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml exec -T postgres pg_isready -U postgres -d electric && break; sleep 2; done
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml exec -T postgres psql -U postgres -d electric < harness/otto-10992/schema.sql
+
+      - name: Build and start engine, proxy and API
+        run: docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml up -d --build ds-proxy engine api
+
+      - name: Link workspace clients for measurement readers
+        run: |
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml exec -T api sh -eu -c '
+            mkdir -p /repo/node_modules/@electric-circuits
+            ln -sfn /repo/packages/client /repo/node_modules/@electric-circuits/client
+            ln -sfn /repo/packages/protocol /repo/node_modules/@electric-circuits/protocol
+            ln -sfn /repo/apps/api /repo/node_modules/@electric-circuits/api
+          '
+
+      - name: Run scenario
+        env:
+          SCENARIO: ${{ matrix.scenario }}
+          RATE: ${{ steps.config.outputs.rate }}
+          ENGINE_REF: ${{ steps.config.outputs.engine_ref }}
+          OUT_DIR: ${{ github.workspace }}/harness/otto-10992/results
+        run: |
+          set -euo pipefail
+          bash ./prototype/experiment.sh
+          python3 prototype/summarize.py "$OUT_DIR"
+
+      - name: Capture stack diagnostics
+        if: always()
+        run: |
+          mkdir -p harness/otto-10992/results/diagnostics
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml ps > harness/otto-10992/results/diagnostics/compose-ps.txt || true
+          docker compose -f docker/compose.yaml -f harness/otto-10992/compose.yaml logs --no-color engine ds-proxy ds postgres > harness/otto-10992/results/diagnostics/compose.log || true
+
+      - name: Upload raw time series and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: otto-11131-${{ github.sha }}-${{ strategy.job-index }}
+          path: |
+            harness/otto-10992/results
+            docker/compose*.log
+          if-no-files-found: warn
+          retention-days: 30
