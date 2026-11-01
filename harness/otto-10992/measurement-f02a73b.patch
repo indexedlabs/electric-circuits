@@ -1,8 +1,8 @@
 diff --git a/apps/engine/src/engine/mod.rs b/apps/engine/src/engine/mod.rs
-index f4f7d5d..bcfb752 100644
+index 4f4e3cf..0271a66 100644
 --- a/apps/engine/src/engine/mod.rs
 +++ b/apps/engine/src/engine/mod.rs
-@@ -1028,9 +1028,20 @@ impl FlipWork {
+@@ -1029,9 +1029,20 @@ impl FlipWork {
  #[derive(Default)]
  pub(crate) struct PendingFlips {
      state: std::sync::Mutex<(i64, BTreeMap<u64, usize>)>,
@@ -23,7 +23,7 @@ index f4f7d5d..bcfb752 100644
      fn add(&self, commit_lsn: u64) {
          self.add_all(std::iter::once(commit_lsn));
      }
-@@ -1043,6 +1054,9 @@ impl PendingFlips {
+@@ -1044,6 +1055,9 @@ impl PendingFlips {
              state.0 += 1;
              *state.1.entry(commit_lsn).or_default() += 1;
          }
@@ -33,7 +33,7 @@ index f4f7d5d..bcfb752 100644
      }
  
      fn complete(&self, commit_lsn: u64) {
-@@ -1053,6 +1067,9 @@ impl PendingFlips {
+@@ -1054,6 +1068,9 @@ impl PendingFlips {
              state.1.remove(&commit_lsn);
          }
          state.0 -= 1;
@@ -43,7 +43,7 @@ index f4f7d5d..bcfb752 100644
      }
  
      fn count(&self) -> i64 {
-@@ -1748,6 +1765,7 @@ impl Engine {
+@@ -1749,6 +1766,7 @@ impl Engine {
          let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
          let (flip_tx, flip_rx) = mpsc::unbounded_channel();
          let pending_flips = Arc::new(PendingFlips::default());
@@ -52,7 +52,7 @@ index f4f7d5d..bcfb752 100644
          let group_lanes =
              emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), emission::GroupLaneConfig::from_env());
 diff --git a/apps/engine/src/engine/sequencer.rs b/apps/engine/src/engine/sequencer.rs
-index 9d617e4..fcaafff 100644
+index 8d89d00..512f13e 100644
 --- a/apps/engine/src/engine/sequencer.rs
 +++ b/apps/engine/src/engine/sequencer.rs
 @@ -467,6 +467,7 @@ pub(crate) async fn sequencer_loop(
@@ -72,7 +72,7 @@ index 9d617e4..fcaafff 100644
      // The highwater the last checkpoint carried. While a transaction is HELD the position is
      // pinned, so the position alone stops changing — but transactions completed before the hold
      // keep advancing the highwater, and that progress has to reach the catalog or a crash
-@@ -1036,7 +1039,9 @@ pub(crate) async fn sequencer_loop(
+@@ -1044,7 +1047,9 @@ pub(crate) async fn sequencer_loop(
                      // re-read the whole incomplete transaction, and `processed` is also what
                      // `GET /tables/{name}/offset` and the segment-deletion floor read.
                      if next.is_some() {
@@ -83,7 +83,7 @@ index 9d617e4..fcaafff 100644
                      }
                      // The segment ended (ADR-0006). Cross only once a read of it comes back EMPTY
                      // (or stops advancing): "closed" can arrive alongside a page of data, and
-@@ -1051,7 +1056,9 @@ pub(crate) async fn sequencer_loop(
+@@ -1059,7 +1064,9 @@ pub(crate) async fn sequencer_loop(
                              Some(n) => {
                                  tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
                                  pos = LogPosition::start_of(n);
@@ -94,7 +94,7 @@ index 9d617e4..fcaafff 100644
                                  crossed = true;
                              }
                              None => {
-@@ -1069,7 +1076,9 @@ pub(crate) async fn sequencer_loop(
+@@ -1077,7 +1084,9 @@ pub(crate) async fn sequencer_loop(
                                              segment_path(n)
                                          );
                                          pos = LogPosition::start_of(n);
@@ -105,9 +105,9 @@ index 9d617e4..fcaafff 100644
                                          crossed = true;
                                      }
                                      Err(e) if e.is::<crate::changelog::MissingSuccessor>() => {
-@@ -1103,6 +1112,7 @@ pub(crate) async fn sequencer_loop(
-                         ckpt_pos = ckpt.clone();
+@@ -1118,6 +1127,7 @@ pub(crate) async fn sequencer_loop(
                          ckpt_hw = highwater;
+                         ckpt_groups = groups.clone();
                          last_ckpt = std::time::Instant::now();
 +                        metrics.set_sequencer_checkpoint(ckpt_pos.segment, &ckpt_pos.offset);
                          // The de-duplication highwater rides WITH the position (ADR-0003): a crash
