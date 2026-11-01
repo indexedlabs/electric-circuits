@@ -31,9 +31,9 @@ pub(crate) fn retire_backoff(attempt: u32) -> std::time::Duration {
 /// One outstanding retirement.
 struct Retirement {
     stream_path: String,
-    /// The shape whose `Dropped` this completes, if any — a change-log segment or a rolled-back
-    /// create's stream has no record to close out.
-    shape_id: Option<String>,
+    /// The shapes whose `Dropped` this completes: one for a shape's own stream, every member for a
+    /// group's shared stream, none for a change-log segment or a rolled-back create's stream.
+    shape_ids: Vec<String>,
     attempt: u32,
     completion: Option<Arc<RetirementCompletion>>,
 }
@@ -135,20 +135,24 @@ impl RetirementQueue {
         self.enqueue_with_completion(stream_path, shape_id, None);
     }
 
+    /// Hand a stream shared by several shapes to the queue: one retirement, completing each.
+    pub(crate) fn enqueue_shared(&self, stream_path: &str, shape_ids: &[String]) {
+        self.push(stream_path, shape_ids.to_vec(), None);
+    }
+
     pub(crate) fn enqueue_with_completion(
         &self,
         stream_path: &str,
         shape_id: Option<&str>,
         completion: Option<Arc<RetirementCompletion>>,
     ) {
+        self.push(stream_path, shape_id.map(str::to_string).into_iter().collect(), completion);
+    }
+
+    fn push(&self, stream_path: &str, shape_ids: Vec<String>, completion: Option<Arc<RetirementCompletion>>) {
         self.pending.fetch_add(1, Ordering::SeqCst);
         self.metrics.retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
-        let item = Retirement {
-            stream_path: stream_path.to_string(),
-            shape_id: shape_id.map(str::to_string),
-            attempt: 0,
-            completion,
-        };
+        let item = Retirement { stream_path: stream_path.to_string(), shape_ids, attempt: 0, completion };
         if self.tx.send(item).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             // Republish: the gauge is written from the counter, so an un-mirrored decrement would
@@ -213,9 +217,10 @@ pub(crate) fn spawn_retirement_queue(
                 Ok(()) => {
                     // Only now: `Retired` means "storage accepted the delete", and the whole point
                     // of the record is that it can be trusted at the next boot.
-                    if let Some(id) = &item.shape_id {
-                        let retired = CatalogEvent::Retired { id: id.clone() };
-                        if item.completion.as_ref().is_some_and(|completion| completion.durable) {
+                    let durable = item.completion.as_ref().is_some_and(|completion| completion.durable);
+                    for id in std::mem::take(&mut item.shape_ids) {
+                        let retired = CatalogEvent::Retired { id };
+                        if durable {
                             if let Err(error) = catalog_tx.send_durable(retired).await {
                                 tracing::error!(error = %error, "retirement completion could not reach the catalog");
                                 abandon_retirements(shutdown.metrics(), Some(item), &mut queue, &mut rx, &counter);
@@ -225,9 +230,10 @@ pub(crate) fn spawn_retirement_queue(
                             catalog_tx.send(retired);
                         }
                     }
-                    if item.attempt > 0 {
-                        tracing::info!("retired stream {} after {} retr(ies)", item.stream_path, item.attempt);
-                    }
+                    // Every queued retirement says when it lands, first attempt included: each one
+                    // was announced with a `queued` warning, and a queued stream with no matching
+                    // line cannot be told apart from one that leaked.
+                    tracing::info!("retired stream {} from the queue after {} retr(ies)", item.stream_path, item.attempt);
                     counter.fetch_sub(1, Ordering::SeqCst);
                     shutdown.metrics()
                         .retirements_pending
@@ -312,6 +318,25 @@ impl Engine {
             Err(e) => {
                 tracing::warn!("retiring stream {stream_path} for shape {id} failed ({e:#}); queued and awaited");
                 self.retirements.enqueue_with_completion(stream_path, Some(id), Some(completion));
+            }
+        }
+    }
+
+    /// Retire a group's shared stream once, for every member that wrote it, and complete each
+    /// member's retirement (ADR-0007) when storage accepts the delete. Callers have made each
+    /// member's `Dropped` durable first, so a storage failure is queued rather than reported: the
+    /// queue retries it until it lands, and a restart before then finds the members' `Dropped`
+    /// records and retires the stream again.
+    pub(crate) async fn retire_group_stream(&self, stream_path: &str, members: &[String]) {
+        match self.ds.retire_stream(stream_path).await {
+            Ok(()) => {
+                for id in members {
+                    self.catalog_tx.send(CatalogEvent::Retired { id: id.clone() });
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, %stream_path, members = members.len(), "group stream retirement failed; queued");
+                self.retirements.enqueue_shared(stream_path, members);
             }
         }
     }
