@@ -644,11 +644,14 @@ canvas update, screenshot.
   which is also the orphan-`shape/*` GC, bounded by the catalog because durable-streams has no list
   API. `GET /shapes/{id}` is 404 from the moment the record goes, pending retirement or not. If you
   add a retirement site, write `Dropped` first and go through `Engine::retire_shape_stream`. The one
-  exception is a group's shared stream, which every member writes: group teardown purges each member
-  with `StreamRetirement::Group` (its `Dropped`, no delete) and then `Engine::retire_group_stream`
-  retires the stream **once**, recording every member's `Retired`. A member that deleted it too would
-  race the others, and durable-streams refuses a concurrent DELETE with `503 stream retirement in
-  progress`.
+  exception is a group's shared stream, which every member writes: group teardown
+  (`release_group_claim_owned`, `cleanup_group_reservation`) purges each member with
+  `StreamRetirement::Group` (its `Dropped`, no delete) and then `Engine::retire_group_stream` retires
+  the stream **once**, recording every member's `Retired`. Concurrent per-member deletes would race,
+  and durable-streams refuses a concurrent DELETE with `503 stream retirement in progress`. Not yet
+  covered: drift, `TRUNCATE` and the epoch reset purge the first member they reach through
+  `purge_shape` (`Owned`), which deletes the group stream before the group's release deletes it again
+  — sequential, so no 503, but before the other members' `Dropped` (OTTO-11268).
 - **A shape id is never re-minted, and the surviving records are not the high-water mark.** The boot
   resumes `next_shape_id` past the maximum id of every `Created` the catalog fold saw, dropped ones
   included (`CatalogFold::max_shape_id`), before the `is_empty()` early return and in `Park` alike. A
