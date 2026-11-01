@@ -1751,13 +1751,16 @@ impl Engine {
                             })
                     });
                 if restorable && lease_live {
+                    let meta = crate::engine::emission::GroupMeta::of(&group);
                     match group_resume.get(&group.stream_path) {
                         // The checkpoint passed commits this group had not delivered: it starts
                         // detached at its durable resume point and reattaches behind a marker.
-                        Some(resume_lsn) => self.group_lanes.register_detached(&group.stream_path, *resume_lsn),
-                        None => self.group_lanes.register(&group.stream_path),
+                        Some(resume_lsn) => self.group_lanes.register_detached(&group.stream_path, *resume_lsn, meta),
+                        None => {
+                            self.group_lanes.register(&group.stream_path);
+                            self.group_lanes.set_meta(&group.stream_path, meta);
+                        }
                     }
-                    self.group_lanes.set_meta(&group.stream_path, crate::engine::emission::GroupMeta::of(&group));
                     st.group_claims.complete(group);
                 } else {
                     tracing::info!(

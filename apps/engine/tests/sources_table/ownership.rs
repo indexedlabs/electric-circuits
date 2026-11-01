@@ -86,6 +86,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupReconnectBurst => group_reconnect_burst(&fixture).await,
             Case::GroupAdmission => group_admission_gate(&fixture).await,
             Case::GroupStall => group_stall_holds_back_no_other_stream(&fixture).await,
+            Case::GroupRestartBehind => group_restart_restores_a_behind_group_detached(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -130,6 +131,7 @@ enum Case {
     GroupReconnectBurst,
     GroupAdmission,
     GroupStall,
+    GroupRestartBehind,
 }
 
 #[test]
@@ -331,6 +333,15 @@ fn group_admission_does_not_block_other_loads_or_plain_shapes() -> Result<()> {
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
 fn group_stall_holds_back_no_other_stream_and_the_group_resumes() -> Result<()> {
     isolated("ownership::group_stall_holds_back_no_other_stream_and_the_group_resumes", Case::GroupStall)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_restart_restores_a_behind_group_detached_and_a_drained_one_attached() -> Result<()> {
+    isolated(
+        "ownership::group_restart_restores_a_behind_group_detached_and_a_drained_one_attached",
+        Case::GroupRestartBehind,
+    )
 }
 
 #[derive(Clone)]
@@ -3066,6 +3077,101 @@ async fn group_stall_holds_back_no_other_stream(f: &Fixture) -> Result<()> {
     .await;
     f.ds.hold_group_stream.send_replace(false);
     engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
+    result
+}
+
+/// OTTO-11131, the durable resume point across a real restart: a group whose output a checkpoint
+/// passed without landing restores detached and reattaches behind a must-refetch marker once its
+/// stream answers; a group whose output had all landed restores attached, with no marker.
+async fn group_restart_restores_a_behind_group_detached(f: &Fixture) -> Result<()> {
+    install_source_fence(f).await?;
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let (status, behind) = post_group(&app, group_body(f, "group-restart-behind", true)).await?;
+        ensure!(status == StatusCode::OK, "behind group create failed: {status} {behind}");
+        let behind_path = behind["streamPath"].as_str().context("behind stream path")?.to_owned();
+        let drained_body = serde_json::json!({
+            "subscription": "group-restart-drained",
+            "members": [{ "key": "inner", "table": format!("public.{}", f.inner), "columns": ["id"] }],
+        });
+        let (status, drained) = post_group(&app, drained_body).await?;
+        ensure!(status == StatusCode::OK, "drained group create failed: {status} {drained}");
+        let drained_path = drained["streamPath"].as_str().context("drained stream path")?.to_owned();
+
+        // The drained group's output lands before the restart.
+        let fence = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id) VALUES (300); INSERT INTO public.circuits_source_fence VALUES ('{fence}'); COMMIT",
+                f.inner
+            ))
+            .await?;
+        wait_group_receipt(&engine, f, fence, &drained_path).await?;
+
+        // The behind group's stream stops answering, and its output for this commit never lands.
+        f.ds.hold_group_stream.send_replace(true);
+        let held = stall_commit(f, 400).await?;
+        wait_source_receipt(&engine, f, held).await?;
+        ensure!(
+            !engine.group_drain_receipt(&held.to_string(), &behind_path).context("behind receipt")?.drained,
+            "the held group's output landed"
+        );
+        engine.close(Duration::from_secs(10)).await;
+        // The stream answers again before the restart, so only the checkpoint's resume point can
+        // tell the restored group that it missed output.
+        f.ds.hold_group_stream.send_replace(false);
+        let (restarted, _restarted_app) =
+            tokio::time::timeout(Duration::from_secs(30), group_engine(f)).await.context("restart timed out")??;
+        let after = tokio::time::timeout(Duration::from_secs(20), async {
+            let mut id = 401;
+            loop {
+                let fence = stall_commit(f, id).await?;
+                let live = id;
+                id += 1;
+                wait_source_receipt(&restarted, f, fence).await?;
+                let events = stream_events(f, &behind_path).await;
+                if let Some(marker) = events.iter().position(|event| event["type"] == "__circuits.control")
+                    && events[marker + 1..].iter().any(|event| event_key(event) == Some(live.to_string()))
+                {
+                    return Ok::<_, anyhow::Error>(events[marker].clone());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await;
+        let marker = match after {
+            Ok(Ok(marker)) => marker,
+            other => anyhow::bail!(
+                "the behind group did not reattach behind a marker after the restart ({other:?}): {:?}",
+                stream_events(f, &behind_path).await
+            ),
+        };
+        ensure!(marker["value"]["groupId"] == behind_path.as_str(), "marker names another group: {marker}");
+
+        // The drained group restored attached: live output, and no marker.
+        let fence = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id) VALUES (301); INSERT INTO public.circuits_source_fence VALUES ('{fence}'); COMMIT",
+                f.inner
+            ))
+            .await?;
+        wait_group_receipt(&restarted, f, fence, &drained_path).await?;
+        let events = stream_events(f, &drained_path).await;
+        ensure!(
+            events.iter().any(|event| event_key(event).as_deref() == Some("301")),
+            "the drained group missed live output after the restart: {events:?}"
+        );
+        ensure!(
+            !events.iter().any(|event| event["type"] == "__circuits.control"),
+            "a group whose output had landed reloaded after the restart: {events:?}"
+        );
+        restarted.close(Duration::from_secs(10)).await;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    f.ds.hold_group_stream.send_replace(false);
     remove_source_fence(f).await;
     result
 }

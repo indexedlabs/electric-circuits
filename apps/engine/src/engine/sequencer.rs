@@ -492,6 +492,10 @@ pub(crate) async fn sequencer_loop(
     // keep advancing the highwater, and that progress has to reach the catalog or a crash
     // re-applies them (ADR-0003).
     let mut ckpt_hw: Option<(u64, u64)> = restore_highwater;
+    // The per-group resume points the last checkpoint carried (OTTO-11131). A change in them is
+    // progress worth persisting too: a group that has caught up should not restore detached just
+    // because a quiet source never moved the position again.
+    let mut ckpt_groups: BTreeMap<String, u64> = BTreeMap::new();
     // The rotation pointer this segment carried (ADR-0006). It can arrive in a batch that is not
     // yet flagged `closed` — the pointer append and the close are two requests — so it is
     // remembered until the close actually lands, and the segment is only left once BOTH are in.
@@ -563,7 +567,7 @@ pub(crate) async fn sequencer_loop(
                 Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
                     let res = activate_shape(
                         &ds, &mut execs, &table, &shape_id, gate, agg_seed, emitted_seed, &mut emitted,
-                        &shutdown,
+                        &shutdown, Some(&subq.group_lanes),
                     ).await;
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
@@ -1103,15 +1107,21 @@ pub(crate) async fn sequencer_loop(
                     // Either half moving is progress worth persisting: the position, or — while the
                     // position is pinned behind a held run — the de-duplication highwater.
                     let ckpt_moved = ckpt != ckpt_pos || highwater != ckpt_hw;
-                    if crossed || (next.is_some() && ckpt_moved && last_ckpt.elapsed() >= std::time::Duration::from_secs(2)) {
+                    let groups = behind_groups(&subq, highwater);
+                    let groups_moved = groups != ckpt_groups;
+                    if crossed
+                        || (next.is_some()
+                            && (ckpt_moved || groups_moved)
+                            && last_ckpt.elapsed() >= std::time::Duration::from_secs(2))
+                    {
                         ckpt_pos = ckpt.clone();
                         ckpt_hw = highwater;
+                        ckpt_groups = groups.clone();
                         last_ckpt = std::time::Instant::now();
                         // The de-duplication highwater rides WITH the position (ADR-0003): a crash
                         // after a prefix of a chunked commit was applied and checkpointed would
                         // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
                         // weights are not idempotent under duplicates.
-                        let groups = behind_groups(&subq, highwater);
                         catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater, groups });
                     }
                     if touched {
@@ -1413,6 +1423,9 @@ pub(crate) async fn activate_shape(
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
     shutdown: &crate::shutdown::ShutdownToken,
+    // A group member's buffered output goes to the group's lane, as its live output does, so a
+    // group stream that stops answering during a member's activation never holds the sequencer.
+    group_lanes: Option<&crate::engine::emission::GroupEmissionLanes>,
 ) -> std::result::Result<(), ActivateFailure> {
     let exec = execs
         .get_mut(table.as_str())
@@ -1463,6 +1476,7 @@ pub(crate) async fn activate_shape(
             // ...then drain the buffer through the gate. `matches()` evaluates equality templates
             // and standalone predicates alike, so one replay path covers both placements.
             let mut outs: Vec<Envelope> = Vec::new();
+            let mut by_commit: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
             for env in &p.buffered {
                 let Ok((delta, txid, lsn)) = apply_envelope(&exec.ts, env) else { continue };
                 if delta.is_empty() {
@@ -1480,8 +1494,19 @@ pub(crate) async fn activate_shape(
                 let first = outs.len();
                 outs.extend(translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)));
                 carry_commit_time(&mut outs[first..], env.headers.commit_ts);
+                by_commit.push((lsn_u64, first..outs.len()));
             }
-            if !outs.is_empty() {
+            if !outs.is_empty()
+                && p.stream_path.starts_with("shape/group-")
+                && let Some(lanes) = group_lanes
+            {
+                *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
+                let mut drained = outs.into_iter();
+                for (commit_lsn, range) in by_commit {
+                    let envs: Vec<Envelope> = drained.by_ref().take(range.len()).collect();
+                    lanes.push(&p.stream_path, envs, commit_lsn);
+                }
+            } else if !outs.is_empty() {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
                 ds.append_reliable(&p.stream_path, &outs)
                     .await
@@ -2836,6 +2861,7 @@ mod pending_buffer_tests {
             0,
             &mut HashMap::new(),
             &crate::shutdown::ShutdownToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2870,6 +2896,7 @@ mod pending_buffer_tests {
             0,
             &mut HashMap::new(),
             &crate::shutdown::ShutdownToken::new(),
+            None,
         )
         .await
         .unwrap();

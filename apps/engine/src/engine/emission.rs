@@ -326,6 +326,9 @@ struct GroupLaneState {
     epoch: u64,
     closed: bool,
     phase: Phase,
+    /// The last gap whose must-refetch marker landed: a receipt for a commit inside it still says
+    /// `mustRefetch`, since that commit's output was dropped and only the marker covers it.
+    healed: Option<(u64, u64)>,
     /// Stall time accrued while the engine moved and this lane landed nothing.
     behind: std::time::Duration,
     landed: bool,
@@ -469,6 +472,7 @@ impl GroupEmissionLanes {
                 next_seq: 0,
                 marker: None,
                 in_flight: None,
+                healed: None,
                 epoch: 0,
                 closed: false,
                 phase: Phase::Attached,
@@ -501,12 +505,13 @@ impl GroupEmissionLanes {
 
     /// Restore a group that a checkpoint recorded as behind: it starts detached at its durable
     /// resume point and reattaches behind a must-refetch marker once its stream answers.
-    pub(crate) fn register_detached(&self, path: &str, resume_lsn: u64) {
+    pub(crate) fn register_detached(&self, path: &str, resume_lsn: u64, meta: GroupMeta) {
         let lane = self.lane(path);
         let mut state = lane.state.lock().unwrap();
         if state.closed {
             return;
         }
+        state.meta = meta;
         let gap = match state.phase {
             Phase::Detached(mut gap) | Phase::Reattaching(mut gap) => {
                 gap.widen(resume_lsn);
@@ -520,12 +525,25 @@ impl GroupEmissionLanes {
             self.shared.metrics.group_lanes_detached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         state.phase = Phase::Detached(gap);
+        self.shared.metrics.group_detaches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let config = &self.shared.config;
         tracing::warn!(
             event = "group_detached",
             group_id = %path,
             subscription = %state.meta.subscription,
+            member_tables = ?state.meta.tables,
             cap = "restart",
+            backlog_batches = 0u64,
+            backlog_bytes = 0u64,
+            in_flight_bytes = 0u64,
+            memory_cap_bytes = config.memory_bytes,
+            stall_cap_secs = state.detach_after.as_secs(),
+            next_stall_cap_secs = state.detach_after.as_secs(),
+            seconds_stalled = 0u64,
+            lag_commits = 0u64,
+            lag_lsn_bytes = 0u64,
             resume_lsn = %lsn_text(gap.resume_lsn),
+            dropped_batches = gap.dropped_batches,
             "group restored behind its checkpoint; it reattaches behind a must-refetch marker"
         );
     }
@@ -613,12 +631,19 @@ impl GroupEmissionLanes {
             Phase::Detached(gap) | Phase::Reattaching(gap) if gap.resume_lsn <= marker_lsn => Some(gap),
             _ => None,
         };
-        let drained = gap.is_none() && state.oldest_outstanding().is_none_or(|oldest| oldest > marker_lsn);
+        // A commit inside the last healed gap had its output dropped; the marker on the stream
+        // covers it, so it is drained, but its readers must refetch.
+        let healed = state.healed.filter(|(resume, through)| (*resume..=*through).contains(&marker_lsn));
+        // Only a commit this process has sequenced can be on the lane's books at all: after a
+        // crash, a durable receipt can name a commit whose group output the replay has not yet
+        // re-derived.
+        let sequenced = marker_lsn <= self.shared.progress.lsn.load(std::sync::atomic::Ordering::Relaxed);
+        let drained = sequenced && gap.is_none() && state.oldest_outstanding().is_none_or(|oldest| oldest > marker_lsn);
         Some(GroupDrain {
             group_id: lane.path.clone(),
             drained,
-            must_refetch: gap.is_some(),
-            resume_lsn: gap.map(|gap| lsn_text(gap.resume_lsn)),
+            must_refetch: gap.is_some() || healed.is_some(),
+            resume_lsn: gap.map(|gap| gap.resume_lsn).or(healed.map(|(resume, _)| resume)).map(lsn_text),
         })
     }
 
@@ -662,6 +687,8 @@ impl GroupEmissionLanes {
     fn unmonitored(ds: DsClient, config: GroupLaneConfig) -> Self {
         let shared =
             Arc::new(LaneShared { config, progress: SequencerProgress::default(), metrics: ds.metrics().clone() });
+        // Most lane tests reason about one lane alone: treat every commit as already sequenced.
+        shared.progress.lsn.store(u64::MAX / 2, std::sync::atomic::Ordering::Relaxed);
         Self {
             lanes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             ds,
@@ -693,11 +720,11 @@ impl GroupLane {
         self.backlog_changed(bytes as i64, 1);
         let limit = self.shared.config.memory_bytes;
         let capped = if state.queued_bytes >= limit / 4 { state.capped_bytes() } else { state.queued_bytes };
+        // A push that jumps past the cap still reports the thresholds it crossed on the way.
+        self.threshold(&mut state, Cap::Bytes, capped as f64 / limit as f64);
         if capped > limit {
             self.detach(&mut state, Cap::Bytes);
         } else {
-            let fraction = capped as f64 / limit as f64;
-            self.threshold(&mut state, Cap::Bytes, fraction);
             drop(state);
             self.worker_wake.notify_one();
         }
@@ -774,6 +801,7 @@ impl GroupLane {
             && let Phase::Reattaching(gap) = state.phase
         {
             state.phase = Phase::Attached;
+            state.healed = Some((gap.resume_lsn, gap.through_lsn));
             state.healthy_since = tokio::time::Instant::now();
             self.shared.metrics.group_lanes_detached.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             tracing::info!(
@@ -837,11 +865,11 @@ impl GroupLane {
         state.landed = false;
         let cap = state.stall_cap(config);
         let fraction = state.behind.as_secs_f64() / cap.as_secs_f64();
+        self.threshold(&mut state, Cap::Stall, fraction);
         if state.behind >= cap {
             self.detach(&mut state, Cap::Stall);
             return false;
         }
-        self.threshold(&mut state, Cap::Stall, fraction);
         if matches!(state.phase, Phase::Attached)
             && state.behind.is_zero()
             && state.detach_after > config.detach_after
@@ -1556,6 +1584,170 @@ mod tests {
         assert!(drain.must_refetch && drain.resume_lsn.as_deref() == Some("0/1"), "{drain:?}");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_receipt_inside_a_healed_gap_says_refetch_and_an_unsequenced_commit_is_not_drained() {
+        let (lanes, store, hold) = held_lanes(test_config());
+        lanes.push(GROUP, vec![group_env("lost")], 0x10);
+        settle().await;
+        for _ in 0..3 {
+            lanes.tick_for_test(true).await;
+        }
+        hold.send_replace(false);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        lanes.tick_for_test(true).await;
+        wait_appended(&store, 1).await;
+        settle().await;
+        let inside = lanes.drain(GROUP, 0x10).unwrap();
+        assert!(inside.drained && inside.must_refetch, "{inside:?}");
+        assert_eq!(inside.resume_lsn.as_deref(), Some("0/10"));
+        let after = lanes.drain(GROUP, 0x20).unwrap();
+        assert!(after.drained && !after.must_refetch, "{after:?}");
+
+        // After a restart, a durable receipt can name a commit this process has not sequenced yet.
+        let restarted = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), Arc::new(crate::ds::ScriptedStore::default())),
+            test_config(),
+        );
+        restarted.shared.progress.lsn.store(0x08, std::sync::atomic::Ordering::Relaxed);
+        restarted.register(GROUP);
+        assert!(!restarted.drain(GROUP, 0x10).unwrap().drained, "an unsequenced commit was reported drained");
+        restarted.note_commit(0x10);
+        assert!(restarted.drain(GROUP, 0x10).unwrap().drained);
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        fn events(&self, name: &str) -> Vec<serde_json::Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .map(|line| line["fields"].clone())
+                .filter(|fields| fields["event"] == name)
+                .collect()
+        }
+    }
+
+    /// `#v-group-backlog-telemetry`: with small caps, a held group logs `group_backlog_threshold`
+    /// at 50% and 90%, then `group_detached` and `group_backlog_high_water`, and `group_reattached`
+    /// once its stream answers; a restart's detach names its subscription and counts as a detach.
+    #[tokio::test(start_paused = true)]
+    async fn group_events_carry_every_listed_field() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().json().with_writer(move || writer.clone()).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let config = GroupLaneConfig { memory_bytes: 8 * 1024, ..test_config() };
+        let (lanes, store, hold) = held_lanes(config);
+        lanes.set_meta(GROUP, GroupMeta { subscription: "scope-1".into(), tables: vec!["public.items".into()] });
+        lanes.push(GROUP, vec![big_env("in-flight")], 1);
+        settle().await;
+        let small = |key: &str| {
+            let mut env = group_env(key);
+            env.value = Some(serde_json::json!({ "id": key, "payload": "x".repeat(900) }));
+            env
+        };
+        for i in 0..20u64 {
+            lanes.push(GROUP, vec![small(&format!("q{i}"))], 2 + i);
+            if detaches(&lanes) == 1 {
+                break;
+            }
+        }
+        assert_eq!(detaches(&lanes), 1);
+        let thresholds = log.events("group_backlog_threshold");
+        let fractions: Vec<f64> = thresholds.iter().map(|event| event["fraction"].as_f64().unwrap()).collect();
+        assert_eq!(fractions, [0.5, 0.9], "{thresholds:?}");
+        let threshold_fields = [
+            "group_id",
+            "subscription",
+            "member_tables",
+            "cap",
+            "fraction",
+            "backlog_batches",
+            "backlog_bytes",
+            "memory_cap_bytes",
+            "stall_cap_secs",
+            "seconds_stalled",
+            "lag_commits",
+            "lag_lsn_bytes",
+        ];
+        for field in threshold_fields {
+            assert!(thresholds.iter().all(|event| !event[field].is_null()), "threshold lacks {field}: {thresholds:?}");
+        }
+        let detach_fields = [
+            "group_id",
+            "subscription",
+            "member_tables",
+            "cap",
+            "backlog_batches",
+            "backlog_bytes",
+            "in_flight_bytes",
+            "memory_cap_bytes",
+            "stall_cap_secs",
+            "next_stall_cap_secs",
+            "seconds_stalled",
+            "lag_commits",
+            "lag_lsn_bytes",
+            "resume_lsn",
+            "dropped_batches",
+        ];
+        let detached = log.events("group_detached");
+        assert_eq!(detached.len(), 1);
+        for field in detach_fields {
+            assert!(!detached[0][field].is_null(), "group_detached lacks {field}: {detached:?}");
+        }
+        assert_eq!(detached[0]["subscription"], "scope-1");
+        let high_water = log.events("group_backlog_high_water");
+        for field in ["group_id", "member_tables", "peak_backlog_batches", "peak_backlog_bytes", "longest_stall_secs"] {
+            assert!(high_water.iter().all(|event| !event[field].is_null()), "high water lacks {field}");
+        }
+        assert!(!high_water.is_empty());
+
+        hold.send_replace(false);
+        settle().await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        lanes.tick_for_test(true).await;
+        lanes.tick_for_test(true).await;
+        wait_appended(&store, 2).await;
+        let reattached = log.events("group_reattached");
+        assert_eq!(reattached.len(), 1, "{reattached:?}");
+        for field in [
+            "group_id",
+            "subscription",
+            "member_tables",
+            "resume_lsn",
+            "through_lsn",
+            "detached_secs",
+            "dropped_batches",
+        ] {
+            assert!(!reattached[0][field].is_null(), "group_reattached lacks {field}");
+        }
+
+        lanes.register_detached(
+            "shape/group-8",
+            0x40,
+            GroupMeta { subscription: "scope-2".into(), tables: vec!["public.items".into()] },
+        );
+        let restart = log.events("group_detached").into_iter().find(|event| event["cap"] == "restart").unwrap();
+        assert_eq!(restart["subscription"], "scope-2");
+        for field in detach_fields {
+            assert!(!restart[field].is_null(), "restart detach lacks {field}: {restart}");
+        }
+        assert_eq!(detaches(&lanes), 2, "a restart's detach counts as a detach");
+    }
+
     #[tokio::test]
     async fn waiting_on_its_own_deferred_flip_is_not_a_stall() {
         let store = Arc::new(crate::ds::ScriptedStore::default());
@@ -1647,7 +1839,7 @@ mod tests {
             DsClient::with_test_store("scripted://group".into(), store.clone()),
             test_config(),
         );
-        lanes.register_detached(GROUP, 0x2A);
+        lanes.register_detached(GROUP, 0x2A, GroupMeta::default());
         assert_eq!(lanes.behind_at_or_before(0x30), BTreeMap::from([(GROUP.to_string(), 0x2A)]));
         assert!(lanes.drain(GROUP, 0x30).unwrap().must_refetch);
         lanes.push(GROUP, vec![group_env("replayed")], 0x31);
