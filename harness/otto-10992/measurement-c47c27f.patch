@@ -1,0 +1,221 @@
+diff --git a/apps/engine/src/engine/mod.rs b/apps/engine/src/engine/mod.rs
+index f4f7d5d..bcfb752 100644
+--- a/apps/engine/src/engine/mod.rs
++++ b/apps/engine/src/engine/mod.rs
+@@ -1028,9 +1028,20 @@ impl FlipWork {
+ #[derive(Default)]
+ pub(crate) struct PendingFlips {
+     state: std::sync::Mutex<(i64, BTreeMap<u64, usize>)>,
++    metrics: std::sync::Mutex<Option<std::sync::Weak<crate::metrics::Metrics>>>,
+ }
+ 
+ impl PendingFlips {
++    pub(crate) fn attach_metrics(&self, metrics: &Arc<crate::metrics::Metrics>) {
++        *self.metrics.lock().unwrap() = Some(Arc::downgrade(metrics));
++    }
++
++    fn publish_depth(&self, depth: i64) {
++        if let Some(metrics) = self.metrics.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
++            metrics.receipt_queue_depth.store(depth.max(0) as u64, Ordering::Relaxed);
++        }
++    }
++
+     fn add(&self, commit_lsn: u64) {
+         self.add_all(std::iter::once(commit_lsn));
+     }
+@@ -1043,6 +1054,9 @@ impl PendingFlips {
+             state.0 += 1;
+             *state.1.entry(commit_lsn).or_default() += 1;
+         }
++        let depth = state.0;
++        drop(state);
++        self.publish_depth(depth);
+     }
+ 
+     fn complete(&self, commit_lsn: u64) {
+@@ -1053,6 +1067,9 @@ impl PendingFlips {
+             state.1.remove(&commit_lsn);
+         }
+         state.0 -= 1;
++        let depth = state.0;
++        drop(state);
++        self.publish_depth(depth);
+     }
+ 
+     fn count(&self) -> i64 {
+@@ -1748,6 +1765,7 @@ impl Engine {
+         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
+         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
+         let pending_flips = Arc::new(PendingFlips::default());
++        pending_flips.attach_metrics(ds.metrics());
+         let degrade = DegradeState::new();
+         let group_lanes =
+             emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), emission::GroupLaneConfig::from_env());
+diff --git a/apps/engine/src/engine/sequencer.rs b/apps/engine/src/engine/sequencer.rs
+index 9d617e4..fcaafff 100644
+--- a/apps/engine/src/engine/sequencer.rs
++++ b/apps/engine/src/engine/sequencer.rs
+@@ -467,6 +467,7 @@ pub(crate) async fn sequencer_loop(
+     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
+     _party: crate::shutdown::ShutdownParty,
+ ) {
++    let metrics = ds.metrics().clone();
+     let mut execs: HashMap<String, TableExec> = HashMap::new();
+     let mut paused = start_paused;
+     // A missing segment or unrecoverable body breach is terminal for this live loop. Keep reads
+@@ -487,6 +488,8 @@ pub(crate) async fn sequencer_loop(
+     // resumes on the segment the log actually moved to.
+     let mut last_ckpt = std::time::Instant::now();
+     let mut ckpt_pos = pos.clone();
++    metrics.set_sequencer_processed(pos.segment, &pos.offset);
++    metrics.set_sequencer_checkpoint(ckpt_pos.segment, &ckpt_pos.offset);
+     // The highwater the last checkpoint carried. While a transaction is HELD the position is
+     // pinned, so the position alone stops changing — but transactions completed before the hold
+     // keep advancing the highwater, and that progress has to reach the catalog or a crash
+@@ -1036,7 +1039,9 @@ pub(crate) async fn sequencer_loop(
+                     // re-read the whole incomplete transaction, and `processed` is also what
+                     // `GET /tables/{name}/offset` and the segment-deletion floor read.
+                     if next.is_some() {
+-                        *processed.lock().unwrap() = published(&pos, &held_from);
++                        let published_pos = published(&pos, &held_from);
++                        *processed.lock().unwrap() = published_pos.clone();
++                        metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
+                     }
+                     // The segment ended (ADR-0006). Cross only once a read of it comes back EMPTY
+                     // (or stops advancing): "closed" can arrive alongside a page of data, and
+@@ -1051,7 +1056,9 @@ pub(crate) async fn sequencer_loop(
+                             Some(n) => {
+                                 tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
+                                 pos = LogPosition::start_of(n);
+-                                *processed.lock().unwrap() = published(&pos, &held_from);
++                                let published_pos = published(&pos, &held_from);
++                                *processed.lock().unwrap() = published_pos.clone();
++                                metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
+                                 crossed = true;
+                             }
+                             None => {
+@@ -1069,7 +1076,9 @@ pub(crate) async fn sequencer_loop(
+                                             segment_path(n)
+                                         );
+                                         pos = LogPosition::start_of(n);
+-                                        *processed.lock().unwrap() = published(&pos, &held_from);
++                                        let published_pos = published(&pos, &held_from);
++                                        *processed.lock().unwrap() = published_pos.clone();
++                                        metrics.set_sequencer_processed(published_pos.segment, &published_pos.offset);
+                                         crossed = true;
+                                     }
+                                     Err(e) if e.is::<crate::changelog::MissingSuccessor>() => {
+@@ -1103,6 +1112,7 @@ pub(crate) async fn sequencer_loop(
+                         ckpt_pos = ckpt.clone();
+                         ckpt_hw = highwater;
+                         last_ckpt = std::time::Instant::now();
++                        metrics.set_sequencer_checkpoint(ckpt_pos.segment, &ckpt_pos.offset);
+                         // The de-duplication highwater rides WITH the position (ADR-0003): a crash
+                         // after a prefix of a chunked commit was applied and checkpointed would
+                         // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
+diff --git a/apps/engine/src/metrics.rs b/apps/engine/src/metrics.rs
+index 3bf4d12..79df386 100644
+--- a/apps/engine/src/metrics.rs
++++ b/apps/engine/src/metrics.rs
+@@ -2,6 +2,7 @@
+ //! via `GET /metrics`. Used by the benchmark harness to attribute bottlenecks (per-envelope
+ //! fan-out, family-step, and shape-append latencies) under sustained load.
+ 
++use std::collections::BTreeMap;
+ use std::sync::atomic::{AtomicU64, Ordering};
+ 
+ const NB: usize = 40; // buckets cover [2^0, 2^40) microseconds (~12 days) — plenty of headroom.
+@@ -84,6 +85,12 @@ pub struct Timer<'a> {
+     hist: &'a Hist,
+     start: std::time::Instant,
+ }
++
++#[derive(Default)]
++struct LaneBacklog {
++    bytes: u64,
++    batches: u64,
++}
+ impl<'a> Timer<'a> {
+     pub fn new(hist: &'a Hist) -> Self {
+         Timer { hist, start: std::time::Instant::now() }
+@@ -211,6 +218,12 @@ pub struct Metrics {
+     /// GAUGE: 1 while a walsender holds the slot (i.e. this engine is streaming), 0 when it is not
+     /// — and 0 when the slot does not exist at all, which is the epoch-break case.
+     pub replication_slot_active: AtomicU64,
++    /// Observation-only backlog of grouped output lanes, keyed by stream path.
++    pub(crate) group_lane_backlog: std::sync::Mutex<BTreeMap<String, LaneBacklog>>,
++    /// Observation-only count of outstanding receipt/barrier batches.
++    pub(crate) receipt_queue_depth: AtomicU64,
++    pub(crate) sequencer_processed: std::sync::Mutex<serde_json::Value>,
++    pub(crate) sequencer_checkpoint: std::sync::Mutex<serde_json::Value>,
+     pub process_envelope: Hist, // end-to-end fan-out latency per table envelope
+     pub family_step: Hist,      // one family circuit transaction
+     pub append: Hist,           // one shape-stream append (durable-streams round-trip)
+@@ -278,6 +291,10 @@ impl Metrics {
+             replication_slot_retained_wal_bytes: AtomicU64::new(0),
+             replication_confirmed_flush_lag_bytes: AtomicU64::new(0),
+             replication_slot_active: AtomicU64::new(0),
++            group_lane_backlog: std::sync::Mutex::new(BTreeMap::new()),
++            receipt_queue_depth: AtomicU64::new(0),
++            sequencer_processed: std::sync::Mutex::new(serde_json::json!(null)),
++            sequencer_checkpoint: std::sync::Mutex::new(serde_json::json!(null)),
+             txn_spills: AtomicU64::new(0),
+             txn_spill_bytes: AtomicU64::new(0),
+             txn_chunked_appends: AtomicU64::new(0),
+@@ -354,6 +371,24 @@ impl Metrics {
+                 "group_lanes_detached": self.group_lanes_detached.load(Ordering::Relaxed),
+                 "group_lane_backlog_bytes": self.group_lane_backlog_bytes.load(Ordering::Relaxed),
+                 "group_lane_backlog_batches": self.group_lane_backlog_batches.load(Ordering::Relaxed),
++                "receipt_queue_depth": self.receipt_queue_depth.load(Ordering::Relaxed),
++            },
++            // OTTO-11131 acceptance: per-group lanes keep only engine-wide backlog gauges.
++            "group_lane_backlog": {
++                "all": {
++                    "bytes": self.group_lane_backlog_bytes.load(Ordering::Relaxed),
++                    "batches": self.group_lane_backlog_batches.load(Ordering::Relaxed),
++                }
++            },
++            "spike": {
++                "group_lanes_retired": 0,
++                "group_lanes_detached": self.group_detaches.load(Ordering::Relaxed),
++                "group_lanes_reattached": self.group_reattaches.load(Ordering::Relaxed),
++                "group_spill_bytes": 0,
++            },
++            "sequencer": {
++                "processed": self.sequencer_processed.lock().unwrap().clone(),
++                "checkpoint": self.sequencer_checkpoint.lock().unwrap().clone(),
+             },
+             "process_envelope_us": self.process_envelope.snapshot(),
+             "family_step_us": self.family_step.snapshot(),
+@@ -361,6 +396,31 @@ impl Metrics {
+         })
+     }
+ 
++    pub(crate) fn group_lane_add(&self, path: &str, bytes: u64) {
++        let mut lanes = self.group_lane_backlog.lock().unwrap();
++        let lane = lanes.entry(path.to_owned()).or_default();
++        lane.bytes = lane.bytes.saturating_add(bytes);
++        lane.batches = lane.batches.saturating_add(1);
++    }
++
++    pub(crate) fn group_lane_complete(&self, path: &str, bytes: u64) {
++        let mut lanes = self.group_lane_backlog.lock().unwrap();
++        let Some(lane) = lanes.get_mut(path) else { return };
++        lane.bytes = lane.bytes.saturating_sub(bytes);
++        lane.batches = lane.batches.saturating_sub(1);
++        if lane.batches == 0 {
++            lanes.remove(path);
++        }
++    }
++
++    pub(crate) fn set_sequencer_processed(&self, segment: u32, offset: &str) {
++        *self.sequencer_processed.lock().unwrap() = serde_json::json!({"segment": segment, "offset": offset});
++    }
++
++    pub(crate) fn set_sequencer_checkpoint(&self, segment: u32, offset: &str) {
++        *self.sequencer_checkpoint.lock().unwrap() = serde_json::json!({"segment": segment, "offset": offset});
++    }
++
+     /// Zero all counters and histograms — the benchmark calls this after shape registration so the
+     /// load-phase percentiles aren't skewed by setup.
+     pub fn reset(&self) {
