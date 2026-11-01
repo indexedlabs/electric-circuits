@@ -94,6 +94,33 @@ impl RetirementCompletion {
     }
 }
 
+/// The one retirement of a group's shared stream, which every member's purge waits on: a member's
+/// [`crate::engine::PurgeBarrier`] completes only once this settles, exactly as an owned stream's
+/// does once its own retirement lands. Settled by [`Engine::retire_group_stream`]; dropped
+/// unsettled (the teardown task was cancelled), it fails its waiters rather than stranding them.
+pub(crate) struct SharedRetirement {
+    completion: Option<Arc<RetirementCompletion>>,
+}
+
+impl SharedRetirement {
+    pub(crate) fn new() -> Self {
+        Self { completion: Some(RetirementCompletion::new_non_durable()) }
+    }
+
+    /// What a member's purge waits on.
+    pub(crate) fn settled(&self) -> Arc<RetirementCompletion> {
+        self.completion.clone().expect("a shared retirement is settled only by consuming it")
+    }
+}
+
+impl Drop for SharedRetirement {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.fail();
+        }
+    }
+}
+
 fn abandon_retirements(
     metrics: &crate::metrics::Metrics,
     current: Option<Retirement>,
@@ -136,8 +163,13 @@ impl RetirementQueue {
     }
 
     /// Hand a stream shared by several shapes to the queue: one retirement, completing each.
-    pub(crate) fn enqueue_shared(&self, stream_path: &str, shape_ids: &[String]) {
-        self.push(stream_path, shape_ids.to_vec(), None);
+    pub(crate) fn enqueue_shared(
+        &self,
+        stream_path: &str,
+        shape_ids: &[String],
+        completion: Option<Arc<RetirementCompletion>>,
+    ) {
+        self.push(stream_path, shape_ids.to_vec(), completion);
     }
 
     pub(crate) fn enqueue_with_completion(
@@ -326,17 +358,25 @@ impl Engine {
     /// member's retirement (ADR-0007) when storage accepts the delete. Callers have made each
     /// member's `Dropped` durable first, so a storage failure is queued rather than reported: the
     /// queue retries it until it lands, and a restart before then finds the members' `Dropped`
-    /// records and retires the stream again.
-    pub(crate) async fn retire_group_stream(&self, stream_path: &str, members: &[String]) {
+    /// records and retires the stream again. `shared` settles when the delete lands, inline or
+    /// from the queue, which is when the members' purge barriers complete.
+    pub(crate) async fn retire_group_stream(
+        &self,
+        stream_path: &str,
+        members: &[String],
+        mut shared: SharedRetirement,
+    ) {
+        let completion = shared.completion.take().expect("a shared retirement is settled once");
         match self.ds.retire_stream(stream_path).await {
             Ok(()) => {
                 for id in members {
                     self.catalog_tx.send(CatalogEvent::Retired { id: id.clone() });
                 }
+                completion.complete();
             }
             Err(error) => {
                 tracing::warn!(%error, %stream_path, members = members.len(), "group stream retirement failed; queued");
-                self.retirements.enqueue_shared(stream_path, members);
+                self.retirements.enqueue_shared(stream_path, members, Some(completion));
             }
         }
     }

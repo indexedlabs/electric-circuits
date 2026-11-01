@@ -1273,7 +1273,8 @@ impl Engine {
 
     /// Purge one shape without consulting or releasing a group claim. Group teardown calls this
     /// helper for each private member, so it cannot recurse back into `release_group_claim`.
-    /// `stream` says whether the purge retires the shape's stream or leaves it to the group.
+    /// `stream` says whether the purge retires the shape's stream or leaves it to the group; either
+    /// way the purge barrier completes only once that retirement has settled.
     async fn purge_shape_member(&self, id: &str, durable: bool, stream: StreamRetirement) -> Result<()> {
         let mut st = self.state.lock().await;
         self.cancel_reactivation_scan(id);
@@ -1352,7 +1353,18 @@ impl Engine {
                 // itself remains Engine-owned and eventually retried by `RetirementQueue`; making
                 // the HTTP request wait for that external recovery turns a durable-stream outage
                 // into an unnecessary, unbounded acknowledgment delay.
+                let shared = match &stream {
+                    StreamRetirement::Group(settled) => Some(settled.clone()),
+                    StreamRetirement::Owned => None,
+                };
                 let _ = engine.finish_purge(&owned, removed, false, None, stream).await;
+                // A group member's stream is retired by its group: the barrier stays open until
+                // that one retirement lands, as an owned stream's stays open over its own.
+                if let Some(settled) = shared
+                    && settled.wait().await.is_err()
+                {
+                    task_barrier.mark_dropped_failed();
+                }
                 task_barrier.complete();
                 engine.purge_barriers.lock().unwrap().remove(&owned);
             });
@@ -1402,11 +1414,17 @@ impl Engine {
         if let Some(rec) = removed {
             // Retirement: close (releasing any tailing long-poll with `stream-closed`) then delete,
             // and record the completion. A storage failure is queued, never forgotten.
-            if stream == StreamRetirement::Group {
+            if let StreamRetirement::Group(settled) = &stream {
                 // The group's teardown retires the shared stream once and completes this member's
-                // retirement with it (`retire_group_stream`).
+                // retirement with it (`retire_group_stream`); the barrier follows that retirement.
                 if let Some(barrier) = completion_barrier {
-                    barrier.complete();
+                    let settled = settled.clone();
+                    self.shutdown.spawn(async move {
+                        if settled.wait().await.is_err() {
+                            barrier.mark_dropped_failed();
+                        }
+                        barrier.complete();
+                    });
                 }
             } else if wait_retirement {
                 self.retire_shape_stream_wait(id, &rec.stream_path).await?;
@@ -2196,18 +2214,20 @@ impl Engine {
 
     async fn release_group_claim_owned(&self, subscription: &str, group: GroupRecord) -> Result<()> {
         let mut first_error = None;
+        let shared = crate::engine::retirement::SharedRetirement::new();
         for member in &group.members {
             if let Err(error) = self.release_group_member_durable(&member.shape_id, &member.subscription).await {
                 tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member release failed");
                 first_error.get_or_insert(error);
             }
-            if let Err(error) = self.purge_shape_member(&member.shape_id, true, StreamRetirement::Group).await {
+            let stream = StreamRetirement::Group(shared.settled());
+            if let Err(error) = self.purge_shape_member(&member.shape_id, true, stream).await {
                 tracing::warn!(%error, shape = %member.shape_id, subscription = %member.subscription, "group member purge failed");
                 first_error.get_or_insert(error);
             }
         }
         let members: Vec<String> = group.members.iter().map(|member| member.shape_id.clone()).collect();
-        self.retire_group_stream(&group.stream_path, &members).await;
+        self.retire_group_stream(&group.stream_path, &members, shared).await;
         // The public claim is dropped last, after every private member release and purge has
         // completed. A cancelled request leaves this engine-owned task running to completion.
         if let Err(error) = self.finish_group_release(subscription, &group.id).await {
@@ -2225,18 +2245,21 @@ impl Engine {
         self.remove_group_lane(stream_path);
         let mut first_error = None;
         let mut members = Vec::with_capacity(created.len());
+        let shared = crate::engine::retirement::SharedRetirement::new();
         for (shape_id, member_subscription) in created {
             if let Err(error) = self.release_group_member_durable(&shape_id, &member_subscription).await {
                 tracing::warn!(%error, %shape_id, %member_subscription, "group member release failed during rollback");
                 first_error.get_or_insert(error);
             }
-            if let Err(error) = self.purge_shape_member(&shape_id, true, StreamRetirement::Group).await {
+            if let Err(error) =
+                self.purge_shape_member(&shape_id, true, StreamRetirement::Group(shared.settled())).await
+            {
                 tracing::warn!(%error, %shape_id, %member_subscription, "group member purge failed during rollback");
                 first_error.get_or_insert(error);
             }
             members.push(shape_id);
         }
-        self.retire_group_stream(stream_path, &members).await;
+        self.retire_group_stream(stream_path, &members, shared).await;
         if let Err(error) = self.abort_group(subscription, stream_path).await {
             first_error.get_or_insert(error);
         }
@@ -2799,15 +2822,16 @@ impl Drop for JoinGuard {
 }
 
 /// Who retires a purged shape's stream.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 enum StreamRetirement {
     /// The shape owns its stream: the purge closes and deletes it.
     Owned,
     /// The stream is its group's, written by every member: the group's teardown retires it once,
     /// after every member's `Dropped` is durable, and completes each member's retirement then.
     /// A member retiring it too sends storage one DELETE per member, which durable-streams answers
-    /// with `503 stream retirement in progress` for all but the first.
-    Group,
+    /// with `503 stream retirement in progress` for all but the first. Carries what the member's
+    /// purge barrier waits on: that one retirement settling.
+    Group(Arc<crate::engine::retirement::RetirementCompletion>),
 }
 
 /// Which per-kind registration a rolled-back create must undo alongside the engine-state entries.
@@ -5091,7 +5115,8 @@ mod subscription_tests {
 
     /// A group of `members` shapes that all write one stream, as `/v1/groups` builds it: every
     /// member's record names the group's stream, and the group claim holds them privately.
-    async fn engine_with_shared_group_stream(ds: DsClient, members: usize) -> (Engine, GroupRecord) {
+    /// `complete: false` leaves the group reserved, as a load that failed mid-assembly does.
+    async fn engine_with_shared_group_stream(ds: DsClient, members: usize, complete: bool) -> (Engine, GroupRecord) {
         let engine = Engine::new_for_in_process_test(ds);
         let stream_path = "shape/group-shared".to_string();
         let now = crate::changelog::now_secs();
@@ -5143,9 +5168,11 @@ mod subscription_tests {
             horizon: "0/0".into(),
             replay_fence: "0".into(),
         };
-        st.group_claims.reserve("scope", "group:scope").unwrap();
+        st.group_claims.reserve("scope", &group.id).unwrap();
         st.group_claims.reserve_private_members("scope", (1..members).map(|i| format!("scope:member:{i}")));
-        st.group_claims.complete(group.clone());
+        if complete {
+            st.group_claims.complete(group.clone());
+        }
         drop(st);
         (engine, group)
     }
@@ -5162,7 +5189,8 @@ mod subscription_tests {
     async fn concurrent_releases_of_a_shared_group_stream_retire_it_once() {
         let server = FakeDs::start().await;
         server.retire_like_storage(std::time::Duration::from_millis(50));
-        let (engine, group) = engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 4).await;
+        let (engine, group) =
+            engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 4, true).await;
 
         let releases: Vec<_> = (0..4)
             .map(|_| {
@@ -5187,6 +5215,7 @@ mod subscription_tests {
         assert!(server.is_deleted(&group.stream_path), "the shared stream is gone from storage");
         assert_eq!(server.deletes_of(&group.stream_path), 1, "the shared stream is retired exactly once");
         assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(5)).await);
+        assert_dropped_before_retired(&server.catalog_events(), 4);
         let mut retired: Vec<String> = server
             .catalog_events()
             .iter()
@@ -5209,7 +5238,8 @@ mod subscription_tests {
     async fn a_refused_group_stream_retirement_is_queued_and_drains() {
         let server = FakeDs::start().await;
         server.fail_deletes(1);
-        let (engine, group) = engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 3).await;
+        let (engine, group) =
+            engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 3, true).await;
 
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -5232,6 +5262,87 @@ mod subscription_tests {
             events.iter().filter(|event| event["t"] == "retired").filter_map(|event| event["id"].as_str()).collect();
         retired.sort_unstable();
         assert_eq!(retired, ["member-0", "member-1", "member-2"], "each member's retirement is completed once");
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    /// ADR-0007: each member's `Dropped` intent lands before its `Retired` completion.
+    fn assert_dropped_before_retired(events: &[serde_json::Value], members: usize) {
+        for i in 0..members {
+            let id = format!("member-{i}");
+            let at = |kind: &str| events.iter().position(|event| event["t"] == kind && event["id"] == id.as_str());
+            let (dropped, retired) = (at("dropped"), at("retired"));
+            assert!(dropped.is_some() && retired.is_some(), "{id}: both records land ({dropped:?}, {retired:?})");
+            assert!(dropped < retired, "{id}: the Dropped intent precedes the Retired completion");
+        }
+    }
+
+    /// A group load that fails mid-assembly rolls its reservation back through the same teardown:
+    /// one DELETE of the shared stream after every member's `Dropped`, and a refused DELETE is
+    /// queued rather than reported as a failed compensation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rolled_back_group_reservation_retires_its_stream_once_and_queues_a_refusal() {
+        let server = FakeDs::start().await;
+        server.fail_deletes(1);
+        let (engine, group) =
+            engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 3, false).await;
+        let created =
+            group.members.iter().map(|member| (member.shape_id.clone(), member.subscription.clone())).collect();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            engine.cleanup_group_reservation(&group.subscription, &group.stream_path, created),
+        )
+        .await
+        .expect("reservation rollback did not finish")
+        .expect("a queued stream retirement must not fail the rollback");
+        assert!(!engine.state.lock().await.group_claims.is_reserved("scope"), "the reservation is released");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while engine.pending_retirements() != 0 {
+            assert!(std::time::Instant::now() < deadline, "the retirement queue never drained");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.deletes_of(&group.stream_path), 2, "one refused DELETE, then the queue's that landed");
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(5)).await);
+        assert_dropped_before_retired(&server.catalog_events(), 3);
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
+    /// A group member's purge barrier stays open until the group's one retirement of the shared
+    /// stream lands, as an owned stream's does over its own: drift's ingest-columns witness waits
+    /// on these barriers for completed dependent retirements (ADR-0012).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_members_purge_barrier_waits_for_the_shared_retirement() {
+        let server = FakeDs::start().await;
+        server.block_deletes(true);
+        let (engine, group) =
+            engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 2, true).await;
+
+        let release = tokio::spawn({
+            let (engine, group) = (engine.clone(), group.clone());
+            async move { engine.release_group_claim(&group.subscription, &group.id).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), server.wait_delete_blocked())
+            .await
+            .expect("the shared stream's DELETE never reached storage");
+        for member in ["member-0", "member-1"] {
+            let barrier = engine.purge_barriers.lock().unwrap().get(member).cloned();
+            let barrier = barrier.unwrap_or_else(|| panic!("{member}: barrier released before its stream was retired"));
+            assert!(!barrier.is_done(), "{member}: barrier completed before its stream was retired");
+        }
+
+        server.release_delete();
+        tokio::time::timeout(std::time::Duration::from_secs(5), release)
+            .await
+            .expect("group release did not finish")
+            .unwrap()
+            .expect("group release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !engine.purge_barriers.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "member barriers never completed after the retirement");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.deletes_of(&group.stream_path), 1);
         engine.close(std::time::Duration::from_secs(1)).await;
     }
 }

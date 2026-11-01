@@ -27,6 +27,12 @@ Retirement is therefore written down in two halves and retried to completion:
   The shape is gone from the engine either way, and `GET /shapes/{id}` stays 404 while its stream is
   still being retired. A changed effective column set on a configured or previously witnessed table
   waits for completion before its durable witness ([ADR-0012](0012-static-ingest-columns.md)).
+- A group's shared stream (every member of a group writes one `shape/group-…` stream) is retired
+  **once, by the group**, after every member's `Dropped` is durable; that one delete records each
+  member's `Retired`, a refused one is queued carrying every member, and each member's purge barrier
+  stays open until it lands. Members never retire it themselves: durable-streams refuses a DELETE of
+  a stream it is already deleting (`503 stream retirement in progress`), so N concurrent deletes of
+  one stream fail all but the first.
 - Every boot enqueues each `Dropped` the catalog fold could not match with a `Retired`. That closes
   the crash window (the in-memory queue is lost at exit and costs nothing, because the intent is
   durable) and doubles as the orphan-`shape/*` GC — bounded by the catalog rather than by a storage

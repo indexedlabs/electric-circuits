@@ -643,7 +643,12 @@ canvas update, screenshot.
   queue (retries 500 ms → 5 s until it lands), and every boot re-queues the fold's unmatched intents —
   which is also the orphan-`shape/*` GC, bounded by the catalog because durable-streams has no list
   API. `GET /shapes/{id}` is 404 from the moment the record goes, pending retirement or not. If you
-  add a retirement site, write `Dropped` first and go through `Engine::retire_shape_stream`.
+  add a retirement site, write `Dropped` first and go through `Engine::retire_shape_stream`. The one
+  exception is a group's shared stream, which every member writes: group teardown purges each member
+  with `StreamRetirement::Group` (its `Dropped`, no delete) and then `Engine::retire_group_stream`
+  retires the stream **once**, recording every member's `Retired`. A member that deleted it too would
+  race the others, and durable-streams refuses a concurrent DELETE with `503 stream retirement in
+  progress`.
 - **A shape id is never re-minted, and the surviving records are not the high-water mark.** The boot
   resumes `next_shape_id` past the maximum id of every `Created` the catalog fold saw, dropped ones
   included (`CatalogFold::max_shape_id`), before the `is_empty()` early return and in `Park` alike. A
