@@ -309,7 +309,7 @@ fn test_subq() -> SubqueryHandle {
     let (trace_tx, _) = tokio::sync::broadcast::channel(16);
     let degrade = DegradeState::new();
     let shutdown = crate::shutdown::ShutdownToken::new();
-    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), pending_flips.clone());
+    let group_lanes = emission::GroupEmissionLanes::new(ds, shutdown.clone(), Default::default());
     spawn_flip_propagator(
         registry.clone(),
         flip_rx,
@@ -897,14 +897,9 @@ async fn coalesced_reactivation_scans_once_and_isolates_append_failures() {
     assert_eq!(store.read_count.load(std::sync::atomic::Ordering::Relaxed), 1, "one page read must serve both shapes");
 }
 
-/// The detached wake half of the same production incident the join-timeout regression covers from
-/// the caller's side. A store that accepts the replay `GET` and then never finishes the response
-/// leaves the coalesced worker parked in `read_for_table` **holding a reactivation permit**: the
-/// shape never leaves `Reactivating`, and because the engine only ever grants two permits, every
-/// later reactivation queues behind one nothing will return. Bounding the read is what lets the
-/// permit come back and the retired identity be recreated.
-#[tokio::test(start_paused = true)]
-async fn a_stalled_replay_page_returns_its_reactivation_permit_and_leaves_a_recreatable_shape() {
+/// An engine whose dormant shape `s1` reactivates against a store that accepts the replay page
+/// and never finishes it, so the reactivation fails.
+async fn engine_with_dormant_shape_behind_a_stalled_replay_page() -> Engine {
     let store = std::sync::Arc::new(crate::ds::ScriptedStore {
         head_offsets: std::sync::Mutex::new(vec![
             "0000000000000000_0000000000000100".into(),
@@ -953,6 +948,18 @@ async fn a_stalled_replay_page_returns_its_reactivation_permit_and_leaves_a_recr
             },
         },
     );
+    engine
+}
+
+/// The detached wake half of the same production incident the join-timeout regression covers from
+/// the caller's side. A store that accepts the replay `GET` and then never finishes the response
+/// leaves the coalesced worker parked in `read_for_table` **holding a reactivation permit**: the
+/// shape never leaves `Reactivating`, and because the engine only ever grants two permits, every
+/// later reactivation queues behind one nothing will return. Bounding the read is what lets the
+/// permit come back and the retired identity be recreated.
+#[tokio::test(start_paused = true)]
+async fn a_stalled_replay_page_returns_its_reactivation_permit_and_leaves_a_recreatable_shape() {
+    let engine = engine_with_dormant_shape_behind_a_stalled_replay_page().await;
 
     let joined = tokio::time::timeout(std::time::Duration::from_secs(600), engine.ensure_active("s1"))
         .await
@@ -979,6 +986,44 @@ async fn a_stalled_replay_page_returns_its_reactivation_permit_and_leaves_a_recr
         .await
         .expect("a create for the same predicate must fall through, not rejoin the abandoned replay")
         .unwrap();
+}
+
+/// The deployment page's alarm reads `engine_reactivations_failed_total` off the scrape route, so a
+/// real reactivation failure has to show up there and not only in the `/metrics` JSON.
+#[tokio::test(start_paused = true)]
+async fn a_failed_reactivation_raises_the_failed_series_on_the_prometheus_route() {
+    use tower::ServiceExt;
+    let engine = engine_with_dormant_shape_behind_a_stalled_replay_page().await;
+    tokio::time::timeout(std::time::Duration::from_secs(600), engine.ensure_active("s1"))
+        .await
+        .expect("the join must bound its own wait")
+        .expect_err("a reactivation whose replay page never arrived is not an active shape");
+
+    // The caller's join gives up before the detached worker's read deadline, so the failure is
+    // counted a little after `ensure_active` returns: poll the route until the series moves.
+    let mut last = String::new();
+    let mut value = 0;
+    for _ in 0..300 {
+        let response = crate::http::router(engine.clone())
+            .oneshot(axum::http::Request::builder().uri("/metrics/prometheus").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let scrape = String::from_utf8(bytes.to_vec()).unwrap();
+        last = scrape
+            .lines()
+            .find(|line| line.starts_with("engine_reactivations_failed_total"))
+            .unwrap_or_else(|| panic!("engine_reactivations_failed_total missing from the scrape: {scrape}"))
+            .to_string();
+        value = last.rsplit(' ').next().unwrap().parse::<u64>().unwrap();
+        if value >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(value >= 1, "a failed reactivation must raise the series within 300 s: {last}");
+    assert!(engine.metrics.snapshot()["counters"]["reactivations_failed"].as_u64().unwrap() >= 1);
 }
 
 #[tokio::test]
@@ -2857,8 +2902,7 @@ async fn a_subquery_shapes_live_output_carries_the_commit_time() {
     sq::insert_outer_shape(&mut reg, "s100", "issues", sq::keyed_membership_pred(100, &sig));
     let (flip_tx, _flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(PendingFlips::default());
-    let group_lanes =
-        emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), pending_flips.clone());
+    let group_lanes = emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), Default::default());
     let subq = SubqueryHandle {
         registry: Arc::new(Mutex::new(reg)),
         flip_tx,

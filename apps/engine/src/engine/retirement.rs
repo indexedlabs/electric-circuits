@@ -31,9 +31,9 @@ pub(crate) fn retire_backoff(attempt: u32) -> std::time::Duration {
 /// One outstanding retirement.
 struct Retirement {
     stream_path: String,
-    /// The shape whose `Dropped` this completes, if any — a change-log segment or a rolled-back
-    /// create's stream has no record to close out.
-    shape_id: Option<String>,
+    /// The shapes whose `Dropped` this completes: one for a shape's own stream, every member for a
+    /// group's shared stream, none for a change-log segment or a rolled-back create's stream.
+    shape_ids: Vec<String>,
     attempt: u32,
     completion: Option<Arc<RetirementCompletion>>,
 }
@@ -94,6 +94,36 @@ impl RetirementCompletion {
     }
 }
 
+/// The one retirement attempt on a group's shared stream, which every member's purge waits on: a
+/// member's [`crate::engine::PurgeBarrier`] completes once the group has tried the delete (landed or
+/// queued), exactly as an owned stream's durable purge completes after its own first attempt.
+/// Waiting for a queued delete to land would let an ordinary drift that meets the barrier stall
+/// ingest for a whole storage outage (ADR-0007). Settled by [`Engine::retire_group_stream`];
+/// dropped unsettled (the teardown task was cancelled), it fails its waiters rather than stranding
+/// them.
+pub(crate) struct SharedRetirement {
+    completion: Option<Arc<RetirementCompletion>>,
+}
+
+impl SharedRetirement {
+    pub(crate) fn new() -> Self {
+        Self { completion: Some(RetirementCompletion::new_non_durable()) }
+    }
+
+    /// What a member's purge waits on.
+    pub(crate) fn settled(&self) -> Arc<RetirementCompletion> {
+        self.completion.clone().expect("a shared retirement is settled only by consuming it")
+    }
+}
+
+impl Drop for SharedRetirement {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.fail();
+        }
+    }
+}
+
 fn abandon_retirements(
     metrics: &crate::metrics::Metrics,
     current: Option<Retirement>,
@@ -135,20 +165,24 @@ impl RetirementQueue {
         self.enqueue_with_completion(stream_path, shape_id, None);
     }
 
+    /// Hand a stream shared by several shapes to the queue: one retirement, completing each.
+    pub(crate) fn enqueue_shared(&self, stream_path: &str, shape_ids: &[String]) {
+        self.push(stream_path, shape_ids.to_vec(), None);
+    }
+
     pub(crate) fn enqueue_with_completion(
         &self,
         stream_path: &str,
         shape_id: Option<&str>,
         completion: Option<Arc<RetirementCompletion>>,
     ) {
+        self.push(stream_path, shape_id.map(str::to_string).into_iter().collect(), completion);
+    }
+
+    fn push(&self, stream_path: &str, shape_ids: Vec<String>, completion: Option<Arc<RetirementCompletion>>) {
         self.pending.fetch_add(1, Ordering::SeqCst);
         self.metrics.retirements_pending.store(self.pending.load(Ordering::SeqCst), Ordering::Relaxed);
-        let item = Retirement {
-            stream_path: stream_path.to_string(),
-            shape_id: shape_id.map(str::to_string),
-            attempt: 0,
-            completion,
-        };
+        let item = Retirement { stream_path: stream_path.to_string(), shape_ids, attempt: 0, completion };
         if self.tx.send(item).is_err() {
             self.pending.fetch_sub(1, Ordering::SeqCst);
             // Republish: the gauge is written from the counter, so an un-mirrored decrement would
@@ -213,9 +247,10 @@ pub(crate) fn spawn_retirement_queue(
                 Ok(()) => {
                     // Only now: `Retired` means "storage accepted the delete", and the whole point
                     // of the record is that it can be trusted at the next boot.
-                    if let Some(id) = &item.shape_id {
-                        let retired = CatalogEvent::Retired { id: id.clone() };
-                        if item.completion.as_ref().is_some_and(|completion| completion.durable) {
+                    let durable = item.completion.as_ref().is_some_and(|completion| completion.durable);
+                    for id in std::mem::take(&mut item.shape_ids) {
+                        let retired = CatalogEvent::Retired { id };
+                        if durable {
                             if let Err(error) = catalog_tx.send_durable(retired).await {
                                 tracing::error!(error = %error, "retirement completion could not reach the catalog");
                                 abandon_retirements(shutdown.metrics(), Some(item), &mut queue, &mut rx, &counter);
@@ -225,9 +260,10 @@ pub(crate) fn spawn_retirement_queue(
                             catalog_tx.send(retired);
                         }
                     }
-                    if item.attempt > 0 {
-                        tracing::info!("retired stream {} after {} retr(ies)", item.stream_path, item.attempt);
-                    }
+                    // Every queued retirement says when it lands, first attempt included: each one
+                    // was announced with a `queued` warning, and a queued stream with no matching
+                    // line cannot be told apart from one that leaked.
+                    tracing::info!("retired stream {} from the queue after {} retr(ies)", item.stream_path, item.attempt);
                     counter.fetch_sub(1, Ordering::SeqCst);
                     shutdown.metrics()
                         .retirements_pending
@@ -316,6 +352,34 @@ impl Engine {
         }
     }
 
+    /// Retire a group's shared stream once, for every member that wrote it, and complete each
+    /// member's retirement (ADR-0007) when storage accepts the delete. Callers have made each
+    /// member's `Dropped` durable first, so a storage failure is queued rather than reported: the
+    /// queue retries it until it lands, and a restart before then finds the members' `Dropped`
+    /// records and retires the stream again. `shared` settles once the delete has been tried,
+    /// landed or queued, which is when the members' purge barriers complete.
+    pub(crate) async fn retire_group_stream(
+        &self,
+        stream_path: &str,
+        members: &[String],
+        mut shared: SharedRetirement,
+    ) {
+        let completion = shared.completion.take().expect("a shared retirement is settled once");
+        match self.ds.retire_stream(stream_path).await {
+            Ok(()) => {
+                for id in members {
+                    self.catalog_tx.send(CatalogEvent::Retired { id: id.clone() });
+                }
+                completion.complete();
+            }
+            Err(error) => {
+                tracing::warn!(%error, %stream_path, members = members.len(), "group stream retirement failed; queued");
+                self.retirements.enqueue_shared(stream_path, members);
+                completion.complete();
+            }
+        }
+    }
+
     /// Retirements enqueued and not yet completed (introspection + the `retirements_pending` gauge).
     pub fn pending_retirements(&self) -> u64 {
         self.retirements.pending()
@@ -326,6 +390,21 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::catalog::testing::FakeDs;
+
+    /// A group teardown cancelled before its retirement attempt releases the members' barriers as
+    /// failed instead of stranding them.
+    #[tokio::test]
+    async fn an_unsettled_shared_retirement_fails_its_waiters_when_dropped() {
+        let shared = SharedRetirement::new();
+        let (first, second) = (shared.settled(), shared.settled());
+        drop(shared);
+        for waiter in [first, second] {
+            let settled = tokio::time::timeout(std::time::Duration::from_secs(1), waiter.wait())
+                .await
+                .expect("a dropped shared retirement must release its waiters");
+            assert!(settled.is_err(), "an unattempted retirement is not reported as settled");
+        }
+    }
 
     #[test]
     fn the_retirement_schedule_climbs_to_five_seconds_and_stays() {

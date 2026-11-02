@@ -7,29 +7,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Per-engine group activity.  This is deliberately owned by the Engine rather than a
-/// process-global counter: two engines may share a process during a handoff and their
-/// transaction fences must not affect one another.
-#[derive(Clone, Default)]
-pub(crate) struct GroupFence {
-    active: Arc<AtomicUsize>,
-}
-
-impl GroupFence {
-    pub(crate) fn activate(&self) {
-        self.active.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn deactivate(&self) {
-        let _ = self.active.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-    }
-
-    pub(crate) fn active(&self) -> bool {
-        self.active.load(Ordering::Acquire) != 0
-    }
-}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GroupMember {

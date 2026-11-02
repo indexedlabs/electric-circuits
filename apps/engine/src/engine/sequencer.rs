@@ -144,7 +144,6 @@ pub(crate) fn spawn_sequencer(
     source_receipt_progress: Arc<std::sync::Mutex<SourceReceiptProgress>>,
     runtime_receipts: Arc<std::sync::Mutex<crate::runtime_authority::RuntimeReceipts>>,
     subq: SubqueryHandle,
-    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -185,7 +184,6 @@ pub(crate) fn spawn_sequencer(
         stats.clone(),
         node_states.clone(),
         subq,
-        group_fence,
         trace_tx,
         arr,
         arr_gates,
@@ -455,7 +453,6 @@ pub(crate) async fn sequencer_loop(
     stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
     node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
     subq: SubqueryHandle,
-    group_fence: crate::engine::GroupFence,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
@@ -495,6 +492,10 @@ pub(crate) async fn sequencer_loop(
     // keep advancing the highwater, and that progress has to reach the catalog or a crash
     // re-applies them (ADR-0003).
     let mut ckpt_hw: Option<(u64, u64)> = restore_highwater;
+    // The per-group resume points the last checkpoint carried (OTTO-11131). A change in them is
+    // progress worth persisting too: a group that has caught up should not restore detached just
+    // because a quiet source never moved the position again.
+    let mut ckpt_groups: BTreeMap<String, u64> = BTreeMap::new();
     // The rotation pointer this segment carried (ADR-0006). It can arrive in a batch that is not
     // yet flagged `closed` — the pointer append and the close are two requests — so it is
     // remembered until the close actually lands, and the segment is only left once BOTH are in.
@@ -531,12 +532,6 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
-    // Groups add one cross-lane fence: before the next source transaction is allowed to
-    // publish, all deferred subquery effects from the previous transaction must have landed.
-    // This is enabled only while at least one group lease is active; ordinary single-table
-    // shapes keep their existing throughput path.
-    let mut last_group_lsn: Option<u64> = None;
-    let mut last_group_paths = HashSet::new();
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -572,7 +567,7 @@ pub(crate) async fn sequencer_loop(
                 Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
                     let res = activate_shape(
                         &ds, &mut execs, &table, &shape_id, gate, agg_seed, emitted_seed, &mut emitted,
-                        &shutdown,
+                        &shutdown, Some(&subq.group_lanes),
                     ).await;
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
@@ -784,14 +779,6 @@ pub(crate) async fn sequencer_loop(
                     let mut touched = false;
                     let mut processing_failed = false;
                     for mut transaction in page.ready {
-                        if group_fence.active()
-                            && let Some(previous) = last_group_lsn
-                            && !wait_for_group_effects(&subq.group_lanes, &last_group_paths, &shutdown, previous).await
-                        {
-                            tracing::error!(previous, "group transaction barrier could not drain before the next commit");
-                            processing_failed = true;
-                            break;
-                        }
                         // Commit highwater only after the complete transaction succeeds. If an
                         // envelope fails, staged output is discarded and replay must retry the
                         // whole transaction rather than skipping an earlier prefix.
@@ -961,40 +948,26 @@ pub(crate) async fn sequencer_loop(
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
                         }
-                        // Group members, including ordinary filters, use the same bounded append
-                        // entry point as deferred subquery effects. This keeps a group's outputs
-                        // behind its source-transaction barrier and applies backpressure only to
-                        // that group's stream.
+                        // Group members, including ordinary filters, go to the group's own lane,
+                        // the same entry point as deferred subquery effects. The lane keeps the
+                        // group's output in commit order behind its own barrier; the sequencer
+                        // never waits for it (OTTO-11131: a commit is atomic within each group,
+                        // not across all streams).
                         let group_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
                         let group_paths: Vec<String> = txn_pending
                             .keys()
                             .filter(|path| path.starts_with("shape/group-"))
                             .cloned()
                             .collect();
-                        let direct_group_paths: HashSet<String> = group_paths.iter().cloned().collect();
                         for path in group_paths {
                             if let Some(envs) = txn_pending.remove(&path) {
-                                subq.group_lanes.enqueue(&path, envs, group_lsn).await;
+                                subq.group_lanes.push(&path, envs, group_lsn);
                             }
                         }
-                        // Transaction boundary: every append of this commit lands before the next
-                        // commit is processed.
+                        // Transaction boundary: every non-group append of this commit lands
+                        // before the next commit is processed.
                         if let Err(error) = flush_pending(&ds, txn_pending).await {
                             tracing::warn!(%error, "sequencer append interrupted; preserving replay boundary");
-                            highwater = txn_highwater;
-                            processing_failed = true;
-                            break;
-                        }
-                        if !direct_group_paths.is_empty()
-                            && !wait_for_group_effects(
-                                &subq.group_lanes,
-                                &direct_group_paths,
-                                &shutdown,
-                                group_lsn,
-                            )
-                            .await
-                        {
-                            tracing::error!(group_lsn, "group output could not land before advancing the processed position");
                             highwater = txn_highwater;
                             processing_failed = true;
                             break;
@@ -1051,18 +1024,7 @@ pub(crate) async fn sequencer_loop(
                             *last_source_receipt.lock().unwrap() = Some(receipt);
                             tracing::info!(source_commit_id, commit_lsn = ?lsn, "source transaction durably drained");
                         }
-                        if group_fence.active()
-                            && let Some(commit_lsn) = lsn.as_deref().map(crate::pg::lsn_to_u64)
-                        {
-                            let paths = subq.group_lanes.paths_at_or_before(commit_lsn);
-                            if !paths.is_empty() {
-                                last_group_lsn = Some(commit_lsn);
-                                last_group_paths = paths;
-                            } else {
-                                last_group_lsn = None;
-                                last_group_paths.clear();
-                            }
-                        }
+                        subq.group_lanes.note_commit(group_lsn);
                     }
                     if processing_failed {
                         // The read cursor advances before processing; rewind it to the page that
@@ -1145,15 +1107,22 @@ pub(crate) async fn sequencer_loop(
                     // Either half moving is progress worth persisting: the position, or — while the
                     // position is pinned behind a held run — the de-duplication highwater.
                     let ckpt_moved = ckpt != ckpt_pos || highwater != ckpt_hw;
-                    if crossed || (next.is_some() && ckpt_moved && last_ckpt.elapsed() >= std::time::Duration::from_secs(2)) {
+                    let groups = behind_groups(&subq, highwater);
+                    let groups_moved = groups != ckpt_groups;
+                    if crossed
+                        || (next.is_some()
+                            && (ckpt_moved || groups_moved)
+                            && last_ckpt.elapsed() >= std::time::Duration::from_secs(2))
+                    {
                         ckpt_pos = ckpt.clone();
                         ckpt_hw = highwater;
+                        ckpt_groups = groups.clone();
                         last_ckpt = std::time::Instant::now();
                         // The de-duplication highwater rides WITH the position (ADR-0003): a crash
                         // after a prefix of a chunked commit was applied and checkpointed would
                         // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
                         // weights are not idempotent under duplicates.
-                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater });
+                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater, groups });
                     }
                     if touched {
                         publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
@@ -1242,7 +1211,8 @@ pub(crate) async fn sequencer_loop(
     // held run it would also re-read a transaction the ingestor never finished.
     if !paused && completed_read {
         let ckpt = published(&pos, &held_from);
-        catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater });
+        let groups = behind_groups(&subq, highwater);
+        catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater, groups });
         tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
     } else if paused {
         tracing::info!("sequencer: stopped while replay was paused; no checkpoint published");
@@ -1279,27 +1249,14 @@ async fn wait_for_source_effects(
     }
 }
 
-async fn wait_for_group_effects(
-    lanes: &crate::engine::emission::GroupEmissionLanes,
-    paths: &HashSet<String>,
-    shutdown: &crate::shutdown::ShutdownToken,
-    marker_lsn: u64,
-) -> bool {
-    loop {
-        if shutdown.is_shutting_down() {
-            return false;
-        }
-        let wake = lanes.wake();
-        let notified = wake.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if !lanes.has_origin_at_or_before(paths, marker_lsn) {
-            return true;
-        }
-        tokio::select! {
-            _ = notified => {}
-            _ = shutdown.wait() => return false,
-        }
+/// The per-group resume points a checkpoint at `highwater` carries: every group with output at
+/// or before it that is not on its stream (OTTO-11131). The checkpoint no longer waits for a
+/// group, so a restart from it restores each of these groups detached, and the group reattaches
+/// behind a must-refetch marker instead of silently missing the commits the checkpoint passed.
+fn behind_groups(subq: &SubqueryHandle, highwater: Option<(u64, u64)>) -> BTreeMap<String, u64> {
+    match highwater {
+        Some((lsn, _)) => subq.group_lanes.behind_at_or_before(lsn),
+        None => BTreeMap::new(),
     }
 }
 
@@ -1466,6 +1423,9 @@ pub(crate) async fn activate_shape(
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
     shutdown: &crate::shutdown::ShutdownToken,
+    // A group member's buffered output goes to the group's lane, as its live output does, so a
+    // group stream that stops answering during a member's activation never holds the sequencer.
+    group_lanes: Option<&crate::engine::emission::GroupEmissionLanes>,
 ) -> std::result::Result<(), ActivateFailure> {
     let exec = execs
         .get_mut(table.as_str())
@@ -1516,6 +1476,7 @@ pub(crate) async fn activate_shape(
             // ...then drain the buffer through the gate. `matches()` evaluates equality templates
             // and standalone predicates alike, so one replay path covers both placements.
             let mut outs: Vec<Envelope> = Vec::new();
+            let mut by_commit: Vec<(u64, std::ops::Range<usize>)> = Vec::new();
             for env in &p.buffered {
                 let Ok((delta, txid, lsn)) = apply_envelope(&exec.ts, env) else { continue };
                 if delta.is_empty() {
@@ -1533,8 +1494,20 @@ pub(crate) async fn activate_shape(
                 let first = outs.len();
                 outs.extend(translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)));
                 carry_commit_time(&mut outs[first..], env.headers.commit_ts);
+                by_commit.push((lsn_u64, first..outs.len()));
             }
-            if !outs.is_empty() {
+            if !outs.is_empty()
+                && p.stream_path.starts_with("shape/group-")
+                && let Some(lanes) = group_lanes
+            {
+                *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
+                let mut drained = outs.into_iter();
+                let batches = by_commit
+                    .into_iter()
+                    .map(|(commit_lsn, range)| (commit_lsn, drained.by_ref().take(range.len()).collect()))
+                    .collect();
+                lanes.push_drain(&p.stream_path, batches);
+            } else if !outs.is_empty() {
                 *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
                 ds.append_reliable(&p.stream_path, &outs)
                     .await
@@ -2186,9 +2159,9 @@ pub(crate) async fn process_envelope(
     // (`pending_flips == 0`).
     {
         let mut group_paths = HashSet::new();
-        let (result, staged_group_emissions) = {
+        let work = {
             let mut reg = subq.registry.lock().await;
-            let result = if reg.touches(&ts.table) {
+            if reg.touches(&ts.table) {
                 if let Some(commit_ts) = commit_ts {
                     reg.note_commit_time(lsn_u64, commit_ts);
                 }
@@ -2214,21 +2187,8 @@ pub(crate) async fn process_envelope(
                 result
             } else {
                 Ok(std::collections::VecDeque::new())
-            };
-            (result, reg.take_group_emissions())
-        };
-        let work = match result {
-            Ok(work) => {
-                for handle in staged_group_emissions {
-                    handle.wait().await;
-                }
-                work
             }
-            Err(error) => {
-                drop(staged_group_emissions);
-                return Err(error);
-            }
-        };
+        }?;
         if !work.is_empty() {
             subq.pending_flips.add(lsn_u64);
             if subq
@@ -2646,7 +2606,6 @@ mod source_fence_tests {
             Default::default(),
             Default::default(),
             engine.subquery_handle(),
-            engine.group_fence.clone(),
             engine.trace_tx.clone(),
             None,
             HashMap::new(),
@@ -2703,7 +2662,7 @@ mod source_fence_tests {
             flip_tx,
             pending_flips: pending_flips.clone(),
             degrade: DegradeState::new(),
-            group_lanes: crate::engine::emission::GroupEmissionLanes::new(ds, shutdown, pending_flips.clone()),
+            group_lanes: crate::engine::emission::GroupEmissionLanes::new(ds, shutdown, Default::default()),
         }
     }
 
@@ -2880,6 +2839,83 @@ mod pending_buffer_tests {
         );
     }
 
+    /// OTTO-11131: a group member's activation drain goes to the group's lane, so a group stream
+    /// that stops answering while a member is created never holds the sequencer, and a drain
+    /// larger than the lane's byte cap queues whole instead of detaching the new group.
+    #[tokio::test]
+    async fn a_group_members_activation_drain_goes_to_its_lane_without_tripping_the_byte_cap() {
+        let ts = users();
+        let path = "shape/group-9";
+        let buffered: Vec<Envelope> = (1..=20u64)
+            .map(|key| {
+                let mut env = envelope(key, 1024);
+                env.headers.lsn = Some(format!("0/{key:X}"));
+                env
+            })
+            .collect();
+        let mut exec = TableExec::new(ts.clone());
+        let mut member = pending(&ts, buffered);
+        member.stream_path = path.to_string();
+        exec.pending.insert("s1".to_string(), member);
+        let mut execs = HashMap::from([(ts.table.to_string(), exec)]);
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (hold, held) = tokio::sync::watch::channel(true);
+        *store.stream_hold.lock().unwrap() = Some((path.into(), held));
+        let ds = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        let config = crate::engine::emission::GroupLaneConfig { memory_bytes: 4096, ..Default::default() };
+        let lanes =
+            crate::engine::emission::GroupEmissionLanes::new(ds.clone(), crate::shutdown::ShutdownToken::new(), config);
+        lanes.register(path);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            activate_shape(
+                &ds,
+                &mut execs,
+                &ts.table,
+                "s1",
+                crate::pg::SnapshotGate::passthrough(),
+                None,
+                0,
+                &mut HashMap::new(),
+                &crate::shutdown::ShutdownToken::new(),
+                Some(&lanes),
+            ),
+        )
+        .await
+        .expect("a held group stream held the activation")
+        .unwrap();
+        assert_eq!(ds.metrics().group_detaches.load(Ordering::Relaxed), 0, "the activation drain tripped the byte cap");
+        hold.send_replace(false);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let landed: usize = store
+                    .appended
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(p, _, _)| p.ends_with(path))
+                    .map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap().len())
+                    .sum();
+                if landed == 20 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the activation drain did not land");
+        let keys: Vec<String> = store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _, _)| p.ends_with(path))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<Envelope>>(body).unwrap())
+            .map(|env| env.key)
+            .collect();
+        assert_eq!(keys, (1..=20).map(|key| key.to_string()).collect::<Vec<_>>());
+    }
+
     /// A change that committed while the shape was being created is drained from its buffer at
     /// activation and appended outside any transaction's `txn_pending`; it still carries its
     /// commit time (`#g-commit-time`).
@@ -2903,6 +2939,7 @@ mod pending_buffer_tests {
             0,
             &mut HashMap::new(),
             &crate::shutdown::ShutdownToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2937,6 +2974,7 @@ mod pending_buffer_tests {
             0,
             &mut HashMap::new(),
             &crate::shutdown::ShutdownToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -3142,7 +3180,6 @@ mod held_spill_tests {
                 Default::default(),
                 Default::default(),
                 engine.subquery_handle(),
-                engine.group_fence.clone(),
                 engine.trace_tx.clone(),
                 None,
                 HashMap::new(),
@@ -3262,7 +3299,7 @@ mod held_spill_tests {
                 .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
                 .filter_map(|value| serde_json::from_value::<CatalogEvent>(value).ok())
                 .find_map(|ev| match ev {
-                    CatalogEvent::Offset { pos, highwater } => Some((pos, highwater)),
+                    CatalogEvent::Offset { pos, highwater, .. } => Some((pos, highwater)),
                     _ => None,
                 })
                 .expect("durable final offset")
@@ -3289,7 +3326,11 @@ mod held_spill_tests {
         h.engine.catalog_tx.seed_durable_offset(floor.clone(), Some((0x10, 2))).await;
         h.engine
             .catalog_tx
-            .send_durable(CatalogEvent::Offset { pos: floor.clone(), highwater: Some((0x10, 2)) })
+            .send_durable(CatalogEvent::Offset {
+                pos: floor.clone(),
+                highwater: Some((0x10, 2)),
+                groups: Default::default(),
+            })
             .await
             .unwrap();
         // A completed stale read defeats the older unread-shutdown guard. Exercise the actual

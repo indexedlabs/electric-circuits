@@ -31,6 +31,7 @@ mod catalog;
 mod circuit_serving;
 mod drift;
 pub(crate) mod emission;
+pub use emission::GroupDrain;
 pub(crate) mod epoch;
 mod executors;
 pub(crate) mod group;
@@ -91,8 +92,7 @@ pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;
 pub(crate) use group::{
-    GroupClaims, GroupConflict, GroupFence, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease,
-    GroupStreamClosed,
+    GroupClaims, GroupConflict, GroupLoadInFlight, GroupMember, GroupRecord, GroupRelease, GroupStreamClosed,
 };
 pub use introspection::{
     AggInfo, ArrConsumer, ArrCounts, ArrIndex, ArrInput, ArrangementGraph, EngineGraph, FamilyStat, GraphEdge,
@@ -607,8 +607,6 @@ pub struct Engine {
     pending_flips: Arc<PendingFlips>,
     /// Fail-closed degradation latch + abandoned-batch count (see [`DegradeState`]).
     degrade: Arc<DegradeState>,
-    /// Per-engine group transaction fence. It must never be process-global.
-    group_fence: GroupFence,
     group_lanes: crate::engine::emission::GroupEmissionLanes,
     /// Group teardowns keyed by group identity. A reload waits for an in-flight release instead of
     /// renewing the dying record or allowing a stale task to drop a replacement under the same name.
@@ -982,8 +980,9 @@ pub(crate) enum FlipWork {
         /// propagation — letting the activity log group them as one write (see
         /// `subquery::emit_flip_trace`).
         lsn: Option<String>,
-        /// Group stream paths reachable from this walk. Registered before the work is sent so a
-        /// following source transaction cannot pass the group fence while this walk is in flight.
+        /// Group stream paths reachable from this walk. Registered with each group's lane before the
+        /// work is sent, so no later commit's output for that group is appended while this walk is
+        /// in flight (the per-group barrier, OTTO-11131).
         group_paths: Vec<String>,
     },
     /// Work that reached a shape while it was still being created, run against that one shape now
@@ -1751,8 +1750,8 @@ impl Engine {
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(PendingFlips::default());
         let degrade = DegradeState::new();
-        let group_fence = GroupFence::default();
-        let group_lanes = emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), pending_flips.clone());
+        let group_lanes =
+            emission::GroupEmissionLanes::new(ds.clone(), shutdown.clone(), emission::GroupLaneConfig::from_env());
         // Ordered emission lanes for subquery-shape appends (network out from under the
         // registry lock; per-stream FIFO keeps append order = eval order). They share the
         // pendingFlips counter so the convergence barrier covers queued batches.
@@ -1833,7 +1832,6 @@ impl Engine {
             flip_tx,
             pending_flips,
             degrade,
-            group_fence,
             group_lanes,
             group_releases: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sequencer_read_failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2272,6 +2270,21 @@ impl Engine {
         self.source_receipts.lock().unwrap().get(source_commit_id).cloned()
     }
 
+    /// The per-group half of a source receipt (OTTO-11131). The shared receipt never waits for a
+    /// group, so a reader of one group asks the group too: whether its own output through the
+    /// receipt's commit is on its stream, or it must refetch. `None` when the commit has no
+    /// receipt yet or this engine serves no such group.
+    pub fn group_drain_receipt(&self, source_commit_id: &str, group_id: &str) -> Option<GroupDrain> {
+        let receipt = self.source_drain_receipt(source_commit_id)?;
+        self.group_drain_at(group_id, &receipt.commit_lsn)
+    }
+
+    /// Whether `group_id`'s output through `commit_lsn` is on its stream. `None` when this engine
+    /// serves no such group.
+    pub(crate) fn group_drain_at(&self, group_id: &str, commit_lsn: &str) -> Option<GroupDrain> {
+        self.group_lanes.drain(group_id, crate::pg::lsn_to_u64(commit_lsn))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_source_drain_receipt_for_test(&self, source_commit_id: &str) {
         let receipt = SourceDrainReceipt { source_commit_id: source_commit_id.to_owned(), commit_lsn: "0/0".into() };
@@ -2566,7 +2579,6 @@ impl Engine {
                 self.source_receipt_progress.clone(),
                 self.runtime_receipts.clone(),
                 self.subquery_handle(),
-                self.group_fence.clone(),
                 self.trace_tx.clone(),
                 self.arrangements.lock().unwrap().clone(),
                 self.arr_gates.read().unwrap().clone(),
@@ -3276,7 +3288,7 @@ impl Engine {
                     })
                     .collect::<Vec<_>>();
                 st.group_claims.complete(record.clone());
-                self.group_fence.activate();
+                self.group_lanes.set_meta(&record.stream_path, emission::GroupMeta::of(&record));
                 (true, renewals)
             } else {
                 (false, Vec::new())
@@ -3502,11 +3514,7 @@ impl Engine {
     /// catalog event is durable. The caller performs member releases outside the state lock.
     pub(crate) async fn take_group(&self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         let mut st = self.state.lock().await;
-        let record = st.group_claims.release_if_matches(subscription, group_id);
-        if record.is_some() {
-            self.group_fence.deactivate();
-        }
-        record
+        st.group_claims.release_if_matches(subscription, group_id)
     }
 
     pub(crate) async fn finish_group_release(&self, subscription: &str, group_id: &str) -> Result<()> {
