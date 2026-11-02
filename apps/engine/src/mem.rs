@@ -689,7 +689,12 @@ pub(crate) fn init_otel(
         ""
     );
     engine_counter!("engine_reactivations_completed", "Reactivations that finished", reactivations_completed, "");
-    engine_counter!("engine_reactivations_failed", "Dormant shapes whose reactivation failed", reactivations_failed, "");
+    engine_counter!(
+        "engine_reactivations_failed",
+        "Dormant shapes whose reactivation failed",
+        reactivations_failed,
+        ""
+    );
     engine_counter!(
         "engine_reactivation_joins_timed_out",
         "Touches that gave up waiting on an in-flight reactivation",
