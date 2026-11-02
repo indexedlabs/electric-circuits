@@ -657,6 +657,57 @@ pub(crate) fn init_otel(
     engine_counter!("engine_shapes_dormanted", "Retention: active -> dormant transitions", shapes_dormanted, "");
     engine_counter!("engine_shapes_reactivated", "Retention: dormant -> active transitions", shapes_reactivated, "");
     engine_counter!("engine_shapes_evicted", "Retention: dormant shapes evicted (stream deleted)", shapes_evicted, "");
+    engine_counter!("engine_reactivations_started", "Dormant-shape reactivations begun", reactivations_started, "");
+    engine_counter!(
+        "engine_reactivations_coalesced",
+        "Touches that joined an in-flight reactivation of the same shape",
+        reactivations_coalesced,
+        ""
+    );
+    engine_counter!(
+        "engine_reactivation_scans_coalesced",
+        "Reactivations that shared one table-stream scan",
+        reactivation_scans_coalesced,
+        ""
+    );
+    engine_counter!(
+        "engine_reactivations_replayed",
+        "Reactivations that replayed the table stream into the shape",
+        reactivations_replayed,
+        ""
+    );
+    engine_counter!(
+        "engine_reactivations_recreated",
+        "Reactivations answered by recreating the shape",
+        reactivations_recreated,
+        ""
+    );
+    engine_counter!(
+        "engine_reactivations_evicted_unresumable",
+        "Dormant shapes evicted because their stream could not be resumed",
+        reactivations_evicted_unresumable,
+        ""
+    );
+    engine_counter!("engine_reactivations_completed", "Reactivations that finished", reactivations_completed, "");
+    engine_counter!(
+        "engine_reactivations_failed",
+        "Dormant shapes whose reactivation failed",
+        reactivations_failed,
+        ""
+    );
+    engine_counter!(
+        "engine_reactivation_joins_timed_out",
+        "Touches that gave up waiting on an in-flight reactivation",
+        reactivation_joins_timed_out,
+        ""
+    );
+    engine_counter!(
+        "engine_reactivation_scanned",
+        "Bytes read from table streams by reactivations",
+        reactivation_bytes_scanned,
+        "By"
+    );
+    engine_counter!("engine_reactivation_spans", "Table-stream spans read by reactivations", reactivation_spans, "");
     engine_counter!(
         "engine_retention_pressure",
         "Sweeps where a cap was exceeded with nothing dormant to evict",
@@ -872,6 +923,31 @@ mod tests {
         let json = metrics.snapshot();
         assert_eq!(json["gauges"]["sequencer_held_bytes"], 4096);
         assert_eq!(json["counters"]["sequencer_held_spills_total"], 2);
+    }
+
+    #[test]
+    fn reactivation_counters_are_exported_on_the_scrape_route() {
+        use super::*;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        metrics.reactivations_failed.store(3, Ordering::Relaxed);
+        metrics.reactivations_completed.store(5, Ordering::Relaxed);
+        metrics.reactivation_bytes_scanned.store(2048, Ordering::Relaxed);
+        let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
+        let scrape = telemetry.prometheus_text();
+        telemetry.shutdown();
+        for (series, value) in [
+            ("engine_reactivations_failed_total", "3"),
+            ("engine_reactivations_completed_total", "5"),
+            ("engine_reactivation_scanned_bytes_total", "2048"),
+            ("engine_reactivations_started_total", "0"),
+        ] {
+            assert!(
+                scrape.lines().any(|line| line.starts_with(series) && line.ends_with(&format!(" {value}"))),
+                "{series} missing: {scrape}"
+            );
+        }
+        let json = metrics.snapshot();
+        assert_eq!(json["counters"]["reactivations_failed"], 3);
     }
 
     #[test]
