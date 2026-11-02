@@ -999,19 +999,30 @@ async fn a_failed_reactivation_raises_the_failed_series_on_the_prometheus_route(
         .expect("the join must bound its own wait")
         .expect_err("a reactivation whose replay page never arrived is not an active shape");
 
-    let response = crate::http::router(engine.clone())
-        .oneshot(axum::http::Request::builder().uri("/metrics/prometheus").body(axum::body::Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::OK);
-    let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
-    let scrape = String::from_utf8(bytes.to_vec()).unwrap();
-    let failed = scrape
-        .lines()
-        .find(|line| line.starts_with("engine_reactivations_failed_total"))
-        .unwrap_or_else(|| panic!("engine_reactivations_failed_total missing from the scrape: {scrape}"));
-    let value: u64 = failed.rsplit(' ').next().unwrap().parse().unwrap();
-    assert!(value >= 1, "a failed reactivation must raise the series: {failed}");
+    // The caller's join gives up before the detached worker's read deadline, so the failure is
+    // counted a little after `ensure_active` returns: poll the route until the series moves.
+    let mut last = String::new();
+    let mut value = 0;
+    for _ in 0..300 {
+        let response = crate::http::router(engine.clone())
+            .oneshot(axum::http::Request::builder().uri("/metrics/prometheus").body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024).await.unwrap();
+        let scrape = String::from_utf8(bytes.to_vec()).unwrap();
+        last = scrape
+            .lines()
+            .find(|line| line.starts_with("engine_reactivations_failed_total"))
+            .unwrap_or_else(|| panic!("engine_reactivations_failed_total missing from the scrape: {scrape}"))
+            .to_string();
+        value = last.rsplit(' ').next().unwrap().parse::<u64>().unwrap();
+        if value >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    assert!(value >= 1, "a failed reactivation must raise the series within 300 s: {last}");
     assert!(engine.metrics.snapshot()["counters"]["reactivations_failed"].as_u64().unwrap() >= 1);
 }
 
