@@ -432,7 +432,12 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
 2. The accept loop closes; in-flight requests finish. A parked `/v1/shape` `live=true` long-poll
    returns **at once** (it joins the shutdown token in its select) instead of holding the
    termination grace for its full `ELECTRIC_LIVE_TIMEOUT_MS` window — and so does the sequencer's own
-   long-poll on the change log.
+   long-poll on the change log. So does a `/v1/shape` `offset=-1` request still **waiting on a shared
+   snapshot build** (or still in the `HEAD` it makes on arrival): it answers `503` with `Retry-After: 1` rather than hold the grace for a build of
+   unknown length (the server's graceful stop waits for it, and Engine close runs only after that). A
+   *new* `offset=-1` is already refused at control admission, which closes when the token flips.
+   Under `ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES`, a catch-up read that is rebuilding its key set
+   (a client resuming at an older offset) also ends at the flip with `503` and `Retry-After: 1`.
 3. The **ingestor** finishes the transaction it is *appending*: if it is inside the chunked append
    it runs to completion and records its position **locally**. The acknowledgement Postgres sees is
    a separate thing — the replication client sends standby feedback on its own status interval
