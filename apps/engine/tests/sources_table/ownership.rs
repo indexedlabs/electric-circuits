@@ -1105,12 +1105,17 @@ async fn every_live_engine_evicts(f: &Fixture) -> Result<()> {
             handles.push((prefix, handle));
         }
         await_idle_release(f, &app, &shapes).await?;
+        // The registry itself, not an answer: a request the handle no longer serves gets 409 whether
+        // the entry is gone or the request's definition differs from the handle's.
+        for source in SOURCES {
+            let engine = host.engine_for_test(source).await.context("live source missing")?;
+            let (registered, _) = electric_circuits_engine::electric::registry_usage_for_test(&engine).await;
+            ensure!(registered == 0, "idle handle on {source} must be evicted, {registered} still registered");
+        }
+        // An evicted handle still resumes when it resends its definition.
         for (prefix, handle) in handles {
-            let (code, body) = f.read_handle(&app, &prefix, &handle).await?;
-            ensure!(
-                code == StatusCode::CONFLICT && body[0]["headers"]["control"] == "must-refetch",
-                "idle handle on {prefix} must be evicted, got {code}: {body}"
-            );
+            let (code, _, body) = f.resume(&app, &prefix, &handle).await?;
+            ensure!(code == StatusCode::OK, "evicted handle on {prefix} must resume, got {code}: {body:?}");
         }
         Ok(())
     }
@@ -1131,11 +1136,10 @@ async fn single_engine_controls(f: &Fixture) -> Result<()> {
         let graph = engine.graph().await;
         ensure!(graph.shapes.len() == 1, "single Engine should have one plain shape");
         await_idle_release(f, &app, &[(String::new(), graph.shapes[0].id.clone())]).await?;
-        let (code, body) = f.read_handle(&app, "", &handle).await?;
-        ensure!(
-            code == StatusCode::CONFLICT && body[0]["headers"]["control"] == "must-refetch",
-            "single Engine must still evict idle handles: {code} {body}"
-        );
+        let (registered, _) = electric_circuits_engine::electric::registry_usage_for_test(&engine).await;
+        ensure!(registered == 0, "single Engine must still evict idle handles, {registered} still registered");
+        let (code, _, body) = f.resume(&app, "", &handle).await?;
+        ensure!(code == StatusCode::OK, "the evicted handle must resume, got {code}: {body:?}");
 
         f.snapshot(&app, "", true).await?;
         let graph = engine.graph().await;
