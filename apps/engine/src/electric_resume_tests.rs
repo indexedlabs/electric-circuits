@@ -39,6 +39,13 @@ struct ByteStore {
     rebuild_reads: Arc<AtomicUsize>,
     /// While true, those reads park until it is false again.
     hold_rebuilds: Arc<watch::Sender<bool>>,
+    /// The rebuild reads that had arrived when the last hold was released. Counted then, because a
+    /// request that lost the race to read afterwards is a retry at an older offset, not a resume.
+    reads_held: Arc<AtomicUsize>,
+    /// This many rebuild reads answer 503 before the store recovers.
+    failing_rebuilds: Arc<AtomicUsize>,
+    /// This many change-log HEADs answer 503 before the store recovers.
+    failing_heads: Arc<AtomicUsize>,
 }
 
 impl Default for ByteStore {
@@ -47,6 +54,9 @@ impl Default for ByteStore {
             streams: Arc::default(),
             rebuild_reads: Arc::default(),
             hold_rebuilds: Arc::new(watch::channel(false).0),
+            reads_held: Arc::default(),
+            failing_rebuilds: Arc::default(),
+            failing_heads: Arc::default(),
         }
     }
 }
@@ -83,6 +93,11 @@ async fn byte_store(State(store): State<ByteStore>, request: Request) -> Respons
         return StatusCode::NO_CONTENT.into_response();
     }
     if method == Method::HEAD {
+        if path.contains("/changes/")
+            && store.failing_heads.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         let streams = store.streams.lock().unwrap();
         let Some(wire) = streams.get(&path) else { return StatusCode::NOT_FOUND.into_response() };
         let mut response = ([("stream-next-offset", format_offset(wire.bytes.len()))], "").into_response();
@@ -95,6 +110,10 @@ async fn byte_store(State(store): State<ByteStore>, request: Request) -> Respons
     if offset == "-1" && path.contains("/shape/") {
         store.rebuild_reads.fetch_add(1, Ordering::SeqCst);
         let _ = store.hold_rebuilds.subscribe().wait_for(|held| !held).await;
+        let failing = store.failing_rebuilds.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if failing.is_ok() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     }
     let start = if offset == "-1" { 0 } else { crate::changelog::offset_bytes(&offset).unwrap() as usize };
     let streams = store.streams.lock().unwrap();
@@ -256,6 +275,22 @@ async fn claims(source: &Source, shape: &str) -> usize {
     serde_json::from_slice::<serde_json::Value>(&body).unwrap()["subscriptions"].as_u64().unwrap() as usize
 }
 
+/// The kind (`created`, `joined`, `left`) of every catalog event that names `subscription`, in order.
+fn claim_events(stack: &Stack, subscription: &str) -> Vec<String> {
+    let streams = stack.store.streams.lock().unwrap();
+    let Some(wire) = streams.iter().find(|(path, _)| path.ends_with("/meta/catalog")).map(|(_, wire)| &wire.bytes)
+    else {
+        return Vec::new();
+    };
+    let items = std::str::from_utf8(&wire[..wire.len().saturating_sub(1)]).unwrap();
+    serde_json::from_str::<Vec<serde_json::Value>>(&format!("[{items}]"))
+        .unwrap()
+        .into_iter()
+        .filter(|event| event["subscription"] == subscription)
+        .map(|event| event["t"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// Long enough for requests that have finished their storage round-trips to reach the shared read.
 async fn let_requests_settle() {
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -283,6 +318,7 @@ impl Stack {
     async fn finish(&self, requests: Vec<tokio::task::JoinHandle<Answer>>) -> Vec<Answer> {
         self.rebuild_reads_arrived(1, &requests).await;
         let_requests_settle().await;
+        self.store.reads_held.store(self.store.rebuild_reads.load(Ordering::SeqCst), Ordering::SeqCst);
         self.store.hold_rebuilds.send_replace(false);
         let mut answers = Vec::new();
         for request in requests {
@@ -398,7 +434,7 @@ async fn concurrent_resumes_of_one_handle_are_one_rebuild_one_entry_one_claim() 
     }
     assert_eq!(registered(&source), 1);
     assert_eq!(claims(&source, "s1").await, 1);
-    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 1, "every resume must share one rebuild");
+    assert_eq!(stack.store.reads_held.load(Ordering::SeqCst), 1, "every resume must share one rebuild");
 }
 
 #[tokio::test]
@@ -428,11 +464,13 @@ async fn different_clients_at_one_offset_share_a_rebuild_and_keep_their_own_clai
     }
     assert_eq!(registered(&source), 2);
     assert_eq!(claims(&source, "s1").await, 2);
-    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 1, "same shape and offset must share one rebuild");
+    assert_eq!(stack.store.reads_held.load(Ordering::SeqCst), 1, "same shape and offset must share one rebuild");
 }
 
+/// A resume does not belong to the request that started it: the client going away does not stop it,
+/// so there is no half-done claim to clean up, and the retry is served by the same resume.
 #[tokio::test]
-async fn a_cancelled_resume_hands_over_to_the_next_and_leaves_no_stale_state() {
+async fn a_cancelled_resume_still_finishes_and_the_retry_uses_it() {
     let stack = stack().await;
     let source = source(&stack, "alpha").await;
     let (handle, empty) = snapshot(&source).await;
@@ -444,15 +482,153 @@ async fn a_cancelled_resume_hands_over_to_the_next_and_leaves_no_stale_state() {
     let (app, uri) = (source.app.clone(), at(&handle, &offset));
     let leader = tokio::spawn(async move { get(&app, uri).await });
     stack.rebuild_reads_arrived(1, std::slice::from_ref(&leader)).await;
+    leader.abort();
     let (app, uri) = (source.app.clone(), at(&handle, &offset));
     let waiter = tokio::spawn(async move { get(&app, uri).await });
-    let_requests_settle().await;
-    leader.abort();
-    stack.rebuild_reads_arrived(2, std::slice::from_ref(&waiter)).await;
     let answers = stack.finish(vec![waiter]).await;
     assert_eq!(answers[0].status, StatusCode::OK, "{:?}", answers[0].body);
     assert_eq!(registered(&source), 1);
     assert_eq!(claims(&source, "s1").await, 1);
+    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 1, "the retry must use the resume already running");
+}
+
+/// The claim's name is all a release has to go on, so a resume that gave it back after a retry had
+/// renewed it would take the retry's claim with it: in memory, and in the catalog, which a restart then
+/// believes. Here the first request goes away while its resume is held, the retry is waiting, and the
+/// first resume then fails and gives its claim back. The retry must take the claim only after that,
+/// and the catalog's last word on it is the judge, since the next poll would re-take it in memory.
+#[tokio::test]
+async fn a_given_back_claim_is_never_the_one_a_retry_holds() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    let subscription = handle.split_once('.').unwrap().1.to_string();
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    forget_handles(&source);
+
+    stack.hold_rebuilds();
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let first = tokio::spawn(async move { get(&app, uri).await });
+    stack.rebuild_reads_arrived(1, std::slice::from_ref(&first)).await;
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let retry = tokio::spawn(async move { get(&app, uri).await });
+    let_requests_settle().await;
+    first.abort();
+    let_requests_settle().await;
+    // The first resume's read fails once it is let go; the retry's own read, if it makes one, works.
+    stack.store.failing_rebuilds.store(1, Ordering::SeqCst);
+    let answers = stack.finish(vec![retry]).await;
+    assert_eq!(answers[0].status, StatusCode::OK, "{:?}", answers[0].body);
+    let_requests_settle().await;
+
+    let events = claim_events(&stack, &subscription);
+    assert_ne!(events.last().map(String::as_str), Some("left"), "the retry's claim was released: {events:?}");
+    assert_eq!(source.engine.subscription_owner(&subscription).await.as_deref(), Some("s1"));
+    assert_eq!(registered(&source), 1);
+}
+
+/// The other half: a resume that fails after its client has gone still gives back the claim it took.
+#[tokio::test]
+async fn a_cancelled_resume_that_fails_still_gives_back_the_claim_it_took() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    let subscription = handle.split_once('.').unwrap().1.to_string();
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    // The claim lapsed while the engine was down, so the resume takes it again.
+    forget_handles(&source);
+    source.engine.release_subscription("s1", Some(&subscription)).await;
+
+    stack.hold_rebuilds();
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let resume = tokio::spawn(async move { get(&app, uri).await });
+    stack.rebuild_reads_arrived(1, std::slice::from_ref(&resume)).await;
+    assert_eq!(claims(&source, "s1").await, 1, "the resume has taken the claim");
+    resume.abort();
+    stack.store.failing_rebuilds.store(1, Ordering::SeqCst);
+    stack.store.hold_rebuilds.send_replace(false);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while claims(&source, "s1").await != 0
+        || claim_events(&stack, &subscription).last().map(String::as_str) != Some("left")
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the claim was never given back: {:?}",
+            claim_events(&stack, &subscription)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(registered(&source), 0);
+}
+
+/// The moment after a restart is when storage is most contended. A client whose handle and offset are
+/// good must not be told to throw away its rows because a read failed: it retries, and resumes.
+#[tokio::test]
+async fn a_storage_failure_during_a_resume_is_retried_with_the_same_handle() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    forget_handles(&source);
+    source.ds.append("shape/s1", &[delete("k1")]).await.unwrap();
+
+    stack.store.failing_rebuilds.store(1, Ordering::SeqCst);
+    let failed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", failed.body);
+    assert_eq!(failed.header("retry-after"), "1");
+    assert_eq!(registered(&source), 0);
+    assert_eq!(claims(&source, "s1").await, 0, "a failed resume gives its claim back");
+
+    let resumed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    assert_eq!(resumed.changes(), [("delete".to_string(), "k1".to_string())]);
+    assert_eq!(claims(&source, "s1").await, 1);
+}
+
+/// A reactivation that cannot finish yet leaves the shape where it was: the client comes back.
+#[tokio::test]
+async fn a_deferred_reactivation_during_a_resume_is_retried_with_the_same_handle() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, offset) = snapshot(&source).await;
+    forget_handles(&source);
+    let unreadable = crate::changelog::LogPosition { segment: 0, offset: "-1".into() };
+    source.engine.park_dormant_shape_for_test("s1", "public.items", unreadable).await;
+    stack.store.failing_heads.store(1, Ordering::SeqCst);
+
+    let failed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", failed.body);
+    assert_eq!(failed.header("retry-after"), "1");
+    assert!(failed.body["message"].as_str().unwrap().contains("reactivation was deferred"), "{:?}", failed.body);
+
+    let resumed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    assert_eq!(resumed.header("electric-handle"), handle);
+}
+
+/// A draining engine's answer to a resume it cannot finish is the one every new long-poll gets.
+#[tokio::test]
+async fn a_resume_interrupted_by_shutdown_is_retried_on_the_next_process() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    forget_handles(&source);
+
+    stack.hold_rebuilds();
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let resume = tokio::spawn(async move { get(&app, uri).await });
+    stack.rebuild_reads_arrived(1, std::slice::from_ref(&resume)).await;
+    source.engine.shutdown_token().begin();
+    let answer = tokio::time::timeout(Duration::from_secs(10), resume).await.unwrap().unwrap();
+    stack.store.hold_rebuilds.send_replace(false);
+    assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE, "{:?}", answer.body);
+    assert_eq!(answer.header("retry-after"), "1");
 }
 
 #[tokio::test]
@@ -470,6 +646,95 @@ async fn an_idle_evicted_handle_takes_its_own_claim_back() {
     assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
     assert_eq!(claims(&source, "s1").await, 1);
     assert_eq!(source.engine.subscription_owner(&subscription).await.as_deref(), Some("s1"));
+}
+
+/// A refused resume costs the engine nothing: a resent definition that matches no shape must not
+/// leave one behind, or an old handle with a new `where` each time would mint shapes and streams that
+/// stay until retention reaps them. The claim is the guard while the handle holds it (it may name one
+/// shape only), so this is the handle whose claim lapsed or was evicted.
+#[tokio::test]
+async fn a_resume_whose_definition_matches_no_shape_creates_none() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, offset) = snapshot(&source).await;
+    let subscription = handle.split_once('.').unwrap().1.to_string();
+    forget_handles(&source);
+    source.engine.release_subscription("s1", Some(&subscription)).await;
+    let shape_streams = || stack.store.streams.lock().unwrap().keys().filter(|path| path.contains("/shape/")).count();
+    let before = shape_streams();
+    for n in 0..5 {
+        let uri = format!("{}&where={}", at(&handle, &offset), urlencode(&format!("label = 'other {n}'")));
+        assert!(get(&source.app, uri).await.must_refetch());
+    }
+    assert_eq!(shape_streams(), before, "a refused resume must not create a shape");
+    let status = source
+        .app
+        .clone()
+        .oneshot(Request::builder().uri("/shapes/s2").body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(get(&source.app, at(&handle, &offset)).await.status, StatusCode::OK);
+}
+
+/// Two requests on one unknown handle with different definitions: the first resumes, and the second,
+/// which waited for the first's turn, is judged on its own definition, not handed the entry the first
+/// registered. Served from that entry it would get rows from a stream its predicate never described.
+#[tokio::test]
+async fn a_resume_that_waited_for_a_turn_is_judged_on_its_own_definition() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    forget_handles(&source);
+
+    stack.hold_rebuilds();
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let first = tokio::spawn(async move { get(&app, uri).await });
+    stack.rebuild_reads_arrived(1, std::slice::from_ref(&first)).await;
+    let other = format!("{}&where={}", at(&handle, &offset), urlencode("label = 'other'"));
+    let app = source.app.clone();
+    let second = tokio::spawn(async move { get(&app, other).await });
+    let answers = stack.finish(vec![first, second]).await;
+    assert_eq!(answers[0].status, StatusCode::OK, "{:?}", answers[0].body);
+    assert!(answers[1].must_refetch(), "{} {:?}", answers[1].status, answers[1].body);
+    assert_eq!(registered(&source), 1);
+    assert_eq!(claims(&source, "s1").await, 1);
+    assert_eq!(get(&source.app, at(&handle, &answers[0].header("electric-offset"))).await.status, StatusCode::OK);
+}
+
+/// The evictor releases the claim a resume of the same handle would renew, so it waits for the
+/// handle's turn: held here, it must not touch the handle until the turn is given up, and a resume
+/// after it ends holding the claim, in memory and as the catalog's last word.
+#[tokio::test]
+async fn an_eviction_waits_for_the_handles_turn() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, offset) = snapshot(&source).await;
+    let subscription = handle.split_once('.').unwrap().1.to_string();
+    let entry = source.engine.electric_handles.entries.lock().unwrap()[&handle].clone();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    let turn = super::take_turn(&source.engine, &handle).await;
+    let (engine, id, idle) = (source.engine.clone(), handle.clone(), entry.clone());
+    let eviction = tokio::spawn(async move { super::evict_idle_handle(&engine, &id, &idle, Duration::ZERO).await });
+    let_requests_settle().await;
+    assert_eq!(registered(&source), 1, "the evictor must wait for the handle's turn");
+    assert_eq!(claims(&source, "s1").await, 1);
+    drop(turn);
+    tokio::time::timeout(Duration::from_secs(10), eviction).await.unwrap().unwrap();
+    assert_eq!(registered(&source), 0);
+    assert_eq!(claims(&source, "s1").await, 0);
+
+    let resumed = get(&source.app, at(&handle, &offset)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    let_requests_settle().await;
+    let events = claim_events(&stack, &subscription);
+    assert_ne!(events.last().map(String::as_str), Some("left"), "{events:?}");
+    assert_eq!(claims(&source, "s1").await, 1);
+    assert!(source.engine.electric_handles.resuming.lock().unwrap().is_empty(), "no turn may outlive its holders");
 }
 
 #[tokio::test]

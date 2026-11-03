@@ -204,9 +204,10 @@ Each response carries fresh `electric-handle` / `electric-offset` / `electric-cu
 loop with the new offset. If nothing happens within the long-poll window (default 20 s,
 `ELECTRIC_LIVE_TIMEOUT_MS`) you get `204 No Content`: just re-issue the request.
 
-If the handle has been evicted (idle for `ELECTRIC_HANDLE_TTL`, default 600 s) you get
-`409 Conflict` with `[{"headers":{"control":"must-refetch"}}]` — restart from `offset=-1` (the
-re-snapshot rejoins the retained live query; the engine keeps idle live queries dormant for days
+A handle survives an engine restart and idle eviction (`ELECTRIC_HANDLE_TTL`, default 600 s): repeat
+the same request and it resumes. If the live query it names is gone, or your request no longer
+resolves to it, you get `409 Conflict` with `[{"headers":{"control":"must-refetch"}}]` — restart from
+`offset=-1` (the re-snapshot rejoins the retained live query; the engine keeps idle live queries dormant for days
 before evicting them — see the retention section of `apps/engine/README.md`).
 Malformed requests (unknown table/column, bad `where`) are `400` with `{"message":"…"}`.
 

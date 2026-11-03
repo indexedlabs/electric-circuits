@@ -124,6 +124,13 @@ impl StreamScope {
         ))
     }
 
+    /// A short name for this scope, for a value that must not outlive it or cross into another.
+    pub(crate) fn tag(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let namespace = format!("{}/{}/{}", self.stack_namespace, self.store.store_generation, self.query_generation);
+        format!("{:x}", Sha256::digest(namespace.as_bytes()))[..16].to_string()
+    }
+
     #[doc(hidden)]
     pub fn in_process_test_scope() -> Self {
         Self::new("test-stack".to_string(), StoreIdentityV1::in_process_test_identity(), "test-query".to_string())

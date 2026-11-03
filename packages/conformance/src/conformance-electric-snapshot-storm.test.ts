@@ -204,7 +204,7 @@ describe('conformance: /v1/shape reconnect storm', () => {
       Array.from({ length: SHAPES }, async (_, grp) => {
         const res = await fetch(shapeUrl(harness, grp, '&offset=-1'))
         expect(res.status, await res.text()).toBe(200)
-        return res.headers.get('electric-handle')!.replace(/h\d+$/, '')
+        return res.headers.get('electric-handle')!.split('h')[0]!
       }),
     )
     await harness.restartEngine()

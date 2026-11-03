@@ -125,7 +125,8 @@ Electric clients/tools work:
   `electric-offset` headers. The `table` param is **resolved**, not stripped: `public.todos` and
   `reporting.todos` are different tables, and a bare `todos` means `public.todos`.
 - **Live:** `GET /v1/shape?...&handle=<h>&offset=<o>&live=true` long-polls for `insert`/`update`/
-  `delete` from that offset. An unknown handle returns `must-refetch`.
+  `delete` from that offset. An unknown handle resumes if the request still resolves to its shape,
+  as after an engine restart, and otherwise returns `must-refetch`.
 
 Here the `where` is a **SQL string** (`status = 'active' AND priority > 2`, `BETWEEN`, `IN (…)`,
 `IN (SELECT …)`, `NOT IN`), parsed by the engine's WHERE parser.
