@@ -705,6 +705,111 @@ async fn a_resume_that_waited_for_a_turn_is_judged_on_its_own_definition() {
     assert_eq!(get(&source.app, at(&handle, &answers[0].header("electric-offset"))).await.status, StatusCode::OK);
 }
 
+/// The clients of a restarted engine come back over seconds, one after another, not at one instant.
+/// Each resume at the same offset would otherwise fold the whole stream again, which is how a
+/// reconnecting fleet used twice the memory its snapshot did.
+#[tokio::test]
+async fn resumes_at_one_offset_one_after_another_cause_one_fold() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let mut handles = Vec::new();
+    let mut empty = String::new();
+    for _ in 0..8 {
+        let (handle, tail) = snapshot(&source).await;
+        handles.push(handle);
+        empty = tail;
+    }
+    source.ds.append("shape/s1", &[upsert("k1", "one"), upsert("k2", "two")]).await.unwrap();
+    // Every client reads on to the same offset, past the snapshot's tail, so no kept snapshot answers.
+    let mut offset = String::new();
+    for handle in &handles {
+        let read = get(&source.app, at(handle, &empty)).await;
+        assert_eq!(read.status, StatusCode::OK);
+        offset = read.header("electric-offset");
+    }
+    forget_handles(&source);
+    source.ds.append("shape/s1", &[delete("k1")]).await.unwrap();
+
+    stack.store.rebuild_reads.store(0, Ordering::SeqCst);
+    for handle in &handles {
+        let resumed = get(&source.app, at(handle, &offset)).await;
+        assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+        assert_eq!(resumed.changes(), [("delete".to_string(), "k1".to_string())]);
+    }
+    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 1, "eight resumes in a row must share one fold");
+    assert!(super::snapshot_cache_heap_bytes(&source.engine) > 0, "a kept rebuild must show in the memory probe");
+    super::close_handles(&source.engine);
+    assert_eq!(super::snapshot_cache_heap_bytes(&source.engine), 0);
+}
+
+/// A client at the tail of a kept `offset=-1` snapshot resumes from that snapshot's keys: no fold.
+#[tokio::test]
+async fn a_resume_at_a_kept_snapshots_tail_needs_no_fold() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    source.ds.append("shape/s1", &[upsert("k1", "one"), upsert("k2", "two")]).await.unwrap();
+    let (handle, tail) = snapshot(&source).await;
+    // Lost, as after an eviction; the snapshot it was answered from is still kept.
+    source.engine.electric_handles.entries.lock().unwrap().remove(&handle);
+    source.ds.append("shape/s1", &[delete("k2"), upsert("k1", "changed")]).await.unwrap();
+
+    stack.store.rebuild_reads.store(0, Ordering::SeqCst);
+    let resumed = get(&source.app, at(&handle, &tail)).await;
+    assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
+    assert_eq!(resumed.changes(), [("delete".to_string(), "k2".to_string()), ("update".to_string(), "k1".to_string())]);
+    assert_eq!(stack.store.rebuild_reads.load(Ordering::SeqCst), 0, "the kept snapshot's keys are the key set");
+}
+
+/// A registered handle is held to its definition as a resuming one is: a request that resends a
+/// different `where` or `columns` is told to refetch, not served rows from this handle's stream.
+#[tokio::test]
+async fn a_registered_handle_sent_with_another_definition_is_told_to_refetch() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, offset) = snapshot(&source).await;
+    let other_where = format!("{}&where={}", at(&handle, &offset), urlencode("label = 'other'"));
+    assert!(get(&source.app, other_where).await.must_refetch());
+    let other_columns = format!("{}&columns=id", at(&handle, &offset));
+    assert!(get(&source.app, other_columns).await.must_refetch());
+    assert_eq!(get(&source.app, at(&handle, &offset)).await.status, StatusCode::OK);
+    assert_eq!(registered(&source), 1);
+    assert_eq!(claims(&source, "s1").await, 1);
+}
+
+/// Engine close aborts its tasks, so a resume it cut off after taking the claim would leave behind a
+/// claim no client was given, durable, and restored by the next boot. Close waits for resumes in
+/// flight instead, and a resume interrupted by shutdown gives its claim back: the catalog's last word
+/// on the claim is `left`, which is what the next boot folds.
+#[tokio::test]
+async fn engine_close_waits_for_a_resume_to_give_back_the_claim_it_took() {
+    let stack = stack().await;
+    let source = source(&stack, "alpha").await;
+    let (handle, empty) = snapshot(&source).await;
+    let subscription = handle.split_once('.').unwrap().1.to_string();
+    source.ds.append("shape/s1", &[upsert("k1", "one")]).await.unwrap();
+    let offset = get(&source.app, at(&handle, &empty)).await.header("electric-offset");
+    // The claim lapsed while the engine was down, so the resume takes it again, durably.
+    forget_handles(&source);
+    source.engine.release_subscription("s1", Some(&subscription)).await;
+
+    stack.hold_rebuilds();
+    let (app, uri) = (source.app.clone(), at(&handle, &offset));
+    let resume = tokio::spawn(async move { get(&app, uri).await });
+    stack.rebuild_reads_arrived(1, std::slice::from_ref(&resume)).await;
+    assert_eq!(claims(&source, "s1").await, 1, "the resume has taken the claim");
+    assert!(source.engine.shutdown_token().outstanding().contains(&"electric resumes"));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), source.engine.close(Duration::from_secs(5)))
+        .await
+        .expect("close must not wait on the held read");
+    stack.store.hold_rebuilds.send_replace(false);
+    assert_eq!(outcome, crate::shutdown::ShutdownOutcome::Complete);
+    let answer = tokio::time::timeout(Duration::from_secs(10), resume).await.unwrap().unwrap();
+    assert!(answer.status.is_server_error() && !answer.must_refetch(), "{} {:?}", answer.status, answer.body);
+    let events = claim_events(&stack, &subscription);
+    assert_eq!(events.last().map(String::as_str), Some("left"), "the claim must not outlive the resume: {events:?}");
+}
+
 /// The evictor releases the claim a resume of the same handle would renew, so it waits for the
 /// handle's turn: held here, it must not touch the handle until the turn is given up, and a resume
 /// after it ends holding the claim, in memory and as the catalog's last word.

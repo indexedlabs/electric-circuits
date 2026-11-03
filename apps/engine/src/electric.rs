@@ -121,6 +121,10 @@ struct HandleEntry {
     /// sees it: the handle is its name for the same thing.
     subscription: String,
     table: TableRef,
+    /// The sharing key of the definition this handle was answered for. Every request on it must resend
+    /// a definition with the same key, or it is told to refetch: served from this stream, a different
+    /// `where` or `columns` would get rows its own definition never described.
+    signature: String,
     pk_cols: Vec<String>,
     /// When this handle was last touched by a request — drives idle-TTL eviction.
     last_access: std::sync::Mutex<Instant>,
@@ -204,6 +208,12 @@ pub(crate) struct HandleRegistry {
     /// One key-set rebuild at a time per (stream path, offset). The registry belongs to one Engine,
     /// which is what makes the path enough: `shape/s5` repeats across sources.
     rebuilds: Flights<(String, String), ResumeOutcome<Arc<HashSet<String>>>>,
+    /// Finished rebuilds by (stream path, offset), kept for [`REBUILD_REUSE_TTL`]: the clients of a
+    /// restarted engine come back over seconds, not at one instant, and each would otherwise fold
+    /// the whole stream again. Lock order: held only briefly, never across I/O.
+    kept_rebuilds: std::sync::Mutex<HashMap<(String, String), KeptRebuild>>,
+    /// How many resumes are in flight, and the shutdown party they hold while there are any.
+    resumes_in_flight: std::sync::Mutex<(usize, Option<crate::shutdown::ShutdownParty>)>,
     /// Snapshot builds by shape stream path: in flight, or finished and kept for reuse (see
     /// [`shared_snapshot`]). The registry belongs to one [`Engine`] — one source in sources-table
     /// mode — so this is keyed by engine as well as by path: two sources each have a `shape/s5`.
@@ -216,6 +226,7 @@ pub(crate) fn close_handles(engine: &Engine) {
     // Durable subscriptions retain their existing lease; shutdown adds no per-handle catalog work.
     drop(std::mem::take(&mut *engine.electric_handles.entries.lock().unwrap()));
     drop(std::mem::take(&mut *engine.electric_handles.snapshots.lock().unwrap()));
+    drop(std::mem::take(&mut *engine.electric_handles.kept_rebuilds.lock().unwrap()));
 }
 
 /// Observe the serving Engine's registry without creating or renewing a handle.
@@ -263,13 +274,15 @@ pub(crate) async fn ttl_registry_heap_bytes(engine: &Engine) -> usize {
 /// it is separate from [`ttl_registry_heap_bytes`] because it outlives no handle and expires on its
 /// own clock, not the handle TTL.
 pub(crate) fn snapshot_cache_heap_bytes(engine: &Engine) -> usize {
-    let snapshots = engine.electric_handles.snapshots.lock().unwrap();
     let mut total = 0;
-    for (path, entry) in snapshots.iter() {
+    for (path, entry) in engine.electric_handles.snapshots.lock().unwrap().iter() {
         total += path.heap_bytes();
         if let SnapshotEntry::Ready { snapshot, .. } = entry {
             total += snapshot.body.len() + snapshot.keys.heap_bytes() + snapshot.tail.heap_bytes();
         }
+    }
+    for ((path, offset), kept) in engine.electric_handles.kept_rebuilds.lock().unwrap().iter() {
+        total += path.heap_bytes() + offset.heap_bytes() + kept.keys.heap_bytes();
     }
     total
 }
@@ -332,7 +345,7 @@ pub(crate) fn ensure_evictor(engine: &Engine) {
 
 /// Evict one idle handle, in its turn: a resume of the same handle renews the claim this releases, so
 /// the two must not interleave, or the release could land after the renewal.
-pub(crate) async fn evict_idle_handle(engine: &Engine, id: &str, entry: &Arc<HandleEntry>, ttl: Duration) {
+async fn evict_idle_handle(engine: &Engine, id: &str, entry: &Arc<HandleEntry>, ttl: Duration) {
     let _turn = take_turn(engine, id).await;
     let current = engine.electric_handles.entries.lock().unwrap().get(id).cloned();
     if !current.is_some_and(|current| Arc::ptr_eq(&current, entry)) {
@@ -1518,6 +1531,7 @@ fn handle_entry(
     subscription: String,
     table: &TableRef,
     ts: &TableSchema,
+    signature: String,
     keys: HashSet<String>,
     offset: String,
 ) -> Arc<HandleEntry> {
@@ -1526,6 +1540,7 @@ fn handle_entry(
         shape_id: rec.id.clone(),
         subscription,
         table: table.clone(),
+        signature,
         pk_cols: ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect(),
         last_access: std::sync::Mutex::new(Instant::now()),
         state: tokio::sync::Mutex::new(HandleState { keys, offset }),
@@ -1573,6 +1588,8 @@ struct ResumeJob {
     pred: Option<crate::predicate::PredicateJson>,
     columns: Option<Vec<String>>,
     ts: TableSchema,
+    /// The definition's sharing key, compared with a registered entry's.
+    signature: String,
     handle: String,
     shape_id: String,
     subscription: String,
@@ -1619,20 +1636,60 @@ async fn resume_handle(engine: &Engine, request: ResumeRequest<'_>) -> ResumeOut
     let Ok(pred) = resolve_definition(request.params, request.ts, request.columns, request.raw_pairs) else {
         return Ok(None);
     };
+    let Ok(signature) =
+        crate::engine::definition_signature(&request.params.table, request.ts, &pred, request.columns.clone())
+    else {
+        return Ok(None);
+    };
     let job = ResumeJob {
         table: request.params.table.clone(),
         pred,
         columns: request.columns.clone(),
         ts: request.ts.clone(),
+        signature,
         handle: request.handle.to_string(),
         shape_id: shape_id.to_string(),
         subscription: subscription.to_string(),
         offset: request.offset.to_string(),
     };
     let task_engine = engine.clone();
-    let outcome = engine.shutdown_token().spawn(async move { resume_in_turn(&task_engine, job).await });
+    let in_flight = ResumeInFlight::enter(engine);
+    let outcome = engine.shutdown_token().spawn(async move {
+        let _in_flight = in_flight;
+        resume_in_turn(&task_engine, job).await
+    });
     // Closed only when the Engine stopped the task, which it does at shutdown.
     outcome.await.unwrap_or_else(|_| Err(ApiError::draining()))
+}
+
+/// Every resume in flight, as one shutdown party: Engine close waits for them before it drains the
+/// catalog and aborts its tasks. A resume ends promptly once shutdown begins, giving back any claim it
+/// took, so the wait is short; aborted instead, it could leave behind a claim no client was given.
+struct ResumeInFlight {
+    registry: Arc<HandleRegistry>,
+}
+
+impl ResumeInFlight {
+    fn enter(engine: &Engine) -> Self {
+        let registry = engine.electric_handles.clone();
+        let mut in_flight = registry.resumes_in_flight.lock().unwrap();
+        in_flight.0 += 1;
+        if in_flight.1.is_none() {
+            in_flight.1 = Some(engine.shutdown_token().party("electric resumes"));
+        }
+        drop(in_flight);
+        Self { registry }
+    }
+}
+
+impl Drop for ResumeInFlight {
+    fn drop(&mut self) {
+        let mut in_flight = self.registry.resumes_in_flight.lock().unwrap();
+        in_flight.0 -= 1;
+        if in_flight.0 == 0 {
+            in_flight.1 = None;
+        }
+    }
 }
 
 /// Wait for this handle's turn, then resume it unless an earlier turn already did.
@@ -1641,12 +1698,8 @@ async fn resume_in_turn(engine: &Engine, job: ResumeJob) -> ResumeOutcome<Arc<Ha
     let registered = engine.electric_handles.entries.lock().unwrap().get(&job.handle).cloned();
     match registered {
         // An earlier turn resumed it, for its own request's definition. This request is judged on its
-        // own, as `try_resume` would judge it: the entry serves it only if its definition is that shape.
-        Some(entry) => match names_handles_shape(engine, &job).await {
-            Ok(true) => Ok(Some(entry)),
-            Ok(false) => Ok(None),
-            Err(error) => Err(error),
-        },
+        // own, exactly as a request on a registered handle is.
+        Some(entry) => Ok((entry.signature == job.signature).then_some(entry)),
         None => try_resume(engine, &job).await,
     }
 }
@@ -1685,8 +1738,15 @@ async fn try_resume(engine: &Engine, job: &ResumeJob) -> ResumeOutcome<Arc<Handl
         if rec.id != job.shape_id { Ok(None) } else { shared_keys_as_of(engine, &rec.stream_path, &job.offset).await };
     match outcome {
         Ok(Some(keys)) => {
-            let entry =
-                handle_entry(&rec, job.subscription.clone(), &job.table, &job.ts, (*keys).clone(), job.offset.clone());
+            let entry = handle_entry(
+                &rec,
+                job.subscription.clone(),
+                &job.table,
+                &job.ts,
+                job.signature.clone(),
+                (*keys).clone(),
+                job.offset.clone(),
+            );
             Ok(Some(engine.electric_handles.entries.lock().unwrap().entry(job.handle.clone()).or_insert(entry).clone()))
         }
         // The claim goes back before this handle's next turn can take it again.
@@ -1700,16 +1760,72 @@ async fn try_resume(engine: &Engine, job: &ResumeJob) -> ResumeOutcome<Arc<Handl
     }
 }
 
+/// How long a finished key-set rebuild is kept. A stream is append-only, so its key set as of an
+/// offset never changes and a kept one is never stale; this bounds only the memory, as
+/// [`SNAPSHOT_REUSE_TTL`] does for a snapshot.
+const REBUILD_REUSE_TTL: Duration = Duration::from_secs(10);
+
+struct KeptRebuild {
+    keys: Arc<HashSet<String>>,
+    kept_at: tokio::time::Instant,
+    /// Tells this keep's own expiry from a later keep of the same key.
+    generation: u64,
+}
+
 /// [`keys_as_of`], shared by every resume of one stream at one offset. A stream is append-only, so the
-/// answer is the same for all of them; a reconnecting fleet at the same offset is one rebuild.
+/// answer is the same for all of them; a reconnecting fleet at the same offset is one rebuild, whether
+/// its clients arrive together or over the next [`REBUILD_REUSE_TTL`]. A client at the tail of a kept
+/// `offset=-1` snapshot needs no fold at all: that snapshot's keys are the key set there.
 async fn shared_keys_as_of(engine: &Engine, path: &str, offset: &str) -> ResumeOutcome<Arc<HashSet<String>>> {
+    let registry = &engine.electric_handles;
+    let key = (path.to_string(), offset.to_string());
+    if let Some(keys) = kept_rebuild(registry, &key) {
+        return Ok(Some(keys));
+    }
+    let from_snapshot = match registry.snapshots.lock().unwrap().get(path) {
+        Some(SnapshotEntry::Ready { snapshot, .. }) if snapshot.tail == offset => Some(snapshot.clone()),
+        _ => None,
+    };
+    if let Some(snapshot) = from_snapshot {
+        let keys = Arc::new(snapshot.keys.iter().cloned().collect::<HashSet<_>>());
+        keep_rebuild(engine, key, keys.clone());
+        return Ok(Some(keys));
+    }
     let rebuild = || async {
-        keys_as_of(engine, path, offset).await.map(|keys| keys.map(Arc::new)).map_err(|error| {
+        if let Some(keys) = kept_rebuild(registry, &key) {
+            return Ok(Some(keys)); // kept by a flight that finished while this one was being joined
+        }
+        let keys = keys_as_of(engine, path, offset).await.map(|keys| keys.map(Arc::new)).map_err(|error| {
             tracing::warn!("/v1/shape key-set rebuild of {path} at {offset} failed: {error:#}");
             resume_failure(engine, error)
-        })
+        })?;
+        if let Some(keys) = &keys {
+            keep_rebuild(engine, key.clone(), keys.clone());
+        }
+        Ok(keys)
     };
-    engine.electric_handles.rebuilds.run((path.to_string(), offset.to_string()), rebuild).await
+    registry.rebuilds.run(key.clone(), rebuild).await
+}
+
+fn kept_rebuild(registry: &HandleRegistry, key: &(String, String)) -> Option<Arc<HashSet<String>>> {
+    let kept = registry.kept_rebuilds.lock().unwrap();
+    kept.get(key).filter(|kept| kept.kept_at.elapsed() < REBUILD_REUSE_TTL).map(|kept| kept.keys.clone())
+}
+
+/// Keep a rebuild, and drop it again after [`REBUILD_REUSE_TTL`] unless a later keep replaced it.
+fn keep_rebuild(engine: &Engine, key: (String, String), keys: Arc<HashSet<String>>) {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    let kept = KeptRebuild { keys, kept_at: tokio::time::Instant::now(), generation };
+    engine.electric_handles.kept_rebuilds.lock().unwrap().insert(key.clone(), kept);
+    let registry = engine.electric_handles.clone();
+    let _ = engine.shutdown_token().spawn(async move {
+        tokio::time::sleep(REBUILD_REUSE_TTL).await;
+        let mut kept = registry.kept_rebuilds.lock().unwrap();
+        if kept.get(&key).is_some_and(|kept| kept.generation == generation) {
+            kept.remove(&key);
+        }
+    });
 }
 
 async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, String)]) -> Result<Response, ApiError> {
@@ -1744,6 +1860,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
     if offset == "-1" {
         let _control = engine.admit_control()?;
         let pred = resolve_definition(&p, &ts, &columns, raw_pairs)?;
+        let signature = crate::engine::definition_signature(&p.table, &ts, &pred, columns.clone())?;
         // share = true: identical /v1/shape definitions collapse to ONE engine shape/stream. A
         // returning client's re-snapshot rejoins the retained shape — reactivated inside
         // `create_shape` if it went dormant — instead of re-backfilling from Postgres. The handle
@@ -1781,7 +1898,7 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
             .entries
             .lock()
             .unwrap()
-            .insert(handle_id.clone(), handle_entry(&rec, subscription, &p.table, &ts, keys, tail.clone()));
+            .insert(handle_id.clone(), handle_entry(&rec, subscription, &p.table, &ts, signature, keys, tail.clone()));
 
         let mut headers = HeaderMap::new();
         headers.insert(HeaderName::from_static("electric-handle"), hv(&handle_id));
@@ -1820,6 +1937,12 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
             "table '{}' does not match the shape of handle '{handle}' (table '{}')",
             p.table, entry.table
         )));
+    }
+    // The resent definition must be the one this handle was answered for, the rule a resume applies
+    // (Electric answers a handle that disagrees with its definition the same way).
+    let pred = resolve_definition(&p, &ts, &columns, raw_pairs)?;
+    if crate::engine::definition_signature(&p.table, &ts, &pred, columns.clone())? != entry.signature {
+        return Ok(must_refetch());
     }
 
     // Live requests at one (handle, offset) coalesce onto a single leader; everything else takes the
@@ -2654,6 +2777,7 @@ mod tests {
             shape_id: "s1".into(),
             subscription: "~test-1".into(),
             table: "t".into(),
+            signature: String::new(),
             pk_cols: vec!["id".into()],
             last_access: std::sync::Mutex::new(Instant::now()),
             state: tokio::sync::Mutex::new(HandleState { keys: HashSet::new(), offset: "-1".into() }),

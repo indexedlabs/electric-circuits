@@ -987,7 +987,12 @@ reactivation, closed admission, a draining engine) answers `503` with `Retry-Aft
 back with the same handle rather than downloading the shape again; the claim goes back meanwhile and the
 retry takes it again. A resume runs as an Engine task rather than in its request, one at a time per
 handle: a claim is named only by its id, so a resume cut off by its client could otherwise give back,
-later, the claim its own retry had just renewed.
+later, the claim its own retry had just renewed. Engine close waits for resumes in flight (they end
+promptly once shutdown begins, giving their claims back) before it drains the catalog and aborts its
+tasks. A finished rebuild is kept for 10 s, because a restarted engine's clients come back over
+seconds, and a client at the tail of a kept `offset=-1` snapshot takes that snapshot's keys with no
+fold; kept rebuilds count in `bytes_electric_adapter`. Every request on a registered handle must
+resend the definition it was answered for, the rule a resume applies, or it gets `409 must-refetch`.
 Handle state is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
 and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
 drop their engine state but keep the stream, and any touch reactivates them by change-log replay

@@ -272,7 +272,7 @@ impl Engine {
     ) -> Result<Option<String>> {
         let st = self.state.lock().await;
         let Some(ts) = st.tables.get(table) else { bail!("unknown table '{table}'") };
-        let sig = shape_signature(table, where_, &resolve_columns(ts, columns)?, false);
+        let sig = super::definition_signature(table, ts, where_, columns)?;
         Ok(st.feed_by_sig.get(&sig).filter(|id| st.shapes.contains_key(*id)).cloned())
     }
 

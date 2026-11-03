@@ -895,8 +895,9 @@ async fn foreign_handle(f: &Fixture) -> Result<()> {
         let alpha = f.snapshot(&app, "/sources/alpha", false).await?;
         let beta = f.snapshot(&app, "/sources/beta", false).await?;
         for (prefix, handle) in [("/sources/alpha", &alpha), ("/sources/beta", &beta)] {
-            let (code, body) = f.read_handle(&app, prefix, handle).await?;
-            ensure!(code == StatusCode::OK, "own handle must work on {prefix}: {code} {body}");
+            // Resending the definition the handle was answered for, as an Electric client does.
+            let (code, _, body) = f.resume(&app, prefix, handle).await?;
+            ensure!(code == StatusCode::OK, "own handle must work on {prefix}: {code} {body:?}");
         }
         let (code, body) = f.read_handle(&app, "/sources/beta", &alpha).await?;
         ensure!(
@@ -2972,8 +2973,8 @@ async fn failed_source_retry(f: &Fixture) -> Result<()> {
         for source in ["beta", "gamma"] {
             f.snapshot(&app, &format!("/sources/{source}"), false).await?;
         }
-        let (code, body) = f.read_handle(&app, "/sources/beta", &beta_handle).await?;
-        ensure!(code == StatusCode::OK, "healthy beta must retain its Engine and handle: {code} {body}");
+        let (code, _, body) = f.resume(&app, "/sources/beta", &beta_handle).await?;
+        ensure!(code == StatusCode::OK, "healthy beta must retain its Engine and handle: {code} {body:?}");
         let after: String = f.client.query_one(&format!("SELECT row_to_json(s)::text FROM {} s WHERE source_id='alpha'", f.sources_table), &[]).await?.get(0);
         let after_revision: i64 = f.client.query_one(&format!("SELECT revision FROM {}", f.version_table), &[]).await?.get(0);
         ensure!(before == after && revision == after_revision, "retry must not require a source or version-row mutation");
