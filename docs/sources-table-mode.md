@@ -144,8 +144,10 @@ The 500 ms cardinality sampler and replication-slot gauge sampler run in each En
 They end on that Engine's shutdown. StatsD keeps one process UDP transport, and source emissions
 use the source id as their `stack_id` tag.
 
-Electric handles belong to the Engine that minted them. A foreign or pre-restart handle receives
-`409 must-refetch`. Idle eviction releases the handle's own subscription on its own Engine. Plain
+Electric handles belong to the stream scope that minted them. A handle from another source receives
+`409 must-refetch`; a pre-restart handle on its own source resumes when its definition still resolves
+to its shape (see "Electric adapter" in `ARCHITECTURE.md`). Rebuilds are shared per Engine, because
+shape paths repeat across sources. Idle eviction releases the handle's own subscription on its own Engine. Plain
 `offset=-1` recovery snapshots also create handles; clients that never resume them are cleaned up by
 the same TTL. Close drops the registry without writing one catalog `Left` per handle; durable
 subscriptions retain their existing lease and lapse after restart. `ttl_registry_heap_bytes`

@@ -19,7 +19,7 @@
 //!   Our engine emits absolute `upsert`/`delete`, so we reconstruct insert-vs-update from a per-handle
 //!   key set (Electric's client rejects insert-of-existing / update-of-missing). Requests on one handle
 //!   are serialized by a per-handle mutex; a retry at an older offset rebuilds the key set **as of that
-//!   offset** before replaying. Concurrent **live** requests at the *same* (handle, offset) are
+//!   offset** ([`keys_as_of`]) before replaying. Concurrent **live** requests at the *same* (handle, offset) are
 //!   identical, so they are **coalesced**: one leader does the read+apply and every waiter receives the
 //!   same response (write-fanout: N clients long-poll one handle at one offset — serializing them behind
 //!   the mutex would hand each a full long-poll timeout in turn). A live request keeps re-polling the
@@ -33,15 +33,19 @@
 //!   snapshot mints a unique handle id over the shared stream), so cursor state is never contended
 //!   across clients; each live handle holds one subscription on the shared shape — and every request
 //!   on a handle RENEWS that subscription's lease (ADR-0008), in memory, so a long-polling client
-//!   keeps its claim without knowing the id exists. (A handle does not survive a restart, so there
-//!   is nothing to record: a returning client gets `must-refetch` and re-snapshots, taking a fresh
-//!   claim.)
+//!   keeps its claim without knowing the id exists.
+//! - **A handle outlives the registry entry that serves it.** Its text names its shape, the stream
+//!   scope it belongs to and its claim, and is unique across boots. A request whose handle the registry
+//!   does not know (after a restart or idle eviction) **resumes** when that is safe
+//!   ([`resume_handle`]): the definition the client resent must resolve to the handle's shape id — ids
+//!   are never re-minted, so that is the stream its offset points into — and the offset must be a
+//!   position in that stream. A handle that cannot resume gets the standard `409 must-refetch`, and the
+//!   re-snapshot rejoins the retained shape (reactivating it if dormant) rather than rebuilding from
+//!   Postgres. A failure that says nothing about the handle stays retryable, as on every other path.
 //! - Handles are evicted after sitting idle for `ELECTRIC_HANDLE_TTL` seconds (default 600). This is
 //!   **handle-state cleanup only**: the per-handle cursor state is dropped and the shape subscription
 //!   released — the underlying engine shape and its durable stream are retained and follow the
-//!   retention lifecycle (idle → dormant → evicted; see [`crate::retention`]). A late request on the
-//!   evicted handle gets the standard `409 must-refetch`; the client's re-snapshot rejoins the
-//!   retained shape (reactivating it if dormant) rather than rebuilding from Postgres.
+//!   retention lifecycle (idle → dormant → evicted; see [`crate::retention`]).
 //! - Errors split by who must act: validation failures (bad `where`, unknown table/column, missing
 //!   handle, table/handle mismatch) are 400 with an Electric-style `{"message": …}` body — the client
 //!   treats 400 as fatal. Everything else (durable-streams hiccups, engine failures) is 500 so the
@@ -53,6 +57,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -116,6 +121,10 @@ struct HandleEntry {
     /// sees it: the handle is its name for the same thing.
     subscription: String,
     table: TableRef,
+    /// The sharing key of the definition this handle was answered for. Every request on it must resend
+    /// a definition with the same key, or it is told to refetch: served from this stream, a different
+    /// `where` or `columns` would get rows its own definition never described.
+    signature: String,
     pk_cols: Vec<String>,
     /// When this handle was last touched by a request — drives idle-TTL eviction.
     last_access: std::sync::Mutex<Instant>,
@@ -145,9 +154,66 @@ struct HandleState {
     offset: String,
 }
 
+/// Where a resume stands: `Ok(None)` is a definite refusal, `409 must-refetch`, because the handle
+/// cannot resume. An `Err` says nothing about the handle: the client keeps it and retries.
+type ResumeOutcome<T> = Result<Option<T>, ApiError>;
+
+/// Concurrent callers of one key share one run of its work. A cancelled runner hands over to the next
+/// caller, and nothing is kept once the last caller has its answer.
+struct Flights<K, V> {
+    slots: std::sync::Mutex<HashMap<K, Arc<tokio::sync::OnceCell<V>>>>,
+}
+
+impl<K, V> Default for Flights<K, V> {
+    fn default() -> Self {
+        Self { slots: std::sync::Mutex::default() }
+    }
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> Flights<K, V> {
+    async fn run<F, Fut>(&self, key: K, work: F) -> V
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = V>,
+    {
+        /// Every clone and drop of a slot happens under the map lock, so a count of 1 means this
+        /// was the last caller; a later one starts a new flight rather than reading an old answer.
+        struct Leave<'a, K: Eq + Hash, V> {
+            flights: &'a Flights<K, V>,
+            key: K,
+            slot: Option<Arc<tokio::sync::OnceCell<V>>>,
+        }
+        impl<K: Eq + Hash, V> Drop for Leave<'_, K, V> {
+            fn drop(&mut self) {
+                let mut slots = self.flights.slots.lock().unwrap();
+                drop(self.slot.take());
+                if slots.get(&self.key).is_some_and(|slot| Arc::strong_count(slot) == 1) {
+                    slots.remove(&self.key);
+                }
+            }
+        }
+        let slot = self.slots.lock().unwrap().entry(key.clone()).or_default().clone();
+        let leave = Leave { flights: self, key, slot: Some(slot) };
+        leave.slot.as_ref().expect("held until drop").get_or_init(work).await.clone()
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct HandleRegistry {
     entries: std::sync::Mutex<HashMap<String, Arc<HandleEntry>>>,
+    /// Each handle's turn ([`take_turn`]): one resume or eviction at a time, so concurrent resumes end
+    /// in one entry and one claim renewal, and a release of the claim, by a failed resume or by the
+    /// evictor, lands before the next resume takes it.
+    resuming: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One key-set rebuild at a time per (stream path, offset). The registry belongs to one Engine,
+    /// which is what makes the path enough: `shape/s5` repeats across sources.
+    rebuilds: Flights<(String, String), ResumeOutcome<Arc<HashSet<String>>>>,
+    /// Finished rebuilds by (stream path, offset), kept for [`REBUILD_REUSE_TTL`]: the clients of a
+    /// restarted engine come back over seconds, not at one instant, and each would otherwise fold
+    /// the whole stream again. Lock order: held only briefly, never across I/O.
+    kept_rebuilds: std::sync::Mutex<HashMap<(String, String), KeptRebuild>>,
+    /// How many resumes are in flight, and the shutdown party they hold while there are any.
+    resumes_in_flight: std::sync::Mutex<(usize, Option<crate::shutdown::ShutdownParty>)>,
     /// Snapshot builds by shape stream path: in flight, or finished and kept for reuse (see
     /// [`shared_snapshot`]). The registry belongs to one [`Engine`] — one source in sources-table
     /// mode — so this is keyed by engine as well as by path: two sources each have a `shape/s5`.
@@ -160,6 +226,7 @@ pub(crate) fn close_handles(engine: &Engine) {
     // Durable subscriptions retain their existing lease; shutdown adds no per-handle catalog work.
     drop(std::mem::take(&mut *engine.electric_handles.entries.lock().unwrap()));
     drop(std::mem::take(&mut *engine.electric_handles.snapshots.lock().unwrap()));
+    drop(std::mem::take(&mut *engine.electric_handles.kept_rebuilds.lock().unwrap()));
 }
 
 /// Observe the serving Engine's registry without creating or renewing a handle.
@@ -207,13 +274,15 @@ pub(crate) async fn ttl_registry_heap_bytes(engine: &Engine) -> usize {
 /// it is separate from [`ttl_registry_heap_bytes`] because it outlives no handle and expires on its
 /// own clock, not the handle TTL.
 pub(crate) fn snapshot_cache_heap_bytes(engine: &Engine) -> usize {
-    let snapshots = engine.electric_handles.snapshots.lock().unwrap();
     let mut total = 0;
-    for (path, entry) in snapshots.iter() {
+    for (path, entry) in engine.electric_handles.snapshots.lock().unwrap().iter() {
         total += path.heap_bytes();
         if let SnapshotEntry::Ready { snapshot, .. } = entry {
             total += snapshot.body.len() + snapshot.keys.heap_bytes() + snapshot.tail.heap_bytes();
         }
+    }
+    for ((path, offset), kept) in engine.electric_handles.kept_rebuilds.lock().unwrap().iter() {
+        total += path.heap_bytes() + offset.heap_bytes() + kept.keys.heap_bytes();
     }
     total
 }
@@ -246,8 +315,8 @@ fn handle_ttl() -> Duration {
 /// Start this Engine's shutdown-aware background evictor once that cleans up handles idle longer than [`handle_ttl`]:
 /// the per-handle cursor state is dropped and the shape's subscription released (`release_subscription`)
 /// — the shape itself is retained and ages through the retention lifecycle. A request arriving
-/// with an evicted handle gets the standard `409 must-refetch` and re-snapshots (rejoining the
-/// retained shape).
+/// with an evicted handle resumes, taking its claim back, or else gets the standard `409 must-refetch`
+/// and re-snapshots (rejoining the retained shape).
 pub(crate) fn ensure_evictor(engine: &Engine) {
     engine.electric_handles.started.get_or_init(|| {
         let engine = engine.clone();
@@ -267,31 +336,67 @@ pub(crate) fn ensure_evictor(engine: &Engine) {
                     .map(|(id, e)| (id.clone(), e.clone()))
                     .collect();
                 for (id, entry) in idle {
-                    // Skip a handle mid-request (its state mutex is held). Holding the guard while we
-                    // unregister keeps a racing request from mutating state we are tearing down; a
-                    // request that snatched the Arc just before removal still reads the retained
-                    // stream fine, and its next request gets 409 must-refetch (registry miss).
-                    let Ok(guard) = entry.state.try_lock() else { continue };
-                    if entry.last_access.lock().unwrap().elapsed() <= ttl {
-                        continue; // touched between the scan and now
-                    }
-                    let Ok(_control) = engine.admit_control() else {
-                        continue; // deployment handoff: keep the handle and its subscription intact
-                    };
-                    {
-                        let mut entries = engine.electric_handles.entries.lock().unwrap();
-                        entries.remove(&id);
-                        if entries.is_empty() {
-                            entries.shrink_to_fit();
-                        }
-                    }
-                    drop(guard);
-                    engine.release_subscription(&entry.shape_id, Some(&entry.subscription)).await;
-                    tracing::debug!("evicted idle electric handle {id} (shape retained)");
+                    evict_idle_handle(&engine, &id, &entry, ttl).await;
                 }
             }
         });
     });
+}
+
+/// Evict one idle handle, in its turn: a resume of the same handle renews the claim this releases, so
+/// the two must not interleave, or the release could land after the renewal.
+async fn evict_idle_handle(engine: &Engine, id: &str, entry: &Arc<HandleEntry>, ttl: Duration) {
+    let _turn = take_turn(engine, id).await;
+    let current = engine.electric_handles.entries.lock().unwrap().get(id).cloned();
+    if !current.is_some_and(|current| Arc::ptr_eq(&current, entry)) {
+        return; // evicted, or resumed as a new entry, while this waited for its turn
+    }
+    // Skip a handle mid-request (its state mutex is held). Holding the guard while we
+    // unregister keeps a racing request from mutating state we are tearing down; a
+    // request that snatched the Arc just before removal still reads the retained
+    // stream fine, and its next request resumes or gets 409 must-refetch (registry miss).
+    let Ok(guard) = entry.state.try_lock() else { return };
+    if entry.last_access.lock().unwrap().elapsed() <= ttl {
+        return; // touched between the scan and now
+    }
+    let Ok(_control) = engine.admit_control() else {
+        return; // deployment handoff: keep the handle and its subscription intact
+    };
+    {
+        let mut entries = engine.electric_handles.entries.lock().unwrap();
+        entries.remove(id);
+        if entries.is_empty() {
+            entries.shrink_to_fit();
+        }
+    }
+    drop(guard);
+    engine.release_subscription(&entry.shape_id, Some(&entry.subscription)).await;
+    tracing::debug!("evicted idle electric handle {id} (shape retained)");
+}
+
+/// A handle's turn: resumes and evictions of one handle run one at a time. The last holder removes it.
+pub(crate) struct HandleTurn {
+    registry: Arc<HandleRegistry>,
+    handle: String,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+pub(crate) async fn take_turn(engine: &Engine, handle: &str) -> HandleTurn {
+    let registry = engine.electric_handles.clone();
+    let turn = registry.resuming.lock().unwrap().entry(handle.to_string()).or_default().clone();
+    let held = turn.lock_owned().await;
+    HandleTurn { registry, handle: handle.to_string(), held: Some(held) }
+}
+
+impl Drop for HandleTurn {
+    fn drop(&mut self) {
+        // As in `Flights`: counted under the map lock, so the last one out removes the turn.
+        let mut resuming = self.registry.resuming.lock().unwrap();
+        drop(self.held.take());
+        if resuming.get(&self.handle).is_some_and(|turn| Arc::strong_count(turn) == 1) {
+            resuming.remove(&self.handle);
+        }
+    }
 }
 
 fn next_cursor() -> u64 {
@@ -551,23 +656,20 @@ fn offset_after(a: &str, b: &str) -> bool {
     }
 }
 
-/// A row value a [`StreamFold`] can keep: the decoded tree (the catch-up key-set fold, which never
-/// decodes it) or the row's raw JSON text (the snapshot build, which copies it into the body once).
+/// A row value a [`StreamFold`] can keep: the decoded tree, or the row's raw JSON text (the snapshot
+/// build, which copies it into the body once).
 trait FoldValue: Sized {
-    fn from_raw(raw: &RawValue, keys_only: bool) -> anyhow::Result<Self>;
+    fn from_raw(raw: &RawValue) -> anyhow::Result<Self>;
 }
 
 impl FoldValue for serde_json::Value {
-    fn from_raw(raw: &RawValue, keys_only: bool) -> anyhow::Result<Self> {
-        if keys_only {
-            return Ok(serde_json::Value::Null);
-        }
+    fn from_raw(raw: &RawValue) -> anyhow::Result<Self> {
         Ok(serde_json::from_str(raw.get())?)
     }
 }
 
 impl FoldValue for Box<RawValue> {
-    fn from_raw(raw: &RawValue, _keys_only: bool) -> anyhow::Result<Self> {
+    fn from_raw(raw: &RawValue) -> anyhow::Result<Self> {
         Ok(raw.to_owned())
     }
 }
@@ -590,21 +692,16 @@ struct PageEnvelope<'a> {
 struct PageHeaders<'a> {
     #[serde(borrow)]
     operation: Cow<'a, str>,
-    #[serde(borrow, default)]
-    offset: Option<Cow<'a, str>>,
 }
 
-/// Page-driven fold of a shape stream into its current key→row map (pure, so unit-testable).
+/// Page-driven fold of a shape stream into its current key→row map (pure, so unit-testable). The key
+/// set as of an offset is [`keys_as_of`]'s, not this fold's: items carry no offset to stop at.
 ///
-/// `until = Some(off)` rebuilds the state **as of** that offset: envelopes stamped after it are
-/// ignored (used when a client retries an older offset — folding to the tail instead would drop
-/// deletes / mis-classify inserts in the replayed window). `done` is set on `up-to-date`, when the
-/// target offset is passed, or when the next offset stops advancing; an empty page mid-stream does
-/// **not** end the fold (that truncated snapshots), but a `closed` page does: a retired stream is
-/// terminal, so there is nothing further to wait for.
+/// `done` is set on `up-to-date` or when the next offset stops advancing; an empty page mid-stream
+/// does **not** end the fold (that truncated snapshots), but a `closed` page does: a retired stream
+/// is terminal, so there is nothing further to wait for.
 struct StreamFold<V = serde_json::Value> {
-    /// Key → current row value. When [`Self::keys_only`] is set the values are dropped as they are
-    /// folded (stored as `Null`) — see [`StreamFold::up_to`].
+    /// Key → current row value.
     rows: HashMap<String, V>,
     /// Keys in first-appearance (stream) order. `rows` alone would randomize the snapshot's
     /// row order per request (HashMap iteration), which readers observably depend on — the
@@ -612,41 +709,12 @@ struct StreamFold<V = serde_json::Value> {
     /// it. Deleted keys keep their slot here and are filtered at emission by map membership.
     order: Vec<String>,
     offset: String,
-    until: Option<String>,
-    /// Fold membership only: the caller wants the KEY SET, so a row's value is dropped the moment
-    /// its key is recorded. Everything else about the fold is identical — a delete still removes the
-    /// key, an upsert still adds it — so the key set is the same either way, at a fraction of the
-    /// memory for a wide shape.
-    keys_only: bool,
     done: bool,
-}
-
-impl StreamFold {
-    /// Rebuild the KEY SET as of `offset`. Values are never retained: the only consumer
-    /// ([`keys_as_of`]) throws them away, and a `/v1/shape` catch-up over a wide shape should not
-    /// hold a table's worth of JSON to work out which keys the client has.
-    fn up_to(offset: &str) -> Self {
-        StreamFold {
-            rows: HashMap::new(),
-            order: Vec::new(),
-            offset: "-1".into(),
-            until: Some(offset.to_string()),
-            keys_only: true,
-            done: false,
-        }
-    }
 }
 
 impl<V: FoldValue> StreamFold<V> {
     fn to_tail() -> Self {
-        StreamFold {
-            rows: HashMap::new(),
-            order: Vec::new(),
-            offset: "-1".into(),
-            until: None,
-            keys_only: false,
-            done: false,
-        }
+        StreamFold { rows: HashMap::new(), order: Vec::new(), offset: "-1".into(), done: false }
     }
 
     /// The folded rows in stream (first-appearance) order.
@@ -661,19 +729,13 @@ impl<V: FoldValue> StreamFold<V> {
             serde_json::from_str(&page.body).with_context(|| format!("parsing stream body: {}", page.body))?
         };
         for env in envelopes {
-            if let (Some(target), Some(stamp)) = (self.until.as_deref(), env.headers.offset.as_deref()) {
-                if offset_after(stamp, target) {
-                    self.done = true;
-                    return Ok(());
-                }
-            }
             match env.headers.operation.as_ref() {
                 "delete" => {
                     self.rows.remove(env.key.as_ref());
                 }
                 _ => {
                     if let Some(raw) = env.value {
-                        let v = V::from_raw(raw, self.keys_only)?;
+                        let v = V::from_raw(raw)?;
                         if let Some(slot) = self.rows.get_mut(env.key.as_ref()) {
                             *slot = v;
                         } else {
@@ -745,10 +807,120 @@ async fn drive_fold<V: FoldValue>(
     Ok(fold)
 }
 
-/// The key set a client holds when positioned at `offset` (fold `-1..=offset`).
-async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<HashSet<String>> {
-    let fold = drive_fold(engine, path, StreamFold::up_to(offset)).await?;
-    Ok(fold.rows.into_keys().collect())
+/// What the key set needs from a stream item. Its row value is skipped as raw text, never parsed: a
+/// rebuild over a wide shape holds keys, not a table's worth of JSON.
+#[derive(Deserialize)]
+struct KeyItem<'a> {
+    #[serde(borrow)]
+    key: Cow<'a, str>,
+    #[serde(borrow, default)]
+    value: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    headers: KeyItemHeaders<'a>,
+}
+
+#[derive(Deserialize)]
+struct KeyItemHeaders<'a> {
+    #[serde(borrow)]
+    operation: Cow<'a, str>,
+}
+
+/// How far one page took a [`keys_as_of`] fold.
+#[derive(Debug, PartialEq, Eq)]
+enum KeyFold {
+    /// Every item in the page is before the target; the next page starts at this byte.
+    Continue(u64),
+    /// The target is the boundary after the item just folded.
+    Reached,
+    /// The target falls inside an item.
+    NotAPosition,
+    /// The page does not add up to its own next offset, so no count over it can be trusted.
+    Misframed,
+}
+
+/// Fold one page of a stream into `keys`, stopping exactly at byte `target`.
+///
+/// Items carry no offset of their own, and a read runs from its offset to the tail, so the only way
+/// to stop at a position is to count to it. A stream is stored as its literal wire bytes, `item,` per
+/// item, and a page starting at byte `start` is `[` + those bytes without the last comma + `]`. An item
+/// that ends `n` bytes into the page's items therefore ends at stream byte `start + n + 1`, which is
+/// what an offset names. `next` is the check on that arithmetic, made before any item is folded: a
+/// page that does not add up to it is refused rather than trusted, wherever the target falls in it.
+fn fold_keys_page(keys: &mut HashSet<String>, body: &str, start: u64, next: u64, target: u64) -> KeyFold {
+    let Some(items) = body.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) else {
+        return KeyFold::Misframed;
+    };
+    let framed_end = if items.is_empty() { start } else { start + items.len() as u64 + 1 };
+    if next != framed_end {
+        return KeyFold::Misframed;
+    }
+    let mut position = 0;
+    while position < items.len() {
+        let mut stream = serde_json::Deserializer::from_str(&items[position..]).into_iter::<KeyItem>();
+        let Some(Ok(item)) = stream.next() else { return KeyFold::Misframed };
+        position += stream.byte_offset();
+        let end = start + position as u64 + 1;
+        if end > target {
+            return KeyFold::NotAPosition;
+        }
+        if item.headers.operation == "delete" {
+            keys.remove(item.key.as_ref());
+        } else if item.value.is_some() {
+            keys.insert(item.key.into_owned());
+        }
+        if end == target {
+            return KeyFold::Reached;
+        }
+        match items.as_bytes().get(position) {
+            Some(b',') => position += 1,
+            None => break,
+            Some(_) => return KeyFold::Misframed,
+        }
+    }
+    KeyFold::Continue(next)
+}
+
+/// The key set a client holds when positioned at `offset`, or `None` when the stream has no such
+/// position: past its tail, inside an item, not an offset at all, or the stream was retired. A client
+/// holding such an offset was not reading this stream, and only a refetch can put that right.
+async fn keys_as_of(engine: &Engine, path: &str, offset: &str) -> anyhow::Result<Option<HashSet<String>>> {
+    let Some(target) = crate::changelog::offset_bytes(offset) else { return Ok(None) };
+    let ds = engine.shape_fold_input(path).await?;
+    let shutdown = engine.shutdown_token();
+    let mut keys = HashSet::new();
+    let mut start = 0;
+    let mut from = "-1".to_string();
+    while start < target {
+        // As in `drive_fold`: retention can change between pages, and a reactivation can need memory,
+        // so this runs with the previous page's reservation already released.
+        engine.shape_fold_input(path).await?;
+        let (mut page, _permit) = tokio::select! {
+            _ = shutdown.wait() => return Err(anyhow::Error::new(FoldInterrupted)),
+            page = ds.read_raw_budgeted(path, &from) => page?,
+        };
+        if page.body.is_empty() {
+            page.body = "[]".to_string(); // a 204
+        }
+        let Some(next) = page.next_offset.as_deref().and_then(crate::changelog::offset_bytes) else {
+            return Ok(None);
+        };
+        // `next <= start` is the tail: there is no more stream, and the target is past it.
+        if page.closed || next <= start {
+            return Ok(None);
+        }
+        match fold_keys_page(&mut keys, &page.body, start, next, target) {
+            KeyFold::Reached => break,
+            KeyFold::Continue(byte) => start = byte,
+            KeyFold::NotAPosition => return Ok(None),
+            KeyFold::Misframed => {
+                // Not a client's mistake: on this store no resume can work, and each one refetches.
+                tracing::warn!("/v1/shape key-set rebuild of {path}: page at byte {start} is not framed as its offset");
+                return Ok(None);
+            }
+        }
+        from = page.next_offset.unwrap_or_default();
+    }
+    Ok(Some(keys))
 }
 
 /// How long a finished snapshot build is kept for reuse while its stream's tail has not moved. The
@@ -1177,7 +1349,7 @@ async fn positioned_read(
         // The client resumed at a different (older) offset than we last served: rebuild the key set
         // **as of that offset** (fold -1..=offset), then replay from there. Folding to the tail instead
         // would silently drop a delete of a key absent at tail and emit updates for reinserted keys.
-        st.keys = keys_as_of(engine, &entry.stream_path, offset).await?;
+        st.keys = keys_as_of(engine, &entry.stream_path, offset).await?.ok_or_else(ApiError::must_refetch)?;
         st.offset = offset.to_string();
     }
     let from = offset.to_string();
@@ -1327,6 +1499,335 @@ pub async fn shape(
     resp
 }
 
+/// Resolve + validate `params` (Electric-compatible), then substitute `$N` into the where clause
+/// BEFORE parsing, so the predicate/subquery machinery — and the shape's identity/signature — are
+/// derived from the substituted text (distinct param values never collide onto one shape). These are
+/// client errors (400); a failure past this point (stream creation, backfill, reads) is internal (500).
+fn resolve_definition(
+    p: &ShapeParams,
+    ts: &TableSchema,
+    columns: &Option<Vec<String>>,
+    raw_pairs: &[(String, String)],
+) -> Result<Option<crate::predicate::PredicateJson>, ApiError> {
+    let params = crate::params::parse_params(raw_pairs).map_err(ApiError::bad_request)?;
+    let where_raw = p.where_.as_deref().unwrap_or("");
+    let where_sub = crate::params::substitute(where_raw, &params).map_err(ApiError::bad_request)?;
+    let pred = crate::where_sql::parse_where_typed(&where_sub, Some(ts))
+        .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
+    if let Some(cols) = columns {
+        for c in cols {
+            ts.column_index(c).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+        }
+    }
+    if let Some(pr) = &pred {
+        crate::predicate::CompiledPredicate::compile_with(pr, ts, &mut ValidateOnly)
+            .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
+    }
+    Ok(pred)
+}
+
+fn handle_entry(
+    rec: &crate::engine::ShapeRecord,
+    subscription: String,
+    table: &TableRef,
+    ts: &TableSchema,
+    signature: String,
+    keys: HashSet<String>,
+    offset: String,
+) -> Arc<HandleEntry> {
+    Arc::new(HandleEntry {
+        stream_path: rec.stream_path.clone(),
+        shape_id: rec.id.clone(),
+        subscription,
+        table: table.clone(),
+        signature,
+        pk_cols: ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect(),
+        last_access: std::sync::Mutex::new(Instant::now()),
+        state: tokio::sync::Mutex::new(HandleState { keys, offset }),
+        live_inflight: std::sync::Mutex::new(HashMap::new()),
+    })
+}
+
+/// `<shape id>h<stream scope>.<claim>`. The claim's nonce makes the handle unique across boots, where
+/// a process counter repeated; the suffix keeps it disjoint from shape ids. The scope ties it to one
+/// source's streams, whose shape ids repeat in every other source's.
+fn mint_handle(engine: &Engine, shape_id: &str, subscription: &str) -> String {
+    format!("{shape_id}h{}.{subscription}", engine.stream_scope_tag())
+}
+
+/// The shape id and claim a handle carries, when it was minted for this Engine's stream scope. A
+/// claim must be engine-minted: a handle is client input, and it must not be able to name, and so
+/// later release, a native subscriber's claim. An older handle, `<shape id>h<counter>`, carries
+/// neither and is answered as an unknown handle.
+fn parse_handle<'a>(handle: &'a str, scope: &str) -> Option<(&'a str, &'a str)> {
+    let (shape_id, rest) = handle.split_once('h')?;
+    let (handle_scope, subscription) = rest.split_once('.')?;
+    let shape_number = shape_id.strip_prefix('s')?;
+    let claim = subscription.strip_prefix(crate::engine::MINTED_SUB_PREFIX)?;
+    let well_formed = handle_scope == scope
+        && !shape_number.is_empty()
+        && shape_number.bytes().all(|b| b.is_ascii_digit())
+        && !claim.is_empty()
+        && claim.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    well_formed.then_some((shape_id, subscription))
+}
+
+/// What a request with an unknown handle resent: everything a resume is judged on.
+struct ResumeRequest<'a> {
+    params: &'a ShapeParams,
+    ts: &'a TableSchema,
+    columns: &'a Option<Vec<String>>,
+    raw_pairs: &'a [(String, String)],
+    handle: &'a str,
+    offset: &'a str,
+}
+
+/// A resume, owned, so it can outlive the request that asked for it.
+struct ResumeJob {
+    table: TableRef,
+    pred: Option<crate::predicate::PredicateJson>,
+    columns: Option<Vec<String>>,
+    ts: TableSchema,
+    /// The definition's sharing key, compared with a registered entry's.
+    signature: String,
+    handle: String,
+    shape_id: String,
+    subscription: String,
+    offset: String,
+}
+
+/// Sort a failure the way [`ApiError`] already does: what is the client's or the handle's doing is a
+/// refusal, and anything retryable stays retryable. Telling a client to drop its rows and download the
+/// shape again because storage hiccupped is the reconnect storm a resume exists to prevent, and the
+/// refetch would meet the same failure.
+fn refused_or_retryable<T>(error: ApiError) -> ResumeOutcome<T> {
+    if error.status.is_server_error() { Err(error) } else { Ok(None) }
+}
+
+/// A resume's failure as the client should hear it. Storage being unavailable and the engine draining
+/// are `503` with `Retry-After` here: the handle is good and the answer is "come back", which a client
+/// reconnecting into a restart must not read as anything more.
+fn resume_failure(engine: &Engine, error: anyhow::Error) -> ApiError {
+    if engine.shutdown_token().is_shutting_down() {
+        return ApiError::draining();
+    }
+    if crate::ds::is_unavailable(&error) {
+        return ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("{error:#}"),
+            retry_after: Some(1),
+            must_refetch: false,
+        };
+    }
+    error.into()
+}
+
+/// Bring back a handle the registry does not know. Never serves rows from a stream the client was not
+/// reading: see [`ResumeOutcome`] for what else can come of it.
+///
+/// The resume runs as an Engine task, not in the request. A claim is named only by its id, so a
+/// resume cut off halfway could give back, later, a claim its own retry had just renewed. As a task it
+/// either registers the handle or gives the claim back, whatever the client does, and resumes of one
+/// handle take turns, so one that gives the claim back has done so before the next takes it.
+async fn resume_handle(engine: &Engine, request: ResumeRequest<'_>) -> ResumeOutcome<Arc<HandleEntry>> {
+    let scope = engine.stream_scope_tag();
+    let Some((shape_id, subscription)) = parse_handle(request.handle, &scope) else { return Ok(None) };
+    // A definition that no longer validates cannot be the handle's shape; the refetch says why.
+    let Ok(pred) = resolve_definition(request.params, request.ts, request.columns, request.raw_pairs) else {
+        return Ok(None);
+    };
+    let Ok(signature) =
+        crate::engine::definition_signature(&request.params.table, request.ts, &pred, request.columns.clone())
+    else {
+        return Ok(None);
+    };
+    let job = ResumeJob {
+        table: request.params.table.clone(),
+        pred,
+        columns: request.columns.clone(),
+        ts: request.ts.clone(),
+        signature,
+        handle: request.handle.to_string(),
+        shape_id: shape_id.to_string(),
+        subscription: subscription.to_string(),
+        offset: request.offset.to_string(),
+    };
+    let task_engine = engine.clone();
+    let in_flight = ResumeInFlight::enter(engine);
+    let outcome = engine.shutdown_token().spawn(async move {
+        let _in_flight = in_flight;
+        resume_in_turn(&task_engine, job).await
+    });
+    // Closed only when the Engine stopped the task, which it does at shutdown.
+    outcome.await.unwrap_or_else(|_| Err(ApiError::draining()))
+}
+
+/// Every resume in flight, as one shutdown party: Engine close waits for them before it drains the
+/// catalog and aborts its tasks. A resume ends promptly once shutdown begins, giving back any claim it
+/// took, so the wait is short; aborted instead, it could leave behind a claim no client was given.
+struct ResumeInFlight {
+    registry: Arc<HandleRegistry>,
+}
+
+impl ResumeInFlight {
+    fn enter(engine: &Engine) -> Self {
+        let registry = engine.electric_handles.clone();
+        let mut in_flight = registry.resumes_in_flight.lock().unwrap();
+        in_flight.0 += 1;
+        if in_flight.1.is_none() {
+            in_flight.1 = Some(engine.shutdown_token().party("electric resumes"));
+        }
+        drop(in_flight);
+        Self { registry }
+    }
+}
+
+impl Drop for ResumeInFlight {
+    fn drop(&mut self) {
+        let mut in_flight = self.registry.resumes_in_flight.lock().unwrap();
+        in_flight.0 -= 1;
+        if in_flight.0 == 0 {
+            in_flight.1 = None;
+        }
+    }
+}
+
+/// Wait for this handle's turn, then resume it unless an earlier turn already did.
+async fn resume_in_turn(engine: &Engine, job: ResumeJob) -> ResumeOutcome<Arc<HandleEntry>> {
+    let _turn = take_turn(engine, &job.handle).await;
+    let registered = engine.electric_handles.entries.lock().unwrap().get(&job.handle).cloned();
+    match registered {
+        // An earlier turn resumed it, for its own request's definition. This request is judged on its
+        // own, exactly as a request on a registered handle is.
+        Some(entry) => Ok((entry.signature == job.signature).then_some(entry)),
+        None => try_resume(engine, &job).await,
+    }
+}
+
+/// Whether the job's definition is registered as the handle's own shape, without creating anything.
+async fn names_handles_shape(engine: &Engine, job: &ResumeJob) -> Result<bool, ApiError> {
+    match engine.shared_shape_id(&job.table, &job.pred, job.columns.clone()).await {
+        Ok(id) => Ok(id.as_deref() == Some(job.shape_id.as_str())),
+        Err(error) => refused_or_retryable::<()>(resume_failure(engine, error)).map(|_| false),
+    }
+}
+
+async fn try_resume(engine: &Engine, job: &ResumeJob) -> ResumeOutcome<Arc<HandleEntry>> {
+    let _control = engine.admit_control()?;
+    // Only the handle's own shape will do, so look before joining: a create here would mint a new shape
+    // for a definition that matches none, and leave it behind when the resume is refused.
+    if !names_handles_shape(engine, job).await? {
+        return Ok(None);
+    }
+    // Exactly the snapshot's create, naming the handle's claim: a claim the catalog restored is
+    // renewed, one that lapsed is taken again, and one this handle holds on another shape is refused.
+    let created = engine
+        .create_shape_as(&job.table, job.pred.clone(), job.columns.clone(), false, true, Some(job.subscription.clone()))
+        .await;
+    let rec = match created {
+        Ok((rec, _)) => rec,
+        Err(error)
+            if error.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+                || error.downcast_ref::<crate::engine::GroupConflict>().is_some() =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return refused_or_retryable(resume_failure(engine, error)),
+    };
+    let outcome =
+        if rec.id != job.shape_id { Ok(None) } else { shared_keys_as_of(engine, &rec.stream_path, &job.offset).await };
+    match outcome {
+        Ok(Some(keys)) => {
+            let entry = handle_entry(
+                &rec,
+                job.subscription.clone(),
+                &job.table,
+                &job.ts,
+                job.signature.clone(),
+                (*keys).clone(),
+                job.offset.clone(),
+            );
+            Ok(Some(engine.electric_handles.entries.lock().unwrap().entry(job.handle.clone()).or_insert(entry).clone()))
+        }
+        // The claim goes back before this handle's next turn can take it again.
+        outcome => {
+            engine.release_subscription(&rec.id, Some(&job.subscription)).await;
+            match outcome {
+                Err(error) => refused_or_retryable(error),
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
+/// How long a finished key-set rebuild is kept. A stream is append-only, so its key set as of an
+/// offset never changes and a kept one is never stale; this bounds only the memory, as
+/// [`SNAPSHOT_REUSE_TTL`] does for a snapshot.
+const REBUILD_REUSE_TTL: Duration = Duration::from_secs(10);
+
+struct KeptRebuild {
+    keys: Arc<HashSet<String>>,
+    kept_at: tokio::time::Instant,
+    /// Tells this keep's own expiry from a later keep of the same key.
+    generation: u64,
+}
+
+/// [`keys_as_of`], shared by every resume of one stream at one offset. A stream is append-only, so the
+/// answer is the same for all of them; a reconnecting fleet at the same offset is one rebuild, whether
+/// its clients arrive together or over the next [`REBUILD_REUSE_TTL`]. A client at the tail of a kept
+/// `offset=-1` snapshot needs no fold at all: that snapshot's keys are the key set there.
+async fn shared_keys_as_of(engine: &Engine, path: &str, offset: &str) -> ResumeOutcome<Arc<HashSet<String>>> {
+    let registry = &engine.electric_handles;
+    let key = (path.to_string(), offset.to_string());
+    if let Some(keys) = kept_rebuild(registry, &key) {
+        return Ok(Some(keys));
+    }
+    let from_snapshot = match registry.snapshots.lock().unwrap().get(path) {
+        Some(SnapshotEntry::Ready { snapshot, .. }) if snapshot.tail == offset => Some(snapshot.clone()),
+        _ => None,
+    };
+    if let Some(snapshot) = from_snapshot {
+        let keys = Arc::new(snapshot.keys.iter().cloned().collect::<HashSet<_>>());
+        keep_rebuild(engine, key, keys.clone());
+        return Ok(Some(keys));
+    }
+    let rebuild = || async {
+        if let Some(keys) = kept_rebuild(registry, &key) {
+            return Ok(Some(keys)); // kept by a flight that finished while this one was being joined
+        }
+        let keys = keys_as_of(engine, path, offset).await.map(|keys| keys.map(Arc::new)).map_err(|error| {
+            tracing::warn!("/v1/shape key-set rebuild of {path} at {offset} failed: {error:#}");
+            resume_failure(engine, error)
+        })?;
+        if let Some(keys) = &keys {
+            keep_rebuild(engine, key.clone(), keys.clone());
+        }
+        Ok(keys)
+    };
+    registry.rebuilds.run(key.clone(), rebuild).await
+}
+
+fn kept_rebuild(registry: &HandleRegistry, key: &(String, String)) -> Option<Arc<HashSet<String>>> {
+    let kept = registry.kept_rebuilds.lock().unwrap();
+    kept.get(key).filter(|kept| kept.kept_at.elapsed() < REBUILD_REUSE_TTL).map(|kept| kept.keys.clone())
+}
+
+/// Keep a rebuild, and drop it again after [`REBUILD_REUSE_TTL`] unless a later keep replaced it.
+fn keep_rebuild(engine: &Engine, key: (String, String), keys: Arc<HashSet<String>>) {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    let kept = KeptRebuild { keys, kept_at: tokio::time::Instant::now(), generation };
+    engine.electric_handles.kept_rebuilds.lock().unwrap().insert(key.clone(), kept);
+    let registry = engine.electric_handles.clone();
+    let _ = engine.shutdown_token().spawn(async move {
+        tokio::time::sleep(REBUILD_REUSE_TTL).await;
+        let mut kept = registry.kept_rebuilds.lock().unwrap();
+        if kept.get(&key).is_some_and(|kept| kept.generation == generation) {
+            kept.remove(&key);
+        }
+    });
+}
+
 async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, String)]) -> Result<Response, ApiError> {
     let offset = p.offset.clone().unwrap_or_else(|| "-1".into());
     let live = p.live.as_deref() == Some("true");
@@ -1358,25 +1859,8 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
     // ---- Snapshot: offset=-1 -> create the shape and emit the current rows as inserts.
     if offset == "-1" {
         let _control = engine.admit_control()?;
-        // Resolve + validate `params` (Electric-compatible), then substitute `$N` into the where clause
-        // BEFORE parsing, so the predicate/subquery machinery — and the shape's identity/signature —
-        // are derived from the substituted text (distinct param values never collide onto one shape).
-        let params = crate::params::parse_params(raw_pairs).map_err(ApiError::bad_request)?;
-        let where_raw = p.where_.as_deref().unwrap_or("");
-        let where_sub = crate::params::substitute(where_raw, &params).map_err(ApiError::bad_request)?;
-        let pred = crate::where_sql::parse_where_typed(&where_sub, Some(&ts))
-            .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
-        // Validate the request shape against the schema up front: these are client errors (400). A
-        // failure past this point (stream creation, backfill, reads) is internal (500).
-        if let Some(cols) = &columns {
-            for c in cols {
-                ts.column_index(c).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
-            }
-        }
-        if let Some(pr) = &pred {
-            crate::predicate::CompiledPredicate::compile_with(pr, &ts, &mut ValidateOnly)
-                .map_err(|e| ApiError::bad_request(format!("invalid where clause: {e:#}")))?;
-        }
+        let pred = resolve_definition(&p, &ts, &columns, raw_pairs)?;
+        let signature = crate::engine::definition_signature(&p.table, &ts, &pred, columns.clone())?;
         // share = true: identical /v1/shape definitions collapse to ONE engine shape/stream. A
         // returning client's re-snapshot rejoins the retained shape — reactivated inside
         // `create_shape` if it went dormant — instead of re-backfilling from Postgres. The handle
@@ -1406,22 +1890,15 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         // Handles are per-client even though the shape is shared: a unique handle id per snapshot
         // keeps each client's cursor state (key set / offset) private, so one client's live
         // long-poll never head-of-line blocks another's positioned read and offsets never thrash.
-        // The suffix keeps handle ids disjoint from shape ids. Each handle holds the one shape
-        // subscription its create/join took; the idle evictor releases it with the handle.
-        let handle_id = format!("{}h{}", rec.id, next_cursor());
-        engine.electric_handles.entries.lock().unwrap().insert(
-            handle_id.clone(),
-            Arc::new(HandleEntry {
-                stream_path: rec.stream_path.clone(),
-                shape_id: rec.id.clone(),
-                subscription: subscription.clone(),
-                table: p.table.clone(),
-                pk_cols: ts.pk_cols.iter().map(|&i| ts.columns[i].0.clone()).collect(),
-                last_access: std::sync::Mutex::new(Instant::now()),
-                state: tokio::sync::Mutex::new(HandleState { keys, offset: tail.clone() }),
-                live_inflight: std::sync::Mutex::new(HashMap::new()),
-            }),
-        );
+        // Each handle holds the one shape subscription its create/join took; the idle evictor releases
+        // it with the handle, and a resume renews it by the name the handle carries.
+        let handle_id = mint_handle(&engine, &rec.id, &subscription);
+        engine
+            .electric_handles
+            .entries
+            .lock()
+            .unwrap()
+            .insert(handle_id.clone(), handle_entry(&rec, subscription, &p.table, &ts, signature, keys, tail.clone()));
 
         let mut headers = HeaderMap::new();
         headers.insert(HeaderName::from_static("electric-handle"), hv(&handle_id));
@@ -1436,22 +1913,36 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
     let handle = p.handle.clone().unwrap();
     let entry = {
         // Registry lock held only for the lookup; never across I/O or the per-handle lock.
-        let map = engine.electric_handles.entries.lock().unwrap();
-        match map.get(&handle) {
-            Some(e) => e.clone(),
-            None => return Ok(must_refetch()),
+        engine.electric_handles.entries.lock().unwrap().get(&handle).cloned()
+    };
+    let entry = match entry {
+        Some(entry) => entry,
+        None => {
+            let request =
+                ResumeRequest { params: &p, ts: &ts, columns: &columns, raw_pairs, handle: &handle, offset: &offset };
+            match resume_handle(&engine, request).await? {
+                Some(entry) => entry,
+                None => return Ok(must_refetch()),
+            }
         }
     };
     entry.touch();
     // ...and the same touch renews the engine-side LEASE this handle holds (ADR-0008). A `/v1/shape`
     // client's reads come through the engine, so unlike a native subscriber it does not have to
-    // renew by hand — the poll is the renewal. In memory only: a handle does not survive a restart.
+    // renew by hand — the poll is the renewal. In memory only: the claim is already in the catalog,
+    // and a restart that lapses it is repaired by the resume, which renews it durably.
     engine.renew_subscription_local(&entry.shape_id, &entry.subscription).await;
     if entry.table != p.table {
         return Err(ApiError::bad_request(format!(
             "table '{}' does not match the shape of handle '{handle}' (table '{}')",
             p.table, entry.table
         )));
+    }
+    // The resent definition must be the one this handle was answered for, the rule a resume applies
+    // (Electric answers a handle that disagrees with its definition the same way).
+    let pred = resolve_definition(&p, &ts, &columns, raw_pairs)?;
+    if crate::engine::definition_signature(&p.table, &ts, &pred, columns.clone())? != entry.signature {
+        return Ok(must_refetch());
     }
 
     // Live requests at one (handle, offset) coalesce onto a single leader; everything else takes the
@@ -1498,6 +1989,10 @@ async fn shape_inner(engine: Engine, p: ShapeParams, raw_pairs: &[(String, Strin
         }
     }
 }
+
+#[cfg(test)]
+#[path = "electric_resume_tests.rs"]
+mod resume_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1943,73 +2438,212 @@ mod tests {
         );
     }
 
-    // C2: rebuilding the key set as of the client's *requested* offset (not the tail).
-    /// `up_to` is a KEY-SET fold: the values never reach memory, but membership is identical (a
-    /// delete past the requested offset is still ignored, an upsert still adds the key).
-    #[test]
-    fn fold_up_to_keeps_keys_and_drops_values() {
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(raw_page(vec![env("upsert", "k1", "01"), env("upsert", "k2", "02")], "02", true)).unwrap();
-        assert_eq!(fold.rows.len(), 2);
-        assert!(fold.rows.values().all(|v| v.is_null()), "a key-set fold must not retain row values: {:?}", fold.rows);
-        // The snapshot fold, by contrast, keeps them — it IS the response body.
-        let mut snap = StreamFold::<Box<RawValue>>::to_tail();
-        snap.apply_page(raw_page(vec![env("upsert", "k1", "01")], "01", true)).unwrap();
-        assert!(snap.rows.values().all(|v| v.get() != "null"));
+    // ---- the key set as of an offset ------------------------------------------------------------
+
+    /// A page as durable-streams serves it from byte `start`, with the stream byte each item ends at.
+    fn wire_page(items: &[Envelope], start: u64) -> (String, Vec<u64>) {
+        let mut body = String::from("[");
+        let mut ends = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push_str(&serde_json::to_string(item).unwrap());
+            ends.push(start + body.len() as u64);
+        }
+        body.push(']');
+        (body, ends)
     }
 
-    #[test]
-    fn fold_up_to_stops_at_the_requested_offset() {
-        // Stream: insert k1 @01, insert k2 @02, delete k2 @03. A client at offset 02 holds {k1, k2}.
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(raw_page(
-            vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")],
-            "03",
-            true,
-        ))
-        .unwrap();
-        assert!(fold.done);
-        let mut keys: Vec<_> = fold.rows.keys().cloned().collect();
+    fn keys_of(keys: &HashSet<String>) -> Vec<&str> {
+        let mut keys: Vec<_> = keys.iter().map(String::as_str).collect();
         keys.sort();
-        assert_eq!(keys, vec!["k1", "k2"], "the delete past the requested offset must not be folded in");
+        keys
     }
 
-    // C2: a delete in the replayed window must reach the client. Folding to the TAIL loses k2 (absent
-    // at tail), so the replayed delete was silently dropped and the client kept a deleted row forever.
+    /// Items carry no offset of their own, so the cut is counted in bytes. A multi-byte value and an
+    /// escaped key are where a count in anything else goes wrong.
     #[test]
-    fn replay_emits_delete_for_row_deleted_in_the_replayed_window() {
-        let all = vec![env("upsert", "k1", "01"), env("upsert", "k2", "02"), env("delete", "k2", "03")];
-
-        // Rebuild as of the client's offset (02)...
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(raw_page(all.clone(), "03", true)).unwrap();
-        let mut keys: HashSet<String> = fold.rows.into_keys().collect();
-
-        // ...then replay everything after it.
-        let replay: Vec<Envelope> =
-            all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
-        let msgs = apply_changes(&mut keys, &["id".into()], replay);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(op_and_key(&msgs[0]), ("delete".into(), "k2".into()));
-        assert!(!keys.contains("k2"));
+    fn key_fold_stops_at_every_item_boundary_and_nowhere_else() {
+        let mut wide = env("upsert", "雪", "");
+        wide.value = Some(serde_json::json!({ "id": "雪", "note": "\"quoted\" ☃ \\ ," }));
+        let items = [wide, env("upsert", "k\"2", ""), env("delete", "雪", ""), env("upsert", "k4", "")];
+        let (body, ends) = wire_page(&items, 40);
+        let next = *ends.last().unwrap();
+        let expected: [&[&str]; 4] = [&["雪"], &["k\"2", "雪"], &["k\"2"], &["k\"2", "k4"]];
+        for (end, expected) in ends.iter().zip(expected) {
+            let mut keys = HashSet::new();
+            assert_eq!(fold_keys_page(&mut keys, &body, 40, next, *end), KeyFold::Reached);
+            let mut expected = expected.to_vec();
+            expected.sort();
+            assert_eq!(keys_of(&keys), expected);
+            // One byte short of a boundary is inside the item that ends there.
+            assert_eq!(fold_keys_page(&mut HashSet::new(), &body, 40, next, *end - 1), KeyFold::NotAPosition);
+        }
     }
 
-    // C2: an insert in the replayed window whose key exists at TAIL must be emitted as an insert (the
-    // tail-state rebuild classified it as `update`, which Electric's client rejects as update-of-missing).
+    /// A delete past the requested offset is not folded in: the client still holds that key, and the
+    /// replay has to tell it otherwise. This is the whole reason not to fold to the tail.
     #[test]
-    fn replay_emits_insert_for_row_reinserted_after_the_replayed_offset() {
-        let all = vec![env("upsert", "k1", "01"), env("delete", "k1", "02"), env("upsert", "k1", "03")];
+    fn key_fold_leaves_a_later_delete_for_the_replay() {
+        let items = [env("upsert", "k1", ""), env("upsert", "k2", ""), env("delete", "k2", "")];
+        let (body, ends) = wire_page(&items, 0);
+        let mut keys = HashSet::new();
+        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[2], ends[1]), KeyFold::Reached);
+        assert_eq!(keys_of(&keys), ["k1", "k2"]);
+        let messages = apply_changes(&mut keys, &["id".into()], vec![env("delete", "k2", "")]);
+        assert_eq!(op_and_key(&messages[0]), ("delete".into(), "k2".into()));
+    }
 
-        let mut fold = StreamFold::up_to("02");
-        fold.apply_page(raw_page(all.clone(), "03", true)).unwrap();
-        let mut keys: HashSet<String> = fold.rows.into_keys().collect();
-        assert!(keys.is_empty(), "as of offset 02 the client holds no rows");
+    /// The other half of the same bug: a key absent at the offset and present at the tail is an
+    /// `insert` to this client, which Electric's client would reject as an update of a missing row.
+    #[test]
+    fn key_fold_leaves_a_later_reinsert_for_the_replay() {
+        let items = [env("upsert", "k1", ""), env("delete", "k1", ""), env("upsert", "k1", "")];
+        let (body, ends) = wire_page(&items, 0);
+        let mut keys = HashSet::new();
+        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[2], ends[1]), KeyFold::Reached);
+        assert!(keys.is_empty());
+        let messages = apply_changes(&mut keys, &["id".into()], vec![env("upsert", "k1", "")]);
+        assert_eq!(op_and_key(&messages[0]), ("insert".into(), "k1".into()));
+    }
 
-        let replay: Vec<Envelope> =
-            all.into_iter().filter(|e| offset_after(e.headers.offset.as_deref().unwrap(), "02")).collect();
-        let msgs = apply_changes(&mut keys, &["id".into()], replay);
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(op_and_key(&msgs[0]), ("insert".into(), "k1".into()));
+    #[test]
+    fn key_fold_continues_past_a_page_that_ends_before_the_target() {
+        let (first, first_ends) = wire_page(&[env("upsert", "k1", "")], 0);
+        let (second, second_ends) = wire_page(&[env("upsert", "k2", "")], first_ends[0]);
+        let target = second_ends[0];
+        let mut keys = HashSet::new();
+        assert_eq!(fold_keys_page(&mut keys, &first, 0, first_ends[0], target), KeyFold::Continue(first_ends[0]));
+        assert_eq!(fold_keys_page(&mut keys, &second, first_ends[0], target, target), KeyFold::Reached);
+        assert_eq!(keys_of(&keys), ["k1", "k2"]);
+    }
+
+    /// The arithmetic rests on how the store frames a page. A store that frames one differently is
+    /// found out by its own next offset, and a resume falls back to a refetch rather than cut wrongly.
+    /// The check comes first: a target inside the page, where a cut would land, is the usual case.
+    #[test]
+    fn key_fold_refuses_a_page_whose_length_disagrees_with_its_next_offset() {
+        let (body, ends) = wire_page(&[env("upsert", "k1", ""), env("upsert", "k2", "")], 0);
+        let spaced = body.replacen("},{", "}, {", 1);
+        for target in [ends[0], ends[1], ends[1] + 100] {
+            let mut keys = HashSet::new();
+            // A store that counts one more byte per item than it serves.
+            assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[1] + 2, target), KeyFold::Misframed);
+            assert_eq!(fold_keys_page(&mut keys, &spaced, 0, ends[1], target), KeyFold::Misframed);
+            assert!(keys.is_empty(), "a misframed page must contribute nothing");
+        }
+        // Same length as its next offset says, but not items separated by commas.
+        let semicolons = body.replacen("},{", "};{", 1);
+        assert_eq!(fold_keys_page(&mut HashSet::new(), &semicolons, 0, ends[1], ends[1]), KeyFold::Misframed);
+        assert_eq!(fold_keys_page(&mut HashSet::new(), "not a page", 0, 10, 10), KeyFold::Misframed);
+    }
+
+    /// A definite refusal is the protocol's 409. Everything retryable stays what it is everywhere else
+    /// on this surface: the client keeps its handle and comes back.
+    #[test]
+    fn a_resume_refuses_only_what_is_about_the_handle() {
+        let refused = [
+            ApiError::must_refetch(),
+            ApiError::bad_request("no such column"),
+            anyhow::Error::new(crate::engine::ReactivationRecreate {
+                shape: "s1".into(),
+                reason: crate::engine::RecreateReason::OverBudget,
+            })
+            .into(),
+        ];
+        for error in refused {
+            assert!(matches!(refused_or_retryable::<()>(error), Ok(None)));
+        }
+        let retryable = [
+            anyhow::Error::new(crate::engine::ReactivationDeferred::new("s1", "change-log HEAD unavailable")),
+            anyhow::Error::new(crate::engine::DeploymentNotReady),
+            anyhow::anyhow!("GET shape/s1: 503"),
+        ];
+        for error in retryable {
+            let outcome = refused_or_retryable::<()>(error.into());
+            assert!(outcome.is_err_and(|error| error.status.is_server_error() && !error.must_refetch));
+        }
+    }
+
+    #[test]
+    fn key_fold_ignores_an_upsert_with_no_value_as_the_snapshot_fold_does() {
+        let mut bare = env("upsert", "k1", "");
+        bare.value = None;
+        let (body, ends) = wire_page(&[bare], 0);
+        let mut keys = HashSet::new();
+        assert_eq!(fold_keys_page(&mut keys, &body, 0, ends[0], ends[0]), KeyFold::Reached);
+        assert!(keys.is_empty());
+    }
+
+    // ---- handle identity --------------------------------------------------------------------------
+
+    #[test]
+    fn a_minted_handle_parses_back_to_its_shape_and_claim() {
+        assert_eq!(parse_handle("s12habc.~3f9a-7", "abc"), Some(("s12", "~3f9a-7")));
+    }
+
+    #[test]
+    fn a_handle_that_cannot_prove_its_claim_or_scope_is_refused() {
+        for handle in [
+            "s12h4",                // today's format: no scope, no claim
+            "s12",                  // not a handle
+            "s12hother.~3f9a-7",    // another source's stream scope
+            "s12habc.native-claim", // a claim the engine did not mint: a handle must not name it
+            "s12habc.~",            // an empty claim
+            "s12habc.~3f\r\n",      // not a header value
+            "shabc.~3f9a-7",        // no shape number
+            "group-1habc.~3f9a-7",  // not an id this adapter mints
+        ] {
+            assert_eq!(parse_handle(handle, "abc"), None, "{handle}");
+        }
+    }
+
+    // ---- shared flights ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_flight_keeps_nothing_after_its_last_caller() {
+        let flights = Flights::<&str, u32>::default();
+        assert_eq!(flights.run("k", || async { 1 }).await, 1);
+        assert!(flights.slots.lock().unwrap().is_empty());
+        assert_eq!(flights.run("k", || async { 2 }).await, 2, "a later caller must not read an old answer");
+    }
+
+    #[tokio::test]
+    async fn concurrent_callers_of_a_flight_share_one_run() {
+        let flights = Arc::new(Flights::<&str, u32>::default());
+        let runs = Arc::new(AtomicU64::new(0));
+        let callers: Vec<_> = (0..16)
+            .map(|_| {
+                let (flights, runs) = (flights.clone(), runs.clone());
+                tokio::spawn(async move {
+                    flights
+                        .run("k", || async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            runs.fetch_add(1, Ordering::SeqCst) as u32
+                        })
+                        .await
+                })
+            })
+            .collect();
+        for caller in callers {
+            assert_eq!(caller.await.unwrap(), 0);
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(flights.slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_flight_leaves_no_slot() {
+        let flights = Arc::new(Flights::<&str, u32>::default());
+        let runner = flights.clone();
+        let cancelled = tokio::spawn(async move {
+            runner.run("k", || std::future::pending()).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        assert!(flights.slots.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2133,15 +2767,6 @@ mod tests {
         assert!(messages[0]["headers"].get("txids").is_none());
     }
 
-    #[test]
-    fn offset_ordering() {
-        assert!(offset_after("02", "01"));
-        assert!(!offset_after("01", "02"));
-        assert!(!offset_after("-1", "01"));
-        assert!(offset_after("01", "-1"));
-        assert!(!offset_after("01", "01"));
-    }
-
     // ---- live-request coalescing --------------------------------------------------------------
 
     use std::sync::atomic::AtomicUsize;
@@ -2152,6 +2777,7 @@ mod tests {
             shape_id: "s1".into(),
             subscription: "~test-1".into(),
             table: "t".into(),
+            signature: String::new(),
             pk_cols: vec!["id".into()],
             last_access: std::sync::Mutex::new(Instant::now()),
             state: tokio::sync::Mutex::new(HandleState { keys: HashSet::new(), offset: "-1".into() }),

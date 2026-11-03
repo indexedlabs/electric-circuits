@@ -1539,6 +1539,17 @@ fn canon_cols(out_cols: &Option<Arc<Vec<usize>>>) -> String {
 /// shapes are interchangeable — and so share one maintained stream — iff these all match. `changes_only`
 /// is part of the key: a backfilled shape and a no-backfill feed over the same rows are NOT the same
 /// stream.
+/// The sharing key a `share = true` row shape with this definition has: what [`Engine::create_shape_as`]
+/// joins on. Pure, so a caller holding a definition can compare it without the state lock.
+pub(crate) fn definition_signature(
+    table: &TableRef,
+    ts: &TableSchema,
+    where_: &Option<PredicateJson>,
+    columns: Option<Vec<String>>,
+) -> Result<String> {
+    Ok(shape_signature(table, where_, &resolve_columns(ts, columns)?, false))
+}
+
 fn shape_signature(
     table: &TableRef,
     where_: &Option<PredicateJson>,
@@ -3816,6 +3827,11 @@ impl Engine {
         // lifecycle-map check when the shape is active (the common case).
         self.ensure_active(sid_of_path(path)).await?;
         self.ds.read(path, offset, live).await
+    }
+
+    /// The stream scope this Engine's shape ids and offsets mean anything in.
+    pub(crate) fn stream_scope_tag(&self) -> String {
+        self.ds.scope_tag()
     }
 
     /// Resolve lifecycle before holding a fold reservation: wake/replay can itself need budget.

@@ -1856,6 +1856,11 @@ impl DsClient {
         Ok((RawPage { body, next_offset, up_to_date, closed }, permit))
     }
 
+    /// A short name for this client's stream scope. See [`StreamScope::tag`].
+    pub(crate) fn scope_tag(&self) -> String {
+        self.scope.tag()
+    }
+
     /// Read one page while decoding row bodies only for `table` and change-log control envelopes.
     /// This is the replay path's cheap-page variant: framing and headers are still validated for
     /// every item, but unrelated table rows remain borrowed raw bytes until discarded.

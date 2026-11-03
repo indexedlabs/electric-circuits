@@ -196,9 +196,9 @@ describe('conformance: /v1/shape params LIVE move-in over uuid columns', () => {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** A /v1/shape handle is `<shapeId>h<seq>` — a per-client handle over a shared engine shape
+/** A /v1/shape handle is `<shapeId>h<scope>.<claim>` — a per-client handle over a shared engine shape
  * (retention lifecycle); strip the suffix to address the underlying shape on the extended API. */
-const shapeIdOfHandle = (handle: string) => handle.replace(/h\d+$/, '')
+const shapeIdOfHandle = (handle: string) => handle.split('h')[0]!
 
 /** Fold a shape's current contents (via /shapes/{id}/rows) and report whether `key` is present. */
 async function shapeContains(engineUrl: string, handle: string, key: string): Promise<boolean> {
