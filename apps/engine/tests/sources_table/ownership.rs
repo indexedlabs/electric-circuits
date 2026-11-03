@@ -899,10 +899,11 @@ async fn foreign_handle(f: &Fixture) -> Result<()> {
             let (code, _, body) = f.resume(&app, prefix, handle).await?;
             ensure!(code == StatusCode::OK, "own handle must work on {prefix}: {code} {body:?}");
         }
-        let (code, body) = f.read_handle(&app, "/sources/beta", &alpha).await?;
+        // With alpha's own definition, so only the handle's stream scope can refuse it.
+        let (code, _, body) = f.resume(&app, "/sources/beta", &alpha).await?;
         ensure!(
             code == StatusCode::CONFLICT && body[0]["headers"]["control"] == "must-refetch",
-            "source beta must refuse source alpha's handle with 409 must-refetch, got {code}: {body}"
+            "source beta must refuse source alpha's handle with 409 must-refetch, got {code}: {body:?}"
         );
         Ok(())
     }
