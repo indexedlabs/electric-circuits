@@ -133,6 +133,9 @@ describe('pgxsinkit durable-streams provider contract used by Electric Circuits'
     })
     expect(appended.status).toBe(204)
     const tail = appended.headers.get('stream-next-offset')
+    // A real token, so every comparison below is against a tail the store reported, never two
+    // missing headers.
+    expect(tail).toMatch(/^\d{16}_\d{16}$/)
     expect(tail).not.toBe('0000000000000000_0000000000000000')
 
     const headOpen = await fetch(stream(base, path), { method: 'HEAD' })
@@ -152,6 +155,7 @@ describe('pgxsinkit durable-streams provider contract used by Electric Circuits'
     expect(read.headers.get('stream-next-offset')).toBe(tail)
     expect(read.headers.has('stream-up-to-date')).toBe(true)
     expect(read.headers.get('stream-closed')).toBe('true')
+    expect(await read.json()).toEqual([{ t: 'created', n: 1 }, { t: 'offset', n: 2 }])
 
     const closedAgain = await fetch(stream(base, path), { method: 'POST', headers: { 'stream-closed': 'true' } })
     expect(closedAgain.status).toBe(204)
