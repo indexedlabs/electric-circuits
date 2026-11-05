@@ -497,6 +497,7 @@ async fn an_unrecorded_first_change_log_segment_is_deleted() {
     store.put(&v1_catalog(), events);
     store.put(&format!("{}shape/s1", v1()), vec![]);
     store.put(&format!("{}changes/0", v1()), vec![]);
+    let before = store.paths();
 
     let dry = retire(&store, &[&v1_catalog()]).await;
 
@@ -504,6 +505,8 @@ async fn an_unrecorded_first_change_log_segment_is_deleted() {
     let would: Vec<&str> = dry.stdout.lines().filter_map(|l| l.strip_prefix("would delete ")).collect();
     let expected = [format!("{}changes/0", v1()), format!("{}shape/s1", v1()), v1_catalog()];
     assert_eq!(would, expected, "stdout: {}", dry.stdout);
+    assert_eq!(store.destructive_requests(), Vec::<String>::new(), "the dry run closed or deleted something");
+    assert_eq!(store.paths(), before, "the dry run changed the store");
 
     let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
