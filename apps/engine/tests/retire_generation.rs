@@ -70,6 +70,9 @@ struct StoreState {
     /// When a request with this label (`"DELETE <path>"`, `"CLOSE <path>"`) arrives, first append
     /// one event to this stream unless it is closed: a writer that races that request.
     append_before: Option<(String, String)>,
+    /// When a request with this label arrives, first create this stream: a writer that makes a
+    /// segment or a shape's stream before its catalog record lands.
+    create_before: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -123,6 +126,11 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
     let mut st = state.lock().unwrap();
     let label = if method == Method::POST && closing { "CLOSE".to_string() } else { method.to_string() };
     st.requests.push(format!("{label} {path}"));
+    if let Some((request, target)) = st.create_before.clone()
+        && request == format!("{label} {path}")
+    {
+        st.streams.entry(target).or_default();
+    }
     if let Some((request, target)) = st.append_before.clone()
         && request == format!("{label} {path}")
         && let Some(stream) = st.streams.get_mut(&target)
@@ -840,6 +848,31 @@ async fn a_rerun_from_a_closed_catalog_finishes() {
 
     assert_eq!(second.code, 0, "stdout: {}\nstderr: {}", second.stdout, second.stderr);
     assert!(!store.paths().contains(&v1_catalog()), "nothing of the generation is left: {:?}", store.paths());
+}
+
+/// A writer that rotates as the catalog closes, with its `ChangesRotated` still queued, leaves the
+/// closed tail unchanged. The run walks the chain once more after the fence, finds the new segment,
+/// and stops with exit 3 and nothing deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_segment_created_as_the_catalog_closes_stops_the_run() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    // The plan's chain ends at changes/2 (an unrecorded successor), so a rotation makes changes/3.
+    let segment = format!("{}changes/3", v1());
+    store.state.lock().unwrap().create_before = Some((format!("CLOSE {}", v1_catalog()), segment.clone()));
+    let mut expected_paths = store.paths();
+    expected_paths.push(segment.clone());
+    expected_paths.sort();
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(
+        run.stdout.contains(&format!("nothing was deleted: {segment} appeared during the run")),
+        "stdout: {}",
+        run.stdout
+    );
+    assert_eq!(store.destructive_requests(), vec![format!("CLOSE {}", v1_catalog())]);
+    assert_eq!(store.paths(), expected_paths, "every stream and the catalog survive");
 }
 
 #[tokio::test(flavor = "multi_thread")]

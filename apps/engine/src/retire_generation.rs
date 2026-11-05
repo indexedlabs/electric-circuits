@@ -41,7 +41,11 @@
 //!
 //! A confirmed run first closes the catalog, the fence: the store refuses appends to a closed
 //! stream, so the tail read after the close is final, and a writer that slipped past every other
-//! guard stops the run before anything is deleted. Each named stream then goes through the
+//! guard stops the run before anything is deleted. A rotation creates the next change-log segment
+//! before recording it, so the run also checks after the fence that the segment past the planned
+//! chain still does not exist. A shape or group stream created during the run, before its record
+//! lands, is not caught: the store has no list API, so only the writer could fence that, and the
+//! guards above are what keep a live writer away. Each named stream then goes through the
 //! engine's own retirement (close, then delete; a 404 or 410 counts as done), so a re-run after a
 //! partial failure picks up where the last one stopped. The catalog goes last, and only once every
 //! stream it names is gone.
@@ -50,7 +54,7 @@
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
 //! | `1` | storage unavailable (unreachable, not ready, 5xx), or some deletes failed and the catalog was kept for a re-run |
-//! | `3` | the catalog moved before the close that fences it: nothing was deleted, and the catalog is kept closed, so an engine writing it stops on its next append. A closed catalog cannot move, so a re-run deletes it unless the 7-day check refuses: find the writer before any re-run |
+//! | `3` | the catalog moved before the close that fences it, or a change-log segment it does not name appeared during the run: nothing was deleted, and the catalog is kept closed, so an engine writing it stops on its next append. A closed catalog cannot move, so a re-run deletes it unless the 7-day check refuses: find the writer before any re-run |
 //! | `78` | refused: a bad argument or path, one of the guards above, no store configured, a store that does not attest the configured identity, or a catalog this engine cannot read |
 
 use std::io::Write;
@@ -270,6 +274,9 @@ pub struct Plan {
     pub evidence: Vec<serde_json::Value>,
     /// The catalog's tail offset when it was read; the catalog is deleted only if it is unchanged.
     tail: Option<String>,
+    /// The first change-log segment past the chain the plan found. A rotation creates it before
+    /// the catalog records it, so if it exists after the fence it was created during the run.
+    next_segment: String,
 }
 
 /// The result of a confirmed run.
@@ -284,6 +291,9 @@ pub struct Retired {
     /// `Some((before, after))` when the catalog's tail had moved since it was read, found right
     /// after the close that fences it: nothing was deleted, and the catalog is kept (closed).
     pub catalog_moved: Option<(Option<String>, Option<String>)>,
+    /// The physical path of a change-log segment the plan did not name that exists after the fence:
+    /// a writer rotated during the run. Nothing was deleted; the catalog is closed.
+    pub unrecorded_stream: Option<String>,
 }
 
 /// Read the catalog `ds` is scoped to and decide what a confirmed run would delete. Deletes
@@ -347,20 +357,20 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
         .filter_map(|p| p.strip_prefix(crate::changelog::CHANGES_PREFIX)?.strip_prefix('/')?.parse::<u32>().ok())
         .max()
         .map_or(0, |last| last.saturating_add(1));
-    let mut reached_end = false;
+    let mut segment_end = None;
     for n in first_unrecorded..first_unrecorded.saturating_add(MAX_UNRECORDED_SEGMENTS) {
         let path = crate::changelog::segment_path(n);
         if ds.head(&path).await.with_context(|| format!("checking {path}"))?.is_none() {
-            reached_end = true;
+            segment_end = Some(path);
             break;
         }
         logical.insert(path);
     }
     // A walk that hit its bound did not find the end of the chain, so the plan would leave the rest
     // with no index once the catalog is gone.
-    if !reached_end {
+    let Some(segment_end) = segment_end else {
         bail!(Refusal::UnrecordedSegmentsUnbounded { from: first_unrecorded, limit: MAX_UNRECORDED_SEGMENTS });
-    }
+    };
 
     let mut streams = Vec::with_capacity(logical.len());
     for path in logical {
@@ -379,6 +389,7 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
         newest_at,
         evidence: fold.evidence_events()?,
         tail: head.next_offset,
+        next_segment: segment_end,
     })
 }
 
@@ -391,11 +402,26 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
 /// loudly instead of its streams going silently. A stream whose delete fails is reported and the
 /// rest still go; the catalog is then kept (closed), so a re-run finds what is left.
 pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<Retired> {
-    let mut retired = Retired { deleted: Vec::new(), failed: Vec::new(), catalog_deleted: false, catalog_moved: None };
+    let mut retired = Retired {
+        deleted: Vec::new(),
+        failed: Vec::new(),
+        catalog_deleted: false,
+        catalog_moved: None,
+        unrecorded_stream: None,
+    };
     ds.close_stream(CATALOG_STREAM).await.with_context(|| format!("closing {}", plan.catalog))?;
     let after = ds.head(CATALOG_STREAM).await.context("re-checking the closed catalog")?.map(|head| head.next_offset);
     if after.as_ref() != Some(&plan.tail) {
         retired.catalog_moved = Some((plan.tail.clone(), after.flatten()));
+        return Ok(retired);
+    }
+    // A rotation creates the next segment before its `ChangesRotated` lands, so a record still
+    // queued when the close won leaves the tail unchanged. Walk the chain once more: if the next
+    // segment exists now, a writer rotated during the run. (A shape's stream is created before its
+    // `Created` too, but with no list API only the writer could fence that; see the module docs.)
+    let next = &plan.next_segment;
+    if ds.head(next).await.with_context(|| format!("re-checking {next}"))?.is_some() {
+        retired.unrecorded_stream = Some(ds.physical_path(next)?);
         return Ok(retired);
     }
     for (n, (logical, physical)) in plan.streams.iter().enumerate() {
@@ -466,6 +492,14 @@ async fn run_inner(ds: &DsClient, args: &Args, own_generation: &str, now: u64, o
     if retired.catalog_deleted {
         writeln!(out, "retired {} streams and the catalog", retired.deleted.len())?;
         Ok(0)
+    } else if let Some(path) = &retired.unrecorded_stream {
+        writeln!(
+            out,
+            "nothing was deleted: {path} appeared during the run and the catalog does not name it, so an engine may \
+             be writing this generation. The catalog is closed now, so that engine's next append fails. Find the \
+             writer before any re-run."
+        )?;
+        Ok(EXIT_CATALOG_MOVED)
     } else if let Some((before, after)) = &retired.catalog_moved {
         writeln!(
             out,
