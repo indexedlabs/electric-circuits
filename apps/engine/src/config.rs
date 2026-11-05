@@ -142,6 +142,10 @@ pub struct Config {
     /// Backfill streaming: the byte budget for one backfill append and the off-by-default
     /// slow-backfill `statement_timeout`.
     pub backfill: crate::pg::BackfillConfig,
+    /// Sliding `Stream-TTL` the engine sends on every stream it creates
+    /// (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, seconds). Unset or `0` sends none. A non-zero value
+    /// under [`crate::retention::stream_ttl_floor`] refuses the boot.
+    pub stream_ttl: Option<std::num::NonZeroU64>,
     /// How long a graceful shutdown may take before it is forced
     /// (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`).
     pub shutdown_grace: Duration,
@@ -649,6 +653,36 @@ impl Config {
         let settle = resolve_settle(&g, d.settle)?;
         let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms, settle };
 
+        let stream_ttl = match g("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") {
+            None => None,
+            Some(raw) => std::num::NonZeroU64::new(raw.trim().parse::<u64>().map_err(|_| {
+                anyhow::anyhow!(
+                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS must be a whole number of seconds (0 = no TTL), got '{}'",
+                    raw.trim()
+                )
+            })?),
+        };
+        if let Some(ttl) = stream_ttl {
+            let Some(floor) = crate::retention::stream_ttl_floor(
+                &crate::retention::RetentionConfig::resolve(&g),
+                &crate::changelog::ChangeLogConfig::resolve(&g),
+            ) else {
+                bail!(
+                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
+                     ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
+                     TTL is safe"
+                );
+            };
+            if Duration::from_secs(ttl.get()) < floor {
+                bail!(
+                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
+                     idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
+                     stream the engine still tracks",
+                    floor.as_secs()
+                );
+            }
+        }
+
         let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
         let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;
         if shutdown_ready_drain >= shutdown_grace {
@@ -732,6 +766,7 @@ impl Config {
             memory_budget: MemoryBudgetConfig::resolve(g("ELECTRIC_CIRCUITS_MEMORY_BUDGET_BYTES"))?,
             subq_storage: crate::subq_circuit::StorageSettings::resolve(g),
             backfill,
+            stream_ttl,
             shutdown_grace,
             shutdown_ready_drain,
             sources,
@@ -753,7 +788,7 @@ impl Config {
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
              secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} json_logs={} memory_log_period={:?} memory_bytes_log_period={:?} initialize_namespace={} log={} \
              txn_memory_bytes={} held_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
-             backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
+             backfill_statement_timeout_ms={} stream_ttl_secs={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -779,6 +814,7 @@ impl Config {
             self.txn.spill_dir.display(),
             self.backfill.append_bytes,
             self.backfill.statement_timeout_ms,
+            self.stream_ttl.map_or(0, |ttl| ttl.get()),
             self.shutdown_grace,
             self.shutdown_ready_drain,
         );
@@ -1453,6 +1489,70 @@ mod tests {
             assert!(msg.contains("ELECTRIC_CIRCUITS_PG_TABLES"), "{msg}");
             assert!(msg.contains("schema.*"), "the message must state the rule: {msg}");
         }
+    }
+
+    /// `#c-ttl-floor`: unset or `0` is no TTL; a non-zero TTL under twice the larger of
+    /// idle-plus-dormancy and the change-log retain window (14.5 days at the defaults) refuses the
+    /// boot, and the floor follows those windows' own settings.
+    #[test]
+    fn stream_ttl_is_off_by_default_and_refused_under_the_floor() {
+        assert_eq!(cfg(&[]).stream_ttl, None);
+        assert_eq!(cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "0")]).stream_ttl, None);
+        assert_eq!(
+            cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1814400")]).stream_ttl.map(|t| t.get()),
+            Some(1_814_400),
+            "prod's 21 days clears the default floor"
+        );
+        let floor = 2 * (6 * 3600 + 7 * 86_400);
+        assert_eq!(floor, 1_252_800, "14.5 days");
+        assert!(try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", &floor.to_string())]).is_ok());
+        let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", &(floor - 1).to_string())])
+            .expect_err("a TTL under the floor refuses the boot");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") && msg.contains("1252800"), "{msg}");
+
+        // The retain window wins when it is the larger.
+        let retain =
+            [("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "2000000"), ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "3999999")];
+        assert!(try_cfg(&retain).is_err());
+        // Short windows lower it.
+        let short = [
+            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
+            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
+            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "8"),
+        ];
+        assert_eq!(cfg(&short).stream_ttl.map(|t| t.get()), Some(8));
+
+        // Idle or dormancy disabled (0) is unbounded: a shape may stay forever, so no TTL is safe.
+        for window in ["ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS"] {
+            let err = try_cfg(&[(window, "0"), ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000")])
+                .expect_err(&format!("{window}=0 refuses any non-zero TTL"));
+            assert!(format!("{err:#}").contains("0 (disabled)"), "{err:#}");
+            assert_eq!(try_cfg(&[(window, "0")]).unwrap().stream_ttl, None, "{window}=0 with no TTL still boots");
+        }
+
+        // A retain window of 0 adds nothing: dormancy eviction still unpins the segment, so the floor is
+        // twice idle-plus-dormancy alone.
+        let no_retain = |ttl: &str| {
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
+                ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "100"),
+                ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "200"),
+                ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", ttl),
+            ])
+        };
+        assert_eq!(no_retain("600").expect("a TTL at the floor boots").stream_ttl.map(|t| t.get()), Some(600));
+        assert!(no_retain("599").is_err(), "under the floor still refuses");
+        let idle_off = try_cfg(&[
+            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000"),
+        ]);
+        assert!(idle_off.is_err_and(|e| format!("{e:#}").contains("0 (disabled)")), "idle 0 refuses with retain 0 too");
+
+        let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "21d")]).expect_err("not a number");
+        assert!(format!("{err:#}").contains("whole number of seconds"));
     }
 
     #[test]

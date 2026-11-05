@@ -99,10 +99,6 @@ pub struct RetentionConfig {
     pub pending_buffer_max_bytes: u64,
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(default)
-}
-
 impl Default for RetentionConfig {
     fn default() -> Self {
         RetentionConfig {
@@ -126,14 +122,20 @@ impl RetentionConfig {
     }
 
     pub fn from_env() -> Self {
+        Self::resolve(|name| std::env::var(name).ok())
+    }
+
+    /// Resolve from an environment getter, so the boot configuration can check the retention
+    /// windows against `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` through the same values.
+    pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Self {
+        let env_u64 =
+            |name: &str, default: u64| get(name).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(default);
         let d = RetentionConfig::default();
         // Backward compatibility: deployments and the conformance harness historically set the
         // idle knob to accelerate both dormancy and lease expiry. An explicit lease knob wins;
         // otherwise preserve that legacy coupling only when the old env var is actually supplied.
-        let legacy_idle =
-            std::env::var("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        let lease_secs = std::env::var("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS")
-            .ok()
+        let legacy_idle = get("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS").and_then(|v| v.trim().parse::<u64>().ok());
+        let lease_secs = get("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .or(legacy_idle)
             .unwrap_or(d.subscription_lease_timeout.as_secs());
@@ -156,6 +158,23 @@ impl RetentionConfig {
             pending_buffer_max_bytes: env_u64("ELECTRIC_CIRCUITS_PENDING_BUFFER_MAX_BYTES", d.pending_buffer_max_bytes),
         }
     }
+}
+
+/// The shortest non-zero `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` the engine starts with: twice the
+/// larger of a shape's idle-plus-dormancy window and the change log's retain window, 14.5 days at
+/// the defaults. Those windows bound how long the engine's own lifecycle holds a stream before it
+/// deletes it, so the TTL stays well clear of them. `None` when idle or dormancy is `0`
+/// (disabled): a shape may then stay forever, and no TTL is safe. A retain window of `0` adds
+/// nothing to the floor, since dormancy eviction still unpins the segment a dormant shape holds.
+///
+/// The floor alone does not keep a tracked stream alive. A stream the engine neither appends to nor
+/// reads, such as a restored dormant shape whose dormancy clock restarted at boot, still expires
+/// unless something reads it; `HEAD` does not slide the TTL.
+pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog::ChangeLogConfig) -> Option<Duration> {
+    if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() {
+        return None;
+    }
+    Some(retention.idle_timeout.saturating_add(retention.dormant_ttl).max(changes.retain).saturating_mul(2))
 }
 
 /// Where a shape is in the lifecycle. Held per shape id by the engine (`Engine::lives`).

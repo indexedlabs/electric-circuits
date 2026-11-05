@@ -767,7 +767,10 @@ async fn source_ds(config: &Config, source_id: &str) -> Result<(DsClient, Stream
             connection.client_key_path.clone(),
             scope.clone(),
         )?;
-        return Ok((DsClient::connect(connection).await?.with_memory_budget(config), scope));
+        return Ok((
+            DsClient::connect(connection).await?.with_memory_budget(config).with_stream_ttl(config.stream_ttl),
+            scope,
+        ));
     }
     if let Some(base_url) = config.ds_in_process_test_url.as_ref() {
         #[cfg(any(test, feature = "test-support"))]
@@ -775,7 +778,8 @@ async fn source_ds(config: &Config, source_id: &str) -> Result<(DsClient, Stream
             let scope = source_scope(&StreamScope::in_process_test_scope(), source_id)?;
             return Ok((
                 DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope.clone())
-                    .with_memory_budget(config),
+                    .with_memory_budget(config)
+                    .with_stream_ttl(config.stream_ttl),
                 scope,
             ));
         }
