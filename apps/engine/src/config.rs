@@ -668,9 +668,9 @@ impl Config {
                 &crate::changelog::ChangeLogConfig::resolve(&g),
             ) else {
                 bail!(
-                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS, \
-                     ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS or ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS is 0 (disabled), \
-                     so the engine may hold a stream forever and no TTL is safe"
+                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
+                     ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
+                     TTL is safe"
                 );
             };
             if Duration::from_secs(ttl.get()) < floor {
@@ -1524,17 +1524,32 @@ mod tests {
         ];
         assert_eq!(cfg(&short).stream_ttl.map(|t| t.get()), Some(8));
 
-        // A disabled window (0) is unbounded: the engine may hold a stream forever, so no TTL is safe.
-        for window in [
-            "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS",
-            "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
-            "ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS",
-        ] {
+        // Idle or dormancy disabled (0) is unbounded: a shape may stay forever, so no TTL is safe.
+        for window in ["ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS"] {
             let err = try_cfg(&[(window, "0"), ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000")])
                 .expect_err(&format!("{window}=0 refuses any non-zero TTL"));
             assert!(format!("{err:#}").contains("0 (disabled)"), "{err:#}");
             assert_eq!(try_cfg(&[(window, "0")]).unwrap().stream_ttl, None, "{window}=0 with no TTL still boots");
         }
+
+        // A retain window of 0 adds nothing: dormancy eviction still unpins the segment, so the floor is
+        // twice idle-plus-dormancy alone.
+        let no_retain = |ttl: &str| {
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
+                ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "100"),
+                ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "200"),
+                ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", ttl),
+            ])
+        };
+        assert_eq!(no_retain("600").expect("a TTL at the floor boots").stream_ttl.map(|t| t.get()), Some(600));
+        assert!(no_retain("599").is_err(), "under the floor still refuses");
+        let idle_off = try_cfg(&[
+            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000"),
+        ]);
+        assert!(idle_off.is_err_and(|e| format!("{e:#}").contains("0 (disabled)")), "idle 0 refuses with retain 0 too");
 
         let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "21d")]).expect_err("not a number");
         assert!(format!("{err:#}").contains("whole number of seconds"));
