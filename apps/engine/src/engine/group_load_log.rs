@@ -61,8 +61,8 @@ pub(crate) struct GroupLoadLog {
     complete: Duration,
     /// The batch read's own pieces.
     pub(crate) batch: SubsetBatchTiming,
-    /// Why the batch read failed, value-free.
-    batch_failure: Option<Failure>,
+    /// Why an engine step failed, value-free.
+    failure: Option<Failure>,
     logged: bool,
 }
 
@@ -82,7 +82,7 @@ impl GroupLoadLog {
             tail: Duration::ZERO,
             complete: Duration::ZERO,
             batch: SubsetBatchTiming::default(),
-            batch_failure: None,
+            failure: None,
             logged: false,
         }
     }
@@ -109,14 +109,16 @@ impl GroupLoadLog {
             GroupLoadPhase::Create => self.create += elapsed,
             GroupLoadPhase::Tail => self.tail += elapsed,
             GroupLoadPhase::Complete => self.complete += elapsed,
-            // The batch times its own pieces.
+            // The batch times its own pieces once it has its plans. Until then this phase is the
+            // planning, and a load that ended there has no other record of it.
+            GroupLoadPhase::Query if self.batch.pool.is_none() => self.batch.plan = elapsed,
             GroupLoadPhase::Query => {}
         }
     }
 
-    /// Record why the batch read failed, while the typed error is still at hand.
-    pub(crate) fn batch_failed(&mut self, error: &anyhow::Error) {
-        self.batch_failure = Some(Failure::of(error));
+    /// Record why a step failed, while the typed error is still at hand.
+    pub(crate) fn failed(&mut self, error: &anyhow::Error) {
+        self.failure = Some(Failure::of(error));
     }
 
     /// Log the load's outcome: `ok`, or `error` with the HTTP status it answered.
@@ -160,7 +162,7 @@ impl GroupLoadLog {
     fn emit(&mut self, outcome: &'static str, phase: Option<&'static str>, status: Option<StatusCode>) {
         self.logged = true;
         let (pool_in_use, pool_size) = self.batch.pool.unwrap_or_default();
-        let (error_kind, sqlstate) = self.batch_failure.take().map_or((None, None), |f| (Some(f.kind), f.sqlstate));
+        let (error_kind, sqlstate) = self.failure.take().map_or((None, None), |f| (Some(f.kind), f.sqlstate));
         let reads = self.batch.reads.lock().unwrap();
         let rows: usize = reads.members.iter().map(|member| member.rows).sum();
         // One string field, so a log search can read every member of a load from its one line.
@@ -337,7 +339,7 @@ mod tests {
             log.batch.query.last = Some(QueryPhase::Select);
             let unsettled =
                 crate::pg::SnapshotUnsettled { cause: crate::pg::UnsettledCause::TimedOut, pending: vec![7] };
-            log.batch_failed(&anyhow::Error::new(unsettled).context("private-sentinel"));
+            log.failed(&anyhow::Error::new(unsettled).context("private-sentinel"));
             log.finish(Err(StatusCode::SERVICE_UNAVAILABLE));
         });
         assert_eq!(logged.len(), 1, "{logged:?}");
@@ -361,6 +363,38 @@ mod tests {
         assert_eq!(logged[0]["outcome"], "cancelled");
         assert_eq!(logged[0]["phase"], "create");
         assert!(logged[0]["create_ms"].as_u64().unwrap() >= 15, "{}", logged[0]);
+    }
+
+    /// A load dropped before it has its plans, waiting for the engine-state lock.
+    #[test]
+    fn a_load_dropped_while_planning_credits_the_plan() {
+        let logged = events(|| {
+            let mut log = log();
+            log.phase(GroupLoadPhase::Query);
+            std::thread::sleep(Duration::from_millis(15));
+            drop(log);
+        });
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert_eq!(logged[0]["outcome"], "cancelled");
+        assert_eq!(logged[0]["phase"], "plan");
+        assert!(logged[0]["plan_ms"].as_u64().unwrap() >= 15, "{}", logged[0]);
+    }
+
+    /// A second load of a subscription still being assembled names that refusal, not just its 503.
+    #[test]
+    fn a_load_refused_as_in_flight_names_the_refusal() {
+        let logged = events(|| {
+            let mut log = log();
+            log.phase(GroupLoadPhase::Create);
+            let refused = crate::engine::GroupLoadInFlight { subscription: "private-sentinel".into() };
+            log.failed(&anyhow::Error::new(refused));
+            log.finish(Err(StatusCode::SERVICE_UNAVAILABLE));
+        });
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert_eq!(logged[0]["phase"], "create");
+        assert_eq!(logged[0]["status"], 503);
+        assert_eq!(logged[0]["error_kind"], "group_load_in_flight");
+        assert!(!logged[0].to_string().contains("private-sentinel"), "{}", logged[0]);
     }
 
     #[test]

@@ -1972,14 +1972,29 @@ pub struct BatchReads {
     pub members: Vec<BatchMemberTiming>,
     /// Connections that held the snapshot: the first, and each helper that imported it.
     pub connections: usize,
-    /// The longest a helper waited for a pool slot.
+    /// The longest a helper waited for a connection, its slot and any dial.
     pub helper_wait: std::time::Duration,
+}
+
+/// Reports a helper's wait for a connection when it ends, however it ends, so a batch dropped or
+/// failed while its helpers queue still shows the wait.
+struct HelperWait<'r> {
+    timing: &'r std::sync::Mutex<BatchReads>,
+    started: std::time::Instant,
+}
+
+impl Drop for HelperWait<'_> {
+    fn drop(&mut self) {
+        let mut timing = self.timing.lock().unwrap();
+        timing.helper_wait = timing.helper_wait.max(self.started.elapsed());
+    }
 }
 
 /// Where a batch's time went. Each piece is written as its phase ends.
 #[derive(Debug, Default)]
 pub struct SubsetBatchTiming {
-    /// Planning every member's SQL, including the wait for the engine-state lock.
+    /// Planning every member's SQL, including the wait for the engine-state lock. Written when the
+    /// plans are done; a batch that ends sooner is credited by whoever timed it.
     pub plan: std::time::Duration,
     /// Pool occupancy and cap when the batch asked for its first connection.
     pub pool: Option<(usize, usize)>,
@@ -2010,11 +2025,6 @@ impl<'r, 'a> MemberQueue<'r, 'a> {
         self.reads.get(index).map(|read| (index, read))
     }
 
-    fn helper_waited(&self, waited: std::time::Duration) {
-        let mut timing = self.timing.lock().unwrap();
-        timing.helper_wait = timing.helper_wait.max(waited);
-    }
-
     /// Read members on `client`, whose open transaction holds the batch's snapshot, until none is left.
     async fn drain(&self, client: &Client) -> Result<Vec<(usize, Vec<Row>)>> {
         let mut pages = Vec::new();
@@ -2039,19 +2049,15 @@ impl<'r, 'a> MemberQueue<'r, 'a> {
     /// unchanged. Only a member's own read can fail the batch.
     async fn help(&self, pool: Pool, snapshot_id: &str) -> Result<Vec<(usize, Vec<Row>)>> {
         let mut drained = self.drained.subscribe();
-        let mut checkout = CheckoutTiming::default();
+        let waiting = HelperWait { timing: self.timing, started: std::time::Instant::now() };
         // Waiting for a slot holds no connection and this batch's first connection keeps taking
         // members meanwhile, so batches filling the pool cannot deadlock on each other.
-        let waiting = std::time::Instant::now();
         let client = tokio::select! {
             biased;
-            _ = drained.wait_for(|drained| *drained) => {
-                self.helper_waited(waiting.elapsed());
-                return Ok(Vec::new());
-            }
-            client = pool.get_timed(&mut checkout) => client,
+            _ = drained.wait_for(|drained| *drained) => return Ok(Vec::new()),
+            client = pool.get() => client,
         };
-        self.helper_waited(checkout.slot_wait);
+        drop(waiting);
         let client = match client {
             Ok(client) => client,
             Err(error) => {
@@ -2086,7 +2092,8 @@ impl<'r, 'a> MemberQueue<'r, 'a> {
 /// settled snapshot and the others import it, so every member sees exactly what `client` sees and
 /// the fences describe them all. The exporting transaction stays open until every member has
 /// finished. `client` itself works through the members, so a batch never needs a second connection
-/// to finish; a single read takes none. Any member's failure fails the batch.
+/// to finish; a single read takes none. Any member's failure fails the batch at once, and its
+/// connections roll back behind whatever they were reading before they return to the pool.
 ///
 /// `timing` receives each phase as it ends, so a failed batch still reports the phases it ran.
 pub async fn query_subset_batch_where(
@@ -2127,12 +2134,21 @@ pub async fn query_subset_batch_where(
         // On the first failure the other workers are dropped, and each one's checkout rolls back.
         tokio::try_join!(queue.drain(client), futures_util::future::try_join_all(helping))
     };
+    // A failed batch answers now. A `COMMIT` would queue behind the `SELECT` a dropped worker left
+    // running on this connection; the checkout's drop rolls back behind it instead.
+    let (own, helped) = match result {
+        Ok(read) => read,
+        Err(error) => {
+            timing.query.select = selecting.elapsed();
+            timing.query.in_progress = None;
+            return Err(error);
+        }
+    };
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
     timing.query.select = selecting.elapsed();
     timing.query.in_progress = None;
-    let (own, helped) = result?;
     let mut pages: Vec<(usize, Vec<Row>)> = own.into_iter().chain(helped.into_iter().flatten()).collect();
     pages.sort_unstable_by_key(|(index, _)| *index);
     let pages = pages.into_iter().map(|(_, rows)| rows).collect();

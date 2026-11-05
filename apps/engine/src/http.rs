@@ -1339,7 +1339,7 @@ async fn run_subset_load_group(
                     engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalSnapshot).await;
                     log.phase(GroupLoadPhase::Query);
                     let page = engine.query_subset_batch(reads, &mut log.batch).await;
-                    let page = page.inspect_err(|error| log.batch_failed(error)).map_err(AppError::from)?;
+                    let page = page.inspect_err(|error| log.failed(error)).map_err(AppError::from)?;
                     log.phase(GroupLoadPhase::Renew);
                     // Recheck under the state lock, where a release begins: a release that has
                     // not begun by now is ordered after this answer (#g-group-recheck).
@@ -1365,7 +1365,10 @@ async fn run_subset_load_group(
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
-    engine.reserve_group_with_id(&group_sub, &member_subscriptions, &group_path).await?;
+    engine
+        .reserve_group_with_id(&group_sub, &member_subscriptions, &group_path)
+        .await
+        .inspect_err(|error| log.failed(error))?;
     engine.register_group_lane(&group_path);
     let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     #[cfg(feature = "test-support")]
@@ -1431,7 +1434,7 @@ async fn run_subset_load_group(
     let page = match engine.query_subset_batch(reads, &mut log.batch).await {
         Ok(page) => page,
         Err(error) => {
-            log.batch_failed(&error);
+            log.failed(&error);
             reservation.rollback().await;
             return Err(AppError::from(error));
         }

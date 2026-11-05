@@ -145,6 +145,9 @@ impl Failure {
             };
             return Failure { kind, sqlstate: None };
         }
+        if e.downcast_ref::<crate::engine::GroupLoadInFlight>().is_some() {
+            return Failure { kind: "group_load_in_flight", sqlstate: None };
+        }
         if let Some(pg) = e.chain().find_map(|cause| cause.downcast_ref::<tokio_postgres::Error>()) {
             let kind = if pg.is_closed() { "postgres_closed" } else { "postgres" };
             return Failure { kind, sqlstate: pg.code().map(|code| code.code().to_owned()) };

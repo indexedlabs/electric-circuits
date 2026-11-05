@@ -248,10 +248,12 @@ async fn a_member_failure_fails_the_load_and_leaves_the_pool_clean() -> Result<(
     f.close_gate().await?;
     let loading = start(&pool, vec![f.gated(0), f.failing(1), f.plain(2)]);
     f.wait_held(1).await?;
-    f.open_gate().await?;
+    // The answer comes while the first connection's member is still held inside PostgreSQL.
     let failure = finished(loading).await.err().context("a failing member must fail the load")?;
+    assert_eq!(f.held_reads().await?, 1, "the other member is still reading");
     let sqlstate = failure.chain().find_map(|cause| cause.downcast_ref::<tokio_postgres::Error>()?.code().cloned());
     assert_eq!(sqlstate, Some(tokio_postgres::error::SqlState::DIVISION_BY_ZERO), "{failure:#}");
+    f.open_gate().await?;
     wait_in_use(&pool, 0).await?;
     assert_eq!(f.stranded_transactions().await?, 0);
     let again = finished(start(&pool, vec![f.plain(0), f.plain(2)])).await?;
@@ -276,6 +278,35 @@ async fn a_dropped_load_gives_every_connection_back() -> Result<()> {
     assert_eq!(f.stranded_transactions().await?, 0);
     let again = finished(start(&pool, vec![f.plain(0), f.plain(1)])).await?;
     assert_eq!(again.pages, [1, 2]);
+    pool.close();
+    f.cleanup().await
+}
+
+/// A load dropped while its helpers queue for a slot still reports how long they waited.
+#[tokio::test]
+#[ignore = "requires PostgreSQL via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+async fn a_load_dropped_while_helpers_queue_reports_their_wait() -> Result<()> {
+    let f = Fixture::new(&[1, 2]).await?;
+    let pool = Pool::new(f.url.clone(), 2);
+    let held_slot = pool.hold_slot_for_test().await;
+    f.close_gate().await?;
+    let members = [f.gated(0), f.plain(1)];
+    let reads = members
+        .iter()
+        .map(|m| SubsetRead { ts: &m.ts, where_sql: m.where_sql.clone(), order: None, limit: None, offset: None })
+        .collect();
+    let scope = SettleScope::request(&members[0].ts.table).with([&members[1].ts.table]);
+    let mut client = pool.get().await?;
+    let mut timing = SubsetBatchTiming::default();
+    let waited = Duration::from_millis(200);
+    let batch = query_subset_batch_where(&mut client, reads, &scope, &mut timing);
+    assert!(tokio::time::timeout(waited, batch).await.is_err(), "the held member keeps the batch reading");
+    let helper_wait = timing.reads.lock().unwrap().helper_wait;
+    assert!(helper_wait >= Duration::from_millis(100), "the helper's wait was lost: {helper_wait:?}");
+    f.open_gate().await?;
+    drop(client);
+    drop(held_slot);
+    wait_in_use(&pool, 0).await?;
     pool.close();
     f.cleanup().await
 }
