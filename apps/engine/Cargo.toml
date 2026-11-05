@@ -45,6 +45,8 @@ utoipa = { version = "4.2.3", features = ["axum_extras"] }
 tokio = { version = "1", features = ["full"] }
 # BroadcastStream adapter for the /trace SSE endpoint.
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Joining a group load's borrowing member reads in the request's own task.
+futures-util = "0.3"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 # Durable Streams supports private HTTP and verified HTTPS with optional client authentication.

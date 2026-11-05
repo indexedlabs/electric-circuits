@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
@@ -1921,7 +1921,7 @@ pub async fn query_subset_where(
     let selecting = std::time::Instant::now();
     timing.in_progress = Some((QueryPhase::Select, selecting));
     timing.last = Some(QueryPhase::Select);
-    let result = query_subset_in_txn(client, ts, where_sql, order, limit, offset).await;
+    let result = query_subset_in_txn(client, ts, where_sql.as_ref(), order, limit, offset).await;
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
@@ -1948,33 +1948,203 @@ pub struct SubsetBatchQuery {
     pub horizon: String,
 }
 
+/// The most connections one batch reads on, the one holding its snapshot included. A batch costs the
+/// slowest of its members once this many run together, and a cold launch runs about ten batches at
+/// once on a pool of 20, so a larger cap would mostly move the wait into the pool.
+const MAX_BATCH_CONNECTIONS: usize = 3;
+
+/// One member read of a batch.
+#[derive(Debug, Clone)]
+pub struct BatchMemberTiming {
+    /// The member's table.
+    pub table: String,
+    pub rows: usize,
+    /// When its `SELECT` began, counted from the start of the batch's select phase.
+    pub started: std::time::Duration,
+    /// Its `SELECT` and the decoding of its rows.
+    pub select: std::time::Duration,
+}
+
+/// What the workers of a batch report as they go, so a dropped or failed batch keeps what finished.
+#[derive(Debug, Default)]
+pub struct BatchReads {
+    /// Members that finished, in the order they finished.
+    pub members: Vec<BatchMemberTiming>,
+    /// Connections that held the snapshot: the first, and each helper that imported it.
+    pub connections: usize,
+    /// The longest a helper waited for a pool slot.
+    pub helper_wait: std::time::Duration,
+}
+
+/// Where a batch's time went. Each piece is written as its phase ends.
+#[derive(Debug, Default)]
+pub struct SubsetBatchTiming {
+    /// Planning every member's SQL, including the wait for the engine-state lock.
+    pub plan: std::time::Duration,
+    /// Pool occupancy and cap when the batch asked for its first connection.
+    pub pool: Option<(usize, usize)>,
+    /// The checkout of the first connection.
+    pub checkout: CheckoutTiming,
+    /// `snapshot` covers the settle and the export; `select` runs from the first member's read until
+    /// the last worker's `COMMIT`.
+    pub query: SubsetQueryTiming,
+    pub reads: std::sync::Mutex<BatchReads>,
+}
+
+/// The members no worker has taken yet.
+struct MemberQueue<'r, 'a> {
+    reads: &'r [SubsetRead<'a>],
+    next: AtomicUsize,
+    /// Set once every member is taken, which ends a helper's wait for a connection.
+    drained: tokio::sync::watch::Sender<bool>,
+    timing: &'r std::sync::Mutex<BatchReads>,
+    started: std::time::Instant,
+}
+
+impl<'r, 'a> MemberQueue<'r, 'a> {
+    fn take(&self) -> Option<(usize, &'r SubsetRead<'a>)> {
+        let index = self.next.fetch_add(1, Ordering::SeqCst);
+        if index + 1 >= self.reads.len() {
+            self.drained.send_replace(true);
+        }
+        self.reads.get(index).map(|read| (index, read))
+    }
+
+    fn helper_waited(&self, waited: std::time::Duration) {
+        let mut timing = self.timing.lock().unwrap();
+        timing.helper_wait = timing.helper_wait.max(waited);
+    }
+
+    /// Read members on `client`, whose open transaction holds the batch's snapshot, until none is left.
+    async fn drain(&self, client: &Client) -> Result<Vec<(usize, Vec<Row>)>> {
+        let mut pages = Vec::new();
+        while let Some((index, r)) = self.take() {
+            let began = std::time::Instant::now();
+            let rows = query_subset_in_txn(client, r.ts, r.where_sql.as_ref(), r.order, r.limit, r.offset).await?;
+            self.timing.lock().unwrap().members.push(BatchMemberTiming {
+                table: r.ts.table.to_string(),
+                rows: rows.len(),
+                started: began.duration_since(self.started),
+                select: began.elapsed(),
+            });
+            pages.push((index, rows));
+        }
+        Ok(pages)
+    }
+
+    /// Take a second connection, import the batch's snapshot and read members on it.
+    ///
+    /// A helper is an optimization. Until it has imported the snapshot it has taken no member, so a
+    /// refused dial or import leaves its share to the other connections and the batch's result is
+    /// unchanged. Only a member's own read can fail the batch.
+    async fn help(&self, pool: Pool, snapshot_id: &str) -> Result<Vec<(usize, Vec<Row>)>> {
+        let mut drained = self.drained.subscribe();
+        let mut checkout = CheckoutTiming::default();
+        // Waiting for a slot holds no connection and this batch's first connection keeps taking
+        // members meanwhile, so batches filling the pool cannot deadlock on each other.
+        let waiting = std::time::Instant::now();
+        let client = tokio::select! {
+            biased;
+            _ = drained.wait_for(|drained| *drained) => {
+                self.helper_waited(waiting.elapsed());
+                return Ok(Vec::new());
+            }
+            client = pool.get_timed(&mut checkout) => client,
+        };
+        self.helper_waited(checkout.slot_wait);
+        let client = match client {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(error = %format!("{error:#}"), "subset batch helper got no connection");
+                return Ok(Vec::new());
+            }
+        };
+        if *self.drained.borrow() {
+            return Ok(Vec::new());
+        }
+        client.transaction_started();
+        let import =
+            format!("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{snapshot_id}'");
+        if let Err(error) = client.batch_execute(&import).await {
+            tracing::warn!(error = %error, "subset batch helper could not import the snapshot");
+            return Ok(Vec::new());
+        }
+        self.timing.lock().unwrap().connections += 1;
+        let pages = self.drain(&client).await?;
+        if client.batch_execute("COMMIT").await.is_ok() {
+            client.transaction_finished();
+        }
+        Ok(pages)
+    }
+}
+
 /// Run several subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the scope
 /// load). `scope` must name every table any read depends on — each read's table and the inner
 /// tables of its subqueries — so the one settle covers all of them.
+///
+/// Members read concurrently, on up to [`MAX_BATCH_CONNECTIONS`] connections: `client` exports its
+/// settled snapshot and the others import it, so every member sees exactly what `client` sees and
+/// the fences describe them all. The exporting transaction stays open until every member has
+/// finished. `client` itself works through the members, so a batch never needs a second connection
+/// to finish; a single read takes none. Any member's failure fails the batch.
+///
+/// `timing` receives each phase as it ends, so a failed batch still reports the phases it ran.
 pub async fn query_subset_batch_where(
     client: &mut PooledClient,
     reads: Vec<SubsetRead<'_>>,
     scope: &SettleScope,
+    timing: &mut SubsetBatchTiming,
 ) -> Result<SubsetBatchQuery> {
-    let fences = begin_settled_snapshot(client, scope, 0, "subset batch").await?;
-    let mut pages = Vec::with_capacity(reads.len());
-    let mut failed = None;
-    for r in reads {
-        match query_subset_in_txn(client, r.ts, r.where_sql, r.order, r.limit, r.offset).await {
-            Ok(rows) => pages.push(rows),
-            Err(e) => {
-                failed = Some(e);
-                break;
-            }
-        }
+    let helpers = MAX_BATCH_CONNECTIONS.min(reads.len()).saturating_sub(1);
+    let started = std::time::Instant::now();
+    timing.query.in_progress = Some((QueryPhase::Snapshot, started));
+    timing.query.last = Some(QueryPhase::Snapshot);
+    let opened = async {
+        let fences = begin_settled_snapshot(client, scope, 0, "subset batch").await?;
+        let snapshot_id = if helpers > 0 { export_snapshot(client).await? } else { String::new() };
+        Ok::<_, anyhow::Error>((fences, snapshot_id))
     }
+    .await;
+    timing.query.snapshot = started.elapsed();
+    timing.query.in_progress = None;
+    let (fences, snapshot_id) = opened?;
+    let client = &*client;
+    let selecting = std::time::Instant::now();
+    timing.query.in_progress = Some((QueryPhase::Select, selecting));
+    timing.query.last = Some(QueryPhase::Select);
+    timing.reads.lock().unwrap().connections = 1;
+    let result = {
+        let (drained, _) = tokio::sync::watch::channel(false);
+        let queue = MemberQueue {
+            reads: &reads,
+            next: AtomicUsize::new(0),
+            drained,
+            timing: &timing.reads,
+            started: selecting,
+        };
+        let pool = Pool { inner: client.inner.clone() };
+        let helping = (0..helpers).map(|_| queue.help(pool.clone(), &snapshot_id));
+        // On the first failure the other workers are dropped, and each one's checkout rolls back.
+        tokio::try_join!(queue.drain(client), futures_util::future::try_join_all(helping))
+    };
     if client.batch_execute("COMMIT").await.is_ok() {
         client.transaction_finished();
     }
-    if let Some(e) = failed {
-        return Err(e);
-    }
+    timing.query.select = selecting.elapsed();
+    timing.query.in_progress = None;
+    let (own, helped) = result?;
+    let mut pages: Vec<(usize, Vec<Row>)> = own.into_iter().chain(helped.into_iter().flatten()).collect();
+    pages.sort_unstable_by_key(|(index, _)| *index);
+    let pages = pages.into_iter().map(|(_, rows)| rows).collect();
     Ok(SubsetBatchQuery { pages, lsn: fences.seed_lsn, snapshot: fences.snapshot, horizon: fences.horizon_lsn })
+}
+
+/// Export the open transaction's snapshot for other connections. Its id stays valid until that
+/// transaction ends.
+async fn export_snapshot(client: &PooledClient) -> Result<String> {
+    let row =
+        client.query_one("select pg_export_snapshot()", &[]).await.context("exporting the subset batch snapshot")?;
+    Ok(row.get(0))
 }
 
 /// One `ORDER BY` term for a subset page.
@@ -1994,14 +2164,14 @@ fn order_term(ts: &TableSchema, col: usize, dir: &str) -> String {
 async fn query_subset_in_txn(
     client: &Client,
     ts: &TableSchema,
-    where_sql: Option<(String, Vec<String>)>,
+    where_sql: Option<&(String, Vec<String>)>,
     order: Option<(usize, bool)>,
     limit: Option<i64>,
     offset: Option<i64>,
 ) -> Result<Vec<Row>> {
     let (where_clause, params) = match where_sql {
-        Some((w, ps)) => (format!(" where {w}"), ps),
-        None => (String::new(), Vec::new()),
+        Some((w, ps)) => (format!(" where {w}"), ps.as_slice()),
+        None => (String::new(), [].as_slice()),
     };
     let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         params.iter().map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
@@ -2042,6 +2212,9 @@ async fn query_subset_in_txn(
 
 #[cfg(test)]
 pub(crate) mod memory_budget_tests;
+
+#[cfg(test)]
+mod subset_batch_tests;
 
 #[cfg(test)]
 mod tests {

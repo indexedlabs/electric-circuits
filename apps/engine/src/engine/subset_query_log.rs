@@ -129,13 +129,13 @@ impl Drop for SubsetQueryLog {
 /// Postgres cast errors), so the event carries a fixed category and, for a Postgres error, its
 /// SQLSTATE: enough to tell a settle wait, a refused connection (`53300`) or a cancelled statement
 /// (`57014`) apart.
-struct Failure {
-    kind: &'static str,
-    sqlstate: Option<String>,
+pub(super) struct Failure {
+    pub(super) kind: &'static str,
+    pub(super) sqlstate: Option<String>,
 }
 
 impl Failure {
-    fn of(e: &anyhow::Error) -> Self {
+    pub(super) fn of(e: &anyhow::Error) -> Self {
         if let Some(unsettled) = e.downcast_ref::<crate::pg::SnapshotUnsettled>() {
             let kind = match unsettled.cause {
                 crate::pg::UnsettledCause::TimedOut => "settle_timed_out",
@@ -153,7 +153,7 @@ impl Failure {
     }
 }
 
-fn ms(d: Duration) -> u64 {
+pub(super) fn ms(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
