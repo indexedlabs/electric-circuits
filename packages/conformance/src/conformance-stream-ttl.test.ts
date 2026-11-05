@@ -8,7 +8,8 @@
 //   2. Streams created before the TTL was set keep their configuration, and the engine still opens
 //      them: it boots over them, and a restored shape keeps receiving writes (`#v-ttl-on-create`,
 //      `#c-old-stream-config`).
-//   3. A TTL under the floor refuses the boot with exit 78 (`#v-ttl-floor`).
+//   3. A TTL under the floor, or any TTL while dormancy is disabled, refuses the boot with exit 78;
+//      a disabled retain window adds nothing to the floor (`#v-ttl-floor`).
 //
 // Second-scale retention knobs keep the floor (twice the larger of idle-plus-dormancy and the
 // change log's retain window) small enough for a test to clear; production's defaults make it
@@ -166,5 +167,24 @@ describe('conformance: engine streams carry a sliding Stream-TTL', () => {
     expect(exit.code, `expected EX_CONFIG (78), got ${JSON.stringify(exit)}\n${raw.stderr()}`).toBe(78)
     expect(raw.stderr()).toContain('boot refused')
     expect(raw.stderr()).toContain('ELECTRIC_CIRCUITS_STREAM_TTL_SECS')
+  })
+
+  it('refuses any TTL with exit 78 while dormancy is disabled', async () => {
+    buildEngine()
+    raw = spawnRawEngine({ ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '0', ELECTRIC_CIRCUITS_STREAM_TTL_SECS: '1000000000' })
+    const exit = await raw.waitForExit(20000)
+    expect(exit.code, `expected EX_CONFIG (78), got ${JSON.stringify(exit)}\n${raw.stderr()}`).toBe(78)
+    expect(raw.stderr()).toContain('boot refused (configuration)')
+    expect(raw.stderr()).toContain('0 (disabled)')
+  })
+
+  it('accepts a TTL at twice idle-plus-dormancy when the retain window is disabled', async () => {
+    buildEngine()
+    // Retain 0 adds nothing to the floor: 2 × (6 h + 7 d) = 1,252,800 s. With no storage configured
+    // the boot then stops at the Durable Streams connection, which is past configuration.
+    raw = spawnRawEngine({ ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS: '0', ELECTRIC_CIRCUITS_STREAM_TTL_SECS: '1252800' })
+    await raw.waitForExit(20000)
+    expect(raw.stderr()).toContain('boot refused (Durable Streams connection')
+    expect(raw.stderr()).not.toContain('boot refused (configuration)')
   })
 })
