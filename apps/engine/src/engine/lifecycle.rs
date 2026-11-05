@@ -5720,38 +5720,33 @@ mod stream_ttl_tests {
         let store = Arc::new(crate::ds::ScriptedStore::default());
         let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
         *store.read_observer.lock().unwrap() = Some(tx);
-        let (hold, held) = tokio::sync::watch::channel(true);
-        *store.stream_hold.lock().unwrap() = Some(("changes/0".into(), held));
+        let held = Arc::new(crate::ds::BodyGate::default());
+        *store.head_gate.lock().unwrap() = Some(held.clone());
+        *store.head_gate_path.lock().unwrap() = Some("changes/0".into());
         let mut engine = ttl_engine(store.clone(), Some(3600));
         engine.retention =
             Arc::new(RetentionConfig { sweep_interval: Duration::from_secs(1), ..RetentionConfig::default() });
         engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
         engine.ensure_retention_sweeper();
 
+        // The retention sweep is inside its change-log HEAD and stays there.
+        tokio::time::timeout(Duration::from_secs(5), held.entered.notified())
+            .await
+            .expect("the retention sweep reaches its change-log HEAD");
+        // A stream that becomes tracked only now must be touched by a keep-alive sweep that starts
+        // while the retention sweep is still held.
+        engine.park_dormant_shape_for_test("s2", "users", LogPosition { segment: 0, offset: "0".into() }).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some((path, offset, live)) = reads.recv().await {
-                if offset == "now" && !live && path.ends_with("shape/s1") {
+                if offset == "now" && !live && path.ends_with("shape/s2") {
                     break;
                 }
             }
         })
         .await
-        .expect("the keep-alive touches the dormant shape while the retention sweep is held");
-        assert!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed) >= 1);
-        assert_eq!(
-            store.head_count.load(Ordering::Relaxed),
-            0,
-            "the retention sweep is still waiting on its change-log HEAD"
-        );
-
-        hold.send(false).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while store.head_count.load(Ordering::Relaxed) == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("released, the retention sweep goes on");
+        .expect("the keep-alive touches the new shape while the retention sweep is held");
+        assert_eq!(held.arrived.load(Ordering::SeqCst), 1, "the retention sweep is still the one held");
+        held.released.notify_one();
     }
 
     /// A touch whose `GET` answers after the stream's `DELETE` records the stream again; the sweep
