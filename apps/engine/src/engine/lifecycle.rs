@@ -5685,6 +5685,21 @@ mod stream_ttl_tests {
         create.await.unwrap().unwrap();
     }
 
+    /// An existing stream opened through a config-mismatch `409` (its TTL differs, so the `PUT`
+    /// slid nothing) is not counted as touched: the next sweep still touches it.
+    #[tokio::test]
+    async fn a_stream_opened_through_a_config_mismatch_is_still_due() {
+        let store = Arc::new(crate::ds::ScriptedStore { ensure_status: 409, ..Default::default() });
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let engine = engine_with_shapes(store, &["s1"]).await;
+        engine.ds.ensure_stream("shape/s1").await.expect("a live stream with another TTL opens");
+        assert_eq!(engine.ds.touched_ago("shape/s1"), None, "the 409 slid nothing");
+
+        engine.sweep_stream_ttl().await;
+        assert!(touches(&mut reads).contains(&"shape/s1".to_string()), "the sweep touches it");
+    }
+
     /// A tracked stream the store has lost (it answers 404 and nothing creates it again) is a
     /// failed touch: the keep-alive cannot keep it, and that must not be hidden as "gone".
     #[tokio::test]

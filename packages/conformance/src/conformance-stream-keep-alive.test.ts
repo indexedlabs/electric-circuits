@@ -6,7 +6,9 @@
 //      reads every cataloged stream nothing has read since the boot at its tail, at once
 //      rather than a quarter TTL after the boot, and a shape stream nothing else reads or appends to
 //      outlives three TTLs (`#v-keep-alive`, `#g-tracked-streams-kept`, `#c-counted-touch`).
-//   2. A failed touch is counted, the untouched-age gauge (the age at the latest finished sweep plus
+//   2. The same holds for a group's stream and an older change-log segment a consumer still pins
+//      (`#g-tracked-streams-kept`).
+//   3. A failed touch is counted, the untouched-age gauge (the age at the latest finished sweep plus
 //      the time since) grows past its healthy bound, and the next sweep touches the stream once
 //      storage answers again (`#v-touch-retry`, `#c-sweep-inside-ttl`).
 //
@@ -14,13 +16,18 @@
 // quarter of each TTL. Production runs a 21-day TTL with a 60 s sweep.
 
 import { createServer, request } from 'node:http'
+import pgpkg from 'pg'
 import type { Schema } from '@electric-circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
-import { bootHarness, type Harness } from './harness.js'
+import { bootHarness, engineChangesSegment, type Harness } from './harness.js'
 import { testPhysicalPath } from './ds-mtls-access.js'
 
 const schema: Schema = {
-  tables: { items: { columns: { id: { type: 'int' }, n: { type: 'int' } }, primaryKey: 'id' } },
+  tables: {
+    items: { columns: { id: { type: 'int' }, n: { type: 'int' } }, primaryKey: 'id' },
+    // Writes that only move the change log along, so no shape or group stream sees an append.
+    log: { columns: { id: { type: 'int' }, n: { type: 'int' } }, primaryKey: 'id' },
+  },
 }
 
 const knobs = (ttl: number) => ({
@@ -130,6 +137,26 @@ async function startTouchFaultProxy(upstreamUrl: string): Promise<TouchFaultProx
   }
 }
 
+async function pg(sql: string, params: unknown[] = []): Promise<void> {
+  const c = new pgpkg.Client({ connectionString: h!.pgUrl })
+  await c.connect()
+  try {
+    await c.query(sql, params)
+  } finally {
+    await c.end().catch(() => {})
+  }
+}
+
+async function engineRequest(method: string, path: string, body: unknown): Promise<{ streamPath?: string }> {
+  const res = await fetch(`${h!.engineUrl}${path}`, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`${method} ${path} -> ${res.status} ${await res.text()}`)
+  return (await res.json()) as { streamPath?: string }
+}
+
 describe('conformance: the engine keeps its tracked streams inside their sliding TTL', () => {
   it('touches every cataloged stream after a restart, so an untouched shape stream outlives three TTLs', async () => {
     const ttl = 8
@@ -151,6 +178,45 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
     // plus one sweep interval (1 s) while touches succeed.
     expect(await series('engine_stream_ttl_oldest_untouched_seconds')).toBeLessThanOrEqual(ttl / 4 + 1)
   }, 90000)
+
+  it('keeps a group stream and a retained older change-log segment alive past three TTLs', async () => {
+    const ttl = 8
+    h = await bootHarness(schema, {
+      engineEnv: {
+        ...knobs(ttl),
+        // Retain 0 never evicts a pin (and adds nothing to the floor, 2 × (1 + 2) = 6 s), so the
+        // consumer pinned below keeps changes/0 for the whole test. Age-only rotation, every second.
+        ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS: '0',
+        ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES: '0',
+        ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS: '1',
+      },
+    })
+    const group = await engineRequest('POST', '/v1/subsets/load', {
+      subscription: 'held-group',
+      members: [{ key: 'plain', table: 'public.items', columns: ['id', 'n'] }],
+    })
+    const groupPath = group.streamPath!
+    await engineRequest('PUT', '/consumers/held', { segment: 0, offset: '-1' })
+    let id = 1
+    const deadline = Date.now() + 30000
+    while (((await engineChangesSegment(h.engineUrl)) ?? 0) < 1) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for a change-log rotation')
+      await pg('INSERT INTO log (id, n) VALUES ($1, $1)', [id++])
+      await sleep(300)
+    }
+    for (const path of [groupPath, 'changes/0']) {
+      expect(await head(path), `${path} before the restart`).toEqual({ status: 200, ttl: String(ttl) })
+    }
+
+    // After the restart nothing reads or appends to either: the group's table sees no writes, the
+    // sequencer resumes in a later segment, and the consumer only pins. Only the keep-alive can.
+    await h.restartEngine()
+    await sleep(3 * ttl * 1000)
+    for (const path of [groupPath, 'changes/0']) {
+      expect(await head(path), `${path} is still there after three TTLs`).toEqual({ status: 200, ttl: String(ttl) })
+    }
+    expect(await series('engine_stream_ttl_touch_failures_total')).toBe(0)
+  }, 120000)
 
   it('touches a stream the restarted engine has not read on its first sweep, not a quarter TTL later', async () => {
     // A quarter of this TTL is 10 s; the sweep runs every second. The held shape's stream, which

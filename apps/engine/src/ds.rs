@@ -1248,6 +1248,26 @@ impl DsClient {
         }
     }
 
+    /// Record an access for a request in flight, returning what to put back if it slides nothing
+    /// (`None` without a TTL: nothing was recorded).
+    fn begin_access(&self, path: &str) -> Option<Option<std::time::Instant>> {
+        self.stream_ttl
+            .is_some()
+            .then(|| self.accessed.lock().unwrap().insert(path.to_string(), std::time::Instant::now()))
+    }
+
+    fn restore_access(&self, path: &str, previous: Option<Option<std::time::Instant>>) {
+        match previous {
+            Some(Some(at)) => {
+                self.accessed.lock().unwrap().insert(path.to_string(), at);
+            }
+            Some(None) => {
+                self.accessed.lock().unwrap().remove(path);
+            }
+            None => {}
+        }
+    }
+
     /// How long since this process last appended to or read `path`; `None` when it never has, so
     /// nothing is known about when the store last slid its TTL (after a boot, every stream).
     pub(crate) fn touched_ago(&self, path: &str) -> Option<std::time::Duration> {
@@ -1477,18 +1497,25 @@ impl DsClient {
     /// retryable, and every other `409` keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
-        // A stream being created counts from when its create began, so a keep-alive sweep that
-        // runs while the PUT is in flight neither touches it (a 404) nor ages it from boot. Counting
-        // a little early only makes it due sooner; a failed create's record is pruned once its
-        // shape is dropped.
-        self.record_access(path);
-        let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
+        // While the PUT is in flight the stream counts as accessed, so a keep-alive sweep that runs
+        // meanwhile neither touches a stream that does not exist yet (a 404) nor ages it from boot.
+        // Only a 2xx slides the TTL on the store, so any other answer puts the previous record
+        // back: an existing stream opened through a config-mismatch 409 stays as due as it was.
+        let previous = self.begin_access(path);
+        let res = match self.store.ensure(&physical_path, "application/json", self.stream_ttl).await {
+            Ok(res) => res,
+            Err(error) => {
+                self.restore_access(path, previous);
+                return Err(error);
+            }
+        };
         if (200..300).contains(&res.status) {
             // A create (or a matching re-create, which the store treats as an access) starts the
             // stream's TTL clock.
             self.note_access(path, res.status);
             return Ok(());
         }
+        self.restore_access(path, previous);
         if res.status == 409 && !res.closed {
             let head = self.store.head(&physical_path).await?;
             if head.status == 200 && !head.closed {
