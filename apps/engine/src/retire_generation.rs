@@ -43,9 +43,9 @@
 //! | exit | meaning |
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
-//! | `1` | storage failed, or some deletes failed and the catalog was kept for a re-run |
+//! | `1` | storage unavailable (unreachable, not ready, 5xx), or some deletes failed and the catalog was kept for a re-run |
 //! | `3` | partial: the named streams were deleted, the catalog was kept because it moved; find the writer before any re-run |
-//! | `78` | refused: a bad argument or path, or one of the guards above |
+//! | `78` | refused: a bad argument or path, one of the guards above, a store that does not attest the configured identity, or a catalog this engine cannot read |
 
 use std::io::Write;
 
@@ -112,10 +112,15 @@ pub enum Refusal {
     )]
     RecentlyAppended { newest_at: u64, age_secs: u64 },
     #[error(
-        "{0} catalog events could not be decoded; a skipped event can name a stream this command would \
-         leave behind once the catalog is gone"
+        "{count} catalog events could not be decoded (first: {}); a skipped event can name a stream this \
+         command would leave behind once the catalog is gone",
+        .first.join("; ")
     )]
-    UndecodedEvents(u64),
+    UndecodedEvents { count: u64, first: Vec<String> },
+    #[error("this engine cannot read the catalog: {0}")]
+    UnreadableCatalog(String),
+    #[error("the store did not attest the identity this engine is configured for: {0}")]
+    UntrustedStore(String),
     #[error("no event in the catalog records a time, so nothing shows it has been quiet for 7 days")]
     UnknownAge,
     #[error("the catalog names stream '{0}', which is outside the catalog's own prefix")]
@@ -272,7 +277,16 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
     let Some(head) = ds.head(CATALOG_STREAM).await.context("checking the catalog stream")? else {
         bail!(Refusal::NoCatalog(catalog.as_str().to_string()));
     };
-    let fold = fold_catalog_at(ds).await.context("reading the catalog")?;
+    // Storage being unavailable is worth a re-run; any other failure (a catalog written before a
+    // format this engine requires, an invalid `ingestColumns`, a stream gone mid-read) needs a
+    // person, so it is a refusal.
+    let fold = fold_catalog_at(ds).await.map_err(|e| {
+        if crate::ds::is_unavailable(&e) {
+            e.context("reading the catalog")
+        } else {
+            anyhow::Error::new(Refusal::UnreadableCatalog(format!("{e:#}")))
+        }
+    })?;
     if let Some(bound) = fold.store_bound()
         && bound.query_generation == own_generation
     {
@@ -281,7 +295,7 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
     // The catalog is the only index of its streams (the store has no list API), so a fold that
     // skipped anything cannot vouch for the plan, nor for the newest event time.
     if fold.undecoded() > 0 {
-        bail!(Refusal::UndecodedEvents(fold.undecoded()));
+        bail!(Refusal::UndecodedEvents { count: fold.undecoded(), first: fold.undecoded_samples().to_vec() });
     }
     let newest_at = fold.newest_at().ok_or(Refusal::UnknownAge)?;
     let age_secs = now.saturating_sub(newest_at);
@@ -445,7 +459,7 @@ pub async fn connect(config: &Config, catalog: &CatalogPath) -> Result<DsClient>
             connection.client_key_path.clone(),
             scope,
         )?;
-        return DsClient::connect(connection).await;
+        return DsClient::connect(connection).await.map_err(untrusted_store);
     }
     #[cfg(feature = "test-support")]
     {
@@ -455,6 +469,20 @@ pub async fn connect(config: &Config, catalog: &CatalogPath) -> Result<DsClient>
         }
     }
     bail!("ELECTRIC_CIRCUITS_DS_URL and its store identity configuration are required")
+}
+
+/// A store that answered with the wrong identity, a malformed readiness document or an
+/// incompatible page capability will not answer differently on a re-run: refuse. A store that is
+/// unreachable, not ready or answering 5xx stays a retryable failure.
+fn untrusted_store(e: anyhow::Error) -> anyhow::Error {
+    use crate::ds::StoreReadinessError as R;
+    let untrusted = e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<R>(),
+            Some(R::IdentityMismatch { .. } | R::Malformed { .. } | R::PageCapability { .. })
+        )
+    });
+    if untrusted { anyhow::Error::new(Refusal::UntrustedStore(format!("{e:#}"))) } else { e }
 }
 
 /// The whole command after argument parsing: connect, run, and map the outcome to an exit code.

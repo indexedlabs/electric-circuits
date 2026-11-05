@@ -618,7 +618,8 @@ async fn the_deployed_configuration_refuses_its_own_generation_and_plans_a_stopp
     let reads_before_mismatch = store.requests().len();
     let other = "00000000-0000-4000-8000-000000000000";
     let mismatch = finish(&mut deployed_command(&store, other, &[&format!("{v1}meta/catalog"), "--confirm"])).await;
-    assert_eq!(mismatch.code, 1, "stdout: {}\nstderr: {}", mismatch.stdout, mismatch.stderr);
+    assert_eq!(mismatch.code, 78, "stdout: {}\nstderr: {}", mismatch.stdout, mismatch.stderr);
+    assert!(mismatch.stderr.contains("did not attest the identity"), "stderr: {}", mismatch.stderr);
     assert!(mismatch.stderr.contains("identity mismatch"), "stderr: {}", mismatch.stderr);
     assert_eq!(
         store.requests()[reads_before_mismatch..].to_vec(),
@@ -649,6 +650,25 @@ async fn a_catalog_with_an_undecodable_event_is_refused() {
 
     assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert!(run.stderr.contains("1 catalog events could not be decoded"), "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("created v1-broken: missing field `changes_only`"), "names the event: {}", run.stderr);
+    assert_eq!(store.destructive_requests(), Vec::<String>::new());
+    assert_eq!(store.paths(), before);
+}
+
+/// A catalog the fold refuses outright (here an event written before ADR-0008, with no `eid`)
+/// cannot be planned, and a re-run will not change that: it is a refusal, not a retryable failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_this_engine_cannot_read_is_refused() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    let mut events = catalog_events("dashboard-conversation-v1", now() - 20 * DAY);
+    events.push(json!({"t": "offset", "pos": {"segment": 1, "offset": "-1"}}));
+    store.put(&v1_catalog(), events);
+    let before = store.paths();
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("this engine cannot read the catalog"), "stderr: {}", run.stderr);
     assert_eq!(store.destructive_requests(), Vec::<String>::new());
     assert_eq!(store.paths(), before);
 }

@@ -1042,6 +1042,9 @@ pub(crate) struct CatalogFold {
     /// (an older engine meeting a newer event); `retire-generation` refuses, because a skipped
     /// `Created` would hide a stream it must delete.
     undecoded: u64,
+    /// `"<t> <eid>: <decode error>"` for the first few of those, so a refusal can name them.
+    /// Bounded by [`UNDECODED_SAMPLES`]; never logged at boot.
+    undecoded_samples: Vec<String>,
     /// The first `StoreBound` (event zero of a coupled-pilot catalog), kept for `retire-generation`:
     /// it names the generation the catalog was written for, and it is incident evidence.
     store_bound: Option<crate::store_identity::StoreBound>,
@@ -1070,6 +1073,7 @@ impl Default for CatalogFold {
             seen: HashSet::new(),
             newest_at: None,
             undecoded: 0,
+            undecoded_samples: Vec::new(),
             store_bound: None,
             checkpointed: false,
         }
@@ -1258,6 +1262,18 @@ impl CatalogFold {
         self.undecoded
     }
 
+    /// `"<t> <eid>: <decode error>"` for the first few skipped events.
+    pub(crate) fn undecoded_samples(&self) -> &[String] {
+        &self.undecoded_samples
+    }
+
+    fn note_undecoded(&mut self, tag: &str, eid: &str, e: &serde_json::Error) {
+        self.undecoded += 1;
+        if self.undecoded_samples.len() < UNDECODED_SAMPLES {
+            self.undecoded_samples.push(format!("{tag} {eid}: {e}"));
+        }
+    }
+
     /// The catalog's first `StoreBound`, if it has one.
     pub(crate) fn store_bound(&self) -> Option<&crate::store_identity::StoreBound> {
         self.store_bound.as_ref()
@@ -1291,6 +1307,9 @@ fn event_time(ev: &CatalogEvent) -> Option<u64> {
         _ => None,
     }
 }
+
+/// How many skipped events a fold describes (see `CatalogFold::undecoded_samples`).
+const UNDECODED_SAMPLES: usize = 5;
 
 /// Read and fold a catalog no engine in this process owns, for `retire-generation`. The store
 /// binding is not checked: the caller names the catalog by its exact path, and a catalog written
@@ -1494,6 +1513,8 @@ impl Engine {
                         return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
                     }
                     let eid = ev["eid"].as_str().unwrap_or_default().to_string();
+                    // Kept only to describe an event that fails to decode (the decode consumes it).
+                    let tag = ev.get("t").and_then(serde_json::Value::as_str).unwrap_or("<untagged>").to_owned();
                     // Unlike unknown future events, malformed projection provenance cannot be
                     // ignored: treating it as legacy "all columns" could resume stale streams.
                     let projection = ev["t"] == "ingestColumns";
@@ -1506,8 +1527,8 @@ impl Engine {
                     let ev = match serde_json::from_value::<CatalogEvent>(ev) {
                         Ok(ev) => ev,
                         Err(e) if projection => return Err(e).context("invalid ingestColumns catalog event"),
-                        Err(_) => {
-                            fold.undecoded += 1;
+                        Err(e) => {
+                            fold.note_undecoded(&tag, &eid, &e);
                             continue;
                         }
                     };
