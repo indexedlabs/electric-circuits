@@ -521,7 +521,9 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   `Engine::new_with_config` are async and return `Result<Engine>`: store bindings must validate across
   every page before an engine or its background tasks exist. Library mode does not fold, retain or
   validate nonbinding history. `boot_library` uses the same path; cancellation releases page credit
-  and starts no engine work. The Postgres catalog fold reads every page
+  and starts no engine work. The client's stream TTL must equal the config's
+  `ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, set with `with_stream_ttl` before `admit_store`, or
+  construction fails. The Postgres catalog fold reads every page
   once and rejects duplicate or reordered bindings before event-id de-duplication, including a
   repeated binding with the same `eid`. No shapes restore from an invalid catalog.
 

@@ -1664,7 +1664,9 @@ impl Engine {
 
     /// Construct using resolved storage/pool settings. Library mode checks bindings across all catalog
     /// pages before construction; errors/cancellation start no engine work. Postgres mode remains
-    /// waiting until `setup_postgres` validates the catalog and completes boot.
+    /// waiting until `setup_postgres` validates the catalog and completes boot. The client's stream
+    /// TTL must equal `config.stream_ttl`, set with `DsClient::with_stream_ttl` before `admit_store`,
+    /// or construction fails.
     pub async fn new_with_config(
         mut admission: StoreAdmission,
         pg_url: Option<String>,
