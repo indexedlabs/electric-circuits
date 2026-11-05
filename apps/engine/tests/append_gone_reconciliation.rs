@@ -30,6 +30,8 @@ struct FakeDs {
     false_404: Arc<AtomicBool>,
     /// The stream really is gone: every method on `shape/*` answers 404, HEAD included.
     stream_lost: Arc<AtomicBool>,
+    /// With `stream_lost`, answer 410 (soft-deleted) instead of 404.
+    soft_deleted: Arc<AtomicBool>,
     /// Successful appends to `shape/*`.
     shape_appends: Arc<AtomicUsize>,
     deleted: Arc<std::sync::Mutex<Vec<String>>>,
@@ -46,7 +48,8 @@ async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
         ds.closed.lock().unwrap().push(path.clone());
     }
     if is_shape && ds.stream_lost.load(Ordering::SeqCst) && request.method() != Method::DELETE {
-        return StatusCode::NOT_FOUND.into_response();
+        return if ds.soft_deleted.load(Ordering::SeqCst) { StatusCode::GONE } else { StatusCode::NOT_FOUND }
+            .into_response();
     }
     match *request.method() {
         Method::PUT => StatusCode::OK.into_response(),
@@ -170,8 +173,20 @@ async fn a_real_404_during_a_restore_append_fails_so_the_caller_retires() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_real_404_retires_the_shape_instead_of_leaving_it_stale() {
     let (engine, client, ds) = engine_with_one_shape().await;
-
     ds.stream_lost.store(true, Ordering::SeqCst);
+    assert_lost_shape_is_retired(&engine, &client, &ds).await;
+}
+
+/// A soft-deleted stream (`410`) is gone just the same (#g-gone-is-retired): the shape is retired.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_410_retires_the_shape_like_a_404() {
+    let (engine, client, ds) = engine_with_one_shape().await;
+    ds.soft_deleted.store(true, Ordering::SeqCst);
+    ds.stream_lost.store(true, Ordering::SeqCst);
+    assert_lost_shape_is_retired(&engine, &client, &ds).await;
+}
+
+async fn assert_lost_shape_is_retired(engine: &Engine, client: &DsClient, ds: &FakeDs) {
     let landed = client.append_reliable("shape/s1", &[envelope()]).await.expect("append while Engine is active");
 
     assert!(!landed, "a stream storage does not have cannot be appended to");
