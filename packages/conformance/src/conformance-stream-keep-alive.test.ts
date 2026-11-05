@@ -191,10 +191,12 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
     const shape = await createShape('held')
 
     await waitFor(async () => (await series('engine_stream_ttl_touch_failures_total')) >= 1, 'a failed touch')
-    const ageAtFailure = await series('engine_stream_ttl_oldest_untouched_seconds')
+    // Healthy, the age stays within a quarter TTL plus one sweep interval. Keep the fault on until
+    // it is past that bound, which only touches failing sweep after sweep can produce.
+    const healthyBound = ttl / 4 + 1
     await waitFor(
-      async () => (await series('engine_stream_ttl_oldest_untouched_seconds')) > ageAtFailure,
-      'the untouched age to keep growing while touches fail',
+      async () => (await series('engine_stream_ttl_oldest_untouched_seconds')) > healthyBound,
+      'the untouched age to grow past the healthy bound while touches fail',
     )
     const failures = await series('engine_stream_ttl_touch_failures_total')
     await waitFor(
@@ -206,7 +208,7 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
     proxy!.failTouches(false)
     await waitFor(async () => (await series('engine_stream_ttl_touches_total')) > touched, 'a touch once storage answers')
     await waitFor(
-      async () => (await series('engine_stream_ttl_oldest_untouched_seconds')) < ttl / 4,
+      async () => (await series('engine_stream_ttl_oldest_untouched_seconds')) <= healthyBound,
       'every tracked stream touched again',
     )
     expect(await head(shape.streamPath)).toEqual({ status: 200, ttl: String(ttl) })

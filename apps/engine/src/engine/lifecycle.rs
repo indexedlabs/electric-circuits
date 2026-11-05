@@ -5711,6 +5711,48 @@ mod stream_ttl_tests {
         sweep.await.unwrap();
     }
 
+    /// The keep-alive runs on a timer of its own: a retention sweep blocked part-way (here on the
+    /// change-log `HEAD` it takes to size a dormant shape's replay, as it could be behind an
+    /// eviction waiting on the sequencer) does not stop the touches.
+    #[tokio::test]
+    async fn the_keep_alive_keeps_touching_while_the_retention_sweep_is_blocked() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let (hold, held) = tokio::sync::watch::channel(true);
+        *store.stream_hold.lock().unwrap() = Some(("changes/0".into(), held));
+        let mut engine = ttl_engine(store.clone(), Some(3600));
+        engine.retention =
+            Arc::new(RetentionConfig { sweep_interval: Duration::from_secs(1), ..RetentionConfig::default() });
+        engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        engine.ensure_retention_sweeper();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some((path, offset, live)) = reads.recv().await {
+                if offset == "now" && !live && path.ends_with("shape/s1") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the keep-alive touches the dormant shape while the retention sweep is held");
+        assert!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            store.head_count.load(Ordering::Relaxed),
+            0,
+            "the retention sweep is still waiting on its change-log HEAD"
+        );
+
+        hold.send(false).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.head_count.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("released, the retention sweep goes on");
+    }
+
     /// Without a TTL there is nothing to keep alive.
     #[tokio::test]
     async fn no_ttl_touches_nothing() {
