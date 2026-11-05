@@ -2151,6 +2151,82 @@ impl Engine {
         }
         // Same tick, second half: the change log's own retention (ADR-0006).
         self.sweep_change_log().await;
+        // Last, so nothing this sweep evicted or deleted is touched.
+        self.sweep_stream_ttl().await;
+    }
+
+    /// The keep-alive half of a sweep (`#g-tracked-streams-kept`): with a sliding
+    /// `ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, read at its tail every stream the engine tracks that has
+    /// not been appended to or read for a quarter of the TTL, so none of them expires while the
+    /// engine still needs it. The tracked streams are `meta/catalog` and every stream it names:
+    /// shape streams (active and dormant), group streams and the retained change-log segments.
+    ///
+    /// The engine only knows what this process appended or read, so a stream it has not touched
+    /// since boot is due at once: the first sweep after a boot reads every tracked stream that
+    /// nothing has appended to or read since. A failed touch is counted and
+    /// logged, and the stream stays due for the next sweep, which the boot configuration
+    /// guarantees comes well inside a quarter of the TTL (`#c-sweep-inside-ttl`).
+    pub(crate) async fn sweep_stream_ttl(&self) {
+        /// Touches in flight at once: the first sweep after a boot reads every tracked stream.
+        const TOUCH_CONCURRENCY: usize = 16;
+        let Some(ttl) = self.ds.stream_ttl() else { return };
+        let due_after = Duration::from_secs(ttl.get()) / 4;
+        let tracked = self.ttl_tracked_streams().await;
+        let due: Vec<String> = tracked
+            .iter()
+            .filter(|path| self.ds.touched_ago(path).is_none_or(|ago| ago >= due_after))
+            .cloned()
+            .collect();
+        let mut due = due.into_iter();
+        let mut touching = tokio::task::JoinSet::new();
+        let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
+        loop {
+            while touching.len() < TOUCH_CONCURRENCY
+                && let Some(path) = due.next()
+            {
+                let ds = self.ds.clone();
+                touching.spawn(async move {
+                    let touched = ds.touch(&path).await;
+                    (path, touched)
+                });
+            }
+            let Some(joined) = touching.join_next().await else { break };
+            match joined {
+                Ok((_, Ok(()))) => {
+                    self.metrics.stream_ttl_touches.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok((path, Err(error))) => failed.push((path, error)),
+                Err(error) => tracing::warn!("stream TTL: a keep-alive touch task failed: {error}"),
+            }
+        }
+        if !failed.is_empty() {
+            // A stream retired between the snapshot and its touch answers 404; that is the
+            // lifecycle working, not a failed keep-alive.
+            let still_tracked = self.ttl_tracked_streams().await;
+            let failed: Vec<_> = failed.into_iter().filter(|(path, _)| still_tracked.contains(path)).collect();
+            if let Some((path, error)) = failed.first() {
+                self.metrics.stream_ttl_touch_failures.fetch_add(failed.len() as u64, Ordering::Relaxed);
+                tracing::warn!(
+                    failed = failed.len(),
+                    "stream TTL: {} keep-alive touch(es) failed; retrying on the next sweep (first: {path}: {error:#})",
+                    failed.len()
+                );
+            }
+        }
+        let oldest = tracked.iter().map(|path| self.ds.untouched_for(path)).max().unwrap_or_default();
+        self.metrics.stream_ttl_oldest_untouched_secs.store(oldest.as_secs(), Ordering::Relaxed);
+    }
+
+    /// `meta/catalog` and every stream it names that the engine still tracks.
+    async fn ttl_tracked_streams(&self) -> std::collections::BTreeSet<String> {
+        let mut paths = std::collections::BTreeSet::from([super::catalog::CATALOG_STREAM.to_string()]);
+        {
+            let st = self.state.lock().await;
+            paths.extend(st.shapes.values().map(|rec| rec.stream_path.clone()));
+            paths.extend(st.group_claims.records_iter().map(|group| group.stream_path.clone()));
+        }
+        paths.extend(self.changes.state().segments().into_keys().map(crate::changelog::segment_path));
+        paths
     }
 
     /// The lease half of a sweep (ADR-0008): release every subscription that has not been renewed
@@ -5382,5 +5458,105 @@ mod subscription_tests {
         assert!(engine.group_record(&group.subscription).await.is_none(), "the group is released");
         assert!(engine.pending_retirements() >= 1, "the refused DELETE is owned by the retry queue");
         engine.close(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+#[cfg(test)]
+mod stream_ttl_tests {
+    use super::*;
+    fn ttl_engine(store: Arc<crate::ds::ScriptedStore>, ttl: Option<u64>) -> Engine {
+        Engine::new_for_in_process_test(
+            DsClient::with_test_store("scripted://ttl".into(), store)
+                .with_stream_ttl(ttl.and_then(std::num::NonZeroU64::new)),
+        )
+    }
+
+    /// Every keep-alive read the store saw since the last drain, as logical paths.
+    fn touches(reads: &mut tokio::sync::mpsc::UnboundedReceiver<(String, String, bool)>) -> Vec<String> {
+        let mut paths = Vec::new();
+        while let Ok((path, offset, live)) = reads.try_recv() {
+            if offset == "now" && !live {
+                paths.push(path.rsplit_once("/queries/test-query/").map_or(path.clone(), |(_, p)| p.to_string()));
+            }
+        }
+        paths.sort();
+        paths
+    }
+
+    /// `#g-tracked-streams-kept` / `#v-keep-alive`: after a boot nothing is known about a stream
+    /// this process has not touched, so the first sweep reads every such tracked stream at its tail
+    /// at once (here a restored dormant shape, which the engine neither appends to nor reads),
+    /// without waiting a quarter TTL. A stream touched less than a quarter TTL ago is not due.
+    #[tokio::test]
+    async fn the_first_sweep_after_boot_touches_every_tracked_stream_then_waits_a_quarter_ttl() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let engine = ttl_engine(store, Some(3600));
+        engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        touches(&mut reads);
+        assert_eq!(engine.ds.touched_ago("shape/s1"), None);
+
+        engine.sweep_stream_ttl().await;
+        let touched = touches(&mut reads);
+        assert!(
+            touched.contains(&"shape/s1".to_string()),
+            "the dormant shape's stream is touched at once: {touched:?}"
+        );
+        assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), touched.len() as u64);
+        assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0);
+        for path in engine.ttl_tracked_streams().await {
+            assert!(engine.ds.touched_ago(&path).is_some(), "{path} was neither touched nor otherwise accessed");
+        }
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+
+        engine.sweep_stream_ttl().await;
+        assert!(touches(&mut reads).is_empty(), "touched under a quarter TTL ago: not due");
+        assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), touched.len() as u64);
+    }
+
+    /// `#c-sweep-inside-ttl` / `#v-touch-retry`: a failed touch is counted, the untouched age keeps
+    /// growing, and the stream stays due, so the next sweep touches it.
+    #[tokio::test]
+    async fn a_failed_touch_is_counted_and_retried_on_the_next_sweep() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let engine = ttl_engine(store.clone(), Some(3600));
+        engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+
+        store.nonlive_read_status.store(503, Ordering::Relaxed);
+        engine.sweep_stream_ttl().await;
+        let first = engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed);
+        assert!(first >= 1, "the dormant shape's touch failed and was counted");
+        assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), 0);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine.sweep_stream_ttl().await;
+        assert_eq!(
+            engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed),
+            2 * first,
+            "still due, still failing"
+        );
+        assert!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed) >= 1, "the age keeps growing");
+        touches(&mut reads);
+
+        store.nonlive_read_status.store(0, Ordering::Relaxed);
+        engine.sweep_stream_ttl().await;
+        assert!(touches(&mut reads).contains(&"shape/s1".to_string()), "the next sweep touches it");
+        assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), first);
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Without a TTL there is nothing to keep alive.
+    #[tokio::test]
+    async fn no_ttl_touches_nothing() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let engine = ttl_engine(store, None);
+        engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        engine.sweep_stream_ttl().await;
+        assert!(touches(&mut reads).is_empty());
+        assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), 0);
     }
 }
