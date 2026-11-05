@@ -67,6 +67,9 @@ struct StoreState {
     /// while it is read.
     append_on_get: Option<(String, usize)>,
     gets: BTreeMap<String, usize>,
+    /// When a request with this label (`"DELETE <path>"`, `"CLOSE <path>"`) arrives, first append
+    /// one event to this stream unless it is closed: a writer that races that request.
+    append_before: Option<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -120,6 +123,13 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
     let mut st = state.lock().unwrap();
     let label = if method == Method::POST && closing { "CLOSE".to_string() } else { method.to_string() };
     st.requests.push(format!("{label} {path}"));
+    if let Some((request, target)) = st.append_before.clone()
+        && request == format!("{label} {path}")
+        && let Some(stream) = st.streams.get_mut(&target)
+        && !stream.closed
+    {
+        stream.events.push(json!({"t": "offset", "eid": "late-writer", "pos": {"segment": 1, "offset": "-1"}}));
+    }
     if method == Method::GET && path == "_admin/ready" {
         return match &st.ready {
             Some(body) => ([("content-type", "application/json")], body.clone()).into_response(),
@@ -561,18 +571,38 @@ async fn a_catalog_appended_to_while_the_command_reads_it_is_refused() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catalog_that_moves_while_its_streams_are_deleted_is_kept() {
     let store = store_with_v1(now() - 20 * DAY).await;
-    // HEADs 1 and 2 bracket the read; HEAD 3, just before the catalog's delete, finds an append.
-    store.state.lock().unwrap().append_on_head = Some((v1_catalog(), 3));
+    // A writer appends while the named streams are being deleted.
+    let first = named(&v1()).remove(0);
+    store.state.lock().unwrap().append_before = Some((format!("DELETE {first}"), v1_catalog()));
 
     let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
+    assert_kept_because_it_moved(&store, &run);
+}
+
+/// The writer can also land after the last check and before the catalog is fenced. The close is the
+/// fence: the tail is checked only after it, so an append racing the close still keeps the catalog.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_appended_to_as_it_is_closed_is_kept() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    store.state.lock().unwrap().append_before = Some((format!("CLOSE {}", v1_catalog()), v1_catalog()));
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_kept_because_it_moved(&store, &run);
+}
+
+fn assert_kept_because_it_moved(store: &Store, run: &Run) {
     assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert!(run.stdout.contains("streams deleted; the catalog was kept because it moved"), "stdout: {}", run.stdout);
     assert!(run.stdout.contains("Find the writer before any re-run"), "stdout: {}", run.stdout);
     let left = store.paths();
     assert!(left.contains(&v1_catalog()), "the moved catalog survives");
     assert!(named(&v1()).iter().all(|p| !left.contains(p)), "every named stream was deleted: {left:?}");
-    assert!(!store.destructive_requests().iter().any(|r| r.ends_with(&v1_catalog())), "the catalog was never closed");
+    assert!(
+        !store.destructive_requests().contains(&format!("DELETE {}", v1_catalog())),
+        "the catalog was never deleted"
+    );
 }
 
 /// A task retires only its own stack's generations: a catalog in another namespace of the same
@@ -773,6 +803,31 @@ async fn a_run_with_no_store_configured_is_refused() {
 
     assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert!(run.stderr.contains("no Durable Streams store is configured"), "stderr: {}", run.stderr);
+}
+
+/// The walk for unrecorded change-log segments is bounded. A chain that runs past the bound has
+/// no end the command can find, so it refuses rather than delete the catalog and leave the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecorded_segment_chain_past_the_bound_is_refused() {
+    let store = Store::start().await;
+    let mut events = vec![store_bound("dashboard-conversation-v1"), shape("s1", now() - 20 * DAY)];
+    for (n, event) in events.iter_mut().enumerate() {
+        event["eid"] = json!(format!("long-chain-{n}"));
+    }
+    store.put(&v1_catalog(), events);
+    store.put(&format!("{}shape/s1", v1()), vec![]);
+    // No rotation is recorded, so the walk starts at changes/0; 1,001 segments outrun its 1,000.
+    for n in 0..=1_000 {
+        store.put(&format!("{}changes/{n}", v1()), vec![]);
+    }
+    let before = store.paths();
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("past the 1000 unrecorded segments"), "stderr: {}", run.stderr);
+    assert_eq!(store.destructive_requests(), Vec::<String>::new());
+    assert_eq!(store.paths(), before);
 }
 
 #[tokio::test(flavor = "multi_thread")]

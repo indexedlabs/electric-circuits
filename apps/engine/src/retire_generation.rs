@@ -45,7 +45,7 @@
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
 //! | `1` | storage unavailable (unreachable, not ready, 5xx), or some deletes failed and the catalog was kept for a re-run |
-//! | `3` | partial: the named streams were deleted, the catalog was kept because it moved; find the writer before any re-run |
+//! | `3` | partial: the named streams were deleted, the catalog was kept (closed) because it moved; find the writer before any re-run |
 //! | `78` | refused: a bad argument or path, one of the guards above, no store configured, a store that does not attest the configured identity, or a catalog this engine cannot read |
 
 use std::io::Write;
@@ -74,9 +74,10 @@ pub const EXIT_FAILED: i32 = 1;
 /// quiet could delete a live generation's catalog. Find the writer first.
 pub const EXIT_CATALOG_MOVED: i32 = 3;
 
-/// Upper bound on the walk past the last recorded change-log segment (or from `changes/0`). A rotation records each new
-/// segment before the next one can begin, so more than one unrecorded successor is already a
-/// broken log; the bound only stops a pathological store from looping the command.
+/// Upper bound on the walk past the last recorded change-log segment (or from `changes/0`). A
+/// rotation records each new segment before the next one can begin, so more than one unrecorded
+/// successor is already a broken log; reaching the bound refuses the run rather than leaving the
+/// rest of the chain behind.
 const MAX_UNRECORDED_SEGMENTS: u32 = 1_000;
 
 /// Why the command will not run. Each one is a decision for the operator, not a transient failure.
@@ -128,6 +129,11 @@ pub enum Refusal {
          (run the command from the engine's own task definition)"
     )]
     NoStore,
+    #[error(
+        "change-log segments from changes/{from} on exist past the {limit} unrecorded segments this command \
+         checks, so it cannot find them all"
+    )]
+    UnrecordedSegmentsUnbounded { from: u32, limit: u32 },
     #[error("this engine cannot read the catalog: {0}")]
     UnreadableCatalog(String),
     #[error("the store did not attest the identity this engine is configured for: {0}")]
@@ -336,12 +342,19 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
         .filter_map(|p| p.strip_prefix(crate::changelog::CHANGES_PREFIX)?.strip_prefix('/')?.parse::<u32>().ok())
         .max()
         .map_or(0, |last| last.saturating_add(1));
+    let mut reached_end = false;
     for n in first_unrecorded..first_unrecorded.saturating_add(MAX_UNRECORDED_SEGMENTS) {
         let path = crate::changelog::segment_path(n);
         if ds.head(&path).await.with_context(|| format!("checking {path}"))?.is_none() {
+            reached_end = true;
             break;
         }
         logical.insert(path);
+    }
+    // A walk that hit its bound did not find the end of the chain, so the plan would leave the rest
+    // with no index once the catalog is gone.
+    if !reached_end {
+        bail!(Refusal::UnrecordedSegmentsUnbounded { from: first_unrecorded, limit: MAX_UNRECORDED_SEGMENTS });
     }
 
     let mut streams = Vec::with_capacity(logical.len());
@@ -386,6 +399,11 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
     if !retired.failed.is_empty() {
         return Ok(retired);
     }
+    // Fence the catalog before the last check: once it is closed nothing can append to it, so the
+    // tail read after the close is final and the delete cannot race a writer. The store has no
+    // conditional delete, and a HEAD-then-delete would leave that window open. A close that does
+    // not land keeps the catalog.
+    ds.close_stream(CATALOG_STREAM).await.with_context(|| format!("closing {}", plan.catalog))?;
     // The streams are already gone, so a moved tail here is not a refusal: keep the catalog, which
     // is what an engine appending to it would need, and report a partial retirement.
     let after = ds.head(CATALOG_STREAM).await.context("re-checking the catalog stream")?.map(|head| head.next_offset);
@@ -393,7 +411,7 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
         retired.catalog_moved = Some((plan.tail.clone(), after.flatten()));
         return Ok(retired);
     }
-    ds.retire_stream(CATALOG_STREAM).await.with_context(|| format!("deleting {}", plan.catalog))?;
+    ds.delete_stream(CATALOG_STREAM).await.with_context(|| format!("deleting {}", plan.catalog))?;
     writeln!(out, "deleted {}", plan.catalog)?;
     retired.catalog_deleted = true;
     Ok(retired)
@@ -447,7 +465,8 @@ async fn run_inner(ds: &DsClient, args: &Args, own_generation: &str, now: u64, o
         writeln!(
             out,
             "{} streams deleted; the catalog was kept because it moved (tail {before:?} -> {after:?}) while they were \
-             deleted, so an engine may be writing it. Find the writer before any re-run.",
+             deleted, so an engine may be writing it. It is closed now, so that engine's next append fails. Find the \
+             writer before any re-run.",
             retired.deleted.len()
         )?;
         Ok(EXIT_CATALOG_MOVED)
