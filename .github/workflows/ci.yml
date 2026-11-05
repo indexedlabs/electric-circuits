@@ -57,6 +57,8 @@ jobs:
           cargo test -p electric-circuits-engine --features test-support --test sources_table -- --ignored
           # Projection restart/backfill and live INSERT/UPDATE/DELETE against a SQL oracle.
           cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored
+          # A group load's members reading concurrently on one exported snapshot.
+          cargo test -p electric-circuits-engine --features test-support --lib pg::subset_batch_tests -- --ignored
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4

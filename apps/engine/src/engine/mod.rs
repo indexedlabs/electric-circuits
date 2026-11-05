@@ -35,6 +35,7 @@ pub use emission::GroupDrain;
 pub(crate) mod epoch;
 mod executors;
 pub(crate) mod group;
+pub(crate) mod group_load_log;
 mod held;
 mod introspection;
 mod lifecycle;
@@ -3559,9 +3560,15 @@ impl Engine {
 
     /// Several one-shot subset reads in **one** settled `REPEATABLE READ` snapshot (prototype: the
     /// scope load). The snapshot settles against every table any read depends on, so the pages are
-    /// mutually consistent and share one set of fences.
-    pub async fn query_subset_batch(&self, reads: Vec<SubsetReadReq>) -> Result<SubsetBatchPage> {
+    /// mutually consistent and share one set of fences. `timing` receives each phase as it ends.
+    pub async fn query_subset_batch(
+        &self,
+        reads: Vec<SubsetReadReq>,
+        timing: &mut crate::pg::SubsetBatchTiming,
+    ) -> Result<SubsetBatchPage> {
         anyhow::ensure!(!reads.is_empty(), "a batch needs at least one table");
+        *timing = crate::pg::SubsetBatchTiming::default();
+        let planning = std::time::Instant::now();
         let mut plans = Vec::with_capacity(reads.len());
         for r in reads {
             plans.push(self.plan_subset(None, &r.table, r.where_, r.columns, r.order_by, r.limit, r.offset).await?);
@@ -3570,7 +3577,10 @@ impl Engine {
         for p in &plans[1..] {
             scope = scope.with(p.scope_tables.iter());
         }
-        let mut client = self.pg_pool.as_ref().context("Postgres pool unavailable")?.get().await?;
+        timing.plan = planning.elapsed();
+        let pool = self.pg_pool.as_ref().context("Postgres pool unavailable")?;
+        timing.pool = Some((pool.in_use(), pool.size()));
+        let mut client = pool.get_timed(&mut timing.checkout).await?;
         let batch_reads: Vec<crate::pg::SubsetRead<'_>> = plans
             .iter()
             .map(|p| crate::pg::SubsetRead {
@@ -3581,7 +3591,7 @@ impl Engine {
                 offset: p.offset,
             })
             .collect();
-        let bq = crate::pg::query_subset_batch_where(&mut client, batch_reads, &scope).await?;
+        let bq = crate::pg::query_subset_batch_where(&mut client, batch_reads, &scope, timing).await?;
         let pages = plans.iter().zip(bq.pages.iter()).map(|(p, rows)| p.project(rows)).collect();
         Ok(SubsetBatchPage { pages, lsn: bq.lsn, snapshot: bq.snapshot, horizon: bq.horizon })
     }

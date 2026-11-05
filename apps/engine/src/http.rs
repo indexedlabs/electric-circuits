@@ -14,6 +14,7 @@ use utoipa::{OpenApi, ToSchema};
 
 #[cfg(feature = "test-support")]
 use crate::engine::GroupLoadAwait;
+use crate::engine::group_load_log::{GroupLoadLog, GroupLoadPhase};
 use crate::engine::{Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
@@ -1203,13 +1204,27 @@ async fn subset_load(
 /// One-stream group form. Members still use the existing plain and subquery shape paths, while a
 /// shared stream path and one settled page snapshot make the members comparable. The group claim
 /// and member list are durable as one catalog event; the group's own lane orders delayed subquery
-/// emissions before the next source transaction's output for the group.
+/// emissions before the next source transaction's output for the group. Every load logs one
+/// `group load finished` event.
 async fn subset_load_group(
     engine: &Engine,
     subscription: Option<String>,
     members: Vec<GroupMemberReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    let mut log = GroupLoadLog::start(members.iter().map(|member| member.table.as_str()));
+    let result = run_subset_load_group(engine, subscription, members, &mut log).await;
+    log.finish(result.as_ref().map(|_| ()).map_err(|error| error.status));
+    result
+}
+
+async fn run_subset_load_group(
+    engine: &Engine,
+    subscription: Option<String>,
+    members: Vec<GroupMemberReq>,
+    log: &mut GroupLoadLog,
+) -> Result<Json<serde_json::Value>, AppError> {
     const MAX_GROUP_MEMBERS: usize = 8;
+    log.phase(GroupLoadPhase::Validate);
     if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
@@ -1264,6 +1279,8 @@ async fn subset_load_group(
     // reads the subscription's group again: a same-members group that replaced it is renewed,
     // never answered as a conflict (#g-group-retry-renews).
     while let Some(existing) = engine.group_record(&group_sub).await {
+        log.group(&existing.stream_path);
+        log.phase(GroupLoadPhase::Renew);
         let same = existing.members.len() == members.len()
             && existing.members.iter().zip(&members).all(|(old, new)| {
                 old.key == new.key()
@@ -1301,6 +1318,7 @@ async fn subset_load_group(
                 // have retired it while this request was between its probes.
                 #[cfg(feature = "test-support")]
                 engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalStreamTail).await;
+                log.phase(GroupLoadPhase::Tail);
                 let tail = engine.stream_tail(&existing.stream_path).await.map_err(|error| {
                     AppError::from(anyhow::Error::new(crate::engine::GroupStreamUnavailable).context(error))
                 })?;
@@ -1319,7 +1337,10 @@ async fn subset_load_group(
                         .collect();
                     #[cfg(feature = "test-support")]
                     engine.wait_group_load_gate_for_test(GroupLoadAwait::RenewalSnapshot).await;
-                    let page = engine.query_subset_batch(reads).await.map_err(AppError::from)?;
+                    log.phase(GroupLoadPhase::Query);
+                    let page = engine.query_subset_batch(reads, &mut log.batch).await;
+                    let page = page.inspect_err(|error| log.failed(error)).map_err(AppError::from)?;
+                    log.phase(GroupLoadPhase::Renew);
                     // Recheck under the state lock, where a release begins: a release that has
                     // not begun by now is ordered after this answer (#g-group-recheck).
                     if engine.group_is_current(&existing).await {
@@ -1335,6 +1356,8 @@ async fn subset_load_group(
         }
     }
     let group_path = engine.group_stream_path();
+    log.group(&group_path);
+    log.phase(GroupLoadPhase::Create);
     // Reserve the one public claim before the first member create.  This check is made
     // under the same engine state lock as ordinary shape subscriptions, so a competing
     // single-shape create cannot win the name between member creates.
@@ -1342,7 +1365,10 @@ async fn subset_load_group(
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
-    engine.reserve_group_with_id(&group_sub, &member_subscriptions, &group_path).await?;
+    engine
+        .reserve_group_with_id(&group_sub, &member_subscriptions, &group_path)
+        .await
+        .inspect_err(|error| log.failed(error))?;
     engine.register_group_lane(&group_path);
     let mut reservation = GroupReservationGuard::new(engine, &group_sub, &group_path);
     #[cfg(feature = "test-support")]
@@ -1375,6 +1401,7 @@ async fn subset_load_group(
     }
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::StreamTail).await;
+    log.phase(GroupLoadPhase::Tail);
     let offset = match engine.stream_tail(&group_path).await {
         Ok(Some(offset)) => offset,
         Ok(None) => {
@@ -1403,13 +1430,16 @@ async fn subset_load_group(
     engine.wait_group_seed_gate_for_test().await;
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::Snapshot).await;
-    let page = match engine.query_subset_batch(reads).await {
+    log.phase(GroupLoadPhase::Query);
+    let page = match engine.query_subset_batch(reads, &mut log.batch).await {
         Ok(page) => page,
         Err(error) => {
+            log.failed(&error);
             reservation.rollback().await;
             return Err(AppError::from(error));
         }
     };
+    log.phase(GroupLoadPhase::Complete);
     let group_id = group_path.clone();
     let group_record = GroupRecord {
         id: group_id.clone(),
