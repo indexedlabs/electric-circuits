@@ -24,6 +24,8 @@
 //! - it refuses a catalog whose read did not reach the tail a `HEAD` reported (a page missing);
 //! - it refuses a catalog naming any stream outside the catalog's own prefix, and one with any
 //!   event the fold cannot decode, since a skipped event can name a stream;
+//! - it refuses a chain of unrecorded change-log segments longer than the 1,000 it checks, since it
+//!   cannot find the chain's end;
 //! - without `--confirm` it deletes nothing and prints what it would delete.
 //!
 //! Every run first prints the catalog's `StoreBound` and last `Offset` checkpoint events
@@ -37,15 +39,18 @@
 //! `["exec /usr/local/bin/electric-circuits-engine retire-generation <catalog stream path>"]`
 //! (append ` --confirm` for the deleting run).
 //!
-//! Deletion uses the engine's own retirement (close, then delete; a 404 or 410 counts as done), so a
-//! re-run after a partial failure picks up where the last one stopped. The catalog goes last, and
-//! only once every stream it names is gone.
+//! A confirmed run first closes the catalog, the fence: the store refuses appends to a closed
+//! stream, so the tail read after the close is final, and a writer that slipped past every other
+//! guard stops the run before anything is deleted. Each named stream then goes through the
+//! engine's own retirement (close, then delete; a 404 or 410 counts as done), so a re-run after a
+//! partial failure picks up where the last one stopped. The catalog goes last, and only once every
+//! stream it names is gone.
 //!
 //! | exit | meaning |
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
 //! | `1` | storage unavailable (unreachable, not ready, 5xx), or some deletes failed and the catalog was kept for a re-run |
-//! | `3` | partial: the named streams were deleted, the catalog was kept (closed) because it moved; find the writer before any re-run |
+//! | `3` | the catalog moved before the close that fences it: nothing was deleted, and the catalog is kept closed, so an engine writing it stops on its next append. A closed catalog cannot move, so a re-run deletes it unless the 7-day check refuses: find the writer before any re-run |
 //! | `78` | refused: a bad argument or path, one of the guards above, no store configured, a store that does not attest the configured identity, or a catalog this engine cannot read |
 
 use std::io::Write;
@@ -69,9 +74,9 @@ pub const EXIT_REFUSED: i32 = crate::pg::EXIT_CONFIG;
 /// Exit code for a storage failure or failed deletes; a re-run continues it.
 pub const EXIT_FAILED: i32 = 1;
 
-/// Exit code when every named stream was deleted but the catalog moved before its own delete and
-/// was kept. Not retryable: something appended to the catalog, and a re-run once that writer goes
-/// quiet could delete a live generation's catalog. Find the writer first.
+/// Exit code when the catalog moved before the close that fences it: nothing was deleted, and the
+/// catalog is now closed. Not retryable: something appended to the catalog, and a re-run once that
+/// writer goes quiet could delete a live generation. Find the writer first.
 pub const EXIT_CATALOG_MOVED: i32 = 3;
 
 /// Upper bound on the walk past the last recorded change-log segment (or from `changes/0`). A
@@ -276,8 +281,8 @@ pub struct Retired {
     pub failed: Vec<(String, String)>,
     /// Whether the catalog itself was deleted.
     pub catalog_deleted: bool,
-    /// `Some((before, after))` when every stream was deleted but the catalog's tail had moved
-    /// since it was read, so the catalog was kept.
+    /// `Some((before, after))` when the catalog's tail had moved since it was read, found right
+    /// after the close that fences it: nothing was deleted, and the catalog is kept (closed).
     pub catalog_moved: Option<(Option<String>, Option<String>)>,
 }
 
@@ -377,10 +382,22 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
     })
 }
 
-/// Delete every stream in `plan`, then the catalog. A stream whose delete fails is reported and
-/// the rest still go; the catalog is then kept, so a re-run finds what is left.
+/// Fence the catalog, then delete every stream in `plan`, then the catalog.
+///
+/// The catalog is closed first: once closed the store refuses every append, so the tail read after
+/// the close is final. The store has no conditional close or delete, so this is the only way to
+/// make the last writer check atomic with the deletes. A tail that moved since the plan means a
+/// writer slipped past every other guard: nothing is deleted, and that writer's next append fails
+/// loudly instead of its streams going silently. A stream whose delete fails is reported and the
+/// rest still go; the catalog is then kept (closed), so a re-run finds what is left.
 pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<Retired> {
     let mut retired = Retired { deleted: Vec::new(), failed: Vec::new(), catalog_deleted: false, catalog_moved: None };
+    ds.close_stream(CATALOG_STREAM).await.with_context(|| format!("closing {}", plan.catalog))?;
+    let after = ds.head(CATALOG_STREAM).await.context("re-checking the closed catalog")?.map(|head| head.next_offset);
+    if after.as_ref() != Some(&plan.tail) {
+        retired.catalog_moved = Some((plan.tail.clone(), after.flatten()));
+        return Ok(retired);
+    }
     for (n, (logical, physical)) in plan.streams.iter().enumerate() {
         match ds.retire_stream(logical).await {
             Ok(()) => {
@@ -397,18 +414,6 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
         }
     }
     if !retired.failed.is_empty() {
-        return Ok(retired);
-    }
-    // Fence the catalog before the last check: once it is closed nothing can append to it, so the
-    // tail read after the close is final and the delete cannot race a writer. The store has no
-    // conditional delete, and a HEAD-then-delete would leave that window open. A close that does
-    // not land keeps the catalog.
-    ds.close_stream(CATALOG_STREAM).await.with_context(|| format!("closing {}", plan.catalog))?;
-    // The streams are already gone, so a moved tail here is not a refusal: keep the catalog, which
-    // is what an engine appending to it would need, and report a partial retirement.
-    let after = ds.head(CATALOG_STREAM).await.context("re-checking the catalog stream")?.map(|head| head.next_offset);
-    if after.as_ref() != Some(&plan.tail) {
-        retired.catalog_moved = Some((plan.tail.clone(), after.flatten()));
         return Ok(retired);
     }
     ds.delete_stream(CATALOG_STREAM).await.with_context(|| format!("deleting {}", plan.catalog))?;
@@ -464,10 +469,9 @@ async fn run_inner(ds: &DsClient, args: &Args, own_generation: &str, now: u64, o
     } else if let Some((before, after)) = &retired.catalog_moved {
         writeln!(
             out,
-            "{} streams deleted; the catalog was kept because it moved (tail {before:?} -> {after:?}) while they were \
-             deleted, so an engine may be writing it. It is closed now, so that engine's next append fails. Find the \
-             writer before any re-run.",
-            retired.deleted.len()
+            "nothing was deleted: the catalog moved (tail {before:?} -> {after:?}) before it was fenced, so an engine \
+             may be writing it. It is closed now, so that engine's next append fails. Find the writer before any \
+             re-run."
         )?;
         Ok(EXIT_CATALOG_MOVED)
     } else {

@@ -190,6 +190,10 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
                         .into_response();
                     if end == total {
                         res.headers_mut().insert("stream-up-to-date", "true".parse().unwrap());
+                        // As the store does: a closed stream says so on the read that reaches its tail.
+                        if stream.closed {
+                            res.headers_mut().insert("stream-closed", "true".parse().unwrap());
+                        }
                     }
                     res
                 }
@@ -565,43 +569,26 @@ async fn a_catalog_appended_to_while_the_command_reads_it_is_refused() {
     assert_eq!(store.paths(), before);
 }
 
-/// The last guard runs after every stream is gone: a catalog that moved meanwhile is kept, and the
-/// run reports a partial retirement with its own exit code (3): neither a refusal (78) nor the
-/// retryable failure (1), because a re-run once the writer goes quiet could delete a live catalog.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_catalog_that_moves_while_its_streams_are_deleted_is_kept() {
-    let store = store_with_v1(now() - 20 * DAY).await;
-    // A writer appends while the named streams are being deleted.
-    let first = named(&v1()).remove(0);
-    store.state.lock().unwrap().append_before = Some((format!("DELETE {first}"), v1_catalog()));
-
-    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
-
-    assert_kept_because_it_moved(&store, &run);
-}
-
-/// The writer can also land after the last check and before the catalog is fenced. The close is the
-/// fence: the tail is checked only after it, so an append racing the close still keeps the catalog.
+/// The catalog is closed before anything is deleted: the close is the fence, since the store has no
+/// conditional delete. A writer whose append lands just before the close is caught by the tail read
+/// after it, so the run stops with exit 3 (neither a refusal nor a retryable failure, since a re-run
+/// once the writer goes quiet could delete a live generation), and every stream survives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catalog_appended_to_as_it_is_closed_is_kept() {
     let store = store_with_v1(now() - 20 * DAY).await;
     store.state.lock().unwrap().append_before = Some((format!("CLOSE {}", v1_catalog()), v1_catalog()));
+    let before = store.paths();
 
     let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
-    assert_kept_because_it_moved(&store, &run);
-}
-
-fn assert_kept_because_it_moved(store: &Store, run: &Run) {
     assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
-    assert!(run.stdout.contains("streams deleted; the catalog was kept because it moved"), "stdout: {}", run.stdout);
+    assert!(run.stdout.contains("nothing was deleted: the catalog moved"), "stdout: {}", run.stdout);
     assert!(run.stdout.contains("Find the writer before any re-run"), "stdout: {}", run.stdout);
-    let left = store.paths();
-    assert!(left.contains(&v1_catalog()), "the moved catalog survives");
-    assert!(named(&v1()).iter().all(|p| !left.contains(p)), "every named stream was deleted: {left:?}");
-    assert!(
-        !store.destructive_requests().contains(&format!("DELETE {}", v1_catalog())),
-        "the catalog was never deleted"
+    assert_eq!(store.paths(), before, "every stream and the catalog survive");
+    assert_eq!(
+        store.destructive_requests(),
+        vec![format!("CLOSE {}", v1_catalog())],
+        "only the fence ran: no named stream was closed or deleted"
     );
 }
 
@@ -828,6 +815,31 @@ async fn an_unrecorded_segment_chain_past_the_bound_is_refused() {
     assert!(run.stderr.contains("past the 1000 unrecorded segments"), "stderr: {}", run.stderr);
     assert_eq!(store.destructive_requests(), Vec::<String>::new());
     assert_eq!(store.paths(), before);
+}
+
+/// The catalog is closed before anything is deleted, so a run that fails at the catalog's own
+/// delete leaves it closed. A re-run must read that closed catalog, fence it again (closing a
+/// closed stream is a no-op) and finish.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_from_a_closed_catalog_finishes() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    store.state.lock().unwrap().fail_delete.insert(v1_catalog());
+
+    let first = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(first.code, 1, "stdout: {}\nstderr: {}", first.stdout, first.stderr);
+    {
+        let st = store.state.lock().unwrap();
+        let catalog = st.streams.get(&v1_catalog()).expect("the catalog survives its failed delete");
+        assert!(catalog.closed, "the catalog is left closed by the fence");
+    }
+    assert!(named(&v1()).iter().all(|p| !store.paths().contains(p)), "the named streams went first");
+
+    store.state.lock().unwrap().fail_delete.clear();
+    let second = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(second.code, 0, "stdout: {}\nstderr: {}", second.stdout, second.stderr);
+    assert!(!store.paths().contains(&v1_catalog()), "nothing of the generation is left: {:?}", store.paths());
 }
 
 #[tokio::test(flavor = "multi_thread")]
