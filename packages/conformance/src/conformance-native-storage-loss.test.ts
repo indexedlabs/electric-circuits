@@ -150,15 +150,18 @@ describe('native shape storage loss', () => {
     const other = await createShape(h, { table: 'items', where: { col: 'id', op: 'gte', value: 100 } })
 
     expect((await testMutualTlsRequest(gone.streamUrl, 'DELETE')).ok).toBe(true)
-    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (1, $1)', ['to the removed stream'])
-    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (101, $1)', ['to the other shape'])
+    // One committed transaction carries a row for the gone stream and a row for the healthy shape.
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (1, $1), (101, $2)', [
+      'to the removed stream',
+      'to the other shape in the same transaction',
+    ])
     await drainEngine(h)
 
     await waitFor(
       async () => (await fetch(`${h!.engineUrl}/shapes/${goneId}`)).status === 404,
       'the shape whose stream is gone to be retired',
     )
-    expect((await foldStream(other.streamUrl)).has('101'), 'the other shape keeps advancing').toBe(true)
+    expect((await foldStream(other.streamUrl)).has('101'), 'the healthy shape gets its row of the same transaction').toBe(true)
 
     const stale = await fetch(`${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset, handle, where })}`)
     expect(stale.status).toBe(409)
@@ -196,15 +199,17 @@ describe('native shape storage loss', () => {
     const other = await createShape(h, { table: 'items', where: { col: 'id', op: 'gte', value: 100 } })
 
     expect((await testMutualTlsRequest(group.streamUrl, 'DELETE')).ok).toBe(true)
-    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (2, $1)', ['to the removed group stream'])
-    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (103, $1)', ['to the other shape'])
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (2, $1), (103, $2)', [
+      'to the removed group stream',
+      'to the other shape in the same transaction',
+    ])
     await drainEngine(h)
 
     await waitFor(
       async () => (await fetch(`${h!.engineUrl}/shapes/${member}`)).status === 404,
       'the group whose stream is gone to be released',
     )
-    expect((await foldStream(other.streamUrl)).has('103'), 'the other shape keeps advancing').toBe(true)
+    expect((await foldStream(other.streamUrl)).has('103'), 'the healthy shape gets its row of the same transaction').toBe(true)
 
     const reloaded = await load()
     expect(reloaded.streamUrl, 'a reload starts a fresh group stream').not.toBe(group.streamUrl)
