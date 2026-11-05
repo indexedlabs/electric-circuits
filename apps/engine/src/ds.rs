@@ -1224,6 +1224,13 @@ impl DsClient {
         self
     }
 
+    /// Pretend this client was built `ago` earlier, so "untouched since boot" reads as that long.
+    #[cfg(test)]
+    pub(crate) fn born_ago_for_test(mut self, ago: std::time::Duration) -> Self {
+        self.born -= ago;
+        self
+    }
+
     pub(crate) fn stream_ttl(&self) -> Option<NonZeroU64> {
         self.stream_ttl
     }

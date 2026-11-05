@@ -145,7 +145,9 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
     }
     expect(await series('engine_stream_ttl_touches_total')).toBeGreaterThanOrEqual(3)
     expect(await series('engine_stream_ttl_touch_failures_total')).toBe(0)
-    expect(await series('engine_stream_ttl_oldest_untouched_seconds')).toBeLessThanOrEqual(ttl / 4)
+    // The exported age is the age at the latest sweep plus the time since: at most a quarter TTL
+    // plus one sweep interval (1 s) while touches succeed.
+    expect(await series('engine_stream_ttl_oldest_untouched_seconds')).toBeLessThanOrEqual(ttl / 4 + 1)
   }, 90000)
 
   it('touches a stream the restarted engine has not read on its first sweep, not a quarter TTL later', async () => {
@@ -162,8 +164,10 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
       },
     })
     const shape = await createShape('held')
-    await h.restartEngine()
+    // The baseline comes before the restart: the new process's first sweep can land before
+    // `restartEngine` resolves, and the old one has no reason to touch a stream it just created.
     const restartedAt = proxy!.touched().length
+    await h.restartEngine()
     const shapePath = `/${testPhysicalPath(shape.streamPath)}`
     await waitFor(
       () => Promise.resolve(proxy!.touched().slice(restartedAt).includes(shapePath)),

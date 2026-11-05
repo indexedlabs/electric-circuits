@@ -1895,6 +1895,9 @@ impl Engine {
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
+        if engine.ds.stream_ttl().is_some() {
+            engine.metrics.arm_stream_ttl_age();
+        }
         engine.ensure_degrade_reaper();
         crate::electric::ensure_evictor(&engine);
         crate::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));

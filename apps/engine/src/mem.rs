@@ -743,12 +743,19 @@ pub(crate) fn init_otel(
         stream_ttl_touch_failures,
         ""
     );
-    engine_gauge!(
-        "engine_stream_ttl_oldest_untouched",
-        "Longest any tracked stream has gone untouched after the latest keep-alive sweep",
-        stream_ttl_oldest_untouched_secs,
-        "s"
-    );
+    {
+        // Not `engine_gauge!`: the value is computed when read, so it keeps rising if sweeps stop.
+        let metrics = metrics.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_gauge("engine_stream_ttl_oldest_untouched")
+            .with_description(
+                "Longest any tracked stream has gone untouched: its age at the latest keep-alive sweep plus the time since",
+            )
+            .with_unit("s")
+            .with_callback(move |obs| obs.observe(metrics.stream_ttl_oldest_untouched_secs(), &attributes))
+            .build();
+    }
     engine_counter!(
         "engine_catalog_restore_retired",
         "Shape records retired during catalog restore because their streams were missing or closed",
@@ -993,7 +1000,7 @@ mod tests {
         let metrics = Arc::new(crate::metrics::Metrics::default());
         metrics.stream_ttl_touches.store(7, Ordering::Relaxed);
         metrics.stream_ttl_touch_failures.store(2, Ordering::Relaxed);
-        metrics.stream_ttl_oldest_untouched_secs.store(90, Ordering::Relaxed);
+        metrics.record_stream_ttl_sweep(std::time::Duration::from_secs(90));
         let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
         let scrape = telemetry.prometheus_text();
         telemetry.shutdown();

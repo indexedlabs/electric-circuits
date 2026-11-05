@@ -2151,11 +2151,9 @@ impl Engine {
         }
         // Same tick, second half: the change log's own retention (ADR-0006).
         self.sweep_change_log().await;
-        // Last, so nothing this sweep evicted or deleted is touched.
-        self.sweep_stream_ttl().await;
     }
 
-    /// The keep-alive half of a sweep (`#g-tracked-streams-kept`): with a sliding
+    /// The keep-alive sweep (`#g-tracked-streams-kept`): with a sliding
     /// `ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, read at its tail every stream the engine tracks that has
     /// not been appended to or read for a quarter of the TTL, so none of them expires while the
     /// engine still needs it. The tracked streams are `meta/catalog` and every stream it names:
@@ -2230,7 +2228,7 @@ impl Engine {
             })
             .max()
             .unwrap_or_default();
-        self.metrics.stream_ttl_oldest_untouched_secs.store(oldest.as_secs(), Ordering::Relaxed);
+        self.metrics.record_stream_ttl_sweep(oldest);
     }
 
     /// `meta/catalog` and every stream it names that the engine still tracks.
@@ -2549,6 +2547,20 @@ impl Engine {
                 engine.retention_sweep().await;
             }
         });
+        // The keep-alive runs on a timer of its own at the same interval, so a retention sweep held
+        // up by an eviction (which waits on the sequencer) cannot hold up the touches as well.
+        if self.ds.stream_ttl().is_some() {
+            let engine = self.clone();
+            self.shutdown.spawn_background(async move {
+                let mut tick = tokio::time::interval(engine.retention.sweep_interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    engine.sweep_stream_ttl().await;
+                }
+            });
+        }
     }
 }
 
@@ -5487,6 +5499,19 @@ mod stream_ttl_tests {
         )
     }
 
+    /// An engine whose process has been up for an hour: "untouched since boot" then reads as 3600 s,
+    /// which no sweep that takes seconds can produce by legitimately aging a touch.
+    fn hour_old_engine(store: Arc<crate::ds::ScriptedStore>) -> Engine {
+        Engine::new_for_in_process_test(
+            DsClient::with_test_store("scripted://ttl".into(), store)
+                .with_stream_ttl(std::num::NonZeroU64::new(3600 * 24))
+                .born_ago_for_test(Duration::from_secs(3600)),
+        )
+    }
+
+    /// Well under the hour an engine from [`hour_old_engine`] has been up.
+    const FRESH_SECS: u64 = 60;
+
     /// Every keep-alive read the store saw since the last drain, as logical paths.
     fn touches(reads: &mut tokio::sync::mpsc::UnboundedReceiver<(String, String, bool)>) -> Vec<String> {
         let mut paths = Vec::new();
@@ -5524,7 +5549,7 @@ mod stream_ttl_tests {
         for path in engine.ttl_tracked_streams().await {
             assert!(engine.ds.touched_ago(&path).is_some(), "{path} was neither touched nor otherwise accessed");
         }
-        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs(), 0);
 
         engine.sweep_stream_ttl().await;
         assert!(touches(&mut reads).is_empty(), "touched under a quarter TTL ago: not due");
@@ -5553,24 +5578,22 @@ mod stream_ttl_tests {
             2 * first,
             "still due, still failing"
         );
-        assert!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed) >= 1, "the age keeps growing");
+        assert!(engine.metrics.stream_ttl_oldest_untouched_secs() >= 1, "the age keeps growing");
         touches(&mut reads);
 
         store.nonlive_read_status.store(0, Ordering::Relaxed);
         engine.sweep_stream_ttl().await;
         assert!(touches(&mut reads).contains(&"shape/s1".to_string()), "the next sweep touches it");
         assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), first);
-        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs(), 0);
     }
 
-    /// Park dormant shapes, then wait long enough that "untouched since boot" would read as a
-    /// whole second: the age a wrongly judged stream would report.
+    /// An hour-old engine with these dormant shapes parked.
     async fn engine_with_shapes(store: Arc<crate::ds::ScriptedStore>, ids: &[&str]) -> Engine {
-        let engine = ttl_engine(store, Some(3600));
+        let engine = hour_old_engine(store);
         for id in ids {
             engine.park_dormant_shape_for_test(id, "users", LogPosition { segment: 0, offset: "0".into() }).await;
         }
-        tokio::time::sleep(Duration::from_millis(1100)).await;
         engine
     }
 
@@ -5606,7 +5629,8 @@ mod stream_ttl_tests {
         gate.released.notify_one();
         sweep.await.unwrap();
 
-        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+        let age = engine.metrics.stream_ttl_oldest_untouched_secs();
+        assert!(age < FRESH_SECS, "no tracked stream reads as untouched since boot: {age}s");
         assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0);
     }
 
@@ -5641,7 +5665,8 @@ mod stream_ttl_tests {
         sweep.await.unwrap();
 
         assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0);
-        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+        let age = engine.metrics.stream_ttl_oldest_untouched_secs();
+        assert!(age < FRESH_SECS, "no tracked stream reads as untouched since boot: {age}s");
     }
 
     /// A tracked stream the store has lost (it answers 404 and nothing creates it again) is a
@@ -5653,6 +5678,37 @@ mod stream_ttl_tests {
         let engine = engine_with_shapes(store, &["s1"]).await;
         engine.sweep_stream_ttl().await;
         assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 1);
+    }
+
+    /// The exported age keeps rising while a sweep cannot finish (stalled on a touch here, as it
+    /// would be behind a stuck store read or a panic), so the keep-alive alarm can fire. It starts
+    /// at boot, before any sweep has finished.
+    #[tokio::test]
+    async fn the_exported_untouched_age_keeps_rising_while_a_sweep_cannot_finish() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let engine = ttl_engine(store.clone(), Some(3600));
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs(), 0);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(engine.metrics.stream_ttl_oldest_untouched_secs() >= 1, "aging from boot before any sweep");
+        engine.sweep_stream_ttl().await;
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs(), 0, "a finished sweep resets it");
+
+        // A shape that becomes tracked now is due at once; its touch never answers.
+        let gate = hold_s2(&store);
+        engine.park_dormant_shape_for_test("s2", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        let sweep = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.sweep_stream_ttl().await }
+        });
+        gate.entered.notified().await;
+        let before = engine.metrics.stream_ttl_oldest_untouched_secs();
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let after = engine.metrics.stream_ttl_oldest_untouched_secs();
+        assert!(after >= before + 2, "the stalled sweep's age keeps rising: {before}s -> {after}s");
+        let scrape = engine.metrics.snapshot();
+        assert!(scrape["gauges"]["stream_ttl_oldest_untouched_seconds"].as_u64().unwrap() >= after);
+        gate.released.notify_one();
+        sweep.await.unwrap();
     }
 
     /// Without a TTL there is nothing to keep alive.
