@@ -2934,6 +2934,18 @@ mod tests {
         engine.close(OTTO_5492_DEADLINE).await;
     }
 
+    /// `#c-sweep-inside-ttl`: the config-less library constructor cannot check a stream TTL against
+    /// the sweep and retention windows, so it refuses a client that has one.
+    #[tokio::test]
+    #[should_panic(expected = "must go through Engine::new_with_config or Engine::boot_library")]
+    async fn the_config_less_library_constructor_refuses_a_client_with_a_stream_ttl() {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://config-less-ttl".into(), store)
+            .with_stream_ttl(std::num::NonZeroU64::new(1_814_400));
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        let _ = Engine::new(admission).await;
+    }
+
     /// The engine sweeps with the retention windows and interval its config was resolved with, the
     /// same ones the TTL floor and quarter-TTL checks used, not the process environment's.
     #[tokio::test]
