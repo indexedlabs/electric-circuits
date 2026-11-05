@@ -1672,7 +1672,7 @@ impl Engine {
         config: &crate::config::Config,
     ) -> Result<Self> {
         let bytes = if pg_url.is_none() {
-            admission.ds = admission.ds.with_memory_budget(config);
+            admission.ds = admission.ds.with_memory_budget(config).with_stream_ttl(config.stream_ttl);
             Some(Self::check_catalog_binding(&admission.ds, &admission.binding).await?)
         } else {
             None
@@ -1726,7 +1726,8 @@ impl Engine {
             store_bound.set(binding).expect("fresh store binding proof");
         }
         let ds = match config {
-            Some(config) => ds.with_memory_budget(config),
+            // A given config is the authority for the client's process budget and stream TTL.
+            Some(config) => ds.with_memory_budget(config).with_stream_ttl(config.stream_ttl),
             None => ds,
         };
         let mut metrics = crate::metrics::Metrics::new(

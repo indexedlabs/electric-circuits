@@ -1574,6 +1574,19 @@ mod tests {
         assert!(sweep("9").is_ok());
         let err = sweep("10").expect_err("a sweep interval of a quarter TTL refuses to start");
         assert!(format!("{err:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{err:#}");
+        // A quarter of a TTL that 4 does not divide is compared at sub-second precision, not
+        // truncated: a quarter of 10 s is 2.5 s, so a 2 s sweep starts and a 3 s sweep does not.
+        let uneven = |secs: &str| {
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "2"),
+                ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "2"),
+                ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "10"),
+                ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", secs),
+            ])
+        };
+        assert!(uneven("2").is_ok(), "2 s is under a quarter of 10 s");
+        assert!(uneven("3").is_err(), "3 s is not");
 
         let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "21d")]).expect_err("not a number");
         assert!(format!("{err:#}").contains("whole number of seconds"));
