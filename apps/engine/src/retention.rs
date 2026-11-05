@@ -162,10 +162,18 @@ impl RetentionConfig {
 
 /// The shortest non-zero `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` the engine starts with: twice the
 /// larger of a shape's idle-plus-dormancy window and the change log's retain window, 14.5 days at
-/// the defaults. Those windows are how long the engine's own lifecycle may hold a stream before it
-/// deletes it, so a sliding TTL at least twice as long never expires a stream the engine tracks.
-pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog::ChangeLogConfig) -> Duration {
-    retention.idle_timeout.saturating_add(retention.dormant_ttl).max(changes.retain).saturating_mul(2)
+/// the defaults. Those windows bound how long the engine's own lifecycle holds a stream before it
+/// deletes it, so the TTL stays well clear of them. `None` when any of them is `0` (disabled): the
+/// engine may then hold a stream forever, and no TTL is safe.
+///
+/// The floor alone does not keep a tracked stream alive. A stream the engine neither appends to nor
+/// reads, such as a restored dormant shape whose dormancy clock restarted at boot, still expires
+/// unless something reads it; `HEAD` does not slide the TTL.
+pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog::ChangeLogConfig) -> Option<Duration> {
+    if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() || changes.retain.is_zero() {
+        return None;
+    }
+    Some(retention.idle_timeout.saturating_add(retention.dormant_ttl).max(changes.retain).saturating_mul(2))
 }
 
 /// Where a shape is in the lifecycle. Held per shape id by the engine (`Engine::lives`).

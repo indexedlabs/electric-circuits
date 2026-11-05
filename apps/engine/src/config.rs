@@ -663,10 +663,16 @@ impl Config {
             })?),
         };
         if let Some(ttl) = stream_ttl {
-            let floor = crate::retention::stream_ttl_floor(
+            let Some(floor) = crate::retention::stream_ttl_floor(
                 &crate::retention::RetentionConfig::resolve(&g),
                 &crate::changelog::ChangeLogConfig::resolve(&g),
-            );
+            ) else {
+                bail!(
+                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS, \
+                     ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS or ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS is 0 (disabled), \
+                     so the engine may hold a stream forever and no TTL is safe"
+                );
+            };
             if Duration::from_secs(ttl.get()) < floor {
                 bail!(
                     "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
@@ -1517,6 +1523,18 @@ mod tests {
             ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "8"),
         ];
         assert_eq!(cfg(&short).stream_ttl.map(|t| t.get()), Some(8));
+
+        // A disabled window (0) is unbounded: the engine may hold a stream forever, so no TTL is safe.
+        for window in [
+            "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS",
+            "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
+            "ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS",
+        ] {
+            let err = try_cfg(&[(window, "0"), ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000")])
+                .expect_err(&format!("{window}=0 refuses any non-zero TTL"));
+            assert!(format!("{err:#}").contains("0 (disabled)"), "{err:#}");
+            assert_eq!(try_cfg(&[(window, "0")]).unwrap().stream_ttl, None, "{window}=0 with no TTL still boots");
+        }
 
         let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "21d")]).expect_err("not a number");
         assert!(format!("{err:#}").contains("whole number of seconds"));
