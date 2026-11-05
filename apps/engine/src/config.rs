@@ -681,6 +681,15 @@ impl Config {
                     floor.as_secs()
                 );
             }
+            let sweep = crate::retention::RetentionConfig::resolve(&g).sweep_interval;
+            if sweep >= Duration::from_secs(ttl.get()) / 4 {
+                bail!(
+                    "ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS is {}s, not under a quarter of \
+                     ELECTRIC_CIRCUITS_STREAM_TTL_SECS ({ttl}s): the keep-alive sweep must come round well before \
+                     a tracked stream's TTL can lapse",
+                    sweep.as_secs()
+                );
+            }
         }
 
         let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
@@ -1520,6 +1529,7 @@ mod tests {
             ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
             ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
             ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
+            ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
             ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "8"),
         ];
         assert_eq!(cfg(&short).stream_ttl.map(|t| t.get()), Some(8));
@@ -1550,6 +1560,20 @@ mod tests {
             ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000"),
         ]);
         assert!(idle_off.is_err_and(|e| format!("{e:#}").contains("0 (disabled)")), "idle 0 refuses with retain 0 too");
+
+        // `#c-sweep-inside-ttl`: the keep-alive sweep must run more often than a quarter of the TTL.
+        let sweep = |secs: &str| {
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
+                ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
+                ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "40"),
+                ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", secs),
+            ])
+        };
+        assert!(sweep("9").is_ok());
+        let err = sweep("10").expect_err("a sweep interval of a quarter TTL refuses to start");
+        assert!(format!("{err:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{err:#}");
 
         let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "21d")]).expect_err("not a number");
         assert!(format!("{err:#}").contains("whole number of seconds"));

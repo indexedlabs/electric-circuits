@@ -134,6 +134,13 @@ pub struct Metrics {
     pub epoch_resets: AtomicU64, // ADR-0004: new epochs bound (every shape retired, fresh slot)
     pub changes_rotations: AtomicU64, // ADR-0006: change-log segments closed and succeeded
     pub changes_segments_deleted: AtomicU64, // ADR-0006: rotated-out segments retired (nothing could resume inside)
+    /// Keep-alive reads that slid a tracked stream's `Stream-TTL` (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`).
+    pub stream_ttl_touches: AtomicU64,
+    /// Keep-alive reads that failed; the stream stays due and the next sweep tries it again.
+    pub stream_ttl_touch_failures: AtomicU64,
+    /// GAUGE: after the latest keep-alive sweep, the longest any tracked stream has gone without an
+    /// append, read or touch, in seconds. Stays under a quarter of the TTL while touches succeed.
+    pub stream_ttl_oldest_untouched_secs: AtomicU64,
     /// Catalog appends re-attempted because durable-streams was unavailable. Never a dropped event
     /// (the writer retries in place, forever) — this is the visible cost of that promise, and a
     /// climbing value with a flat `shapes_*` means creates are waiting on storage.
@@ -261,6 +268,9 @@ impl Metrics {
             epoch_resets: AtomicU64::new(0),
             changes_rotations: AtomicU64::new(0),
             changes_segments_deleted: AtomicU64::new(0),
+            stream_ttl_touches: AtomicU64::new(0),
+            stream_ttl_touch_failures: AtomicU64::new(0),
+            stream_ttl_oldest_untouched_secs: AtomicU64::new(0),
             changes_segments_retained: AtomicU64::new(0),
             catalog_append_retries: AtomicU64::new(0),
             catalog_restore_retired: AtomicU64::new(0),
@@ -310,9 +320,17 @@ impl Metrics {
                 ("electric_snapshot_builds_total", &self.electric_snapshot_builds),
                 ("electric_snapshot_joins_total", &self.electric_snapshot_joins),
                 ("electric_snapshot_reuses_total", &self.electric_snapshot_reuses),
+                ("stream_ttl_touches_total", &self.stream_ttl_touches),
+                ("stream_ttl_touch_failures_total", &self.stream_ttl_touch_failures),
             ] {
                 counters.insert(name.into(), counter.load(Ordering::Relaxed).into());
             }
+        }
+        if let Some(gauges) = snapshot["gauges"].as_object_mut() {
+            gauges.insert(
+                "stream_ttl_oldest_untouched_seconds".into(),
+                self.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed).into(),
+            );
         }
         snapshot
     }
@@ -415,6 +433,8 @@ impl Metrics {
         self.epoch_resets.store(0, Ordering::Relaxed);
         self.changes_rotations.store(0, Ordering::Relaxed);
         self.changes_segments_deleted.store(0, Ordering::Relaxed);
+        self.stream_ttl_touches.store(0, Ordering::Relaxed);
+        self.stream_ttl_touch_failures.store(0, Ordering::Relaxed);
         self.catalog_append_retries.store(0, Ordering::Relaxed);
         self.catalog_restore_retired.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);
