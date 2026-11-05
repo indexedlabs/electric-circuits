@@ -450,7 +450,8 @@ async fn a_catalog_appended_to_while_the_command_reads_it_is_refused() {
 }
 
 /// The last guard runs after every stream is gone: a catalog that moved meanwhile is kept, and the
-/// run reports a partial retirement (exit 1), not a refusal.
+/// run reports a partial retirement with its own exit code (3): neither a refusal (78) nor the
+/// retryable failure (1), because a re-run once the writer goes quiet could delete a live catalog.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catalog_that_moves_while_its_streams_are_deleted_is_kept() {
     let store = store_with_v1(now() - 20 * DAY).await;
@@ -459,8 +460,9 @@ async fn a_catalog_that_moves_while_its_streams_are_deleted_is_kept() {
 
     let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
-    assert_eq!(run.code, 1, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert!(run.stdout.contains("streams deleted; the catalog was kept because it moved"), "stdout: {}", run.stdout);
+    assert!(run.stdout.contains("Find the writer before any re-run"), "stdout: {}", run.stdout);
     let left = store.paths();
     assert!(left.contains(&v1_catalog()), "the moved catalog survives");
     assert!(named(&v1()).iter().all(|p| !left.contains(p)), "every named stream was deleted: {left:?}");

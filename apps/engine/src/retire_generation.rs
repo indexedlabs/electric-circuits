@@ -42,7 +42,8 @@
 //! | exit | meaning |
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
-//! | `1` | storage failed; some deletes failed and the catalog was kept for a re-run; or every stream was deleted but the catalog moved meanwhile and was kept |
+//! | `1` | storage failed, or some deletes failed and the catalog was kept for a re-run |
+//! | `3` | partial: the named streams were deleted, the catalog was kept because it moved; find the writer before any re-run |
 //! | `78` | refused: a bad argument or path, or one of the guards above |
 
 use std::io::Write;
@@ -63,8 +64,13 @@ pub const QUIET_SECS: u64 = 7 * 24 * 60 * 60;
 /// Exit code for a refusal: the request is wrong, and running it again unchanged will not help.
 pub const EXIT_REFUSED: i32 = crate::pg::EXIT_CONFIG;
 
-/// Exit code for a storage failure or a partial retirement; a re-run continues it.
+/// Exit code for a storage failure or failed deletes; a re-run continues it.
 pub const EXIT_FAILED: i32 = 1;
+
+/// Exit code when every named stream was deleted but the catalog moved before its own delete and
+/// was kept. Not retryable: something appended to the catalog, and a re-run once that writer goes
+/// quiet could delete a live generation's catalog. Find the writer first.
+pub const EXIT_CATALOG_MOVED: i32 = 3;
 
 /// Upper bound on the walk past the last recorded change-log segment. A rotation records each new
 /// segment before the next one can begin, so more than one unrecorded successor is already a
@@ -392,10 +398,10 @@ async fn run_inner(ds: &DsClient, args: &Args, own_generation: &str, now: u64, o
         writeln!(
             out,
             "{} streams deleted; the catalog was kept because it moved (tail {before:?} -> {after:?}) while they were \
-             deleted, so an engine may be writing it. Check it before deleting it or re-running.",
+             deleted, so an engine may be writing it. Find the writer before any re-run.",
             retired.deleted.len()
         )?;
-        Ok(EXIT_FAILED)
+        Ok(EXIT_CATALOG_MOVED)
     } else {
         writeln!(
             out,
