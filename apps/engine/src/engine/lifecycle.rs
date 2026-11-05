@@ -5641,7 +5641,7 @@ mod stream_ttl_tests {
         let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
         *store.read_observer.lock().unwrap() = Some(tx);
         let gate = hold_s2(&store);
-        let engine = engine_with_shapes(store, &["s1", "s2"]).await;
+        let engine = engine_with_shapes(store.clone(), &["s1", "s2"]).await;
         let sweep = tokio::spawn({
             let engine = engine.clone();
             async move { engine.sweep_stream_ttl().await }
@@ -5664,6 +5664,25 @@ mod stream_ttl_tests {
         assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0);
         let age = engine.metrics.stream_ttl_oldest_untouched_secs();
         assert!(age < FRESH_SECS, "no tracked stream reads as untouched since boot: {age}s");
+
+        // A create whose PUT is still open for the whole sweep: it counts from when the create
+        // began, so the sweep neither fails a touch on it nor reports it as untouched since boot.
+        *store.read_gate.lock().unwrap() = None;
+        store.uncreated.lock().unwrap().push("shape/s3".into());
+        let put = Arc::new(crate::ds::BodyGate::default());
+        *store.ensure_gate.lock().unwrap() = Some(put.clone());
+        engine.park_dormant_shape_for_test("s3", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        let create = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.ds.ensure_stream("shape/s3").await }
+        });
+        put.entered.notified().await;
+        engine.sweep_stream_ttl().await;
+        assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0, "no failed touch");
+        let age = engine.metrics.stream_ttl_oldest_untouched_secs();
+        assert!(age < FRESH_SECS, "a create in flight does not read as untouched since boot: {age}s");
+        put.released.notify_one();
+        create.await.unwrap().unwrap();
     }
 
     /// A tracked stream the store has lost (it answers 404 and nothing creates it again) is a

@@ -765,11 +765,16 @@ impl Config {
         Ok(config)
     }
 
-    /// Check a non-zero `stream_ttl` against the retention windows and sweep interval this config
-    /// carries: the floor, a disabled idle or dormancy window, and the quarter-TTL sweep. Run by
+    /// Check the sweep interval (never zero) and a non-zero `stream_ttl` against the retention
+    /// windows and sweep interval this config carries: the floor, a disabled idle or dormancy
+    /// window, and the quarter-TTL sweep. Run by
     /// `resolve` and again by `Engine::new_with_config`, so a config changed after resolving is
     /// checked with the values the engine will use.
     pub fn check_stream_ttl(&self) -> Result<()> {
+        // The retention and keep-alive timers cannot run on a zero period, TTL or not.
+        if self.retention.sweep_interval.is_zero() {
+            bail!("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS must be at least 1 second");
+        }
         let Some(ttl) = self.stream_ttl else { return Ok(()) };
         let Some(floor) = crate::retention::stream_ttl_floor(&self.retention, &self.change_log) else {
             bail!(

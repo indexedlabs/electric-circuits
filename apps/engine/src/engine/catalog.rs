@@ -2988,6 +2988,22 @@ mod tests {
         assert!(format!("{refused:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{refused:#}");
     }
 
+    /// `#c-sweep-inside-ttl`: a sweep interval changed to zero after resolving is refused at
+    /// construction, with or without a TTL; the retention and keep-alive timers cannot run on it.
+    #[tokio::test]
+    async fn a_zero_sweep_interval_is_refused_at_construction() {
+        let mut config = crate::config::Config::resolve(|_| None).unwrap();
+        config.retention.sweep_interval = std::time::Duration::ZERO;
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://zero-sweep".into(), store);
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        let refused = Engine::new_with_config(admission, None, PostgresSetup::EngineManaged, &config)
+            .await
+            .err()
+            .expect("a zero sweep interval is refused");
+        assert!(format!("{refused:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{refused:#}");
+    }
+
     /// The engine sweeps with the retention windows and interval its config was resolved with, the
     /// same ones the TTL floor and quarter-TTL checks used, not the process environment's.
     #[tokio::test]

@@ -1237,7 +1237,13 @@ impl DsClient {
 
     /// A successful append or read slid the stream's TTL; remember when (only while a TTL is set).
     fn note_access(&self, path: &str, status: u16) {
-        if self.stream_ttl.is_some() && (200..300).contains(&status) {
+        if (200..300).contains(&status) {
+            self.record_access(path);
+        }
+    }
+
+    fn record_access(&self, path: &str) {
+        if self.stream_ttl.is_some() {
             self.accessed.lock().unwrap().insert(path.to_string(), std::time::Instant::now());
         }
     }
@@ -1471,6 +1477,11 @@ impl DsClient {
     /// retryable, and every other `409` keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
+        // A stream being created counts from when its create began, so a keep-alive sweep that
+        // runs while the PUT is in flight neither touches it (a 404) nor ages it from boot. Counting
+        // a little early only makes it due sooner; a failed create's record is pruned once its
+        // shape is dropped.
+        self.record_access(path);
         let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
         if (200..300).contains(&res.status) {
             // A create (or a matching re-create, which the store treats as an access) starts the
@@ -2792,6 +2803,8 @@ mod tests {
         /// Path suffixes whose streams are not created yet: a non-live read answers 404 until an
         /// ensure of that path creates it.
         pub(crate) uncreated: std::sync::Mutex<Vec<String>>,
+        /// Hold every ensure before it creates its stream, as a PUT still in flight.
+        pub(crate) ensure_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
         /// One live GET response for a matching path suffix, without deleting storage.
         pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
@@ -2944,6 +2957,10 @@ mod tests {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
                 self.ensure_ttls.lock().unwrap().push((path.to_string(), ttl.map(NonZeroU64::get)));
+                let gate = self.ensure_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.hold().await;
+                }
                 self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
                 if self.ensure_status != 0 {
                     let mut res = response(self.ensure_status);
