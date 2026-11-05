@@ -455,8 +455,12 @@ async fn confirm_deletes_every_named_stream_and_then_the_catalog() {
     assert_eq!(run.code, 0, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     let deletes: Vec<String> =
         store.requests().into_iter().filter_map(|r| r.strip_prefix("DELETE ").map(str::to_string)).collect();
-    let mut expected = named(&v1());
-    expected.push(v1_catalog());
+    // Shapes and groups first, then the change log from the highest segment down, then the catalog.
+    let expected: Vec<String> =
+        ["shape/group-abc-1", "shape/s1", "shape/s2", "shape/s3", "changes/2", "changes/1", "meta/catalog"]
+            .iter()
+            .map(|p| format!("{}{p}", v1()))
+            .collect();
     assert_eq!(deletes, expected, "every named stream, each once, and the catalog last");
     let v2 = prefix(NAMESPACE, "dashboard-conversation-v2");
     assert_eq!(
@@ -873,6 +877,63 @@ async fn a_segment_created_as_the_catalog_closes_stops_the_run() {
     );
     assert_eq!(store.destructive_requests(), vec![format!("CLOSE {}", v1_catalog())]);
     assert_eq!(store.paths(), expected_paths, "every stream and the catalog survive");
+}
+
+/// A rotation while the shape streams are being deleted creates the next segment. The change log
+/// goes last, so the run finds it before any planned segment is gone: it keeps the catalog
+/// (closed) and exits 3, and a re-run's walk finds the whole chain, the new segment included.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_segment_created_during_the_deletes_is_cleaned_up_by_a_rerun() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    let segment = format!("{}changes/3", v1());
+    store.state.lock().unwrap().create_before = Some((format!("DELETE {}shape/s3", v1()), segment.clone()));
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stdout.contains(&format!("named streams were deleted, but {segment} appeared")), "{}", run.stdout);
+    let left = store.paths();
+    assert!(left.contains(&v1_catalog()), "the catalog survives: {left:?}");
+    for kept in ["changes/1", "changes/2", "changes/3"] {
+        assert!(left.contains(&format!("{}{kept}", v1())), "{kept} survives for the re-run: {left:?}");
+    }
+
+    store.state.lock().unwrap().create_before = None;
+    let rerun = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(rerun.code, 0, "stdout: {}\nstderr: {}", rerun.stdout, rerun.stderr);
+    let left = store.paths();
+    assert!(!left.contains(&segment) && !left.contains(&v1_catalog()), "nothing of the generation is left: {left:?}");
+}
+
+/// The change log is deleted from the highest segment down and stops at the first failure, so a
+/// partial run leaves a contiguous chain that a re-run's walk (which stops at the first missing
+/// segment) still finds, however many segments were never recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rerun_finds_every_segment_a_partial_run_left() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    // changes/2 and changes/3 are both unrecorded successors of changes/1.
+    let top = format!("{}changes/3", v1());
+    store.put(&top, vec![]);
+    store.state.lock().unwrap().fail_delete.insert(top.clone());
+
+    let first = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(first.code, 1, "stdout: {}\nstderr: {}", first.stdout, first.stderr);
+    let left = store.paths();
+    for kept in ["changes/1", "changes/2", "changes/3"] {
+        assert!(left.contains(&format!("{}{kept}", v1())), "{kept} is kept, contiguous: {left:?}");
+    }
+
+    store.state.lock().unwrap().fail_delete.clear();
+    let rerun = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(rerun.code, 0, "stdout: {}\nstderr: {}", rerun.stdout, rerun.stderr);
+    let left = store.paths();
+    assert!(
+        left.iter().all(|p| !p.starts_with(&format!("{}changes/", v1()))) && !left.contains(&v1_catalog()),
+        "nothing of the generation is left: {left:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
