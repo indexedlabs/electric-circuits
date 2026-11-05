@@ -1671,8 +1671,19 @@ impl Engine {
         setup: PostgresSetup,
         config: &crate::config::Config,
     ) -> Result<Self> {
+        // The client's TTL is the one that created the catalog in `admit_store`, so it stays the
+        // authority: a config that disagrees is refused rather than applied after the fact.
+        if admission.ds.stream_ttl() != config.stream_ttl {
+            bail!(
+                "the Durable Streams client's stream TTL ({}) differs from the configured \
+                 ELECTRIC_CIRCUITS_STREAM_TTL_SECS ({}); set it on the DsClient with \
+                 `with_stream_ttl(config.stream_ttl)` before `admit_store`",
+                admission.ds.stream_ttl().map_or("none".to_string(), |ttl| format!("{ttl}s")),
+                config.stream_ttl.map_or("none".to_string(), |ttl| format!("{ttl}s")),
+            );
+        }
         let bytes = if pg_url.is_none() {
-            admission.ds = admission.ds.with_memory_budget(config).with_stream_ttl(config.stream_ttl);
+            admission.ds = admission.ds.with_memory_budget(config);
             Some(Self::check_catalog_binding(&admission.ds, &admission.binding).await?)
         } else {
             None
@@ -1726,8 +1737,7 @@ impl Engine {
             store_bound.set(binding).expect("fresh store binding proof");
         }
         let ds = match config {
-            // A given config is the authority for the client's process budget and stream TTL.
-            Some(config) => ds.with_memory_budget(config).with_stream_ttl(config.stream_ttl),
+            Some(config) => ds.with_memory_budget(config),
             None => ds,
         };
         let mut metrics = crate::metrics::Metrics::new(

@@ -2868,23 +2868,46 @@ mod tests {
         engine.close(OTTO_5492_DEADLINE).await;
     }
 
-    /// `#g-tracked-streams-kept`: an embedder's `Config::stream_ttl` reaches the engine even when its
-    /// client was built without one. A shape created through the engine carries the TTL, and the
-    /// keep-alive touches it.
+    /// `#g-tracked-streams-kept`: the client that creates the catalog in `admit_store` carries the
+    /// stream TTL, so a library engine whose client disagrees with its config is refused. A matching
+    /// client puts the TTL on the `meta/catalog` create and on a shape stream, and the keep-alive
+    /// touches the shape stream.
     #[tokio::test]
-    async fn a_config_ttl_reaches_a_library_engine_whose_client_has_none() {
+    async fn a_library_engine_needs_the_configs_ttl_on_its_client_from_admission() {
+        let ttl_config = |ttl: Option<&str>| {
+            let ttl = ttl.map(str::to_string);
+            crate::config::Config::resolve(move |key| {
+                (key == "ELECTRIC_CIRCUITS_STREAM_TTL_SECS").then(|| ttl.clone()).flatten()
+            })
+            .unwrap()
+        };
+        let admitted = |client_ttl: Option<u64>| async move {
+            let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+            let ds = DsClient::with_test_store("scripted://library-ttl".into(), store.clone())
+                .with_stream_ttl(client_ttl.and_then(std::num::NonZeroU64::new));
+            (store, Engine::admit_store(ds, expected_store_bound(), true).await.unwrap())
+        };
+
+        // A mismatch either way is refused, naming both values.
+        for (client, config) in [(None, Some("1814400")), (Some(1_814_400), None)] {
+            let (_, admission) = admitted(client).await;
+            let refused = Engine::boot_library(admission, &ttl_config(config))
+                .await
+                .err()
+                .expect("a client whose TTL differs from the config's is refused");
+            let message = format!("{refused:#}");
+            assert!(
+                message.contains("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") && message.contains("admit_store"),
+                "{message}"
+            );
+            assert!(message.contains("1814400s") && message.contains("none"), "{message}");
+        }
+
         // Not `boot_race_store`: it parks every change-log read, and the keep-alive touches segments.
-        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let (store, admission) = admitted(Some(1_814_400)).await;
         let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
         *store.read_observer.lock().unwrap() = Some(tx);
-        let ds = DsClient::with_test_store("scripted://library-ttl".into(), store.clone());
-        assert_eq!(ds.stream_ttl(), None);
-        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
-        let config = crate::config::Config::resolve(|key| {
-            (key == "ELECTRIC_CIRCUITS_STREAM_TTL_SECS").then(|| "1814400".to_string())
-        })
-        .unwrap();
-        let engine = Engine::boot_library(admission, &config).await.unwrap();
+        let engine = Engine::boot_library(admission, &ttl_config(Some("1814400"))).await.unwrap();
         let schema = serde_json::from_value(serde_json::json!({
             "tables": { "users": { "columns": { "id": { "type": "int" } }, "primaryKey": "id" } }
         }))
@@ -2892,15 +2915,11 @@ mod tests {
         engine.define_schema(&schema).await.unwrap();
         assert_eq!(otto_5492_create(&engine).await.status(), axum::http::StatusCode::OK);
 
-        let shape = store
-            .ensure_ttls
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(path, _)| path.contains("/shape/"))
-            .cloned()
-            .expect("the create made a shape stream");
-        assert_eq!(shape.1, Some(1_814_400), "the shape stream carries the config's Stream-TTL");
+        let created = store.ensure_ttls.lock().unwrap().clone();
+        let ttl_of = |part: &str| created.iter().find(|(path, _)| path.contains(part)).cloned();
+        assert_eq!(ttl_of("meta/catalog").map(|c| c.1), Some(Some(1_814_400)), "the catalog create: {created:?}");
+        let shape = ttl_of("/shape/").expect("the create made a shape stream");
+        assert_eq!(shape.1, Some(1_814_400), "the shape stream carries the TTL");
 
         while reads.try_recv().is_ok() {}
         engine.ds.retain_accessed(&Default::default()); // as after a boot: nothing touched yet
