@@ -759,6 +759,22 @@ async fn a_catalog_appended_to_before_it_is_read_is_refused_as_written() {
     assert_eq!(store.paths(), before);
 }
 
+/// Run outside the engine's task definition, with no store configured, the command cannot do
+/// anything a re-run would change: it refuses rather than reporting a retryable failure.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_with_no_store_configured_is_refused() {
+    let run = finish(
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_electric-circuits-engine"))
+            .arg("retire-generation")
+            .arg(v1_catalog())
+            .env_clear(),
+    )
+    .await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("no Durable Streams store is configured"), "stderr: {}", run.stderr);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_delete_keeps_the_catalog_and_a_rerun_finishes() {
     let store = store_with_v1(now() - 20 * DAY).await;

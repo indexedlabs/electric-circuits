@@ -46,7 +46,7 @@
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
 //! | `1` | storage unavailable (unreachable, not ready, 5xx), or some deletes failed and the catalog was kept for a re-run |
 //! | `3` | partial: the named streams were deleted, the catalog was kept because it moved; find the writer before any re-run |
-//! | `78` | refused: a bad argument or path, one of the guards above, a store that does not attest the configured identity, or a catalog this engine cannot read |
+//! | `78` | refused: a bad argument or path, one of the guards above, no store configured, a store that does not attest the configured identity, or a catalog this engine cannot read |
 
 use std::io::Write;
 
@@ -123,6 +123,11 @@ pub enum Refusal {
          missing, so the read cannot vouch for every stream the catalog names"
     )]
     IncompleteRead { read_to: Option<String>, tail: Option<String> },
+    #[error(
+        "no Durable Streams store is configured: ELECTRIC_CIRCUITS_DS_URL and its store identity are required \
+         (run the command from the engine's own task definition)"
+    )]
+    NoStore,
     #[error("this engine cannot read the catalog: {0}")]
     UnreadableCatalog(String),
     #[error("the store did not attest the identity this engine is configured for: {0}")]
@@ -486,7 +491,7 @@ pub async fn connect(config: &Config, catalog: &CatalogPath) -> Result<DsClient>
             return Ok(DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope));
         }
     }
-    bail!("ELECTRIC_CIRCUITS_DS_URL and its store identity configuration are required")
+    bail!(Refusal::NoStore)
 }
 
 /// A store that answered with the wrong identity, a malformed readiness document or an
@@ -506,9 +511,7 @@ fn untrusted_store(e: anyhow::Error) -> anyhow::Error {
 /// The whole command after argument parsing: connect, run, and map the outcome to an exit code.
 pub async fn command(config: &Config, args: &Args, out: &mut dyn Write) -> i32 {
     let Some(own_generation) = own_generation(config) else {
-        return report_error(&anyhow::anyhow!(
-            "ELECTRIC_CIRCUITS_DS_URL and its store identity configuration are required"
-        ));
+        return report_error(&anyhow::Error::new(Refusal::NoStore));
     };
     match connect(config, &args.catalog).await {
         Ok(ds) => run(&ds, args, &own_generation, crate::changelog::now_secs(), out).await,
