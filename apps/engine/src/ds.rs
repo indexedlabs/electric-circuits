@@ -1460,6 +1460,9 @@ impl DsClient {
         let physical_path = self.physical_path(path)?;
         let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
         if (200..300).contains(&res.status) {
+            // A create (or a matching re-create, which the store treats as an access) starts the
+            // stream's TTL clock.
+            self.note_access(path, res.status);
             return Ok(());
         }
         if res.status == 409 && !res.closed {
@@ -2773,6 +2776,9 @@ mod tests {
         pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
         /// Answer every non-live read with this status while non-zero (a store refusing keep-alives).
         pub(crate) nonlive_read_status: std::sync::atomic::AtomicU16,
+        /// Path suffixes whose streams are not created yet: a non-live read answers 404 until an
+        /// ensure of that path creates it.
+        pub(crate) uncreated: std::sync::Mutex<Vec<String>>,
         /// One live GET response for a matching path suffix, without deleting storage.
         pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
@@ -2925,6 +2931,7 @@ mod tests {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
                 self.ensure_ttls.lock().unwrap().push((path.to_string(), ttl.map(NonZeroU64::get)));
+                self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
                 if self.ensure_status != 0 {
                     let mut res = response(self.ensure_status);
                     res.closed = self.ensure_closed;
@@ -3036,6 +3043,9 @@ mod tests {
                 let refused = self.nonlive_read_status.load(std::sync::atomic::Ordering::Relaxed);
                 if !live && refused != 0 {
                     return Ok(response(refused));
+                }
+                if !live && self.uncreated.lock().unwrap().iter().any(|suffix| path.ends_with(suffix.as_str())) {
+                    return Ok(response(404));
                 }
                 {
                     let mut fault = self.read_fault.lock().unwrap();

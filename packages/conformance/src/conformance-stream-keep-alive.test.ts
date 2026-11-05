@@ -76,18 +76,22 @@ async function waitFor(cond: () => Promise<boolean>, what: string, timeoutMs = 3
 
 interface TouchFaultProxy {
   url: string
+  /** Physical paths of every keep-alive `GET` that reached durable-streams. */
+  touched(): string[]
   failTouches(fail: boolean): void
   close(): Promise<void>
 }
 
-/** Refuse the keep-alive (`GET …?offset=now` without `live`) with 503; pass everything else. */
+/** Record the keep-alive (`GET …?offset=now` without `live`), or refuse it with 503; pass everything else. */
 async function startTouchFaultProxy(upstreamUrl: string): Promise<TouchFaultProxy> {
   let fail = false
+  const touched: string[] = []
   const upstream = new URL(upstreamUrl)
   const server = createServer((incoming, outgoing) => {
     const target = new URL(incoming.url ?? '/', upstream)
     const touch =
       incoming.method === 'GET' && target.searchParams.get('offset') === 'now' && !target.searchParams.has('live')
+    if (touch && !fail) touched.push(target.pathname)
     if (fail && touch) {
       incoming.resume()
       outgoing.writeHead(503, { 'content-type': 'text/plain' })
@@ -116,6 +120,7 @@ async function startTouchFaultProxy(upstreamUrl: string): Promise<TouchFaultProx
   if (!address || typeof address === 'string') throw new Error('touch fault proxy did not bind TCP')
   return {
     url: `http://127.0.0.1:${address.port}`,
+    touched: () => [...touched],
     failTouches: (next) => {
       fail = next
     },
@@ -144,19 +149,27 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
   }, 90000)
 
   it('touches a stream the restarted engine has not read on its first sweep, not a quarter TTL later', async () => {
-    // A quarter of this TTL is 10 s; the sweep runs every second. A stream nothing has read since
-    // the boot (the held shape's) must be touched by the first sweep, because before the boot the
-    // engine may have left it untouched for most of a TTL.
+    // A quarter of this TTL is 10 s; the sweep runs every second. The held shape's stream, which
+    // nothing reads or appends to after the boot, must be touched by the first sweep, because
+    // before the boot the engine may have left it untouched for most of a TTL.
     const ttl = 40
-    h = await bootHarness(schema, { engineEnv: knobs(ttl) })
-    await createShape('held')
+    let proxy: TouchFaultProxy | undefined
+    h = await bootHarness(schema, {
+      engineEnv: knobs(ttl),
+      wrapEngineDs: async (upstreamUrl) => {
+        proxy = await startTouchFaultProxy(upstreamUrl)
+        return proxy
+      },
+    })
+    const shape = await createShape('held')
     await h.restartEngine()
+    const restartedAt = proxy!.touched().length
+    const shapePath = `/${testPhysicalPath(shape.streamPath)}`
     await waitFor(
-      async () => (await series('engine_stream_ttl_touches_total')) >= 1,
-      'the first sweep after boot to touch the shape stream',
+      () => Promise.resolve(proxy!.touched().slice(restartedAt).includes(shapePath)),
+      "the first sweep after boot to touch the held shape's stream",
       3000,
     )
-    expect(await series('engine_stream_ttl_oldest_untouched_seconds')).toBeLessThan(ttl / 4)
     expect(await series('engine_stream_ttl_touch_failures_total')).toBe(0)
   }, 60000)
 

@@ -2199,21 +2199,37 @@ impl Engine {
                 Err(error) => tracing::warn!("stream TTL: a keep-alive touch task failed: {error}"),
             }
         }
-        if !failed.is_empty() {
-            // A stream retired between the snapshot and its touch answers 404; that is the
-            // lifecycle working, not a failed keep-alive.
-            let still_tracked = self.ttl_tracked_streams().await;
-            let failed: Vec<_> = failed.into_iter().filter(|(path, _)| still_tracked.contains(path)).collect();
-            if let Some((path, error)) = failed.first() {
-                self.metrics.stream_ttl_touch_failures.fetch_add(failed.len() as u64, Ordering::Relaxed);
-                tracing::warn!(
-                    failed = failed.len(),
-                    "stream TTL: {} keep-alive touch(es) failed; retrying on the next sweep (first: {path}: {error:#})",
-                    failed.len()
-                );
-            }
+        // Judge the sweep against what is tracked now, not the snapshot it started from. A stream
+        // retired meanwhile is gone, not untouched (its delete also dropped its record), and one
+        // whose create landed meanwhile is fresh: the create's PUT started its TTL clock.
+        let still_tracked = self.ttl_tracked_streams().await;
+        let gone: std::collections::HashSet<String> = failed
+            .iter()
+            .filter(|(_, error)| error.downcast_ref::<crate::ds::StreamGone>().is_some())
+            .map(|(path, _)| path.clone())
+            .collect();
+        failed.retain(|(path, _)| {
+            still_tracked.contains(path) && self.ds.touched_ago(path).is_none_or(|ago| ago >= due_after)
+        });
+        if let Some((path, error)) = failed.first() {
+            self.metrics.stream_ttl_touch_failures.fetch_add(failed.len() as u64, Ordering::Relaxed);
+            tracing::warn!(
+                failed = failed.len(),
+                "stream TTL: {} keep-alive touch(es) failed; retrying on the next sweep (first: {path}: {error:#})",
+                failed.len()
+            );
         }
-        let oldest = tracked.iter().map(|path| self.ds.untouched_for(path)).max().unwrap_or_default();
+        // A stream this process never appended to, read or touched has been untouched since boot,
+        // but only one this sweep tried and the store did not call gone: a stream still being
+        // created, or new since the snapshot, has nothing to expire yet.
+        let oldest = still_tracked
+            .iter()
+            .filter_map(|path| match self.ds.touched_ago(path) {
+                Some(ago) => Some(ago),
+                None => (tracked.contains(path) && !gone.contains(path)).then(|| self.ds.untouched_for(path)),
+            })
+            .max()
+            .unwrap_or_default();
         self.metrics.stream_ttl_oldest_untouched_secs.store(oldest.as_secs(), Ordering::Relaxed);
     }
 
@@ -5545,6 +5561,98 @@ mod stream_ttl_tests {
         assert!(touches(&mut reads).contains(&"shape/s1".to_string()), "the next sweep touches it");
         assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), first);
         assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+    }
+
+    /// Park dormant shapes, then wait long enough that "untouched since boot" would read as a
+    /// whole second: the age a wrongly judged stream would report.
+    async fn engine_with_shapes(store: Arc<crate::ds::ScriptedStore>, ids: &[&str]) -> Engine {
+        let engine = ttl_engine(store, Some(3600));
+        for id in ids {
+            engine.park_dormant_shape_for_test(id, "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        }
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        engine
+    }
+
+    /// Hold the touch of `shape/s2` so a test can change the engine while the sweep is in flight.
+    fn hold_s2(store: &crate::ds::ScriptedStore) -> Arc<crate::ds::BodyGate> {
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.read_gate.lock().unwrap() = Some(("shape/s2".into(), false, gate.clone()));
+        gate
+    }
+
+    /// The untouched-age gauge is judged against what is tracked after the touches. A shape retired
+    /// while the sweep runs (its delete drops its access record) is gone, not untouched since boot,
+    /// so the gauge does not report the process uptime and page the keep-alive alarm.
+    #[tokio::test]
+    async fn a_stream_retired_during_the_sweep_does_not_read_as_untouched_since_boot() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = hold_s2(&store);
+        let engine = engine_with_shapes(store, &["s1", "s2"]).await;
+        let sweep = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.sweep_stream_ttl().await }
+        });
+        gate.entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.ds.touched_ago("shape/s1").is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("s1's touch lands while s2's is held");
+        engine.state.lock().await.shapes.remove("s1");
+        engine.ds.delete_stream("shape/s1").await.unwrap();
+        gate.released.notify_one();
+        sweep.await.unwrap();
+
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0);
+    }
+
+    /// A shape whose stream is still being created answers its touch 404. Once the create's PUT
+    /// lands, which starts the TTL clock, the stream is fresh: not a failed touch, and not
+    /// untouched since boot.
+    #[tokio::test]
+    async fn a_stream_created_during_the_sweep_is_neither_a_failed_touch_nor_untouched() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        store.uncreated.lock().unwrap().push("shape/s1".into());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let gate = hold_s2(&store);
+        let engine = engine_with_shapes(store, &["s1", "s2"]).await;
+        let sweep = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.sweep_stream_ttl().await }
+        });
+        gate.entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some((path, offset, _)) = reads.recv().await {
+                if offset == "now" && path.ends_with("shape/s1") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("s1 is touched before its stream exists");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        engine.ds.ensure_stream("shape/s1").await.unwrap();
+        gate.released.notify_one();
+        sweep.await.unwrap();
+
+        assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.metrics.stream_ttl_oldest_untouched_secs.load(Ordering::Relaxed), 0);
+    }
+
+    /// A tracked stream the store has lost (it answers 404 and nothing creates it again) is a
+    /// failed touch: the keep-alive cannot keep it, and that must not be hidden as "gone".
+    #[tokio::test]
+    async fn a_tracked_stream_the_store_lost_is_a_failed_touch() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        store.uncreated.lock().unwrap().push("shape/s1".into());
+        let engine = engine_with_shapes(store, &["s1"]).await;
+        engine.sweep_stream_ttl().await;
+        assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 1);
     }
 
     /// Without a TTL there is nothing to keep alive.
