@@ -1033,6 +1033,16 @@ pub(crate) struct CatalogFold {
     /// Bounded by the catalog's length, like the fold itself — it lives only for the duration of
     /// one boot's read and is dropped with the fold.
     seen: HashSet<String>,
+    /// The newest wall-clock second any event records (`Created`, `Joined`, `ChangesRotated`,
+    /// `SlotBound`), whether or not the fold kept the event's effect. The store exposes no
+    /// last-append time, so this is how `retire-generation` tells a stopped catalog from one an
+    /// engine still writes. `None` = no event carries a time.
+    newest_at: Option<u64>,
+    /// The first `StoreBound` (event zero of a coupled-pilot catalog), kept for `retire-generation`:
+    /// it names the generation the catalog was written for, and it is incident evidence.
+    store_bound: Option<crate::store_identity::StoreBound>,
+    /// Whether any `Offset` checkpoint was folded, so the last one can be told from the default.
+    checkpointed: bool,
 }
 
 impl Default for CatalogFold {
@@ -1054,6 +1064,9 @@ impl Default for CatalogFold {
             segment_starts: std::collections::BTreeMap::new(),
             consumers: std::collections::BTreeMap::new(),
             seen: HashSet::new(),
+            newest_at: None,
+            store_bound: None,
+            checkpointed: false,
         }
     }
 }
@@ -1074,8 +1087,13 @@ impl CatalogFold {
     /// Fold one event in. Pure (no engine, no IO), so the log's semantics — last-writer-wins for the
     /// epoch and the offset, remove-on-drop for the shapes — are unit-testable.
     fn apply(&mut self, ev: CatalogEvent) {
+        if let Some(at) = event_time(&ev) {
+            self.newest_at = Some(self.newest_at.map_or(at, |cur| cur.max(at)));
+        }
         match ev {
-            CatalogEvent::StoreBound(_) => {}
+            CatalogEvent::StoreBound(bound) => {
+                self.store_bound.get_or_insert(bound);
+            }
             CatalogEvent::GroupCreated { group } => {
                 self.groups.insert(group.subscription.clone(), group);
             }
@@ -1151,6 +1169,7 @@ impl CatalogFold {
                 self.start_pos = pos;
                 self.start_highwater = highwater;
                 self.group_resume = groups;
+                self.checkpointed = true;
             }
             // The LAST rotation is the current segment; every one of them is kept, because the
             // retain window needs to know when each segment began (see the variant).
@@ -1211,6 +1230,63 @@ impl CatalogFold {
     fn is_empty(&self) -> bool {
         self.recs.is_empty() && self.start_pos == LogPosition::start()
     }
+
+    /// Every stream this catalog still names, as logical paths: each surviving shape's (live or
+    /// dormant), each group's, each `Dropped` shape's whose `Retired` never landed, and each
+    /// change-log segment not recorded as deleted. Sorted and de-duplicated; the catalog itself is
+    /// not in it. A `Retired` shape's stream is not named: storage already accepted its delete.
+    pub(crate) fn named_streams(&self) -> std::collections::BTreeSet<String> {
+        let shapes = self.recs.values().map(|(rec, ..)| rec.stream_path.clone());
+        let groups = self.groups.values().map(|group| group.stream_path.clone());
+        let pending = self.pending_retire.values().cloned();
+        let segments = self.segment_starts.keys().map(|n| crate::changelog::segment_path(*n));
+        shapes.chain(groups).chain(pending).chain(segments).filter(|path| path != CATALOG_STREAM).collect()
+    }
+
+    /// See the field: the newest wall-clock second any event in the log records.
+    pub(crate) fn newest_at(&self) -> Option<u64> {
+        self.newest_at
+    }
+
+    /// The catalog's first `StoreBound`, if it has one.
+    pub(crate) fn store_bound(&self) -> Option<&crate::store_identity::StoreBound> {
+        self.store_bound.as_ref()
+    }
+
+    /// The catalog's `StoreBound` and its last `Offset` checkpoint, as catalog events on the wire
+    /// (without their `eid`): what an operator keeps as evidence before a generation is retired.
+    pub(crate) fn evidence_events(&self) -> Result<Vec<serde_json::Value>> {
+        let bound = self.store_bound.clone().map(CatalogEvent::StoreBound);
+        let checkpoint = self.checkpointed.then(|| CatalogEvent::Offset {
+            pos: self.start_pos.clone(),
+            highwater: self.start_highwater,
+            groups: self.group_resume.clone(),
+        });
+        bound.into_iter().chain(checkpoint).map(|ev| Ok(serde_json::to_value(ev)?)).collect()
+    }
+}
+
+/// The wall-clock second an event records, for the events that carry one. A `SlotBound` whose
+/// `bound_at` does not parse as RFC 3339 counts as carrying none.
+fn event_time(ev: &CatalogEvent) -> Option<u64> {
+    match ev {
+        CatalogEvent::Created { at, .. }
+        | CatalogEvent::Joined { at, .. }
+        | CatalogEvent::ChangesRotated { at, .. } => Some(*at),
+        CatalogEvent::SlotBound(binding) => {
+            time::OffsetDateTime::parse(&binding.bound_at, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .and_then(|t| u64::try_from(t.unix_timestamp()).ok())
+        }
+        _ => None,
+    }
+}
+
+/// Read and fold a catalog no engine in this process owns, for `retire-generation`. The store
+/// binding is not checked: the caller names the catalog by its exact path, and a catalog written
+/// before event zero existed must still be retirable.
+pub(crate) async fn fold_catalog_at(ds: &DsClient) -> Result<CatalogFold> {
+    Engine::read_catalog(ds, None).await.map(|(fold, _)| fold)
 }
 
 /// How much of a folded catalog a boot actually installs.
@@ -3326,6 +3402,23 @@ mod tests {
             CatalogEvent::Created { rec, .. } => assert_eq!(rec.table.to_string(), "other.users"),
             other => panic!("expected Created, got {other:?}"),
         }
+    }
+
+    /// `retire-generation` reads a catalog's age from its events: the newest recorded time wins,
+    /// whether or not the fold kept the event's effect, and an unparseable `bound_at` counts as none.
+    #[test]
+    fn the_fold_keeps_the_newest_time_any_event_records() {
+        let mut fold = CatalogFold::default();
+        assert_eq!(fold.newest_at(), None);
+        fold.apply(bound("slot", "1", "not a time"));
+        assert_eq!(fold.newest_at(), None);
+        fold.apply(bound("slot", "1", "2026-10-15T00:00:00.000Z"));
+        assert_eq!(fold.newest_at(), Some(1_792_022_400));
+        fold.apply(CatalogEvent::ChangesRotated { segment: 1, at: 100 });
+        assert_eq!(fold.newest_at(), Some(1_792_022_400), "an older time does not move it back");
+        // A renewal for a shape the fold never saw changes no state, but it was still appended.
+        fold.apply(CatalogEvent::Joined { id: "s404".into(), subscription: "sub".into(), at: 1_792_022_401 });
+        assert_eq!(fold.newest_at(), Some(1_792_022_401));
     }
 
     fn bound(slot: &str, sysid: &str, at: &str) -> CatalogEvent {

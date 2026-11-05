@@ -788,10 +788,18 @@ async fn source_ds(config: &Config, source_id: &str) -> Result<(DsClient, Stream
     bail!("sources mode requires a Durable Streams configuration")
 }
 
+/// The namespace prefix of every per-source stream scope. `retire-generation` refuses a catalog
+/// under it: a source's catalog belongs to the supervisor that owns the source row.
+pub(crate) const SOURCE_NAMESPACE_PREFIX: &str = "source-";
+
 fn source_scope(base: &StreamScope, source_id: &str) -> Result<StreamScope> {
     use sha2::{Digest, Sha256};
     let digest = format!("{:x}", Sha256::digest(source_id.as_bytes()));
-    StreamScope::new(format!("source-{}", &digest[..40]), base.store.clone(), format!("query-{}", &digest[..40]))
+    StreamScope::new(
+        format!("{SOURCE_NAMESPACE_PREFIX}{}", &digest[..40]),
+        base.store.clone(),
+        format!("query-{}", &digest[..40]),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

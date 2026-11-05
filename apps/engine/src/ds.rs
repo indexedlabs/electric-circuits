@@ -1389,7 +1389,7 @@ impl DsClient {
         self.refresh_readiness(&expected).await
     }
 
-    fn physical_path(&self, logical_path: &str) -> Result<String> {
+    pub(crate) fn physical_path(&self, logical_path: &str) -> Result<String> {
         self.scope.qualify(logical_path)
     }
 

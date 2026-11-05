@@ -89,6 +89,7 @@ impl Default for SubqueryAdmission {
     }
 }
 
+pub(crate) use catalog::{CATALOG_STREAM, fold_catalog_at};
 pub use drift::ResolveLock;
 pub use epoch::{EpochBreakReason, EpochBroken, EpochResetting, SlotBinding};
 pub use executors::AggFn;

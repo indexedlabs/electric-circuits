@@ -23,6 +23,10 @@
 //! In sources mode, catalog refusal and circuit rebuild restart only the affected source.
 //! Failed source starts retry on the existing poll interval without a row revision change.
 //!
+//! `electric-circuits-engine retire-generation <catalog stream path> [--confirm]` runs a one-shot
+//! command instead of the engine: it deletes one stopped generation's streams and catalog, with its
+//! own exit codes ([`electric_circuits_engine::retire_generation`]).
+//!
 //! A **retryable** Postgres condition — connection refused, DNS, a timeout, "the database system is
 //! starting up" — is not an exit at all: the boot backs off (1 s → 30 s, jittered) and tries again
 //! forever, answering `GET /ready` with `503 {"status":"waiting"}` throughout. Kubernetes gates
@@ -44,10 +48,14 @@ use electric_circuits_engine::shutdown::{self, ShutdownToken};
 use electric_circuits_engine::store_identity::StoreBound;
 #[cfg(feature = "test-support")]
 use electric_circuits_engine::store_identity::StreamScope;
-use electric_circuits_engine::{pg, statsd};
+use electric_circuits_engine::{pg, retire_generation, statsd};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some(retire_generation::COMMAND) {
+        std::process::exit(retire_generation_command().await);
+    }
+
     // Anchor process-uptime / boot-to-ready timing before anything else runs.
     statsd::mark_start();
 
@@ -436,6 +444,25 @@ async fn await_signal_and_begin(engine: Engine, shutdown: ShutdownToken, ready_d
 /// 0" must mean "everything got to a clean point".
 async fn finish_shutdown(engine: &Engine, _shutdown: &ShutdownToken, grace: Duration) -> shutdown::ShutdownOutcome {
     engine.close(grace).await
+}
+
+/// `retire-generation`: parse its arguments, resolve the engine's own configuration for the store
+/// connection, and run it. Returns the command's exit code.
+async fn retire_generation_command() -> i32 {
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let args = match retire_generation::parse_args(&args) {
+        Ok(args) => args,
+        Err(refusal) => {
+            eprintln!("{} refused: {refusal}", retire_generation::COMMAND);
+            return retire_generation::EXIT_REFUSED;
+        }
+    };
+    let config = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => refuse_boot("configuration", &e),
+    };
+    init_tracing(&config.log_filter, config.json_logs);
+    retire_generation::command(&config, &args, &mut std::io::stdout()).await
 }
 
 /// Refuse the boot: name the class of failure, print the whole error chain, exit [`pg::EXIT_CONFIG`].
