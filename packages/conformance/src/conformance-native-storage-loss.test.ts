@@ -6,7 +6,7 @@ import { createServer, request } from 'node:http'
 import type { Schema } from '@electric-circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { createShape, foldStream, pgQuery } from './engine-native.js'
+import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 import { testMutualTlsRequest, testPhysicalPath } from './ds-mtls-access.js'
 
@@ -131,6 +131,89 @@ describe('native shape storage loss', () => {
     expect(fault.headHits).toBe(1)
     expect(replacement.shapeId).not.toBe(first.shapeId)
     expect((await fetch(replacement.streamUrl)).status).toBe(200)
+  })
+
+  // #v-gone-append: a stream the store removed behind the engine (an expired TTL, an operator
+  // delete) retires its shape on the next append; the sequencer keeps applying every other shape's
+  // changes, and the client refetches into a fresh shape.
+  it('retires a shape whose stream the store removed and keeps applying other shapes changes', async () => {
+    h = await bootHarness(schema)
+    const where = 'id < 100'
+    const snapshot = await fetch(`${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset: '-1', where })}`)
+    expect(snapshot.status).toBe(200)
+    const handle = snapshot.headers.get('electric-handle') as string
+    const offset = snapshot.headers.get('electric-offset') as string
+    await snapshot.text()
+    // A handle is `<shapeId>h<scope>.<claim>` over the engine shape.
+    const goneId = handle.split('h')[0]
+    const gone = (await (await fetch(`${h.engineUrl}/shapes/${goneId}`)).json()) as { streamUrl: string }
+    const other = await createShape(h, { table: 'items', where: { col: 'id', op: 'gte', value: 100 } })
+
+    expect((await testMutualTlsRequest(gone.streamUrl, 'DELETE')).ok).toBe(true)
+    // One committed transaction carries a row for the gone stream and a row for the healthy shape.
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (1, $1), (101, $2)', [
+      'to the removed stream',
+      'to the other shape in the same transaction',
+    ])
+    await drainEngine(h)
+
+    await waitFor(
+      async () => (await fetch(`${h!.engineUrl}/shapes/${goneId}`)).status === 404,
+      'the shape whose stream is gone to be retired',
+    )
+    expect((await foldStream(other.streamUrl)).has('101'), 'the healthy shape gets its row of the same transaction').toBe(true)
+
+    const stale = await fetch(`${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset, handle, where })}`)
+    expect(stale.status).toBe(409)
+    const control = (await stale.json()) as Array<{ headers: { control?: string } }>
+    expect(control[0]?.headers.control).toBe('must-refetch')
+
+    const refetch = await fetch(`${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset: '-1', where })}`)
+    expect(refetch.status).toBe(200)
+    expect(refetch.headers.get('electric-handle')).not.toBe(handle)
+    const rows = (await refetch.json()) as Array<{ value?: { id?: unknown } }>
+    expect(rows.some((m) => String(m.value?.id) === '1'), 'the refetch carries the change').toBe(true)
+
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (102, $1)', ['after the retirement'])
+    await drainEngine(h)
+    expect((await foldStream(other.streamUrl)).has('102')).toBe(true)
+  })
+
+  it('releases a group whose shared stream the store removed and keeps applying other shapes changes', async () => {
+    h = await bootHarness(schema)
+    const load = async () => {
+      const res = await fetch(`${h!.engineUrl}/v1/subsets/load`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          subscription: 'gone-group',
+          members: [{ table: 'items', where: { col: 'id', op: 'lt', value: 100 } }],
+        }),
+      })
+      expect(res.status).toBe(200)
+      return (await res.json()) as { streamUrl: string; results: Array<{ shapeId: string }> }
+    }
+    const group = await load()
+    const member = group.results[0]!.shapeId
+    expect((await fetch(`${h.engineUrl}/shapes/${member}`)).status).toBe(200)
+    const other = await createShape(h, { table: 'items', where: { col: 'id', op: 'gte', value: 100 } })
+
+    expect((await testMutualTlsRequest(group.streamUrl, 'DELETE')).ok).toBe(true)
+    await pgQuery(h, 'INSERT INTO items (id, payload) VALUES (2, $1), (103, $2)', [
+      'to the removed group stream',
+      'to the other shape in the same transaction',
+    ])
+    await drainEngine(h)
+
+    await waitFor(
+      async () => (await fetch(`${h!.engineUrl}/shapes/${member}`)).status === 404,
+      'the group whose stream is gone to be released',
+    )
+    expect((await foldStream(other.streamUrl)).has('103'), 'the healthy shape gets its row of the same transaction').toBe(true)
+
+    const reloaded = await load()
+    expect(reloaded.streamUrl, 'a reload starts a fresh group stream').not.toBe(group.streamUrl)
+    expect((await fetch(reloaded.streamUrl)).status).toBe(200)
   })
 
   it('does not retire an acknowledged aggregate after one transient append failure during restore', async () => {

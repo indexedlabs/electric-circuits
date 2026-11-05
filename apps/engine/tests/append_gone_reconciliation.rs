@@ -30,10 +30,14 @@ struct FakeDs {
     false_404: Arc<AtomicBool>,
     /// The stream really is gone: every method on `shape/*` answers 404, HEAD included.
     stream_lost: Arc<AtomicBool>,
+    /// With `stream_lost`, answer 410 (soft-deleted) instead of 404.
+    soft_deleted: Arc<AtomicBool>,
     /// Successful appends to `shape/*`.
     shape_appends: Arc<AtomicUsize>,
     deleted: Arc<std::sync::Mutex<Vec<String>>>,
     closed: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every event appended to `meta/catalog`, in order.
+    catalog: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
@@ -45,8 +49,20 @@ async fn ds_handler(State(ds): State<FakeDs>, request: Request) -> Response {
     if closing {
         ds.closed.lock().unwrap().push(path.clone());
     }
-    if is_shape && ds.stream_lost.load(Ordering::SeqCst) && request.method() != Method::DELETE {
-        return StatusCode::NOT_FOUND.into_response();
+    if is_shape && ds.stream_lost.load(Ordering::SeqCst) {
+        // The delete of a gone stream answers what the store answers: the same 404/410.
+        if request.method() == Method::DELETE {
+            ds.deleted.lock().unwrap().push(path);
+        }
+        return if ds.soft_deleted.load(Ordering::SeqCst) { StatusCode::GONE } else { StatusCode::NOT_FOUND }
+            .into_response();
+    }
+    if request.method() == Method::POST && !closing && path.ends_with("meta/catalog") {
+        let body = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+        if let Ok(serde_json::Value::Array(events)) = serde_json::from_slice(&body) {
+            ds.catalog.lock().unwrap().extend(events);
+        }
+        return StatusCode::OK.into_response();
     }
     match *request.method() {
         Method::PUT => StatusCode::OK.into_response(),
@@ -170,8 +186,21 @@ async fn a_real_404_during_a_restore_append_fails_so_the_caller_retires() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_real_404_retires_the_shape_instead_of_leaving_it_stale() {
     let (engine, client, ds) = engine_with_one_shape().await;
-
     ds.stream_lost.store(true, Ordering::SeqCst);
+    assert_lost_shape_is_retired(&engine, &client, &ds).await;
+}
+
+/// A soft-deleted stream (`410`) is gone just the same (#g-gone-is-retired): the append retires the
+/// shape, and the retirement's own DELETE, answered `410`, completes it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_410_retires_the_shape_like_a_404() {
+    let (engine, client, ds) = engine_with_one_shape().await;
+    ds.soft_deleted.store(true, Ordering::SeqCst);
+    ds.stream_lost.store(true, Ordering::SeqCst);
+    assert_lost_shape_is_retired(&engine, &client, &ds).await;
+}
+
+async fn assert_lost_shape_is_retired(engine: &Engine, client: &DsClient, ds: &FakeDs) {
     let landed = client.append_reliable("shape/s1", &[envelope()]).await.expect("append while Engine is active");
 
     assert!(!landed, "a stream storage does not have cannot be appended to");
@@ -195,4 +224,16 @@ async fn a_real_404_retires_the_shape_instead_of_leaving_it_stale() {
     until("retirement closes before deleting (ADR-0007) — the close is attempted even on a lost stream", &ds.closed)
         .await;
     assert!(engine.graph().await.shapes.is_empty(), "no shape may survive its lost stream");
+
+    // A delete answered 404/410 completes the retirement: `Retired` is written and the delete is
+    // not retried (a failed one would be re-queued on the retirement queue, 500 ms → 5 s).
+    let retired = |events: &[serde_json::Value]| events.iter().any(|e| e["t"] == "retired" && e["id"] == "s1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !retired(&ds.catalog.lock().unwrap()) {
+        assert!(std::time::Instant::now() < deadline, "no Retired after a gone delete: {:?}", ds.catalog);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let deletes = ds.deleted.lock().unwrap().iter().filter(|p| p.ends_with("shape/s1")).count();
+    assert_eq!(deletes, 1, "a delete answered 404/410 is complete, never retried");
 }
