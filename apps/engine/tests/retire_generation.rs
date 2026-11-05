@@ -892,6 +892,7 @@ async fn a_segment_created_during_the_deletes_is_cleaned_up_by_a_rerun() {
 
     assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert!(run.stdout.contains(&format!("named streams were deleted, but {segment} appeared")), "{}", run.stdout);
+    assert!(run.stdout.contains(&format!("a re-run finds and deletes {segment}")), "{}", run.stdout);
     let left = store.paths();
     assert!(left.contains(&v1_catalog()), "the catalog survives: {left:?}");
     for kept in ["changes/1", "changes/2", "changes/3"] {
@@ -934,6 +935,31 @@ async fn a_rerun_finds_every_segment_a_partial_run_left() {
         left.iter().all(|p| !p.starts_with(&format!("{}changes/", v1()))) && !left.contains(&v1_catalog()),
         "nothing of the generation is left: {left:?}"
     );
+}
+
+/// A rotation while the change log itself is being deleted makes a segment past a chain that is
+/// gone, which a re-run's walk may not reach. The last check before the catalog delete finds it:
+/// the run keeps the catalog (closed), exits 3, and names the exact path for the operator to check.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_segment_created_while_the_change_log_is_deleted_is_named() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    let segment = format!("{}changes/3", v1());
+    store.state.lock().unwrap().create_before = Some((format!("DELETE {}changes/1", v1()), segment.clone()));
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stdout.contains(&format!("but {segment} appeared while they were")), "stdout: {}", run.stdout);
+    assert!(
+        run.stdout.contains(&format!(
+            "a re-run may not find {segment}: after it, check that {segment} is gone and delete it by hand"
+        )),
+        "stdout: {}",
+        run.stdout
+    );
+    let left = store.paths();
+    assert!(left.contains(&v1_catalog()), "the catalog is kept: {left:?}");
+    assert!(left.contains(&segment), "the new segment is named, not deleted: {left:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
