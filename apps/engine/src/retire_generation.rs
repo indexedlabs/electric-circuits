@@ -21,7 +21,8 @@
 //!   the only witness that no engine is writing it — and a catalog whose tail moves while the
 //!   command runs;
 //! - it refuses a catalog in another store generation or stack namespace than the engine's own;
-//! - it refuses a catalog naming any stream outside the catalog's own prefix;
+//! - it refuses a catalog naming any stream outside the catalog's own prefix, and one with any
+//!   event the fold cannot decode, since a skipped event can name a stream;
 //! - without `--confirm` it deletes nothing and prints what it would delete.
 //!
 //! Every run first prints the catalog's `StoreBound` and last `Offset` checkpoint events
@@ -110,6 +111,11 @@ pub enum Refusal {
          7 days may still have an engine writing it"
     )]
     RecentlyAppended { newest_at: u64, age_secs: u64 },
+    #[error(
+        "{0} catalog events could not be decoded; a skipped event can name a stream this command would \
+         leave behind once the catalog is gone"
+    )]
+    UndecodedEvents(u64),
     #[error("no event in the catalog records a time, so nothing shows it has been quiet for 7 days")]
     UnknownAge,
     #[error("the catalog names stream '{0}', which is outside the catalog's own prefix")]
@@ -271,6 +277,11 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
         && bound.query_generation == own_generation
     {
         bail!(Refusal::OwnGeneration(bound.query_generation.clone()));
+    }
+    // The catalog is the only index of its streams (the store has no list API), so a fold that
+    // skipped anything cannot vouch for the plan, nor for the newest event time.
+    if fold.undecoded() > 0 {
+        bail!(Refusal::UndecodedEvents(fold.undecoded()));
     }
     let newest_at = fold.newest_at().ok_or(Refusal::UnknownAge)?;
     let age_secs = now.saturating_sub(newest_at);

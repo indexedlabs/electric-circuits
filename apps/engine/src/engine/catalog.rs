@@ -1038,6 +1038,10 @@ pub(crate) struct CatalogFold {
     /// last-append time, so this is how `retire-generation` tells a stopped catalog from one an
     /// engine still writes. `None` = no event carries a time.
     newest_at: Option<u64>,
+    /// Events the strict deserializer could not read, which the fold skipped. A boot tolerates them
+    /// (an older engine meeting a newer event); `retire-generation` refuses, because a skipped
+    /// `Created` would hide a stream it must delete.
+    undecoded: u64,
     /// The first `StoreBound` (event zero of a coupled-pilot catalog), kept for `retire-generation`:
     /// it names the generation the catalog was written for, and it is incident evidence.
     store_bound: Option<crate::store_identity::StoreBound>,
@@ -1065,6 +1069,7 @@ impl Default for CatalogFold {
             consumers: std::collections::BTreeMap::new(),
             seen: HashSet::new(),
             newest_at: None,
+            undecoded: 0,
             store_bound: None,
             checkpointed: false,
         }
@@ -1246,6 +1251,11 @@ impl CatalogFold {
     /// See the field: the newest wall-clock second any event in the log records.
     pub(crate) fn newest_at(&self) -> Option<u64> {
         self.newest_at
+    }
+
+    /// How many events the fold skipped because they would not decode.
+    pub(crate) fn undecoded(&self) -> u64 {
+        self.undecoded
     }
 
     /// The catalog's first `StoreBound`, if it has one.
@@ -1496,7 +1506,10 @@ impl Engine {
                     let ev = match serde_json::from_value::<CatalogEvent>(ev) {
                         Ok(ev) => ev,
                         Err(e) if projection => return Err(e).context("invalid ingestColumns catalog event"),
-                        Err(_) => continue,
+                        Err(_) => {
+                            fold.undecoded += 1;
+                            continue;
+                        }
                     };
                     if let CatalogEvent::IngestColumns { columns, hash, .. } = &ev
                         && (columns.is_empty()

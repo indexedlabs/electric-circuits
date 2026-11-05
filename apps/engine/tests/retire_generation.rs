@@ -19,6 +19,10 @@ use serde_json::{Value, json};
 const STORE_GENERATION: &str = "ff8b5fa6-e786-4994-8da0-f14e9e79f318";
 /// The in-process test scope's stack namespace: the one the command is configured for.
 const NAMESPACE: &str = "test-stack";
+/// The rest of the in-process test store's identity, which the deployed-configuration test sets
+/// through the environment instead.
+const STORE_ID: &str = "2bc96d0b-9740-4f50-97c6-754b2b27d6b0";
+const FILESYSTEM_UUID: &str = "253f14d5-cbee-4df8-9e3c-e44c6e41501b";
 const DAY: u64 = 86_400;
 
 fn prefix(namespace: &str, query: &str) -> String {
@@ -53,6 +57,8 @@ struct StoreState {
     /// On the nth HEAD of this path, append one event to it first: an engine writing the catalog.
     append_on_head: Option<(String, usize)>,
     heads: BTreeMap<String, usize>,
+    /// The body `GET /_admin/ready` answers; `None` answers 404 (the in-process mode never asks).
+    ready: Option<String>,
 }
 
 #[derive(Clone)]
@@ -99,6 +105,12 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
     let mut st = state.lock().unwrap();
     let label = if method == Method::POST && closing { "CLOSE".to_string() } else { method.to_string() };
     st.requests.push(format!("{label} {path}"));
+    if method == Method::GET && path == "_admin/ready" {
+        return match &st.ready {
+            Some(body) => ([("content-type", "application/json")], body.clone()).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    }
     match method {
         Method::PUT => {
             st.streams.entry(path).or_default();
@@ -177,6 +189,65 @@ fn engine_command(store: &Store, program: &str) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(program);
     command.env_clear().env("ELECTRIC_CIRCUITS_DS_URL", &store.url).env("ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST", "1");
     command
+}
+
+/// The engine binary configured as a deployment configures it: the full store identity, its own
+/// namespace and query generation, and no in-process test flag. `store_id` is what the command
+/// expects the store to attest.
+fn deployed_command(store: &Store, store_id: &str, args: &[&str]) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_electric-circuits-engine"));
+    command.arg("retire-generation").args(args).env_clear();
+    for (name, value) in [
+        ("ELECTRIC_CIRCUITS_DS_URL", store.url.as_str()),
+        ("ELECTRIC_CIRCUITS_DS_STORE_ID", store_id),
+        ("ELECTRIC_CIRCUITS_DS_STORE_GENERATION", STORE_GENERATION),
+        ("ELECTRIC_CIRCUITS_DS_PROTOCOL_VERSION", "1"),
+        ("ELECTRIC_CIRCUITS_DS_LAYOUT_VERSION", "1"),
+        ("ELECTRIC_CIRCUITS_DS_DURABILITY_MODE", "wal"),
+        ("ELECTRIC_CIRCUITS_DS_WAL_SHARDS", "2"),
+        ("ELECTRIC_CIRCUITS_DS_STREAM_LANES", "1"),
+        ("ELECTRIC_CIRCUITS_DS_FILESYSTEM_UUID", FILESYSTEM_UUID),
+        ("ELECTRIC_CIRCUITS_DS_NAMESPACE", "indexed-prod"),
+        ("ELECTRIC_CIRCUITS_QUERY_GENERATION", "dashboard-conversation-v2"),
+    ] {
+        command.env(name, value);
+    }
+    command
+}
+
+/// What a ready store with the in-process test identity answers on `GET /_admin/ready`.
+fn readiness() -> String {
+    json!({
+        "contract_version": "durable-streams-store-ready-v1",
+        "status": "ready",
+        "artifact_digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "manifest": {
+            "store_id": STORE_ID,
+            "store_generation": STORE_GENERATION,
+            "protocol_version": 1,
+            "layout_version": 1,
+            "durability_mode": "wal",
+            "wal_shard_count": 2,
+            "stream_lane_count": 1,
+            "filesystem_uuid": FILESYSTEM_UUID,
+            "creation_time": "2026-08-27T19:00:00Z"
+        },
+        "recovery": {
+            "completed": true,
+            "wal_shards": [
+                { "shard": 0, "durable_lsn": 0, "checkpoint_lsn": 0 },
+                { "shard": 1, "durable_lsn": 0, "checkpoint_lsn": 0 }
+            ]
+        },
+        "reserve": {
+            "free_bytes": 85899345920u64,
+            "free_inodes": 1000000u64,
+            "minimum_free_bytes": 21474836480u64,
+            "minimum_free_inodes": 10000u64,
+            "satisfied": true
+        }
+    })
+    .to_string()
 }
 
 async fn retire(store: &Store, args: &[&str]) -> Run {
@@ -512,6 +583,74 @@ async fn an_unrecorded_first_change_log_segment_is_deleted() {
 
     assert_eq!(run.code, 0, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert_eq!(store.paths(), Vec::<String>::new(), "nothing of the generation is left");
+}
+
+/// The command as a deployment runs it: the store identity, namespace and query generation come
+/// from the environment, and the store must attest its identity before anything is read. The
+/// configured generation is refused however old its catalog is, a stopped one is planned, and a
+/// store that attests another identity is never read.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_deployed_configuration_refuses_its_own_generation_and_plans_a_stopped_one() {
+    let store = Store::start().await;
+    store.state.lock().unwrap().ready = Some(readiness());
+    let v1 = prefix("indexed-prod", "dashboard-conversation-v1");
+    let v2 = prefix("indexed-prod", "dashboard-conversation-v2");
+    store.put(&format!("{v1}meta/catalog"), catalog_events("dashboard-conversation-v1", now() - 20 * DAY));
+    for path in named(&v1) {
+        store.put(&path, vec![]);
+    }
+    // The configured generation's catalog, quiet for as long as v1's: only the generation refuses it.
+    store.put(&format!("{v2}meta/catalog"), catalog_events("dashboard-conversation-v2", now() - 20 * DAY));
+    store.put(&format!("{v2}shape/s1"), vec![]);
+    let before = store.paths();
+
+    let own = finish(&mut deployed_command(&store, STORE_ID, &[&format!("{v2}meta/catalog"), "--confirm"])).await;
+    assert_eq!(own.code, 78, "stdout: {}\nstderr: {}", own.stdout, own.stderr);
+    assert!(own.stderr.contains("'dashboard-conversation-v2', the generation this engine runs with"), "{}", own.stderr);
+
+    let stopped = finish(&mut deployed_command(&store, STORE_ID, &[&format!("{v1}meta/catalog")])).await;
+    assert_eq!(stopped.code, 0, "stdout: {}\nstderr: {}", stopped.stdout, stopped.stderr);
+    let would: Vec<&str> = stopped.stdout.lines().filter_map(|l| l.strip_prefix("would delete ")).collect();
+    let mut expected = named(&v1);
+    expected.push(format!("{v1}meta/catalog"));
+    assert_eq!(would, expected, "stdout: {}", stopped.stdout);
+
+    let reads_before_mismatch = store.requests().len();
+    let other = "00000000-0000-4000-8000-000000000000";
+    let mismatch = finish(&mut deployed_command(&store, other, &[&format!("{v1}meta/catalog"), "--confirm"])).await;
+    assert_eq!(mismatch.code, 1, "stdout: {}\nstderr: {}", mismatch.stdout, mismatch.stderr);
+    assert!(mismatch.stderr.contains("identity mismatch"), "stderr: {}", mismatch.stderr);
+    assert_eq!(
+        store.requests()[reads_before_mismatch..].to_vec(),
+        vec!["GET _admin/ready".to_string()],
+        "a store that attests another identity is never read"
+    );
+
+    assert!(store.requests().iter().any(|r| r == "GET _admin/ready"), "the store was asked to attest");
+    assert_eq!(store.destructive_requests(), Vec::<String>::new());
+    assert_eq!(store.paths(), before);
+}
+
+/// The catalog is the only index of its streams, so an event the fold cannot decode (here a
+/// `Created` missing a required field) could hide one: the run is refused and nothing is deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_with_an_undecodable_event_is_refused() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    let mut events = catalog_events("dashboard-conversation-v1", now() - 20 * DAY);
+    let mut broken = shape("s9", now() - 20 * DAY);
+    broken["rec"].as_object_mut().unwrap().remove("changes_only");
+    broken["eid"] = json!("v1-broken");
+    events.push(broken);
+    store.put(&v1_catalog(), events);
+    store.put(&format!("{}shape/s9", v1()), vec![]);
+    let before = store.paths();
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("1 catalog events could not be decoded"), "stderr: {}", run.stderr);
+    assert_eq!(store.destructive_requests(), Vec::<String>::new());
+    assert_eq!(store.paths(), before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
