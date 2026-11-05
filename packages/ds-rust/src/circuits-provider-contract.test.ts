@@ -121,6 +121,45 @@ describe('pgxsinkit durable-streams provider contract used by Electric Circuits'
     expect(closedTail.headers.get('stream-next-offset')).toBe('0000000000000000_0000000000000000')
   })
 
+  it('keeps a non-empty stream tail across close and answers a second close with the same tail', async () => {
+    // retire-generation fences a catalog by closing it and then requires the next HEAD to report
+    // the tail it planned from; a re-run after a partial retirement closes the catalog again.
+    const path = 'circuits-provider-contract/close-non-empty'
+    await fetch(stream(base, path), { method: 'PUT', headers: { 'content-type': JSON_TYPE } })
+    const appended = await fetch(stream(base, path), {
+      method: 'POST',
+      headers: { 'content-type': JSON_TYPE },
+      body: JSON.stringify([{ t: 'created', n: 1 }, { t: 'offset', n: 2 }]),
+    })
+    expect(appended.status).toBe(204)
+    const tail = appended.headers.get('stream-next-offset')
+    expect(tail).not.toBe('0000000000000000_0000000000000000')
+
+    const headOpen = await fetch(stream(base, path), { method: 'HEAD' })
+    expect(headOpen.headers.get('stream-next-offset')).toBe(tail)
+
+    const closed = await fetch(stream(base, path), { method: 'POST', headers: { 'stream-closed': 'true' } })
+    expect(closed.status).toBe(204)
+    expect(closed.headers.get('stream-next-offset')).toBe(tail)
+
+    const headClosed = await fetch(stream(base, path), { method: 'HEAD' })
+    expect(headClosed.status).toBe(200)
+    expect(headClosed.headers.get('stream-next-offset')).toBe(tail)
+    expect(headClosed.headers.get('stream-closed')).toBe('true')
+
+    const read = await fetch(stream(base, path, { offset: '-1' }))
+    expect(read.status).toBe(200)
+    expect(read.headers.get('stream-next-offset')).toBe(tail)
+    expect(read.headers.has('stream-up-to-date')).toBe(true)
+    expect(read.headers.get('stream-closed')).toBe('true')
+
+    const closedAgain = await fetch(stream(base, path), { method: 'POST', headers: { 'stream-closed': 'true' } })
+    expect(closedAgain.status).toBe(204)
+    expect(closedAgain.headers.get('stream-next-offset')).toBe(tail)
+    const headAgain = await fetch(stream(base, path), { method: 'HEAD' })
+    expect(headAgain.headers.get('stream-next-offset')).toBe(tail)
+  })
+
   it('deletes idempotently and exposes missing streams as 404 for HEAD and DELETE', async () => {
     const path = 'circuits-provider-contract/delete'
     await fetch(stream(base, path), { method: 'PUT', headers: { 'content-type': JSON_TYPE } })
