@@ -45,8 +45,9 @@
 //! before recording it, so the run also checks that the segment past the planned chain still does
 //! not exist: after the fence, again after the shape and group streams are deleted (the change log
 //! goes last, highest segment first, so a re-run's walk can still find the new segment), and once
-//! more just before the catalog is deleted. A segment found by that last check is named in the
-//! output, because a re-run's walk may not reach it past the deleted chain. A rotation that lands
+//! more just before the catalog is deleted. Segments found by that last check (the whole contiguous
+//! run past the planned chain) are named in the output, because a re-run's walk may not reach them
+//! past the deleted chain. A rotation that lands
 //! between that check and the catalog delete is not caught. A shape or group stream created during the run, before its record
 //! lands, is not caught: the store has no list API, so only the writer could fence that, and the
 //! guards above are what keep a live writer away. Each named stream then goes through the
@@ -58,7 +59,7 @@
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
 //! | `1` | storage unavailable (unreachable, not ready, 5xx), or some deletes failed and the catalog was kept for a re-run |
-//! | `3` | a writer slipped past every other guard; the catalog is always kept, closed, so an engine writing it stops on its next append, and the output names the stream that showed it. If the catalog moved, or a segment appeared, before any delete: nothing was deleted. If a segment appeared while the shape and group streams were deleted: they are gone and the planned segments are kept, so a re-run finds and deletes the new one. If it appeared while the change log was deleted: every named stream is gone, and a re-run may not find the new segment, so check that path after the re-run and delete it by hand if it is still there. A closed catalog cannot move, so a re-run deletes what is left unless the 7-day check refuses: find the writer before any re-run |
+//! | `3` | a writer slipped past every other guard; the catalog is always kept, closed, so an engine writing it stops on its next append, and the output names the stream that showed it. If the catalog moved, or a segment appeared, before any delete: nothing was deleted. If a segment appeared while the shape and group streams were deleted: they are gone and the planned segments are kept, so a re-run finds and deletes the new one. If it appeared while the change log was deleted: every named stream is gone, and a re-run may not find the new segments, so the output names every one of them (the whole contiguous run past the planned chain); check each after the re-run and delete by hand any that is still there. A closed catalog cannot move, so a re-run deletes what is left unless the 7-day check refuses: find the writer before any re-run |
 //! | `78` | refused: a bad argument or path, one of the guards above, no store configured, a store that does not attest the configured identity, or a catalog this engine cannot read |
 
 use std::io::Write;
@@ -300,13 +301,13 @@ pub struct Retired {
     /// The physical path of a change-log segment the plan did not name that exists after the fence:
     /// a writer rotated during the run. Nothing was deleted; the catalog is closed.
     pub unrecorded_stream: Option<String>,
-    /// The physical path of a change-log segment the plan did not name that appeared while the
-    /// shape and group streams were being deleted. The catalog and the planned segments are kept
-    /// (the catalog closed), so a re-run's walk finds and deletes it.
-    pub segment_appeared: Option<String>,
-    /// Whether `segment_appeared` was found only after the planned segments were deleted, when a
-    /// re-run's walk may not reach it.
-    pub segment_appeared_after_change_log: bool,
+    /// The physical paths of the change-log segments past the planned chain that appeared while the
+    /// named streams were being deleted: the whole contiguous run from the first one. The catalog
+    /// is kept (closed).
+    pub segments_appeared: Vec<String>,
+    /// Whether `segments_appeared` were found only after the planned segments were deleted, when a
+    /// re-run's walk may not reach them.
+    pub segments_appeared_after_change_log: bool,
 }
 
 /// Read the catalog `ds` is scoped to and decide what a confirmed run would delete. Deletes
@@ -421,8 +422,8 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
         catalog_deleted: false,
         catalog_moved: None,
         unrecorded_stream: None,
-        segment_appeared: None,
-        segment_appeared_after_change_log: false,
+        segments_appeared: Vec::new(),
+        segments_appeared_after_change_log: false,
     };
     ds.close_stream(CATALOG_STREAM).await.with_context(|| format!("closing {}", plan.catalog))?;
     let after = ds.head(CATALOG_STREAM).await.context("re-checking the closed catalog")?.map(|head| head.next_offset);
@@ -453,8 +454,8 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
     if !retired.failed.is_empty() {
         return Ok(retired);
     }
-    if ds.head(next).await.with_context(|| format!("re-checking {next}"))?.is_some() {
-        retired.segment_appeared = Some(ds.physical_path(next)?);
+    retired.segments_appeared = segments_from(ds, next).await?;
+    if !retired.segments_appeared.is_empty() {
         return Ok(retired);
     }
     // Highest first, stopping at the first failure: whatever a partial run leaves is a contiguous
@@ -465,12 +466,12 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
             return Ok(retired);
         }
     }
-    // One more check just before the catalog goes. A rotation that raced the segment deletes made a
-    // segment past a chain that is now gone, which a re-run's walk may not reach, so the run names
-    // it for the operator.
-    if ds.head(next).await.with_context(|| format!("re-checking {next}"))?.is_some() {
-        retired.segment_appeared = Some(ds.physical_path(next)?);
-        retired.segment_appeared_after_change_log = true;
+    // One more check just before the catalog goes. Rotations that raced the segment deletes made
+    // segments past a chain that is now gone, which a re-run's walk may not reach, so the run names
+    // every one of them for the operator.
+    retired.segments_appeared = segments_from(ds, next).await?;
+    if !retired.segments_appeared.is_empty() {
+        retired.segments_appeared_after_change_log = true;
         return Ok(retired);
     }
     ds.delete_stream(CATALOG_STREAM).await.with_context(|| format!("deleting {}", plan.catalog))?;
@@ -499,6 +500,21 @@ async fn retire_one(
             Ok(false)
         }
     }
+}
+
+/// The physical paths of the contiguous run of change-log segments that exist from `first` on.
+/// Bounded like the plan's walk.
+async fn segments_from(ds: &DsClient, first: &str) -> Result<Vec<String>> {
+    let mut found = Vec::new();
+    let Some(start) = segment_number(first) else { return Ok(found) };
+    for n in start..start.saturating_add(MAX_UNRECORDED_SEGMENTS) {
+        let path = crate::changelog::segment_path(n);
+        if ds.head(&path).await.with_context(|| format!("re-checking {path}"))?.is_none() {
+            break;
+        }
+        found.push(ds.physical_path(&path)?);
+    }
+    Ok(found)
 }
 
 /// The segment number of a change-log path (`changes/7` -> 7); `None` for any other stream.
@@ -550,21 +566,22 @@ async fn run_inner(ds: &DsClient, args: &Args, own_generation: &str, now: u64, o
     if retired.catalog_deleted {
         writeln!(out, "retired {} streams and the catalog", retired.deleted.len())?;
         Ok(0)
-    } else if let Some(path) = &retired.segment_appeared {
+    } else if !retired.segments_appeared.is_empty() {
+        let paths = retired.segments_appeared.join(", ");
         writeln!(
             out,
-            "{} named streams were deleted, but {path} appeared while they were: a writer rotated during the run. \
+            "{} named streams were deleted, but {paths} appeared while they were: a writer rotated during the run. \
              The catalog is kept (closed). Find the writer before any re-run.",
             retired.deleted.len()
         )?;
-        if retired.segment_appeared_after_change_log {
+        if retired.segments_appeared_after_change_log {
             writeln!(
                 out,
-                "the planned change-log segments were already deleted, so a re-run may not find {path}: after it, \
-                 check that {path} is gone and delete it by hand if it is still there."
+                "the planned change-log segments were already deleted, so a re-run may not find {paths}: after it, \
+                 check each of them and delete by hand any that is still there."
             )?;
         } else {
-            writeln!(out, "the planned change-log segments are kept, so a re-run finds and deletes {path}.")?;
+            writeln!(out, "the planned change-log segments are kept, so a re-run finds and deletes {paths}.")?;
         }
         Ok(EXIT_CATALOG_MOVED)
     } else if let Some(path) = &retired.unrecorded_stream {

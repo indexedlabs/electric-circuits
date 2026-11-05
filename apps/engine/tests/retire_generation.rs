@@ -72,7 +72,7 @@ struct StoreState {
     append_before: Option<(String, String)>,
     /// When a request with this label arrives, first create this stream: a writer that makes a
     /// segment or a shape's stream before its catalog record lands.
-    create_before: Option<(String, String)>,
+    create_before: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -126,10 +126,10 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
     let mut st = state.lock().unwrap();
     let label = if method == Method::POST && closing { "CLOSE".to_string() } else { method.to_string() };
     st.requests.push(format!("{label} {path}"));
-    if let Some((request, target)) = st.create_before.clone()
-        && request == format!("{label} {path}")
-    {
-        st.streams.entry(target).or_default();
+    for (request, target) in st.create_before.clone() {
+        if request == format!("{label} {path}") {
+            st.streams.entry(target).or_default();
+        }
     }
     if let Some((request, target)) = st.append_before.clone()
         && request == format!("{label} {path}")
@@ -862,7 +862,7 @@ async fn a_segment_created_as_the_catalog_closes_stops_the_run() {
     let store = store_with_v1(now() - 20 * DAY).await;
     // The plan's chain ends at changes/2 (an unrecorded successor), so a rotation makes changes/3.
     let segment = format!("{}changes/3", v1());
-    store.state.lock().unwrap().create_before = Some((format!("CLOSE {}", v1_catalog()), segment.clone()));
+    store.state.lock().unwrap().create_before = vec![(format!("CLOSE {}", v1_catalog()), segment.clone())];
     let mut expected_paths = store.paths();
     expected_paths.push(segment.clone());
     expected_paths.sort();
@@ -886,7 +886,7 @@ async fn a_segment_created_as_the_catalog_closes_stops_the_run() {
 async fn a_segment_created_during_the_deletes_is_cleaned_up_by_a_rerun() {
     let store = store_with_v1(now() - 20 * DAY).await;
     let segment = format!("{}changes/3", v1());
-    store.state.lock().unwrap().create_before = Some((format!("DELETE {}shape/s3", v1()), segment.clone()));
+    store.state.lock().unwrap().create_before = vec![(format!("DELETE {}shape/s3", v1()), segment.clone())];
 
     let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
@@ -899,7 +899,7 @@ async fn a_segment_created_during_the_deletes_is_cleaned_up_by_a_rerun() {
         assert!(left.contains(&format!("{}{kept}", v1())), "{kept} survives for the re-run: {left:?}");
     }
 
-    store.state.lock().unwrap().create_before = None;
+    store.state.lock().unwrap().create_before.clear();
     let rerun = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
     assert_eq!(rerun.code, 0, "stdout: {}\nstderr: {}", rerun.stdout, rerun.stderr);
@@ -944,7 +944,7 @@ async fn a_rerun_finds_every_segment_a_partial_run_left() {
 async fn a_segment_created_while_the_change_log_is_deleted_is_named() {
     let store = store_with_v1(now() - 20 * DAY).await;
     let segment = format!("{}changes/3", v1());
-    store.state.lock().unwrap().create_before = Some((format!("DELETE {}changes/1", v1()), segment.clone()));
+    store.state.lock().unwrap().create_before = vec![(format!("DELETE {}changes/1", v1()), segment.clone())];
 
     let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
 
@@ -952,7 +952,7 @@ async fn a_segment_created_while_the_change_log_is_deleted_is_named() {
     assert!(run.stdout.contains(&format!("but {segment} appeared while they were")), "stdout: {}", run.stdout);
     assert!(
         run.stdout.contains(&format!(
-            "a re-run may not find {segment}: after it, check that {segment} is gone and delete it by hand"
+            "a re-run may not find {segment}: after it, check each of them and delete by hand any that is still there"
         )),
         "stdout: {}",
         run.stdout
@@ -960,6 +960,31 @@ async fn a_segment_created_while_the_change_log_is_deleted_is_named() {
     let left = store.paths();
     assert!(left.contains(&v1_catalog()), "the catalog is kept: {left:?}");
     assert!(left.contains(&segment), "the new segment is named, not deleted: {left:?}");
+}
+
+/// Two rotations during the change-log deletes make two segments past the planned chain. The last
+/// check walks the whole contiguous run, so the output names both, not just the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_segment_created_while_the_change_log_is_deleted_is_named() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    let third = format!("{}changes/3", v1());
+    let fourth = format!("{}changes/4", v1());
+    // The change log goes highest first: changes/2, then changes/1.
+    store.state.lock().unwrap().create_before = vec![
+        (format!("DELETE {}changes/2", v1()), third.clone()),
+        (format!("DELETE {}changes/1", v1()), fourth.clone()),
+    ];
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 3, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(
+        run.stdout.contains(&format!("a re-run may not find {third}, {fourth}: after it, check each of them")),
+        "names both: {}",
+        run.stdout
+    );
+    let left = store.paths();
+    assert!(left.contains(&third) && left.contains(&fourth) && left.contains(&v1_catalog()), "{left:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
