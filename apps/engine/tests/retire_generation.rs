@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 
 /// The in-process test store's generation (`StoreIdentityV1::in_process_test_identity`).
 const STORE_GENERATION: &str = "ff8b5fa6-e786-4994-8da0-f14e9e79f318";
+/// The in-process test scope's stack namespace: the one the command is configured for.
+const NAMESPACE: &str = "test-stack";
 const DAY: u64 = 86_400;
 
 fn prefix(namespace: &str, query: &str) -> String {
@@ -24,7 +26,7 @@ fn prefix(namespace: &str, query: &str) -> String {
 }
 
 fn v1() -> String {
-    prefix("indexed-prod", "dashboard-conversation-v1")
+    prefix(NAMESPACE, "dashboard-conversation-v1")
 }
 
 fn v1_catalog() -> String {
@@ -226,7 +228,7 @@ fn store_bound(query: &str) -> Value {
             "stream_lane_count": 1,
             "filesystem_uuid": "253f14d5-cbee-4df8-9e3c-e44c6e41501b",
         },
-        "stack_namespace": "indexed-prod",
+        "stack_namespace": NAMESPACE,
         "ingest_epoch": "coupled-v1",
         "query_generation": query,
     })
@@ -281,7 +283,7 @@ async fn store_with_v1(last: u64) -> Store {
         store.put(&path, vec![]);
     }
     store.put(&format!("{}shape/s99", v1()), vec![]);
-    let v2 = prefix("indexed-prod", "dashboard-conversation-v2");
+    let v2 = prefix(NAMESPACE, "dashboard-conversation-v2");
     store.put(&format!("{v2}meta/catalog"), catalog_events("dashboard-conversation-v2", now()));
     store.put(&format!("{v2}shape/s1"), vec![]);
     store
@@ -328,7 +330,7 @@ async fn confirm_deletes_every_named_stream_and_then_the_catalog() {
     let mut expected = named(&v1());
     expected.push(v1_catalog());
     assert_eq!(deletes, expected, "every named stream, each once, and the catalog last");
-    let v2 = prefix("indexed-prod", "dashboard-conversation-v2");
+    let v2 = prefix(NAMESPACE, "dashboard-conversation-v2");
     assert_eq!(
         store.paths(),
         vec![format!("{v1}shape/s99", v1 = v1()), format!("{v2}meta/catalog"), format!("{v2}shape/s1")],
@@ -355,7 +357,7 @@ async fn it_runs_as_a_shell_command_override_of_the_engine_task() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_catalog_of_its_own_configured_generation_is_refused() {
     // The in-process test store's ELECTRIC_CIRCUITS_QUERY_GENERATION is `test-query`.
-    let own = prefix("indexed-prod", "test-query");
+    let own = prefix(NAMESPACE, "test-query");
     let store = store_with_v1(now() - 20 * DAY).await;
     store.put(&format!("{own}meta/catalog"), catalog_events("test-query", now() - 20 * DAY));
     store.put(&format!("{own}shape/s1"), vec![]);
@@ -445,6 +447,40 @@ async fn a_catalog_appended_to_while_the_command_reads_it_is_refused() {
     assert!(run.stderr.contains("an engine is writing it"), "stderr: {}", run.stderr);
     assert_eq!(store.destructive_requests(), Vec::<String>::new());
     assert_eq!(store.paths(), before);
+}
+
+/// The last guard runs after every stream is gone: a catalog that moved meanwhile is kept, and the
+/// run reports a partial retirement (exit 1), not a refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_that_moves_while_its_streams_are_deleted_is_kept() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    // HEADs 1 and 2 bracket the read; HEAD 3, just before the catalog's delete, finds an append.
+    store.state.lock().unwrap().append_on_head = Some((v1_catalog(), 3));
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 1, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stdout.contains("streams deleted; the catalog was kept because it moved"), "stdout: {}", run.stdout);
+    let left = store.paths();
+    assert!(left.contains(&v1_catalog()), "the moved catalog survives");
+    assert!(named(&v1()).iter().all(|p| !left.contains(p)), "every named stream was deleted: {left:?}");
+    assert!(!store.destructive_requests().iter().any(|r| r.ends_with(&v1_catalog())), "the catalog was never closed");
+}
+
+/// A task retires only its own stack's generations: a catalog in another namespace of the same
+/// store is refused before anything is read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_in_another_namespace_is_refused() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    let other = prefix("other-stack", "dashboard-conversation-v1");
+    store.put(&format!("{other}meta/catalog"), catalog_events("dashboard-conversation-v1", now() - 20 * DAY));
+    store.put(&format!("{other}shape/s1"), vec![]);
+
+    let run = retire(&store, &[&format!("{other}meta/catalog"), "--confirm"]).await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("namespace 'other-stack'"), "stderr: {}", run.stderr);
+    assert_eq!(store.requests(), Vec::<String>::new(), "the other namespace is never read");
 }
 
 #[tokio::test(flavor = "multi_thread")]

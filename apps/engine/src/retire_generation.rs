@@ -20,6 +20,7 @@
 //!   records no time at all — the store keeps no last-append time, so the catalog's own events are
 //!   the only witness that no engine is writing it — and a catalog whose tail moves while the
 //!   command runs;
+//! - it refuses a catalog in another store generation or stack namespace than the engine's own;
 //! - it refuses a catalog naming any stream outside the catalog's own prefix;
 //! - without `--confirm` it deletes nothing and prints what it would delete.
 //!
@@ -41,7 +42,7 @@
 //! | exit | meaning |
 //! |---|---|
 //! | `0` | a dry run printed its plan, or every named stream and the catalog were deleted |
-//! | `1` | storage failed, or some deletes failed and the catalog was kept for a re-run |
+//! | `1` | storage failed; some deletes failed and the catalog was kept for a re-run; or every stream was deleted but the catalog moved meanwhile and was kept |
 //! | `78` | refused: a bad argument or path, or one of the guards above |
 
 use std::io::Write;
@@ -51,7 +52,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Config;
 use crate::ds::DsClient;
 use crate::engine::{CATALOG_STREAM, fold_catalog_at};
-use crate::store_identity::{StoreIdentityV1, StreamScope, validate_identifier};
+use crate::store_identity::{StreamScope, validate_identifier};
 
 /// The command's name on the engine binary's command line.
 pub const COMMAND: &str = "retire-generation";
@@ -86,6 +87,11 @@ pub enum Refusal {
         "'{path}' is in store generation {path_generation}, but this engine is configured for store generation {configured}"
     )]
     OtherStore { path: String, path_generation: String, configured: String },
+    #[error(
+        "'{path}' is in namespace '{path_namespace}', but this engine is configured for namespace '{configured}' \
+         (ELECTRIC_CIRCUITS_DS_NAMESPACE)"
+    )]
+    OtherNamespace { path: String, path_namespace: String, configured: String },
     #[error(
         "the catalog belongs to query generation '{0}', the generation this engine runs with \
          (ELECTRIC_CIRCUITS_QUERY_GENERATION); a running engine's own catalog is never retired"
@@ -184,14 +190,23 @@ impl CatalogPath {
         self.physical.strip_suffix(CATALOG_STREAM).expect("parse checked the suffix")
     }
 
-    /// The scope that qualifies this catalog's logical paths in `store`. Refused when the path
-    /// belongs to another store generation than the one the engine is configured for.
-    pub fn scope(&self, store: &StoreIdentityV1) -> Result<StreamScope> {
+    /// The scope that qualifies this catalog's logical paths in the configured store. Refused when
+    /// the path belongs to another store generation or another stack namespace than the ones the
+    /// engine is configured for: a task only retires generations of its own stack.
+    pub fn scope(&self, configured: &StreamScope) -> Result<StreamScope> {
+        let store = &configured.store;
         if store.store_generation != self.store_generation {
             bail!(Refusal::OtherStore {
                 path: self.physical.clone(),
                 path_generation: self.store_generation.clone(),
                 configured: store.store_generation.clone(),
+            });
+        }
+        if configured.stack_namespace != self.stack_namespace {
+            bail!(Refusal::OtherNamespace {
+                path: self.physical.clone(),
+                path_namespace: self.stack_namespace.clone(),
+                configured: configured.stack_namespace.clone(),
             });
         }
         let scope = StreamScope::new(self.stack_namespace.clone(), store.clone(), self.query_generation.clone())?;
@@ -227,6 +242,9 @@ pub struct Retired {
     pub failed: Vec<(String, String)>,
     /// Whether the catalog itself was deleted.
     pub catalog_deleted: bool,
+    /// `Some((before, after))` when every stream was deleted but the catalog's tail had moved
+    /// since it was read, so the catalog was kept.
+    pub catalog_moved: Option<(Option<String>, Option<String>)>,
 }
 
 /// Read the catalog `ds` is scoped to and decide what a confirmed run would delete. Deletes
@@ -294,7 +312,7 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
 /// Delete every stream in `plan`, then the catalog. A stream whose delete fails is reported and
 /// the rest still go; the catalog is then kept, so a re-run finds what is left.
 pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<Retired> {
-    let mut retired = Retired { deleted: Vec::new(), failed: Vec::new(), catalog_deleted: false };
+    let mut retired = Retired { deleted: Vec::new(), failed: Vec::new(), catalog_deleted: false, catalog_moved: None };
     for (n, (logical, physical)) in plan.streams.iter().enumerate() {
         match ds.retire_stream(logical).await {
             Ok(()) => {
@@ -313,7 +331,13 @@ pub async fn execute(ds: &DsClient, plan: &Plan, out: &mut dyn Write) -> Result<
     if !retired.failed.is_empty() {
         return Ok(retired);
     }
-    ensure_tail(ds, &plan.tail).await?;
+    // The streams are already gone, so a moved tail here is not a refusal: keep the catalog, which
+    // is what an engine appending to it would need, and report a partial retirement.
+    let after = ds.head(CATALOG_STREAM).await.context("re-checking the catalog stream")?.map(|head| head.next_offset);
+    if after.as_ref() != Some(&plan.tail) {
+        retired.catalog_moved = Some((plan.tail.clone(), after.flatten()));
+        return Ok(retired);
+    }
     ds.retire_stream(CATALOG_STREAM).await.with_context(|| format!("deleting {}", plan.catalog))?;
     writeln!(out, "deleted {}", plan.catalog)?;
     retired.catalog_deleted = true;
@@ -364,6 +388,14 @@ async fn run_inner(ds: &DsClient, args: &Args, own_generation: &str, now: u64, o
     if retired.catalog_deleted {
         writeln!(out, "retired {} streams and the catalog", retired.deleted.len())?;
         Ok(0)
+    } else if let Some((before, after)) = &retired.catalog_moved {
+        writeln!(
+            out,
+            "{} streams deleted; the catalog was kept because it moved (tail {before:?} -> {after:?}) while they were \
+             deleted, so an engine may be writing it. Check it before deleting it or re-running.",
+            retired.deleted.len()
+        )?;
+        Ok(EXIT_FAILED)
     } else {
         writeln!(
             out,
@@ -387,7 +419,7 @@ pub fn own_generation(config: &Config) -> Option<String> {
 /// Connect to the store the engine's configuration names, scoped to `catalog`'s generation.
 pub async fn connect(config: &Config, catalog: &CatalogPath) -> Result<DsClient> {
     if let Some(connection) = &config.ds_connection {
-        let scope = catalog.scope(&connection.scope.store)?;
+        let scope = catalog.scope(&connection.scope)?;
         let connection = crate::ds::DsConnectionConfig::new(
             connection.base_url.clone(),
             connection.ca_bundle_path.clone(),
@@ -400,7 +432,7 @@ pub async fn connect(config: &Config, catalog: &CatalogPath) -> Result<DsClient>
     #[cfg(feature = "test-support")]
     {
         if let Some(base_url) = &config.ds_in_process_test_url {
-            let scope = catalog.scope(&StreamScope::in_process_test_scope().store)?;
+            let scope = catalog.scope(&StreamScope::in_process_test_scope())?;
             return Ok(DsClient::new_for_in_process_test_with_scope(base_url.clone(), scope));
         }
     }
@@ -490,9 +522,21 @@ mod tests {
 
     #[test]
     fn refuses_a_catalog_in_another_store_generation() {
-        let mut store = StoreIdentityV1::in_process_test_identity();
-        store.store_generation = "00000000-0000-4000-8000-000000000000".into();
-        let e = CatalogPath::parse(V1).unwrap().scope(&store).unwrap_err();
+        let mut configured = StreamScope::in_process_test_scope();
+        configured.stack_namespace = "indexed-prod".into();
+        configured.store.store_generation = "00000000-0000-4000-8000-000000000000".into();
+        let e = CatalogPath::parse(V1).unwrap().scope(&configured).unwrap_err();
         assert!(matches!(refusal(&e), Some(Refusal::OtherStore { .. })), "{e:#}");
+    }
+
+    #[test]
+    fn scopes_only_a_catalog_in_its_own_namespace() {
+        let mut configured = StreamScope::in_process_test_scope();
+        configured.stack_namespace = "indexed-prod".into();
+        let scope = CatalogPath::parse(V1).unwrap().scope(&configured).unwrap();
+        assert_eq!(scope.qualify(CATALOG_STREAM).unwrap(), V1);
+        configured.stack_namespace = "indexed-dev".into();
+        let e = CatalogPath::parse(V1).unwrap().scope(&configured).unwrap_err();
+        assert!(matches!(refusal(&e), Some(Refusal::OtherNamespace { .. })), "{e:#}");
     }
 }
