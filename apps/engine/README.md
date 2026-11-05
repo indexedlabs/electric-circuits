@@ -523,7 +523,8 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   validate nonbinding history. `boot_library` uses the same path; cancellation releases page credit
   and starts no engine work. The client's stream TTL must equal the config's
   `ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, set with `with_stream_ttl` before `admit_store`, or
-  construction fails. The Postgres catalog fold reads every page
+  construction fails. The config-less constructors (`Engine::new`, `new_pg`, `new_pg_with_setup`)
+  refuse a client with a stream TTL. The Postgres catalog fold reads every page
   once and rejects duplicate or reordered bindings before event-id de-duplication, including a
   repeated binding with the same `eid`. No shapes restore from an invalid catalog.
 

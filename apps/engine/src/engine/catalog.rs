@@ -2934,16 +2934,40 @@ mod tests {
         engine.close(OTTO_5492_DEADLINE).await;
     }
 
-    /// `#c-sweep-inside-ttl`: the config-less library constructor cannot check a stream TTL against
-    /// the sweep and retention windows, so it refuses a client that has one.
-    #[tokio::test]
-    #[should_panic(expected = "must go through Engine::new_with_config or Engine::boot_library")]
-    async fn the_config_less_library_constructor_refuses_a_client_with_a_stream_ttl() {
+    /// A store admission whose client carries a stream TTL.
+    async fn ttl_admission() -> StoreAdmission {
         let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
         let ds = DsClient::with_test_store("scripted://config-less-ttl".into(), store)
             .with_stream_ttl(std::num::NonZeroU64::new(1_814_400));
-        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
-        let _ = Engine::new(admission).await;
+        Engine::admit_store(ds, expected_store_bound(), true).await.unwrap()
+    }
+
+    /// `#c-sweep-inside-ttl`: the config-less constructors cannot check a stream TTL against the
+    /// sweep and retention windows, so they refuse a client that has one: `Engine::new` with an
+    /// error, the Postgres constructors by panicking before they touch Postgres.
+    #[tokio::test]
+    async fn the_config_less_library_constructor_refuses_a_client_with_a_stream_ttl() {
+        let refused = Engine::new(ttl_admission().await).await.err().expect("a TTL client is refused");
+        assert!(
+            format!("{refused:#}").contains("must go through Engine::new_with_config or Engine::boot_library"),
+            "{refused:#}"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must go through Engine::new_with_config or Engine::boot_library")]
+    async fn the_config_less_postgres_constructor_refuses_a_client_with_a_stream_ttl() {
+        let _ = Engine::new_pg(ttl_admission().await, "postgres://unreachable.invalid/db".into());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must go through Engine::new_with_config or Engine::boot_library")]
+    async fn the_config_less_postgres_setup_constructor_refuses_a_client_with_a_stream_ttl() {
+        let _ = Engine::new_pg_with_setup(
+            ttl_admission().await,
+            "postgres://unreachable.invalid/db".into(),
+            PostgresSetup::ExternallyManaged,
+        );
     }
 
     /// The engine sweeps with the retention windows and interval its config was resolved with, the

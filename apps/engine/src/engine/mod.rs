@@ -1595,12 +1595,14 @@ fn sid_of_path(stream_path: &str) -> &str {
 
 /// The config-less public constructors cannot check a stream TTL against the sweep and retention
 /// windows, so they refuse a client that has one.
-fn refuse_stream_ttl_without_config(ds: &DsClient) {
-    assert!(
-        ds.stream_ttl().is_none(),
-        "a Durable Streams client with a stream TTL must go through Engine::new_with_config or \
-         Engine::boot_library, which check the TTL against the sweep and retention windows"
-    );
+fn refuse_stream_ttl_without_config(ds: &DsClient) -> Result<()> {
+    if ds.stream_ttl().is_some() {
+        bail!(
+            "a Durable Streams client with a stream TTL must go through Engine::new_with_config or \
+             Engine::boot_library, which check the TTL against the sweep and retention windows"
+        );
+    }
+    Ok(())
 }
 
 impl Engine {
@@ -1610,11 +1612,11 @@ impl Engine {
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
-    /// It refuses (panics on) a client with a stream TTL: that client belongs on
+    /// It refuses a client with a stream TTL with an error: that client belongs on
     /// [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library), which check
     /// the TTL against the sweep and retention windows.
     pub async fn new(admission: StoreAdmission) -> Result<Self> {
-        refuse_stream_ttl_without_config(&admission.ds);
+        refuse_stream_ttl_without_config(&admission.ds)?;
         let bytes = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
         let engine =
             Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None);
@@ -1628,7 +1630,6 @@ impl Engine {
     /// [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library), which check
     /// the TTL against the sweep and retention windows.
     pub fn new_pg(admission: StoreAdmission, pg_url: String) -> Self {
-        refuse_stream_ttl_without_config(&admission.ds);
         Self::new_pg_with_setup(admission, pg_url, PostgresSetup::EngineManaged)
     }
 
@@ -1639,7 +1640,9 @@ impl Engine {
     /// [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library), which check
     /// the TTL against the sweep and retention windows.
     pub fn new_pg_with_setup(admission: StoreAdmission, pg_url: String, setup: PostgresSetup) -> Self {
-        refuse_stream_ttl_without_config(&admission.ds);
+        if let Err(error) = refuse_stream_ttl_without_config(&admission.ds) {
+            panic!("{error}");
+        }
         let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup, None, None);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
