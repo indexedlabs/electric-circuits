@@ -1698,6 +1698,8 @@ impl Engine {
         setup: PostgresSetup,
         config: &crate::config::Config,
     ) -> Result<Self> {
+        // A config changed after `Config::resolve` is checked again with the values the engine uses.
+        config.check_stream_ttl()?;
         // The client's TTL is the one that created the catalog in `admit_store`, so it stays the
         // authority: a config that disagrees is refused rather than applied after the fact.
         if admission.ds.stream_ttl() != config.stream_ttl {

@@ -2970,6 +2970,24 @@ mod tests {
         );
     }
 
+    /// `#c-sweep-inside-ttl`: a config changed after `Config::resolve` is checked again at
+    /// construction, with the values the engine would run with: a sweep interval moved past a
+    /// quarter of the TTL is refused.
+    #[tokio::test]
+    async fn a_config_changed_after_resolve_is_checked_again_at_construction() {
+        let mut config = crate::config::Config::resolve(|key| {
+            (key == "ELECTRIC_CIRCUITS_STREAM_TTL_SECS").then(|| "1814400".to_string())
+        })
+        .unwrap();
+        config.retention.sweep_interval = std::time::Duration::from_secs(1_814_400 / 4);
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds =
+            DsClient::with_test_store("scripted://changed-config".into(), store).with_stream_ttl(config.stream_ttl);
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        let refused = Engine::boot_library(admission, &config).await.err().expect("the changed config is refused");
+        assert!(format!("{refused:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{refused:#}");
+    }
+
     /// The engine sweeps with the retention windows and interval its config was resolved with, the
     /// same ones the TTL floor and quarter-TTL checks used, not the process environment's.
     #[tokio::test]

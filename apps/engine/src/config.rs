@@ -669,32 +669,6 @@ impl Config {
         };
         let retention = crate::retention::RetentionConfig::resolve(&g);
         let change_log = crate::changelog::ChangeLogConfig::resolve(&g);
-        if let Some(ttl) = stream_ttl {
-            let Some(floor) = crate::retention::stream_ttl_floor(&retention, &change_log) else {
-                bail!(
-                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
-                     ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
-                     TTL is safe"
-                );
-            };
-            if Duration::from_secs(ttl.get()) < floor {
-                bail!(
-                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
-                     idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
-                     stream the engine still tracks",
-                    floor.as_secs()
-                );
-            }
-            let sweep = retention.sweep_interval;
-            if sweep >= Duration::from_secs(ttl.get()) / 4 {
-                bail!(
-                    "ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS is {}s, not under a quarter of \
-                     ELECTRIC_CIRCUITS_STREAM_TTL_SECS ({ttl}s): the keep-alive sweep must come round well before \
-                     a tracked stream's TTL can lapse",
-                    sweep.as_secs()
-                );
-            }
-        }
 
         let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
         let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;
@@ -748,7 +722,7 @@ impl Config {
             }
         };
 
-        Ok(Config {
+        let config = Config {
             pg_url,
             ds_url,
             ds_connection,
@@ -786,7 +760,42 @@ impl Config {
             shutdown_ready_drain,
             sources,
             noop_vars: Vec::new(),
-        })
+        };
+        config.check_stream_ttl()?;
+        Ok(config)
+    }
+
+    /// Check a non-zero `stream_ttl` against the retention windows and sweep interval this config
+    /// carries: the floor, a disabled idle or dormancy window, and the quarter-TTL sweep. Run by
+    /// `resolve` and again by `Engine::new_with_config`, so a config changed after resolving is
+    /// checked with the values the engine will use.
+    pub fn check_stream_ttl(&self) -> Result<()> {
+        let Some(ttl) = self.stream_ttl else { return Ok(()) };
+        let Some(floor) = crate::retention::stream_ttl_floor(&self.retention, &self.change_log) else {
+            bail!(
+                "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
+                 ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
+                 TTL is safe"
+            );
+        };
+        if Duration::from_secs(ttl.get()) < floor {
+            bail!(
+                "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
+                 idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
+                 stream the engine still tracks",
+                floor.as_secs()
+            );
+        }
+        let sweep = self.retention.sweep_interval;
+        if sweep >= Duration::from_secs(ttl.get()) / 4 {
+            bail!(
+                "ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS is {}s, not under a quarter of \
+                 ELECTRIC_CIRCUITS_STREAM_TTL_SECS ({ttl}s): the keep-alive sweep must come round well before \
+                 a tracked stream's TTL can lapse",
+                sweep.as_secs()
+            );
+        }
+        Ok(())
     }
 
     /// Resolve from the real process environment, then scan it for accepted-no-op `ELECTRIC_*` vars.

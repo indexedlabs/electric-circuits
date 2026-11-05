@@ -2202,11 +2202,6 @@ impl Engine {
         // whose create landed meanwhile is fresh: the create's PUT started its TTL clock.
         let still_tracked = self.ttl_tracked_streams().await;
         self.ds.retain_accessed(&still_tracked);
-        let gone: std::collections::HashSet<String> = failed
-            .iter()
-            .filter(|(_, error)| error.downcast_ref::<crate::ds::StreamGone>().is_some())
-            .map(|(path, _)| path.clone())
-            .collect();
         failed.retain(|(path, _)| {
             still_tracked.contains(path) && self.ds.touched_ago(path).is_none_or(|ago| ago >= due_after)
         });
@@ -2218,14 +2213,15 @@ impl Engine {
                 failed.len()
             );
         }
-        // A stream this process never appended to, read or touched has been untouched since boot,
-        // but only one this sweep tried and the store did not call gone: a stream still being
-        // created, or new since the snapshot, has nothing to expire yet.
+        // A tracked stream this process never appended to, read or touched has been untouched since
+        // boot, including one whose touch the store answered 404/410: it is still tracked, so its
+        // age shows. Only a stream that became tracked after the snapshot (a create in flight) is
+        // left out; it has nothing to expire yet.
         let oldest = still_tracked
             .iter()
             .filter_map(|path| match self.ds.touched_ago(path) {
                 Some(ago) => Some(ago),
-                None => (tracked.contains(path) && !gone.contains(path)).then(|| self.ds.untouched_for(path)),
+                None => tracked.contains(path).then(|| self.ds.untouched_for(path)),
             })
             .max()
             .unwrap_or_default();
@@ -5679,6 +5675,37 @@ mod stream_ttl_tests {
         let engine = engine_with_shapes(store, &["s1"]).await;
         engine.sweep_stream_ttl().await;
         assert_eq!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed), 1);
+        // Still tracked, never touched: it keeps aging from boot (an hour ago), not hidden.
+        let age = engine.metrics.stream_ttl_oldest_untouched_secs();
+        assert!(age >= 3600, "the lost stream's age shows in the gauge: {age}s");
+    }
+
+    /// `#g-tracked-streams-kept`: the tracked set covers a group's own stream (named only by its
+    /// group claim) and every retained change-log segment, not just the current one.
+    #[tokio::test]
+    async fn the_tracked_set_includes_group_streams_and_retained_segments() {
+        let engine = ttl_engine(Arc::new(crate::ds::ScriptedStore::default()), Some(3600));
+        {
+            let mut st = engine.state.lock().await;
+            let group = GroupRecord {
+                id: "shape/group-only".into(),
+                stream_path: "shape/group-only".into(),
+                subscription: "g".into(),
+                members: Vec::new(),
+                lsn: "0/0".into(),
+                snapshot: "".into(),
+                horizon: "0/0".into(),
+                replay_fence: "0".into(),
+            };
+            st.group_claims.reserve("g", &group.id).unwrap();
+            st.group_claims.complete(group);
+        }
+        engine.changes.state().adopt(2, [(0, 1), (1, 2), (2, 3)].into(), None);
+
+        let tracked = engine.ttl_tracked_streams().await;
+        for path in ["meta/catalog", "shape/group-only", "changes/0", "changes/1", "changes/2"] {
+            assert!(tracked.contains(path), "{path} is tracked: {tracked:?}");
+        }
     }
 
     /// The exported age keeps rising while a sweep cannot finish (stalled on a touch here, as it
