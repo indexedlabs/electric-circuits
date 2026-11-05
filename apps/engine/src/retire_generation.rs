@@ -6,7 +6,7 @@
 //! catalog and every stream it names stay on disk, because nothing tracks them any more. This
 //! one-shot command folds the old catalog exactly as a boot would and deletes what the fold still
 //! names — live and dormant shape streams, group streams, shapes whose retirement never landed,
-//! change-log segments (and any later segment a rotation created but never recorded) — and then
+//! change-log segments (and any segment the engine created but never recorded) — and then
 //! the catalog itself.
 //!
 //! It is deliberately hard to aim at the wrong thing:
@@ -72,7 +72,7 @@ pub const EXIT_FAILED: i32 = 1;
 /// quiet could delete a live generation's catalog. Find the writer first.
 pub const EXIT_CATALOG_MOVED: i32 = 3;
 
-/// Upper bound on the walk past the last recorded change-log segment. A rotation records each new
+/// Upper bound on the walk past the last recorded change-log segment (or from `changes/0`). A rotation records each new
 /// segment before the next one can begin, so more than one unrecorded successor is already a
 /// broken log; the bound only stops a pathological store from looping the command.
 const MAX_UNRECORDED_SEGMENTS: u32 = 1_000;
@@ -279,20 +279,21 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
     }
 
     let mut logical = fold.named_streams();
-    // A rotation creates segment n+1 before it records it, so a crash can leave successors the
-    // catalog never names. They are this generation's too.
-    let last_segment = logical
+    // The engine creates a segment before it records it, so a crash can leave segments the catalog
+    // never names: successors of the last recorded one, or `changes/0` itself when no rotation was
+    // ever recorded. They are this generation's too, so the walk starts right after the last
+    // recorded segment, or at 0 when there is none.
+    let first_unrecorded = logical
         .iter()
         .filter_map(|p| p.strip_prefix(crate::changelog::CHANGES_PREFIX)?.strip_prefix('/')?.parse::<u32>().ok())
-        .max();
-    if let Some(last) = last_segment {
-        for n in last.saturating_add(1)..last.saturating_add(1).saturating_add(MAX_UNRECORDED_SEGMENTS) {
-            let path = crate::changelog::segment_path(n);
-            if ds.head(&path).await.with_context(|| format!("checking {path}"))?.is_none() {
-                break;
-            }
-            logical.insert(path);
+        .max()
+        .map_or(0, |last| last.saturating_add(1));
+    for n in first_unrecorded..first_unrecorded.saturating_add(MAX_UNRECORDED_SEGMENTS) {
+        let path = crate::changelog::segment_path(n);
+        if ds.head(&path).await.with_context(|| format!("checking {path}"))?.is_none() {
+            break;
         }
+        logical.insert(path);
     }
 
     let mut streams = Vec::with_capacity(logical.len());

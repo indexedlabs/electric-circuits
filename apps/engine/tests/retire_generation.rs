@@ -485,6 +485,32 @@ async fn a_catalog_in_another_namespace_is_refused() {
     assert_eq!(store.requests(), Vec::<String>::new(), "the other namespace is never read");
 }
 
+/// An engine that died between creating `changes/0` and recording its rotation left a segment the
+/// catalog never names; it is still this generation's, so it is planned and deleted.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrecorded_first_change_log_segment_is_deleted() {
+    let store = Store::start().await;
+    let mut events = vec![store_bound("dashboard-conversation-v1"), shape("s1", now() - 20 * DAY)];
+    for (n, event) in events.iter_mut().enumerate() {
+        event["eid"] = json!(format!("crashed-{n}"));
+    }
+    store.put(&v1_catalog(), events);
+    store.put(&format!("{}shape/s1", v1()), vec![]);
+    store.put(&format!("{}changes/0", v1()), vec![]);
+
+    let dry = retire(&store, &[&v1_catalog()]).await;
+
+    assert_eq!(dry.code, 0, "stdout: {}\nstderr: {}", dry.stdout, dry.stderr);
+    let would: Vec<&str> = dry.stdout.lines().filter_map(|l| l.strip_prefix("would delete ")).collect();
+    let expected = [format!("{}changes/0", v1()), format!("{}shape/s1", v1()), v1_catalog()];
+    assert_eq!(would, expected, "stdout: {}", dry.stdout);
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 0, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert_eq!(store.paths(), Vec::<String>::new(), "nothing of the generation is left");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_delete_keeps_the_catalog_and_a_rerun_finishes() {
     let store = store_with_v1(now() - 20 * DAY).await;
