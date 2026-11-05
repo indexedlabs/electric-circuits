@@ -169,8 +169,9 @@ impl RetentionConfig {
 ///
 /// The floor alone does not keep a tracked stream alive: a stream the engine neither appends to nor
 /// reads, such as a restored dormant shape whose dormancy clock restarted at boot, would still
-/// expire. The retention sweep's keep-alive (`Engine::sweep_stream_ttl`) reads each of them at its
-/// tail at least once per quarter TTL; `HEAD` does not slide the TTL.
+/// expire. The keep-alive sweep (`Engine::sweep_stream_ttl`, on its own timer at the retention
+/// sweep interval) reads each of them at its tail at least once per quarter TTL; `HEAD` does not
+/// slide the TTL.
 pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog::ChangeLogConfig) -> Option<Duration> {
     if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() {
         return None;

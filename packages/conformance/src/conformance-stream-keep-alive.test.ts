@@ -2,11 +2,13 @@
 // deployment spec's "Stream expiry" section) — end to end against the live engine, real Postgres and
 // the real durable-streams server, whose own clock is what expires a stream.
 //
-//   1. After a restart, the first retention sweep reads every cataloged stream at its tail, at once
+//   1. After a restart, the first keep-alive sweep (its own timer, at the retention sweep interval)
+//      reads every cataloged stream nothing has read since the boot at its tail, at once
 //      rather than a quarter TTL after the boot, and a shape stream nothing else reads or appends to
 //      outlives three TTLs (`#v-keep-alive`, `#g-tracked-streams-kept`, `#c-counted-touch`).
-//   2. A failed touch is counted, the untouched-age gauge keeps growing, and the next sweep touches
-//      the stream once storage answers again (`#v-touch-retry`, `#c-sweep-inside-ttl`).
+//   2. A failed touch is counted, the untouched-age gauge (the age at the latest finished sweep plus
+//      the time since) grows past its healthy bound, and the next sweep touches the stream once
+//      storage answers again (`#v-touch-retry`, `#c-sweep-inside-ttl`).
 //
 // Second-scale knobs: the floor is 2 × max(1 + 2, 2) = 6 s, and the sweep (1 s) runs well inside a
 // quarter of each TTL. Production runs a 21-day TTL with a 60 s sweep.

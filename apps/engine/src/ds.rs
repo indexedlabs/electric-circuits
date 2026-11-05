@@ -1248,6 +1248,12 @@ impl DsClient {
         self.accessed.lock().unwrap().get(path).map(std::time::Instant::elapsed)
     }
 
+    /// Forget every stream not in `tracked`. A touch whose `GET` answers after the stream's `DELETE`
+    /// records it again, so the keep-alive prunes to what is tracked after each sweep.
+    pub(crate) fn retain_accessed(&self, tracked: &std::collections::BTreeSet<String>) {
+        self.accessed.lock().unwrap().retain(|path, _| tracked.contains(path));
+    }
+
     /// [`Self::touched_ago`], counting a stream this process never touched from when the client
     /// was built: the age the untouched gauge reports.
     pub(crate) fn untouched_for(&self, path: &str) -> std::time::Duration {

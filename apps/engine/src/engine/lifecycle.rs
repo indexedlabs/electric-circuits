@@ -2201,6 +2201,7 @@ impl Engine {
         // retired meanwhile is gone, not untouched (its delete also dropped its record), and one
         // whose create landed meanwhile is fresh: the create's PUT started its TTL clock.
         let still_tracked = self.ttl_tracked_streams().await;
+        self.ds.retain_accessed(&still_tracked);
         let gone: std::collections::HashSet<String> = failed
             .iter()
             .filter(|(_, error)| error.downcast_ref::<crate::ds::StreamGone>().is_some())
@@ -5751,6 +5752,31 @@ mod stream_ttl_tests {
         })
         .await
         .expect("released, the retention sweep goes on");
+    }
+
+    /// A touch whose `GET` answers after the stream's `DELETE` records the stream again; the sweep
+    /// prunes the access record to what is still tracked, so retired streams do not accumulate.
+    #[tokio::test]
+    async fn a_touch_that_lands_after_the_delete_leaves_no_access_record() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let gate = Arc::new(crate::ds::BodyGate::default());
+        *store.read_gate.lock().unwrap() = Some(("shape/s1".into(), false, gate.clone()));
+        let engine = ttl_engine(store, Some(3600));
+        engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+        let sweep = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.sweep_stream_ttl().await }
+        });
+        // The touch has reached the store; the shape is retired before its answer comes back.
+        gate.entered.notified().await;
+        engine.state.lock().await.shapes.remove("s1");
+        engine.ds.delete_stream("shape/s1").await.unwrap();
+        assert_eq!(engine.ds.touched_ago("shape/s1"), None);
+        gate.released.notify_one();
+        sweep.await.unwrap();
+
+        assert_eq!(engine.ds.touched_ago("shape/s1"), None, "the late touch's record is pruned");
+        assert!(engine.ds.touched_ago("meta/catalog").is_some(), "tracked streams keep theirs");
     }
 
     /// Without a TTL there is nothing to keep alive.
