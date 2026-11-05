@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fs, path::PathBuf};
@@ -798,7 +799,8 @@ type StoreFuture<'a> = Pin<Box<dyn Future<Output = Result<StoreResponse>> + Send
 pub(crate) trait DurableStreamStore: Send + Sync {
     fn read_caps(&self) -> Arc<ReadCaps>;
     fn ready<'a>(&'a self) -> StoreFuture<'a>;
-    fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a>;
+    /// Create the stream, with a sliding `Stream-TTL` of `ttl` seconds when one is given.
+    fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str, ttl: Option<NonZeroU64>) -> StoreFuture<'a>;
     fn append<'a>(
         &'a self,
         path: &'a str,
@@ -1052,15 +1054,13 @@ impl DurableStreamStore for HttpDurableStreamsStore {
         })
     }
 
-    fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str) -> StoreFuture<'a> {
+    fn ensure<'a>(&'a self, path: &'a str, content_type: &'a str, ttl: Option<NonZeroU64>) -> StoreFuture<'a> {
         Box::pin(async move {
-            let res = self
-                .http
-                .put(self.stream_url(path))
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .send()
-                .await
-                .with_context(|| format!("PUT {path}"))?;
+            let mut req = self.http.put(self.stream_url(path)).header(reqwest::header::CONTENT_TYPE, content_type);
+            if let Some(ttl) = ttl {
+                req = req.header("stream-ttl", ttl.get());
+            }
+            let res = req.send().await.with_context(|| format!("PUT {path}"))?;
             Ok(self.response(res, BodyRead::Always, Some(path)).await)
         })
     }
@@ -1184,6 +1184,8 @@ pub struct DsClient {
     appended: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// In-flight reliable appends retrying after a failure. Diagnostic only; excludes retired streams.
     failed_appends: Arc<std::sync::atomic::AtomicUsize>,
+    /// Sliding `Stream-TTL` sent on every stream this client creates (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`).
+    stream_ttl: Option<NonZeroU64>,
 }
 
 struct FailedAppend<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -1208,6 +1210,12 @@ impl DsClient {
     /// Share the boot configuration's process budget, also across supervised source clients.
     pub fn with_memory_budget(mut self, config: &crate::config::Config) -> Self {
         self.memory_budget = config.memory_budget.budget();
+        self
+    }
+
+    /// Create every stream from here on with this sliding `Stream-TTL` (`None` sends none).
+    pub fn with_stream_ttl(mut self, ttl: Option<NonZeroU64>) -> Self {
+        self.stream_ttl = ttl;
         self
     }
 
@@ -1262,6 +1270,7 @@ impl DsClient {
             reconcile: std::sync::Arc::new(std::sync::Mutex::new(None)),
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             failed_appends: Arc::default(),
+            stream_ttl: None,
         }
     }
 
@@ -1393,16 +1402,27 @@ impl DsClient {
         self.scope.qualify(logical_path)
     }
 
-    /// Idempotently create a JSON stream (PUT). Existing stream with same config -> 200.
+    /// Idempotently create a JSON stream (PUT), with the client's sliding `Stream-TTL` if it has
+    /// one. Existing stream with same config -> 200.
+    ///
+    /// An existing stream whose configuration differs — one created before the TTL was set, or
+    /// with another TTL — keeps that configuration and is opened as it is. The store answers that
+    /// PUT `409`, the same answer it gives a closed or soft-deleted stream, so a `HEAD` tells them
+    /// apart: only a live stream that is not closed counts as existing, and every other `409`
+    /// keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
-        let res = self.store.ensure(&physical_path, "application/json").await?;
+        let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
         if (200..300).contains(&res.status) {
-            Ok(())
-        } else {
-            let status = res.status;
-            Err(status_error("PUT", path, status, &res.body_or_default()))
+            return Ok(());
         }
+        if res.status == 409 && !res.closed {
+            let head = self.store.head(&physical_path).await?;
+            if head.status == 200 && !head.closed {
+                return Ok(());
+            }
+        }
+        Err(status_error("PUT", path, res.status, &res.body_or_default()))
     }
 
     /// Append envelopes as a JSON array (the server flattens one array level into N messages).
@@ -2688,6 +2708,12 @@ mod tests {
         pub(crate) streams: Option<std::sync::Mutex<HashMap<String, bool>>>,
         /// Status for an absent stream on GET/HEAD; zero retains the normal 404 default.
         pub(crate) missing_status: u16,
+        /// Answer every ensure with this status (and `stream-closed` when `ensure_closed`) without
+        /// creating anything; zero creates the stream and answers 201.
+        pub(crate) ensure_status: u16,
+        pub(crate) ensure_closed: bool,
+        /// The `Stream-TTL` each ensure carried, by path.
+        pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
         /// One live GET response for a matching path suffix, without deleting storage.
         pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
@@ -2836,9 +2862,15 @@ mod tests {
             })
         }
 
-        fn ensure<'a>(&'a self, path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
+        fn ensure<'a>(&'a self, path: &'a str, _content_type: &'a str, ttl: Option<NonZeroU64>) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
+                self.ensure_ttls.lock().unwrap().push((path.to_string(), ttl.map(NonZeroU64::get)));
+                if self.ensure_status != 0 {
+                    let mut res = response(self.ensure_status);
+                    res.closed = self.ensure_closed;
+                    return Ok(res);
+                }
                 if let Some(streams) = &self.streams {
                     streams.lock().unwrap().entry(path.to_string()).or_insert(false);
                 }
@@ -3799,5 +3831,53 @@ mod tests {
         let five = status_error("PUT", "shape/1", reqwest::StatusCode::BAD_GATEWAY.as_u16(), "");
         assert!(is_unavailable(&five));
         assert!(format!("{five:#}").contains("502"));
+    }
+
+    /// `#c-sliding-ttl`: the configured TTL rides on every create as a sliding `Stream-TTL`, and an
+    /// unconfigured client sends none.
+    #[tokio::test]
+    async fn ensure_stream_sends_the_configured_sliding_ttl() {
+        let store = Arc::new(ScriptedStore::default());
+        let path = StreamScope::in_process_test_scope().qualify("shape/s1").unwrap();
+        let plain = DsClient::with_test_store("scripted://ttl".into(), store.clone());
+        plain.ensure_stream("shape/s1").await.unwrap();
+        plain.with_stream_ttl(NonZeroU64::new(1_814_400)).ensure_stream("shape/s1").await.unwrap();
+        assert_eq!(*store.ensure_ttls.lock().unwrap(), vec![(path.clone(), None), (path, Some(1_814_400))]);
+    }
+
+    /// `#c-old-stream-config`: a create the store refuses with a config-mismatch `409` opens a live,
+    /// open stream that was made with another configuration (before the TTL was set), while a
+    /// closed or deleted stream behind the same `409`, and a `409` carrying `stream-closed`, stay
+    /// refusals.
+    #[tokio::test]
+    async fn ensure_stream_opens_a_stream_with_another_config_but_not_a_closed_or_gone_one() {
+        let path = StreamScope::in_process_test_scope().qualify("shape/s1").unwrap();
+        let ensure = |stream: Option<bool>, missing_status: u16, ensure_closed: bool| {
+            let path = path.clone();
+            async move {
+                let store = Arc::new(ScriptedStore {
+                    streams: Some(std::sync::Mutex::new(stream.map(|closed| (path, closed)).into_iter().collect())),
+                    missing_status,
+                    ensure_status: 409,
+                    ensure_closed,
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://ttl".into(), store.clone())
+                    .with_stream_ttl(NonZeroU64::new(1_814_400));
+                (client.ensure_stream("shape/s1").await, store.head_count.load(std::sync::atomic::Ordering::Relaxed))
+            }
+        };
+
+        let (open, _) = ensure(Some(false), 0, false).await;
+        assert!(open.is_ok(), "a live stream with another config is opened: {open:?}");
+        let (closed, _) = ensure(Some(true), 0, false).await;
+        assert!(closed.is_err_and(|e| format!("{e:#}").contains("409")), "a closed stream keeps the PUT's 409");
+        let (soft_deleted, _) = ensure(None, 410, false).await;
+        assert!(soft_deleted.is_err(), "a soft-deleted stream keeps the PUT's 409");
+        let (deleted, _) = ensure(None, 0, false).await;
+        assert!(deleted.is_err(), "a deleted stream keeps the PUT's 409");
+        let (closed_put, heads) = ensure(Some(false), 0, true).await;
+        assert!(closed_put.is_err(), "a 409 with stream-closed keeps its meaning");
+        assert_eq!(heads, 0, "a 409 with stream-closed is answered without a HEAD");
     }
 }

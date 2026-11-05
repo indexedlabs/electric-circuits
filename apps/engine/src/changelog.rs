@@ -196,12 +196,16 @@ impl Default for ChangeLogConfig {
     }
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(default)
-}
-
 impl ChangeLogConfig {
     pub fn from_env() -> Self {
+        Self::resolve(|name| std::env::var(name).ok())
+    }
+
+    /// Resolve from an environment getter, so the boot configuration can check the retain window
+    /// against `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` through the same value.
+    pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Self {
+        let env_u64 =
+            |name: &str, default: u64| get(name).and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(default);
         let d = ChangeLogConfig::default();
         ChangeLogConfig {
             segment_bytes: env_u64("ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES", d.segment_bytes),
