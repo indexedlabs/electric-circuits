@@ -59,6 +59,10 @@ struct StoreState {
     heads: BTreeMap<String, usize>,
     /// The body `GET /_admin/ready` answers; `None` answers 404 (the in-process mode never asks).
     ready: Option<String>,
+    /// Answer reads in pages of this many events (`None`: the whole stream in one page).
+    page_size: Option<usize>,
+    /// A read of this path at this offset answers 404, as a proxy or failover can mid-read.
+    missing_page: Option<(String, usize)>,
 }
 
 #[derive(Clone)]
@@ -99,6 +103,13 @@ impl Store {
 
 async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Response {
     let path = req.uri().path().trim_start_matches('/').to_string();
+    // `-1` (or no offset) is the beginning; any other offset is an event index this stand-in issued.
+    let offset = req
+        .uri()
+        .query()
+        .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("offset=")))
+        .and_then(|o| o.parse::<usize>().ok())
+        .unwrap_or(0);
     let method = req.method().clone();
     let closing = req.headers().get("stream-closed").is_some();
     let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
@@ -140,15 +151,23 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
         }
         Method::GET => match st.streams.get(&path) {
             None => StatusCode::NOT_FOUND.into_response(),
-            Some(stream) => (
-                [
-                    ("stream-next-offset", stream.events.len().to_string()),
-                    ("stream-up-to-date", "true".to_string()),
-                    ("content-type", "application/json".to_string()),
-                ],
-                serde_json::to_string(&stream.events).unwrap(),
-            )
-                .into_response(),
+            Some(_) if st.missing_page.as_ref().is_some_and(|(p, at)| *p == path && *at == offset) => {
+                StatusCode::NOT_FOUND.into_response()
+            }
+            Some(stream) => {
+                let total = stream.events.len();
+                let end = st.page_size.map_or(total, |size| (offset + size).min(total));
+                let page = &stream.events[offset.min(total)..end];
+                let mut res = (
+                    [("stream-next-offset", end.to_string()), ("content-type", "application/json".to_string())],
+                    serde_json::to_string(page).unwrap(),
+                )
+                    .into_response();
+                if end == total {
+                    res.headers_mut().insert("stream-up-to-date", "true".parse().unwrap());
+                }
+                res
+            }
         },
         Method::POST => {
             let Some(stream) = st.streams.get_mut(&path) else {
@@ -669,6 +688,39 @@ async fn a_catalog_this_engine_cannot_read_is_refused() {
 
     assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
     assert!(run.stderr.contains("this engine cannot read the catalog"), "stderr: {}", run.stderr);
+    assert_eq!(store.destructive_requests(), Vec::<String>::new());
+    assert_eq!(store.paths(), before);
+}
+
+/// A catalog read over several pages must reach the tail a `HEAD` reported. A later page answered
+/// 404 (a proxy or failover mid-read) ends the read as if it were up to date; planning from that
+/// prefix would delete the catalog and leave the later pages' streams with no index at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_read_that_ends_early_is_refused() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    store.state.lock().unwrap().page_size = Some(4);
+    let before = store.paths();
+
+    // Paged reads that reach the tail plan exactly what a single page does.
+    let whole = retire(&store, &[&v1_catalog()]).await;
+    assert_eq!(whole.code, 0, "stdout: {}\nstderr: {}", whole.stdout, whole.stderr);
+    let would: Vec<&str> = whole.stdout.lines().filter_map(|l| l.strip_prefix("would delete ")).collect();
+    let mut expected = named(&v1());
+    expected.push(v1_catalog());
+    assert_eq!(would, expected, "stdout: {}", whole.stdout);
+
+    // The second page answers 404 while the HEAD keeps reporting the same tail.
+    store.state.lock().unwrap().missing_page = Some((v1_catalog(), 4));
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    let tail = catalog_events("dashboard-conversation-v1", now()).len();
+    assert!(
+        run.stderr.contains(&format!("ended at offset Some(\"4\"), but the catalog's tail is Some(\"{tail}\")"))
+            || run.stderr.contains(&format!("ended at offset None, but the catalog's tail is Some(\"{tail}\")")),
+        "names both offsets: {}",
+        run.stderr
+    );
     assert_eq!(store.destructive_requests(), Vec::<String>::new());
     assert_eq!(store.paths(), before);
 }

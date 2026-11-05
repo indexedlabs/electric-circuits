@@ -21,6 +21,7 @@
 //!   the only witness that no engine is writing it — and a catalog whose tail moves while the
 //!   command runs;
 //! - it refuses a catalog in another store generation or stack namespace than the engine's own;
+//! - it refuses a catalog whose read did not reach the tail a `HEAD` reported (a page missing);
 //! - it refuses a catalog naming any stream outside the catalog's own prefix, and one with any
 //!   event the fold cannot decode, since a skipped event can name a stream;
 //! - without `--confirm` it deletes nothing and prints what it would delete.
@@ -117,6 +118,11 @@ pub enum Refusal {
         .first.join("; ")
     )]
     UndecodedEvents { count: u64, first: Vec<String> },
+    #[error(
+        "the catalog read ended at offset {read_to:?}, but the catalog's tail is {tail:?}: a page was \
+         missing, so the read cannot vouch for every stream the catalog names"
+    )]
+    IncompleteRead { read_to: Option<String>, tail: Option<String> },
     #[error("this engine cannot read the catalog: {0}")]
     UnreadableCatalog(String),
     #[error("the store did not attest the identity this engine is configured for: {0}")]
@@ -278,8 +284,9 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
         bail!(Refusal::NoCatalog(catalog.as_str().to_string()));
     };
     // Storage being unavailable is worth a re-run; any other failure (a catalog written before a
-    // format this engine requires, an invalid `ingestColumns`, a stream gone mid-read) needs a
-    // person, so it is a refusal.
+    // format this engine requires, an invalid `ingestColumns`, a page over the read cap) needs a
+    // person, so it is a refusal. A page answered 404 part-way is no error at all: the read just
+    // stops, which the tail check below catches.
     let fold = fold_catalog_at(ds).await.map_err(|e| {
         if crate::ds::is_unavailable(&e) {
             e.context("reading the catalog")
@@ -287,6 +294,11 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
             anyhow::Error::new(Refusal::UnreadableCatalog(format!("{e:#}")))
         }
     })?;
+    // The fold must cover the whole catalog: a read that stopped early leaves out every stream the
+    // later pages name, and the catalog is their only index.
+    if fold.read_tail() != head.next_offset.as_deref() {
+        bail!(Refusal::IncompleteRead { read_to: fold.read_tail().map(str::to_owned), tail: head.next_offset.clone() });
+    }
     if let Some(bound) = fold.store_bound()
         && bound.query_generation == own_generation
     {

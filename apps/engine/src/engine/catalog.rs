@@ -663,7 +663,17 @@ pub struct StoreAdmission {
 
 /// Consume each page before requesting the next; callers retain only their validation/fold state.
 /// Returns response-body bytes, including JSON framing, whitespace and repeated events.
-async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json::Value>)) -> Result<u64> {
+async fn visit_catalog_pages(ds: &DsClient, visit: impl FnMut(Vec<serde_json::Value>)) -> Result<u64> {
+    visit_catalog_pages_to_tail(ds, visit).await.map(|(bytes, _)| bytes)
+}
+
+/// [`visit_catalog_pages`], also returning the last page's `Stream-Next-Offset`: where the read
+/// ended. A read answered 404 part-way stops there as if it were up to date, so a caller that must
+/// know it saw the whole log compares this with the tail a `HEAD` reported.
+async fn visit_catalog_pages_to_tail(
+    ds: &DsClient,
+    mut visit: impl FnMut(Vec<serde_json::Value>),
+) -> Result<(u64, Option<String>)> {
     let mut off = "-1".to_string();
     let mut bytes = 0u64;
     loop {
@@ -678,7 +688,7 @@ async fn visit_catalog_pages(ds: &DsClient, mut visit: impl FnMut(Vec<serde_json
         visit(page);
         match next {
             Some(next) if !up_to_date && next != off => off = next,
-            _ => return Ok(bytes),
+            last => return Ok((bytes, last)),
         }
     }
 }
@@ -1045,6 +1055,8 @@ pub(crate) struct CatalogFold {
     /// `"<t> <eid>: <decode error>"` for the first few of those, so a refusal can name them.
     /// Bounded by [`UNDECODED_SAMPLES`]; never logged at boot.
     undecoded_samples: Vec<String>,
+    /// The last page's `Stream-Next-Offset`: where the read that built this fold ended.
+    read_tail: Option<String>,
     /// The first `StoreBound` (event zero of a coupled-pilot catalog), kept for `retire-generation`:
     /// it names the generation the catalog was written for, and it is incident evidence.
     store_bound: Option<crate::store_identity::StoreBound>,
@@ -1074,6 +1086,7 @@ impl Default for CatalogFold {
             newest_at: None,
             undecoded: 0,
             undecoded_samples: Vec::new(),
+            read_tail: None,
             store_bound: None,
             checkpointed: false,
         }
@@ -1260,6 +1273,11 @@ impl CatalogFold {
     /// How many events the fold skipped because they would not decode.
     pub(crate) fn undecoded(&self) -> u64 {
         self.undecoded
+    }
+
+    /// Where the read that built this fold ended (the last page's `Stream-Next-Offset`).
+    pub(crate) fn read_tail(&self) -> Option<&str> {
+        self.read_tail.as_deref()
     }
 
     /// `"<t> <eid>: <decode error>"` for the first few skipped events.
@@ -1476,7 +1494,7 @@ impl Engine {
         let mut fold = CatalogFold::default();
         let mut binding = expected.map(StoreBindingCheck::new);
         let mut fold_result = Ok(());
-        let bytes = visit_catalog_pages(ds, |page| {
+        let (bytes, read_tail) = visit_catalog_pages_to_tail(ds, |page| {
             if let Some(binding) = &mut binding {
                 binding.observe_page(&page);
                 if binding.result.is_err() {
@@ -1550,6 +1568,7 @@ impl Engine {
             binding.finish()?;
         }
         fold_result?;
+        fold.read_tail = read_tail;
         tracing::info!(catalog_bytes = bytes, "catalog read complete");
         Ok((fold, bytes))
     }
