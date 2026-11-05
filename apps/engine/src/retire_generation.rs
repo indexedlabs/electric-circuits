@@ -295,8 +295,14 @@ pub async fn plan(ds: &DsClient, catalog: &CatalogPath, own_generation: &str, no
         }
     })?;
     // The fold must cover the whole catalog: a read that stopped early leaves out every stream the
-    // later pages name, and the catalog is their only index.
+    // later pages name, and the catalog is their only index. A read that ended elsewhere than the
+    // first HEAD's tail is either a writer appending meanwhile or a page missing; a second HEAD
+    // tells them apart, so a live writer is reported as one rather than as a transient read fault.
     if fold.read_tail() != head.next_offset.as_deref() {
+        let now = ds.head(CATALOG_STREAM).await.context("re-checking the catalog stream")?.map(|h| h.next_offset);
+        if now.as_ref() != Some(&head.next_offset) {
+            bail!(Refusal::CatalogMoved { before: head.next_offset.clone(), after: now.flatten() });
+        }
         bail!(Refusal::IncompleteRead { read_to: fold.read_tail().map(str::to_owned), tail: head.next_offset.clone() });
     }
     if let Some(bound) = fold.store_bound()

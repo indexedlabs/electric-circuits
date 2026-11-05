@@ -63,6 +63,10 @@ struct StoreState {
     page_size: Option<usize>,
     /// A read of this path at this offset answers 404, as a proxy or failover can mid-read.
     missing_page: Option<(String, usize)>,
+    /// On the nth GET of this path, append one event to it first: an engine writing the catalog
+    /// while it is read.
+    append_on_get: Option<(String, usize)>,
+    gets: BTreeMap<String, usize>,
 }
 
 #[derive(Clone)]
@@ -149,26 +153,38 @@ async fn handle(State(state): State<Arc<Mutex<StoreState>>>, req: Request) -> Re
                 }
             }
         }
-        Method::GET => match st.streams.get(&path) {
-            None => StatusCode::NOT_FOUND.into_response(),
-            Some(_) if st.missing_page.as_ref().is_some_and(|(p, at)| *p == path && *at == offset) => {
-                StatusCode::NOT_FOUND.into_response()
+        Method::GET => {
+            let n = {
+                let count = st.gets.entry(path.clone()).or_default();
+                *count += 1;
+                *count
+            };
+            if st.append_on_get.as_ref().is_some_and(|(p, at)| *p == path && *at == n)
+                && let Some(stream) = st.streams.get_mut(&path)
+            {
+                stream.events.push(json!({"t": "offset", "eid": "late-writer", "pos": {"segment": 1, "offset": "-1"}}));
             }
-            Some(stream) => {
-                let total = stream.events.len();
-                let end = st.page_size.map_or(total, |size| (offset + size).min(total));
-                let page = &stream.events[offset.min(total)..end];
-                let mut res = (
-                    [("stream-next-offset", end.to_string()), ("content-type", "application/json".to_string())],
-                    serde_json::to_string(page).unwrap(),
-                )
-                    .into_response();
-                if end == total {
-                    res.headers_mut().insert("stream-up-to-date", "true".parse().unwrap());
+            match st.streams.get(&path) {
+                None => StatusCode::NOT_FOUND.into_response(),
+                Some(_) if st.missing_page.as_ref().is_some_and(|(p, at)| *p == path && *at == offset) => {
+                    StatusCode::NOT_FOUND.into_response()
                 }
-                res
+                Some(stream) => {
+                    let total = stream.events.len();
+                    let end = st.page_size.map_or(total, |size| (offset + size).min(total));
+                    let page = &stream.events[offset.min(total)..end];
+                    let mut res = (
+                        [("stream-next-offset", end.to_string()), ("content-type", "application/json".to_string())],
+                        serde_json::to_string(page).unwrap(),
+                    )
+                        .into_response();
+                    if end == total {
+                        res.headers_mut().insert("stream-up-to-date", "true".parse().unwrap());
+                    }
+                    res
+                }
             }
-        },
+        }
         Method::POST => {
             let Some(stream) = st.streams.get_mut(&path) else {
                 return StatusCode::NOT_FOUND.into_response();
@@ -721,6 +737,24 @@ async fn a_catalog_read_that_ends_early_is_refused() {
         "names both offsets: {}",
         run.stderr
     );
+    assert_eq!(store.destructive_requests(), Vec::<String>::new());
+    assert_eq!(store.paths(), before);
+}
+
+/// A writer appending between the first HEAD and the read makes the read end past that HEAD's
+/// tail. It is reported as a live writer, not as a missing page, so the operator does not mistake
+/// it for a transient fault and re-run into a generation that is still being written.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_appended_to_before_it_is_read_is_refused_as_written() {
+    let store = store_with_v1(now() - 20 * DAY).await;
+    store.state.lock().unwrap().append_on_get = Some((v1_catalog(), 1));
+    let before = store.paths();
+
+    let run = retire(&store, &[&v1_catalog(), "--confirm"]).await;
+
+    assert_eq!(run.code, 78, "stdout: {}\nstderr: {}", run.stdout, run.stderr);
+    assert!(run.stderr.contains("an engine is writing it"), "the writer message: {}", run.stderr);
+    assert!(!run.stderr.contains("a page was missing"), "not the missing-page message: {}", run.stderr);
     assert_eq!(store.destructive_requests(), Vec::<String>::new());
     assert_eq!(store.paths(), before);
 }
