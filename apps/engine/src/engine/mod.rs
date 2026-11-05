@@ -1600,6 +1600,8 @@ impl Engine {
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
+    /// It skips the config's stream TTL floor and sweep checks, so a client with a stream TTL
+    /// belongs on [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library).
     pub async fn new(admission: StoreAdmission) -> Result<Self> {
         let bytes = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
         let engine =
@@ -1610,6 +1612,8 @@ impl Engine {
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
     /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
+    /// It skips the config's stream TTL floor and sweep checks, so a client with a stream TTL
+    /// belongs on [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library).
     pub fn new_pg(admission: StoreAdmission, pg_url: String) -> Self {
         Self::new_pg_with_setup(admission, pg_url, PostgresSetup::EngineManaged)
     }
@@ -1617,6 +1621,8 @@ impl Engine {
     /// Engine in Postgres mode where a trusted control plane owns DDL.
     /// `setup_postgres` validates the exact existing publication and replica
     /// identity rather than trying to broaden the Engine's database grants.
+    /// It skips the config's stream TTL floor and sweep checks, so a client with a stream TTL
+    /// belongs on [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library).
     pub fn new_pg_with_setup(admission: StoreAdmission, pg_url: String, setup: PostgresSetup) -> Self {
         let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup, None, None);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
