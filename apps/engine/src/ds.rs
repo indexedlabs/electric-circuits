@@ -1408,8 +1408,8 @@ impl DsClient {
     /// An existing stream whose configuration differs — one created before the TTL was set, or
     /// with another TTL — keeps that configuration and is opened as it is. The store answers that
     /// PUT `409`, the same answer it gives a closed or soft-deleted stream, so a `HEAD` tells them
-    /// apart: only a live stream that is not closed counts as existing, and every other `409`
-    /// keeps its meaning.
+    /// apart: only a live stream that is not closed counts as existing, a `5xx` on the `HEAD` stays
+    /// retryable, and every other `409` keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
         let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
@@ -1420,6 +1420,11 @@ impl DsClient {
             let head = self.store.head(&physical_path).await?;
             if head.status == 200 && !head.closed {
                 return Ok(());
+            }
+            // The store failed to answer, which says nothing about the stream: keep it retryable
+            // (`DsUnavailable`) rather than reporting the PUT's 409 as a refusal.
+            if (500..600).contains(&head.status) {
+                return Err(status_error("HEAD", path, head.status, ""));
             }
         }
         Err(status_error("PUT", path, res.status, &res.body_or_default()))
@@ -3879,5 +3884,14 @@ mod tests {
         let (closed_put, heads) = ensure(Some(false), 0, true).await;
         assert!(closed_put.is_err(), "a 409 with stream-closed keeps its meaning");
         assert_eq!(heads, 0, "a 409 with stream-closed is answered without a HEAD");
+
+        // A store that fails the confirming HEAD has said nothing about the stream: the error is
+        // retryable, so a boot backs off instead of exiting 78 on a 409 it never confirmed.
+        let store = Arc::new(ScriptedStore { ensure_status: 409, head_status: 503, ..Default::default() });
+        let client =
+            DsClient::with_test_store("scripted://ttl".into(), store).with_stream_ttl(NonZeroU64::new(1_814_400));
+        let blip = client.ensure_stream("changes/3").await.expect_err("a failed HEAD is not an open stream");
+        assert!(is_unavailable(&blip), "a 5xx on the HEAD is DsUnavailable: {blip:#}");
+        assert!(format!("{blip:#}").contains("HEAD changes/3 -> 503"), "{blip:#}");
     }
 }
