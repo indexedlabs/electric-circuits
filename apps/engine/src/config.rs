@@ -146,6 +146,11 @@ pub struct Config {
     /// (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, seconds). Unset or `0` sends none. A non-zero value
     /// under [`crate::retention::stream_ttl_floor`] refuses the boot.
     pub stream_ttl: Option<std::num::NonZeroU64>,
+    /// Shape retention windows and sweep interval, resolved from the same getter as `stream_ttl`
+    /// so the TTL checks and the engine use one set of values.
+    pub retention: crate::retention::RetentionConfig,
+    /// Change-log segmentation and retain window, resolved like `retention`.
+    pub change_log: crate::changelog::ChangeLogConfig,
     /// How long a graceful shutdown may take before it is forced
     /// (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`).
     pub shutdown_grace: Duration,
@@ -662,11 +667,10 @@ impl Config {
                 )
             })?),
         };
+        let retention = crate::retention::RetentionConfig::resolve(&g);
+        let change_log = crate::changelog::ChangeLogConfig::resolve(&g);
         if let Some(ttl) = stream_ttl {
-            let Some(floor) = crate::retention::stream_ttl_floor(
-                &crate::retention::RetentionConfig::resolve(&g),
-                &crate::changelog::ChangeLogConfig::resolve(&g),
-            ) else {
+            let Some(floor) = crate::retention::stream_ttl_floor(&retention, &change_log) else {
                 bail!(
                     "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
                      ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
@@ -681,7 +685,7 @@ impl Config {
                     floor.as_secs()
                 );
             }
-            let sweep = crate::retention::RetentionConfig::resolve(&g).sweep_interval;
+            let sweep = retention.sweep_interval;
             if sweep >= Duration::from_secs(ttl.get()) / 4 {
                 bail!(
                     "ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS is {}s, not under a quarter of \
@@ -776,6 +780,8 @@ impl Config {
             subq_storage: crate::subq_circuit::StorageSettings::resolve(g),
             backfill,
             stream_ttl,
+            retention,
+            change_log,
             shutdown_grace,
             shutdown_ready_drain,
             sources,

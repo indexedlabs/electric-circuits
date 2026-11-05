@@ -1806,7 +1806,7 @@ impl Engine {
         let changes = ChangeLogWriter::new(
             ds.clone(),
             Arc::new(ChangesState::default()),
-            crate::changelog::ChangeLogConfig::from_env(),
+            config.map_or_else(crate::changelog::ChangeLogConfig::from_env, |c| c.change_log),
             {
                 let catalog_tx = catalog_tx.clone();
                 Arc::new(move |segment, at| catalog_tx.send(CatalogEvent::ChangesRotated { segment, at }))
@@ -1880,7 +1880,7 @@ impl Engine {
             seq_highwater: Arc::new(std::sync::Mutex::new(None)),
             restore_reads_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            retention: Arc::new(RetentionConfig::from_env()),
+            retention: Arc::new(config.map_or_else(RetentionConfig::from_env, |c| c.retention.clone())),
             reactivation_permits: Arc::new(tokio::sync::Semaphore::new(
                 std::env::var("ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY")
                     .ok()
