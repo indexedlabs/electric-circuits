@@ -1193,6 +1193,36 @@ pub struct DsClient {
     born: std::time::Instant,
 }
 
+/// An access recorded for a request in flight (see [`DsClient::begin_access`]). `previous` is the
+/// record it replaced, `None` when the client has no TTL and nothing was recorded.
+struct PendingAccess<'a> {
+    client: &'a DsClient,
+    path: &'a str,
+    previous: Option<Option<std::time::Instant>>,
+}
+
+impl PendingAccess<'_> {
+    /// The request slid the TTL: keep the record.
+    fn keep(mut self) {
+        self.previous = None;
+    }
+}
+
+impl Drop for PendingAccess<'_> {
+    fn drop(&mut self) {
+        let Some(previous) = self.previous.take() else { return };
+        let mut accessed = self.client.accessed.lock().unwrap();
+        match previous {
+            Some(at) => {
+                accessed.insert(self.path.to_string(), at);
+            }
+            None => {
+                accessed.remove(self.path);
+            }
+        }
+    }
+}
+
 struct FailedAppend<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl<'a> FailedAppend<'a> {
@@ -1248,24 +1278,15 @@ impl DsClient {
         }
     }
 
-    /// Record an access for a request in flight, returning what to put back if it slides nothing
-    /// (`None` without a TTL: nothing was recorded).
-    fn begin_access(&self, path: &str) -> Option<Option<std::time::Instant>> {
-        self.stream_ttl
+    /// Record an access for a request in flight. Unless the returned guard is kept, dropping it
+    /// puts the previous record back, so a request that fails, answers non-2xx or is cancelled
+    /// slides nothing in the access record either.
+    fn begin_access<'a>(&'a self, path: &'a str) -> PendingAccess<'a> {
+        let previous = self
+            .stream_ttl
             .is_some()
-            .then(|| self.accessed.lock().unwrap().insert(path.to_string(), std::time::Instant::now()))
-    }
-
-    fn restore_access(&self, path: &str, previous: Option<Option<std::time::Instant>>) {
-        match previous {
-            Some(Some(at)) => {
-                self.accessed.lock().unwrap().insert(path.to_string(), at);
-            }
-            Some(None) => {
-                self.accessed.lock().unwrap().remove(path);
-            }
-            None => {}
-        }
+            .then(|| self.accessed.lock().unwrap().insert(path.to_string(), std::time::Instant::now()));
+        PendingAccess { client: self, path, previous }
     }
 
     /// How long since this process last appended to or read `path`; `None` when it never has, so
@@ -1499,23 +1520,19 @@ impl DsClient {
         let physical_path = self.physical_path(path)?;
         // While the PUT is in flight the stream counts as accessed, so a keep-alive sweep that runs
         // meanwhile neither touches a stream that does not exist yet (a 404) nor ages it from boot.
-        // Only a 2xx slides the TTL on the store, so any other answer puts the previous record
-        // back: an existing stream opened through a config-mismatch 409 stays as due as it was.
-        let previous = self.begin_access(path);
-        let res = match self.store.ensure(&physical_path, "application/json", self.stream_ttl).await {
-            Ok(res) => res,
-            Err(error) => {
-                self.restore_access(path, previous);
-                return Err(error);
-            }
-        };
+        // Only a 2xx slides the TTL on the store, so the guard puts the previous record back on any
+        // other answer, an error or a cancelled PUT: an existing stream opened through a
+        // config-mismatch 409 stays as due as it was.
+        let pending = self.begin_access(path);
+        let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
         if (200..300).contains(&res.status) {
             // A create (or a matching re-create, which the store treats as an access) starts the
             // stream's TTL clock.
+            pending.keep();
             self.note_access(path, res.status);
             return Ok(());
         }
-        self.restore_access(path, previous);
+        drop(pending);
         if res.status == 409 && !res.closed {
             let head = self.store.head(&physical_path).await?;
             if head.status == 200 && !head.closed {
@@ -4008,6 +4025,19 @@ mod tests {
         plain.append_json("meta/catalog", &[serde_json::json!({"t": "x"})]).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(plain.touched_ago("meta/catalog"), None, "no TTL, no record");
+    }
+
+    /// A `PUT` that fails slides nothing, so the stream keeps the access record it had before.
+    #[tokio::test]
+    async fn a_failed_put_keeps_the_streams_older_access_record() {
+        let store = Arc::new(ScriptedStore { ensure_status: 503, ..Default::default() });
+        let client = DsClient::with_test_store("scripted://ttl".into(), store).with_stream_ttl(NonZeroU64::new(3600));
+        client.touch("shape/s1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let failed = client.ensure_stream("shape/s1").await.expect_err("a 503 PUT fails");
+        assert!(is_unavailable(&failed), "{failed:#}");
+        let ago = client.touched_ago("shape/s1").expect("the older record is still there");
+        assert!(ago >= std::time::Duration::from_millis(50), "the failed PUT did not refresh it: {ago:?}");
     }
 
     /// `#c-old-stream-config`: a create the store refuses with a config-mismatch `409` opens a live,

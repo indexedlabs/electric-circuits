@@ -5700,6 +5700,31 @@ mod stream_ttl_tests {
         assert!(touches(&mut reads).contains(&"shape/s1".to_string()), "the sweep touches it");
     }
 
+    /// A create cancelled while its `PUT` is pending (a client disconnect, a shutdown `select!`, an
+    /// abort) leaves no access record behind, so the stream stays due and the next sweep touches it.
+    #[tokio::test]
+    async fn a_cancelled_create_leaves_the_stream_due() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let put = Arc::new(crate::ds::BodyGate::default());
+        *store.ensure_gate.lock().unwrap() = Some(put.clone());
+        let engine = engine_with_shapes(store.clone(), &["s1"]).await;
+        let create = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.ds.ensure_stream("shape/s1").await }
+        });
+        put.entered.notified().await;
+        assert!(engine.ds.touched_ago("shape/s1").is_some(), "in flight, it counts as accessed");
+        create.abort();
+        assert!(create.await.unwrap_err().is_cancelled());
+        assert_eq!(engine.ds.touched_ago("shape/s1"), None, "the cancelled PUT left no record");
+
+        *store.ensure_gate.lock().unwrap() = None;
+        engine.sweep_stream_ttl().await;
+        assert!(touches(&mut reads).contains(&"shape/s1".to_string()), "the next sweep touches it");
+    }
+
     /// A tracked stream the store has lost (it answers 404 and nothing creates it again) is a
     /// failed touch: the keep-alive cannot keep it, and that must not be hidden as "gone".
     #[tokio::test]
