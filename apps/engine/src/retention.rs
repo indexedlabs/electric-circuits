@@ -167,9 +167,11 @@ impl RetentionConfig {
 /// (disabled): a shape may then stay forever, and no TTL is safe. A retain window of `0` adds
 /// nothing to the floor, since dormancy eviction still unpins the segment a dormant shape holds.
 ///
-/// The floor alone does not keep a tracked stream alive. A stream the engine neither appends to nor
-/// reads, such as a restored dormant shape whose dormancy clock restarted at boot, still expires
-/// unless something reads it; `HEAD` does not slide the TTL.
+/// The floor alone does not keep a tracked stream alive: a stream the engine neither appends to nor
+/// reads, such as a restored dormant shape whose dormancy clock restarted at boot, would still
+/// expire. The keep-alive sweep (`Engine::sweep_stream_ttl`, on its own timer at the retention
+/// sweep interval) reads each of them at its tail at least once per quarter TTL; `HEAD` does not
+/// slide the TTL.
 pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog::ChangeLogConfig) -> Option<Duration> {
     if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() {
         return None;

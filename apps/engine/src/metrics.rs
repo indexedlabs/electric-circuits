@@ -134,6 +134,16 @@ pub struct Metrics {
     pub epoch_resets: AtomicU64, // ADR-0004: new epochs bound (every shape retired, fresh slot)
     pub changes_rotations: AtomicU64, // ADR-0006: change-log segments closed and succeeded
     pub changes_segments_deleted: AtomicU64, // ADR-0006: rotated-out segments retired (nothing could resume inside)
+    /// Keep-alive reads that slid a tracked stream's `Stream-TTL` (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`).
+    pub stream_ttl_touches: AtomicU64,
+    /// Keep-alive reads that failed; the stream stays due and the next sweep tries it again.
+    pub stream_ttl_touch_failures: AtomicU64,
+    /// GAUGE that ages by itself: the longest any tracked stream had gone without an append, read
+    /// or touch when the latest keep-alive sweep finished, and when that was. Read through
+    /// [`Self::stream_ttl_oldest_untouched_secs`], which adds the time since, so a sweep that
+    /// stalls or dies shows as a rising age rather than a frozen healthy one. `None` (reported
+    /// as 0) while no TTL is set.
+    stream_ttl_untouched: std::sync::Mutex<Option<(std::time::Instant, std::time::Duration)>>,
     /// Catalog appends re-attempted because durable-streams was unavailable. Never a dropped event
     /// (the writer retries in place, forever) — this is the visible cost of that promise, and a
     /// climbing value with a flat `shapes_*` means creates are waiting on storage.
@@ -261,6 +271,9 @@ impl Metrics {
             epoch_resets: AtomicU64::new(0),
             changes_rotations: AtomicU64::new(0),
             changes_segments_deleted: AtomicU64::new(0),
+            stream_ttl_touches: AtomicU64::new(0),
+            stream_ttl_touch_failures: AtomicU64::new(0),
+            stream_ttl_untouched: std::sync::Mutex::new(None),
             changes_segments_retained: AtomicU64::new(0),
             catalog_append_retries: AtomicU64::new(0),
             catalog_restore_retired: AtomicU64::new(0),
@@ -302,6 +315,24 @@ impl Metrics {
         crate::statsd::Emitter::new(&self.stack_id, self.source_mode)
     }
 
+    /// Start the untouched-age clock at boot when a TTL is set: until a keep-alive sweep finishes,
+    /// every tracked stream has been untouched since then.
+    pub(crate) fn arm_stream_ttl_age(&self) {
+        self.stream_ttl_untouched.lock().unwrap().get_or_insert((std::time::Instant::now(), Default::default()));
+    }
+
+    /// A keep-alive sweep finished with `oldest` the longest any tracked stream had gone untouched.
+    pub(crate) fn record_stream_ttl_sweep(&self, oldest: std::time::Duration) {
+        *self.stream_ttl_untouched.lock().unwrap() = Some((std::time::Instant::now(), oldest));
+    }
+
+    /// The exported untouched age: the age at the latest finished sweep plus the time since. No
+    /// tracked stream can be older, since only a sweep or an append or read touches one, and the
+    /// value keeps rising when sweeps stop.
+    pub fn stream_ttl_oldest_untouched_secs(&self) -> u64 {
+        self.stream_ttl_untouched.lock().unwrap().map_or(0, |(at, oldest)| (oldest + at.elapsed()).as_secs())
+    }
+
     pub fn snapshot(&self) -> serde_json::Value {
         let mut snapshot = self.snapshot_core();
         // Added outside the literal below, which is at `json!`'s macro recursion limit.
@@ -310,9 +341,14 @@ impl Metrics {
                 ("electric_snapshot_builds_total", &self.electric_snapshot_builds),
                 ("electric_snapshot_joins_total", &self.electric_snapshot_joins),
                 ("electric_snapshot_reuses_total", &self.electric_snapshot_reuses),
+                ("stream_ttl_touches_total", &self.stream_ttl_touches),
+                ("stream_ttl_touch_failures_total", &self.stream_ttl_touch_failures),
             ] {
                 counters.insert(name.into(), counter.load(Ordering::Relaxed).into());
             }
+        }
+        if let Some(gauges) = snapshot["gauges"].as_object_mut() {
+            gauges.insert("stream_ttl_oldest_untouched_seconds".into(), self.stream_ttl_oldest_untouched_secs().into());
         }
         snapshot
     }
@@ -415,6 +451,8 @@ impl Metrics {
         self.epoch_resets.store(0, Ordering::Relaxed);
         self.changes_rotations.store(0, Ordering::Relaxed);
         self.changes_segments_deleted.store(0, Ordering::Relaxed);
+        self.stream_ttl_touches.store(0, Ordering::Relaxed);
+        self.stream_ttl_touch_failures.store(0, Ordering::Relaxed);
         self.catalog_append_retries.store(0, Ordering::Relaxed);
         self.catalog_restore_retired.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);

@@ -1593,6 +1593,18 @@ fn sid_of_path(stream_path: &str) -> &str {
     stream_path.strip_prefix("shape/").unwrap_or(stream_path)
 }
 
+/// The config-less public constructors cannot check a stream TTL against the sweep and retention
+/// windows, so they refuse a client that has one.
+fn refuse_stream_ttl_without_config(ds: &DsClient) -> Result<()> {
+    if ds.stream_ttl().is_some() {
+        bail!(
+            "a Durable Streams client with a stream TTL must go through Engine::new_with_config or \
+             Engine::boot_library, which check the TTL against the sweep and retention windows"
+        );
+    }
+    Ok(())
+}
+
 impl Engine {
     pub(crate) fn group_stream_path(&self) -> String {
         format!("shape/group-{}-{}", self.sub_nonce, uuid::Uuid::new_v4())
@@ -1600,7 +1612,11 @@ impl Engine {
     /// Construct a library engine after checking store bindings across every catalog page.
     /// Fails before engine tasks or control surfaces exist if the read or binding check fails.
     /// Cancellation during validation releases the current page and starts no engine work.
+    /// It refuses a client with a stream TTL with an error: that client belongs on
+    /// [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library), which check
+    /// the TTL against the sweep and retention windows.
     pub async fn new(admission: StoreAdmission) -> Result<Self> {
+        refuse_stream_ttl_without_config(&admission.ds)?;
         let bytes = Self::check_catalog_binding(&admission.ds, &admission.binding).await?;
         let engine =
             Self::new_inner(admission.ds, None, Some(admission.binding), PostgresSetup::EngineManaged, None, None);
@@ -1610,6 +1626,9 @@ impl Engine {
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
     /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
+    /// It refuses (panics on) a client with a stream TTL: that client belongs on
+    /// [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library), which check
+    /// the TTL against the sweep and retention windows.
     pub fn new_pg(admission: StoreAdmission, pg_url: String) -> Self {
         Self::new_pg_with_setup(admission, pg_url, PostgresSetup::EngineManaged)
     }
@@ -1617,7 +1636,13 @@ impl Engine {
     /// Engine in Postgres mode where a trusted control plane owns DDL.
     /// `setup_postgres` validates the exact existing publication and replica
     /// identity rather than trying to broaden the Engine's database grants.
+    /// It refuses (panics on) a client with a stream TTL: that client belongs on
+    /// [`new_with_config`](Self::new_with_config) or [`boot_library`](Self::boot_library), which check
+    /// the TTL against the sweep and retention windows.
     pub fn new_pg_with_setup(admission: StoreAdmission, pg_url: String, setup: PostgresSetup) -> Self {
+        if let Err(error) = refuse_stream_ttl_without_config(&admission.ds) {
+            panic!("{error}");
+        }
         let e = Self::new_inner(admission.ds, Some(pg_url), Some(admission.binding), setup, None, None);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
@@ -1664,13 +1689,28 @@ impl Engine {
 
     /// Construct using resolved storage/pool settings. Library mode checks bindings across all catalog
     /// pages before construction; errors/cancellation start no engine work. Postgres mode remains
-    /// waiting until `setup_postgres` validates the catalog and completes boot.
+    /// waiting until `setup_postgres` validates the catalog and completes boot. The client's stream
+    /// TTL must equal `config.stream_ttl`, set with `DsClient::with_stream_ttl` before `admit_store`,
+    /// or construction fails.
     pub async fn new_with_config(
         mut admission: StoreAdmission,
         pg_url: Option<String>,
         setup: PostgresSetup,
         config: &crate::config::Config,
     ) -> Result<Self> {
+        // A config changed after `Config::resolve` is checked again with the values the engine uses.
+        config.check_stream_ttl()?;
+        // The client's TTL is the one that created the catalog in `admit_store`, so it stays the
+        // authority: a config that disagrees is refused rather than applied after the fact.
+        if admission.ds.stream_ttl() != config.stream_ttl {
+            bail!(
+                "the Durable Streams client's stream TTL ({}) differs from the configured \
+                 ELECTRIC_CIRCUITS_STREAM_TTL_SECS ({}); set it on the DsClient with \
+                 `with_stream_ttl(config.stream_ttl)` before `admit_store`",
+                admission.ds.stream_ttl().map_or("none".to_string(), |ttl| format!("{ttl}s")),
+                config.stream_ttl.map_or("none".to_string(), |ttl| format!("{ttl}s")),
+            );
+        }
         let bytes = if pg_url.is_none() {
             admission.ds = admission.ds.with_memory_budget(config);
             Some(Self::check_catalog_binding(&admission.ds, &admission.binding).await?)
@@ -1793,7 +1833,7 @@ impl Engine {
         let changes = ChangeLogWriter::new(
             ds.clone(),
             Arc::new(ChangesState::default()),
-            crate::changelog::ChangeLogConfig::from_env(),
+            config.map_or_else(crate::changelog::ChangeLogConfig::from_env, |c| c.change_log),
             {
                 let catalog_tx = catalog_tx.clone();
                 Arc::new(move |segment, at| catalog_tx.send(CatalogEvent::ChangesRotated { segment, at }))
@@ -1867,7 +1907,7 @@ impl Engine {
             seq_highwater: Arc::new(std::sync::Mutex::new(None)),
             restore_reads_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lives: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            retention: Arc::new(RetentionConfig::from_env()),
+            retention: Arc::new(config.map_or_else(RetentionConfig::from_env, |c| c.retention.clone())),
             reactivation_permits: Arc::new(tokio::sync::Semaphore::new(
                 std::env::var("ELECTRIC_CIRCUITS_REACTIVATION_CONCURRENCY")
                     .ok()
@@ -1895,6 +1935,9 @@ impl Engine {
         // The streams client must be able to ask the engine whether a terminal append answer is
         // real before a live shape's batch is discarded (see `Engine::install_gone_reconciler`).
         engine.install_gone_reconciler();
+        if engine.ds.stream_ttl().is_some() {
+            engine.metrics.arm_stream_ttl_age();
+        }
         engine.ensure_degrade_reaper();
         crate::electric::ensure_evictor(&engine);
         crate::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));

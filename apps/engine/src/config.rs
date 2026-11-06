@@ -146,6 +146,11 @@ pub struct Config {
     /// (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, seconds). Unset or `0` sends none. A non-zero value
     /// under [`crate::retention::stream_ttl_floor`] refuses the boot.
     pub stream_ttl: Option<std::num::NonZeroU64>,
+    /// Shape retention windows and sweep interval, resolved from the same getter as `stream_ttl`
+    /// so the TTL checks and the engine use one set of values.
+    pub retention: crate::retention::RetentionConfig,
+    /// Change-log segmentation and retain window, resolved like `retention`.
+    pub change_log: crate::changelog::ChangeLogConfig,
     /// How long a graceful shutdown may take before it is forced
     /// (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`).
     pub shutdown_grace: Duration,
@@ -662,26 +667,8 @@ impl Config {
                 )
             })?),
         };
-        if let Some(ttl) = stream_ttl {
-            let Some(floor) = crate::retention::stream_ttl_floor(
-                &crate::retention::RetentionConfig::resolve(&g),
-                &crate::changelog::ChangeLogConfig::resolve(&g),
-            ) else {
-                bail!(
-                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
-                     ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
-                     TTL is safe"
-                );
-            };
-            if Duration::from_secs(ttl.get()) < floor {
-                bail!(
-                    "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
-                     idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
-                     stream the engine still tracks",
-                    floor.as_secs()
-                );
-            }
-        }
+        let retention = crate::retention::RetentionConfig::resolve(&g);
+        let change_log = crate::changelog::ChangeLogConfig::resolve(&g);
 
         let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
         let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;
@@ -735,7 +722,7 @@ impl Config {
             }
         };
 
-        Ok(Config {
+        let config = Config {
             pg_url,
             ds_url,
             ds_connection,
@@ -767,11 +754,53 @@ impl Config {
             subq_storage: crate::subq_circuit::StorageSettings::resolve(g),
             backfill,
             stream_ttl,
+            retention,
+            change_log,
             shutdown_grace,
             shutdown_ready_drain,
             sources,
             noop_vars: Vec::new(),
-        })
+        };
+        config.check_stream_ttl()?;
+        Ok(config)
+    }
+
+    /// Check the sweep interval (never zero) and a non-zero `stream_ttl` against the retention
+    /// windows and sweep interval this config carries: the floor, a disabled idle or dormancy
+    /// window, and the quarter-TTL sweep. Run by
+    /// `resolve` and again by `Engine::new_with_config`, so a config changed after resolving is
+    /// checked with the values the engine will use.
+    pub fn check_stream_ttl(&self) -> Result<()> {
+        // The retention and keep-alive timers cannot run on a zero period, TTL or not.
+        if self.retention.sweep_interval.is_zero() {
+            bail!("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS must be at least 1 second");
+        }
+        let Some(ttl) = self.stream_ttl else { return Ok(()) };
+        let Some(floor) = crate::retention::stream_ttl_floor(&self.retention, &self.change_log) else {
+            bail!(
+                "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, but ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS or \
+                 ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS is 0 (disabled), so a shape may stay forever and no \
+                 TTL is safe"
+            );
+        };
+        if Duration::from_secs(ttl.get()) < floor {
+            bail!(
+                "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
+                 idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
+                 stream the engine still tracks",
+                floor.as_secs()
+            );
+        }
+        let sweep = self.retention.sweep_interval;
+        if sweep >= Duration::from_secs(ttl.get()) / 4 {
+            bail!(
+                "ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS is {}s, not under a quarter of \
+                 ELECTRIC_CIRCUITS_STREAM_TTL_SECS ({ttl}s): the keep-alive sweep must come round well before \
+                 a tracked stream's TTL can lapse",
+                sweep.as_secs()
+            );
+        }
+        Ok(())
     }
 
     /// Resolve from the real process environment, then scan it for accepted-no-op `ELECTRIC_*` vars.
@@ -1520,6 +1549,7 @@ mod tests {
             ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
             ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
             ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
+            ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
             ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "8"),
         ];
         assert_eq!(cfg(&short).stream_ttl.map(|t| t.get()), Some(8));
@@ -1550,6 +1580,33 @@ mod tests {
             ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "1000000000"),
         ]);
         assert!(idle_off.is_err_and(|e| format!("{e:#}").contains("0 (disabled)")), "idle 0 refuses with retain 0 too");
+
+        // `#c-sweep-inside-ttl`: the keep-alive sweep must run more often than a quarter of the TTL.
+        let sweep = |secs: &str| {
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
+                ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
+                ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "40"),
+                ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", secs),
+            ])
+        };
+        assert!(sweep("9").is_ok());
+        let err = sweep("10").expect_err("a sweep interval of a quarter TTL refuses to start");
+        assert!(format!("{err:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{err:#}");
+        // A quarter of a TTL that 4 does not divide is compared at sub-second precision, not
+        // truncated: a quarter of 10 s is 2.5 s, so a 2 s sweep starts and a 3 s sweep does not.
+        let uneven = |secs: &str| {
+            try_cfg(&[
+                ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "2"),
+                ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "2"),
+                ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "10"),
+                ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", secs),
+            ])
+        };
+        assert!(uneven("2").is_ok(), "2 s is under a quarter of 10 s");
+        assert!(uneven("3").is_err(), "3 s is not");
 
         let err = try_cfg(&[("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "21d")]).expect_err("not a number");
         assert!(format!("{err:#}").contains("whole number of seconds"));
