@@ -1,6 +1,6 @@
 # Build + test on every push/PR: Rust engine unit tests, then the full TS suite (unit + the
-# conformance harness, which boots its own ephemeral logical-replication Postgres — the runner
-# image ships the PostgreSQL server binaries; they just need to be on PATH).
+# conformance harness, which boots its own ephemeral logical-replication Postgres — a step below
+# installs the PostgreSQL 18 server binaries and puts them on PATH).
 name: ci
 
 on:
@@ -11,7 +11,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # A fork pull request keeps a GitHub-hosted runner: its code never runs on
+    # a Mighty runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","mighty-ci-8x32"]') }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
