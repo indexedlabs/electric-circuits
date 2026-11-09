@@ -22,7 +22,7 @@ jobs:
     concurrency:
       group: dbsp-benchmark-${{ github.event.pull_request.number || inputs.head }}
       cancel-in-progress: false
-    runs-on: [self-hosted, mighty-ci-8x16]
+    runs-on: [self-hosted, mighty-ci-8x32]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4

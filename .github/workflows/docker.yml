@@ -22,20 +22,22 @@ permissions:
 
 jobs:
   image:
-    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    # A fork pull request keeps a GitHub-hosted runner: its code never runs on
+    # a Mighty runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON(format('["self-hosted","{0}"]', matrix.runner)) }}
     timeout-minutes: 45
     strategy:
       matrix:
         include:
           - name: engine
             dockerfile: docker/Dockerfile.engine
-            runner: mighty-ci-8x16
+            runner: mighty-ci-8x32
           - name: node
             dockerfile: docker/Dockerfile.node
             runner: mighty-ci-4x8
           - name: electric
             dockerfile: docker/Dockerfile.electric
-            runner: mighty-ci-8x16
+            runner: mighty-ci-8x32
     steps:
       - uses: actions/checkout@v4
 
