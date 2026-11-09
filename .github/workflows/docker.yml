@@ -22,17 +22,20 @@ permissions:
 
 jobs:
   image:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
     timeout-minutes: 45
     strategy:
       matrix:
         include:
           - name: engine
             dockerfile: docker/Dockerfile.engine
+            runner: mighty-ci-8x16
           - name: node
             dockerfile: docker/Dockerfile.node
+            runner: mighty-ci-4x8
           - name: electric
             dockerfile: docker/Dockerfile.electric
+            runner: mighty-ci-8x16
     steps:
       - uses: actions/checkout@v4
 

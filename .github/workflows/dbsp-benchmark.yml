@@ -22,7 +22,7 @@ jobs:
     concurrency:
       group: dbsp-benchmark-${{ github.event.pull_request.number || inputs.head }}
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, mighty-ci-8x16]
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -75,4 +75,4 @@ jobs:
           # upload-artifact v4 skips dot-paths unless asked, and the results live under .bench-artifacts.
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
