@@ -691,12 +691,14 @@ sequencer feeds every table's deltas into:
   Flip detection is the circuit's incremental distinct: the step's output deltas ARE the flips.
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
   with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
-  with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Every
-  dependent a value flip reaches through the same connecting column shares **one** query-back per
-  table (the rows are the same; only the evaluation is per dependent), so a node with N dependents
-  costs one read per flip, not N. A NULL flip's NULL-sensitive dependents (see *NULL sensitivity*
-  below) each need every row of their table instead, and share **one** full-table read per table
-  the same way. Flip
+  with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. A value
+  flip issues **one** query-back per (tier, table, connecting column): shapes are read per outer
+  table and parent nodes per inner table, in separate tiers, and dependents reached through
+  different connecting columns are read separately. The N dependents in one such group re-evaluate
+  the same rows (only the evaluation is per dependent), so they cost one read, not N. A NULL flip's
+  NULL-sensitive dependents (see *NULL sensitivity* below) each need every row of their table
+  instead, so they share **one** full-table read per (tier, table), whatever column reached them.
+  Each dependent is then evaluated under its own registry-lock hold, never all N under one. Flip
   propagation runs on a **semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`, default 8),
   off the sequencer hot path: the Postgres query-backs run concurrently (bounded by the shared
   `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
@@ -752,7 +754,8 @@ sequencer feeds every table's deltas into:
   re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
   UNKNOWN, and AND/OR are monotone over FALSE < UNKNOWN < TRUE, so inclusion can't change). Each
-  is re-derived from every row of its table, read once per table for all of them.
+  is re-derived from every row of its table, read once per (tier, table) — shapes per outer table,
+  parent nodes per inner table — for all of them.
 - **Atomicity** — node creation/refcounts/edges roll back exactly on a failed shape create (§5.4).
 - **The creation window** — a subquery create registers its edges before it backfills, so a flip on
   an inner node it *shares* with an already-live shape reaches it while there is no shape to move
