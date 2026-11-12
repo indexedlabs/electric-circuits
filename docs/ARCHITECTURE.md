@@ -1054,6 +1054,9 @@ or exposing readiness/control operations; `boot_library` delegates to the same p
 restore or validate lifecycle records or checkpoints. Library replay begins at the start of the log;
 only this process's durable checkpoints advance its retention boundary. A failed or cancelled
 validation leaves no engine running. Postgres construction remains waiting for its boot validation.
+The client's stream TTL must equal the config's `ELECTRIC_CIRCUITS_STREAM_TTL_SECS`, set with
+`with_stream_ttl` before `admit_store`, or `Engine::new_with_config` fails. The config-less
+constructors (`Engine::new`, `new_pg`, `new_pg_with_setup`) refuse a client with a stream TTL.
 
 Postgres boot binds HTTP before catalog restore. Shape/aggregate creation, dormant reactivation and
 guarded reads refuse work until the engine is active; native create returns `503` with

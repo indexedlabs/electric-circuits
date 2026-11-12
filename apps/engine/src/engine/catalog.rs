@@ -2868,6 +2868,173 @@ mod tests {
         engine.close(OTTO_5492_DEADLINE).await;
     }
 
+    /// `#g-tracked-streams-kept`: the client that creates the catalog in `admit_store` carries the
+    /// stream TTL, so a library engine whose client disagrees with its config is refused. A matching
+    /// client puts the TTL on the `meta/catalog` create and on a shape stream, and the keep-alive
+    /// touches the shape stream.
+    #[tokio::test]
+    async fn a_library_engine_needs_the_configs_ttl_on_its_client_from_admission() {
+        let ttl_config = |ttl: Option<&str>| {
+            let ttl = ttl.map(str::to_string);
+            crate::config::Config::resolve(move |key| {
+                (key == "ELECTRIC_CIRCUITS_STREAM_TTL_SECS").then(|| ttl.clone()).flatten()
+            })
+            .unwrap()
+        };
+        let admitted = |client_ttl: Option<u64>| async move {
+            let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+            let ds = DsClient::with_test_store("scripted://library-ttl".into(), store.clone())
+                .with_stream_ttl(client_ttl.and_then(std::num::NonZeroU64::new));
+            (store, Engine::admit_store(ds, expected_store_bound(), true).await.unwrap())
+        };
+
+        // A mismatch either way is refused, naming both values.
+        for (client, config) in [(None, Some("1814400")), (Some(1_814_400), None)] {
+            let (_, admission) = admitted(client).await;
+            let refused = Engine::boot_library(admission, &ttl_config(config))
+                .await
+                .err()
+                .expect("a client whose TTL differs from the config's is refused");
+            let message = format!("{refused:#}");
+            assert!(
+                message.contains("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") && message.contains("admit_store"),
+                "{message}"
+            );
+            assert!(message.contains("1814400s") && message.contains("none"), "{message}");
+        }
+
+        // Not `boot_race_store`: it parks every change-log read, and the keep-alive touches segments.
+        let (store, admission) = admitted(Some(1_814_400)).await;
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let engine = Engine::boot_library(admission, &ttl_config(Some("1814400"))).await.unwrap();
+        let schema = serde_json::from_value(serde_json::json!({
+            "tables": { "users": { "columns": { "id": { "type": "int" } }, "primaryKey": "id" } }
+        }))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        assert_eq!(otto_5492_create(&engine).await.status(), axum::http::StatusCode::OK);
+
+        let created = store.ensure_ttls.lock().unwrap().clone();
+        let ttl_of = |part: &str| created.iter().find(|(path, _)| path.contains(part)).cloned();
+        assert_eq!(ttl_of("meta/catalog").map(|c| c.1), Some(Some(1_814_400)), "the catalog create: {created:?}");
+        let shape = ttl_of("/shape/").expect("the create made a shape stream");
+        assert_eq!(shape.1, Some(1_814_400), "the shape stream carries the TTL");
+
+        while reads.try_recv().is_ok() {}
+        engine.ds.retain_accessed(&Default::default()); // as after a boot: nothing touched yet
+        engine.sweep_stream_ttl().await;
+        let mut touched = Vec::new();
+        while let Ok((path, offset, live)) = reads.try_recv() {
+            if offset == "now" && !live {
+                touched.push(path);
+            }
+        }
+        assert!(touched.contains(&shape.0), "the keep-alive touches the shape stream: {touched:?}");
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
+    /// A store admission whose client carries a stream TTL.
+    async fn ttl_admission() -> StoreAdmission {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://config-less-ttl".into(), store)
+            .with_stream_ttl(std::num::NonZeroU64::new(1_814_400));
+        Engine::admit_store(ds, expected_store_bound(), true).await.unwrap()
+    }
+
+    /// `#c-sweep-inside-ttl`: the config-less constructors cannot check a stream TTL against the
+    /// sweep and retention windows, so they refuse a client that has one: `Engine::new` with an
+    /// error, the Postgres constructors by panicking before they touch Postgres.
+    #[tokio::test]
+    async fn the_config_less_library_constructor_refuses_a_client_with_a_stream_ttl() {
+        let refused = Engine::new(ttl_admission().await).await.err().expect("a TTL client is refused");
+        assert!(
+            format!("{refused:#}").contains("must go through Engine::new_with_config or Engine::boot_library"),
+            "{refused:#}"
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must go through Engine::new_with_config or Engine::boot_library")]
+    async fn the_config_less_postgres_constructor_refuses_a_client_with_a_stream_ttl() {
+        let _ = Engine::new_pg(ttl_admission().await, "postgres://unreachable.invalid/db".into());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "must go through Engine::new_with_config or Engine::boot_library")]
+    async fn the_config_less_postgres_setup_constructor_refuses_a_client_with_a_stream_ttl() {
+        let _ = Engine::new_pg_with_setup(
+            ttl_admission().await,
+            "postgres://unreachable.invalid/db".into(),
+            PostgresSetup::ExternallyManaged,
+        );
+    }
+
+    /// `#c-sweep-inside-ttl`: a config changed after `Config::resolve` is checked again at
+    /// construction, with the values the engine would run with: a sweep interval moved past a
+    /// quarter of the TTL is refused.
+    #[tokio::test]
+    async fn a_config_changed_after_resolve_is_checked_again_at_construction() {
+        let mut config = crate::config::Config::resolve(|key| {
+            (key == "ELECTRIC_CIRCUITS_STREAM_TTL_SECS").then(|| "1814400".to_string())
+        })
+        .unwrap();
+        config.retention.sweep_interval = std::time::Duration::from_secs(1_814_400 / 4);
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds =
+            DsClient::with_test_store("scripted://changed-config".into(), store).with_stream_ttl(config.stream_ttl);
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        let refused = Engine::boot_library(admission, &config).await.err().expect("the changed config is refused");
+        assert!(format!("{refused:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{refused:#}");
+    }
+
+    /// `#c-sweep-inside-ttl`: a sweep interval changed to zero after resolving is refused at
+    /// construction, with or without a TTL; the retention and keep-alive timers cannot run on it.
+    #[tokio::test]
+    async fn a_zero_sweep_interval_is_refused_at_construction() {
+        let mut config = crate::config::Config::resolve(|_| None).unwrap();
+        config.retention.sweep_interval = std::time::Duration::ZERO;
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds = DsClient::with_test_store("scripted://zero-sweep".into(), store);
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        let refused = Engine::new_with_config(admission, None, PostgresSetup::EngineManaged, &config)
+            .await
+            .err()
+            .expect("a zero sweep interval is refused");
+        assert!(format!("{refused:#}").contains("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS"), "{refused:#}");
+    }
+
+    /// The engine sweeps with the retention windows and interval its config was resolved with, the
+    /// same ones the TTL floor and quarter-TTL checks used, not the process environment's.
+    #[tokio::test]
+    async fn a_library_engine_uses_the_retention_its_config_resolved() {
+        let settings = [
+            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "8"),
+            ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "2"),
+            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "2"),
+        ];
+        for (key, _) in settings {
+            assert!(std::env::var(key).is_err(), "{key} must come from the getter, not the environment");
+        }
+        let config = crate::config::Config::resolve(|key| {
+            settings.iter().find(|(name, _)| *name == key).map(|(_, value)| value.to_string())
+        })
+        .unwrap();
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let ds =
+            DsClient::with_test_store("scripted://library-retention".into(), store).with_stream_ttl(config.stream_ttl);
+        let admission = Engine::admit_store(ds, expected_store_bound(), true).await.unwrap();
+        let engine = Engine::boot_library(admission, &config).await.unwrap();
+
+        assert_eq!(engine.retention.sweep_interval, std::time::Duration::from_secs(1));
+        assert_eq!(engine.retention.idle_timeout, std::time::Duration::from_secs(1));
+        assert_eq!(engine.retention.dormant_ttl, std::time::Duration::from_secs(2));
+        assert_eq!(engine.changes.config().retain, std::time::Duration::from_secs(2));
+        engine.close(OTTO_5492_DEADLINE).await;
+    }
+
     #[tokio::test]
     async fn memory_budget_covers_catalog_admission_and_the_page_visitor() {
         use std::future::Future;

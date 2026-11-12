@@ -732,6 +732,31 @@ pub(crate) fn init_otel(
     );
     engine_counter!("engine_changes_segments_deleted", "Rotated-out segments retired", changes_segments_deleted, "");
     engine_counter!(
+        "engine_stream_ttl_touches",
+        "Keep-alive reads that slid a tracked stream's Stream-TTL",
+        stream_ttl_touches,
+        ""
+    );
+    engine_counter!(
+        "engine_stream_ttl_touch_failures",
+        "Keep-alive reads that failed (retried on the next sweep)",
+        stream_ttl_touch_failures,
+        ""
+    );
+    {
+        // Not `engine_gauge!`: the value is computed when read, so it keeps rising if sweeps stop.
+        let metrics = metrics.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_gauge("engine_stream_ttl_oldest_untouched")
+            .with_description(
+                "Longest any tracked stream has gone untouched: its age at the latest keep-alive sweep plus the time since",
+            )
+            .with_unit("s")
+            .with_callback(move |obs| obs.observe(metrics.stream_ttl_oldest_untouched_secs(), &attributes))
+            .build();
+    }
+    engine_counter!(
         "engine_catalog_restore_retired",
         "Shape records retired during catalog restore because their streams were missing or closed",
         catalog_restore_retired,
@@ -967,6 +992,31 @@ mod tests {
         }
         let json = metrics.snapshot();
         assert_eq!(json["counters"]["reactivations_failed"], 3);
+    }
+
+    #[test]
+    fn stream_ttl_keep_alive_series_are_exported_on_the_scrape_route() {
+        use super::*;
+        let metrics = Arc::new(crate::metrics::Metrics::default());
+        metrics.stream_ttl_touches.store(7, Ordering::Relaxed);
+        metrics.stream_ttl_touch_failures.store(2, Ordering::Relaxed);
+        metrics.record_stream_ttl_sweep(std::time::Duration::from_secs(90));
+        let telemetry = init_otel(metrics.clone(), Arc::new(Gauges::default()), None);
+        let scrape = telemetry.prometheus_text();
+        telemetry.shutdown();
+        for (series, value) in [
+            ("engine_stream_ttl_touches_total", "7"),
+            ("engine_stream_ttl_touch_failures_total", "2"),
+            ("engine_stream_ttl_oldest_untouched_seconds", "90"),
+        ] {
+            assert!(
+                scrape.lines().any(|line| line.starts_with(series) && line.ends_with(&format!(" {value}"))),
+                "{series} missing: {scrape}"
+            );
+        }
+        let json = metrics.snapshot();
+        assert_eq!(json["counters"]["stream_ttl_touches_total"], 7);
+        assert_eq!(json["gauges"]["stream_ttl_oldest_untouched_seconds"], 90);
     }
 
     #[test]

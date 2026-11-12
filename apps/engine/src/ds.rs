@@ -1186,6 +1186,41 @@ pub struct DsClient {
     failed_appends: Arc<std::sync::atomic::AtomicUsize>,
     /// Sliding `Stream-TTL` sent on every stream this client creates (`ELECTRIC_CIRCUITS_STREAM_TTL_SECS`).
     stream_ttl: Option<NonZeroU64>,
+    /// With a TTL: when this process last appended to or read each stream (logical path), which is
+    /// when the store last slid its TTL. Shared across clones; an absent stream has not been
+    /// touched since [`Self::born`], so after a boot every stream counts as untouched.
+    accessed: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    born: std::time::Instant,
+}
+
+/// An access recorded for a request in flight (see [`DsClient::begin_access`]). `previous` is the
+/// record it replaced, `None` when the client has no TTL and nothing was recorded.
+struct PendingAccess<'a> {
+    client: &'a DsClient,
+    path: &'a str,
+    previous: Option<Option<std::time::Instant>>,
+}
+
+impl PendingAccess<'_> {
+    /// The request slid the TTL: keep the record.
+    fn keep(mut self) {
+        self.previous = None;
+    }
+}
+
+impl Drop for PendingAccess<'_> {
+    fn drop(&mut self) {
+        let Some(previous) = self.previous.take() else { return };
+        let mut accessed = self.client.accessed.lock().unwrap();
+        match previous {
+            Some(at) => {
+                accessed.insert(self.path.to_string(), at);
+            }
+            None => {
+                accessed.remove(self.path);
+            }
+        }
+    }
 }
 
 struct FailedAppend<'a>(&'a std::sync::atomic::AtomicUsize);
@@ -1217,6 +1252,75 @@ impl DsClient {
     pub fn with_stream_ttl(mut self, ttl: Option<NonZeroU64>) -> Self {
         self.stream_ttl = ttl;
         self
+    }
+
+    /// Pretend this client was built `ago` earlier, so "untouched since boot" reads as that long.
+    #[cfg(test)]
+    pub(crate) fn born_ago_for_test(mut self, ago: std::time::Duration) -> Self {
+        self.born -= ago;
+        self
+    }
+
+    pub(crate) fn stream_ttl(&self) -> Option<NonZeroU64> {
+        self.stream_ttl
+    }
+
+    /// A successful append or read slid the stream's TTL; remember when (only while a TTL is set).
+    fn note_access(&self, path: &str, status: u16) {
+        if (200..300).contains(&status) {
+            self.record_access(path);
+        }
+    }
+
+    fn record_access(&self, path: &str) {
+        if self.stream_ttl.is_some() {
+            self.accessed.lock().unwrap().insert(path.to_string(), std::time::Instant::now());
+        }
+    }
+
+    /// Record an access for a request in flight. Unless the returned guard is kept, dropping it
+    /// puts the previous record back, so a request that fails, answers non-2xx or is cancelled
+    /// slides nothing in the access record either.
+    fn begin_access<'a>(&'a self, path: &'a str) -> PendingAccess<'a> {
+        let previous = self
+            .stream_ttl
+            .is_some()
+            .then(|| self.accessed.lock().unwrap().insert(path.to_string(), std::time::Instant::now()));
+        PendingAccess { client: self, path, previous }
+    }
+
+    /// How long since this process last appended to or read `path`; `None` when it never has, so
+    /// nothing is known about when the store last slid its TTL (after a boot, every stream).
+    pub(crate) fn touched_ago(&self, path: &str) -> Option<std::time::Duration> {
+        self.accessed.lock().unwrap().get(path).map(std::time::Instant::elapsed)
+    }
+
+    /// Forget every stream not in `tracked`. A touch whose `GET` answers after the stream's `DELETE`
+    /// records it again, so the keep-alive prunes to what is tracked after each sweep.
+    pub(crate) fn retain_accessed(&self, tracked: &std::collections::BTreeSet<String>) {
+        self.accessed.lock().unwrap().retain(|path, _| tracked.contains(path));
+    }
+
+    /// [`Self::touched_ago`], counting a stream this process never touched from when the client
+    /// was built: the age the untouched gauge reports.
+    pub(crate) fn untouched_for(&self, path: &str) -> std::time::Duration {
+        self.touched_ago(path).unwrap_or_else(|| self.born.elapsed())
+    }
+
+    /// The keep-alive: a non-live `GET` at the tail (`offset=now`), which slides the stream's TTL
+    /// without reading any of it. `HEAD` would not slide it. A stream that is not there is a typed
+    /// [`StreamGone`].
+    pub(crate) async fn touch(&self, path: &str) -> Result<()> {
+        let physical_path = self.physical_path(path)?;
+        let res = self.store.read(&physical_path, "now", false).await?;
+        if res.status == 404 || res.status == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
+        }
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
+        }
+        self.note_access(path, res.status);
+        Ok(())
     }
 
     pub(crate) fn memory_budget(&self) -> &Arc<crate::memory_budget::MemoryBudget> {
@@ -1271,6 +1375,8 @@ impl DsClient {
             appended: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             failed_appends: Arc::default(),
             stream_ttl: None,
+            accessed: Arc::default(),
+            born: std::time::Instant::now(),
         }
     }
 
@@ -1412,10 +1518,21 @@ impl DsClient {
     /// retryable, and every other `409` keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
+        // While the PUT is in flight the stream counts as accessed, so a keep-alive sweep that runs
+        // meanwhile neither touches a stream that does not exist yet (a 404) nor ages it from boot.
+        // Only a 2xx slides the TTL on the store, so the guard puts the previous record back on any
+        // other answer, an error or a cancelled PUT: an existing stream opened through a
+        // config-mismatch 409 stays as due as it was.
+        let pending = self.begin_access(path);
         let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
         if (200..300).contains(&res.status) {
+            // A create (or a matching re-create, which the store treats as an access) starts the
+            // stream's TTL clock.
+            pending.keep();
+            self.note_access(path, res.status);
             return Ok(());
         }
+        drop(pending);
         if res.status == 409 && !res.closed {
             let head = self.store.head(&physical_path).await?;
             if head.status == 200 && !head.closed {
@@ -1439,6 +1556,7 @@ impl DsClient {
         let body = serde_json::to_vec(events).with_context(|| format!("serializing POST {path}"))?;
         let physical_path = self.physical_path(path)?;
         let res = self.store.append(&physical_path, "application/json", body, BodyRead::OnFailure).await?;
+        self.note_access(path, res.status);
         if !(200..300).contains(&res.status) {
             let status = res.status;
             return Err(status_error("POST", path, status, &res.body_or_default()));
@@ -1492,6 +1610,7 @@ impl DsClient {
                 .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
                 .await?
         };
+        self.note_access(path, res.status);
         if res.status == 204 || res.status == 404 {
             return Ok((String::new(), res.next_offset, true, res.permit));
         }
@@ -1628,6 +1747,7 @@ impl DsClient {
         // draining its response; the body text ("stream is closed") is not the contract.
         if (200..300).contains(&res.status) {
             *self.appended.lock().unwrap().entry(path.to_string()).or_insert(0) += payload_len;
+            self.note_access(path, res.status);
             Ok(res.next_offset)
         } else if res.status == 404 || res.status == 410 || (res.status == 409 && res.closed) {
             Err(AppendError::Gone(res.status))
@@ -1765,6 +1885,7 @@ impl DsClient {
         let res = self.store.delete(&physical_path).await?;
         if (200..300).contains(&res.status) || res.status == 404 || res.status == 410 {
             self.appended.lock().unwrap().remove(path);
+            self.accessed.lock().unwrap().remove(path);
             Ok(())
         } else {
             let status = res.status;
@@ -1852,6 +1973,7 @@ impl DsClient {
         } else {
             self.store.read(&physical_path, offset, live).await?
         };
+        self.note_access(path, res.status);
         let permit = std::mem::take(&mut res.permit);
 
         // 204 = long-poll timeout / no new data / a close that woke this long-poll.
@@ -1905,6 +2027,7 @@ impl DsClient {
                 }
             }
         };
+        self.note_access(path, res.status);
         if res.status == 204 {
             return Ok(ReadResult {
                 envelopes: Vec::new(),
@@ -2719,6 +2842,13 @@ mod tests {
         pub(crate) ensure_closed: bool,
         /// The `Stream-TTL` each ensure carried, by path.
         pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
+        /// Answer every non-live read with this status while non-zero (a store refusing keep-alives).
+        pub(crate) nonlive_read_status: std::sync::atomic::AtomicU16,
+        /// Path suffixes whose streams are not created yet: a non-live read answers 404 until an
+        /// ensure of that path creates it.
+        pub(crate) uncreated: std::sync::Mutex<Vec<String>>,
+        /// Hold every ensure before it creates its stream, as a PUT still in flight.
+        pub(crate) ensure_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
         /// One live GET response for a matching path suffix, without deleting storage.
         pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
@@ -2871,6 +3001,11 @@ mod tests {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
                 self.ensure_ttls.lock().unwrap().push((path.to_string(), ttl.map(NonZeroU64::get)));
+                let gate = self.ensure_gate.lock().unwrap().clone();
+                if let Some(gate) = gate {
+                    gate.hold().await;
+                }
+                self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
                 if self.ensure_status != 0 {
                     let mut res = response(self.ensure_status);
                     res.closed = self.ensure_closed;
@@ -2978,6 +3113,13 @@ mod tests {
                 self.read_offsets.lock().unwrap().push(offset.to_string());
                 if let Some(observer) = self.read_observer.lock().unwrap().as_ref() {
                     let _ = observer.send((path.to_string(), offset.to_string(), live));
+                }
+                let refused = self.nonlive_read_status.load(std::sync::atomic::Ordering::Relaxed);
+                if !live && refused != 0 {
+                    return Ok(response(refused));
+                }
+                if !live && self.uncreated.lock().unwrap().iter().any(|suffix| path.ends_with(suffix.as_str())) {
+                    return Ok(response(404));
                 }
                 {
                     let mut fault = self.read_fault.lock().unwrap();
@@ -3848,6 +3990,54 @@ mod tests {
         plain.ensure_stream("shape/s1").await.unwrap();
         plain.with_stream_ttl(NonZeroU64::new(1_814_400)).ensure_stream("shape/s1").await.unwrap();
         assert_eq!(*store.ensure_ttls.lock().unwrap(), vec![(path.clone(), None), (path, Some(1_814_400))]);
+    }
+
+    /// `#c-counted-touch`: the keep-alive is a non-live read at the tail (`offset=now`), and with a
+    /// TTL every successful append or read restarts the stream's untouched clock. Without a TTL
+    /// nothing is recorded.
+    #[tokio::test]
+    async fn touch_reads_the_tail_and_appends_and_reads_restart_the_untouched_clock() {
+        let store = Arc::new(ScriptedStore::default());
+        let (tx, mut reads) = tokio::sync::mpsc::unbounded_channel();
+        *store.read_observer.lock().unwrap() = Some(tx);
+        let client =
+            DsClient::with_test_store("scripted://ttl".into(), store.clone()).with_stream_ttl(NonZeroU64::new(3600));
+        let path = StreamScope::in_process_test_scope().qualify("shape/s1").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(client.touched_ago("shape/s1"), None, "after a boot nothing is known to be touched");
+        assert!(client.untouched_for("shape/s1") >= std::time::Duration::from_millis(20), "aged from boot");
+
+        client.touch("shape/s1").await.unwrap();
+        assert_eq!(reads.try_recv().unwrap(), (path, "now".to_string(), false), "a non-live GET at the tail");
+        assert!(client.untouched_for("shape/s1") < std::time::Duration::from_millis(20), "the touch slid it");
+
+        client.append_json("meta/catalog", &[serde_json::json!({"t": "x"})]).await.unwrap();
+        assert!(client.untouched_for("meta/catalog") < std::time::Duration::from_millis(20), "an append slid it");
+
+        store.nonlive_read_status.store(404, std::sync::atomic::Ordering::Relaxed);
+        let gone = client.touch("shape/s2").await.expect_err("a missing stream is not touched");
+        assert!(gone.downcast_ref::<StreamGone>().is_some(), "{gone:#}");
+        store.nonlive_read_status.store(503, std::sync::atomic::Ordering::Relaxed);
+        assert!(client.touch("shape/s2").await.is_err());
+        assert_eq!(client.touched_ago("shape/s2"), None, "a failed touch slides nothing");
+
+        let plain = DsClient::with_test_store("scripted://ttl".into(), Arc::new(ScriptedStore::default()));
+        plain.append_json("meta/catalog", &[serde_json::json!({"t": "x"})]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(plain.touched_ago("meta/catalog"), None, "no TTL, no record");
+    }
+
+    /// A `PUT` that fails slides nothing, so the stream keeps the access record it had before.
+    #[tokio::test]
+    async fn a_failed_put_keeps_the_streams_older_access_record() {
+        let store = Arc::new(ScriptedStore { ensure_status: 503, ..Default::default() });
+        let client = DsClient::with_test_store("scripted://ttl".into(), store).with_stream_ttl(NonZeroU64::new(3600));
+        client.touch("shape/s1").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let failed = client.ensure_stream("shape/s1").await.expect_err("a 503 PUT fails");
+        assert!(is_unavailable(&failed), "{failed:#}");
+        let ago = client.touched_ago("shape/s1").expect("the older record is still there");
+        assert!(ago >= std::time::Duration::from_millis(50), "the failed PUT did not refresh it: {ago:?}");
     }
 
     /// `#c-old-stream-config`: a create the store refuses with a config-mismatch `409` opens a live,
