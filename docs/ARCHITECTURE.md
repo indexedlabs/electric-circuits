@@ -692,9 +692,11 @@ sequencer feeds every table's deltas into:
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
   with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
   with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Every
-  dependent a flip reaches through the same connecting column shares **one** query-back per table
-  (the rows are the same; only the evaluation is per dependent), so a node with N dependents costs
-  one read per flip, not N. Flip
+  dependent a value flip reaches through the same connecting column shares **one** query-back per
+  table (the rows are the same; only the evaluation is per dependent), so a node with N dependents
+  costs one read per flip, not N. A NULL flip's NULL-sensitive dependents (see *NULL sensitivity*
+  below) each need every row of their table instead, and share **one** full-table read per table
+  the same way. Flip
   propagation runs on a **semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`, default 8),
   off the sequencer hot path: the Postgres query-backs run concurrently (bounded by the shared
   `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
@@ -749,7 +751,8 @@ sequencer feeds every table's deltas into:
 - **NULL sensitivity** — SQL: a NULL in the inner set makes `x NOT IN S` UNKNOWN. A NULL flip
   re-derives exactly the dependents that can change: those whose `IN` leaf is negated **or sits under
   any `Not{…}`** (with no negation above the leaf, NULL only moves the leaf between FALSE and
-  UNKNOWN, and AND/OR are monotone over FALSE < UNKNOWN < TRUE, so inclusion can't change).
+  UNKNOWN, and AND/OR are monotone over FALSE < UNKNOWN < TRUE, so inclusion can't change). Each
+  is re-derived from every row of its table, read once per table for all of them.
 - **Atomicity** — node creation/refcounts/edges roll back exactly on a failed shape create (§5.4).
 - **The creation window** — a subquery create registers its edges before it backfills, so a flip on
   an inner node it *shares* with an already-live shape reaches it while there is no shape to move
