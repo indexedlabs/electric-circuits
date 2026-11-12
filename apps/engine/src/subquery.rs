@@ -568,6 +568,9 @@ pub struct SubqueryRegistry {
     ds: DsClient,
     pg_url: Option<String>,
     pg_pool: Option<crate::pg::Pool>,
+    /// Test-only stand-in for Postgres behind every flip query-back (see [`CandidateReader`]).
+    #[cfg(test)]
+    fake_candidates: Option<Arc<tests::FakeCandidates>>,
     schemas: SchemaMap,
     /// Ordered emission lanes (see `engine::emission`): membership envelopes are enqueued
     /// under this registry's lock — per-stream enqueue order = eval order — and land on their
@@ -651,6 +654,8 @@ impl SubqueryRegistry {
             ds,
             pg_url,
             pg_pool,
+            #[cfg(test)]
+            fake_candidates: None,
             schemas: Arc::new(HashMap::new()),
             lanes: None,
             group_lanes: None,
@@ -1888,6 +1893,15 @@ impl SubqueryRegistry {
         self.schemas.get(table).cloned().with_context(|| format!("unknown table '{table}'"))
     }
 
+    /// Where this registry's flip query-backs read their candidate rows (pooled Postgres).
+    fn candidate_reader(&self) -> CandidateReader {
+        CandidateReader {
+            pool: self.pg_pool.clone(),
+            #[cfg(test)]
+            fake: self.fake_candidates.clone(),
+        }
+    }
+
     /// The ONE emission tail (spec §5): evaluate each shape's candidates against the current
     /// membership snapshot, transition the host-side per-feed key set ([`crate::subq_feed::FeedSet`])
     /// in the same synchronous step, and deliver — **upserts for every matching candidate** (an
@@ -2290,6 +2304,16 @@ pub async fn propagate_flips(
 /// One flip's worth of the walk: move every dependent of the flipped node, pushing any parent-node
 /// flips it derives onto `work`. Split out of [`propagate_flips`] so a failure anywhere inside it
 /// unwinds to exactly one place — the caller that puts the flip back on the queue.
+///
+/// Every dependent the flip reaches through the same connecting column re-evaluates the SAME
+/// candidate rows (`<table> WHERE <col> = <value>`), so they share one read per table instead of
+/// issuing one each: the read is the expensive part (a pooled connection, a settled
+/// `REPEATABLE READ` snapshot, a SELECT), the per-dependent evaluation is in memory. Without this a
+/// node with N dependents costs N identical query-backs per flip — the 2026-11-11 backfill storm,
+/// where one flip reached 445 shapes and ~1,000 flips kept the flip workers (and every drain
+/// receipt waiting behind them) busy for 23 minutes. Shapes are moved before parent nodes; order
+/// across dependents carries no meaning, since each shape's emission is absolute per pk and each
+/// parent reconciles its own set.
 async fn propagate_one(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     sig: &SubquerySig,
@@ -2307,82 +2331,200 @@ async fn propagate_one(
         let reg = registry.lock().await;
         (reg.edges_of(sig), reg.nodes.get(sig).map(|n| n.inner_table.clone()))
     };
-    for edge in edges {
-        // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an
-        // `IN` leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which
-        // negation turns into a membership change). It can shift *every* dependent row, so
-        // re-derive the dependent fully; NULL-insensitive dependents can't change (AND/OR are
-        // monotone over FALSE < UNKNOWN < TRUE), so skip.
-        if matches!(flip.value, Value::Null) {
+    // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an `IN`
+    // leaf under any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which negation turns
+    // into a membership change). It can shift *every* dependent row, so re-derive the dependent
+    // fully; NULL-insensitive dependents can't change (AND/OR are monotone over
+    // FALSE < UNKNOWN < TRUE), so skip.
+    if matches!(flip.value, Value::Null) {
+        for edge in edges {
             if edge.null_sensitive {
                 rederive_dependent(registry, &edge, txid.clone(), work, commit_lsn).await?;
             }
-            continue;
         }
-        match &edge.dependent {
-            Dependent::Shape(id) => {
-                let moved =
-                    move_shape_for_value(registry, id, edge.connecting_col, &flip.value, txid.clone(), commit_lsn)
-                        .await?;
-                // Light the whole path only when the shape actually moved rows: source
-                // `table:<t>` → the flipped `node:<sig>` → this `shape:<id>`.
-                if let (Some((outer, net)), Some(src)) = (moved, source_table.as_ref()) {
-                    emit_flip_trace(
-                        trace_tx,
-                        &outer,
-                        src,
-                        sig,
-                        format!("shape:{id}"),
-                        vec![id.clone()],
-                        net,
-                        lsn.clone(),
-                        txid.clone(),
-                    );
-                }
+        return Ok(());
+    }
+    let (shapes, parents) = group_dependents_by_column(edges);
+    for (col, ids) in shapes {
+        let moved = move_shapes_for_value(registry, &ids, col, &flip.value, txid.clone(), commit_lsn).await?;
+        // Light the whole path only for the shapes that actually moved rows: source `table:<t>` →
+        // the flipped `node:<sig>` → that `shape:<id>`.
+        let Some(src) = source_table.as_ref() else { continue };
+        for (id, outer, net) in moved {
+            emit_flip_trace(
+                trace_tx,
+                &outer,
+                src,
+                sig,
+                format!("shape:{id}"),
+                vec![id],
+                net,
+                lsn.clone(),
+                txid.clone(),
+            );
+        }
+    }
+    for (col, parent_sigs) in parents {
+        // A parent missing from the result vanished, or is a fresh node its own create is still
+        // seeding — in which case the re-derivation was queued on the node and runs when that
+        // create installs the seed (see `queue_node_deferred`).
+        let reconciled =
+            requery_and_reconcile_parents(registry, &parent_sigs, Some((col, &flip.value)), commit_lsn).await?;
+        for (parent_sig, _inner, flips) in reconciled {
+            // A nested `IN`: connect the flipped child `node:<sig>` to the parent
+            // `node:<parent_sig>` it re-derived, so the propagation reads through. The parent's
+            // own downstream shape lights when its flips reach a shape edge.
+            if let (false, Some(src)) = (flips.is_empty(), source_table.as_ref()) {
+                emit_flip_trace(
+                    trace_tx,
+                    src,
+                    src,
+                    sig,
+                    format!("node:{parent_sig}"),
+                    Vec::new(),
+                    flip_net(&flips),
+                    lsn.clone(),
+                    txid.clone(),
+                );
             }
-            Dependent::Node(parent_sig) => {
-                // `None` = the parent vanished, or it is a fresh node its own create is still
-                // seeding — in which case the re-derivation was queued on the node and runs when
-                // that create installs the seed (see `queue_node_deferred`).
-                let new_flips = requery_and_reconcile_parent(
-                    registry,
-                    parent_sig,
-                    Some((edge.connecting_col, &flip.value)),
-                    commit_lsn,
-                )
-                .await?;
-                if let Some((_inner, flips)) = new_flips {
-                    // A nested `IN`: connect the flipped child `node:<sig>` to the parent
-                    // `node:<parent_sig>` it re-derived, so the propagation reads through. The
-                    // parent's own downstream shape lights when its flips reach a shape edge.
-                    if let (false, Some(src)) = (flips.is_empty(), source_table.as_ref()) {
-                        emit_flip_trace(
-                            trace_tx,
-                            src,
-                            src,
-                            sig,
-                            format!("node:{parent_sig}"),
-                            Vec::new(),
-                            flip_net(&flips),
-                            lsn.clone(),
-                            txid.clone(),
-                        );
-                    }
-                    for f in flips {
-                        work.push_back((parent_sig.clone(), f));
-                    }
-                }
+            for f in flips {
+                work.push_back((parent_sig.clone(), f));
             }
         }
     }
     Ok(())
 }
 
-/// An inner-set value `v` flipped for an outer shape: query the outer rows with `connecting_col = v`,
-/// re-evaluate the full shape predicate, and append `upsert` (matches) / `delete` (doesn't) by pk.
-/// Returns `Some((outer_table, net_weight))` when envelopes were appended — the shape's own table
-/// (the event's `table`) and the net membership change (for the trace dot's label/colour) — or
-/// `None` when nothing moved.
+/// A flipped node's dependents, grouped by the connecting column they are reached through (the
+/// column a query-back filters on), shapes and parent nodes apart, each dependent once per column
+/// and in edge order.
+#[allow(clippy::type_complexity)]
+fn group_dependents_by_column(edges: Vec<Edge>) -> (Vec<(usize, Vec<String>)>, Vec<(usize, Vec<SubquerySig>)>) {
+    fn push(groups: &mut Vec<(usize, Vec<String>)>, seen: &mut HashSet<(usize, String)>, col: usize, id: String) {
+        if !seen.insert((col, id.clone())) {
+            return;
+        }
+        match groups.iter_mut().find(|(c, _)| *c == col) {
+            Some((_, ids)) => ids.push(id),
+            None => groups.push((col, vec![id])),
+        }
+    }
+    let (mut shapes, mut parents) = (Vec::new(), Vec::new());
+    let (mut seen_shapes, mut seen_parents) = (HashSet::new(), HashSet::new());
+    for edge in edges {
+        match edge.dependent {
+            Dependent::Shape(id) => push(&mut shapes, &mut seen_shapes, edge.connecting_col, id),
+            Dependent::Node(parent) => push(&mut parents, &mut seen_parents, edge.connecting_col, parent),
+        }
+    }
+    (shapes, parents)
+}
+
+/// An inner-set value `v` flipped for outer shapes: query the outer rows with `connecting_col = v`
+/// — ONCE per outer table, however many shapes share it — re-evaluate each shape's full predicate
+/// against them, and append `upsert` (matches) / `delete` (doesn't) by pk. Returns
+/// `(shape_id, outer_table, net_weight)` for each shape that appended envelopes — the shape's own
+/// table (the event's `table`) and the net membership change (for the trace dot's label/colour).
+async fn move_shapes_for_value(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    shape_ids: &[String],
+    connecting_col: usize,
+    value: &Value,
+    txid: Option<String>,
+    commit_lsn: u64,
+) -> Result<Vec<(String, TableRef, i64)>> {
+    // Brief lock: snapshot what the query-backs need, grouped by outer table.
+    let (groups, reader) = {
+        let mut reg = registry.lock().await;
+        let mut groups: Vec<(TableSchema, Vec<String>)> = Vec::new();
+        for shape_id in shape_ids {
+            // A shape whose create is still in flight has edges (phase A) but no installed shape to
+            // move: the flip waits on its pending entry and runs at install, instead of falling
+            // through to a `shapes` miss that would silently drop it.
+            if reg.queue_deferred(
+                shape_id,
+                DeferredShapeWork::Value { connecting_col, value: value.clone(), txid: txid.clone(), commit_lsn },
+            ) {
+                continue;
+            }
+            let Some(shape) = reg.shapes.get(shape_id) else { continue };
+            let table = shape.outer_table.clone();
+            match groups.iter_mut().find(|(ts, _)| ts.table == table) {
+                Some((_, ids)) => ids.push(shape_id.clone()),
+                None => groups.push((reg.snapshot_for_table(&table)?, vec![shape_id.clone()])),
+            }
+        }
+        // In flight from here until the evaluation below: live decisions taken in that window are
+        // stamped on each shape and beat whatever the shared read returns. Marked only after every
+        // fallible step above, so an early return leaves nothing to balance.
+        for (_, ids) in &groups {
+            for shape_id in ids {
+                reg.begin_queryback(shape_id);
+            }
+        }
+        (groups, reg.candidate_reader())
+    };
+    // Every exit from here on must decrement every marked shape — including a read's error path —
+    // or the shape would keep recording recency (and dropping candidates) forever. There is no
+    // guard object that can do it: the registry mutex is async and cannot be taken in `Drop`.
+    let end_all = |reg: &mut SubqueryRegistry| {
+        for (_, ids) in &groups {
+            for shape_id in ids {
+                reg.end_queryback(shape_id);
+            }
+        }
+    };
+    let mut reads = Vec::with_capacity(groups.len());
+    for (ts, _) in &groups {
+        match reader.by_col(ts, connecting_col, value).await {
+            Ok(read) => reads.push(read),
+            Err(e) => {
+                end_all(&mut *registry.lock().await);
+                return Err(e);
+            }
+        }
+    }
+    // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
+    // (candidates from a query-back all still exist), each shape filtered against the live
+    // decisions taken since the shared read's snapshot. One shape at a time, each with its own
+    // copy of the shared candidates: copying rows in memory is cheap next to another read.
+    let mut reg = registry.lock().await;
+    let mut moved = Vec::new();
+    let mut result = Ok(());
+    'groups: for ((ts, ids), (rows, gate)) in groups.iter().zip(reads) {
+        if rows.is_empty() {
+            continue;
+        }
+        let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
+        for shape_id in ids {
+            let emitted = reg
+                .emit_for_shapes(
+                    ts,
+                    vec![(shape_id.clone(), candidates.clone())],
+                    txid.clone(),
+                    EmissionSource::QueryBack { gate: &gate, commit_lsn },
+                )
+                .await;
+            match emitted {
+                Ok(emitted) => moved.extend(
+                    emitted
+                        .into_iter()
+                        .filter(|(_, appended, _)| *appended)
+                        .map(|(id, _, net)| (id, ts.table.clone(), net)),
+                ),
+                Err(e) => {
+                    result = Err(e);
+                    break 'groups;
+                }
+            }
+        }
+    }
+    end_all(&mut reg);
+    result.map(|()| moved)
+}
+
+/// [`move_shapes_for_value`] for one shape: `Some((outer_table, net_weight))` when it appended
+/// envelopes, `None` when nothing moved (or the shape is gone or still being created).
 async fn move_shape_for_value(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     shape_id: &str,
@@ -2391,117 +2533,105 @@ async fn move_shape_for_value(
     txid: Option<String>,
     commit_lsn: u64,
 ) -> Result<Option<(TableRef, i64)>> {
-    // Brief lock: snapshot what the query-back needs.
-    let (ts, pg_url) = {
-        let mut reg = registry.lock().await;
-        // A shape whose create is still in flight has edges (phase A) but no installed shape to
-        // move: the flip waits on its pending entry and runs at install, instead of falling through
-        // to a `shapes` miss that would silently drop it.
-        if reg.queue_deferred(
-            shape_id,
-            DeferredShapeWork::Value { connecting_col, value: value.clone(), txid: txid.clone(), commit_lsn },
-        ) {
-            return Ok(None);
-        }
-        let Some(shape) = reg.shapes.get(shape_id) else { return Ok(None) };
-        let snapshot = (reg.snapshot_for_table(&shape.outer_table)?, reg.pg_pool.clone());
-        // In flight from here until the evaluation below: live decisions taken in that window are
-        // stamped on the shape and beat whatever this read returns.
-        reg.begin_queryback(shape_id);
-        snapshot
-    };
-    // Every exit from here on must decrement — including the read's error path — or the shape
-    // would keep recording recency (and dropping candidates) forever. There is no guard object
-    // that can do it: the registry mutex is async and cannot be taken in `Drop`.
-    let (rows, gate) = match query_candidates(&pg_url, &ts, connecting_col, value).await {
-        Ok(r) => r,
-        Err(e) => {
-            registry.lock().await.end_queryback(shape_id);
-            return Err(e);
-        }
-    };
-    if rows.is_empty() {
-        registry.lock().await.end_queryback(shape_id);
-        return Ok(None);
-    }
-    // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
-    // (candidates from a query-back all still exist), filtered against the live decisions taken
-    // since `gate`'s snapshot.
-    let emitted = {
-        let mut reg = registry.lock().await;
-        let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-        let emitted = reg
-            .emit_for_shapes(
-                &ts,
-                vec![(shape_id.to_string(), candidates)],
-                txid,
-                EmissionSource::QueryBack { gate: &gate, commit_lsn },
-            )
-            .await;
-        reg.end_queryback(shape_id);
-        emitted?
-    };
-    Ok(match emitted.first() {
-        Some((_, true, net)) => Some((ts.table.clone(), *net)),
-        _ => None,
-    })
+    let shape_ids = [shape_id.to_string()];
+    let mut moved = move_shapes_for_value(registry, &shape_ids, connecting_col, value, txid, commit_lsn).await?;
+    Ok(moved.pop().map(|(_, table, net)| (table, net)))
 }
 
-/// Re-query a parent node's inner rows — `Some((col, v))` = only rows with
-/// `connecting_col = v` (a value flip), `None` = every row (a NULL re-derive) — then
-/// re-evaluate the parent's full predicate and reconcile. Returns `Some((inner_table,
-/// flips))`, or `None` if the parent vanished. The shared body of both flip-driven parent
-/// paths: the fetch differs, the eval+reconcile never does.
+/// Re-query parent nodes' inner rows — `Some((col, v))` = only rows with `connecting_col = v` (a
+/// value flip), `None` = every row (a NULL re-derive) — ONCE per inner table, however many parents
+/// share it, then re-evaluate each parent's full predicate and reconcile. Returns
+/// `(parent, inner_table, flips)` for every parent reconciled; a parent that vanished, or is still
+/// being seeded (its work is queued on it), is absent. The shared body of every flip-driven parent
+/// path: the fetch differs, the eval+reconcile never does.
+///
+/// Every read happens before any parent is reconciled, so a failed read consumes no transition and
+/// the caller's retry finds every parent exactly as it was.
+async fn requery_and_reconcile_parents(
+    registry: &tokio::sync::Mutex<SubqueryRegistry>,
+    parent_sigs: &[SubquerySig],
+    filter: Option<(usize, &Value)>,
+    commit_lsn: u64,
+) -> Result<Vec<(SubquerySig, TableRef, Vec<Flip>)>> {
+    let (groups, reader) = {
+        let mut reg = registry.lock().await;
+        let mut groups: Vec<(TableSchema, Vec<SubquerySig>)> = Vec::new();
+        for parent_sig in parent_sigs {
+            // Same as `move_shapes_for_value`'s pending-shape check, one tier down: a parent node
+            // whose own create is still seeding it has edges (phase A) but no set to reconcile
+            // against. The work waits on the node and runs at install, instead of re-deriving
+            // against an empty set whose seed — older than this flip — would then be installed
+            // over the change.
+            if reg.queue_node_deferred(
+                parent_sig,
+                match filter {
+                    Some((col, value)) => {
+                        DeferredNodeWork::Value { connecting_col: col, value: value.clone(), commit_lsn }
+                    }
+                    None => DeferredNodeWork::Full { commit_lsn },
+                },
+            ) {
+                continue;
+            }
+            let Some(n) = reg.nodes.get(parent_sig) else { continue };
+            let table = n.inner_table.clone();
+            match groups.iter_mut().find(|(ts, _)| ts.table == table) {
+                Some((_, sigs)) => sigs.push(parent_sig.clone()),
+                None => groups.push((reg.snapshot_for_table(&table)?, vec![parent_sig.clone()])),
+            }
+        }
+        // In flight from here until the reconcile below: live contribution decisions taken in that
+        // window are stamped on each node and beat whatever the shared read returns. Marked only
+        // after every fallible step above.
+        for (_, sigs) in &groups {
+            for parent_sig in sigs {
+                reg.begin_node_queryback(parent_sig);
+            }
+        }
+        (groups, reg.candidate_reader())
+    };
+    // Every exit from here on must decrement every marked node — the read's error path included —
+    // or the node would keep recording recency forever (same reason as `move_shapes_for_value`).
+    let mut reads = Vec::with_capacity(groups.len());
+    for (ts, _) in &groups {
+        match reader.read(ts, filter).await {
+            Ok(read) => reads.push(read),
+            Err(e) => {
+                let mut reg = registry.lock().await;
+                for (_, sigs) in &groups {
+                    for parent_sig in sigs {
+                        reg.end_node_queryback(parent_sig);
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+    let mut reg = registry.lock().await;
+    let mut reconciled = Vec::new();
+    for ((ts, sigs), (rows, gate)) in groups.iter().zip(reads) {
+        for parent_sig in sigs {
+            if let Some(evals) = reg.node_queryback_evals(parent_sig, ts, &rows, &gate) {
+                let flips = reg.apply_node_evals(parent_sig, evals).await;
+                reconciled.push((parent_sig.clone(), ts.table.clone(), flips));
+            }
+            reg.end_node_queryback(parent_sig);
+        }
+    }
+    Ok(reconciled)
+}
+
+/// [`requery_and_reconcile_parents`] for one parent: `Some((inner_table, flips))`, or `None` if the
+/// parent vanished or is still being seeded.
 async fn requery_and_reconcile_parent(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     parent_sig: &SubquerySig,
     filter: Option<(usize, &Value)>,
     commit_lsn: u64,
 ) -> Result<Option<(TableRef, Vec<Flip>)>> {
-    let (ts, pg_url) = {
-        let mut reg = registry.lock().await;
-        // Same as `move_shape_for_value`'s pending-shape check, one tier down: a parent node whose
-        // own create is still seeding it has edges (phase A) but no set to reconcile against. The
-        // work waits on the node and runs at install, instead of re-deriving against an empty set
-        // whose seed — older than this flip — would then be installed over the change.
-        if reg.queue_node_deferred(
-            parent_sig,
-            match filter {
-                Some((col, value)) => DeferredNodeWork::Value { connecting_col: col, value: value.clone(), commit_lsn },
-                None => DeferredNodeWork::Full { commit_lsn },
-            },
-        ) {
-            return Ok(None);
-        }
-        let Some(n) = reg.nodes.get(parent_sig) else { return Ok(None) };
-        let snapshot = (reg.snapshot_for_table(&n.inner_table)?, reg.pg_pool.clone());
-        // In flight from here until the reconcile below: live contribution decisions taken in that
-        // window are stamped on the node and beat whatever this read returns.
-        reg.begin_node_queryback(parent_sig);
-        snapshot
-    };
-    // Every exit from here on must decrement — the read's error path included — or the node would
-    // keep recording recency forever. There is no guard object that can do it: the registry mutex
-    // is async and cannot be taken in `Drop` (same reason as `move_shape_for_value`).
-    let read = match filter {
-        Some((col, value)) => query_candidates(&pg_url, &ts, col, value).await,
-        None => query_all(&pg_url, &ts).await,
-    };
-    let (rows, gate) = match read {
-        Ok(r) => r,
-        Err(e) => {
-            registry.lock().await.end_node_queryback(parent_sig);
-            return Err(e);
-        }
-    };
-    let mut reg = registry.lock().await;
-    let Some(evals) = reg.node_queryback_evals(parent_sig, &ts, &rows, &gate) else {
-        reg.end_node_queryback(parent_sig);
-        return Ok(None);
-    };
-    let flips = reg.apply_node_evals(parent_sig, evals).await;
-    reg.end_node_queryback(parent_sig);
-    Ok(Some((ts.table.clone(), flips)))
+    let mut reconciled =
+        requery_and_reconcile_parents(registry, std::slice::from_ref(parent_sig), filter, commit_lsn).await?;
+    Ok(reconciled.pop().map(|(_, table, flips)| (table, flips)))
 }
 
 /// Re-derive a dependent fully (used for NULL flips on negated edges): re-query every candidate row
@@ -2537,7 +2667,7 @@ async fn rederive_shape(
     txid: Option<String>,
     commit_lsn: u64,
 ) -> Result<()> {
-    let (ts, pg_url) = {
+    let (ts, reader) = {
         let mut reg = registry.lock().await;
         // Same as `move_shape_for_value`: a shape still being created is queued, not dropped — its
         // edges are live but its `shapes` entry does not exist yet.
@@ -2545,12 +2675,12 @@ async fn rederive_shape(
             return Ok(());
         }
         let Some(s) = reg.shapes.get(shape_id) else { return Ok(()) };
-        let snapshot = (reg.snapshot_for_table(&s.outer_table)?, reg.pg_pool.clone());
+        let snapshot = (reg.snapshot_for_table(&s.outer_table)?, reg.candidate_reader());
         reg.begin_queryback(shape_id);
         snapshot
     };
     // Same accounting discipline as `move_shape_for_value`: decrement on every path.
-    let (rows, gate) = match query_all(&pg_url, &ts).await {
+    let (rows, gate) = match reader.all(&ts).await {
         Ok(r) => r,
         Err(e) => {
             registry.lock().await.end_queryback(shape_id);
@@ -2579,6 +2709,47 @@ async fn rederive_shape(
 // Candidate-row resolution (arrangement snapshot → pooled Postgres fallback) is the shared
 // membership kernel's — one implementation for this registry and for circuit cohort serving.
 use crate::engine::membership::{query_rows_all as query_all, query_rows_by_col as query_candidates};
+
+/// The read behind every flip query-back: pooled Postgres, through the shared membership kernel.
+/// Unit tests swap in an in-memory table that counts its reads, which is how the query-back
+/// fan-out is asserted without a live database.
+#[derive(Clone)]
+struct CandidateReader {
+    pool: Option<crate::pg::Pool>,
+    #[cfg(test)]
+    fake: Option<Arc<tests::FakeCandidates>>,
+}
+
+impl CandidateReader {
+    /// `<ts> WHERE <col> = <value>`, with the read's snapshot gate.
+    async fn by_col(&self, ts: &TableSchema, col: usize, value: &Value) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.read(ts, Some((col, value)));
+        }
+        query_candidates(&self.pool, ts, col, value).await
+    }
+
+    /// Every row of `ts` (a full re-derive), with the read's snapshot gate.
+    async fn all(&self, ts: &TableSchema) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.read(ts, None);
+        }
+        query_all(&self.pool, ts).await
+    }
+
+    async fn read(
+        &self,
+        ts: &TableSchema,
+        filter: Option<(usize, &Value)>,
+    ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
+        match filter {
+            Some((col, value)) => self.by_col(ts, col, value).await,
+            None => self.all(ts).await,
+        }
+    }
+}
 
 /// Net membership change carried by a batch of parent-node flips (enters +1, leaves −1), for the
 /// trace dot's label/colour.
@@ -2943,6 +3114,126 @@ pub(crate) mod tests {
         assert_eq!(work.len(), 2, "a failed attempt must not consume the work it did not finish");
         assert_eq!(work[0].1.value, Value::Int(100), "the failed item goes back at the front");
         assert_eq!(work[1].1.value, Value::Int(200), "and the untouched item keeps its place");
+    }
+
+    /// In-memory candidate rows standing in for Postgres behind flip query-backs (see
+    /// [`CandidateReader`]). Counts every read, so a test can assert how many query-backs a walk
+    /// issued — the quantity that multiplied in production.
+    #[derive(Default)]
+    pub(crate) struct FakeCandidates {
+        rows: HashMap<TableRef, Vec<Row>>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeCandidates {
+        pub(crate) fn with_rows(tables: impl IntoIterator<Item = (&'static str, Vec<Row>)>) -> Self {
+            FakeCandidates {
+                rows: tables.into_iter().map(|(t, rows)| (TableRef::from(t), rows)).collect(),
+                reads: Default::default(),
+            }
+        }
+
+        pub(crate) fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn read(
+            &self,
+            ts: &TableSchema,
+            filter: Option<(usize, &Value)>,
+        ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let rows = self
+                .rows
+                .get(&ts.table)
+                .map(|rows| {
+                    rows.iter().filter(|r| filter.is_none_or(|(col, v)| r.0.get(col) == Some(v))).cloned().collect()
+                })
+                .unwrap_or_default();
+            Ok((rows, crate::pg::SnapshotGate::passthrough()))
+        }
+    }
+
+    fn flip_edge(node: &SubquerySig, dependent: Dependent, connecting_col: usize) -> Edge {
+        Edge { node_sig: node.clone(), dependent, connecting_col, negated: false, null_sensitive: false }
+    }
+
+    /// **Incident 2026-11-11 (backfill storm): one flip, one read.** Every dependent a flipped
+    /// node reaches through the same connecting column re-evaluates the SAME candidate rows
+    /// (`<outer table> WHERE <col> = <value>`), so the walk must read them once and evaluate them
+    /// against each shape. In production one flip reached 445 shapes and issued 445 identical
+    /// query-backs (each a `REPEATABLE READ` snapshot + settle + SELECT on a pooled connection);
+    /// ~1,000 such flips kept the 8 flip workers busy for 23 minutes, and every drain receipt
+    /// behind them waited out the backlog.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_flip_reads_its_candidates_once_for_every_dependent_shape() {
+        const SHAPES: usize = 64;
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let sig: SubquerySig = "project_members|project_id|L(user_id,Eq,1)".into();
+        insert_test_node(&mut reg, &sig);
+        // Project 100 is in the set, so issue 1 (project 100) is a member of every shape.
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        for i in 0..SHAPES {
+            let id = format!("s{i}");
+            insert_membership_shape(&mut reg, &id, &sig, 1);
+            reg.add_edge(flip_edge(&sig, Dependent::Shape(id), 1));
+        }
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts)].into_iter().collect()));
+        let fake = Arc::new(FakeCandidates::with_rows([("issues", vec![issue(1, 100), issue(2, 200)])]));
+        reg.fake_candidates = Some(fake.clone());
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> =
+            [(sig.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        assert_eq!(fake.reads(), 1, "one flip must issue one query-back, not one per dependent shape");
+        for i in 0..SHAPES {
+            assert_eq!(ops_for(&store, &format!("shape/s{i}")), vec!["upsert"], "shape s{i} moves issue 1 in");
+        }
+        let reg = registry.lock().await;
+        assert!(reg.shapes.values().all(|s| s.inflight_querybacks == 0), "every query-back is balanced");
+    }
+
+    /// The same one tier down: parent NODES reached through one connecting column share the
+    /// re-derivation read, and each is still reconciled (its own flips derived and walked on).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_flip_reads_its_candidates_once_for_every_dependent_node() {
+        use crate::schema::TableDef;
+        const PARENTS: usize = 32;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "gid": {"type":"int"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let t = TableSchema::from_def(&TableRef::from("t"), &def).unwrap();
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
+        let child: SubquerySig = "child".into();
+        insert_test_node(&mut reg, &child);
+        let parents: Vec<SubquerySig> = (0..PARENTS).map(|i| SubquerySig::from(format!("parent-{i}"))).collect();
+        for parent in &parents {
+            insert_test_node(&mut reg, parent);
+            reg.add_edge(flip_edge(&child, Dependent::Node(parent.clone()), 1));
+        }
+        reg.set_schemas(Arc::new([(TableRef::from("t"), t)].into_iter().collect()));
+        // `t(id 7, gid 100)`: the child flips gid 100 in, so every parent's `id` set gains 7.
+        let fake = Arc::new(FakeCandidates::with_rows([("t", vec![Row(vec![Value::Int(7), Value::Int(100)])])]));
+        reg.fake_candidates = Some(fake.clone());
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> =
+            [(child.clone(), Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        assert_eq!(fake.reads(), 1, "one flip must issue one re-derivation read, not one per parent node");
+        let reg = registry.lock().await;
+        for parent in &parents {
+            assert!(reg.contains(parent, &Value::Int(7)), "parent {parent} reconciled from the shared read");
+            assert_eq!(reg.nodes[parent].inflight_querybacks, 0, "every re-derivation is balanced");
+        }
     }
 
     /// The same, through the retrying entry point every caller uses: exhausting the attempts still

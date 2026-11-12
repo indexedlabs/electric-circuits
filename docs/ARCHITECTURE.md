@@ -691,7 +691,10 @@ sequencer feeds every table's deltas into:
   Flip detection is the circuit's incremental distinct: the step's output deltas ARE the flips.
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
   with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
-  with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Flip
+  with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Every
+  dependent a flip reaches through the same connecting column shares **one** query-back per table
+  (the rows are the same; only the evaluation is per dependent), so a node with N dependents costs
+  one read per flip, not N. Flip
   propagation runs on a **semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`, default 8),
   off the sequencer hot path: the Postgres query-backs run concurrently (bounded by the shared
   `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
