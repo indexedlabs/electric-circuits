@@ -2709,7 +2709,7 @@ async fn requery_and_reconcile_parents(
             reg.end_node_queryback(parent_sig);
             #[cfg(test)]
             if let Some(probe) = reg.reconcile_probe.clone() {
-                probe(&*reg, parent_sig.as_str());
+                probe(&mut *reg, parent_sig.as_str());
             }
         }
     }
@@ -3587,7 +3587,7 @@ pub(crate) mod tests {
     /// See [`SubqueryRegistry::delivery_probe`].
     pub(crate) type DeliveryProbe = Arc<dyn Fn(&mut SubqueryRegistry, &str) -> Result<()> + Send + Sync>;
     /// See [`SubqueryRegistry::reconcile_probe`].
-    pub(crate) type ReconcileProbe = Arc<dyn Fn(&SubqueryRegistry, &str) + Send + Sync>;
+    pub(crate) type ReconcileProbe = Arc<dyn Fn(&mut SubqueryRegistry, &str) + Send + Sync>;
 
     /// **The shared read must not become one long lock hold.** Each shape is evaluated under its
     /// own hold and released from in flight the moment it is — so at every delivery the shapes
@@ -3677,7 +3677,7 @@ pub(crate) mod tests {
             // Right after each reconcile: every parent's in-flight count, as that hold left it.
             let seen: Arc<std::sync::Mutex<Vec<(String, Vec<u32>)>>> = Default::default();
             let log = seen.clone();
-            reg.reconcile_probe = Some(Arc::new(move |reg: &SubqueryRegistry, sig: &str| {
+            reg.reconcile_probe = Some(Arc::new(move |reg: &mut SubqueryRegistry, sig: &str| {
                 let counts = (0..PARENTS).map(|i| reg.nodes[&format!("parent-{i}")].inflight_querybacks).collect();
                 log.lock().unwrap().push((sig.to_string(), counts));
             }));
@@ -3881,6 +3881,202 @@ pub(crate) mod tests {
         }
         let reg = registry.lock().await;
         assert!(reg.shapes.values().all(|s| s.inflight_querybacks == 0), "every query-back is balanced");
+    }
+
+    /// Apply a live change through the table tailer's path from inside a (sync) probe. The probe
+    /// runs under the registry lock on a walk spawned onto a worker thread, so it can block in place.
+    fn apply_live(reg: &mut SubqueryRegistry, ts: &TableSchema, delta: &[Tup2<Row, ZWeight>], lsn: u64, xid: u64) {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(reg.on_table_delta(ts, delta, lsn, Some(xid), None, None))
+        })
+        .expect("live change");
+    }
+
+    /// Walk one flip on a worker thread (where a probe may block in place), handing back the result
+    /// and whatever the walk left on its queue.
+    async fn walk_on_worker(
+        registry: &Arc<tokio::sync::Mutex<SubqueryRegistry>>,
+        sig: &SubquerySig,
+        flip: &Flip,
+    ) -> (Result<()>, VecDeque<(SubquerySig, Flip)>) {
+        let (registry, item) = (registry.clone(), (sig.clone(), flip.clone()));
+        tokio::spawn(async move {
+            let (trace_tx, _rx) = tokio::sync::broadcast::channel(64);
+            let mut work: VecDeque<(SubquerySig, Flip)> = [item].into_iter().collect();
+            let res = propagate_flips(&registry, &mut work, None, None, &trace_tx).await;
+            (res, work)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The parent tier of [`a_live_change_between_holds_beats_the_shared_read_for_later_shapes`]:
+    /// right after parent 0 reconciles from the shared read (its hold, before parent 1's), the
+    /// inner row it read moves (`gid` 100 → 300, xid 50) through the live template path. The parents
+    /// still waiting are marked, so the live contribution is stamped on them and the shared read's
+    /// older row — from a snapshot that cannot see xid 50 — is dropped when they re-derive. Every
+    /// parent, parent 0 included, ends with the live contribution and not the stale one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_change_between_holds_beats_the_shared_read_for_later_parents() {
+        const PARENTS: usize = 4;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
+        let child: SubquerySig = "child".into();
+        insert_test_node(&mut reg, &child);
+        let pt = id_gid_ts("pt");
+        let gid = pt.column_index("gid").unwrap();
+        let parents: Vec<SubquerySig> = (0..PARENTS).map(|i| format!("parent-{i}")).collect();
+        for parent in &parents {
+            // Each parent projects `gid`, so the row's move changes the value it contributes.
+            insert_test_node_on(&mut reg, parent, "pt", gid);
+            reg.add_edge(flip_edge(&child, Dependent::Node(parent.clone()), gid));
+        }
+        reg.set_schemas(Arc::new([(TableRef::from("pt"), pt.clone())].into_iter().collect()));
+        let fake = FakeCandidates::with_rows([("pt", vec![id_gid_row(&pt, 7, 100)])])
+            .with_gate(crate::pg::SnapshotGate::parse("40:45:", "0/100"));
+        reg.fake_candidates = Some(Arc::new(fake));
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let live_pt = pt.clone();
+        reg.reconcile_probe = Some(Arc::new(move |reg: &mut SubqueryRegistry, sig: &str| {
+            if sig != "parent-0" || fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let delta = [Tup2(id_gid_row(&live_pt, 7, 100), -1), Tup2(id_gid_row(&live_pt, 7, 300), 1)];
+            apply_live(reg, &live_pt, &delta, 0x200, 50);
+        }));
+        let registry = Arc::new(tokio::sync::Mutex::new(reg));
+        let flip = Flip { value: Value::Int(100), dir: FlipDir::Leave };
+        let (res, work) = walk_on_worker(&registry, &child, &flip).await;
+
+        res.unwrap();
+        assert!(work.is_empty(), "the walk finished");
+        let reg = registry.lock().await;
+        for parent in &parents {
+            assert!(reg.contains(parent, &Value::Int(300)), "{parent} holds the live contribution");
+            assert!(!reg.contains(parent, &Value::Int(100)), "{parent} does not hold the stale one");
+            assert_eq!(reg.nodes[parent].inflight_querybacks, 0, "{parent} released");
+            assert!(reg.nodes[parent].recent.is_empty(), "{parent}'s recency cleared");
+        }
+    }
+
+    /// **An empty shared read releases its group and moves nothing.** Shapes on `issues` and
+    /// `comments`, parents on `t` and `t2`, where `comments` and `t2` have no rows: their reads come
+    /// back empty, for a value flip and a NULL flip alike. While the empty groups wait, a live change
+    /// lands on each of their tables (at the first `issues` delivery and after the first `t`
+    /// reconcile), so those dependents hold recency stamps; releasing the empty group must clear
+    /// them. The empty groups emit and reconcile nothing beyond the live change; the non-empty
+    /// groups move as usual. With an emission failure in the `issues` group instead, every
+    /// dependent — the empty group's included — is still released and the flip stays at the front.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_shared_read_releases_its_group_and_moves_nothing() {
+        for value in [Value::Int(100), Value::Null] {
+            for fail_at in [None, Some("shape/issues-1")] {
+                let case = format!("{value:?} failing at {fail_at:?}");
+                let (ds_url, store) = spawn_fake_ds().await;
+                let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+                let sig: SubquerySig = "child".into();
+                insert_test_node(&mut reg, &sig);
+                let ts = id_gid_ts("any");
+                let (id_col, gid_col) = (ts.column_index("id").unwrap(), ts.column_index("gid").unwrap());
+                let mut shapes = Vec::new();
+                for table in ["issues", "comments"] {
+                    for i in 0..2 {
+                        let id = format!("{table}-{i}");
+                        insert_outer_shape(
+                            &mut reg,
+                            &id,
+                            table,
+                            CompiledPredicate::InSubquery { col: gid_col, sig: sig.clone(), negated: true },
+                        );
+                        reg.add_edge(null_sensitive_edge(&sig, Dependent::Shape(id.clone()), gid_col));
+                        shapes.push(id);
+                    }
+                }
+                let mut parents = Vec::new();
+                for table in ["t", "t2"] {
+                    for i in 0..2 {
+                        let parent = format!("{table}-parent-{i}");
+                        insert_test_node_on(&mut reg, &parent, table, id_col);
+                        reg.add_edge(null_sensitive_edge(&sig, Dependent::Node(parent.clone()), gid_col));
+                        parents.push(parent);
+                    }
+                }
+                reg.set_schemas(Arc::new(
+                    ["issues", "comments", "t", "t2"].into_iter().map(|t| (TableRef::from(t), id_gid_ts(t))).collect(),
+                ));
+                let fake = FakeCandidates::with_rows([
+                    ("issues", vec![id_gid_row(&ts, 1, 100)]),
+                    ("comments", Vec::new()),
+                    ("t", vec![id_gid_row(&ts, 7, 100)]),
+                    ("t2", Vec::new()),
+                ])
+                .with_gate(crate::pg::SnapshotGate::parse("40:45:", "0/100"));
+                let fake = Arc::new(fake);
+                reg.fake_candidates = Some(fake.clone());
+                let (comments, t2) = (id_gid_ts("comments"), id_gid_ts("t2"));
+                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                reg.delivery_probe = Some(Arc::new(move |reg: &mut SubqueryRegistry, path: &str| {
+                    if path == "shape/issues-0" && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        apply_live(reg, &comments, &[Tup2(id_gid_row(&comments, 10, 300), 1)], 0x200, 50);
+                    }
+                    if Some(path) == fail_at {
+                        anyhow::bail!("injected emission failure");
+                    }
+                    Ok(())
+                }));
+                let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                reg.reconcile_probe = Some(Arc::new(move |reg: &mut SubqueryRegistry, parent: &str| {
+                    if parent == "t-parent-0" && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        apply_live(reg, &t2, &[Tup2(id_gid_row(&t2, 70, 300), 1)], 0x300, 51);
+                    }
+                }));
+                let registry = Arc::new(tokio::sync::Mutex::new(reg));
+                let flip = Flip { value: value.clone(), dir: FlipDir::Leave };
+                let (res, work) = walk_on_worker(&registry, &sig, &flip).await;
+
+                let key = |id: i64| ts.key_string(&id_gid_row(&ts, id, 0)).unwrap();
+                let keys = |id: &str| -> Vec<String> {
+                    envs_for(&store, &format!("shape/{id}")).into_iter().map(|(_, k, _)| k).collect()
+                };
+                let reg = registry.lock().await;
+                // Released, and no recency left behind, whatever happened.
+                for (id, s) in &reg.shapes {
+                    assert_eq!(s.inflight_querybacks, 0, "{case}: shape {id} released");
+                    assert!(s.recent.is_empty(), "{case}: shape {id}'s recency cleared");
+                }
+                for parent in &parents {
+                    assert_eq!(reg.nodes[parent].inflight_querybacks, 0, "{case}: {parent} released");
+                    assert!(reg.nodes[parent].recent.is_empty(), "{case}: {parent}'s recency cleared");
+                }
+                // The empty `comments` group emitted nothing of its own: only the live insert.
+                for i in 0..2 {
+                    assert_eq!(keys(&format!("comments-{i}")), vec![key(10)], "{case}: comments-{i}");
+                }
+                match fail_at {
+                    None => {
+                        res.unwrap();
+                        assert!(work.is_empty(), "{case}: the walk finished");
+                        assert_eq!(fake.reads(), 4, "{case}: one read per table, empty ones included");
+                        for i in 0..2 {
+                            assert_eq!(keys(&format!("issues-{i}")), vec![key(1)], "{case}: issues-{i} moved");
+                            let (t_parent, t2_parent) = (format!("t-parent-{i}"), format!("t2-parent-{i}"));
+                            assert!(reg.contains(&t_parent, &Value::Int(7)), "{case}: {t_parent} reconciled");
+                            assert!(reg.contains(&t2_parent, &Value::Int(70)), "{case}: {t2_parent} has the live row");
+                            assert!(!reg.contains(&t2_parent, &Value::Int(7)), "{case}: and nothing from `t`");
+                        }
+                    }
+                    Some(_) => {
+                        assert!(res.is_err(), "{case}: the failed emission fails the walk");
+                        assert_eq!(work, VecDeque::from([(sig.clone(), flip.clone())]), "{case}: the flip goes back");
+                        assert_eq!(fake.reads_of("t"), (0, 0), "{case}: the parent tier is never reached");
+                        for parent in &parents {
+                            for id in [7, 70] {
+                                assert!(!reg.contains(parent, &Value::Int(id)), "{case}: {parent} not reconciled");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A flip reaching installed AND still-being-created dependents: the pending ones get the work
