@@ -3799,10 +3799,13 @@ pub(crate) mod tests {
     }
 
     /// **A live decision between two holds still wins.** Shapes are evaluated one hold at a time, so
-    /// a live commit can land after s0's evaluation and before s1's. The shapes still waiting are
-    /// marked in flight, so the live verdict is stamped on them, and the shared read's older row for
-    /// that pk — from a snapshot that cannot see the commit — is dropped when they evaluate it. s1..
-    /// carry only the live row; s0 keeps its query-back upsert, followed by the live one.
+    /// a live commit can land after s0's evaluation and before s1's. The test applies it inside s0's
+    /// hold, right after s0's delivery — the same point in the walk, made deterministic (that another
+    /// task really gets the lock there is `another_task_takes_the_lock_between_dependents`). The
+    /// shapes still waiting are marked in flight, so the live verdict is stamped on them, and the
+    /// shared read's older row for that pk — from a snapshot that cannot see the commit — is dropped
+    /// when they evaluate it. s1.. carry only the live row; s0 keeps its query-back upsert, followed
+    /// by the live one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_live_change_between_holds_beats_the_shared_read_for_later_shapes() {
         const SHAPES: usize = 4;
@@ -3826,7 +3829,7 @@ pub(crate) mod tests {
         let fake = FakeCandidates::with_rows([("issues", vec![issue(1, 100)])])
             .with_gate(crate::pg::SnapshotGate::parse("40:45:", "0/100"));
         reg.fake_candidates = Some(Arc::new(fake));
-        // Right after s0's query-back delivery (its hold, before s1's): issue 1 moves from project
+        // Inside s0's hold, right after its query-back delivery (before s1's hold): issue 1 moves from project
         // 100 to 300 in xid 50, through the live outer-table path.
         let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let live_ts = ts.clone();
@@ -3911,8 +3914,8 @@ pub(crate) mod tests {
     }
 
     /// The parent tier of [`a_live_change_between_holds_beats_the_shared_read_for_later_shapes`]:
-    /// right after parent 0 reconciles from the shared read (its hold, before parent 1's), the
-    /// inner row it read moves (`gid` 100 → 300, xid 50) through the live template path. The parents
+    /// inside parent 0's hold, right after it reconciles from the shared read (before parent 1's
+    /// hold), the inner row it read moves (`gid` 100 → 300, xid 50) through the live template path. The parents
     /// still waiting are marked, so the live contribution is stamped on them and the shared read's
     /// older row — from a snapshot that cannot see xid 50 — is dropped when they re-derive. Every
     /// parent, parent 0 included, ends with the live contribution and not the stale one.
@@ -3956,6 +3959,88 @@ pub(crate) mod tests {
             assert_eq!(reg.nodes[parent].inflight_querybacks, 0, "{parent} released");
             assert!(reg.nodes[parent].recent.is_empty(), "{parent}'s recency cleared");
         }
+    }
+
+    /// From inside a probe (which runs under the walker's registry lock): spawn a task that waits on
+    /// that lock and logs `"contender"` once it gets it, and return only once that task is queued on
+    /// the mutex. The task signals right before `lock().await` and the probe then gives it time to
+    /// reach the wait queue; the tokio mutex is FIFO-fair, so it is next in line when this hold ends.
+    fn queue_a_contender(
+        registry: &std::sync::OnceLock<std::sync::Weak<tokio::sync::Mutex<SubqueryRegistry>>>,
+        log: &Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let (registry, log) = (registry.get().expect("registry set").upgrade().expect("registry alive"), log.clone());
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        tokio::spawn(async move {
+            queued_tx.send(()).unwrap();
+            let _held = registry.lock().await;
+            log.lock().unwrap().push("contender".to_string());
+        });
+        tokio::task::block_in_place(|| {
+            queued_rx.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+    }
+
+    /// **Another task really gets the registry between two dependents** — the point of evaluating
+    /// each under its own hold. From the first dependent's probe (shape s0's delivery, parent 0's
+    /// reconcile) a contender is queued on the registry lock; it must acquire it before the second
+    /// dependent's probe runs. Under one hold across the loop it could only get in after the last.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_task_takes_the_lock_between_dependents() {
+        let (ds_url, _store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let sig: SubquerySig = "child".into();
+        insert_test_node(&mut reg, &sig);
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        for i in 0..3 {
+            let id = format!("s{i}");
+            insert_membership_shape(&mut reg, &id, &sig, 1);
+            reg.add_edge(flip_edge(&sig, Dependent::Shape(id), 1));
+        }
+        let t = id_gid_ts("t");
+        let (id_col, gid_col) = (t.column_index("id").unwrap(), t.column_index("gid").unwrap());
+        for i in 0..3 {
+            let parent = format!("parent-{i}");
+            insert_test_node_on(&mut reg, &parent, "t", id_col);
+            reg.add_edge(flip_edge(&sig, Dependent::Node(parent), gid_col));
+        }
+        let t_rows = vec![id_gid_row(&t, 7, 100)];
+        reg.set_schemas(Arc::new(
+            [(TableRef::parse("issues").unwrap(), issues_ts()), (TableRef::from("t"), t)].into_iter().collect(),
+        ));
+        reg.fake_candidates =
+            Some(Arc::new(FakeCandidates::with_rows([("issues", vec![issue(1, 100)]), ("t", t_rows)])));
+        let cell: Arc<std::sync::OnceLock<std::sync::Weak<tokio::sync::Mutex<SubqueryRegistry>>>> = Default::default();
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let (probe_cell, probe_log) = (cell.clone(), log.clone());
+        reg.delivery_probe = Some(Arc::new(move |_: &mut SubqueryRegistry, path: &str| {
+            probe_log.lock().unwrap().push(path.to_string());
+            if path == "shape/s0" {
+                queue_a_contender(&probe_cell, &probe_log);
+            }
+            Ok(())
+        }));
+        let (probe_cell, probe_log) = (cell.clone(), log.clone());
+        reg.reconcile_probe = Some(Arc::new(move |_: &mut SubqueryRegistry, parent: &str| {
+            probe_log.lock().unwrap().push(parent.to_string());
+            if parent == "parent-0" {
+                queue_a_contender(&probe_cell, &probe_log);
+            }
+        }));
+        let registry = Arc::new(tokio::sync::Mutex::new(reg));
+        cell.set(Arc::downgrade(&registry)).unwrap();
+        let flip = Flip { value: Value::Int(100), dir: FlipDir::Enter };
+        let (res, work) = walk_on_worker(&registry, &sig, &flip).await;
+
+        res.unwrap();
+        assert!(work.is_empty(), "the walk finished");
+        let log = log.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            ["shape/s0", "contender", "shape/s1", "shape/s2", "parent-0", "contender", "parent-1", "parent-2"],
+            "the contender gets the lock right after the first dependent's hold, in both tiers"
+        );
     }
 
     /// **An empty shared read releases its group and moves nothing.** Shapes on `issues` and
