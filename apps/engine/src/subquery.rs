@@ -571,6 +571,10 @@ pub struct SubqueryRegistry {
     /// Test-only stand-in for Postgres behind every flip query-back (see [`CandidateReader`]).
     #[cfg(test)]
     fake_candidates: Option<Arc<tests::FakeCandidates>>,
+    /// Test-only hook run under the lock at every delivery, before it is sent: lets a test observe
+    /// the registry exactly as the emission sees it, and fail that delivery.
+    #[cfg(test)]
+    delivery_probe: Option<tests::DeliveryProbe>,
     schemas: SchemaMap,
     /// Ordered emission lanes (see `engine::emission`): membership envelopes are enqueued
     /// under this registry's lock — per-stream enqueue order = eval order — and land on their
@@ -656,6 +660,8 @@ impl SubqueryRegistry {
             pg_pool,
             #[cfg(test)]
             fake_candidates: None,
+            #[cfg(test)]
+            delivery_probe: None,
             schemas: Arc::new(HashMap::new()),
             lanes: None,
             group_lanes: None,
@@ -769,6 +775,10 @@ impl SubqueryRegistry {
     /// append order = eval order — the "data in the right place" invariant). Without lanes
     /// (unit tests) this awaits a direct reliable append, the pre-lane behavior.
     async fn deliver(&mut self, stream_path: &str, mut envs: Vec<Envelope>, commit_lsn: u64) -> Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = self.delivery_probe.clone() {
+            probe(self, stream_path)?;
+        }
         if let Some(&commit_ts) = self.commit_times.get(&commit_lsn) {
             for env in &mut envs {
                 env.headers.commit_ts = Some(commit_ts);
@@ -2521,45 +2531,54 @@ async fn requery_and_move_shapes(
             }
         }
     }
-    // Evaluate + assert + deliver atomically under the lock, through the ONE emission tail
-    // (candidates from a query-back all still exist), each shape filtered against the live
-    // decisions taken since the shared read's snapshot. One shape at a time, each with its own
-    // copy of the shared candidates: copying rows in memory is cheap next to another read.
-    let mut reg = registry.lock().await;
+    // Evaluate + assert + deliver through the ONE emission tail (candidates from a query-back all
+    // still exist), each shape filtered against the live decisions taken since the shared read's
+    // snapshot, with its own copy of the shared candidates (copying rows in memory is cheap next to
+    // another read). ONE shape per lock hold, released from in flight as soon as it is evaluated:
+    // one hold across every dependent — hundreds of them, each over a whole table on a NULL flip —
+    // would keep the live sequencer path and every other flip worker off the registry for all N
+    // evaluations at once. Each shape's eval + FeedSet transition + enqueue stays atomic under its
+    // own hold, and the shapes still waiting stay marked, so live decisions taken in between are
+    // stamped on them and beat the shared read exactly as before.
+    let reads: Vec<(Vec<(Row, bool)>, crate::pg::SnapshotGate)> =
+        reads.into_iter().map(|(rows, gate)| (rows.into_iter().map(|r| (r, true)).collect(), gate)).collect();
+    let order: Vec<(usize, &String)> =
+        groups.iter().enumerate().flat_map(|(g, (_, ids))| ids.iter().map(move |id| (g, id))).collect();
     let mut moved = Vec::new();
-    let mut result = Ok(());
-    'groups: for ((ts, ids), (rows, gate)) in groups.iter().zip(reads) {
+    for (i, &(g, shape_id)) in order.iter().enumerate() {
+        let (ts, (candidates, gate)) = (&groups[g].0, &reads[g]);
+        let mut reg = registry.lock().await;
         // The emission tail only ever touches the candidates it is given, so an empty read moves
-        // nothing for any shape (a full re-derive included) and is skipped.
-        if rows.is_empty() {
-            continue;
-        }
-        let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
-        for shape_id in ids {
-            let emitted = reg
-                .emit_for_shapes(
-                    ts,
-                    vec![(shape_id.clone(), candidates.clone())],
-                    txid.clone(),
-                    EmissionSource::QueryBack { gate: &gate, commit_lsn },
-                )
-                .await;
-            match emitted {
-                Ok(emitted) => moved.extend(
-                    emitted
-                        .into_iter()
-                        .filter(|(_, appended, _)| *appended)
-                        .map(|(id, _, net)| (id, ts.table.clone(), net)),
-                ),
-                Err(e) => {
-                    result = Err(e);
-                    break 'groups;
+        // nothing (a full re-derive included) and is skipped.
+        let emitted = if candidates.is_empty() {
+            Ok(Vec::new())
+        } else {
+            reg.emit_for_shapes(
+                ts,
+                vec![(shape_id.clone(), candidates.clone())],
+                txid.clone(),
+                EmissionSource::QueryBack { gate, commit_lsn },
+            )
+            .await
+        };
+        reg.end_queryback(shape_id);
+        match emitted {
+            Ok(emitted) => moved.extend(
+                emitted
+                    .into_iter()
+                    .filter(|(_, appended, _)| *appended)
+                    .map(|(id, _, net)| (id, ts.table.clone(), net)),
+            ),
+            Err(e) => {
+                // This shape is released above; release every one not evaluated yet.
+                for &(_, rest) in &order[i + 1..] {
+                    reg.end_queryback(rest);
                 }
+                return Err(e);
             }
         }
     }
-    end_all(&mut reg);
-    result.map(|()| moved)
+    Ok(moved)
 }
 
 /// [`requery_and_move_shapes`] for one shape and one flipped value: `Some((outer_table,
@@ -2648,10 +2667,14 @@ async fn requery_and_reconcile_parents(
             }
         }
     }
-    let mut reg = registry.lock().await;
+    // ONE parent per lock hold, released from in flight as soon as it is reconciled — the same reason
+    // as `requery_and_move_shapes`: one hold across every parent would keep the registry locked for
+    // all N re-derivations. The parents still waiting stay marked. Reconciling cannot fail, so there
+    // is no partial-exit path to balance.
     let mut reconciled = Vec::new();
     for ((ts, sigs), (rows, gate)) in groups.iter().zip(reads) {
         for parent_sig in sigs {
+            let mut reg = registry.lock().await;
             if let Some(evals) = reg.node_queryback_evals(parent_sig, ts, &rows, &gate) {
                 let flips = reg.apply_node_evals(parent_sig, evals).await;
                 reconciled.push((parent_sig.clone(), ts.table.clone(), flips));
@@ -3512,6 +3535,74 @@ pub(crate) mod tests {
                 for (id, s) in &reg.shapes {
                     assert_eq!(s.inflight_querybacks, 0, "{case}: shape {id} released");
                 }
+            }
+        }
+    }
+
+    /// See [`SubqueryRegistry::delivery_probe`].
+    pub(crate) type DeliveryProbe = Arc<dyn Fn(&SubqueryRegistry, &str) -> Result<()> + Send + Sync>;
+
+    /// **The shared read must not become one long lock hold.** Each shape is evaluated under its
+    /// own hold and released from in flight the moment it is — so at every delivery the shapes
+    /// before it are already released and the ones after it still marked — and an emission error
+    /// midway releases every shape (those never evaluated included), emits nothing further and
+    /// leaves the flip at the front of the walk. For a value flip and a NULL flip alike.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_shape_is_released_as_soon_as_it_is_evaluated() {
+        const SHAPES: usize = 5;
+        for value in [Value::Int(100), Value::Null] {
+            let (ds_url, store) = spawn_fake_ds().await;
+            let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+            let sig: SubquerySig = "child".into();
+            insert_test_node(&mut reg, &sig);
+            for i in 0..SHAPES {
+                let id = format!("s{i}");
+                insert_outer_shape(
+                    &mut reg,
+                    &id,
+                    "issues",
+                    CompiledPredicate::InSubquery { col: 1, sig: sig.clone(), negated: true },
+                );
+                reg.add_edge(null_sensitive_edge(&sig, Dependent::Shape(id), 1));
+            }
+            reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), issues_ts())].into_iter().collect()));
+            let fake = Arc::new(FakeCandidates::with_rows([("issues", vec![issue(1, 100), issue(2, 200)])]));
+            reg.fake_candidates = Some(fake.clone());
+            // At every delivery: each shape's in-flight count as the emission sees it. s2's fails.
+            let seen: Arc<std::sync::Mutex<Vec<(String, Vec<u32>)>>> = Default::default();
+            let log = seen.clone();
+            reg.delivery_probe = Some(Arc::new(move |reg: &SubqueryRegistry, path: &str| {
+                let counts = (0..SHAPES).map(|i| reg.shapes[&format!("s{i}")].inflight_querybacks).collect();
+                log.lock().unwrap().push((path.to_string(), counts));
+                if path == "shape/s2" {
+                    anyhow::bail!("injected emission failure");
+                }
+                Ok(())
+            }));
+            let registry = tokio::sync::Mutex::new(reg);
+            let (trace_tx, _rx) = tokio::sync::broadcast::channel(64);
+            let flip = Flip { value: value.clone(), dir: FlipDir::Leave };
+            let mut work: VecDeque<(SubquerySig, Flip)> = [(sig.clone(), flip.clone())].into_iter().collect();
+            let res = propagate_flips(&registry, &mut work, None, None, &trace_tx).await;
+
+            assert!(res.is_err(), "{value:?}: the failed emission fails the walk");
+            assert_eq!(work, VecDeque::from([(sig.clone(), flip.clone())]), "{value:?}: the flip goes back");
+            assert_eq!(fake.reads(), 1, "{value:?}: still one shared read");
+            let seen = seen.lock().unwrap().clone();
+            let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+            assert_eq!(paths, ["shape/s0", "shape/s1", "shape/s2"], "{value:?}: s3 and s4 are never evaluated");
+            for (k, (path, counts)) in seen.iter().enumerate() {
+                for (i, count) in counts.iter().enumerate() {
+                    let expected = if i < k { 0 } else { 1 };
+                    assert_eq!(*count, expected, "{value:?}: at {path}, s{i} is released iff evaluated earlier");
+                }
+            }
+            for i in 3..SHAPES {
+                assert!(ops_for(&store, &format!("shape/s{i}")).is_empty(), "{value:?}: s{i} emitted nothing");
+            }
+            let reg = registry.lock().await;
+            for (id, s) in &reg.shapes {
+                assert_eq!(s.inflight_querybacks, 0, "{value:?}: shape {id} released");
             }
         }
     }
