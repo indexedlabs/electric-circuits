@@ -201,4 +201,48 @@ mod tests {
         let mixed = values_in_sql("c", &[Value::Int(1), Value::Text("a".into())], Some("text"));
         assert_eq!(mixed.0, "(\"c\" IN (1) OR \"c\" IN ($1::text::\"text\"))");
     }
+
+    /// The coalesced read against real PostgreSQL: several values of a uuid column, cast from text
+    /// params in one `IN (…)`, return exactly those values' rows (and one value is the single-value
+    /// read).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires PostgreSQL via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+    async fn query_rows_by_values_real_postgres_reads_each_value_once() -> Result<()> {
+        let url = std::env::var("ELECTRIC_CIRCUITS_TEST_PG_URL")?;
+        let client = crate::pg::connect(&url).await?;
+        let table: TableRef = format!("queryback_{}", uuid::Uuid::new_v4().simple()).parse()?;
+        let uuids: Vec<String> = (0..10).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+        let rows: Vec<String> = (1..=30).map(|i| format!("({i}, '{}', {})", uuids[i % 10], i % 10)).collect();
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id bigint PRIMARY KEY, record_id uuid, n bigint);
+                 INSERT INTO {table} VALUES {}",
+                rows.join(", ")
+            ))
+            .await?;
+        let ts = TableSchema::from_def(&table, &crate::pg::introspect(&client, &table, false).await?)?;
+        let pool = Some(crate::pg::Pool::new(url, 2));
+        let uuid_of = |n: usize| Value::Text(uuids.get(n).cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+        let ids = |rows: &[Row]| {
+            let mut ids: Vec<i64> = rows
+                .iter()
+                .map(|r| match &r.0[ts.column_index("id").unwrap()] {
+                    Value::Int(i) => *i,
+                    other => panic!("id is an int, got {other:?}"),
+                })
+                .collect();
+            ids.sort();
+            ids
+        };
+        let record_id = ts.column_index("record_id")?;
+        let (rows, _) = query_rows_by_values(&pool, &ts, record_id, &[uuid_of(1), uuid_of(2), uuid_of(42)]).await?;
+        assert_eq!(ids(&rows), vec![1, 2, 11, 12, 21, 22], "two values present, one absent");
+        let (rows, _) = query_rows_by_values(&pool, &ts, record_id, &[uuid_of(3)]).await?;
+        assert_eq!(ids(&rows), vec![3, 13, 23], "one value is the single-value read");
+        let n = ts.column_index("n")?;
+        let (rows, _) = query_rows_by_values(&pool, &ts, n, &[Value::Int(4), Value::Int(5)]).await?;
+        assert_eq!(ids(&rows), vec![4, 5, 14, 15, 24, 25], "inlined integers");
+        client.batch_execute(&format!("DROP TABLE {table}")).await?;
+        Ok(())
+    }
 }

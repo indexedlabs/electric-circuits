@@ -2385,33 +2385,52 @@ async fn propagate_round(
     // Every flipped node's dependents, plus the table each node's change entered through: the head
     // of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
     // dependent). Fetched under one lock so a concurrent drop can't split them.
+    // Every flip of a node reaches all of that node's dependents, so the round is planned per
+    // flipped node: its distinct non-NULL values (one shared list, however many dependents read
+    // it), whether a NULL flipped in it, and its edges, walked once.
+    let mut flipped: Vec<&SubquerySig> = Vec::new();
+    let mut node_flips: HashMap<&SubquerySig, (Vec<Value>, HashSet<&Value>, bool)> = HashMap::new();
+    for (sig, flip) in round {
+        let (values, seen, null) = node_flips.entry(sig).or_insert_with(|| {
+            flipped.push(sig);
+            Default::default()
+        });
+        if matches!(flip.value, Value::Null) {
+            *null = true;
+        } else if seen.insert(&flip.value) {
+            values.push(flip.value.clone());
+        }
+    }
+    let node_values: HashMap<SubquerySig, Arc<[Value]>> =
+        node_flips.iter().map(|(sig, (values, _, _))| ((*sig).clone(), Arc::from(values.as_slice()))).collect();
     let mut shapes: RoundPlan<String> = RoundPlan::default();
     let mut parents: RoundPlan<SubquerySig> = RoundPlan::default();
     let mut sources: HashMap<SubquerySig, TableRef> = HashMap::new();
     {
         let reg = registry.lock().await;
-        let mut edges_by_node: HashMap<&SubquerySig, Vec<Edge>> = HashMap::new();
-        for (sig, flip) in round {
-            if !edges_by_node.contains_key(sig) {
-                edges_by_node.insert(sig, reg.edges_of(sig));
-                if let Some(n) = reg.nodes.get(sig) {
-                    sources.insert(sig.clone(), n.inner_table.clone());
-                }
+        for sig in flipped {
+            if let Some(n) = reg.nodes.get(sig) {
+                sources.insert(sig.clone(), n.inner_table.clone());
             }
-            let null = matches!(flip.value, Value::Null);
-            for edge in &edges_by_node[sig] {
-                if null && !edge.null_sensitive {
-                    continue;
+            let (values, _, null) = &node_flips[sig];
+            for edge in reg.edges_of(sig) {
+                let mut needs = Vec::with_capacity(2);
+                if !values.is_empty() {
+                    needs.push(Some(edge.connecting_col));
                 }
-                let need = (!null).then(|| (edge.connecting_col, &flip.value));
-                match &edge.dependent {
-                    Dependent::Shape(id) => shapes.add(id, need, sig),
-                    Dependent::Node(parent) => parents.add(parent, need, sig),
+                if *null && edge.null_sensitive {
+                    needs.push(None);
+                }
+                for need in needs {
+                    match &edge.dependent {
+                        Dependent::Shape(id) => shapes.add(id, need, sig),
+                        Dependent::Node(parent) => parents.add(parent, need, sig),
+                    }
                 }
             }
         }
     }
-    let shape_reqs = shapes.into_requests();
+    let shape_reqs = shapes.into_requests(&node_values);
     let moved = requery_and_move(registry, &shape_reqs, txid.clone(), commit_lsn).await?;
     // Light the whole path only for the shapes that actually moved rows: source `table:<t>` → the
     // flipped `node:<sig>` → that `shape:<id>`.
@@ -2435,7 +2454,7 @@ async fn propagate_round(
     // A parent missing from the result vanished, or is a fresh node its own create is still seeding
     // — in which case the re-derivation was queued on the node and runs when that create installs
     // the seed (see `queue_node_deferred`).
-    let parent_reqs = parents.into_requests();
+    let parent_reqs = parents.into_requests(&node_values);
     for (i, _inner, flips) in requery_and_reconcile(registry, &parent_reqs, commit_lsn).await? {
         let req = &parent_reqs[i];
         // A nested `IN`: connect the flipped child `node:<sig>` to the parent `node:<parent_sig>` it
@@ -2469,7 +2488,11 @@ async fn propagate_round(
 #[derive(Clone, Debug, PartialEq)]
 enum Need {
     Full,
-    Values { col: usize, values: Vec<Value> },
+    /// Shared with every dependent the same flipped node reached through `col`.
+    Values {
+        col: usize,
+        values: Arc<[Value]>,
+    },
 }
 
 /// One dependent's query-back in a round, and the flipped nodes that reached it (whose paths its
@@ -2481,7 +2504,7 @@ struct Requery<K> {
 }
 
 /// One tier's dependents for a round, in the order the round first reached them: per dependent,
-/// either a full re-derive or the values per connecting column, each value once.
+/// either a full re-derive or, per connecting column, the flipped nodes that reached it there.
 struct RoundPlan<K> {
     order: Vec<K>,
     deps: HashMap<K, PlannedDependent>,
@@ -2496,13 +2519,14 @@ impl<K> Default for RoundPlan<K> {
 #[derive(Default)]
 struct PlannedDependent {
     full: bool,
-    cols: Vec<(usize, Vec<Value>, HashSet<Value>)>,
+    cols: Vec<(usize, Vec<SubquerySig>)>,
     via: Vec<SubquerySig>,
 }
 
 impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
-    /// `need` is `None` for a full re-derive, else the connecting column and the flipped value.
-    fn add(&mut self, dependent: &K, need: Option<(usize, &Value)>, via: &SubquerySig) {
+    /// `need` is `None` for a full re-derive, else the connecting column `via`'s values reach it
+    /// through.
+    fn add(&mut self, dependent: &K, need: Option<usize>, via: &SubquerySig) {
         if !self.deps.contains_key(dependent) {
             self.order.push(dependent.clone());
         }
@@ -2512,25 +2536,18 @@ impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
         }
         match need {
             None => dep.full = true,
-            Some((col, value)) => {
-                let i = match dep.cols.iter().position(|(c, _, _)| *c == col) {
-                    Some(i) => i,
-                    None => {
-                        dep.cols.push((col, Vec::new(), HashSet::new()));
-                        dep.cols.len() - 1
-                    }
-                };
-                let (_, values, seen) = &mut dep.cols[i];
-                if seen.insert(value.clone()) {
-                    values.push(value.clone());
-                }
-            }
+            Some(col) => match dep.cols.iter_mut().find(|(c, _)| *c == col) {
+                Some((_, sigs)) if sigs.contains(via) => {}
+                Some((_, sigs)) => sigs.push(via.clone()),
+                None => dep.cols.push((col, vec![via.clone()])),
+            },
         }
     }
 
     /// One request per dependent and connecting column — or ONE full re-derive for a dependent any
-    /// NULL flip reached, which covers every value of its table — in first-reached order.
-    fn into_requests(mut self) -> Vec<Requery<K>> {
+    /// NULL flip reached, which covers every value of its table — in first-reached order. A column
+    /// one node reached shares that node's value list; several nodes' lists are merged.
+    fn into_requests(mut self, node_values: &HashMap<SubquerySig, Arc<[Value]>>) -> Vec<Requery<K>> {
         let mut out = Vec::new();
         for dependent in self.order {
             let Some(dep) = self.deps.remove(&dependent) else { continue };
@@ -2538,7 +2555,21 @@ impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
                 out.push(Requery { dependent, need: Need::Full, via: dep.via });
                 continue;
             }
-            for (col, values, _) in dep.cols {
+            for (col, sigs) in dep.cols {
+                let values = match sigs.as_slice() {
+                    [sig] => node_values.get(sig).cloned().unwrap_or_else(|| Arc::from([])),
+                    _ => {
+                        let mut seen = HashSet::new();
+                        let merged: Vec<Value> = sigs
+                            .iter()
+                            .filter_map(|sig| node_values.get(sig))
+                            .flat_map(|values| values.iter())
+                            .filter(|v| seen.insert(*v))
+                            .cloned()
+                            .collect();
+                        Arc::from(merged)
+                    }
+                };
                 out.push(Requery {
                     dependent: dependent.clone(),
                     need: Need::Values { col, values },
@@ -2574,7 +2605,7 @@ impl ReadGroup {
                     }
                 };
                 let (_, all, seen) = &mut self.cols[k];
-                for v in values {
+                for v in values.iter() {
                     if seen.insert(v.clone()) {
                         all.push(v.clone());
                     }
@@ -2686,7 +2717,7 @@ async fn requery_and_move_shapes(
     commit_lsn: u64,
 ) -> Result<Vec<(String, TableRef, i64)>> {
     let need = match filter {
-        Some((col, value)) => Need::Values { col, values: vec![value.clone()] },
+        Some((col, value)) => Need::Values { col, values: Arc::from([value.clone()]) },
         None => Need::Full,
     };
     let reqs: Vec<Requery<String>> =
@@ -2851,7 +2882,7 @@ async fn requery_and_reconcile_parents(
     commit_lsn: u64,
 ) -> Result<Vec<(SubquerySig, TableRef, Vec<Flip>)>> {
     let need = match filter {
-        Some((col, value)) => Need::Values { col, values: vec![value.clone()] },
+        Some((col, value)) => Need::Values { col, values: Arc::from([value.clone()]) },
         None => Need::Full,
     };
     let reqs: Vec<Requery<SubquerySig>> =
