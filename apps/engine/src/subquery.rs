@@ -2582,7 +2582,8 @@ impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
 }
 
 /// The dependents of one tier that live on one table, and what the round reads of it: one full read
-/// if any of them needs one, else one read per connecting column of every value they need on it.
+/// for the members re-derived in full, and one read per connecting column of every value the other
+/// members need on it.
 struct ReadGroup {
     ts: TableSchema,
     full: bool,
@@ -2624,12 +2625,13 @@ fn group_for(groups: &mut Vec<ReadGroup>, reg: &SubqueryRegistry, table: &TableR
     Ok(groups.len() - 1)
 }
 
-/// What a group's reads returned.
-enum GroupRead {
-    /// Every row of the table: serves every request of the group, whatever it needed.
-    Full(Vec<Row>, crate::pg::SnapshotGate),
-    /// One read per connecting column.
-    Cols(Vec<ColRead>),
+/// What a group's reads returned. A full read serves only the members re-derived in full: a member
+/// reached by values alone keeps the rows of its own values, or it would re-upsert every member row
+/// of its shape whenever a NULL flip shared its table in the same round.
+struct GroupRead {
+    full: Option<(Vec<Row>, crate::pg::SnapshotGate)>,
+    /// One read per connecting column the value-only members need.
+    cols: Vec<ColRead>,
 }
 
 /// One `<table> WHERE <col> IN (…)` read, indexed by the column's value.
@@ -2648,10 +2650,10 @@ struct ColRead {
 
 impl GroupRead {
     async fn read(reader: &CandidateReader, group: &ReadGroup) -> Result<GroupRead> {
-        if group.full {
-            let (rows, gate) = reader.read(&group.ts, None).await?;
-            return Ok(GroupRead::Full(rows, gate));
-        }
+        let full = match group.full {
+            true => Some(reader.read(&group.ts, None).await?),
+            false => None,
+        };
         let mut cols = Vec::with_capacity(group.cols.len());
         for (col, values, asked) in &group.cols {
             let (rows, gate) = reader.read(&group.ts, Some((*col, values))).await?;
@@ -2665,38 +2667,56 @@ impl GroupRead {
             }
             cols.push(ColRead { col: *col, rows, gate, by_value, unmatched });
         }
-        Ok(GroupRead::Cols(cols))
+        Ok(GroupRead { full, cols })
     }
 
-    /// The candidate rows of one request, with the gate of the read they came from: the whole table
-    /// for a full read, else the rows of exactly the values the request needs.
-    fn candidates(&self, need: &Need) -> (Vec<Row>, &crate::pg::SnapshotGate) {
-        let (cols, col, values) = match (self, need) {
-            (GroupRead::Full(rows, gate), _) => return (rows.clone(), gate),
-            (GroupRead::Cols(cols), Need::Values { col, values }) => (cols, col, values),
-            // A full need always makes its group a full read.
-            (GroupRead::Cols(_), Need::Full) => unreachable!("a full re-derive makes its group a full read"),
-        };
-        let read = cols.iter().find(|r| r.col == *col).expect("every requested column was read");
-        let rows = values
-            .iter()
-            .filter_map(|v| read.by_value.get(v))
-            .flatten()
-            .chain(&read.unmatched)
-            .map(|&i| read.rows[i].clone())
-            .collect();
-        (rows, &read.gate)
+    /// The read that serves one request: the full read for a full re-derive, else its column's.
+    fn source<'a>(&'a self, need: &'a Need) -> Result<Source<'a>> {
+        match need {
+            Need::Full => match &self.full {
+                Some((rows, gate)) => Ok(Source::Full(rows, gate)),
+                None => anyhow::bail!("a full re-derive's group read no full table"),
+            },
+            Need::Values { col, values } => match self.cols.iter().find(|r| r.col == *col) {
+                Some(read) => Ok(Source::Col(read, values)),
+                None => anyhow::bail!("a query-back's column {col} was never read"),
+            },
+        }
+    }
+}
+
+/// The read rows one request's candidates come from.
+enum Source<'a> {
+    Full(&'a [Row], &'a crate::pg::SnapshotGate),
+    Col(&'a ColRead, &'a [Value]),
+}
+
+impl Source<'_> {
+    /// The request's candidate rows, with the gate of the read they came from: the whole table for
+    /// a full re-derive, else the rows of exactly the values the request needs.
+    fn candidates(&self) -> (Vec<Row>, &crate::pg::SnapshotGate) {
+        match self {
+            Source::Full(rows, gate) => (rows.to_vec(), gate),
+            Source::Col(read, values) => {
+                let rows = values
+                    .iter()
+                    .filter_map(|v| read.by_value.get(v))
+                    .flatten()
+                    .chain(&read.unmatched)
+                    .map(|&i| read.rows[i].clone())
+                    .collect();
+                (rows, &read.gate)
+            }
+        }
     }
 
-    /// Whether one request has no candidate row at all (cheaper than [`Self::candidates`]).
-    fn is_empty_for(&self, need: &Need) -> bool {
-        match (self, need) {
-            (GroupRead::Full(rows, _), _) => rows.is_empty(),
-            (GroupRead::Cols(cols), Need::Values { col, values }) => cols
-                .iter()
-                .find(|r| r.col == *col)
-                .is_none_or(|r| r.unmatched.is_empty() && values.iter().all(|v| !r.by_value.contains_key(v))),
-            (GroupRead::Cols(_), Need::Full) => false,
+    /// Whether the request has no candidate row at all (cheaper than [`Self::candidates`]).
+    fn is_empty(&self) -> bool {
+        match self {
+            Source::Full(rows, _) => rows.is_empty(),
+            Source::Col(read, values) => {
+                read.unmatched.is_empty() && values.iter().all(|v| !read.by_value.contains_key(v))
+            }
         }
     }
 }
@@ -2802,6 +2822,19 @@ async fn requery_and_move(
             }
         }
     }
+    // Each request's read, resolved before anything is evaluated, so no evaluation is left half done.
+    let sources: Result<Vec<Vec<Source<'_>>>> = groups
+        .iter()
+        .zip(&reads)
+        .map(|(g, read)| g.members.iter().map(|&i| read.source(&reqs[i].need)).collect())
+        .collect();
+    let sources = match sources {
+        Ok(sources) => sources,
+        Err(e) => {
+            release(&mut *registry.lock().await, &mut marked, &mut (0..reqs.len()));
+            return Err(e);
+        }
+    };
     // Evaluate + assert + deliver through the ONE emission tail (candidates from a query-back all
     // still exist), each shape filtered against the live decisions taken since the shared read's
     // snapshot, with its own copy of its candidates (copying rows in memory is cheap next to another
@@ -2812,16 +2845,15 @@ async fn requery_and_move(
     // the shapes still waiting stay marked, so live decisions taken in between are stamped on them
     // and beat the shared read exactly as before.
     let mut moved = Vec::new();
-    for (g, read) in groups.iter().zip(&reads) {
+    for (g, srcs) in groups.iter().zip(&sources) {
         // The emission tail only ever touches the candidates it is given, so a request with no
         // candidate moves nothing (a full re-derive included): release all of them in one hold.
-        let (empty, live): (Vec<usize>, Vec<usize>) =
-            g.members.iter().partition(|&&i| read.is_empty_for(&reqs[i].need));
+        let (empty, live): (Vec<_>, Vec<_>) = g.members.iter().copied().zip(srcs).partition(|(_, src)| src.is_empty());
         if !empty.is_empty() {
-            release(&mut *registry.lock().await, &mut marked, &mut empty.into_iter());
+            release(&mut *registry.lock().await, &mut marked, &mut empty.into_iter().map(|(i, _)| i));
         }
-        for i in live {
-            let (rows, gate) = read.candidates(&reqs[i].need);
+        for (i, src) in live {
+            let (rows, gate) = src.candidates();
             let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
             let shape_id = &reqs[i].dependent;
             let mut reg = registry.lock().await;
@@ -2953,19 +2985,36 @@ async fn requery_and_reconcile(
             }
         }
     }
+    // Each request's read, resolved before any parent is reconciled.
+    let sources: Result<Vec<Vec<Source<'_>>>> = groups
+        .iter()
+        .zip(&reads)
+        .map(|(g, read)| g.members.iter().map(|&i| read.source(&reqs[i].need)).collect())
+        .collect();
+    let sources = match sources {
+        Ok(sources) => sources,
+        Err(e) => {
+            let mut reg = registry.lock().await;
+            for g in &groups {
+                for &i in &g.members {
+                    reg.end_node_queryback(&reqs[i].dependent);
+                }
+            }
+            return Err(e);
+        }
+    };
     // ONE parent per lock hold, released from in flight as soon as it is reconciled — the same reason
     // as `requery_and_move`: one hold across every parent would keep the registry locked for all N
     // re-derivations. The parents still waiting stay marked. Reconciling cannot fail, so there is no
     // partial-exit path to balance.
     let mut reconciled = Vec::new();
-    for (g, read) in groups.iter().zip(&reads) {
+    for (g, srcs) in groups.iter().zip(&sources) {
         // A request with no candidate asserts nothing: reconcile (to no flips) and release all of
         // them in one hold.
-        let (empty, live): (Vec<usize>, Vec<usize>) =
-            g.members.iter().partition(|&&i| read.is_empty_for(&reqs[i].need));
+        let (empty, live): (Vec<_>, Vec<_>) = g.members.iter().copied().zip(srcs).partition(|(_, src)| src.is_empty());
         if !empty.is_empty() {
             let mut reg = registry.lock().await;
-            for i in empty {
+            for (i, _) in empty {
                 let parent_sig = &reqs[i].dependent;
                 if reg.nodes.contains_key(parent_sig) {
                     reconciled.push((i, g.ts.table.clone(), Vec::new()));
@@ -2973,9 +3022,9 @@ async fn requery_and_reconcile(
                 reg.end_node_queryback(parent_sig);
             }
         }
-        for i in live {
+        for (i, src) in live {
             let parent_sig = &reqs[i].dependent;
-            let (rows, gate) = read.candidates(&reqs[i].need);
+            let (rows, gate) = src.candidates();
             let mut reg = registry.lock().await;
             if let Some(evals) = reg.node_queryback_evals(parent_sig, &g.ts, &rows, gate) {
                 let flips = reg.apply_node_evals(parent_sig, evals).await;
@@ -3303,7 +3352,7 @@ pub(crate) mod tests {
     }
 
     /// [`insert_test_node`] over a named inner table, projecting `proj_col`.
-    fn insert_test_node_on(reg: &mut SubqueryRegistry, sig: &str, inner_table: &str, proj_col: usize) {
+    pub(crate) fn insert_test_node_on(reg: &mut SubqueryRegistry, sig: &str, inner_table: &str, proj_col: usize) {
         let node_id = reg.next_node_id;
         reg.next_node_id += 1;
         let mut node = SubqueryNode::new(
