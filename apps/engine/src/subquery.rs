@@ -3809,6 +3809,81 @@ pub(crate) mod tests {
         assert!(reg.shapes.values().all(|s| s.inflight_querybacks == 0), "every query-back is balanced");
     }
 
+    /// A NULL flip's full read serves only the dependents it re-derives. In one round, a value flip
+    /// into a plain-`IN` shape and a NULL flip into a `NOT IN` shape on the SAME outer table: the
+    /// `NOT IN` shape is re-derived from the whole table, while the plain shape gets its own `IN`
+    /// read and moves only its value's row. Handed the full read instead, it would re-upsert every
+    /// row it already holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_null_flips_full_read_does_not_reach_a_value_only_shape_on_the_same_table() {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let (a, b): (SubquerySig, SubquerySig) = ("node-a".into(), "node-b".into());
+        insert_test_node(&mut reg, &a);
+        insert_test_node(&mut reg, &b);
+        insert_membership_shape(&mut reg, "plain", &a, 1);
+        reg.add_edge(flip_edge(&a, Dependent::Shape("plain".into()), 1));
+        insert_outer_shape(
+            &mut reg,
+            "not-in",
+            "issues",
+            CompiledPredicate::InSubquery { col: 1, sig: b.clone(), negated: true },
+        );
+        reg.add_edge(null_sensitive_edge(&b, Dependent::Shape("not-in".into()), 1));
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts.clone())].into_iter().collect()));
+        let fake = Arc::new(FakeCandidates::with_rows([(
+            "issues",
+            vec![issue(1, 100), issue(2, 200), issue(3, 300), issue(4, 400)],
+        )]));
+        reg.fake_candidates = Some(fake.clone());
+        // `plain` holds issues 1 and 2 (A = {100, 200}); `not-in` holds nothing (B = {300, NULL}).
+        let mut work: VecDeque<(SubquerySig, Flip)> = reg
+            .apply_node_evals(&a, vec![("a1".into(), Some(Value::Int(100))), ("a2".into(), Some(Value::Int(200)))])
+            .await
+            .into_iter()
+            .map(|f| (a.clone(), f))
+            .collect();
+        reg.apply_node_evals(&b, vec![("b1".into(), Some(Value::Int(300))), ("b2".into(), Some(Value::Null))]).await;
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+        assert_eq!(ops_for(&store, "shape/plain"), vec!["upsert", "upsert"], "plain starts with issues 1 and 2");
+
+        // One round: 400 enters A, and the NULL leaves B.
+        let mut work = {
+            let mut reg = registry.lock().await;
+            let mut work = VecDeque::new();
+            for f in reg.apply_node_evals(&a, vec![("a4".into(), Some(Value::Int(400)))]).await {
+                work.push_back((a.clone(), f));
+            }
+            for f in reg.apply_node_evals(&b, vec![("b2".into(), None)]).await {
+                work.push_back((b.clone(), f));
+            }
+            work
+        };
+        assert_eq!(work.len(), 2);
+        let before = fake.reads();
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        assert_eq!(fake.reads() - before, 2, "one full read for the NOT IN shape, one IN read for the plain one");
+        let key = |id: i64, project: i64| ts.key_string(&issue(id, project)).unwrap();
+        let plain: Vec<(String, String)> =
+            envs_for(&store, "shape/plain").into_iter().skip(2).map(|(_, k, op)| (k, op)).collect();
+        assert_eq!(plain, vec![(key(4, 400), "upsert".to_string())], "plain moves only issue 4 in");
+        let mut not_in: Vec<String> = envs_for(&store, "shape/not-in")
+            .into_iter()
+            .filter(|(_, _, op)| op == "upsert")
+            .map(|(_, k, _)| k)
+            .collect();
+        not_in.sort();
+        let mut expected = vec![key(1, 100), key(2, 200), key(4, 400)];
+        expected.sort();
+        assert_eq!(not_in, expected, "NOT IN {{300}} admits every issue but 3 once the NULL leaves");
+        let reg = registry.lock().await;
+        assert!(reg.shapes.values().all(|s| s.inflight_querybacks == 0), "every query-back is balanced");
+    }
+
     /// The same incident, for a NULL flip: a NULL leaving (or entering) an inner set re-derives every
     /// NULL-sensitive dependent from ALL the rows of its table — the same per-dependent fan-out as a
     /// value flip, on a more expensive read. The NULL-sensitive shapes share one full read of their
