@@ -803,6 +803,8 @@ pub(crate) async fn sequencer_loop(
                         // flush partial output or publish partial highwater.
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        // The transaction's subquery flips, walked as one batch (see `TxnFlips`).
+                        let mut txn_flips = TxnFlips::default();
                         // The commit time the ingestor stamped on this transaction's changes.
                         let mut commit_ts: Option<i64> = None;
                         loop {
@@ -904,10 +906,10 @@ pub(crate) async fn sequencer_loop(
                                         );
                                     }
                                 }
-                                if let Err(e) = process_envelope(
+                                if let Err(e) = process_envelope_into(
                                     ds.metrics(), &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
                                     &mut exec.aggregates, &exec.agg_index, env, &mut txn_pending,
-                                    &subq, &trace_tx, library_mode,
+                                    &subq, &trace_tx, library_mode, &mut txn_flips,
                                 )
                                 .await
                                 {
@@ -924,6 +926,9 @@ pub(crate) async fn sequencer_loop(
                             }
                             if processing_failed { break; }
                         }
+                        // Before this commit's output is flushed or its highwater published, and on
+                        // the failure paths too (see `TxnFlips::dispatch`).
+                        txn_flips.dispatch(&subq);
                         if processing_failed {
                             // Do not run the count fold or flush the partial transaction. The
                             // failed transaction is retried from its page boundary on restart.
@@ -1939,6 +1944,69 @@ async fn stream_backfill(
     Ok((fences.gate, agg_seed, emitted_seed, BackfillStats { rows: rows_total, estimated_bytes }))
 }
 
+/// The most flips one gathered walk holds before it is dispatched and the transaction goes on
+/// gathering into a fresh one: the bound on what a transaction's flips retain while it is still
+/// being read. Shrunk under `cfg(test)` so the bound is exercised by a small transaction.
+pub(crate) const TXN_FLIPS_MAX: usize = if cfg!(test) { 256 } else { 65_536 };
+
+/// One transaction's subquery flips, gathered across its envelopes and handed to the flip
+/// propagator as ONE walk when the transaction's envelopes have all been processed, or sooner when
+/// the walk reaches [`TXN_FLIPS_MAX`] flips.
+///
+/// Each envelope is one row change, and a bulk change is one transaction of many rows: walked one
+/// envelope at a time, a 1,000-row delete was 1,000 walks, each re-reading every dependent table
+/// for its one value. As one walk its rounds read each (tier, table, column) once for up to
+/// `subquery::ROUND_MAX_VALUES` values (OTTO-13358). Every envelope of a transaction carries the
+/// transaction's commit LSN and txid, so each walk keeps the receipt (`pending_flips`) and the
+/// group-lane origins a per-envelope walk had: one origin per group path, held until the walk ends.
+/// A transaction past the cap dispatches several walks, each with its own receipt and origins,
+/// exactly as several envelopes' walks always did.
+#[derive(Default)]
+pub(crate) struct TxnFlips {
+    work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+    /// Group paths whose lane holds an origin for the walk being gathered (`begin_origin`).
+    group_paths: HashSet<String>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    lsn_u64: u64,
+}
+
+impl TxnFlips {
+    /// Hand the gathered walk to the propagator. Called once per transaction, before its output is
+    /// flushed or its highwater published, on the failure paths too: the inner-set nodes already
+    /// moved under these flips, so dropping the walk would lose its effects, not defer them.
+    pub(crate) fn dispatch(mut self, subq: &SubqueryHandle) {
+        self.flush(subq);
+    }
+
+    /// Dispatch the walk gathered so far and start a fresh one for the rest of the transaction.
+    fn flush(&mut self, subq: &SubqueryHandle) {
+        let work = std::mem::take(&mut self.work);
+        let group_paths: Vec<String> = std::mem::take(&mut self.group_paths).into_iter().collect();
+        let lsn_u64 = self.lsn_u64;
+        if work.is_empty() {
+            // Nothing to walk: release any origin taken for it, as a finished walk would.
+            for path in &group_paths {
+                subq.group_lanes.complete_origin(path, lsn_u64);
+            }
+            return;
+        }
+        subq.pending_flips.add(lsn_u64);
+        if let Err(mpsc::error::SendError(FlipWork::Walk { group_paths, .. })) =
+            subq.flip_tx.send(FlipWork::Walk { work, txid: self.txid.clone(), lsn: self.lsn.clone(), group_paths })
+        {
+            // Propagator gone (shutdown) — don't leave the barrier stuck.
+            subq.pending_flips.complete(lsn_u64);
+            for path in &group_paths {
+                subq.group_lanes.complete_origin(path, lsn_u64);
+            }
+        }
+    }
+}
+
+/// [`process_envelope_into`] for an envelope that is a transaction of its own: its flips are
+/// dispatched as soon as it is processed. The sequencer gathers a whole transaction instead.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_envelope(
     metrics: &crate::metrics::Metrics,
@@ -1953,6 +2021,45 @@ pub(crate) async fn process_envelope(
     subq: &SubqueryHandle,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     library_mode: bool,
+) -> Result<()> {
+    let mut flips = TxnFlips::default();
+    let result = process_envelope_into(
+        metrics,
+        ts,
+        shapes,
+        shape_index,
+        families,
+        aggregates,
+        agg_index,
+        env,
+        pending,
+        subq,
+        trace_tx,
+        library_mode,
+        &mut flips,
+    )
+    .await;
+    flips.dispatch(subq);
+    result
+}
+
+/// Process one envelope of a transaction, gathering its subquery flips into `flips` (see
+/// [`TxnFlips`]) for the caller to dispatch once the whole transaction is processed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_envelope_into(
+    metrics: &crate::metrics::Metrics,
+    ts: &TableSchema,
+    shapes: &HashMap<String, StandaloneShape>,
+    shape_index: &StandaloneIndex,
+    families: &HashMap<Vec<usize>, KeyRouter>,
+    aggregates: &mut HashMap<String, AggShape>,
+    agg_index: &StandaloneIndex,
+    env: Envelope,
+    pending: &mut HashMap<String, Vec<Envelope>>,
+    subq: &SubqueryHandle,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    library_mode: bool,
+    flips: &mut TxnFlips,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
     let commit_ts = env.headers.commit_ts;
@@ -2154,11 +2261,11 @@ pub(crate) async fn process_envelope(
     }
     // Subquery shapes/nodes: route this delta through the cross-table registry. Under the lock it
     // updates the shared inner-set nodes (in-memory) and emits outer-shape deltas; the flip-driven
-    // Postgres query-backs are handed to the engine's flip-propagator task so they never block
-    // this tailer. The convergence barrier is processed offsets + a drained flip queue
-    // (`pending_flips == 0`).
+    // Postgres query-backs are gathered into the transaction's walk (`flips`), which the caller
+    // hands to the engine's flip-propagator task so they never block this tailer. The convergence
+    // barrier is processed offsets + a drained flip queue (`pending_flips == 0`).
     {
-        let mut group_paths = HashSet::new();
+        let mut envelope_paths: Vec<String> = Vec::new();
         let work = {
             let mut reg = subq.registry.lock().await;
             if reg.touches(&ts.table) {
@@ -2168,9 +2275,15 @@ pub(crate) async fn process_envelope(
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
                 if let Ok(result_work) = result.as_ref() {
-                    group_paths = reg.group_paths_for_work(result_work);
-                    for path in &group_paths {
-                        subq.group_lanes.begin_origin(path, lsn_u64);
+                    // One origin per group path for the whole transaction's walk, taken before
+                    // any of this commit's output can reach the group's lane.
+                    envelope_paths = reg.group_paths_for_work(result_work).into_iter().collect();
+                    for path in &envelope_paths {
+                        if !flips.group_paths.contains(path) {
+                            subq.group_lanes.begin_origin(path, lsn_u64);
+                            flips.lsn_u64 = lsn_u64;
+                            flips.group_paths.insert(path.clone());
+                        }
                     }
                     if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
                         for h in &sq {
@@ -2189,22 +2302,26 @@ pub(crate) async fn process_envelope(
                 Ok(std::collections::VecDeque::new())
             }
         }?;
+        let mut work = work;
         if !work.is_empty() {
-            subq.pending_flips.add(lsn_u64);
-            if subq
-                .flip_tx
-                .send(FlipWork::Walk {
-                    work,
-                    txid: txid.clone(),
-                    lsn: lsn.clone(),
-                    group_paths: group_paths.iter().cloned().collect(),
-                })
-                .is_err()
-            {
-                // Propagator gone (shutdown) — don't leave the barrier stuck.
-                subq.pending_flips.complete(lsn_u64);
-                for path in &group_paths {
-                    subq.group_lanes.complete_origin(path, lsn_u64);
+            // Every envelope of a transaction carries its commit's txid and LSN.
+            flips.txid = txid.clone();
+            flips.lsn = lsn.clone();
+            flips.lsn_u64 = lsn_u64;
+        }
+        // Fill the walk up to the cap, dispatch it, and go on into a fresh one, so no walk exceeds
+        // `TXN_FLIPS_MAX` even when one row flips out of more nodes than that. The rest of this
+        // envelope's flips reach the same group paths, so the fresh walk takes their origins too.
+        while !work.is_empty() {
+            let take = (TXN_FLIPS_MAX - flips.work.len()).min(work.len());
+            flips.work.extend(work.drain(..take));
+            if flips.work.len() >= TXN_FLIPS_MAX {
+                flips.flush(subq);
+                if !work.is_empty() {
+                    for path in &envelope_paths {
+                        subq.group_lanes.begin_origin(path, lsn_u64);
+                        flips.group_paths.insert(path.clone());
+                    }
                 }
             }
         }
@@ -3138,6 +3255,23 @@ mod held_spill_tests {
             budget: Option<u64>,
             postgres: bool,
         ) -> Self {
+            Self::build(cap, start, highwater, budget, postgres, Engine::subquery_handle)
+        }
+
+        /// A harness whose sequencer routes subquery work through the handle `subquery` builds, so
+        /// a test can own the flip channel the propagator would otherwise drain.
+        fn with_subquery(cap: u64, subquery: impl FnOnce(&Engine) -> SubqueryHandle) -> Self {
+            Self::build(cap, LogPosition::start_of(0), None, None, false, subquery)
+        }
+
+        fn build(
+            cap: u64,
+            start: LogPosition,
+            highwater: Option<(u64, u64)>,
+            budget: Option<u64>,
+            postgres: bool,
+            subquery: impl FnOnce(&Engine) -> SubqueryHandle,
+        ) -> Self {
             let dir = std::env::temp_dir().join(format!("circuits-held-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&dir).unwrap();
             let cfg = crate::txn_buffer::TxnBufferConfig::resolve(|key| match key {
@@ -3179,7 +3313,7 @@ mod held_spill_tests {
                 processed.clone(),
                 Default::default(),
                 Default::default(),
-                engine.subquery_handle(),
+                subquery(&engine),
                 engine.trace_tx.clone(),
                 None,
                 HashMap::new(),
@@ -3343,6 +3477,199 @@ mod held_spill_tests {
             (floor, Some((0x10, 2))),
             "shutdown must preserve the durable restart cursor and highwater"
         );
+    }
+
+    /// A harness over `public.items` whose sequencer sends its flips to a channel the test holds,
+    /// with three nodes over `items.id`: every inserted row flips its id into all three. Returns
+    /// the receiver and the receipt counter the source fence waits on.
+    fn flip_harness() -> (Harness, mpsc::UnboundedReceiver<FlipWork>, Arc<PendingFlips>) {
+        let table: TableRef = "public.items".into();
+        let def = serde_json::from_value(serde_json::json!({
+            "columns": {"id":{"type":"int"}, "blob":{"type":"text"}}, "primaryKey":"id"
+        }))
+        .unwrap();
+        let ts = TableSchema::from_def(&table, &def).unwrap();
+        let (flip_tx, flip_rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(PendingFlips::default());
+        let receipts = pending.clone();
+        let h = Harness::with_subquery(512, move |engine| {
+            let mut reg = SubqueryRegistry::new(engine.ds.clone(), None);
+            for n in 0..3 {
+                crate::subquery::tests::insert_test_node_on(
+                    &mut reg,
+                    &format!("items|user-{n}"),
+                    "public.items",
+                    ts.column_index("id").unwrap(),
+                );
+            }
+            SubqueryHandle {
+                registry: Arc::new(Mutex::new(reg)),
+                flip_tx,
+                pending_flips: receipts,
+                degrade: engine.degrade.clone(),
+                group_lanes: engine.group_lanes.clone(),
+            }
+        });
+        let def = serde_json::from_value(serde_json::json!({
+            "columns": {"id":{"type":"int"}, "blob":{"type":"text"}}, "primaryKey":"id"
+        }))
+        .unwrap();
+        h.engine.tables_shared.write().unwrap().insert(table.clone(), TableSchema::from_def(&table, &def).unwrap());
+        (h, flip_rx, pending)
+    }
+
+    /// Offer one more page to the parked read without waiting for it to be processed.
+    fn offer(h: &mut Harness, from: &str, to: &str, envelopes: Vec<Envelope>) {
+        h.store
+            .pages_by_offset
+            .lock()
+            .unwrap()
+            .insert(from.into(), (to.into(), true, serde_json::to_string(&envelopes).unwrap()));
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::PauseReads { done }).unwrap();
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::ResumeReads { done }).unwrap();
+    }
+
+    /// Drive the sequencer until the propagator is handed a walk. A sequencer that stops on a failed
+    /// transaction may hand it over in the same poll it returns from.
+    async fn next_walk(h: &mut Harness, rx: &mut mpsc::UnboundedReceiver<FlipWork>) -> FlipWork {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                walk = rx.recv() => walk.expect("flip channel open"),
+                _ = &mut h.future => rx.try_recv().expect("sequencer stopped before dispatching a walk"),
+            }
+        })
+        .await
+        .expect("walk deadline")
+    }
+
+    /// OTTO-13358, through the real sequencer: a transaction that arrives across two pages and
+    /// spills to disk reaches the propagator as ONE walk under ONE receipt, only once its last
+    /// envelope is in, and before its source fence waits: the fence's receipt and the replay
+    /// position stay unpublished until that walk lands, then publish at the commit.
+    #[tokio::test]
+    async fn a_spilled_transactions_flips_are_one_walk_that_its_fence_waits_for() {
+        let (mut h, mut rx, pending) = flip_harness();
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, false), change("1", "0/10", 1, false)]).await;
+        assert_eq!(h.files().len(), 1, "the incomplete transaction spilled");
+        assert!(rx.try_recv().is_err(), "nothing is walked before the transaction is complete");
+
+        let mut fence = change("1", "0/10", 3, true);
+        fence.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        fence.key = "commit-1".into();
+        offer(&mut h, "p1", "p2", vec![change("1", "0/10", 2, false), fence]);
+        let FlipWork::Walk { work, lsn, txid, .. } = next_walk(&mut h, &mut rx).await else {
+            panic!("a live transaction's flips are a walk");
+        };
+        assert_eq!(work.len(), 9, "three rows, each into three nodes, in one walk");
+        assert_eq!((lsn.as_deref(), txid.as_deref()), (Some("0/10"), Some("1")));
+        assert_eq!(pending.count(), 1, "one receipt for the commit");
+        std::future::poll_fn(|cx| {
+            assert!(h.future.as_mut().poll(cx).is_pending(), "the fence waits on the walk");
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(rx.try_recv().is_err(), "one walk per transaction");
+        assert!(h.engine.source_drain_receipt("commit-1").is_none(), "no receipt while the walk is pending");
+        assert_eq!(h.processed.lock().unwrap().offset, start.offset, "no replay position past the walk");
+
+        pending.complete(0x10);
+        let (done, ack) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::Barrier { done }).unwrap();
+        h.receive(ack).await;
+        assert_eq!(h.engine.source_drain_receipt("commit-1").unwrap().commit_lsn, "0/10");
+        assert_eq!(h.processed.lock().unwrap().offset, "p2");
+        assert!(h.files().is_empty());
+    }
+
+    /// A transaction that fails part-way still hands over the flips its processed envelopes caused
+    /// (the nodes already moved under them, so dropping them would lose the effects), and publishes
+    /// nothing: its replay position stays before it.
+    #[tokio::test]
+    async fn a_failed_transaction_still_dispatches_the_flips_it_caused() {
+        let (mut h, mut rx, _pending) = flip_harness();
+        let start = LogPosition::start_of(0);
+        let mut broken = change("1", "0/10", 2, true);
+        broken.value = None;
+        offer(&mut h, &start.offset, "p1", vec![change("1", "0/10", 0, false), change("1", "0/10", 1, false), broken]);
+        let FlipWork::Walk { work, .. } = next_walk(&mut h, &mut rx).await else {
+            panic!("a live transaction's flips are a walk");
+        };
+        assert_eq!(work.len(), 6, "the two processed rows' flips, into three nodes each");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.processed.lock().unwrap().offset, start.offset, "the failed transaction is not published");
+    }
+
+    /// A transaction past [`TXN_FLIPS_MAX`], through the real sequencer: its flips go out as two
+    /// walks, each under its own receipt at the commit, and the fence at its end waits for BOTH:
+    /// the source receipt and the replay position stay unpublished while either walk is pending.
+    #[tokio::test]
+    async fn a_transaction_past_the_cap_publishes_only_after_every_walk_lands() {
+        let (mut h, mut rx, pending) = flip_harness();
+        let start = LogPosition::start_of(0);
+        // Three nodes per row: 90 rows are 270 flips, past the test cap of 256.
+        let rows = 90u64;
+        let mut page: Vec<Envelope> = (0..rows).map(|seq| change("1", "0/10", seq, false)).collect();
+        let mut fence = change("1", "0/10", rows, true);
+        fence.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        fence.key = "commit-1".into();
+        page.push(fence);
+        offer(&mut h, &start.offset, "p1", page);
+        let mut sizes = Vec::new();
+        for _ in 0..2 {
+            let FlipWork::Walk { work, lsn, .. } = next_walk(&mut h, &mut rx).await else {
+                panic!("a live transaction's flips are walks");
+            };
+            assert_eq!(lsn.as_deref(), Some("0/10"));
+            sizes.push(work.len());
+        }
+        assert_eq!(sizes, vec![TXN_FLIPS_MAX, 270 - TXN_FLIPS_MAX], "split at the cap, nothing lost");
+        assert_eq!(pending.count(), 2, "one receipt per walk");
+        for landed in 0..2 {
+            // Run the sequencer long enough for the fence to re-read the receipt count (it re-checks
+            // every 10 ms), so "one of two landed" is really observed, not just a single poll.
+            tokio::select! {
+                _ = &mut h.future => panic!("the fence waits on every walk"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+            assert!(rx.try_recv().is_err(), "no third walk");
+            assert!(h.engine.source_drain_receipt("commit-1").is_none(), "{landed} of 2 walks landed: no receipt");
+            assert_eq!(h.processed.lock().unwrap().offset, start.offset, "{landed} of 2 walks landed: no position");
+            pending.complete(0x10);
+        }
+        let (done, ack) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::Barrier { done }).unwrap();
+        h.receive(ack).await;
+        assert_eq!(h.engine.source_drain_receipt("commit-1").unwrap().commit_lsn, "0/10");
+        assert_eq!(h.processed.lock().unwrap().offset, "p1");
+    }
+
+    /// A transaction that fails after an early cap flush: the walk sent at the cap and the rest the
+    /// processed envelopes caused both reach the propagator, and nothing of the transaction is
+    /// published.
+    #[tokio::test]
+    async fn a_transaction_failing_after_a_cap_flush_dispatches_both_walks_and_publishes_nothing() {
+        let (mut h, mut rx, _pending) = flip_harness();
+        let start = LogPosition::start_of(0);
+        let rows = 90u64;
+        let mut page: Vec<Envelope> = (0..rows).map(|seq| change("1", "0/10", seq, false)).collect();
+        let mut broken = change("1", "0/10", rows, true);
+        broken.value = None;
+        page.push(broken);
+        offer(&mut h, &start.offset, "p1", page);
+        let mut total = 0;
+        for _ in 0..2 {
+            let FlipWork::Walk { work, .. } = next_walk(&mut h, &mut rx).await else {
+                panic!("a live transaction's flips are walks");
+            };
+            total += work.len();
+        }
+        assert_eq!(total, 270, "every processed row's flips, across the cap flush");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.processed.lock().unwrap().offset, start.offset, "the failed transaction is not published");
     }
 
     fn change(txid: &str, lsn: &str, seq: u64, last: bool) -> Envelope {
