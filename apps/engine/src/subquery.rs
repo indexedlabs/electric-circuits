@@ -2371,8 +2371,8 @@ fn take_round(work: &mut VecDeque<(SubquerySig, Flip)>) -> Vec<(SubquerySig, Fli
 /// any `Not{…}` (SQL: a NULL in the set makes the leaf UNKNOWN, which negation turns into a
 /// membership change). It can shift *every* dependent row, so the dependent is re-derived fully;
 /// NULL-insensitive dependents can't change (AND/OR are monotone over FALSE < UNKNOWN < TRUE), so
-/// they are skipped. A full re-derive reads every row of the dependent's table, so it covers the
-/// value reads of that table in the same tier and replaces them.
+/// they are skipped. A full re-derive reads every row of the dependent's table, so it covers that
+/// dependent's own value reads; other dependents of the table keep their `IN` reads.
 async fn propagate_round(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     round: &[(SubquerySig, Flip)],
@@ -2433,23 +2433,21 @@ async fn propagate_round(
     let shape_reqs = shapes.into_requests(&node_values);
     let moved = requery_and_move(registry, &shape_reqs, txid.clone(), commit_lsn).await?;
     // Light the whole path only for the shapes that actually moved rows: source `table:<t>` → the
-    // flipped `node:<sig>` → that `shape:<id>`.
+    // flipped `node:<sig>` → that `shape:<id>`. One event per request, carrying its net once.
     for (i, outer, net) in moved {
         let req = &shape_reqs[i];
-        for sig in &req.via {
-            let Some(src) = sources.get(sig) else { continue };
-            emit_flip_trace(
-                trace_tx,
-                &outer,
-                src,
-                sig,
-                format!("shape:{}", req.dependent),
-                vec![req.dependent.clone()],
-                net,
-                lsn.clone(),
-                txid.clone(),
-            );
-        }
+        let Some(src) = sources.get(&req.via) else { continue };
+        emit_flip_trace(
+            trace_tx,
+            &outer,
+            src,
+            &req.via,
+            format!("shape:{}", req.dependent),
+            vec![req.dependent.clone()],
+            net,
+            lsn.clone(),
+            txid.clone(),
+        );
     }
     // A parent missing from the result vanished, or is a fresh node its own create is still seeding
     // — in which case the re-derivation was queued on the node and runs when that create installs
@@ -2460,21 +2458,18 @@ async fn propagate_round(
         // A nested `IN`: connect the flipped child `node:<sig>` to the parent `node:<parent_sig>` it
         // re-derived, so the propagation reads through. The parent's own downstream shape lights
         // when its flips reach a shape edge.
-        if !flips.is_empty() {
-            for sig in &req.via {
-                let Some(src) = sources.get(sig) else { continue };
-                emit_flip_trace(
-                    trace_tx,
-                    src,
-                    src,
-                    sig,
-                    format!("node:{}", req.dependent),
-                    Vec::new(),
-                    flip_net(&flips),
-                    lsn.clone(),
-                    txid.clone(),
-                );
-            }
+        if let (false, Some(src)) = (flips.is_empty(), sources.get(&req.via)) {
+            emit_flip_trace(
+                trace_tx,
+                src,
+                src,
+                &req.via,
+                format!("node:{}", req.dependent),
+                Vec::new(),
+                flip_net(&flips),
+                lsn.clone(),
+                txid.clone(),
+            );
         }
         for f in flips {
             work.push_back((req.dependent.clone(), f));
@@ -2495,12 +2490,13 @@ enum Need {
     },
 }
 
-/// One dependent's query-back in a round, and the flipped nodes that reached it (whose paths its
-/// trace lights).
+/// One dependent's query-back in a round, and the flipped node its trace credits: the first to
+/// reach it through this request's column (or, for a full re-derive, with a NULL). A round's moves
+/// are not split per node, so the net is reported once, on that node's path.
 struct Requery<K> {
     dependent: K,
     need: Need,
-    via: Vec<SubquerySig>,
+    via: SubquerySig,
 }
 
 /// One tier's dependents for a round, in the order the round first reached them: per dependent,
@@ -2518,9 +2514,9 @@ impl<K> Default for RoundPlan<K> {
 
 #[derive(Default)]
 struct PlannedDependent {
-    full: bool,
+    /// The first node whose NULL flip reached it, when one did: it is then re-derived in full.
+    full: Option<SubquerySig>,
     cols: Vec<(usize, Vec<SubquerySig>)>,
-    via: Vec<SubquerySig>,
 }
 
 impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
@@ -2531,11 +2527,10 @@ impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
             self.order.push(dependent.clone());
         }
         let dep = self.deps.entry(dependent.clone()).or_default();
-        if !dep.via.contains(via) {
-            dep.via.push(via.clone());
-        }
         match need {
-            None => dep.full = true,
+            None => {
+                dep.full.get_or_insert_with(|| via.clone());
+            }
             Some(col) => match dep.cols.iter_mut().find(|(c, _)| *c == col) {
                 Some((_, sigs)) if sigs.contains(via) => {}
                 Some((_, sigs)) => sigs.push(via.clone()),
@@ -2551,8 +2546,8 @@ impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
         let mut out = Vec::new();
         for dependent in self.order {
             let Some(dep) = self.deps.remove(&dependent) else { continue };
-            if dep.full {
-                out.push(Requery { dependent, need: Need::Full, via: dep.via });
+            if let Some(via) = dep.full {
+                out.push(Requery { dependent, need: Need::Full, via });
                 continue;
             }
             for (col, sigs) in dep.cols {
@@ -2570,11 +2565,8 @@ impl<K: Clone + Eq + std::hash::Hash> RoundPlan<K> {
                         Arc::from(merged)
                     }
                 };
-                out.push(Requery {
-                    dependent: dependent.clone(),
-                    need: Need::Values { col, values },
-                    via: dep.via.clone(),
-                });
+                let via = sigs.into_iter().next().unwrap_or_default();
+                out.push(Requery { dependent: dependent.clone(), need: Need::Values { col, values }, via });
             }
         }
         out
@@ -2740,8 +2732,10 @@ async fn requery_and_move_shapes(
         Some((col, value)) => Need::Values { col, values: Arc::from([value.clone()]) },
         None => Need::Full,
     };
-    let reqs: Vec<Requery<String>> =
-        shape_ids.iter().map(|id| Requery { dependent: id.clone(), need: need.clone(), via: Vec::new() }).collect();
+    let reqs: Vec<Requery<String>> = shape_ids
+        .iter()
+        .map(|id| Requery { dependent: id.clone(), need: need.clone(), via: SubquerySig::new() })
+        .collect();
     let moved = requery_and_move(registry, &reqs, txid, commit_lsn).await?;
     Ok(moved.into_iter().map(|(i, table, net)| (reqs[i].dependent.clone(), table, net)).collect())
 }
@@ -2917,8 +2911,10 @@ async fn requery_and_reconcile_parents(
         Some((col, value)) => Need::Values { col, values: Arc::from([value.clone()]) },
         None => Need::Full,
     };
-    let reqs: Vec<Requery<SubquerySig>> =
-        parent_sigs.iter().map(|sig| Requery { dependent: sig.clone(), need: need.clone(), via: Vec::new() }).collect();
+    let reqs: Vec<Requery<SubquerySig>> = parent_sigs
+        .iter()
+        .map(|sig| Requery { dependent: sig.clone(), need: need.clone(), via: SubquerySig::new() })
+        .collect();
     let reconciled = requery_and_reconcile(registry, &reqs, commit_lsn).await?;
     Ok(reconciled.into_iter().map(|(i, table, flips)| (reqs[i].dependent.clone(), table, flips)).collect())
 }
@@ -3931,6 +3927,44 @@ pub(crate) mod tests {
         assert_eq!(not_in, expected, "NOT IN {{300}} admits every issue but 3 once the NULL leaves");
         let reg = registry.lock().await;
         assert!(reg.shapes.values().all(|s| s.inflight_querybacks == 0), "every query-back is balanced");
+    }
+
+    /// A round's flip trace reports each moved dependent once, on the path of a node that reached it
+    /// through that column: two nodes feeding one shape through one column, both flipping in the same
+    /// round, light one `node → shape` hop carrying the shape's net once, not one per node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rounds_trace_reports_each_moved_shape_once() {
+        let (ds_url, _store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let (a, b): (SubquerySig, SubquerySig) = ("node-a".into(), "node-b".into());
+        insert_test_node(&mut reg, &a);
+        insert_test_node(&mut reg, &b);
+        insert_membership_shape(&mut reg, "s1", &a, 1);
+        reg.add_edge(flip_edge(&a, Dependent::Shape("s1".into()), 1));
+        reg.add_edge(flip_edge(&b, Dependent::Shape("s1".into()), 1));
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), issues_ts())].into_iter().collect()));
+        reg.fake_candidates =
+            Some(Arc::new(FakeCandidates::with_rows([("issues", vec![issue(1, 100), issue(2, 200)])])));
+        let mut work = VecDeque::new();
+        for f in reg.apply_node_evals(&a, vec![("a1".into(), Some(Value::Int(100)))]).await {
+            work.push_back((a.clone(), f));
+        }
+        for f in reg.apply_node_evals(&b, vec![("b1".into(), Some(Value::Int(200)))]).await {
+            work.push_back((b.clone(), f));
+        }
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, mut trace_rx) = tokio::sync::broadcast::channel(16);
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = trace_rx.try_recv() {
+            events.push(serde_json::from_str::<serde_json::Value>(&ev).unwrap());
+        }
+        assert_eq!(events.len(), 1, "one event for the one request that moved s1, got {events:?}");
+        let hops: Vec<&str> =
+            events[0]["hops"].as_array().unwrap().iter().map(|h| h["node"].as_str().unwrap()).collect();
+        assert_eq!(hops, ["table:public.t", "node:node-a", "shape:s1"], "credited to a node that reached it");
+        assert_eq!(events[0]["delta"][0]["w"], 1, "issue 1 moved in, reported once");
     }
 
     /// The same incident, for a NULL flip: a NULL leaving (or entering) an inner set re-derives every
