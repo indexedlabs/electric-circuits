@@ -3353,6 +3353,86 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
+    /// Leave flips for `values`, as one bulk change produces them: per changed row (value), the flip
+    /// of every node that held it — node-major within the row, row after row, the order a
+    /// transaction's envelopes reach the walk in.
+    async fn remove_values(
+        reg: &mut SubqueryRegistry,
+        nodes: &[SubquerySig],
+        values: impl Iterator<Item = i64> + Clone,
+    ) -> VecDeque<(SubquerySig, Flip)> {
+        let mut per_node = Vec::new();
+        for sig in nodes {
+            let evals = values.clone().map(|v| (format!("r{v}"), None)).collect();
+            per_node.push(reg.apply_node_evals(sig, evals).await);
+        }
+        let mut work = VecDeque::new();
+        for (k, _) in values.enumerate() {
+            for (sig, flips) in nodes.iter().zip(&per_node) {
+                if let Some(flip) = flips.get(k) {
+                    work.push_back((sig.clone(), flip.clone()));
+                }
+            }
+        }
+        work
+    }
+
+    /// **Incident 2026-11-14 (OTTO-13358): a bulk delete reads each dependent table once.** A
+    /// Google disconnect deleted ~2,900 records. Each record id left the inner set of every
+    /// per-user node holding it, and each of those (node, value) flips re-read every dependent table
+    /// for that one value — ~150k reads a minute, every one empty (the cascade had deleted the
+    /// rows), with drain fences waiting behind them for 45 minutes. The walk must read each
+    /// (tier, table, connecting column) once for all of a round's values, however many nodes they
+    /// flipped in, and an empty read must move nothing and leave every dependent balanced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bulk_delete_reads_each_dependent_table_once_however_many_nodes_it_flips() {
+        const NODES: usize = 16;
+        const VALUES: i64 = 200;
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let t = id_gid_ts("t");
+        let (t_id, t_gid) = (t.column_index("id").unwrap(), t.column_index("gid").unwrap());
+        let nodes: Vec<SubquerySig> = (0..NODES).map(|n| SubquerySig::from(format!("record|user-{n}"))).collect();
+        for (n, sig) in nodes.iter().enumerate() {
+            insert_test_node(&mut reg, sig);
+            reg.apply_node_evals(sig, (0..VALUES).map(|v| (format!("r{v}"), Some(Value::Int(v)))).collect()).await;
+            // Each user's outer shape (`issues.project_id IN set`) and nested parent node
+            // (`t.id WHERE gid IN set`).
+            let shape = format!("s{n}");
+            insert_membership_shape(&mut reg, &shape, sig, 1);
+            reg.add_edge(flip_edge(sig, Dependent::Shape(shape), 1));
+            let parent = SubquerySig::from(format!("edge|user-{n}"));
+            insert_test_node_on(&mut reg, &parent, "t", t_id);
+            reg.add_edge(flip_edge(sig, Dependent::Node(parent), t_gid));
+        }
+        reg.set_schemas(Arc::new(
+            [(TableRef::parse("issues").unwrap(), issues_ts()), (TableRef::from("t"), t)].into_iter().collect(),
+        ));
+        // The cascade already deleted every dependent row.
+        let fake = Arc::new(FakeCandidates::with_rows([("issues", Vec::new()), ("t", Vec::new())]));
+        reg.fake_candidates = Some(fake.clone());
+        let mut work = remove_values(&mut reg, &nodes, 0..VALUES).await;
+        assert_eq!(work.len(), NODES * VALUES as usize, "every value left every node");
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        assert_eq!(
+            fake.reads(),
+            2,
+            "one read per (tier, table, column) for the whole bulk delete, not one per (node, value)"
+        );
+        assert_eq!(fake.reads_of("issues"), (1, 0), "the shapes share one filtered read of their outer table");
+        assert_eq!(fake.reads_of("t"), (1, 0), "the parents share one filtered read of their inner table");
+        for n in 0..NODES {
+            assert!(ops_for(&store, &format!("shape/s{n}")).is_empty(), "an empty read moves nothing for s{n}");
+        }
+        let reg = registry.lock().await;
+        assert!(reg.shapes.values().all(|s| s.inflight_querybacks == 0), "every query-back is balanced");
+        assert!(reg.nodes.values().all(|n| n.inflight_querybacks == 0), "every re-derivation is balanced");
+    }
+
     /// The same incident, for a NULL flip: a NULL leaving (or entering) an inner set re-derives every
     /// NULL-sensitive dependent from ALL the rows of its table — the same per-dependent fan-out as a
     /// value flip, on a more expensive read. The NULL-sensitive shapes share one full read of their
