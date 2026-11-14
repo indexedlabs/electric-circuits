@@ -3629,11 +3629,12 @@ mod held_spill_tests {
         assert_eq!(sizes, vec![TXN_FLIPS_MAX, 270 - TXN_FLIPS_MAX], "split at the cap, nothing lost");
         assert_eq!(pending.count(), 2, "one receipt per walk");
         for landed in 0..2 {
-            std::future::poll_fn(|cx| {
-                assert!(h.future.as_mut().poll(cx).is_pending(), "the fence waits on every walk");
-                std::task::Poll::Ready(())
-            })
-            .await;
+            // Run the sequencer long enough for the fence to re-read the receipt count (it re-checks
+            // every 10 ms), so "one of two landed" is really observed, not just a single poll.
+            tokio::select! {
+                _ = &mut h.future => panic!("the fence waits on every walk"),
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
             assert!(rx.try_recv().is_err(), "no third walk");
             assert!(h.engine.source_drain_receipt("commit-1").is_none(), "{landed} of 2 walks landed: no receipt");
             assert_eq!(h.processed.lock().unwrap().offset, start.offset, "{landed} of 2 walks landed: no position");
