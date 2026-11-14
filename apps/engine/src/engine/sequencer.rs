@@ -2265,6 +2265,7 @@ pub(crate) async fn process_envelope_into(
     // hands to the engine's flip-propagator task so they never block this tailer. The convergence
     // barrier is processed offsets + a drained flip queue (`pending_flips == 0`).
     {
+        let mut envelope_paths: Vec<String> = Vec::new();
         let work = {
             let mut reg = subq.registry.lock().await;
             if reg.touches(&ts.table) {
@@ -2276,11 +2277,12 @@ pub(crate) async fn process_envelope_into(
                 if let Ok(result_work) = result.as_ref() {
                     // One origin per group path for the whole transaction's walk, taken before
                     // any of this commit's output can reach the group's lane.
-                    for path in reg.group_paths_for_work(result_work) {
-                        if !flips.group_paths.contains(&path) {
-                            subq.group_lanes.begin_origin(&path, lsn_u64);
+                    envelope_paths = reg.group_paths_for_work(result_work).into_iter().collect();
+                    for path in &envelope_paths {
+                        if !flips.group_paths.contains(path) {
+                            subq.group_lanes.begin_origin(path, lsn_u64);
                             flips.lsn_u64 = lsn_u64;
-                            flips.group_paths.insert(path);
+                            flips.group_paths.insert(path.clone());
                         }
                     }
                     if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
@@ -2300,14 +2302,27 @@ pub(crate) async fn process_envelope_into(
                 Ok(std::collections::VecDeque::new())
             }
         }?;
+        let mut work = work;
         if !work.is_empty() {
             // Every envelope of a transaction carries its commit's txid and LSN.
             flips.txid = txid.clone();
             flips.lsn = lsn.clone();
             flips.lsn_u64 = lsn_u64;
-            flips.work.extend(work);
+        }
+        // Fill the walk up to the cap, dispatch it, and go on into a fresh one, so no walk exceeds
+        // `TXN_FLIPS_MAX` even when one row flips out of more nodes than that. The rest of this
+        // envelope's flips reach the same group paths, so the fresh walk takes their origins too.
+        while !work.is_empty() {
+            let take = (TXN_FLIPS_MAX - flips.work.len()).min(work.len());
+            flips.work.extend(work.drain(..take));
             if flips.work.len() >= TXN_FLIPS_MAX {
                 flips.flush(subq);
+                if !work.is_empty() {
+                    for path in &envelope_paths {
+                        subq.group_lanes.begin_origin(path, lsn_u64);
+                        flips.group_paths.insert(path.clone());
+                    }
+                }
             }
         }
     }

@@ -3102,7 +3102,7 @@ async fn a_transactions_flips_split_into_walks_at_the_cap() {
     let Ok(FlipWork::Walk { work: first, .. }) = flip_rx.try_recv() else {
         panic!("the walk that reached the cap is dispatched before the transaction ends");
     };
-    assert!(first.len() >= TXN_FLIPS_MAX && first.len() < TXN_FLIPS_MAX + NODES as usize, "split at the cap");
+    assert_eq!(first.len(), TXN_FLIPS_MAX, "split exactly at the cap");
     flips.dispatch(&subq);
     let Ok(FlipWork::Walk { work: rest, lsn, .. }) = flip_rx.try_recv() else {
         panic!("the rest of the transaction is one more walk");
@@ -3112,4 +3112,62 @@ async fn a_transactions_flips_split_into_walks_at_the_cap() {
     assert!(flip_rx.try_recv().is_err());
     assert_eq!(pending_flips.count(), 2, "one receipt per walk, both at the commit");
     assert!(pending_flips.has_at_or_before(0x10));
+}
+
+/// The cap holds for one row too: a delete whose value leaves more nodes than one walk may hold
+/// splits its own flips across walks, none past [`TXN_FLIPS_MAX`], each under its own receipt.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_rows_flips_past_the_cap_split_across_walks() {
+    use crate::subquery::tests as sq;
+    let nodes = TXN_FLIPS_MAX + 44;
+    let t = sq::id_gid_ts("t");
+    let ds = DsClient::new_for_in_process_test("http://127.0.0.1:1");
+    let mut reg = SubqueryRegistry::new(ds.clone(), None);
+    let pk = t.key_string(&sq::id_gid_row(&t, 1, 100)).unwrap();
+    for n in 0..nodes {
+        let sig: crate::predicate::SubquerySig = format!("record|user-{n}");
+        sq::insert_test_node(&mut reg, &sig);
+        reg.assert_seed_row_for_test(&sig, &pk, Value::Int(100)).await;
+    }
+    let (flip_tx, mut flip_rx) = mpsc::unbounded_channel();
+    let pending_flips = Arc::new(PendingFlips::default());
+    let group_lanes = emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), Default::default());
+    let subq = SubqueryHandle {
+        registry: Arc::new(Mutex::new(reg)),
+        flip_tx,
+        pending_flips: pending_flips.clone(),
+        degrade: DegradeState::new(),
+        group_lanes,
+    };
+    let (trace_tx, _) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+    let mut e = env("delete", "1", None, Some(serde_json::json!({ "id": 1, "gid": 100 })));
+    e.type_ = "t".into();
+    e.headers.lsn = Some("0/10".into());
+    e.headers.txid = Some("42".into());
+    let mut flips = TxnFlips::default();
+    process_envelope_into(
+        &crate::metrics::Metrics::default(),
+        &t,
+        &HashMap::new(),
+        &StandaloneIndex::default(),
+        &HashMap::new(),
+        &mut HashMap::new(),
+        &StandaloneIndex::default(),
+        e,
+        &mut HashMap::new(),
+        &subq,
+        &trace_tx,
+        false,
+        &mut flips,
+    )
+    .await
+    .unwrap();
+    flips.dispatch(&subq);
+
+    let mut sizes = Vec::new();
+    while let Ok(FlipWork::Walk { work, .. }) = flip_rx.try_recv() {
+        sizes.push(work.len());
+    }
+    assert_eq!(sizes, vec![TXN_FLIPS_MAX, 44], "one row's flips split at the cap, none lost");
+    assert_eq!(pending_flips.count(), 2, "one receipt per walk");
 }
