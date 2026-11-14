@@ -3334,6 +3334,22 @@ pub fn referenced_tables(p: &PredicateJson) -> Vec<TableRef> {
 pub(crate) mod tests {
     use super::*;
 
+    /// Wire `shape_id` as a plain dependent of node `sig`, reached through `connecting_col`.
+    pub(crate) fn add_test_shape_edge(
+        reg: &mut SubqueryRegistry,
+        sig: &SubquerySig,
+        shape_id: &str,
+        connecting_col: usize,
+    ) {
+        reg.add_edge(Edge {
+            node_sig: sig.clone(),
+            dependent: Dependent::Shape(shape_id.into()),
+            connecting_col,
+            negated: false,
+            null_sensitive: false,
+        });
+    }
+
     /// A registry with one MatchAll node registered the way `collect()` would: node map,
     /// node_by_id, and a unit-bind template — so `on_table_delta`, `apply_node_evals`, and the
     /// `SubqueryEval` reads all work.

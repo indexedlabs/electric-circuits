@@ -3129,9 +3129,14 @@ async fn one_rows_flips_past_the_cap_split_across_walks() {
         sq::insert_test_node(&mut reg, &sig);
         reg.assert_seed_row_for_test(&sig, &pk, Value::Int(100)).await;
     }
+    // A group shape behind the first node: every walk that may move it holds one origin on its lane.
+    let group = "shape/group-g1";
+    sq::insert_outer_shape(&mut reg, "group-g1", "issues", sq::keyed_membership_pred(100, &"record|user-0".into()));
+    sq::add_test_shape_edge(&mut reg, &"record|user-0".into(), "group-g1", 1);
     let (flip_tx, mut flip_rx) = mpsc::unbounded_channel();
     let pending_flips = Arc::new(PendingFlips::default());
     let group_lanes = emission::GroupEmissionLanes::new(ds, crate::shutdown::ShutdownToken::new(), Default::default());
+    group_lanes.register(group);
     let subq = SubqueryHandle {
         registry: Arc::new(Mutex::new(reg)),
         flip_tx,
@@ -3165,9 +3170,21 @@ async fn one_rows_flips_past_the_cap_split_across_walks() {
     flips.dispatch(&subq);
 
     let mut sizes = Vec::new();
-    while let Ok(FlipWork::Walk { work, .. }) = flip_rx.try_recv() {
+    let mut walk_paths = Vec::new();
+    while let Ok(FlipWork::Walk { work, group_paths, .. }) = flip_rx.try_recv() {
         sizes.push(work.len());
+        walk_paths.push(group_paths);
     }
     assert_eq!(sizes, vec![TXN_FLIPS_MAX, 44], "one row's flips split at the cap, none lost");
     assert_eq!(pending_flips.count(), 2, "one receipt per walk");
+    assert_eq!(
+        walk_paths,
+        vec![vec![group.to_string()], vec![group.to_string()]],
+        "each walk holds the group's origin"
+    );
+    assert_eq!(subq.group_lanes.origins_for_test(group, 0x10), 2, "one origin per dispatched walk");
+    for _ in &walk_paths {
+        subq.group_lanes.complete_origin(group, 0x10);
+    }
+    assert_eq!(subq.group_lanes.origins_for_test(group, 0x10), 0, "both walks completing release the lane");
 }

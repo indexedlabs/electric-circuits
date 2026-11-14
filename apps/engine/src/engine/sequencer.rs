@@ -3603,6 +3603,74 @@ mod held_spill_tests {
         assert_eq!(h.processed.lock().unwrap().offset, start.offset, "the failed transaction is not published");
     }
 
+    /// A transaction past [`TXN_FLIPS_MAX`], through the real sequencer: its flips go out as two
+    /// walks, each under its own receipt at the commit, and the fence at its end waits for BOTH:
+    /// the source receipt and the replay position stay unpublished while either walk is pending.
+    #[tokio::test]
+    async fn a_transaction_past_the_cap_publishes_only_after_every_walk_lands() {
+        let (mut h, mut rx, pending) = flip_harness();
+        let start = LogPosition::start_of(0);
+        // Three nodes per row: 90 rows are 270 flips, past the test cap of 256.
+        let rows = 90u64;
+        let mut page: Vec<Envelope> = (0..rows).map(|seq| change("1", "0/10", seq, false)).collect();
+        let mut fence = change("1", "0/10", rows, true);
+        fence.type_ = crate::replication::SOURCE_FENCE_ENVELOPE.into();
+        fence.key = "commit-1".into();
+        page.push(fence);
+        offer(&mut h, &start.offset, "p1", page);
+        let mut sizes = Vec::new();
+        for _ in 0..2 {
+            let FlipWork::Walk { work, lsn, .. } = next_walk(&mut h, &mut rx).await else {
+                panic!("a live transaction's flips are walks");
+            };
+            assert_eq!(lsn.as_deref(), Some("0/10"));
+            sizes.push(work.len());
+        }
+        assert_eq!(sizes, vec![TXN_FLIPS_MAX, 270 - TXN_FLIPS_MAX], "split at the cap, nothing lost");
+        assert_eq!(pending.count(), 2, "one receipt per walk");
+        for landed in 0..2 {
+            std::future::poll_fn(|cx| {
+                assert!(h.future.as_mut().poll(cx).is_pending(), "the fence waits on every walk");
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(rx.try_recv().is_err(), "no third walk");
+            assert!(h.engine.source_drain_receipt("commit-1").is_none(), "{landed} of 2 walks landed: no receipt");
+            assert_eq!(h.processed.lock().unwrap().offset, start.offset, "{landed} of 2 walks landed: no position");
+            pending.complete(0x10);
+        }
+        let (done, ack) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::Barrier { done }).unwrap();
+        h.receive(ack).await;
+        assert_eq!(h.engine.source_drain_receipt("commit-1").unwrap().commit_lsn, "0/10");
+        assert_eq!(h.processed.lock().unwrap().offset, "p1");
+    }
+
+    /// A transaction that fails after an early cap flush: the walk sent at the cap and the rest the
+    /// processed envelopes caused both reach the propagator, and nothing of the transaction is
+    /// published.
+    #[tokio::test]
+    async fn a_transaction_failing_after_a_cap_flush_dispatches_both_walks_and_publishes_nothing() {
+        let (mut h, mut rx, _pending) = flip_harness();
+        let start = LogPosition::start_of(0);
+        let rows = 90u64;
+        let mut page: Vec<Envelope> = (0..rows).map(|seq| change("1", "0/10", seq, false)).collect();
+        let mut broken = change("1", "0/10", rows, true);
+        broken.value = None;
+        page.push(broken);
+        offer(&mut h, &start.offset, "p1", page);
+        let mut total = 0;
+        for _ in 0..2 {
+            let FlipWork::Walk { work, .. } = next_walk(&mut h, &mut rx).await else {
+                panic!("a live transaction's flips are walks");
+            };
+            total += work.len();
+        }
+        assert_eq!(total, 270, "every processed row's flips, across the cap flush");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(h.processed.lock().unwrap().offset, start.offset, "the failed transaction is not published");
+    }
+
     fn change(txid: &str, lsn: &str, seq: u64, last: bool) -> Envelope {
         Envelope {
             type_: "public.items".into(),

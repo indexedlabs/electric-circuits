@@ -695,6 +695,14 @@ impl GroupEmissionLanes {
         all.into_iter().filter(|lane| lane.tick(engine_moved)).collect()
     }
 
+    /// Origins `path`'s lane holds for `commit_lsn`: walks that may still append the commit's output.
+    #[cfg(test)]
+    pub(crate) fn origins_for_test(&self, path: &str, commit_lsn: u64) -> usize {
+        self.existing_lane(path)
+            .and_then(|lane| lane.state.lock().unwrap().producing.get(&commit_lsn).copied())
+            .unwrap_or(0)
+    }
+
     /// Run one monitor pass inline, probes included, without the background monitor.
     #[cfg(test)]
     async fn tick_for_test(&self, engine_moved: bool) {
