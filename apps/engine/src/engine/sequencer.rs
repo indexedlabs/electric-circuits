@@ -803,6 +803,8 @@ pub(crate) async fn sequencer_loop(
                         // flush partial output or publish partial highwater.
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        // The transaction's subquery flips, walked as one batch (see `TxnFlips`).
+                        let mut txn_flips = TxnFlips::default();
                         // The commit time the ingestor stamped on this transaction's changes.
                         let mut commit_ts: Option<i64> = None;
                         loop {
@@ -904,10 +906,10 @@ pub(crate) async fn sequencer_loop(
                                         );
                                     }
                                 }
-                                if let Err(e) = process_envelope(
+                                if let Err(e) = process_envelope_into(
                                     ds.metrics(), &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
                                     &mut exec.aggregates, &exec.agg_index, env, &mut txn_pending,
-                                    &subq, &trace_tx, library_mode,
+                                    &subq, &trace_tx, library_mode, &mut txn_flips,
                                 )
                                 .await
                                 {
@@ -924,6 +926,9 @@ pub(crate) async fn sequencer_loop(
                             }
                             if processing_failed { break; }
                         }
+                        // Before this commit's output is flushed or its highwater published, and on
+                        // the failure paths too (see `TxnFlips::dispatch`).
+                        txn_flips.dispatch(&subq);
                         if processing_failed {
                             // Do not run the count fold or flush the partial transaction. The
                             // failed transaction is retried from its page boundary on restart.
@@ -1939,6 +1944,54 @@ async fn stream_backfill(
     Ok((fences.gate, agg_seed, emitted_seed, BackfillStats { rows: rows_total, estimated_bytes }))
 }
 
+/// One transaction's subquery flips, gathered across all of its envelopes and handed to the flip
+/// propagator as ONE walk when the transaction's envelopes have all been processed.
+///
+/// Each envelope is one row change, and a bulk change is one transaction of many rows: walked one
+/// envelope at a time, a 1,000-row delete was 1,000 walks, each re-reading every dependent table
+/// for its one value. As one walk its rounds read each (tier, table, column) once for up to
+/// `subquery::ROUND_MAX_VALUES` values (OTTO-13358). Every envelope of a transaction carries the
+/// transaction's commit LSN and txid, so the merged walk keeps the receipt (`pending_flips`) and
+/// group-lane origin each envelope's walk had: one origin per group path, held until the walk ends.
+#[derive(Default)]
+pub(crate) struct TxnFlips {
+    work: std::collections::VecDeque<(crate::predicate::SubquerySig, crate::subquery::Flip)>,
+    /// Group paths whose lane already holds this transaction's origin (`begin_origin`).
+    group_paths: HashSet<String>,
+    txid: Option<String>,
+    lsn: Option<String>,
+    lsn_u64: u64,
+}
+
+impl TxnFlips {
+    /// Hand the gathered walk to the propagator. Called once per transaction, before its output is
+    /// flushed or its highwater published, on the failure paths too: the inner-set nodes already
+    /// moved under these flips, so dropping the walk would lose its effects, not defer them.
+    pub(crate) fn dispatch(self, subq: &SubqueryHandle) {
+        let TxnFlips { work, group_paths, txid, lsn, lsn_u64 } = self;
+        if work.is_empty() {
+            // Nothing to walk: release any origin taken for it, as a finished walk would.
+            for path in &group_paths {
+                subq.group_lanes.complete_origin(path, lsn_u64);
+            }
+            return;
+        }
+        subq.pending_flips.add(lsn_u64);
+        let group_paths: Vec<String> = group_paths.into_iter().collect();
+        if let Err(mpsc::error::SendError(FlipWork::Walk { group_paths, .. })) =
+            subq.flip_tx.send(FlipWork::Walk { work, txid, lsn, group_paths })
+        {
+            // Propagator gone (shutdown) — don't leave the barrier stuck.
+            subq.pending_flips.complete(lsn_u64);
+            for path in &group_paths {
+                subq.group_lanes.complete_origin(path, lsn_u64);
+            }
+        }
+    }
+}
+
+/// [`process_envelope_into`] for an envelope that is a transaction of its own: its flips are
+/// dispatched as soon as it is processed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_envelope(
     metrics: &crate::metrics::Metrics,
@@ -1953,6 +2006,45 @@ pub(crate) async fn process_envelope(
     subq: &SubqueryHandle,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     library_mode: bool,
+) -> Result<()> {
+    let mut flips = TxnFlips::default();
+    let result = process_envelope_into(
+        metrics,
+        ts,
+        shapes,
+        shape_index,
+        families,
+        aggregates,
+        agg_index,
+        env,
+        pending,
+        subq,
+        trace_tx,
+        library_mode,
+        &mut flips,
+    )
+    .await;
+    flips.dispatch(subq);
+    result
+}
+
+/// Process one envelope of a transaction, gathering its subquery flips into `flips` (see
+/// [`TxnFlips`]) for the caller to dispatch once the whole transaction is processed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_envelope_into(
+    metrics: &crate::metrics::Metrics,
+    ts: &TableSchema,
+    shapes: &HashMap<String, StandaloneShape>,
+    shape_index: &StandaloneIndex,
+    families: &HashMap<Vec<usize>, KeyRouter>,
+    aggregates: &mut HashMap<String, AggShape>,
+    agg_index: &StandaloneIndex,
+    env: Envelope,
+    pending: &mut HashMap<String, Vec<Envelope>>,
+    subq: &SubqueryHandle,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    library_mode: bool,
+    flips: &mut TxnFlips,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
     let commit_ts = env.headers.commit_ts;
@@ -2154,11 +2246,10 @@ pub(crate) async fn process_envelope(
     }
     // Subquery shapes/nodes: route this delta through the cross-table registry. Under the lock it
     // updates the shared inner-set nodes (in-memory) and emits outer-shape deltas; the flip-driven
-    // Postgres query-backs are handed to the engine's flip-propagator task so they never block
-    // this tailer. The convergence barrier is processed offsets + a drained flip queue
-    // (`pending_flips == 0`).
+    // Postgres query-backs are gathered into the transaction's walk (`flips`), which the caller
+    // hands to the engine's flip-propagator task so they never block this tailer. The convergence
+    // barrier is processed offsets + a drained flip queue (`pending_flips == 0`).
     {
-        let mut group_paths = HashSet::new();
         let work = {
             let mut reg = subq.registry.lock().await;
             if reg.touches(&ts.table) {
@@ -2168,9 +2259,14 @@ pub(crate) async fn process_envelope(
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
                 let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
                 if let Ok(result_work) = result.as_ref() {
-                    group_paths = reg.group_paths_for_work(result_work);
-                    for path in &group_paths {
-                        subq.group_lanes.begin_origin(path, lsn_u64);
+                    // One origin per group path for the whole transaction's walk, taken before
+                    // any of this commit's output can reach the group's lane.
+                    for path in reg.group_paths_for_work(result_work) {
+                        if !flips.group_paths.contains(&path) {
+                            subq.group_lanes.begin_origin(&path, lsn_u64);
+                            flips.lsn_u64 = lsn_u64;
+                            flips.group_paths.insert(path);
+                        }
                     }
                     if let (Some((hops, ids)), Some(sq)) = (tr.as_mut(), sq_hops) {
                         for h in &sq {
@@ -2190,23 +2286,11 @@ pub(crate) async fn process_envelope(
             }
         }?;
         if !work.is_empty() {
-            subq.pending_flips.add(lsn_u64);
-            if subq
-                .flip_tx
-                .send(FlipWork::Walk {
-                    work,
-                    txid: txid.clone(),
-                    lsn: lsn.clone(),
-                    group_paths: group_paths.iter().cloned().collect(),
-                })
-                .is_err()
-            {
-                // Propagator gone (shutdown) — don't leave the barrier stuck.
-                subq.pending_flips.complete(lsn_u64);
-                for path in &group_paths {
-                    subq.group_lanes.complete_origin(path, lsn_u64);
-                }
-            }
+            // Every envelope of a transaction carries its commit's txid and LSN.
+            flips.txid = txid.clone();
+            flips.lsn = lsn.clone();
+            flips.lsn_u64 = lsn_u64;
+            flips.work.extend(work);
         }
     }
     // Scalar aggregations: fold this delta into each *candidate* aggregate (necessary-conjunct

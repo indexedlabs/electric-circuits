@@ -3,7 +3,7 @@
 //! implementation; row data lives in Postgres):
 //!
 //!  * **candidate-row resolution** from pooled Postgres ([`query_rows_by_col`],
-//!    [`query_rows_all`]) — parallel across the flip-worker pool, bounded by
+//!    [`query_rows_by_values`], [`query_rows_all`]) — parallel across the flip-worker pool, bounded by
 //!    `ELECTRIC_DB_POOL_SIZE`;
 //!  * the **latest-row-per-pk fold** used before an absolute membership evaluation
 //!    ([`latest_rows_by_pk`]);
@@ -75,6 +75,30 @@ pub(crate) async fn query_rows_by_col(
     Ok((rows, fences.gate))
 }
 
+/// [`query_rows_by_col`] for a SET of values: `<ts> WHERE <col> IN (<values>)` in one read, with
+/// the read's snapshot gate. The coalesced form of a walk round's query-backs (see
+/// `subquery::propagate_flips`): every dependent that a round's flips reach through the same table
+/// and column shares this one read, however many flipped nodes and values reached it. One value
+/// is exactly [`query_rows_by_col`].
+pub(crate) async fn query_rows_by_values(
+    pg_pool: &Option<crate::pg::Pool>,
+    ts: &TableSchema,
+    col: usize,
+    values: &[Value],
+) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
+    if let [value] = values {
+        return query_rows_by_col(pg_pool, ts, col, value).await;
+    }
+    let pool = pg_pool.as_ref().context("membership query-back requires postgres")?;
+    let mut client = pool.get().await?;
+    let where_sql = values_in_sql(&ts.columns[col].0, values, ts.pg_types.get(col).and_then(|o| o.as_deref()));
+    // `collect`, for the same reason as `query_rows_by_col`: the result is the candidate set.
+    let scope = crate::pg::SettleScope::internal(&ts.table);
+    let (rows, fences) =
+        crate::pg::backfill_where_reader(&mut client, ts, Some(where_sql), &scope).await?.collect().await?;
+    Ok((rows, fences.gate))
+}
+
 /// Query all rows of `ts` (full re-derive) from Postgres on a pooled connection, with the read's
 /// snapshot gate (see [`query_rows_by_col`]).
 pub(crate) async fn query_rows_all(
@@ -106,6 +130,42 @@ pub(crate) fn value_eq_sql(col: &str, value: &Value, pg_type: Option<&str>) -> (
     }
 }
 
+/// `col IN (…)` over several non-NULL flipped values: the same per-value comparison as
+/// [`value_eq_sql`] — text cast to the column's native type when known, else compared as text —
+/// as one list, so a set of values costs one index probe per value in ONE statement instead of
+/// one statement each. Text values are numbered params `$1..$n`; other scalars are inlined.
+pub(crate) fn values_in_sql(col: &str, values: &[Value], pg_type: Option<&str>) -> (String, Vec<String>) {
+    let name = crate::pg::quote_ident(col);
+    let mut params = Vec::new();
+    let mut inlined = Vec::new();
+    for value in values {
+        match value {
+            // A NULL flip is a full re-derive, never a filtered read; `= NULL` would match nothing.
+            Value::Null => {}
+            Value::Int(i) => inlined.push(i.to_string()),
+            Value::Float(f) => inlined.push(f.into_inner().to_string()),
+            Value::Bool(b) => inlined.push(if *b { "true" } else { "false" }.to_string()),
+            Value::Text(s) => params.push(s.clone()),
+        }
+    }
+    let mut terms = Vec::new();
+    if !inlined.is_empty() {
+        terms.push(format!("{name} IN ({})", inlined.join(", ")));
+    }
+    if !params.is_empty() {
+        let list = |cast: &str| (1..=params.len()).map(|n| format!("${n}{cast}")).collect::<Vec<_>>().join(", ");
+        terms.push(match pg_type {
+            Some(ty) => format!("{name} IN ({})", list(&format!("::text::{}", crate::pg::quote_ident(ty)))),
+            None => format!("{name}::text IN ({})", list("")),
+        });
+    }
+    match terms.len() {
+        0 => ("FALSE".to_string(), params),
+        1 => (terms.pop().unwrap_or_default(), params),
+        _ => (format!("({})", terms.join(" OR ")), params),
+    }
+}
+
 /// Fold a Z-set delta down to each touched pk's **latest** state: the `+1` row if present
 /// (insert/update — the row still exists), else the `-1` row (delete). The `bool` is
 /// "row still exists". This is the front half of every absolute membership evaluation: decide
@@ -121,4 +181,24 @@ pub(crate) fn latest_rows_by_pk(ts: &TableSchema, delta: &[Tup2<Row, ZWeight>]) 
         }
     }
     by_pk.into_values().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A coalesced query-back keeps each value's own comparison: integers inlined, text as numbered
+    /// params cast to the column's native type (or compared as text when the type is unknown).
+    #[test]
+    fn values_in_sql_lists_each_value_with_its_own_comparison() {
+        let ints = values_in_sql("record_id", &[Value::Int(1), Value::Int(2)], Some("int8"));
+        assert_eq!(ints, ("\"record_id\" IN (1, 2)".to_string(), Vec::new()));
+        let uuids = values_in_sql("record_id", &[Value::Text("a".into()), Value::Text("b".into())], Some("uuid"));
+        assert_eq!(uuids.0, "\"record_id\" IN ($1::text::\"uuid\", $2::text::\"uuid\")");
+        assert_eq!(uuids.1, vec!["a".to_string(), "b".to_string()]);
+        let untyped = values_in_sql("c", &[Value::Text("a".into()), Value::Text("b".into())], None);
+        assert_eq!(untyped.0, "\"c\"::text IN ($1, $2)");
+        let mixed = values_in_sql("c", &[Value::Int(1), Value::Text("a".into())], Some("text"));
+        assert_eq!(mixed.0, "(\"c\" IN (1) OR \"c\" IN ($1::text::\"text\"))");
+    }
 }
