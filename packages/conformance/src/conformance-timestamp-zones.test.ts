@@ -16,7 +16,7 @@ import type { Predicate, Row, Schema } from '@electric-circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 
-import { createShape, pgQuery, readEnvelopes, waitFor } from './engine-native.js'
+import { createShape, pgQuery, readEnvelopes, sleep, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -241,6 +241,63 @@ describe.each([
       expect(live![column], `live ${column}`).toBe(spelling)
     }
   }, 120000)
+})
+
+// The boot's answer is about the defaults the boot saw. A default set later reaches the NEXT
+// replication connection, which starts with whatever the database says then. So the engine asks
+// again before every such connection, and one that would print another style is not opened:
+// nothing is decoded from it, and ingest waits until the style is ISO again.
+describe('a date style changed under a running engine', () => {
+  let h: Harness | undefined
+  afterEach(async () => {
+    await h?.shutdown()
+    h = undefined
+  })
+
+  it('is never decoded: the next replication connection waits until the style is ISO again', async () => {
+    h = await bootHarness(schema, { ddl })
+    await pgQuery(h, 'INSERT INTO records (id, visible) VALUES (1, true)')
+    await pgQuery(
+      h,
+      `INSERT INTO events (id, record_id, starts, name) VALUES (14, 1, '2026-10-21 12:34:56.789+00', 'midweek')`,
+    )
+    await drainEngine(h)
+    const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'eq', value: 14 } })
+    await drainEngine(h)
+    const live = async () => (await readEnvelopes(shape.streamUrl)).filter((env) => env.headers.lsn !== undefined)
+    expect(await live(), 'nothing has changed since the backfill').toHaveLength(0)
+
+    // The default changes — for new sessions only — and the replication connection drops.
+    await setDatabaseDefault('datestyle', 'German')({ pgUrl: h.pgUrl })
+    const dropped = await pgQuery(
+      h,
+      'SELECT pg_terminate_backend(active_pid) AS done FROM pg_replication_slots WHERE slot_name = $1 AND active',
+      [h.slot],
+    )
+    expect(dropped, 'the walsender was connected').toHaveLength(1)
+    await pgQuery(h, `UPDATE events SET name = 'edited under German' WHERE id = 14`)
+
+    // A walsender session opened now prints `21.10.2026 …`. No cell in that style may reach the
+    // stream — the engine reconnects within about a second, so several seconds is long enough to
+    // see one arrive.
+    const utc = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?\+00$/
+    const until = Date.now() + 6000
+    while (Date.now() < until) {
+      for (const env of await live()) {
+        expect(String((env.value as Row).starts), 'a live timestamptz cell is spelled in ISO style, in UTC').toMatch(utc)
+      }
+      await sleep(250)
+    }
+    expect(await live(), 'nothing is ingested while the replication session would print German dates').toHaveLength(0)
+    expect(h.engineStderr(), 'the refusal names the setting').toContain('DateStyle=German')
+
+    // Put back, the next attempt connects, and the change arrives spelled as every other one is.
+    await setDatabaseDefault('datestyle', 'ISO, MDY')({ pgUrl: h.pgUrl })
+    await waitFor(async () => (await live()).length === 1, 'the edit to arrive once the date style is ISO again', 60000)
+    const edited = (await live())[0]!.value as Row
+    expect(edited.name).toBe('edited under German')
+    expect(edited.starts).toBe('2026-10-21 12:34:56.789+00')
+  }, 150000)
 })
 
 // The live path's session cannot be given a date style (the replication connection takes no

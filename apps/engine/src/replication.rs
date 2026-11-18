@@ -341,6 +341,26 @@ pub async fn run(
                 continue;
             }
         };
+        // The walsender's session takes no startup options, so its date style is whatever the
+        // database, the role or the server defaults to NOW — which need not be what the boot saw.
+        // A default changed under a running engine reaches the next replication connection, and a
+        // non-ISO one would hand the decoder cells it cannot read, which it would pass on as they
+        // are while every query session still prints ISO. So the same question the boot asks is
+        // asked before every connection, and a refusal is "not yet": no cell is decoded until the
+        // setting is put back, and the next attempt then connects.
+        // Raced against the shutdown like the backoff is: a dial that hangs must not hold a
+        // terminating process.
+        let checked = tokio::select! {
+            checked = crate::pg::check_replication_session(&pg_url, &shutdown) => checked,
+            _ = shutdown.wait() => continue,
+        };
+        if let Err(refused) = checked {
+            tracing::error!("replicator: not connecting — {refused:#}");
+            let (base, next) = next_backoff(attempt, false);
+            backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
+            attempt = next;
+            continue;
+        }
         let mut connected = false;
         match stream_loop(
             cfg,

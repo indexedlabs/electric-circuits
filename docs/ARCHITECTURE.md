@@ -910,8 +910,12 @@ the database, the role or the server defaults to**, by a different means on each
 - Respelling needs the ISO style, and that the engine cannot give the replication session either.
   The boot opens one session with no options — the same defaults the walsender will get — and
   **refuses to start** (exit 78, naming `ALTER ROLE … SET datestyle`) unless its `DateStyle` is
-  ISO (`pg::check_replication_session`). The check is at boot only: a default changed under a
-  running engine takes effect at the next replication reconnect and is not re-checked there.
+  ISO (`pg::check_replication_session`). The same check runs **before every replication
+  connection**, because a default changed under a running engine reaches the next walsender
+  session. There a session that would not print ISO is not opened: nothing is decoded, the
+  refusal is logged by name, and the ingestor asks again on its reconnect backoff until the style
+  is ISO. Query sessions keep printing ISO throughout, so the engine serves what it has and
+  ingests nothing it would misread.
 
 Not respelled, and left as the session printed them: `infinity`/`-infinity` (the same in every
 zone), a `BC` year and a year the shift carries outside 0001–9999. Other session settings that

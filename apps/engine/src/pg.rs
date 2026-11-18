@@ -609,21 +609,24 @@ pub(crate) fn check_replication_date_style(date_style: Option<&str>) -> Result<(
     bail!(
         "the replication session would print dates in DateStyle={}, and the engine reads only the ISO \
          style. That session takes no startup options, so the setting comes from the database, the role \
-         or the server. Set it for the engine's role and restart the engine: \
+         or the server. Set it for the engine's role: \
          `ALTER ROLE <the engine's role> SET datestyle = 'ISO, MDY'` (or `ALTER DATABASE … SET datestyle`, \
-         or `datestyle` in postgresql.conf).",
+         or `datestyle` in postgresql.conf). A running engine connects at its next attempt; one that \
+         refused to boot has to be started again.",
         date_style.unwrap_or("(not reported)"),
     )
 }
 
-/// The boot's check that the replication session will print cells the engine can read: open one
-/// session exactly as the walsender connection will be opened — the same role and database, and
-/// no startup options — and look at the date style it comes up with
+/// The check that the replication session will print cells the engine can read: open one session
+/// exactly as the walsender connection will be opened — the same role and database, and no
+/// startup options — and look at the date style it comes up with
 /// ([`check_replication_date_style`]). Its time zone is logged, not judged: any zone is corrected
 /// at decode.
 ///
-/// Boot only. A default changed under a running engine applies to the next replication
-/// connection and is not re-checked there.
+/// Asked twice. At boot, where a refusal is a configuration error (exit 78). And before EVERY
+/// replication connection (`replication::run`), because a default changed under a running engine
+/// reaches the next walsender session: there a refusal is "not yet" — the connection is not
+/// opened, nothing is decoded, and the ingestor asks again on its backoff schedule.
 pub(crate) async fn check_replication_session(url: &str, owner: &crate::shutdown::ShutdownToken) -> Result<()> {
     let config = PgConnectionConfig::from_process_env(url)?;
     let (client, session) = config.dial(&config.bare, Some(owner)).await?;

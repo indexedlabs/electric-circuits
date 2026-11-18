@@ -57,7 +57,14 @@ The engine sets everything else up for you on startup, per configured table:
 > in UTC as they arrive. The one thing it needs from the defaults is the **ISO date style for the
 > engine's role** (`ISO, MDY` is Postgres's own default): the replication connection takes no
 > startup options, and a role or database set to `German`, `SQL` or `Postgres` style is refused at
-> boot (exit `78`) with the `ALTER ROLE … SET datestyle` that fixes it.
+> boot (exit `78`) with the `ALTER ROLE … SET datestyle` that fixes it. The engine asks again
+> before every replication connection: if the style is changed while it runs, it stops ingesting
+> at the next reconnect, logs the same message, and resumes by itself once the style is ISO.
+>
+> **Timestamp literals.** A predicate on a `timestamptz`, `timestamp` or `date` column takes its
+> literal in ISO 8601 form (`2026-10-19T07:00:00Z`, `2026-10-19 07:00:00+05:30`, `2026-10-19`),
+> with `Z`, `UTC`, `GMT` or a numeric offset as the zone, or `infinity`. Any other spelling is
+> refused with `400`, including ones Postgres itself reads, such as `… PST` or `Oct 19 2026`.
 
 ## Step 2 — Run the engine
 
