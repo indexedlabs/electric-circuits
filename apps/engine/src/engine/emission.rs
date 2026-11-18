@@ -368,7 +368,8 @@ struct GroupLaneState {
     next_seq: u64,
     /// **The stream's position**: the highest `headers.lsn` this lane has taken for an append
     /// (`0` = nothing placed yet). The lane decides the group stream's order, so the lane places
-    /// its envelopes — see [`GroupLane::take_appendable`].
+    /// its envelopes — see [`GroupLane::take_appendable`]. A lane restored at boot starts at the
+    /// restored checkpoint's highwater ([`GroupEmissionLanes::restore_position`]).
     position: u64,
     marker: Option<Envelope>,
     in_flight: Option<InFlight>,
@@ -729,6 +730,30 @@ impl GroupEmissionLanes {
     /// and restored detached, so a per-group receipt for it need not wait for a new commit.
     pub(crate) fn note_restored_highwater(&self, commit_lsn: u64) {
         self.shared.progress.lsn.fetch_max(commit_lsn, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Give a restored group's lane the position its stream had reached at the checkpoint the
+    /// engine restored from: that checkpoint's highwater. Every commit the checkpoint passed was
+    /// sequenced by the earlier process, so whatever of its output landed is at or below it
+    /// (a position is never above the newest commit handed to the lane). Without this a restored
+    /// lane starts at zero, and what it appends first — a must-refetch marker at its resume point,
+    /// a replay, a member's activation drain — is placed below envelopes the stream already
+    /// carries. Never lowers a position: the lane may already have placed newer output.
+    ///
+    /// What the earlier process appended AFTER its last checkpoint is in no record the restore
+    /// reads. Those commits are re-emitted by the replay, at their own positions, like the replays
+    /// on a plain shape's stream.
+    pub(crate) fn restore_position(&self, path: &str, position: u64) {
+        if let Some(lane) = self.existing_lane(path) {
+            let mut state = lane.state.lock().unwrap();
+            state.position = state.position.max(position);
+        }
+    }
+
+    /// A lane's stream position, for tests of the restore.
+    #[cfg(test)]
+    pub(crate) fn position(&self, path: &str) -> Option<u64> {
+        self.existing_lane(path).map(|lane| lane.state.lock().unwrap().position)
     }
 
     pub(crate) fn remove(&self, path: &str) {
@@ -2381,6 +2406,61 @@ mod tests {
         assert!(lanes.drain(GROUP, 7).unwrap().drained);
         assert!(lanes.behind_at_or_before(u64::MAX).is_empty());
         assert!(lanes.drain("shape/group-unknown", 7).is_none());
+    }
+
+    /// A restart with **a later landed envelope and an older outstanding origin**. Before it,
+    /// commit 0x20's output had landed, and work for the older commit 0x10 — which registered late
+    /// — was still outstanding, so the checkpoint recorded 0x10 as the group's resume point. The
+    /// restored lane starts detached at 0x10. Its must-refetch marker, and the replay that follows
+    /// it, land AFTER the envelope at 0x20 that the stream already carries, so they are placed at
+    /// the position the stream had reached — the checkpoint's highwater — and not at 0x10.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_lane_never_places_its_marker_below_what_its_stream_already_carries() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes_over = |store: &Arc<crate::ds::ScriptedStore>| {
+            GroupEmissionLanes::unmonitored(
+                DsClient::with_test_store("scripted://group".into(), store.clone()),
+                test_config(),
+            )
+        };
+        // The run before the restart.
+        let before = lanes_over(&store);
+        before.register(GROUP);
+        before.push(GROUP, vec![group_env("landed")], 0x20);
+        wait_appended(&store, 1).await;
+        before.begin_origin(GROUP, 0x10);
+        assert_eq!(
+            before.behind_at_or_before(0x20),
+            BTreeMap::from([(GROUP.to_string(), 0x10)]),
+            "the checkpoint at highwater 0x20 records 0x10 as the group's resume point"
+        );
+        before.remove(GROUP);
+
+        // The next boot, as the catalog restore does it: the checkpoint's highwater, the group
+        // detached at its resume point, and the position its stream had reached.
+        let lanes = lanes_over(&store);
+        lanes.note_restored_highwater(0x20);
+        lanes.register_detached(GROUP, 0x10, GroupMeta::default());
+        lanes.restore_position(GROUP, 0x20);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        lanes.tick_for_test(true).await;
+        // The replay re-emits the commit that was outstanding; then a new commit arrives.
+        lanes.push(GROUP, vec![group_env("replayed")], 0x10);
+        lanes.push(GROUP, vec![group_env("live")], 0x30);
+        wait_appended(&store, 4).await;
+        assert_eq!(
+            appended_positions(&store),
+            [
+                placed("landed", "0/20"),
+                placed(MUST_REFETCH, "0/20"),
+                placed("replayed", "0/20"),
+                placed("live", "0/30")
+            ]
+        );
+
+        // A restored position never lowers one the lane has already reached.
+        lanes.restore_position(GROUP, 0x18);
+        assert_eq!(lanes.position(GROUP), Some(0x30));
     }
 
     #[tokio::test(start_paused = true)]

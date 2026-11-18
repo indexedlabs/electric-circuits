@@ -1065,10 +1065,23 @@ row or its membership changed again — by offset and by position alike. A batch
 later commit is still its own commit's output: the group's receipt for T is not drained until it
 has landed, and a detach that drops it resumes from T.
 
-The guarantee is per engine run. A subquery shape's stream does not outlive its run (§9). A plain
-shape's does, and a restart can re-emit the commits after its checkpoint at their own positions,
-below what the stream already carries; those are replays, and rule 1 drops the ones a consumer has
-moved past.
+The guarantee is per engine run, and three kinds of stream meet a restart differently:
+
+- A **subquery shape's** stream, and a group's with a subquery member, does not outlive its run
+  (§9).
+- A **plain shape's** stream does. A restart re-emits the commits after its checkpoint at their own
+  positions, below what the stream already carries. Those are replays, and rule 1 drops the ones a
+  consumer has moved past.
+- A **group stream of plain members** is restored as well, and its lane's position with it: the
+  lane starts at the restored checkpoint's highwater (`GroupEmissionLanes::restore_position`).
+  Every commit that checkpoint passed had landed at or below it. So the must-refetch marker of a
+  group restored behind, the replay after it and a member's activation drain are all placed at or
+  above what the stream carried at the checkpoint, even when the group's resume point is an older
+  commit than output it had already landed. What the earlier run appended *after* its last
+  checkpoint is in no record the restore reads: those commits are re-emitted as replays at their
+  own positions, exactly as on a plain shape's stream, and can sit below the envelopes of that
+  window. A consumer of a group stream must therefore follow rule 1 across a restart, and must not
+  treat a falling position as an error.
 
 ---
 

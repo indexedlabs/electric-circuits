@@ -1764,6 +1764,13 @@ impl Engine {
                             self.group_lanes.set_meta(&group.stream_path, meta);
                         }
                     }
+                    // The lane's position is in memory only. Its stream carries what the earlier
+                    // process appended, all of it at or below the checkpoint's highwater for the
+                    // commits the checkpoint passed, so the lane resumes from there: a marker, a
+                    // replay or a drain it appends next is never placed below that.
+                    if let Some((lsn, _)) = start_highwater {
+                        self.group_lanes.restore_position(&group.stream_path, lsn);
+                    }
                     st.group_claims.complete(group);
                 } else {
                     tracing::info!(
@@ -3516,6 +3523,72 @@ mod tests {
             fold.apply_once(&eid, ev);
         }
         fold
+    }
+
+    /// The restore gives every group lane it brings back the position its stream had reached at
+    /// the checkpoint: the checkpoint's highwater, which every commit it passed landed at or below.
+    /// Without it a lane restarts at zero, and a group restored behind — its resume point older
+    /// than output it had already landed — stamps its must-refetch marker below what the stream
+    /// already carries.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_group_lane_starts_at_the_checkpoints_highwater() {
+        let now = crate::changelog::now_secs();
+        let member = |id: &str, sub: &str| -> Vec<CatalogEvent> {
+            let mut created = created_event("public.users");
+            created["rec"]["id"] = serde_json::json!(id);
+            created["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
+            created["rec"]["changes_only"] = serde_json::json!(true);
+            created["sig"] = serde_json::json!(format!("sig-{id}"));
+            created["subscription"] = serde_json::json!(sub);
+            created["at"] = serde_json::json!(now);
+            vec![
+                serde_json::from_value::<CatalogEvent>(created).unwrap(),
+                CatalogEvent::Dormant {
+                    id: id.to_string(),
+                    resume: pos(0, "5"),
+                    gate: crate::pg::SnapshotGate::passthrough(),
+                },
+            ]
+        };
+        let group = |n: u8, id: &str, sub: &str| GroupRecord {
+            id: format!("shape/group-{n}"),
+            stream_path: format!("shape/group-{n}"),
+            subscription: format!("scope-{n}"),
+            members: vec![crate::engine::group::GroupMember {
+                key: "users".into(),
+                shape_id: id.into(),
+                table: "public.users".into(),
+                where_: None,
+                columns: None,
+                subscription: sub.into(),
+                is_subquery: false,
+            }],
+            lsn: "0/0".into(),
+            snapshot: "".into(),
+            horizon: "0/0".into(),
+            replay_fence: "0".into(),
+        };
+        // Group 1 is behind at the checkpoint: output of commit 0x10 had not landed, while the
+        // checkpoint itself had passed commit 0x20. Group 2 had landed everything.
+        let behind: std::collections::BTreeMap<String, u64> = [("shape/group-1".to_string(), 0x10)].into();
+        let fold = fold_of(
+            member("s1", "member-1")
+                .into_iter()
+                .chain(member("s2", "member-2"))
+                .chain([
+                    CatalogEvent::GroupCreated { group: group(1, "s1", "member-1") },
+                    CatalogEvent::GroupCreated { group: group(2, "s2", "member-2") },
+                    CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x20, 1)), groups: behind },
+                ])
+                .collect(),
+        );
+        let server = FakeDs::start().await;
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+
+        assert!(engine.group_lanes.drain("shape/group-1", 0x20).unwrap().must_refetch, "restored behind, detached");
+        assert_eq!(engine.group_lanes.position("shape/group-1"), Some(0x20), "the group restored behind");
+        assert_eq!(engine.group_lanes.position("shape/group-2"), Some(0x20), "the group restored attached");
     }
 
     #[test]
