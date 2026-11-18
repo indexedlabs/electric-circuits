@@ -5532,4 +5532,45 @@ pub(crate) mod tests {
         // unknown sig -> empty
         assert!(!reg.contains(&"other".to_string(), &Value::Int(1)));
     }
+
+    /// The equality literals of an inner predicate are lifted into its template's bind, and a
+    /// replicated inner row finds its node by looking its own cells up among the binds. For a
+    /// timestamp column the bind therefore has to be in the cells' spelling — Postgres's output for
+    /// that instant — or no row ever matches it and the inner set stays empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timestamp_bind_is_spelled_as_the_cells_it_is_matched_against() {
+        use crate::schema::TableDef;
+        let mut def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "gid": {"type":"int"}, "at": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        def.columns.get_mut("at").unwrap().pg_type = Some("timestamptz".into());
+        let slots = TableSchema::from_def(&TableRef::from("slots"), &def).unwrap();
+        let mut schemas = creating_schemas();
+        schemas.insert(TableRef::from("slots"), slots.clone());
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test("http://unused"), None);
+        reg.set_schemas(Arc::new(schemas));
+        let pred: PredicateJson = serde_json::from_value(serde_json::json!({
+            "col": "gid",
+            "in": {"table": "slots", "project": "gid", "where": {"col": "at", "op": "eq", "value": "2026-10-19T00:00:00-07:00"}}
+        }))
+        .unwrap();
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &pred, None, true).unwrap();
+        let seeds = begin
+            .seeds
+            .into_iter()
+            .map(|(sig, _, _)| (sig, Vec::new(), crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
+        let node = reg.nodes.values().next().expect("the inner set");
+        assert_eq!(node.bind, Row(vec![Value::Text("2026-10-19 07:00:00+00".into())]));
+
+        // A slot at that instant, as replication hands it over, puts its `gid` into the inner set.
+        let slot = slots
+            .row_from_json(serde_json::json!({"id": 1, "gid": 7, "at": "2026-10-19 07:00:00+00"}).as_object().unwrap())
+            .unwrap();
+        let flips = reg.on_table_delta(&slots, &[Tup2(slot, 1)], 0x10, None, None, None).await.unwrap();
+        let entered: Vec<Flip> = flips.into_iter().map(|(_, flip)| flip).collect();
+        assert_eq!(entered, vec![Flip { value: Value::Int(7), dir: FlipDir::Enter }]);
+    }
 }
