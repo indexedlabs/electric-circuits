@@ -908,8 +908,9 @@ was dropped in and credits that phase with the time it had run. Phases a page ne
 The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk
 versions**: a row read from a page carries that page's snapshot (`snapshot` = `pg_current_snapshot()`
 and `horizon` = `pg_current_wal_insert_lsn()`, returned with every page), and an applied delta
-replaces it with the delta's commit LSN. Engine output envelopes carry their commit LSN and 32-bit
-`txid` for exactly this. Key invariants (all regression-tested):
+replaces it with the delta's position. Every live envelope carries one — `headers.lsn` and the
+32-bit `txid` of the transaction that caused it — for exactly this; what a consumer may assume
+about it is *Native envelope positions* below. Key invariants (all regression-tested):
 
 - The feed is created and its head offset captured **before** the page snapshot, so no delta can fall
   in the gap. The engine settles the page snapshot against what it has already fanned out (§4), so
@@ -964,6 +965,92 @@ Paging is **keyset**, and the cursor has to agree with the page query's `ORDER B
   on a `C`/`C.UTF-8` database the index already IS the "C" collation and nothing changes, but on
   `en_US.UTF-8` a range scan over a large table falls back to a sequential scan. The remedy is an
   expression index — `CREATE INDEX … ON t ((col COLLATE "C"))` — on the columns subsets order by.
+
+### Native envelope positions
+
+Every envelope the engine appends to a native stream once the stream's backfill is on it carries a
+**position**, and this subsection is everything a consumer may assume about it. It holds for plain
+shape streams, subquery shape streams, `changes_only` feeds and group streams (`shape/group-*`),
+and for every way an envelope comes about: a row change, the key set's delete, a `changes_only`
+feed's proven delete (§6), a change buffered during a create and replayed at install, and a flip's
+query-back.
+
+- **Form.** `headers.lsn` is a Postgres LSN as text, `HI/LO`: two upper-case hexadecimal numbers
+  without padding, each at most eight digits, valued `(HI << 32) | LO`. `headers.txid` is a
+  transaction's 32-bit xid in decimal. `headers.seq` is never present on an output envelope and is
+  no part of a position.
+- **Meaning.** `txid` names the transaction that **caused** the envelope: the one that changed the
+  row, or — for a membership verdict a flip produced — the one that changed the inner set, however
+  much later the verdict was taken. `lsn` is that transaction's commit LSN, **raised to the highest
+  `lsn` already appended to the same stream** when that is greater. So `lsn` is never below the
+  commit LSN of `txid`, and equals it unless the envelope was produced out of commit order.
+- **Order.** Along one stream, in offset order, `lsn` never decreases. Equal positions are
+  ordinary: every envelope of one transaction shares one, and a raised verdict shares the position
+  it was raised to while naming its own `txid`. Among equal positions offset order decides, and
+  the later envelope is the newer statement about its key.
+- **Absent.** A materialized shape's backfill rows carry neither header: they are the snapshot,
+  not a commit's. In library mode there is no Postgres and no envelope carries `lsn`. `txid` is
+  absent from a group's must-refetch control envelope (`type` `__circuits.control`), and from an
+  emission a shape create deferred whose commit is no longer among the 4,096 most recent the
+  registry remembers; such an envelope is placed by `lsn` alone.
+
+What a consumer does with a position:
+
+1. **Between envelopes, a position can only reject a replay.** A consumer that remembers the `lsn`
+   of the last envelope it applied to a key, and applies the next one iff its `lsn` is **greater
+   than or equal to** it, applies every envelope it reads in offset order. Testing `>` instead
+   discards the second envelope a transaction emits for a key, and every raised verdict.
+2. **Against a snapshot** (a subset page or a group load: `lsn`, `snapshot`, `horizon`), and only
+   for a key it has applied no stream envelope to since that snapshot, it may skip an envelope iff
+   `lsn < horizon` and its `txid` was visible to `snapshot` (with no `txid`: iff `lsn` is below the
+   snapshot's `lsn`). Every other envelope it applies. After the first envelope with
+   `lsn >= horizon` nothing later can be in the snapshot, and the snapshot is not consulted again.
+3. **An envelope is absolute** — the key's row, or its absence — never a difference. When in doubt,
+   apply: an applied envelope is corrected by the next one for its key, a skipped one is not.
+
+Why no correct verdict is discarded. The engine's own invariant is about **offset order**, and
+positions are made to say the same thing — nothing more. On a single stream, appends are in
+evaluation order and a query-back drops a key whose live decision its read could not have seen
+(§6, *Query-back recency*), so the last envelope appended for a key is its freshest verdict. A
+flip's verdict is taken after the commit that caused it, so it can follow a newer live change to
+the same key. Stamped with its own commit alone it would sit below that change, and rule 1 would
+discard the stream's last word. Raising it to the stream's position makes position order agree
+with offset order, so a consumer that orders by position ends exactly where one that folds by
+offset ends. It keeps its own `txid` because rule 2 asks a different question — does the snapshot
+already include what this envelope reports — and that is a question about the cause. A verdict
+skipped by rule 2 may also reflect a later transaction the snapshot lacks; that transaction's own
+envelope follows under its own `txid` and is not skipped (for a `changes_only` feed, within the
+limits of the proof in §6).
+
+The position is assigned where the stream's order is decided. A single stream's appends are
+enqueued under the registry lock, in evaluation order, so the registry keeps the stream's position
+(`SubqueryShape::position`). A group stream's order is its lane's (`engine/emission.rs`): commit
+order — a flip's verdict lands before the next commit's output — with two exceptions, each of
+which lands a batch later than its commit. Work that registers late lands late. And **the
+envelopes of one key reach a group stream in the order they were evaluated**, as on a single
+stream: a batch handed to the lane after a later commit's queued envelope for one of its keys is
+ordered at that envelope's commit, behind everything already queued there, whole, instead of at
+its own commit. So the lane assigns
+`max(the commit the batch is ordered at, the last position it appended)` as it appends, and a
+flip's verdict in a group keeps its own commit's position unless it lands late. On a group stream
+too, then, a position repeats what offset order already says, and the last envelope appended for
+a key is its freshest verdict.
+
+Commit order alone would end wrong, which is why the second exception exists. With a **nested**
+subquery, a commit T's change reaches an outer shape in two deferred steps, and until the first
+has run the engine judges that shape's rows against an inner set T has already made stale. A live
+change to such a row in T+1 is then judged wrongly, and T's verdict, evaluated later, corrects it.
+Appended in evaluation order the two end right, on a single stream and on a group's (this is the
+interleaving the stamping rule is tested on). Appended in commit order, T's verdict would land
+ahead of the stale T+1 envelope, which would then be the stream's last word for that key until the
+row or its membership changed again — by offset and by position alike. A batch ordered behind a
+later commit is still its own commit's output: the group's receipt for T is not drained until it
+has landed, and a detach that drops it resumes from T.
+
+The guarantee is per engine run. A subquery shape's stream does not outlive its run (§9). A plain
+shape's does, and a restart can re-emit the commits after its checkpoint at their own positions,
+below what the stream already carries; those are replays, and rule 1 drops the ones a consumer has
+moved past.
 
 ---
 

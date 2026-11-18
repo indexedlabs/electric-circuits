@@ -288,11 +288,46 @@ pub struct SubqueryShape {
     /// How many query-backs for this shape are between their registry-lock release and their
     /// evaluation. Non-zero is exactly the window `recent` has to cover.
     pub(crate) inflight_querybacks: u32,
+    /// **The stream's position**: the highest `headers.lsn` this shape has appended to its own
+    /// stream (`0` = nothing placed yet). Every envelope is placed at `max(its commit's LSN, this)`
+    /// ([`place`](Self::place)), so a position never falls along the stream.
+    ///
+    /// A live change is evaluated in commit order and lands at its own commit. A flip's verdict
+    /// does not: its query-back runs after the commit that caused it, so the verdict can follow a
+    /// NEWER live change to the same key. At its own commit's LSN it would sit below that change,
+    /// and a consumer that applies a delta only at or above the position it holds for the key —
+    /// every consumer that orders by position — would discard the stream's last word. Offset order
+    /// is the engine's truth (append order is evaluation order, and the recency fence keeps the
+    /// last evaluation of a key its freshest), and raising the verdict to the stream's position
+    /// makes position order agree with it. `docs/ARCHITECTURE.md` §7, *Native envelope positions*,
+    /// is the contract consumers read.
+    ///
+    /// Kept on the shape because the shape is its stream's only writer once the backfill is on it,
+    /// and the two share a lifetime: a subquery shape is never dormant, and neither it nor its
+    /// stream outlives the engine run that created it. A group member's stream is shared and
+    /// ordered by its lane, which keeps the position instead (`engine::emission`); for a group
+    /// member this stays `0`.
+    pub(crate) position: u64,
+}
+
+impl SubqueryShape {
+    /// The position of the envelopes the commit at `commit_lsn` caused on this shape's stream, as
+    /// `headers.lsn` spells it — advancing [`position`](Self::position) to it. `None` only when
+    /// there is no position at all: library mode, where no change has an LSN.
+    fn place(&mut self, commit_lsn: u64) -> Option<String> {
+        let position = if self.stream_path.starts_with("shape/group-") {
+            commit_lsn
+        } else {
+            self.position = self.position.max(commit_lsn);
+            self.position
+        };
+        (position != 0).then(|| crate::engine::emission::lsn_text(position))
+    }
 }
 
 impl HeapSize for SubqueryShape {
     /// `pred`/`out_cols` are `Arc`-shared, not uniquely owned; `emitted` (`AtomicU64`),
-    /// `feed_id` (`i64`) and `inflight_querybacks` (`u32`) are inline. `recent` is bounded by the
+    /// `feed_id` (`i64`), `inflight_querybacks` (`u32`) and `position` (`u64`) are inline. `recent` is bounded by the
     /// pks touched while a query-back is in flight and is dropped when the last one finishes, but
     /// it is owned heap while it lives, so it is counted.
     fn heap_bytes(&self) -> usize {
@@ -328,7 +363,9 @@ pub(crate) enum EmissionSource<'a> {
     /// same way — and kept a distinct variant because the two call sites are not interchangeable.
     Replay { lsn: u64, xid: Option<u64> },
     /// Candidates read from Postgres by a query-back, under `gate`'s snapshot. `commit_lsn`
-    /// belongs to the triggering flip, not the snapshot: its resulting appends hold that receipt.
+    /// belongs to the triggering flip, not the snapshot: its resulting appends hold that receipt,
+    /// and are placed at that commit — or at the stream's position, when the stream already
+    /// carries a newer one ([`SubqueryShape::position`]).
     QueryBack { gate: &'a crate::pg::SnapshotGate, commit_lsn: u64 },
 }
 
@@ -706,9 +743,16 @@ pub struct SubqueryRegistry {
     /// [`COMMIT_TIMES_RETAINED`] commits are kept; a delivery for an older one goes unstamped,
     /// which costs only its telemetry.
     commit_times: BTreeMap<u64, i64>,
+    /// The transaction id of recent commits the registry ingested, by commit LSN, so an emission
+    /// that reaches the tail with its commit's LSN but no transaction in hand — a create's replayed
+    /// seed flips and deferred node re-derivations carry only their origin — still names the
+    /// transaction that caused it (`headers.txid`). The newest [`COMMIT_TIMES_RETAINED`] commits
+    /// are kept; an emission for an older one is placed by `headers.lsn` alone.
+    commit_txids: BTreeMap<u64, String>,
 }
 
-/// How many live commits' times [`SubqueryRegistry`] keeps for stamping deliveries (16 bytes each).
+/// How many live commits' times and transaction ids [`SubqueryRegistry`] keeps for stamping
+/// deliveries.
 const COMMIT_TIMES_RETAINED: usize = 4096;
 
 impl HeapSize for SubqueryRegistry {
@@ -736,6 +780,7 @@ impl HeapSize for SubqueryRegistry {
             + self.collect_log.heap_bytes()
             + self.pg_url.heap_bytes()
             + self.commit_times.heap_bytes()
+            + self.commit_txids.heap_bytes()
     }
 }
 
@@ -787,6 +832,7 @@ impl SubqueryRegistry {
             lanes: None,
             group_lanes: None,
             commit_times: BTreeMap::new(),
+            commit_txids: BTreeMap::new(),
         }
     }
 
@@ -1428,6 +1474,7 @@ impl SubqueryRegistry {
             feed_id,
             recent: HashMap::new(),
             inflight_querybacks: 0,
+            position: 0,
         });
         // Seed the feed with the backfilled pks (the stream already carries the snapshot) —
         // replaces the old known_members hand-off. This is phase C, under the registry lock,
@@ -1665,6 +1712,16 @@ impl SubqueryRegistry {
         // A new commit: the transitions kept for the previous one are no longer "this commit's".
         if lsn == 0 || self.commit.lsn != lsn {
             self.commit = CommitScope { lsn, ..CommitScope::default() };
+            // Remember whose commit this is, for the emissions it causes later that arrive with
+            // its LSN alone (see `commit_txids`).
+            if lsn != 0
+                && let Some(txid) = &txid
+            {
+                self.commit_txids.insert(lsn, txid.clone());
+                while self.commit_txids.len() > COMMIT_TIMES_RETAINED {
+                    self.commit_txids.pop_first();
+                }
+            }
         }
         // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
@@ -2230,21 +2287,39 @@ impl SubqueryRegistry {
         if let Some(undone) = lent {
             self.commit.undone = undone;
         }
+        // The transaction every envelope of this emission names is the one that CAUSED it: the
+        // commit a live or replayed change belongs to, or the commit whose flip a query-back
+        // serves — never a later transaction its rows may also reflect. A replay knows its xid, not
+        // the text; work a create handed back knows only its commit's LSN, which the registry
+        // remembers the transaction of.
+        let txid = txid
+            .or_else(|| match &source {
+                EmissionSource::Live { xid, .. } | EmissionSource::Replay { xid, .. } => xid.map(|xid| xid.to_string()),
+                EmissionSource::QueryBack { .. } => None,
+            })
+            .or_else(|| self.commit_txids.get(&commit_lsn).cloned());
         // Phase 3: build + deliver per shape (still under the caller's lock — enqueue order
         // on each stream's FIFO lane is evaluation order).
         let mut results = Vec::with_capacity(staged.len());
         for (shape_id, members) in staged {
-            let Some(shape) = self.shapes.get(&shape_id) else { continue };
             let dels = deletes.remove(&shape_id).unwrap_or_default();
+            let Some(shape) = self.shapes.get_mut(&shape_id) else { continue };
+            if members.is_empty() && dels.is_empty() {
+                results.push((shape_id, false, 0));
+                continue;
+            }
             let net = members.len() as i64 - dels.len() as i64;
+            // Placed here, under the lock that fixes this stream's append order, so the position
+            // an envelope carries can never fall behind one already enqueued ahead of it.
+            let lsn = shape.place(commit_lsn);
             let mut envs = crate::engine::translate_output(
                 ts,
                 members.into_iter().map(|r| (r, 1)).collect(),
                 txid.clone(),
-                None,
+                lsn.clone(),
                 shape.out_cols.as_deref().map(Vec::as_slice),
             );
-            envs.extend(crate::engine::delete_envelopes(ts, dels, txid.clone()));
+            envs.extend(crate::engine::delete_envelopes(ts, dels, txid.clone(), lsn));
             if envs.is_empty() {
                 results.push((shape_id, false, 0));
                 continue;
@@ -2277,7 +2352,9 @@ impl SubqueryRegistry {
 //    emission evaluated at t2 > t1 for the same pk (which would leave the stream's last word
 //    stale — permanent divergence). This is the same guarantee the old
 //    hold-the-lock-across-append design gave, without network under the lock and without a
-//    single-task bottleneck. Postgres round-trips run outside the lock, concurrently.
+//    single-task bottleneck. Postgres round-trips run outside the lock, concurrently. A group
+//    member's stream is shared and its lane orders it by commit, but never one key against this
+//    rule: a key's envelopes land in the order they were enqueued here (`GroupLaneState::order_for`).
 //  * **Per-pk recency across the read**: evaluation order is not freshness order for a query-back,
 //    whose candidate rows were READ before it took the lock. A live outer-row change committed
 //    after that read's snapshot can be evaluated in between, and the query-back would then
@@ -2286,6 +2363,12 @@ impl SubqueryRegistry {
 //    its own snapshot could not see (`SubqueryShape::recent`, `EmissionSource`). Without this the
 //    two invariants above still leave the stream's last word for that pk stale forever — native
 //    consumers fold by durable-stream offset, so an older LSN on the envelope repairs nothing.
+//  * **A position never falls along a stream**: those three make OFFSET order the truth, and a
+//    consumer that orders by `headers.lsn` has to arrive at the same place. A flip's verdict is
+//    evaluated after the commit that caused it, so it can follow a newer live change on its
+//    stream; it is placed at `max(its own commit, the stream's position)`
+//    (`SubqueryShape::position`) and keeps its own `txid`, so that such a consumer never ranks
+//    the stream's last word for a pk below an earlier one.
 
 /// How many times a flip batch's propagation is attempted before the engine gives up on the batch
 /// — and on itself (see [`propagate_with_retry`]).
@@ -5202,6 +5285,7 @@ pub(crate) mod tests {
             feed_id,
             recent: HashMap::new(),
             inflight_querybacks: 0,
+            position: 0,
         });
     }
 
@@ -6163,5 +6247,226 @@ pub(crate) mod tests {
 
         reg.on_table_delta(&ts, &[Tup2(before, -1), Tup2(after, 1)], 1, None, None, None).await.unwrap();
         assert!(envs_for(&store, "shape/materialized").is_empty());
+    }
+
+    // --- envelope positions (`headers.lsn`, `headers.txid`) ------------------------------------
+    //
+    // Every envelope the registry emits is placed: it carries the commit LSN and the transaction id
+    // of the change that caused it. A plain shape's envelopes always were (the ingestor stamps
+    // them); the registry's carried `operation`, `txid` and `commit_ts` only, and a consumer that
+    // orders by position cannot place such an envelope at all.
+    //
+    // Presence is the easy half. A flip's verdict is taken out of commit order, so it can follow a
+    // NEWER live change on the same stream, and at its own commit's LSN it would sit below what the
+    // stream already carries: a consumer that applies a delta only at or above the key's applied
+    // position would discard a correct verdict. So a position never falls along a stream.
+
+    /// `(key, operation, lsn, txid)` of every envelope delivered to one stream path, in append order.
+    fn positions_for(store: &DsStore, path: &str) -> Vec<(String, String, Option<String>, Option<String>)> {
+        store
+            .0
+            .lock()
+            .unwrap()
+            .get(path)
+            .map(|v| {
+                v.iter()
+                    .map(|e| {
+                        (e.key.clone(), e.headers.operation.clone(), e.headers.lsn.clone(), e.headers.txid.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn placed(key: &str, operation: &str, lsn: &str, txid: &str) -> (String, String, Option<String>, Option<String>) {
+        (key.into(), operation.into(), Some(lsn.into()), Some(txid.into()))
+    }
+
+    const MEMBERS: &str = "project_members|project_id|L(user_id,Eq,1)";
+
+    /// A live arrival and a live removal (the key set's own: the stream delivered the row) each
+    /// carry their commit's LSN, spelled as Postgres spells one, and their transaction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_change_carries_its_commits_position() {
+        let (ts, store, mut reg) = recency_fixture().await;
+
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 0x1_0000_0010, Some(700), Some("700".into()), None)
+            .await
+            .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x1_0000_00A0, Some(701), Some("701".into()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            positions_for(&store, "shape/s1"),
+            vec![placed("1", "upsert", "1/10", "700"), placed("1", "delete", "1/A0", "701")]
+        );
+    }
+
+    /// A changes-only feed's removal of a row it never delivered — opened by proof, not by the key
+    /// set — is placed like any other live envelope.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_proven_removal_carries_its_commits_position() {
+        let (ts, store, mut reg, _) = two_week_feeds().await;
+        let (before, after) = (event(&ts, 1, 7, 12, None), event(&ts, 1, 7, 12, Some(99)));
+
+        reg.on_table_delta(&ts, &[Tup2(before, -1), Tup2(after, 1)], 0x30, Some(702), Some("702".into()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(positions_for(&store, "shape/week1"), vec![placed("1", "delete", "0/30", "702")]);
+    }
+
+    /// A change buffered while its shape was being created is replayed at install under the commit
+    /// it arrived with, transaction included: it is that commit's live envelope, delivered late.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_change_carries_the_position_it_was_buffered_under() {
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        reg.set_schemas(Arc::new(creating_schemas()));
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, true).unwrap();
+        let outer = reg.schemas[&TableRef::parse("outer_t").unwrap()].clone();
+        let inner = reg.schemas[&TableRef::parse("inner_t").unwrap()].clone();
+
+        for (lsn, xid, id) in [(0x40u64, 703u64, 5i64), (0x50, 704, 6)] {
+            let delta = [Tup2(id_gid_row(&outer, id, 7), 1)];
+            reg.on_table_delta(&outer, &delta, lsn, Some(xid), Some(xid.to_string()), None).await.unwrap();
+        }
+        assert!(positions_for(&store, "shape/s1").is_empty(), "a pending shape buffers; it emits nothing yet");
+
+        // The inner set holds 7, so both buffered rows are members when the shape is installed.
+        let seeds = begin
+            .seeds
+            .into_iter()
+            .map(|(sig, _, _)| (sig, vec![id_gid_row(&inner, 1, 7)], crate::pg::SnapshotGate::passthrough()))
+            .collect();
+        reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
+
+        assert_eq!(
+            positions_for(&store, "shape/s1"),
+            vec![placed("5", "upsert", "0/40", "703"), placed("6", "upsert", "0/50", "704")]
+        );
+    }
+
+    /// A flip's verdict names the commit that caused it: the triggering transaction's LSN and id,
+    /// however much later its query-back ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flips_verdict_carries_the_commit_that_caused_it() {
+        let (ts, store, mut reg) = recency_fixture().await;
+        let sig: SubquerySig = MEMBERS.into();
+        reg.add_edge(flip_edge(&sig, Dependent::Shape("s1".into()), 1));
+        reg.set_schemas(Arc::new([(TableRef::parse("issues").unwrap(), ts)].into_iter().collect()));
+        reg.fake_candidates =
+            Some(Arc::new(FakeCandidates::with_rows([("issues", vec![issue(1, 100), issue(2, 100)])])));
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+
+        let mut work: VecDeque<(SubquerySig, Flip)> =
+            [(sig, Flip { value: Value::Int(100), dir: FlipDir::Enter })].into_iter().collect();
+        propagate_with_retry(&registry, &mut work, Some("705".into()), Some("0/50".into()), &trace_tx).await.unwrap();
+
+        assert_eq!(
+            positions_for(&store, "shape/s1"),
+            vec![placed("1", "upsert", "0/50", "705"), placed("2", "upsert", "0/50", "705")]
+        );
+    }
+
+    /// **The ordering rule.** Commit 0x50 flips an inner value; before its query-back runs, commit
+    /// 0x60 changes row 1 and its live envelope lands at 0x60. The query-back's verdict for row 1 is
+    /// the later word on the stream and must not be placed below the earlier one: it takes the
+    /// stream's position (0x60) and keeps its own transaction. A later commit is placed at itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flips_verdict_is_never_placed_below_what_its_stream_already_carries() {
+        let (ts, store, mut reg) = recency_fixture().await;
+
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 0x60, Some(706), Some("706".into()), None).await.unwrap();
+        let gate = crate::pg::SnapshotGate::passthrough();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("s1".to_string(), vec![(issue(1, 100), true), (issue(2, 100), true)])],
+            Some("705".into()),
+            EmissionSource::QueryBack { gate: &gate, commit_lsn: 0x50 },
+        )
+        .await
+        .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), -1)], 0x70, Some(707), Some("707".into()), None).await.unwrap();
+
+        assert_eq!(
+            positions_for(&store, "shape/s1"),
+            vec![
+                placed("1", "upsert", "0/60", "706"),
+                placed("1", "upsert", "0/60", "705"),
+                placed("2", "upsert", "0/60", "705"),
+                placed("1", "delete", "0/70", "707"),
+            ]
+        );
+    }
+
+    /// A group stream's order is the group lane's to decide (commit order, and evaluation order
+    /// for one key — `engine::emission`), so a group member's verdict leaves the registry at its
+    /// own commit and the lane places it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_members_verdict_leaves_the_registry_at_its_own_commit() {
+        let ts = issues_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let sig: SubquerySig = MEMBERS.into();
+        insert_test_node(&mut reg, &sig);
+        reg.apply_node_evals(&sig, vec![("pm-1".into(), Some(Value::Int(100)))]).await;
+        insert_changes_only_feed(&mut reg, "group-g", "issues", keyed_membership_pred(100, &sig));
+
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 0x60, Some(706), Some("706".into()), None).await.unwrap();
+        let gate = crate::pg::SnapshotGate::passthrough();
+        reg.emit_for_shapes(
+            &ts,
+            vec![("group-g".to_string(), vec![(issue(1, 100), true)])],
+            Some("705".into()),
+            EmissionSource::QueryBack { gate: &gate, commit_lsn: 0x50 },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            positions_for(&store, "shape/group-g"),
+            vec![placed("1", "upsert", "0/60", "706"), placed("1", "upsert", "0/50", "705")]
+        );
+    }
+
+    /// Work a create hands back (a seed replay's flips, a deferred node re-derivation) reaches the
+    /// emission tail with its commit's LSN but no transaction id in hand. The registry remembers
+    /// the transaction of each commit it ingests, so the verdict still names it. A commit the
+    /// registry never ingested has no transaction to name, and is placed by LSN alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_verdict_handed_no_transaction_names_the_one_its_commit_was_ingested_under() {
+        let (ts, store, mut reg) = recency_fixture().await;
+        // Commit 0x50 reaches the registry (this row is in no shape, so nothing is emitted).
+        reg.on_table_delta(&ts, &[Tup2(issue(9, 999), 1)], 0x50, Some(705), Some("705".into()), None).await.unwrap();
+        assert!(positions_for(&store, "shape/s1").is_empty());
+
+        let gate = crate::pg::SnapshotGate::passthrough();
+        for (commit_lsn, id) in [(0x50, 1), (0x58, 2)] {
+            reg.emit_for_shapes(
+                &ts,
+                vec![("s1".to_string(), vec![(issue(id, 100), true)])],
+                None,
+                EmissionSource::QueryBack { gate: &gate, commit_lsn },
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            positions_for(&store, "shape/s1"),
+            vec![placed("1", "upsert", "0/50", "705"), ("2".into(), "upsert".into(), Some("0/58".into()), None)]
+        );
+    }
+
+    /// With no commit at all — library mode, where no change has an LSN — nothing is stamped: an
+    /// envelope without a position is applied by key, as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_change_with_no_commit_position_is_left_unplaced() {
+        let (ts, store, mut reg) = recency_fixture().await;
+        reg.on_table_delta(&ts, &[Tup2(issue(1, 100), 1)], 0, None, None, None).await.unwrap();
+        assert_eq!(positions_for(&store, "shape/s1"), vec![("1".into(), "upsert".into(), None, None)]);
     }
 }
