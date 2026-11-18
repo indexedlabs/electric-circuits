@@ -106,6 +106,22 @@ pub(crate) fn value_eq_sql(col: &str, value: &Value, pg_type: Option<&str>) -> (
     }
 }
 
+/// Each touched pk's row as it stood BEFORE the delta: its first image, when that image is a
+/// retraction (`-1` — the old half of an update, or a delete). A pk whose first image is an
+/// insertion did not exist before and has no entry. This is the half of the delta
+/// [`latest_rows_by_pk`] folds away, and what proves a row was in a scope until this change.
+pub(crate) fn prior_rows_by_pk(ts: &TableSchema, delta: &[Tup2<Row, ZWeight>]) -> HashMap<String, Row> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut prior = HashMap::new();
+    for Tup2(row, w) in delta {
+        let pk = ts.key_string(row).unwrap_or_default();
+        if seen.insert(pk.clone()) && *w < 0 {
+            prior.insert(pk, row.clone());
+        }
+    }
+    prior
+}
+
 /// Fold a Z-set delta down to each touched pk's **latest** state: the `+1` row if present
 /// (insert/update — the row still exists), else the `-1` row (delete). The `bool` is
 /// "row still exists". This is the front half of every absolute membership evaluation: decide

@@ -735,6 +735,22 @@ sequencer feeds every table's deltas into:
   never-member spurious delete (the PR #30 wake-storm) cannot be emitted at all. Flip
   propagation runs deferred (out of commit order); absolute assertion converges regardless of
   that timing — which is why the Electric-style LSN-buffering/tag protocol isn't needed here.
+- **A `changes_only` feed's second gate** — the key set is what the *stream* delivered, and that
+  is everything the client holds only for a materialized shape, whose set is seeded with its
+  backfill. A `changes_only` feed opens with an empty stream and an empty set while its client
+  holds the rows of a separate snapshot query (§7), and it owes that client every row that later
+  leaves the scope. So for such a feed the gate also opens on **proof that the row was a member
+  just before the change** (`subquery::Prior`): an outer-row change carries the row's old image,
+  and a flip's query-back re-judges each candidate with the flip looked past; both are judged
+  against the inner sets as they stood before the commit, which the registry reconstructs from the
+  transitions that commit has applied (`CommitScope`), and each departure is said once per commit.
+  A row that was never in the scope proves nothing and emits nothing, so the wake-storm property
+  holds. The proof is exact for the causes that meet in one evaluation. It can miss a row with two
+  causes that do not: its membership rests on two inner sets that both drop it in one commit and a
+  later commit reaches the registry before the query-backs run, or the row itself changes in a
+  later commit while a flip that already removed it is still waiting for its query-back. Those
+  rows stay until the client's next snapshot. Only a key set seeded with what the client holds —
+  a materialized shape — is exact. Materialized shapes ignore the proof entirely.
 - **Query-back recency** — absolute assertion makes cross-pk ordering irrelevant, but the *last*
   evaluation of a given pk still has to be the freshest one. A query-back reads its candidates at
   one Postgres snapshot with the registry lock released, so a direct outer-row change committed

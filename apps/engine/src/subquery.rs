@@ -254,6 +254,12 @@ pub struct SubqueryShape {
     pub out_cols: Option<Arc<Vec<usize>>>,
     /// The shape's backfill-snapshot fence; outer deltas already visible to the backfill are skipped.
     pub gate: crate::pg::SnapshotGate,
+    /// A `changes_only` feed: no backfill, so its stream — and its key set — began EMPTY while its
+    /// client holds the rows of a separate snapshot query. For such a feed the key set is not what
+    /// the client holds, and the delete gate also opens on proof that a row was a member just
+    /// before the change ([`Prior`]). A materialized shape's key set is seeded with its backfill
+    /// and is already complete, so it keeps the key set as its only gate.
+    pub changes_only: bool,
     /// Envelopes appended to this shape's stream (backfill + live), for the visualizer's per-node
     /// state. Atomic because the append paths hold `&self`.
     pub emitted: std::sync::atomic::AtomicU64,
@@ -324,6 +330,113 @@ pub(crate) enum EmissionSource<'a> {
     /// Candidates read from Postgres by a query-back, under `gate`'s snapshot. `commit_lsn`
     /// belongs to the triggering flip, not the snapshot: its resulting appends hold that receipt.
     QueryBack { gate: &'a crate::pg::SnapshotGate, commit_lsn: u64 },
+}
+
+/// Inner-set transitions to look past: `sig -> value -> was the value in the set BEFORE the
+/// transition`. A value that left was present before; one that entered was absent. When a value
+/// moves more than once the FIRST transition wins, because that is the state before all of them.
+pub(crate) type Undone = HashMap<SubquerySig, HashMap<Value, bool>>;
+
+fn note_undone(undone: &mut Undone, sig: &SubquerySig, flip: &Flip) {
+    undone.entry(sig.clone()).or_default().entry(flip.value.clone()).or_insert(matches!(flip.dir, FlipDir::Leave));
+}
+
+/// What the caller of [`SubqueryRegistry::emit_for_shapes_with`] can prove about its candidates'
+/// membership **immediately before** the change being evaluated — the second way the delete gate
+/// opens, used only for a [`changes_only`](SubqueryShape::changes_only) feed.
+///
+/// The first way is the feed's key set ([`crate::subq_feed`]): a delete for a pk the stream itself
+/// delivered. A changes-only feed delivered nothing at open, yet its client holds every row a
+/// snapshot query returned, and is owed each one that later leaves the scope. The key set cannot
+/// say which those are. The change itself can: a row that satisfied the predicate just before the
+/// change and does not satisfy it now has left because of it. That is as selective as the key
+/// set — a row that was never in the scope proves nothing and still emits nothing, so a busy
+/// table cannot wake every idle feed on it (the wake storm the gate exists to prevent).
+///
+/// The proof is exact for one cause at a time. What it can miss — and what the next snapshot
+/// repairs, as it repairs everything today — is a row with TWO causes that do not meet in one
+/// evaluation: its membership rests on two inner sets that both drop it in one commit and a later
+/// commit reaches the registry before that commit's query-backs run, or the row itself changes
+/// in a later commit while a flip that already removed it is still waiting for its query-back.
+/// Only a key set seeded with what the client holds — a materialized shape — is exact.
+#[derive(Clone, Copy)]
+pub(crate) enum Prior<'a> {
+    /// Nothing beyond the key set.
+    Unknown,
+    /// An outer-row change: each touched pk's row before this commit (absent: the row did not
+    /// exist). The old row is judged against the inner sets as they stood before the commit.
+    Images(&'a HashMap<String, Row>),
+    /// An inner-set flip's query-back: `value` just left (`left`) or entered node `sig`'s set. The
+    /// candidates are the rows that depend on it; one was a member before the flip iff it
+    /// satisfies the predicate with the flip — and whatever else its commit did to the inner
+    /// sets, while that commit is still the one being ingested — looked past.
+    Flip { sig: &'a SubquerySig, value: &'a Value, left: bool },
+}
+
+impl Prior<'_> {
+    /// Was this candidate a member of `pred` just before the change? `row` is its current image;
+    /// `commit` is what the commit being evaluated has done to the inner sets so far (empty when
+    /// the evaluation belongs to an earlier commit, whose record is gone).
+    fn was_member(
+        &self,
+        pk: &str,
+        row: &Row,
+        pred: &CompiledPredicate,
+        reg: &SubqueryRegistry,
+        commit: &Undone,
+    ) -> bool {
+        match *self {
+            Prior::Unknown => false,
+            Prior::Images(images) => {
+                images.get(pk).is_some_and(|old| pred.matches_ctx(old, &Before { reg, undone: commit, flip: None }))
+            }
+            Prior::Flip { sig, value, left } => {
+                pred.matches_ctx(row, &Before { reg, undone: commit, flip: Some((sig, value, left)) })
+            }
+        }
+    }
+}
+
+/// What the registry remembers about the ONE commit it is ingesting, for [`Prior`]. Replaced when
+/// the next commit's first change arrives, so nothing accumulates across commits; a change with no
+/// LSN (0) keeps nothing.
+#[derive(Default)]
+struct CommitScope {
+    lsn: u64,
+    /// The inner-set transitions the commit has applied so far: what an evaluation looks past to
+    /// see the sets as they stood before the commit.
+    undone: Undone,
+    /// `(feed, pk)` removals a changes-only feed has already emitted for this commit. One commit
+    /// can prove the same departure more than once — an outer-row change and the flip behind it,
+    /// or two flips that each took the row out — and the stream needs to hear it once.
+    removed: HashSet<(i64, String)>,
+}
+
+/// The registry's inner sets as they stood before some transitions (see [`Undone`]): the one
+/// flip being propagated, which decides its own value whatever the commit's record says, then the
+/// rest of that commit's transitions.
+struct Before<'a> {
+    reg: &'a SubqueryRegistry,
+    undone: &'a Undone,
+    flip: Option<(&'a SubquerySig, &'a Value, bool)>,
+}
+
+impl SubqueryEval for Before<'_> {
+    fn contains(&self, sig: &SubquerySig, value: &Value) -> bool {
+        if let Some((flipped, flipped_value, left)) = self.flip
+            && flipped == sig
+            && flipped_value == value
+        {
+            return left;
+        }
+        match self.undone.get(sig).and_then(|values| values.get(value)) {
+            Some(&was_present) => was_present,
+            None => self.reg.contains(sig, value),
+        }
+    }
+    fn has_null(&self, sig: &SubquerySig) -> bool {
+        self.contains(sig, &Value::Null)
+    }
 }
 
 /// One table delta buffered by a mid-create shape (outer table) or a mid-seed node (inner table),
@@ -565,6 +678,8 @@ pub struct SubqueryRegistry {
     /// once, and nodes that return to zero are removed. The registry mutex is held for the phase-A
     /// compile; the log then moves into that create's pending entry before releasing the lock.
     collect_log: Vec<SubquerySig>,
+    /// The commit now being ingested, as [`Prior`] needs it (see [`CommitScope`]).
+    commit: CommitScope,
     ds: DsClient,
     pg_url: Option<String>,
     pg_pool: Option<crate::pg::Pool>,
@@ -658,6 +773,7 @@ impl SubqueryRegistry {
             pending_seed: Vec::new(),
             pending_shapes: Vec::new(),
             collect_log: Vec::new(),
+            commit: CommitScope::default(),
             ds,
             pg_url,
             pg_pool,
@@ -1307,6 +1423,7 @@ impl SubqueryRegistry {
             pred: pending.pred.clone(),
             out_cols: pending.out_cols.clone(),
             gate: outer_gate,
+            changes_only: pending.changes_only,
             emitted: std::sync::atomic::AtomicU64::new(seeded),
             feed_id,
             recent: HashMap::new(),
@@ -1545,6 +1662,10 @@ impl SubqueryRegistry {
         mut trace: Option<&mut Vec<crate::trace::TraceHop>>,
     ) -> Result<VecDeque<(SubquerySig, Flip)>> {
         let table = ts.table.clone();
+        // A new commit: the transitions kept for the previous one are no longer "this commit's".
+        if lsn == 0 || self.commit.lsn != lsn {
+            self.commit = CommitScope { lsn, ..CommitScope::default() };
+        }
         // Work queue of (node sig, flip) pairs to propagate (BFS up the dependency DAG).
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         // Trace helper: record a hop once per node id (a shape reached via several flips is one hop).
@@ -1590,6 +1711,11 @@ impl SubqueryRegistry {
             asserts.contributors.extend(self.template_assertions(tkey, evals, lsn, xid));
         }
         let flips = self.apply_asserts(asserts).await;
+        if lsn != 0 {
+            for (sig, flip) in &flips {
+                note_undone(&mut self.commit.undone, sig, flip);
+            }
+        }
         for sig in live_sigs {
             let flipped = flips.iter().any(|(s, _)| s == &sig);
             hop(&mut trace, format!("node:{sig}"), if flipped { "passed" } else { "dropped" });
@@ -1623,8 +1749,16 @@ impl SubqueryRegistry {
         // This is the freshest verdict any path can have for these pks: it is derived from the
         // commit itself. `EmissionSource::Live` carries that commit's stamp so a query-back
         // already reading Postgres cannot later overwrite the decision with an older row.
-        for (id, emitted, _net) in
-            self.emit_for_shapes(ts, groups, txid.clone(), EmissionSource::Live { lsn, xid }).await?
+        //
+        // The delta also carries each row's image BEFORE the commit, which is the proof a
+        // changes-only feed needs to remove a row it never delivered (see [`Prior`]). The old
+        // image is judged against the inner sets as they stood before this commit, so a commit
+        // that first withdraws a row's inner value and then changes the row still removes it.
+        let images =
+            if groups.is_empty() { HashMap::new() } else { crate::engine::membership::prior_rows_by_pk(ts, delta) };
+        for (id, emitted, _net) in self
+            .emit_for_shapes_with(ts, groups, txid.clone(), EmissionSource::Live { lsn, xid }, Prior::Images(&images))
+            .await?
         {
             hop(&mut trace, format!("shape:{id}"), if emitted { "passed" } else { "dropped" });
         }
@@ -1954,6 +2088,21 @@ impl SubqueryRegistry {
         txid: Option<String>,
         source: EmissionSource<'_>,
     ) -> Result<Vec<(String, bool, i64)>> {
+        self.emit_for_shapes_with(ts, groups, txid, source, Prior::Unknown).await
+    }
+
+    /// [`emit_for_shapes`](Self::emit_for_shapes) with what the caller can prove about the
+    /// candidates' membership just before this change. For a `changes_only` feed a non-member
+    /// candidate is deleted when the key set held it **or** `prior` shows it was a member; every
+    /// other shape ignores `prior` and gates on the key set alone, as before.
+    async fn emit_for_shapes_with(
+        &mut self,
+        ts: &TableSchema,
+        groups: Vec<(String, Vec<(Row, bool)>)>,
+        txid: Option<String>,
+        source: EmissionSource<'_>,
+        prior: Prior<'_>,
+    ) -> Result<Vec<(String, bool, i64)>> {
         // Phase 1: evaluate each candidate against the current membership snapshot and, in the
         // SAME synchronous step (no `.await`), transition the host-side FeedSet — building the
         // member upserts and the gated deletes. A delete is emitted for a shape's pk **iff**
@@ -1969,6 +2118,14 @@ impl SubqueryRegistry {
             EmissionSource::Live { lsn, .. } | EmissionSource::Replay { lsn, .. } => *lsn,
             EmissionSource::QueryBack { commit_lsn, .. } => *commit_lsn,
         };
+        // Whether this evaluation belongs to the commit the registry is ingesting (see
+        // [`CommitScope`]): only then can it share that commit's record of removals already said.
+        let same_commit = commit_lsn != 0 && self.commit.lsn == commit_lsn;
+        // That commit's inner-set transitions, lent to the proof for the synchronous evaluation
+        // below and put back before anything awaits. Moved out and back, never copied: a commit
+        // can hold thousands of flips, and each reaches hundreds of shapes.
+        let lent = (same_commit && !matches!(prior, Prior::Unknown)).then(|| std::mem::take(&mut self.commit.undone));
+        let no_record = Undone::new();
         // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
         // query-back, which reads this map instead of writing it.
         let live_stamp: Option<(u64, Option<u64>)> = match &source {
@@ -1978,6 +2135,8 @@ impl SubqueryRegistry {
         for (shape_id, candidates) in groups {
             let Some(shape) = self.shapes.get(&shape_id) else { continue };
             let (pred, feed_id) = (shape.pred.clone(), shape.feed_id);
+            let changes_only = shape.changes_only;
+            let prior = if changes_only { prior } else { Prior::Unknown };
             // Recency is only worth recording while some query-back for THIS shape is between its
             // Postgres read and its evaluation; outside that window there is no older read that
             // could overwrite this decision, so the map stays empty (and no pk id is minted for a
@@ -2022,29 +2181,42 @@ impl SubqueryRegistry {
                     // Current member: deliver the upsert and record presence in the feed.
                     let pk_id = self.pk_dict.get_or_insert(&pk);
                     self.feed_sets.insert(feed_id, pk_id);
+                    if same_commit && !self.commit.removed.is_empty() {
+                        // Back in the scope: a later departure in this commit is news again.
+                        self.commit.removed.remove(&(feed_id, pk.clone()));
+                    }
                     if record_recency {
                         evaluated.push(pk_id);
                     }
                     members.push(row);
                 } else {
-                    // Non-member. The delete is emitted only if the pk was actually in the feed;
-                    // the dictionary is probed WITHOUT minting — a never-interned pk can never
-                    // have been a member, so it gates with no id allocated (the same
-                    // probe-without-mint rationale as `template_assertions`).
-                    if let Some(pk_id) = self.pk_dict.get(&pk) {
-                        if self.feed_sets.remove(feed_id, pk_id) {
-                            deletes.entry(shape_id.clone()).or_default().push(pk);
+                    // Non-member. The delete is emitted if the pk was actually in the feed; the
+                    // dictionary is probed WITHOUT minting — a never-interned pk can never have
+                    // been delivered, so it gates with no id allocated (the same
+                    // probe-without-mint rationale as `template_assertions`). The key set is
+                    // retracted FIRST and unconditionally, so it never keeps a pk the stream has
+                    // been told is gone.
+                    let pk_id = self.pk_dict.get(&pk);
+                    let delivered = pk_id.is_some_and(|pk_id| self.feed_sets.remove(feed_id, pk_id));
+                    // A changes-only feed also owes the delete for a row it never delivered but
+                    // its client holds from the snapshot: the row was a member until this change.
+                    let proven =
+                        !delivered && prior.was_member(&pk, &row, &pred, self, lent.as_ref().unwrap_or(&no_record));
+                    if delivered || proven {
+                        // Said once per commit, however many of the commit's changes prove it. A
+                        // key-set retraction is never held back: it is the stream's own record.
+                        let first = !(changes_only && same_commit) || self.commit.removed.insert((feed_id, pk.clone()));
+                        if delivered || first {
+                            deletes.entry(shape_id.clone()).or_default().push(pk.clone());
                         }
-                        if record_recency {
-                            evaluated.push(pk_id);
-                        }
-                    } else if record_recency {
-                        // A never-interned non-member emits nothing — and still has to win over a
-                        // query-back holding an older row for this pk, which WOULD emit an upsert
-                        // (the empty-shape row-moved-away case). Recording it needs an id, so this
-                        // is the one place a non-member mints one; it is bounded by the pks a live
-                        // commit touches while a query-back is in flight.
-                        evaluated.push(self.pk_dict.get_or_insert(&pk));
+                    }
+                    if record_recency {
+                        // A never-interned non-member still has to win over a query-back holding
+                        // an older row for this pk, which WOULD emit an upsert (the empty-shape
+                        // row-moved-away case). Recording it needs an id, so this is the one place
+                        // a non-member mints one; it is bounded by the pks a live commit touches
+                        // while a query-back is in flight.
+                        evaluated.push(pk_id.unwrap_or_else(|| self.pk_dict.get_or_insert(&pk)));
                     }
                 }
             }
@@ -2054,6 +2226,9 @@ impl SubqueryRegistry {
                 }
             }
             staged.push((shape_id, members));
+        }
+        if let Some(undone) = lent {
+            self.commit.undone = undone;
         }
         // Phase 3: build + deliver per shape (still under the caller's lock — enqueue order
         // on each stream's FIFO lane is evaluation order).
@@ -2364,7 +2539,7 @@ async fn propagate_one(
     // FALSE < UNKNOWN < TRUE), so skip. The full reads are shared per table, like a value flip's.
     if matches!(flip.value, Value::Null) {
         let (shapes, parents) = null_sensitive_dependents(edges);
-        requery_and_move_shapes(registry, &shapes, None, txid.clone(), commit_lsn).await?;
+        requery_and_move_shapes(registry, &shapes, None, Some((sig, flip)), txid.clone(), commit_lsn).await?;
         for (parent_sig, _inner, flips) in requery_and_reconcile_parents(registry, &parents, None, commit_lsn).await? {
             for f in flips {
                 work.push_back((parent_sig.clone(), f));
@@ -2374,7 +2549,15 @@ async fn propagate_one(
     }
     let (shapes, parents) = group_dependents_by_column(edges);
     for (col, ids) in shapes {
-        let moved = requery_and_move_shapes(registry, &ids, Some((col, &flip.value)), txid.clone(), commit_lsn).await?;
+        let moved = requery_and_move_shapes(
+            registry,
+            &ids,
+            Some((col, &flip.value)),
+            Some((sig, flip)),
+            txid.clone(),
+            commit_lsn,
+        )
+        .await?;
         // Light the whole path only for the shapes that actually moved rows: source `table:<t>` →
         // the flipped `node:<sig>` → that `shape:<id>`.
         let Some(src) = source_table.as_ref() else { continue };
@@ -2482,10 +2665,15 @@ fn null_sensitive_dependents(edges: Vec<Edge>) -> (Vec<String>, Vec<SubquerySig>
 /// instead, and a shape that vanished is skipped. The shared body of every flip-driven shape path,
 /// as [`requery_and_reconcile_parents`] is for parent nodes: the fetch differs, the evaluation and
 /// emission never do.
+///
+/// `cause` is the flip being propagated, when there is one (deferred work replayed at install has
+/// none): it is what lets a changes-only feed remove a row it never delivered — the row was a
+/// member until this flip iff it satisfies the predicate with the flip looked past (see [`Prior`]).
 async fn requery_and_move_shapes(
     registry: &tokio::sync::Mutex<SubqueryRegistry>,
     shape_ids: &[String],
     filter: Option<(usize, &Value)>,
+    cause: Option<(&SubquerySig, &Flip)>,
     txid: Option<String>,
     commit_lsn: u64,
 ) -> Result<Vec<(String, TableRef, i64)>> {
@@ -2566,12 +2754,21 @@ async fn requery_and_move_shapes(
         let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
         for (k, shape_id) in ids.iter().enumerate() {
             let mut reg = registry.lock().await;
+            // The proof a changes-only feed needs: the flip itself. The emission tail adds whatever
+            // else the flip's commit did to the inner sets, while that commit is still the one
+            // being ingested, so a row whose membership rested on two of them is still seen to
+            // have been a member.
+            let prior = match cause {
+                Some((sig, flip)) => Prior::Flip { sig, value: &flip.value, left: matches!(flip.dir, FlipDir::Leave) },
+                None => Prior::Unknown,
+            };
             let emitted = reg
-                .emit_for_shapes(
+                .emit_for_shapes_with(
                     ts,
                     vec![(shape_id.clone(), candidates.clone())],
                     txid.clone(),
                     EmissionSource::QueryBack { gate: &gate, commit_lsn },
+                    prior,
                 )
                 .await;
             reg.end_queryback(shape_id);
@@ -2609,7 +2806,7 @@ async fn move_shape_for_value(
 ) -> Result<Option<(TableRef, i64)>> {
     let shape_ids = [shape_id.to_string()];
     let mut moved =
-        requery_and_move_shapes(registry, &shape_ids, Some((connecting_col, value)), txid, commit_lsn).await?;
+        requery_and_move_shapes(registry, &shape_ids, Some((connecting_col, value)), None, txid, commit_lsn).await?;
     Ok(moved.pop().map(|(_, table, net)| (table, net)))
 }
 
@@ -2740,7 +2937,7 @@ async fn rederive_shape(
     commit_lsn: u64,
 ) -> Result<()> {
     let shape_ids = [shape_id.to_string()];
-    requery_and_move_shapes(registry, &shape_ids, None, txid, commit_lsn).await.map(|_| ())
+    requery_and_move_shapes(registry, &shape_ids, None, None, txid, commit_lsn).await.map(|_| ())
 }
 
 // Candidate-row resolution (arrangement snapshot → pooled Postgres fallback) is the shared
@@ -4970,6 +5167,27 @@ pub(crate) mod tests {
         outer_table: &str,
         pred: CompiledPredicate,
     ) {
+        install_outer_shape(reg, shape_id, outer_table, pred, false);
+    }
+
+    /// [`insert_outer_shape`] for a `changes_only` feed, exactly as its create installs it: a
+    /// passthrough gate, nothing emitted, an empty key set.
+    pub(crate) fn insert_changes_only_feed(
+        reg: &mut SubqueryRegistry,
+        shape_id: &str,
+        outer_table: &str,
+        pred: CompiledPredicate,
+    ) {
+        install_outer_shape(reg, shape_id, outer_table, pred, true);
+    }
+
+    fn install_outer_shape(
+        reg: &mut SubqueryRegistry,
+        shape_id: &str,
+        outer_table: &str,
+        pred: CompiledPredicate,
+        changes_only: bool,
+    ) {
         let feed_id = reg.next_feed_id;
         reg.next_feed_id += 1;
         reg.install_shape(SubqueryShape {
@@ -4979,6 +5197,7 @@ pub(crate) mod tests {
             pred: Arc::new(pred),
             out_cols: None,
             gate: crate::pg::SnapshotGate::passthrough(),
+            changes_only,
             emitted: std::sync::atomic::AtomicU64::new(0),
             feed_id,
             recent: HashMap::new(),
@@ -5527,5 +5746,422 @@ pub(crate) mod tests {
         assert!(reg.has_null(&sig));
         // unknown sig -> empty
         assert!(!reg.contains(&"other".to_string(), &Value::Int(1)));
+    }
+
+    // --- changes-only feeds: removals of rows the feed never delivered -------------------------
+    //
+    // A native subset load is two requests: a changes-only feed (`POST /v1/subset-feeds`) and a
+    // snapshot query. The feed skips its backfill, so `finish_create` installs it with no seeded
+    // pks and its key set starts EMPTY — while the client holds every row the snapshot returned.
+    // The feed still owes that client each row that leaves the scope after it opened. Opening the
+    // delete gate only for a pk the feed itself delivered drops every one of them. Observed
+    // against the gateway on 2026-11-16: 10 soft-deleted events and 12 re-dated Records stayed on
+    // the client, in the events' own scope and in the two scopes that reach a Record's date
+    // through a subquery, and the streams carried upserts only.
+    //
+    // `insert_changes_only_feed` installs a shape exactly as a changes-only create does: a
+    // passthrough gate, nothing emitted, an empty key set.
+
+    /// `events(id, record_id, starts, deleted_at)`: an app calendar scope in miniature — a window
+    /// on a row-local column, a soft-delete column, and an access check that is a subquery.
+    fn events_ts() -> TableSchema {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": {
+                "id": {"type":"int"}, "record_id": {"type":"int"}, "starts": {"type":"int"},
+                "deleted_at": {"type":"int"}
+            },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        TableSchema::from_def(&TableRef::from("events"), &def).unwrap()
+    }
+
+    fn event(ts: &TableSchema, id: i64, record_id: i64, starts: i64, deleted_at: Option<i64>) -> Row {
+        ts.row_from_json(
+            serde_json::json!({"id": id, "record_id": record_id, "starts": starts, "deleted_at": deleted_at})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// `starts >= lo AND starts < hi AND deleted_at IS NULL AND record_id IN <visible records>`.
+    fn window_pred(ts: &TableSchema, lo: i64, hi: i64, visible: &SubquerySig) -> CompiledPredicate {
+        use crate::predicate::LeafOp;
+        let starts = ts.column_index("starts").unwrap();
+        CompiledPredicate::And(vec![
+            CompiledPredicate::Cmp { col: starts, op: LeafOp::Gte, value: Value::Int(lo) },
+            CompiledPredicate::Cmp { col: starts, op: LeafOp::Lt, value: Value::Int(hi) },
+            CompiledPredicate::IsNull { col: ts.column_index("deleted_at").unwrap(), is_null: true },
+            CompiledPredicate::InSubquery {
+                col: ts.column_index("record_id").unwrap(),
+                sig: visible.clone(),
+                negated: false,
+            },
+        ])
+    }
+
+    /// Two changes-only feeds over `events` — week one `[10, 20)` and week two `[20, 30)` — for a
+    /// caller who can see Records 7 and 8. Neither feed has delivered anything.
+    async fn two_week_feeds() -> (TableSchema, DsStore, SubqueryRegistry, SubquerySig) {
+        let ts = events_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let visible: SubquerySig = "visible_records".into();
+        insert_test_node(&mut reg, &visible);
+        reg.apply_node_evals(
+            &visible,
+            vec![("grant-7".into(), Some(Value::Int(7))), ("grant-8".into(), Some(Value::Int(8)))],
+        )
+        .await;
+        let record_col = ts.column_index("record_id").unwrap();
+        for (id, lo, hi) in [("week1", 10, 20), ("week2", 20, 30)] {
+            insert_changes_only_feed(&mut reg, id, "events", window_pred(&ts, lo, hi, &visible));
+            reg.add_edge(flip_edge(&visible, Dependent::Shape(id.to_string()), record_col));
+        }
+        reg.set_schemas(Arc::new([(TableRef::from("events"), ts.clone())].into_iter().collect()));
+        (ts, store, reg, visible)
+    }
+
+    fn envelope_of(ts: &TableSchema, row: &Row, operation: &str) -> (String, String, String) {
+        (TableRef::from("events").to_string(), ts.key_string(row).unwrap(), operation.to_string())
+    }
+
+    /// Soft delete: the row is still in Postgres, and its own `deleted_at` takes it out of the
+    /// scope. The client has it from the snapshot; the feed has never sent it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_that_is_soft_deleted() {
+        let (ts, store, mut reg, _) = two_week_feeds().await;
+        let (before, after) = (event(&ts, 1, 7, 12, None), event(&ts, 1, 7, 12, Some(99)));
+
+        reg.on_table_delta(&ts, &[Tup2(before.clone(), -1), Tup2(after.clone(), 1)], 1, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            envs_for(&store, "shape/week1"),
+            vec![envelope_of(&ts, &before, "delete")],
+            "the row was in week one until this commit, so the feed owes its removal"
+        );
+        assert!(envs_for(&store, "shape/week2").is_empty(), "week two never held it");
+
+        // A later change to the already-removed row says nothing more.
+        reg.on_table_delta(&ts, &[Tup2(after, -1), Tup2(event(&ts, 1, 7, 13, Some(99)), 1)], 2, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(envs_for(&store, "shape/week1").len(), 1, "one removal, not one per later change");
+    }
+
+    /// A re-dated row leaves one week and enters the next: the removal and the arrival both land.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_that_moves_to_another_window() {
+        let (ts, store, mut reg, _) = two_week_feeds().await;
+        let (before, after) = (event(&ts, 1, 7, 12, None), event(&ts, 1, 7, 22, None));
+
+        reg.on_table_delta(&ts, &[Tup2(before.clone(), -1), Tup2(after.clone(), 1)], 1, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(envs_for(&store, "shape/week1"), vec![envelope_of(&ts, &before, "delete")], "it left week one");
+        assert_eq!(envs_for(&store, "shape/week2"), vec![envelope_of(&ts, &after, "upsert")], "and entered week two");
+    }
+
+    /// A hard delete carries only the row's old image.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_that_is_deleted() {
+        let (ts, store, mut reg, _) = two_week_feeds().await;
+        let row = event(&ts, 1, 7, 12, None);
+
+        reg.on_table_delta(&ts, &[Tup2(row.clone(), -1)], 1, None, None, None).await.unwrap();
+        assert_eq!(envs_for(&store, "shape/week1"), vec![envelope_of(&ts, &row, "delete")]);
+        assert!(envs_for(&store, "shape/week2").is_empty());
+    }
+
+    /// The row itself is untouched: the caller loses access to Record 7, so the value leaves the
+    /// inner set and the flip's query-back finds the rows that depended on it. Each one that was
+    /// in a scope until this flip is removed from that scope — and nothing else is: not the
+    /// soft-deleted row, not the row outside both windows, not the rows of Record 8.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_snapshot_rows_when_their_access_is_withdrawn() {
+        let (ts, store, mut reg, visible) = two_week_feeds().await;
+        let in_week1 = event(&ts, 1, 7, 12, None);
+        let in_week2 = event(&ts, 2, 7, 22, None);
+        let fake = Arc::new(FakeCandidates::with_rows([(
+            "events",
+            vec![
+                in_week1.clone(),
+                in_week2.clone(),
+                event(&ts, 3, 7, 12, Some(99)), // Record 7, week one, already soft-deleted
+                event(&ts, 4, 8, 13, None),     // Record 8: still visible
+                event(&ts, 5, 7, 40, None),     // Record 7, outside both windows
+            ],
+        )]));
+        reg.fake_candidates = Some(fake.clone());
+
+        let flips = reg.apply_node_evals(&visible, vec![("grant-7".into(), None)]).await;
+        assert_eq!(flips, vec![Flip { value: Value::Int(7), dir: FlipDir::Leave }]);
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut work: VecDeque<(SubquerySig, Flip)> = flips.into_iter().map(|f| (visible.clone(), f)).collect();
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        assert_eq!(envs_for(&store, "shape/week1"), vec![envelope_of(&ts, &in_week1, "delete")]);
+        assert_eq!(envs_for(&store, "shape/week2"), vec![envelope_of(&ts, &in_week2, "delete")]);
+    }
+
+    /// The same through a `NOT IN`: there a value ENTERING the inner set is what takes rows out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_snapshot_rows_when_a_not_in_set_gains_their_value() {
+        let ts = events_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let hidden: SubquerySig = "hidden_records".into();
+        insert_test_node(&mut reg, &hidden);
+        let record_col = ts.column_index("record_id").unwrap();
+        insert_changes_only_feed(
+            &mut reg,
+            "unhidden",
+            "events",
+            CompiledPredicate::InSubquery { col: record_col, sig: hidden.clone(), negated: true },
+        );
+        reg.add_edge(null_sensitive_edge(&hidden, Dependent::Shape("unhidden".into()), record_col));
+        reg.set_schemas(Arc::new([(TableRef::from("events"), ts.clone())].into_iter().collect()));
+        let (leaving, staying) = (event(&ts, 1, 7, 12, None), event(&ts, 2, 8, 12, None));
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![leaving.clone(), staying])])));
+
+        let flips = reg.apply_node_evals(&hidden, vec![("hide-7".into(), Some(Value::Int(7)))]).await;
+        assert_eq!(flips, vec![Flip { value: Value::Int(7), dir: FlipDir::Enter }]);
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut work: VecDeque<(SubquerySig, Flip)> = flips.into_iter().map(|f| (hidden.clone(), f)).collect();
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        assert_eq!(envs_for(&store, "shape/unhidden"), vec![envelope_of(&ts, &leaving, "delete")]);
+    }
+
+    /// The other half of the gate, which must keep holding: a row that was NOT in a scope just
+    /// before the change gets no delete there, however it changes. This is what stops one busy
+    /// table from waking every idle feed on it (the wake storm the gate exists for).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_sends_nothing_for_rows_that_were_not_in_its_scope() {
+        let (ts, store, mut reg, visible) = two_week_feeds().await;
+        let mut lsn = 0;
+        for (before, after) in [
+            // Outside both windows, before and after.
+            (Some(event(&ts, 1, 7, 40, None)), Some(event(&ts, 1, 7, 41, None))),
+            // In week one's window, but a Record the caller cannot see.
+            (Some(event(&ts, 2, 9, 12, None)), Some(event(&ts, 2, 9, 12, Some(99)))),
+            // Already soft-deleted, then edited and finally deleted.
+            (Some(event(&ts, 3, 7, 12, Some(50))), Some(event(&ts, 3, 7, 13, Some(50)))),
+            (Some(event(&ts, 3, 7, 13, Some(50))), None),
+            // An insert that matches nothing.
+            (None, Some(event(&ts, 4, 7, 99, None))),
+        ] {
+            lsn += 1;
+            let delta: Vec<Tup2<Row, ZWeight>> =
+                before.into_iter().map(|r| Tup2(r, -1)).chain(after.into_iter().map(|r| Tup2(r, 1))).collect();
+            reg.on_table_delta(&ts, &delta, lsn, None, None, None).await.unwrap();
+        }
+        // The caller gains a Record with no rows in either window, and loses one it never had.
+        reg.fake_candidates =
+            Some(Arc::new(FakeCandidates::with_rows([("events", vec![event(&ts, 2, 9, 12, Some(99))])])));
+        let mut flips = reg.apply_node_evals(&visible, vec![("grant-9".into(), Some(Value::Int(9)))]).await;
+        flips.extend(reg.apply_node_evals(&visible, vec![("grant-9".into(), None)]).await);
+        let registry = tokio::sync::Mutex::new(reg);
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut work: VecDeque<(SubquerySig, Flip)> = flips.into_iter().map(|f| (visible.clone(), f)).collect();
+        propagate_with_retry(&registry, &mut work, None, None, &trace_tx).await.unwrap();
+
+        for week in ["week1", "week2"] {
+            assert!(
+                envs_for(&store, &format!("shape/{week}")).is_empty(),
+                "{week} must stay silent, got {:?}",
+                envs_for(&store, &format!("shape/{week}"))
+            );
+        }
+    }
+
+    /// A row the feed DID deliver is removed exactly once, by whichever rule sees it first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_delivered_row_exactly_once() {
+        let (ts, store, mut reg, _) = two_week_feeds().await;
+        let (live, gone) = (event(&ts, 1, 7, 12, None), event(&ts, 1, 7, 12, Some(99)));
+
+        reg.on_table_delta(&ts, &[Tup2(live.clone(), 1)], 1, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(live.clone(), -1), Tup2(gone.clone(), 1)], 2, None, None, None).await.unwrap();
+        reg.on_table_delta(&ts, &[Tup2(gone, -1)], 3, None, None, None).await.unwrap();
+        assert_eq!(
+            envs_for(&store, "shape/week1"),
+            vec![envelope_of(&ts, &live, "upsert"), envelope_of(&ts, &live, "delete")]
+        );
+    }
+
+    // The cases above have one cause each. A transaction often has two: the app removes a Record's
+    // date row and soft-deletes the Record, or withdraws a grant and a schedule together. Each
+    // change is then judged against inner sets the SAME commit has already moved, so the proof has
+    // to look past all of that commit's transitions — and the removal must still be said once.
+
+    /// `grants(id, gid)` / `schedule(id, gid)`: inner tables whose `gid` is a Record id. Their
+    /// nodes are driven through `on_table_delta`, as replication drives them.
+    fn record_link(ts: &TableSchema, id: i64, record_id: i64) -> Row {
+        id_gid_row(ts, id, record_id)
+    }
+
+    /// One changes-only feed over `events` whose rows need BOTH a grant and a schedule entry for
+    /// their Record: `record_id IN <granted> AND record_id IN <scheduled>`. Record 7 has both.
+    async fn granted_and_scheduled_feed()
+    -> (TableSchema, TableSchema, TableSchema, DsStore, SubqueryRegistry, SubquerySig, SubquerySig) {
+        let events = events_ts();
+        let (grants, schedule) = (id_gid_ts("grants"), id_gid_ts("schedule"));
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let (granted, scheduled): (SubquerySig, SubquerySig) = ("granted".into(), "scheduled".into());
+        let gid = grants.column_index("gid").unwrap();
+        insert_test_node_on(&mut reg, &granted, "grants", gid);
+        insert_test_node_on(&mut reg, &scheduled, "schedule", gid);
+        let record_col = events.column_index("record_id").unwrap();
+        insert_changes_only_feed(
+            &mut reg,
+            "feed",
+            "events",
+            CompiledPredicate::And(vec![
+                CompiledPredicate::InSubquery { col: record_col, sig: granted.clone(), negated: false },
+                CompiledPredicate::InSubquery { col: record_col, sig: scheduled.clone(), negated: false },
+            ]),
+        );
+        for sig in [&granted, &scheduled] {
+            reg.add_edge(flip_edge(sig, Dependent::Shape("feed".into()), record_col));
+        }
+        reg.set_schemas(Arc::new(
+            [("events", events.clone()), ("grants", grants.clone()), ("schedule", schedule.clone())]
+                .into_iter()
+                .map(|(name, ts)| (TableRef::from(name), ts))
+                .collect(),
+        ));
+        reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 1, 7), 1)], 1, None, None, None).await.unwrap();
+        reg.on_table_delta(&schedule, &[Tup2(record_link(&schedule, 1, 7), 1)], 2, None, None, None).await.unwrap();
+        assert!(envs_for(&store, "shape/feed").is_empty(), "setup delivers nothing: no outer row has changed");
+        (events, grants, schedule, store, reg, granted, scheduled)
+    }
+
+    async fn propagate(
+        registry: &tokio::sync::Mutex<SubqueryRegistry>,
+        work: VecDeque<(SubquerySig, Flip)>,
+        lsn: &str,
+    ) {
+        let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
+        let mut work = work;
+        propagate_with_retry(registry, &mut work, None, Some(lsn.to_string()), &trace_tx).await.unwrap();
+    }
+
+    /// One commit withdraws the grant and THEN edits the event. By the time the event's change is
+    /// evaluated the grant is already gone, so its old image only counts as a member if the
+    /// commit's own transition is looked past. The flip's query-back can prove the same departure
+    /// a second time, and must not say it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_changed_after_its_inner_value_left_in_the_same_commit() {
+        let (events, grants, _, store, mut reg, _, _) = granted_and_scheduled_feed().await;
+        let (before, after) = (event(&events, 1, 7, 12, None), event(&events, 1, 7, 13, None));
+
+        let work =
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 1, 7), -1)], 0x10, None, None, None).await.unwrap();
+        assert_eq!(work.len(), 1, "the grant's withdrawal flips Record 7 out of the granted set");
+        reg.on_table_delta(&events, &[Tup2(before.clone(), -1), Tup2(after.clone(), 1)], 0x10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(envs_for(&store, "shape/feed"), vec![envelope_of(&events, &before, "delete")]);
+
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![after])])));
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+        assert_eq!(envs_for(&store, "shape/feed").len(), 1, "the flip's query-back must not repeat the removal");
+    }
+
+    /// One commit withdraws the grant AND the schedule entry; the event row is untouched. Either
+    /// flip alone, looked past on its own, still finds the other set without Record 7 — only the
+    /// commit's transitions together show the row was a member. Two flips, one removal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_once_when_one_commit_empties_both_inner_sets() {
+        let (events, grants, schedule, store, mut reg, _, _) = granted_and_scheduled_feed().await;
+        let row = event(&events, 1, 7, 12, None);
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![row.clone()])])));
+
+        let mut work =
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 1, 7), -1)], 0x10, None, None, None).await.unwrap();
+        work.extend(
+            reg.on_table_delta(&schedule, &[Tup2(record_link(&schedule, 1, 7), -1)], 0x10, None, None, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(work.len(), 2, "both inner sets lose Record 7");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+
+        assert_eq!(envs_for(&store, "shape/feed"), vec![envelope_of(&events, &row, "delete")]);
+    }
+
+    /// A row the feed DID deliver, in a commit that withdraws its grant and then renames it: the
+    /// key set removes it at the rename, and the flip's query-back — which can also prove the row
+    /// was a member before the commit — must not say so again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_delivered_row_once_when_its_commit_proves_it_twice() {
+        let (events, grants, _, store, mut reg, _, _) = granted_and_scheduled_feed().await;
+        let (delivered, renamed) = (event(&events, 1, 7, 12, None), event(&events, 1, 7, 13, None));
+        reg.on_table_delta(&events, &[Tup2(delivered.clone(), 1)], 3, None, None, None).await.unwrap();
+
+        let work =
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 1, 7), -1)], 0x10, None, None, None).await.unwrap();
+        reg.on_table_delta(&events, &[Tup2(delivered.clone(), -1), Tup2(renamed.clone(), 1)], 0x10, None, None, None)
+            .await
+            .unwrap();
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![renamed])])));
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+
+        assert_eq!(
+            envs_for(&store, "shape/feed"),
+            vec![envelope_of(&events, &delivered, "upsert"), envelope_of(&events, &delivered, "delete")]
+        );
+    }
+
+    /// The commit's record ends with the commit: the next one starts clean, so a row that comes
+    /// back and leaves again in a later commit is removed again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_row_again_after_it_returns_in_a_later_commit() {
+        let (ts, store, mut reg, _) = two_week_feeds().await;
+        let (inside, outside) = (event(&ts, 1, 7, 12, None), event(&ts, 1, 7, 40, None));
+
+        reg.on_table_delta(&ts, &[Tup2(inside.clone(), -1), Tup2(outside.clone(), 1)], 0x10, None, None, None)
+            .await
+            .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(outside.clone(), -1), Tup2(inside.clone(), 1)], 0x20, None, None, None)
+            .await
+            .unwrap();
+        reg.on_table_delta(&ts, &[Tup2(inside.clone(), -1), Tup2(outside, 1)], 0x30, None, None, None).await.unwrap();
+        assert_eq!(
+            envs_for(&store, "shape/week1"),
+            vec![
+                envelope_of(&ts, &inside, "delete"),
+                envelope_of(&ts, &inside, "upsert"),
+                envelope_of(&ts, &inside, "delete"),
+            ]
+        );
+    }
+
+    /// A materialized shape is untouched by all of this: its key set, seeded with the backfill, is
+    /// already what its client holds, so a row it never held still gets no delete — exactly the
+    /// existing gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_materialized_shape_still_gates_on_its_key_set_alone() {
+        let ts = events_ts();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        let visible: SubquerySig = "visible_records".into();
+        insert_test_node(&mut reg, &visible);
+        reg.apply_node_evals(&visible, vec![("grant-7".into(), Some(Value::Int(7)))]).await;
+        insert_outer_shape(&mut reg, "materialized", "events", window_pred(&ts, 10, 20, &visible));
+        let (before, after) = (event(&ts, 1, 7, 12, None), event(&ts, 1, 7, 12, Some(99)));
+
+        reg.on_table_delta(&ts, &[Tup2(before, -1), Tup2(after, 1)], 1, None, None, None).await.unwrap();
+        assert!(envs_for(&store, "shape/materialized").is_empty());
     }
 }
