@@ -374,10 +374,6 @@ pub(crate) enum EmissionSource<'a> {
 /// moves more than once the FIRST transition wins, because that is the state before all of them.
 pub(crate) type Undone = HashMap<SubquerySig, HashMap<Value, bool>>;
 
-fn note_undone(undone: &mut Undone, sig: &SubquerySig, flip: &Flip) {
-    undone.entry(sig.clone()).or_default().entry(flip.value.clone()).or_insert(matches!(flip.dir, FlipDir::Leave));
-}
-
 /// What the caller of [`SubqueryRegistry::emit_for_shapes_with`] can prove about its candidates'
 /// membership **immediately before** the change being evaluated — the second way the delete gate
 /// opens, used only for a [`changes_only`](SubqueryShape::changes_only) feed.
@@ -395,7 +391,8 @@ fn note_undone(undone: &mut Undone, sig: &SubquerySig, flip: &Flip) {
 /// evaluation: its membership rests on two inner sets that both drop it in one commit and a later
 /// commit reaches the registry before that commit's query-backs run, or the row itself changes
 /// in a later commit while a flip that already removed it is still waiting for its query-back.
-/// Only a key set seeded with what the client holds — a materialized shape — is exact.
+/// A commit too large for its record ([`CommitScope::saturated`]) reaches the same limit inside
+/// itself. Only a key set seeded with what the client holds — a materialized shape — is exact.
 #[derive(Clone, Copy)]
 pub(crate) enum Prior<'a> {
     /// Nothing beyond the key set.
@@ -406,7 +403,8 @@ pub(crate) enum Prior<'a> {
     /// An inner-set flip's query-back: `value` just left (`left`) or entered node `sig`'s set. The
     /// candidates are the rows that depend on it; one was a member before the flip iff it
     /// satisfies the predicate with the flip — and whatever else its commit did to the inner
-    /// sets, while that commit is still the one being ingested — looked past.
+    /// sets, while that commit is still the one being ingested — looked past. Where the commit's
+    /// record knows the flipped value it decides, not the flip (see [`Before`]).
     Flip { sig: &'a SubquerySig, value: &'a Value, left: bool },
 }
 
@@ -434,6 +432,17 @@ impl Prior<'_> {
     }
 }
 
+/// How much one commit's record ([`CommitScope`]) may hold, in estimated heap bytes.
+///
+/// The record grows with every inner value the commit flips and every removal it proves, and one
+/// transaction can do either any number of times: a bulk delete that takes a thousand values out
+/// of each of a few hundred inner sets is some hundred thousand transitions. Typical commits
+/// record a handful. An entry that would take the record past this is not copied into it: the
+/// record is given up for the rest of the commit instead — see [`CommitScope::saturated`] for what
+/// that costs. The figure is what the registry's heap accounting reports for the record, hash
+/// tables included, so it bounds what the record owns at every moment, not only at rest.
+pub(crate) const COMMIT_PROOF_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// What the registry remembers about the ONE commit it is ingesting, for [`Prior`]. Replaced when
 /// the next commit's first change arrives, so nothing accumulates across commits; a change with no
 /// LSN (0) keeps nothing.
@@ -441,17 +450,182 @@ impl Prior<'_> {
 struct CommitScope {
     lsn: u64,
     /// The inner-set transitions the commit has applied so far: what an evaluation looks past to
-    /// see the sets as they stood before the commit.
+    /// see the sets as they stood before the commit. Every transition is here, wherever it was
+    /// derived — a set whose inner table the commit changed, and a parent set that a flip's walk
+    /// re-derived afterwards ([`SubqueryRegistry::note_commit_flip`]).
     undone: Undone,
-    /// `(feed, pk)` removals a changes-only feed has already emitted for this commit. One commit
-    /// can prove the same departure more than once — an outer-row change and the flip behind it,
-    /// or two flips that each took the row out — and the stream needs to hear it once.
-    removed: HashSet<(i64, String)>,
+    /// The removals a changes-only feed has already emitted for this commit, as `feed -> pks`. One
+    /// commit can prove the same departure more than once — an outer-row change and the flip
+    /// behind it, or two flips that each took the row out — and the stream needs to hear it once.
+    removed: HashMap<i64, HashSet<String>>,
+    /// What `undone` and `removed` own — exactly the figure [`HeapSize`] reports for them, hash
+    /// tables included — kept as they change, so the budget is asked without walking them.
+    bytes: usize,
+    /// The record outgrew [`COMMIT_PROOF_MAX_BYTES`] and was given up: for the rest of this commit
+    /// nothing is recorded, and an evaluation is judged as one that belongs to an earlier commit
+    /// is — by its own cause alone (the flip being propagated, or the row's old image against the
+    /// sets as they are now). That is the proof's documented limit, reached early: a row with two
+    /// causes in this commit can be missed, a value that entered and left inside it can produce a
+    /// delete for a row that was never in the scope, and a departure proven twice is said twice.
+    /// None of them removes a row that is in the scope: a delete is only ever sent for a row that
+    /// is not a member now.
+    saturated: bool,
+    /// The most the record has been charged with at any moment.
+    #[cfg(test)]
+    peak: usize,
 }
 
-/// The registry's inner sets as they stood before some transitions (see [`Undone`]): the one
-/// flip being propagated, which decides its own value whatever the commit's record says, then the
-/// rest of that commit's transitions.
+/// What a hash table with room for `capacity` entries of type `T` owns, as [`crate::heap_size`]
+/// counts it.
+fn table_bytes<T>(capacity: usize) -> usize {
+    (capacity * (std::mem::size_of::<T>() + 1) * 11) / 10
+}
+
+/// What one more entry of type `T` can make a hash table of `len` entries and room for `capacity`
+/// grow by. An upper bound: a full table at most doubles (and starts at no more than 8).
+fn table_growth<T>(len: usize, capacity: usize) -> usize {
+    if len < capacity {
+        return 0;
+    }
+    table_bytes::<T>((capacity * 2).max(8)) - table_bytes::<T>(capacity)
+}
+
+type UndoneEntry = (SubquerySig, HashMap<Value, bool>);
+type RemovedEntry = (i64, HashSet<String>);
+
+impl CommitScope {
+    /// Record one inner-set transition. When a value moves more than once the first transition is
+    /// kept: that is its state before all of them.
+    ///
+    /// The budget is asked BEFORE the value is copied: what the entry would own, and what the
+    /// tables can grow by to hold it. A value larger than the whole budget — Postgres text can be
+    /// — is therefore never in the record, not even between the copy and the check.
+    fn note_transition(&mut self, sig: &SubquerySig, flip: &Flip) {
+        if self.saturated {
+            return;
+        }
+        let values = self.undone.get(sig);
+        if values.is_some_and(|values| values.contains_key(&flip.value)) {
+            return;
+        }
+        let (len, capacity) = values.map_or((0, 0), |values| (values.len(), values.capacity()));
+        let mut more = flip.value.heap_bytes() + table_growth::<(Value, bool)>(len, capacity);
+        if values.is_none() {
+            more += sig.len() + table_growth::<UndoneEntry>(self.undone.len(), self.undone.capacity());
+        }
+        if !self.admit(more) {
+            return;
+        }
+        // Charged with what was actually taken: the copies' own heap, and each table's real growth.
+        let mut taken = 0;
+        if !self.undone.contains_key(sig) {
+            let before = self.undone.capacity();
+            let sig = sig.clone();
+            taken += sig.heap_bytes();
+            self.undone.insert(sig, HashMap::new());
+            taken += table_bytes::<UndoneEntry>(self.undone.capacity()) - table_bytes::<UndoneEntry>(before);
+        }
+        let values = self.undone.get_mut(sig).expect("inserted above");
+        let before = values.capacity();
+        let value = flip.value.clone();
+        taken += value.heap_bytes();
+        values.insert(value, matches!(flip.dir, FlipDir::Leave));
+        taken += table_bytes::<(Value, bool)>(values.capacity()) - table_bytes::<(Value, bool)>(before);
+        self.charge(taken);
+    }
+
+    /// Whether this is the first time the commit removes `pk` from `feed_id`, recording it if so.
+    /// A removal the record has no room to remember — or that comes after the record was given
+    /// up — is the first every time: it is said, perhaps twice, never swallowed.
+    fn first_removal(&mut self, feed_id: i64, pk: &str) -> bool {
+        if self.saturated {
+            return true;
+        }
+        let pks = self.removed.get(&feed_id);
+        if pks.is_some_and(|pks| pks.contains(pk)) {
+            return false;
+        }
+        let (len, capacity) = pks.map_or((0, 0), |pks| (pks.len(), pks.capacity()));
+        let mut more = pk.len() + table_growth::<String>(len, capacity);
+        if pks.is_none() {
+            more += table_growth::<RemovedEntry>(self.removed.len(), self.removed.capacity());
+        }
+        if !self.admit(more) {
+            return true;
+        }
+        let mut taken = 0;
+        if !self.removed.contains_key(&feed_id) {
+            let before = self.removed.capacity();
+            self.removed.insert(feed_id, HashSet::new());
+            taken += table_bytes::<RemovedEntry>(self.removed.capacity()) - table_bytes::<RemovedEntry>(before);
+        }
+        let pks = self.removed.get_mut(&feed_id).expect("inserted above");
+        let before = pks.capacity();
+        let pk = pk.to_string();
+        taken += pk.heap_bytes();
+        pks.insert(pk);
+        taken += table_bytes::<String>(pks.capacity()) - table_bytes::<String>(before);
+        self.charge(taken);
+        true
+    }
+
+    /// `pk` is back in `feed_id`'s scope: a later departure in this commit is news again.
+    fn forget_removal(&mut self, feed_id: i64, pk: &str) {
+        let Some(pks) = self.removed.get_mut(&feed_id) else { return };
+        let before = pks.capacity();
+        if let Some(pk) = pks.take(pk) {
+            // The table keeps its storage, but a slot freed in the middle of a probe run leaves a
+            // tombstone, and the table then reports room for one entry fewer.
+            let tombstoned = table_bytes::<String>(before) - table_bytes::<String>(pks.capacity());
+            self.bytes -= pk.heap_bytes() + tombstoned;
+        }
+    }
+
+    /// Whether `more` bytes still fit. When they do not the record is given up — before the entry
+    /// that would not fit is copied into it.
+    fn admit(&mut self, more: usize) -> bool {
+        if self.bytes.saturating_add(more) <= COMMIT_PROOF_MAX_BYTES {
+            return true;
+        }
+        tracing::warn!(
+            event = "subquery_commit_record_given_up",
+            commit_lsn = %crate::engine::emission::lsn_text(self.lsn),
+            record_bytes = self.bytes,
+            refused_bytes = more,
+            budget_bytes = COMMIT_PROOF_MAX_BYTES,
+            "one commit's record of inner-set transitions would outgrow its budget; for the rest of this commit \
+             a changes-only feed's removals are proven one cause at a time"
+        );
+        self.undone = Undone::new();
+        self.removed = HashMap::new();
+        self.bytes = 0;
+        self.saturated = true;
+        false
+    }
+
+    fn charge(&mut self, taken: usize) {
+        self.bytes += taken;
+        #[cfg(test)]
+        {
+            self.peak = self.peak.max(self.bytes);
+        }
+    }
+}
+
+impl HeapSize for CommitScope {
+    fn heap_bytes(&self) -> usize {
+        self.undone.heap_bytes() + self.removed.heap_bytes()
+    }
+}
+
+/// The registry's inner sets as they stood before some transitions (see [`Undone`]).
+///
+/// The commit's record decides first: it holds each value's state before ALL of the commit's
+/// transitions, which is the state the client's snapshot saw. The flip being propagated decides
+/// its own value only where the record has nothing for it — the evaluation belongs to an earlier
+/// commit, whose record is gone. Read the other way round, a value that entered and left inside
+/// one commit would count as present before it (its `Leave` flip says so), and a row that was
+/// never in the scope would be removed.
 struct Before<'a> {
     reg: &'a SubqueryRegistry,
     undone: &'a Undone,
@@ -460,16 +634,16 @@ struct Before<'a> {
 
 impl SubqueryEval for Before<'_> {
     fn contains(&self, sig: &SubquerySig, value: &Value) -> bool {
+        if let Some(&was_present) = self.undone.get(sig).and_then(|values| values.get(value)) {
+            return was_present;
+        }
         if let Some((flipped, flipped_value, left)) = self.flip
             && flipped == sig
             && flipped_value == value
         {
             return left;
         }
-        match self.undone.get(sig).and_then(|values| values.get(value)) {
-            Some(&was_present) => was_present,
-            None => self.reg.contains(sig, value),
-        }
+        self.reg.contains(sig, value)
     }
     fn has_null(&self, sig: &SubquerySig) -> bool {
         self.contains(sig, &Value::Null)
@@ -765,7 +939,8 @@ impl HeapSize for SubqueryRegistry {
     /// [`SubqueryRegistry::feed_sets_bytes`]). `ds` (a client
     /// handle) and `schemas` (`Arc`-shared with the engine's compiled
     /// schema) are not uniquely owned; `lanes` holds channel senders, not owned data;
-    /// `next_node_id`/`next_feed_id` are inline counters.
+    /// `next_node_id`/`next_feed_id` are inline counters. `commit` is the record of the commit
+    /// being ingested: owned, bounded by [`COMMIT_PROOF_MAX_BYTES`], and replaced per commit.
     fn heap_bytes(&self) -> usize {
         self.nodes.heap_bytes()
             + self.edges.heap_bytes()
@@ -778,6 +953,7 @@ impl HeapSize for SubqueryRegistry {
             + self.pending_seed.heap_bytes()
             + self.pending_shapes.heap_bytes()
             + self.collect_log.heap_bytes()
+            + self.commit.heap_bytes()
             + self.pg_url.heap_bytes()
             + self.commit_times.heap_bytes()
             + self.commit_txids.heap_bytes()
@@ -1768,10 +1944,8 @@ impl SubqueryRegistry {
             asserts.contributors.extend(self.template_assertions(tkey, evals, lsn, xid));
         }
         let flips = self.apply_asserts(asserts).await;
-        if lsn != 0 {
-            for (sig, flip) in &flips {
-                note_undone(&mut self.commit.undone, sig, flip);
-            }
+        for (sig, flip) in &flips {
+            self.note_commit_flip(lsn, sig, flip);
         }
         for sig in live_sigs {
             let flipped = flips.iter().any(|(s, _)| s == &sig);
@@ -2148,6 +2322,17 @@ impl SubqueryRegistry {
         self.emit_for_shapes_with(ts, groups, txid, source, Prior::Unknown).await
     }
 
+    /// Record one inner-set transition of the commit at `commit_lsn` in that commit's record
+    /// ([`CommitScope`]), wherever it was derived: by the commit's own change to the set's inner
+    /// table, or later, by a flip's walk re-deriving a parent set. A transition of any other
+    /// commit — an earlier one whose walk ran late, or a change with no LSN — is not recorded: the
+    /// record is the one commit's, and such an evaluation is judged without it.
+    fn note_commit_flip(&mut self, commit_lsn: u64, sig: &SubquerySig, flip: &Flip) {
+        if commit_lsn != 0 && self.commit.lsn == commit_lsn {
+            self.commit.note_transition(sig, flip);
+        }
+    }
+
     /// [`emit_for_shapes`](Self::emit_for_shapes) with what the caller can prove about the
     /// candidates' membership just before this change. For a `changes_only` feed a non-member
     /// candidate is deleted when the key set held it **or** `prior` shows it was a member; every
@@ -2181,7 +2366,9 @@ impl SubqueryRegistry {
         // That commit's inner-set transitions, lent to the proof for the synchronous evaluation
         // below and put back before anything awaits. Moved out and back, never copied: a commit
         // can hold thousands of flips, and each reaches hundreds of shapes.
-        let lent = (same_commit && !matches!(prior, Prior::Unknown)).then(|| std::mem::take(&mut self.commit.undone));
+        // A record that was given up lends nothing: the evaluation is judged by its own cause.
+        let lent = (same_commit && !self.commit.saturated && !matches!(prior, Prior::Unknown))
+            .then(|| std::mem::take(&mut self.commit.undone));
         let no_record = Undone::new();
         // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
         // query-back, which reads this map instead of writing it.
@@ -2238,9 +2425,9 @@ impl SubqueryRegistry {
                     // Current member: deliver the upsert and record presence in the feed.
                     let pk_id = self.pk_dict.get_or_insert(&pk);
                     self.feed_sets.insert(feed_id, pk_id);
-                    if same_commit && !self.commit.removed.is_empty() {
+                    if same_commit {
                         // Back in the scope: a later departure in this commit is news again.
-                        self.commit.removed.remove(&(feed_id, pk.clone()));
+                        self.commit.forget_removal(feed_id, &pk);
                     }
                     if record_recency {
                         evaluated.push(pk_id);
@@ -2262,7 +2449,7 @@ impl SubqueryRegistry {
                     if delivered || proven {
                         // Said once per commit, however many of the commit's changes prove it. A
                         // key-set retraction is never held back: it is the stream's own record.
-                        let first = !(changes_only && same_commit) || self.commit.removed.insert((feed_id, pk.clone()));
+                        let first = !(changes_only && same_commit) || self.commit.first_removal(feed_id, &pk);
                         if delivered || first {
                             deletes.entry(shape_id.clone()).or_default().push(pk.clone());
                         }
@@ -2284,7 +2471,10 @@ impl SubqueryRegistry {
             }
             staged.push((shape_id, members));
         }
-        if let Some(undone) = lent {
+        // Not put back into a record this evaluation's own removals just pushed past its budget.
+        if let Some(undone) = lent
+            && !self.commit.saturated
+        {
             self.commit.undone = undone;
         }
         // The transaction every envelope of this emission names is the one that CAUSED it: the
@@ -2984,6 +3174,13 @@ async fn requery_and_reconcile_parents(
             let mut reg = registry.lock().await;
             if let Some(evals) = reg.node_queryback_evals(parent_sig, ts, &rows, &gate) {
                 let flips = reg.apply_node_evals(parent_sig, evals).await;
+                // A parent's set moves here, not in `on_table_delta`: the commit changed a row of a
+                // deeper inner table, and this re-derivation is where the parent learns of it. It
+                // is that commit's transition all the same, and a row that rests on two such
+                // parents is proven a member only if both are in the commit's record.
+                for flip in &flips {
+                    reg.note_commit_flip(commit_lsn, parent_sig, flip);
+                }
                 reconciled.push((parent_sig.clone(), ts.table.clone(), flips));
             }
             reg.end_node_queryback(parent_sig);
@@ -6247,6 +6444,307 @@ pub(crate) mod tests {
 
         reg.on_table_delta(&ts, &[Tup2(before, -1), Tup2(after, 1)], 1, None, None, None).await.unwrap();
         assert!(envs_for(&store, "shape/materialized").is_empty());
+    }
+
+    // The proof judges a row against the inner sets as they stood BEFORE the commit. Two things
+    // decide whether that view is the true one: every transition of the commit has to be in it,
+    // the nested ones included, and it has to outrank the single flip being propagated.
+
+    /// `<name>(id, gid)` tables for a scope behind two NESTED inner sets: an event's Record (its
+    /// `gid`) must be linked in `links1` AND in `links2`, and a link counts only while its id is
+    /// granted in `grants1` / `grants2`.
+    fn two_link_schemas() -> HashMap<TableRef, TableSchema> {
+        ["events", "links1", "links2", "grants1", "grants2"]
+            .into_iter()
+            .map(|name| (TableRef::from(name), id_gid_ts(name)))
+            .collect()
+    }
+
+    /// `gid IN (SELECT gid FROM links<n> WHERE id IN (SELECT gid FROM grants<n>))`.
+    fn linked_through(n: u8) -> serde_json::Value {
+        serde_json::json!({"col": "gid", "in": {"table": format!("links{n}"), "project": "gid",
+            "where": {"col": "id", "in": {"table": format!("grants{n}"), "project": "gid"}}}})
+    }
+
+    /// One commit withdraws the grant behind BOTH links, and the event row is untouched. The
+    /// grants are the inner sets the commit's changes touch directly; the links are parent sets,
+    /// re-derived later by the flips' walk. Each parent's flip, looked past on its own, still
+    /// finds the other parent without Record 7, so the row is seen as a member before the commit
+    /// only if the parents' transitions are part of the commit's record too. Two flips, one removal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_once_when_one_commit_empties_two_nested_inner_sets() {
+        let schemas = two_link_schemas();
+        let table = |name: &str| schemas[&TableRef::from(name)].clone();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        reg.set_schemas(Arc::new(schemas.clone()));
+        let pred: PredicateJson =
+            serde_json::from_value(serde_json::json!({"and": [linked_through(1), linked_through(2)]})).unwrap();
+        let begin = reg.begin_create("feed", &TableRef::from("events"), "shape/feed", &pred, None, true).unwrap();
+        assert_eq!(begin.seeds.len(), 4, "two link sets, each over its own grant set");
+        // Link 5 ties Record 7 in both tables, and grant 1 grants link 5 in both.
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, inner, _)| {
+                let ts = &schemas[inner];
+                let granting = [TableRef::from("grants1"), TableRef::from("grants2")].contains(inner);
+                let row = if granting { id_gid_row(ts, 1, 5) } else { id_gid_row(ts, 5, 7) };
+                (sig.clone(), vec![row], crate::pg::SnapshotGate::passthrough())
+            })
+            .collect();
+        reg.finish_create("feed", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
+        let row = id_gid_row(&table("events"), 1, 7);
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([
+            ("links1", vec![id_gid_row(&table("links1"), 5, 7)]),
+            ("links2", vec![id_gid_row(&table("links2"), 5, 7)]),
+            ("events", vec![row.clone()]),
+        ])));
+
+        let (grants1, grants2) = (table("grants1"), table("grants2"));
+        let mut work = reg
+            .on_table_delta(&grants1, &[Tup2(id_gid_row(&grants1, 1, 5), -1)], 0x10, None, None, None)
+            .await
+            .unwrap();
+        work.extend(
+            reg.on_table_delta(&grants2, &[Tup2(id_gid_row(&grants2, 1, 5), -1)], 0x10, None, None, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(work.len(), 2, "both grant sets lose link 5");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+
+        let reg = registry.lock().await;
+        assert!(
+            reg.nodes.values().all(|node| !reg.contains(&node.sig, &Value::Int(7))),
+            "both link sets lost Record 7"
+        );
+        assert_eq!(
+            envs_for(&store, "shape/feed"),
+            vec![(TableRef::from("events").to_string(), "1".to_string(), "delete".to_string())]
+        );
+    }
+
+    /// A value that enters an inner set and leaves it again inside one commit was not in the set
+    /// before the commit and is not in it after. A row that depends on it was never in the scope
+    /// at any commit boundary, so the client never held it and the feed owes it nothing: the
+    /// commit's record (the value was absent before) outranks the flip being propagated (it left).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_sends_nothing_when_a_value_enters_and_leaves_within_one_commit() {
+        let (events, grants, schedule, store, mut reg, _, _) = granted_and_scheduled_feed().await;
+        // Record 9 is scheduled but not granted, so its event is outside the scope.
+        reg.on_table_delta(&schedule, &[Tup2(record_link(&schedule, 2, 9), 1)], 3, None, None, None).await.unwrap();
+        let outside = event(&events, 1, 9, 12, None);
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![outside])])));
+
+        let mut work =
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 2, 9), 1)], 0x10, None, None, None).await.unwrap();
+        work.extend(
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 2, 9), -1)], 0x10, None, None, None).await.unwrap(),
+        );
+        assert_eq!(work.len(), 2, "the grant's arrival and its withdrawal are two flips");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+
+        assert!(
+            envs_for(&store, "shape/feed").is_empty(),
+            "the row was outside the scope before the commit and after it, got {:?}",
+            envs_for(&store, "shape/feed")
+        );
+    }
+
+    // The commit's record is owned heap for as long as that commit is the one being ingested, and
+    // one transaction can flip any number of inner values. So it is counted, and it is bounded.
+
+    /// `grants(id, name)` and `count` of its rows: an inner table whose projected value is text,
+    /// so a test can make the values of one commit as large as it needs (`bytes` each).
+    fn named_grants(count: usize, bytes: usize) -> (TableSchema, Vec<Row>) {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "name": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let ts = TableSchema::from_def(&TableRef::from("grants"), &def).unwrap();
+        let rows = (0..count)
+            .map(|i| {
+                let name = format!("{i:08}{}", "x".repeat(bytes - 8));
+                ts.row_from_json(serde_json::json!({"id": i, "name": name}).as_object().unwrap()).unwrap()
+            })
+            .collect();
+        (ts, rows)
+    }
+
+    /// A registry with one inner set, `granted`, over [`named_grants`]' table.
+    fn registry_with_named_grants(ds_url: &str, ts: &TableSchema) -> SubqueryRegistry {
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(ds_url), None);
+        insert_test_node_on(&mut reg, "granted", "grants", ts.column_index("name").unwrap());
+        reg
+    }
+
+    /// What the registry's heap accounting attributes to the commit being ingested: its total now,
+    /// less its total once the next commit's first change has replaced the record.
+    async fn counted_for_the_commit(reg: &mut SubqueryRegistry, ts: &TableSchema, next_lsn: u64) -> usize {
+        let during = reg.heap_bytes();
+        reg.on_table_delta(ts, &[], next_lsn, None, None, None).await.unwrap();
+        during.saturating_sub(reg.heap_bytes())
+    }
+
+    /// The registry's heap accounting (`/memory`) includes the record of the commit being ingested.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commits_proof_record_is_counted_in_the_registrys_heap() {
+        const VALUE_BYTES: usize = 1024;
+        let (ts, rows) = named_grants(100, VALUE_BYTES);
+        let mut reg = registry_with_named_grants("http://unused", &ts);
+        reg.set_schemas(Arc::new([(TableRef::from("grants"), ts.clone())].into_iter().collect()));
+        let delta: Vec<Tup2<Row, ZWeight>> = rows.into_iter().map(|row| Tup2(row, 1)).collect();
+        let flips = reg.on_table_delta(&ts, &delta, 0x10, None, None, None).await.unwrap();
+        assert_eq!(flips.len(), 100, "every grant is a transition the commit's record keeps");
+
+        let counted = counted_for_the_commit(&mut reg, &ts, 0x20).await;
+        assert!(counted >= 100 * VALUE_BYTES, "100 transitions of {VALUE_BYTES} bytes each, counted {counted} bytes");
+    }
+
+    /// A commit whose record would outgrow [`COMMIT_PROOF_MAX_BYTES`] does not keep it: the record
+    /// is given up for the rest of that commit, and nothing more is recorded. What is lost is the
+    /// view of the commit's OTHER transitions, never the proof itself: each flip is then judged on
+    /// its own, as it is for an earlier commit, so a row with one cause is still removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commits_proof_record_stays_inside_its_budget_and_then_judges_one_cause_at_a_time() {
+        use crate::schema::TableDef;
+        const VALUE_BYTES: usize = 512 * 1024;
+        let (grants, rows) = named_grants(COMMIT_PROOF_MAX_BYTES / VALUE_BYTES + 4, VALUE_BYTES);
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "label": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let events = TableSchema::from_def(&TableRef::from("events"), &def).unwrap();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = registry_with_named_grants(&ds_url, &grants);
+        let label = events.column_index("label").unwrap();
+        let granted: SubquerySig = "granted".into();
+        insert_changes_only_feed(
+            &mut reg,
+            "feed",
+            "events",
+            CompiledPredicate::InSubquery { col: label, sig: granted.clone(), negated: false },
+        );
+        reg.add_edge(flip_edge(&granted, Dependent::Shape("feed".into()), label));
+        reg.set_schemas(Arc::new(
+            [(TableRef::from("grants"), grants.clone()), (TableRef::from("events"), events.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        // One commit grants every name: more transitions than the budget holds.
+        let grant: Vec<Tup2<Row, ZWeight>> = rows.iter().cloned().map(|row| Tup2(row, 1)).collect();
+        reg.on_table_delta(&grants, &grant, 0x10, None, None, None).await.unwrap();
+        let counted = counted_for_the_commit(&mut reg, &grants, 0x18).await;
+        assert!(
+            counted <= COMMIT_PROOF_MAX_BYTES,
+            "the record of one commit must stay inside {COMMIT_PROOF_MAX_BYTES} bytes, counted {counted}"
+        );
+
+        // The client holds event 1 from its snapshot: its label is the first granted name. Another
+        // commit, as large, withdraws every grant; the flip that takes event 1 out still removes it.
+        let name = grants.column_index("name").unwrap();
+        let first = rows[0].0[name].clone();
+        let Value::Text(label_text) = &first else { panic!("a text projection") };
+        let held = events
+            .row_from_json(serde_json::json!({"id": 1, "label": label_text.to_string()}).as_object().unwrap())
+            .unwrap();
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![held])])));
+        let withdraw: Vec<Tup2<Row, ZWeight>> = rows.iter().cloned().map(|row| Tup2(row, -1)).collect();
+        let mut work = reg.on_table_delta(&grants, &withdraw, 0x20, None, None, None).await.unwrap();
+        work.retain(|(_, flip)| flip.value == first);
+        assert_eq!(work.len(), 1, "the withdrawal of the first name is one flip");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/20").await;
+
+        assert_eq!(
+            envs_for(&store, "shape/feed"),
+            vec![(TableRef::from("events").to_string(), "1".to_string(), "delete".to_string())]
+        );
+    }
+
+    // The budget is a bound on what the record OWNS, at every moment. Three ways it could be one in
+    // name only: the running figure is not what the heap accounting reports; the hash tables' own
+    // storage is left out of it; or an entry is copied in first and the budget asked afterwards.
+
+    fn transition(value: Value) -> Flip {
+        Flip { value, dir: FlipDir::Leave }
+    }
+
+    /// The figure the budget is checked against is exactly what [`HeapSize`] reports for the
+    /// record, through inserts into several inner sets, repeats, removals said and taken back.
+    #[test]
+    fn a_commits_proof_record_charges_itself_exactly_what_its_heap_accounting_reports() {
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        for i in 0..6_000i64 {
+            let sig: SubquerySig = format!("inner-set-{}", i % 7);
+            let value = if i % 3 == 0 { Value::Text(format!("value-{i}")) } else { Value::Int(i / 2) };
+            scope.note_transition(&sig, &transition(value));
+            scope.first_removal(i % 5, &format!("pk-{}", i / 3));
+            if i % 11 == 0 {
+                scope.forget_removal(i % 5, &format!("pk-{}", i / 3));
+            }
+            if i % 97 == 0 {
+                assert_eq!(scope.bytes, scope.heap_bytes(), "after {i} steps");
+            }
+        }
+        assert!(!scope.saturated, "this much fits");
+        assert_eq!(scope.bytes, scope.heap_bytes());
+    }
+
+    /// Many small entries: most of what such a record owns is its hash tables, which grow by
+    /// doubling. The record gives up before the tables outgrow the budget, not once the entries'
+    /// own sizes add up to it.
+    #[test]
+    fn a_commits_proof_record_counts_its_tables_against_the_budget() {
+        let sig: SubquerySig = "granted".into();
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        let mut largest = 0;
+        for i in 0..400_000i64 {
+            scope.note_transition(&sig, &transition(Value::Int(i)));
+            if i % 1024 == 0 {
+                largest = largest.max(scope.heap_bytes());
+            }
+        }
+        assert!(scope.saturated, "400,000 transitions do not fit in {COMMIT_PROOF_MAX_BYTES} bytes");
+        assert!(largest <= COMMIT_PROOF_MAX_BYTES, "the record owned {largest} bytes on the way");
+
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        let mut largest = 0;
+        for i in 0..400_000i64 {
+            scope.first_removal(1, &i.to_string());
+            if i % 1024 == 0 {
+                largest = largest.max(scope.heap_bytes());
+            }
+        }
+        assert!(scope.saturated, "400,000 removals do not fit in {COMMIT_PROOF_MAX_BYTES} bytes");
+        assert!(largest <= COMMIT_PROOF_MAX_BYTES, "the record owned {largest} bytes on the way");
+    }
+
+    /// One projected value, or one primary key, larger than the whole budget — Postgres text can be
+    /// far larger. The record is asked whether the entry fits BEFORE the entry is copied into it,
+    /// so it never owns it, not even for the moment between the copy and the check.
+    #[test]
+    fn an_entry_larger_than_the_budget_is_never_copied_into_a_commits_proof_record() {
+        let sig: SubquerySig = "granted".into();
+        let oversized = "x".repeat(COMMIT_PROOF_MAX_BYTES + 1024);
+
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        scope.note_transition(&sig, &transition(Value::Int(1)));
+        scope.note_transition(&sig, &transition(Value::Text(oversized.clone())));
+        assert!(scope.saturated && scope.undone.is_empty(), "the record is given up, not grown past its budget");
+        assert!(scope.peak <= COMMIT_PROOF_MAX_BYTES, "the value was in the record first: {} bytes", scope.peak);
+
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        assert!(scope.first_removal(1, "small"));
+        assert!(scope.first_removal(1, &oversized), "a removal that cannot be remembered is said");
+        assert!(scope.first_removal(1, &oversized), "and said again, since nothing remembers it");
+        assert!(scope.saturated && scope.removed.is_empty());
+        assert!(scope.peak <= COMMIT_PROOF_MAX_BYTES, "the key was in the record first: {} bytes", scope.peak);
     }
 
     // --- envelope positions (`headers.lsn`, `headers.txid`) ------------------------------------
