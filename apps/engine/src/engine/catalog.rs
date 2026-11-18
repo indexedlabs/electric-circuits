@@ -940,6 +940,21 @@ fn schema_moved_while_down(rec: &ShapeRecord, compiled: &HashMap<TableRef, Table
     }
 }
 
+/// The timestamp literal in `rec`'s predicate that the engine cannot read, if it has one (see
+/// [`crate::pg_temporal::UnreadableLiteral`]). A subquery record is not judged here: it cannot be
+/// compiled without the registry, and the restore drops it for its own reasons.
+fn unreadable_literal(
+    rec: &ShapeRecord,
+    compiled: &HashMap<TableRef, TableSchema>,
+) -> Option<crate::pg_temporal::UnreadableLiteral> {
+    if rec.is_subquery {
+        return None;
+    }
+    let ts = compiled.get(&rec.table)?;
+    let refused = CompiledPredicate::compile(rec.where_json.as_ref()?, ts).err()?;
+    refused.downcast_ref::<crate::pg_temporal::UnreadableLiteral>().cloned()
+}
+
 /// Idempotently create the catalog stream, logging a failure only the FIRST time through an outage
 /// — the writer retries this before every append attempt while the stream has never been created,
 /// and one error line per attempt for as long as storage is down is a flood, not information.
@@ -1679,6 +1694,20 @@ impl Engine {
                     tracing::warn!(
                         "restore: retiring shape {id} on {} — its schema changed while the engine was \
                          down ({what}); subscribers observe the closed stream and recreate",
+                        rec.table
+                    );
+                    self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
+                    dead_streams.push((id.clone(), rec.stream_path.clone()));
+                    continue;
+                }
+                // A record written before the engine refused timestamp literals it cannot read
+                // would fail to compile on resume, or on its first touch if it is dormant, and a
+                // failed resume fails the whole restore. It is the shape that is wrong, not the
+                // boot: retire it, and the client's next create is told why.
+                if let Some(refused) = unreadable_literal(&rec, compiled) {
+                    tracing::warn!(
+                        "restore: retiring shape {id} on {} — {refused}; subscribers observe the closed stream, \
+                         and a new create with that literal is refused with this reason",
                         rec.table
                     );
                     self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
@@ -4394,6 +4423,62 @@ mod tests {
         assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s2"), "{events:?}");
         assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s2"), "{events:?}");
         assert_eq!(missing_server.deletes(), 1, "exactly the absent stream takes the (404-tolerant) delete path");
+    }
+
+    /// A catalog can hold a shape whose predicate compares a timestamp column with a literal the
+    /// engine refuses today: the record was written before it did. Such a shape would fail to
+    /// compile when it is resumed, or at its first touch if it is dormant. It is retired at
+    /// restore, as a shape whose schema moved is, and the rest of the catalog restores.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_a_shape_whose_timestamp_literal_the_engine_cannot_read() {
+        fn dormant(id: &str, bound: &str) -> Vec<CatalogEvent> {
+            let mut created = created_event("public.users");
+            created["rec"]["id"] = serde_json::json!(id);
+            created["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
+            created["rec"]["where_json"] = serde_json::json!({"col": "created", "op": "gte", "value": bound});
+            created["sig"] = serde_json::json!(format!("sig-{id}"));
+            let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
+            let gate = crate::pg::SnapshotGate::passthrough();
+            vec![
+                created,
+                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200 },
+                CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate },
+            ]
+        }
+        // `public.users(id, created timestamptz)` as boot introspection compiles it.
+        let mut def: crate::schema::TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "created": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        def.columns.get_mut("created").unwrap().pg_type = Some("timestamptz".into());
+        let users = TableRef::parse("public.users").unwrap();
+        let compiled: HashMap<TableRef, TableSchema> =
+            [(users.clone(), TableSchema::from_def(&users, &def).unwrap())].into_iter().collect();
+
+        let server = FakeDs::start().await;
+        let fold = fold_of(
+            dormant("s1", "2026-10-19T07:00:00Z")
+                .into_iter()
+                .chain(dormant("s2", "2026-10-19 07:00:00 PST"))
+                .chain(dormant("s3", "2026-10-19 07:00:00 UTC"))
+                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() }])
+                .collect(),
+        );
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        engine
+            .apply_catalog(fold, &compiled, RestoreMode::Resume)
+            .await
+            .expect("an unreadable literal retires its shape; it does not fail the boot");
+        let st = engine.state.lock().await;
+        assert!(st.shapes.contains_key("s1") && st.shapes.contains_key("s3"), "the shapes the engine can read restore");
+        assert!(!st.shapes.contains_key("s2"), "the shape whose bound is `… PST` is not installed");
+        assert!(st.subscription_owner("sub-s2").is_none(), "and it holds no subscription");
+        drop(st);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        let events = server.catalog_events();
+        assert!(events.iter().any(|event| event["t"] == "dropped" && event["id"] == "s2"), "{events:?}");
+        assert!(events.iter().any(|event| event["t"] == "retired" && event["id"] == "s2"), "{events:?}");
+        assert!(!events.iter().any(|event| event["t"] == "dropped" && event["id"] != "s2"), "{events:?}");
     }
 
     /// A closed retained stream is the same definitive storage answer as a missing one: retire
