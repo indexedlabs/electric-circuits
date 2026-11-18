@@ -763,9 +763,12 @@ sequencer feeds every table's deltas into:
 
   The commit's record is owned heap while that commit is being ingested, so it is counted in the
   registry's heap (`/memory`) and bounded: `COMMIT_PROOF_MAX_BYTES`, 8 MiB of transitions and
-  removals. A commit that outgrows it — a bulk change that moves some hundred thousand inner
-  values — gives the record up, and for the rest of that commit each evaluation is judged by its
-  own cause alone, exactly as one that belongs to an earlier commit is, with the same limits.
+  removals. The bound is on what the record owns at every moment: it is checked against the same
+  figure the heap accounting reports, hash tables included, and before an entry is copied in, so
+  one value or key larger than the whole budget never enters it. A commit that would outgrow it —
+  a bulk change that moves some hundred thousand inner values — gives the record up, and for the
+  rest of that commit each evaluation is judged by its own cause alone, exactly as one that
+  belongs to an earlier commit is, with the same limits.
 - **Query-back recency** — absolute assertion makes cross-pk ordering irrelevant, but the *last*
   evaluation of a given pk still has to be the freshest one. A query-back reads its candidates at
   one Postgres snapshot with the registry lock released, so a direct outer-row change committed
