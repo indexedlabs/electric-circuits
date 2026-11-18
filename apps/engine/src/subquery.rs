@@ -369,7 +369,8 @@ pub(crate) enum Prior<'a> {
     /// An inner-set flip's query-back: `value` just left (`left`) or entered node `sig`'s set. The
     /// candidates are the rows that depend on it; one was a member before the flip iff it
     /// satisfies the predicate with the flip — and whatever else its commit did to the inner
-    /// sets, while that commit is still the one being ingested — looked past.
+    /// sets, while that commit is still the one being ingested — looked past. Where the commit's
+    /// record knows the flipped value it decides, not the flip (see [`Before`]).
     Flip { sig: &'a SubquerySig, value: &'a Value, left: bool },
 }
 
@@ -404,7 +405,9 @@ impl Prior<'_> {
 struct CommitScope {
     lsn: u64,
     /// The inner-set transitions the commit has applied so far: what an evaluation looks past to
-    /// see the sets as they stood before the commit.
+    /// see the sets as they stood before the commit. Every transition is here, wherever it was
+    /// derived — a set whose inner table the commit changed, and a parent set that a flip's walk
+    /// re-derived afterwards ([`SubqueryRegistry::note_commit_flip`]).
     undone: Undone,
     /// `(feed, pk)` removals a changes-only feed has already emitted for this commit. One commit
     /// can prove the same departure more than once — an outer-row change and the flip behind it,
@@ -412,9 +415,14 @@ struct CommitScope {
     removed: HashSet<(i64, String)>,
 }
 
-/// The registry's inner sets as they stood before some transitions (see [`Undone`]): the one
-/// flip being propagated, which decides its own value whatever the commit's record says, then the
-/// rest of that commit's transitions.
+/// The registry's inner sets as they stood before some transitions (see [`Undone`]).
+///
+/// The commit's record decides first: it holds each value's state before ALL of the commit's
+/// transitions, which is the state the client's snapshot saw. The flip being propagated decides
+/// its own value only where the record has nothing for it — the evaluation belongs to an earlier
+/// commit, whose record is gone. Read the other way round, a value that entered and left inside
+/// one commit would count as present before it (its `Leave` flip says so), and a row that was
+/// never in the scope would be removed.
 struct Before<'a> {
     reg: &'a SubqueryRegistry,
     undone: &'a Undone,
@@ -423,16 +431,16 @@ struct Before<'a> {
 
 impl SubqueryEval for Before<'_> {
     fn contains(&self, sig: &SubquerySig, value: &Value) -> bool {
+        if let Some(&was_present) = self.undone.get(sig).and_then(|values| values.get(value)) {
+            return was_present;
+        }
         if let Some((flipped, flipped_value, left)) = self.flip
             && flipped == sig
             && flipped_value == value
         {
             return left;
         }
-        match self.undone.get(sig).and_then(|values| values.get(value)) {
-            Some(&was_present) => was_present,
-            None => self.reg.contains(sig, value),
-        }
+        self.reg.contains(sig, value)
     }
     fn has_null(&self, sig: &SubquerySig) -> bool {
         self.contains(sig, &Value::Null)
@@ -1711,10 +1719,8 @@ impl SubqueryRegistry {
             asserts.contributors.extend(self.template_assertions(tkey, evals, lsn, xid));
         }
         let flips = self.apply_asserts(asserts).await;
-        if lsn != 0 {
-            for (sig, flip) in &flips {
-                note_undone(&mut self.commit.undone, sig, flip);
-            }
+        for (sig, flip) in &flips {
+            self.note_commit_flip(lsn, sig, flip);
         }
         for sig in live_sigs {
             let flipped = flips.iter().any(|(s, _)| s == &sig);
@@ -2089,6 +2095,17 @@ impl SubqueryRegistry {
         source: EmissionSource<'_>,
     ) -> Result<Vec<(String, bool, i64)>> {
         self.emit_for_shapes_with(ts, groups, txid, source, Prior::Unknown).await
+    }
+
+    /// Record one inner-set transition of the commit at `commit_lsn` in that commit's record
+    /// ([`CommitScope`]), wherever it was derived: by the commit's own change to the set's inner
+    /// table, or later, by a flip's walk re-deriving a parent set. A transition of any other
+    /// commit — an earlier one whose walk ran late, or a change with no LSN — is not recorded: the
+    /// record is the one commit's, and such an evaluation is judged without it.
+    fn note_commit_flip(&mut self, commit_lsn: u64, sig: &SubquerySig, flip: &Flip) {
+        if commit_lsn != 0 && self.commit.lsn == commit_lsn {
+            note_undone(&mut self.commit.undone, sig, flip);
+        }
     }
 
     /// [`emit_for_shapes`](Self::emit_for_shapes) with what the caller can prove about the
@@ -2901,6 +2918,13 @@ async fn requery_and_reconcile_parents(
             let mut reg = registry.lock().await;
             if let Some(evals) = reg.node_queryback_evals(parent_sig, ts, &rows, &gate) {
                 let flips = reg.apply_node_evals(parent_sig, evals).await;
+                // A parent's set moves here, not in `on_table_delta`: the commit changed a row of a
+                // deeper inner table, and this re-derivation is where the parent learns of it. It
+                // is that commit's transition all the same, and a row that rests on two such
+                // parents is proven a member only if both are in the commit's record.
+                for flip in &flips {
+                    reg.note_commit_flip(commit_lsn, parent_sig, flip);
+                }
                 reconciled.push((parent_sig.clone(), ts.table.clone(), flips));
             }
             reg.end_node_queryback(parent_sig);
@@ -6163,5 +6187,113 @@ pub(crate) mod tests {
 
         reg.on_table_delta(&ts, &[Tup2(before, -1), Tup2(after, 1)], 1, None, None, None).await.unwrap();
         assert!(envs_for(&store, "shape/materialized").is_empty());
+    }
+
+    // The proof judges a row against the inner sets as they stood BEFORE the commit. Two things
+    // decide whether that view is the true one: every transition of the commit has to be in it,
+    // the nested ones included, and it has to outrank the single flip being propagated.
+
+    /// `<name>(id, gid)` tables for a scope behind two NESTED inner sets: an event's Record (its
+    /// `gid`) must be linked in `links1` AND in `links2`, and a link counts only while its id is
+    /// granted in `grants1` / `grants2`.
+    fn two_link_schemas() -> HashMap<TableRef, TableSchema> {
+        ["events", "links1", "links2", "grants1", "grants2"]
+            .into_iter()
+            .map(|name| (TableRef::from(name), id_gid_ts(name)))
+            .collect()
+    }
+
+    /// `gid IN (SELECT gid FROM links<n> WHERE id IN (SELECT gid FROM grants<n>))`.
+    fn linked_through(n: u8) -> serde_json::Value {
+        serde_json::json!({"col": "gid", "in": {"table": format!("links{n}"), "project": "gid",
+            "where": {"col": "id", "in": {"table": format!("grants{n}"), "project": "gid"}}}})
+    }
+
+    /// One commit withdraws the grant behind BOTH links, and the event row is untouched. The
+    /// grants are the inner sets the commit's changes touch directly; the links are parent sets,
+    /// re-derived later by the flips' walk. Each parent's flip, looked past on its own, still
+    /// finds the other parent without Record 7, so the row is seen as a member before the commit
+    /// only if the parents' transitions are part of the commit's record too. Two flips, one removal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_removes_a_snapshot_row_once_when_one_commit_empties_two_nested_inner_sets() {
+        let schemas = two_link_schemas();
+        let table = |name: &str| schemas[&TableRef::from(name)].clone();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(&ds_url), None);
+        reg.set_schemas(Arc::new(schemas.clone()));
+        let pred: PredicateJson =
+            serde_json::from_value(serde_json::json!({"and": [linked_through(1), linked_through(2)]})).unwrap();
+        let begin = reg.begin_create("feed", &TableRef::from("events"), "shape/feed", &pred, None, true).unwrap();
+        assert_eq!(begin.seeds.len(), 4, "two link sets, each over its own grant set");
+        // Link 5 ties Record 7 in both tables, and grant 1 grants link 5 in both.
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, inner, _)| {
+                let ts = &schemas[inner];
+                let granting = [TableRef::from("grants1"), TableRef::from("grants2")].contains(inner);
+                let row = if granting { id_gid_row(ts, 1, 5) } else { id_gid_row(ts, 5, 7) };
+                (sig.clone(), vec![row], crate::pg::SnapshotGate::passthrough())
+            })
+            .collect();
+        reg.finish_create("feed", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default()).await.unwrap();
+        let row = id_gid_row(&table("events"), 1, 7);
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([
+            ("links1", vec![id_gid_row(&table("links1"), 5, 7)]),
+            ("links2", vec![id_gid_row(&table("links2"), 5, 7)]),
+            ("events", vec![row.clone()]),
+        ])));
+
+        let (grants1, grants2) = (table("grants1"), table("grants2"));
+        let mut work = reg
+            .on_table_delta(&grants1, &[Tup2(id_gid_row(&grants1, 1, 5), -1)], 0x10, None, None, None)
+            .await
+            .unwrap();
+        work.extend(
+            reg.on_table_delta(&grants2, &[Tup2(id_gid_row(&grants2, 1, 5), -1)], 0x10, None, None, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(work.len(), 2, "both grant sets lose link 5");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+
+        let reg = registry.lock().await;
+        assert!(
+            reg.nodes.values().all(|node| !reg.contains(&node.sig, &Value::Int(7))),
+            "both link sets lost Record 7"
+        );
+        assert_eq!(
+            envs_for(&store, "shape/feed"),
+            vec![(TableRef::from("events").to_string(), "1".to_string(), "delete".to_string())]
+        );
+    }
+
+    /// A value that enters an inner set and leaves it again inside one commit was not in the set
+    /// before the commit and is not in it after. A row that depends on it was never in the scope
+    /// at any commit boundary, so the client never held it and the feed owes it nothing: the
+    /// commit's record (the value was absent before) outranks the flip being propagated (it left).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_changes_only_feed_sends_nothing_when_a_value_enters_and_leaves_within_one_commit() {
+        let (events, grants, schedule, store, mut reg, _, _) = granted_and_scheduled_feed().await;
+        // Record 9 is scheduled but not granted, so its event is outside the scope.
+        reg.on_table_delta(&schedule, &[Tup2(record_link(&schedule, 2, 9), 1)], 3, None, None, None).await.unwrap();
+        let outside = event(&events, 1, 9, 12, None);
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![outside])])));
+
+        let mut work =
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 2, 9), 1)], 0x10, None, None, None).await.unwrap();
+        work.extend(
+            reg.on_table_delta(&grants, &[Tup2(record_link(&grants, 2, 9), -1)], 0x10, None, None, None).await.unwrap(),
+        );
+        assert_eq!(work.len(), 2, "the grant's arrival and its withdrawal are two flips");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/10").await;
+
+        assert!(
+            envs_for(&store, "shape/feed").is_empty(),
+            "the row was outside the scope before the commit and after it, got {:?}",
+            envs_for(&store, "shape/feed")
+        );
     }
 }

@@ -743,7 +743,11 @@ sequencer feeds every table's deltas into:
   just before the change** (`subquery::Prior`): an outer-row change carries the row's old image,
   and a flip's query-back re-judges each candidate with the flip looked past; both are judged
   against the inner sets as they stood before the commit, which the registry reconstructs from the
-  transitions that commit has applied (`CommitScope`), and each departure is said once per commit.
+  transitions that commit has applied (`CommitScope`): those of a set whose inner table the commit
+  changed, and those of a parent set that a flip's walk re-derived afterwards (a nested subquery).
+  Where that record knows a value it decides, not the flip being propagated, so a value that
+  entered and left inside one commit counts as absent before it. Each departure is said once per
+  commit.
   A row that was never in the scope proves nothing and emits nothing, so the wake-storm property
   holds. The proof is exact for the causes that meet in one evaluation. It can miss a row with two
   causes that do not: its membership rests on two inner sets that both drop it in one commit and a
