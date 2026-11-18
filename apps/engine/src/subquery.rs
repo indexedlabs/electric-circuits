@@ -337,10 +337,6 @@ pub(crate) enum EmissionSource<'a> {
 /// moves more than once the FIRST transition wins, because that is the state before all of them.
 pub(crate) type Undone = HashMap<SubquerySig, HashMap<Value, bool>>;
 
-fn note_undone(undone: &mut Undone, sig: &SubquerySig, flip: &Flip) {
-    undone.entry(sig.clone()).or_default().entry(flip.value.clone()).or_insert(matches!(flip.dir, FlipDir::Leave));
-}
-
 /// What the caller of [`SubqueryRegistry::emit_for_shapes_with`] can prove about its candidates'
 /// membership **immediately before** the change being evaluated — the second way the delete gate
 /// opens, used only for a [`changes_only`](SubqueryShape::changes_only) feed.
@@ -358,7 +354,8 @@ fn note_undone(undone: &mut Undone, sig: &SubquerySig, flip: &Flip) {
 /// evaluation: its membership rests on two inner sets that both drop it in one commit and a later
 /// commit reaches the registry before that commit's query-backs run, or the row itself changes
 /// in a later commit while a flip that already removed it is still waiting for its query-back.
-/// Only a key set seeded with what the client holds — a materialized shape — is exact.
+/// A commit too large for its record ([`CommitScope::saturated`]) reaches the same limit inside
+/// itself. Only a key set seeded with what the client holds — a materialized shape — is exact.
 #[derive(Clone, Copy)]
 pub(crate) enum Prior<'a> {
     /// Nothing beyond the key set.
@@ -398,6 +395,15 @@ impl Prior<'_> {
     }
 }
 
+/// How much one commit's record ([`CommitScope`]) may hold, in estimated heap bytes.
+///
+/// The record grows with every inner value the commit flips and every removal it proves, and one
+/// transaction can do either any number of times: a bulk delete that takes a thousand values out
+/// of each of a few hundred inner sets is some hundred thousand transitions. Typical commits
+/// record a handful. Past this the record is given up for the rest of the commit — see
+/// [`CommitScope::saturated`] for what that costs.
+pub(crate) const COMMIT_PROOF_MAX_BYTES: usize = 8 * 1024 * 1024;
+
 /// What the registry remembers about the ONE commit it is ingesting, for [`Prior`]. Replaced when
 /// the next commit's first change arrives, so nothing accumulates across commits; a change with no
 /// LSN (0) keeps nothing.
@@ -413,6 +419,84 @@ struct CommitScope {
     /// can prove the same departure more than once — an outer-row change and the flip behind it,
     /// or two flips that each took the row out — and the stream needs to hear it once.
     removed: HashSet<(i64, String)>,
+    /// A running estimate of what `undone` and `removed` hold, so the budget is checked without
+    /// walking them.
+    bytes: usize,
+    /// The record outgrew [`COMMIT_PROOF_MAX_BYTES`] and was given up: for the rest of this commit
+    /// nothing is recorded, and an evaluation is judged as one that belongs to an earlier commit
+    /// is — by its own cause alone (the flip being propagated, or the row's old image against the
+    /// sets as they are now). That is the proof's documented limit, reached early: a row with two
+    /// causes in this commit can be missed, a value that entered and left inside it can produce a
+    /// delete for a row that was never in the scope, and a departure proven twice is said twice.
+    /// None of them removes a row that is in the scope: a delete is only ever sent for a row that
+    /// is not a member now.
+    saturated: bool,
+}
+
+impl CommitScope {
+    /// Record one inner-set transition. When a value moves more than once the first transition is
+    /// kept: that is its state before all of them.
+    fn note_transition(&mut self, sig: &SubquerySig, flip: &Flip) {
+        if self.saturated {
+            return;
+        }
+        if !self.undone.contains_key(sig) {
+            self.bytes += std::mem::size_of::<(SubquerySig, HashMap<Value, bool>)>() + sig.heap_bytes();
+            self.undone.insert(sig.clone(), HashMap::new());
+        }
+        let values = self.undone.get_mut(sig).expect("inserted above");
+        if !values.contains_key(&flip.value) {
+            self.bytes += std::mem::size_of::<(Value, bool)>() + flip.value.heap_bytes();
+            values.insert(flip.value.clone(), matches!(flip.dir, FlipDir::Leave));
+        }
+        self.keep_inside_budget();
+    }
+
+    /// Whether this is the first time the commit removes `pk` from `feed_id`, recording it if so.
+    /// Always the first once the record is given up.
+    fn first_removal(&mut self, feed_id: i64, pk: &str) -> bool {
+        if self.saturated {
+            return true;
+        }
+        let first = self.removed.insert((feed_id, pk.to_string()));
+        if first {
+            self.bytes += std::mem::size_of::<(i64, String)>() + pk.len();
+            self.keep_inside_budget();
+        }
+        first
+    }
+
+    /// `pk` is back in `feed_id`'s scope: a later departure in this commit is news again.
+    fn forget_removal(&mut self, feed_id: i64, pk: &str) {
+        if !self.removed.is_empty() && self.removed.remove(&(feed_id, pk.to_string())) {
+            self.bytes = self.bytes.saturating_sub(std::mem::size_of::<(i64, String)>() + pk.len());
+        }
+    }
+
+    fn keep_inside_budget(&mut self) {
+        if self.bytes <= COMMIT_PROOF_MAX_BYTES {
+            return;
+        }
+        tracing::warn!(
+            event = "subquery_commit_record_given_up",
+            commit_lsn = %crate::engine::emission::lsn_text(self.lsn),
+            transitions = self.undone.values().map(HashMap::len).sum::<usize>(),
+            removals = self.removed.len(),
+            budget_bytes = COMMIT_PROOF_MAX_BYTES,
+            "one commit's record of inner-set transitions outgrew its budget; for the rest of this commit a \
+             changes-only feed's removals are proven one cause at a time"
+        );
+        self.undone = Undone::new();
+        self.removed = HashSet::new();
+        self.bytes = 0;
+        self.saturated = true;
+    }
+}
+
+impl HeapSize for CommitScope {
+    fn heap_bytes(&self) -> usize {
+        self.undone.heap_bytes() + self.removed.heap_bytes()
+    }
 }
 
 /// The registry's inner sets as they stood before some transitions (see [`Undone`]).
@@ -729,7 +813,8 @@ impl HeapSize for SubqueryRegistry {
     /// [`SubqueryRegistry::feed_sets_bytes`]). `ds` (a client
     /// handle) and `schemas` (`Arc`-shared with the engine's compiled
     /// schema) are not uniquely owned; `lanes` holds channel senders, not owned data;
-    /// `next_node_id`/`next_feed_id` are inline counters.
+    /// `next_node_id`/`next_feed_id` are inline counters. `commit` is the record of the commit
+    /// being ingested: owned, bounded by [`COMMIT_PROOF_MAX_BYTES`], and replaced per commit.
     fn heap_bytes(&self) -> usize {
         self.nodes.heap_bytes()
             + self.edges.heap_bytes()
@@ -742,6 +827,7 @@ impl HeapSize for SubqueryRegistry {
             + self.pending_seed.heap_bytes()
             + self.pending_shapes.heap_bytes()
             + self.collect_log.heap_bytes()
+            + self.commit.heap_bytes()
             + self.pg_url.heap_bytes()
             + self.commit_times.heap_bytes()
     }
@@ -2104,7 +2190,7 @@ impl SubqueryRegistry {
     /// record is the one commit's, and such an evaluation is judged without it.
     fn note_commit_flip(&mut self, commit_lsn: u64, sig: &SubquerySig, flip: &Flip) {
         if commit_lsn != 0 && self.commit.lsn == commit_lsn {
-            note_undone(&mut self.commit.undone, sig, flip);
+            self.commit.note_transition(sig, flip);
         }
     }
 
@@ -2141,7 +2227,9 @@ impl SubqueryRegistry {
         // That commit's inner-set transitions, lent to the proof for the synchronous evaluation
         // below and put back before anything awaits. Moved out and back, never copied: a commit
         // can hold thousands of flips, and each reaches hundreds of shapes.
-        let lent = (same_commit && !matches!(prior, Prior::Unknown)).then(|| std::mem::take(&mut self.commit.undone));
+        // A record that was given up lends nothing: the evaluation is judged by its own cause.
+        let lent = (same_commit && !self.commit.saturated && !matches!(prior, Prior::Unknown))
+            .then(|| std::mem::take(&mut self.commit.undone));
         let no_record = Undone::new();
         // The commit stamp a live/replayed decision records for the pks it evaluates; `None` for a
         // query-back, which reads this map instead of writing it.
@@ -2198,9 +2286,9 @@ impl SubqueryRegistry {
                     // Current member: deliver the upsert and record presence in the feed.
                     let pk_id = self.pk_dict.get_or_insert(&pk);
                     self.feed_sets.insert(feed_id, pk_id);
-                    if same_commit && !self.commit.removed.is_empty() {
+                    if same_commit {
                         // Back in the scope: a later departure in this commit is news again.
-                        self.commit.removed.remove(&(feed_id, pk.clone()));
+                        self.commit.forget_removal(feed_id, &pk);
                     }
                     if record_recency {
                         evaluated.push(pk_id);
@@ -2222,7 +2310,7 @@ impl SubqueryRegistry {
                     if delivered || proven {
                         // Said once per commit, however many of the commit's changes prove it. A
                         // key-set retraction is never held back: it is the stream's own record.
-                        let first = !(changes_only && same_commit) || self.commit.removed.insert((feed_id, pk.clone()));
+                        let first = !(changes_only && same_commit) || self.commit.first_removal(feed_id, &pk);
                         if delivered || first {
                             deletes.entry(shape_id.clone()).or_default().push(pk.clone());
                         }
@@ -2244,7 +2332,10 @@ impl SubqueryRegistry {
             }
             staged.push((shape_id, members));
         }
-        if let Some(undone) = lent {
+        // Not put back into a record this evaluation's own removals just pushed past its budget.
+        if let Some(undone) = lent
+            && !self.commit.saturated
+        {
             self.commit.undone = undone;
         }
         // Phase 3: build + deliver per shape (still under the caller's lock — enqueue order
@@ -6294,6 +6385,119 @@ pub(crate) mod tests {
             envs_for(&store, "shape/feed").is_empty(),
             "the row was outside the scope before the commit and after it, got {:?}",
             envs_for(&store, "shape/feed")
+        );
+    }
+
+    // The commit's record is owned heap for as long as that commit is the one being ingested, and
+    // one transaction can flip any number of inner values. So it is counted, and it is bounded.
+
+    /// `grants(id, name)` and `count` of its rows: an inner table whose projected value is text,
+    /// so a test can make the values of one commit as large as it needs (`bytes` each).
+    fn named_grants(count: usize, bytes: usize) -> (TableSchema, Vec<Row>) {
+        use crate::schema::TableDef;
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "name": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let ts = TableSchema::from_def(&TableRef::from("grants"), &def).unwrap();
+        let rows = (0..count)
+            .map(|i| {
+                let name = format!("{i:08}{}", "x".repeat(bytes - 8));
+                ts.row_from_json(serde_json::json!({"id": i, "name": name}).as_object().unwrap()).unwrap()
+            })
+            .collect();
+        (ts, rows)
+    }
+
+    /// A registry with one inner set, `granted`, over [`named_grants`]' table.
+    fn registry_with_named_grants(ds_url: &str, ts: &TableSchema) -> SubqueryRegistry {
+        let mut reg = SubqueryRegistry::new(DsClient::new_for_in_process_test(ds_url), None);
+        insert_test_node_on(&mut reg, "granted", "grants", ts.column_index("name").unwrap());
+        reg
+    }
+
+    /// What the registry's heap accounting attributes to the commit being ingested: its total now,
+    /// less its total once the next commit's first change has replaced the record.
+    async fn counted_for_the_commit(reg: &mut SubqueryRegistry, ts: &TableSchema, next_lsn: u64) -> usize {
+        let during = reg.heap_bytes();
+        reg.on_table_delta(ts, &[], next_lsn, None, None, None).await.unwrap();
+        during.saturating_sub(reg.heap_bytes())
+    }
+
+    /// The registry's heap accounting (`/memory`) includes the record of the commit being ingested.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commits_proof_record_is_counted_in_the_registrys_heap() {
+        const VALUE_BYTES: usize = 1024;
+        let (ts, rows) = named_grants(100, VALUE_BYTES);
+        let mut reg = registry_with_named_grants("http://unused", &ts);
+        reg.set_schemas(Arc::new([(TableRef::from("grants"), ts.clone())].into_iter().collect()));
+        let delta: Vec<Tup2<Row, ZWeight>> = rows.into_iter().map(|row| Tup2(row, 1)).collect();
+        let flips = reg.on_table_delta(&ts, &delta, 0x10, None, None, None).await.unwrap();
+        assert_eq!(flips.len(), 100, "every grant is a transition the commit's record keeps");
+
+        let counted = counted_for_the_commit(&mut reg, &ts, 0x20).await;
+        assert!(counted >= 100 * VALUE_BYTES, "100 transitions of {VALUE_BYTES} bytes each, counted {counted} bytes");
+    }
+
+    /// A commit whose record would outgrow [`COMMIT_PROOF_MAX_BYTES`] does not keep it: the record
+    /// is given up for the rest of that commit, and nothing more is recorded. What is lost is the
+    /// view of the commit's OTHER transitions, never the proof itself: each flip is then judged on
+    /// its own, as it is for an earlier commit, so a row with one cause is still removed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commits_proof_record_stays_inside_its_budget_and_then_judges_one_cause_at_a_time() {
+        use crate::schema::TableDef;
+        const VALUE_BYTES: usize = 512 * 1024;
+        let (grants, rows) = named_grants(COMMIT_PROOF_MAX_BYTES / VALUE_BYTES + 4, VALUE_BYTES);
+        let def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "label": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        let events = TableSchema::from_def(&TableRef::from("events"), &def).unwrap();
+        let (ds_url, store) = spawn_fake_ds().await;
+        let mut reg = registry_with_named_grants(&ds_url, &grants);
+        let label = events.column_index("label").unwrap();
+        let granted: SubquerySig = "granted".into();
+        insert_changes_only_feed(
+            &mut reg,
+            "feed",
+            "events",
+            CompiledPredicate::InSubquery { col: label, sig: granted.clone(), negated: false },
+        );
+        reg.add_edge(flip_edge(&granted, Dependent::Shape("feed".into()), label));
+        reg.set_schemas(Arc::new(
+            [(TableRef::from("grants"), grants.clone()), (TableRef::from("events"), events.clone())]
+                .into_iter()
+                .collect(),
+        ));
+
+        // One commit grants every name: more transitions than the budget holds.
+        let grant: Vec<Tup2<Row, ZWeight>> = rows.iter().cloned().map(|row| Tup2(row, 1)).collect();
+        reg.on_table_delta(&grants, &grant, 0x10, None, None, None).await.unwrap();
+        let counted = counted_for_the_commit(&mut reg, &grants, 0x18).await;
+        assert!(
+            counted <= COMMIT_PROOF_MAX_BYTES,
+            "the record of one commit must stay inside {COMMIT_PROOF_MAX_BYTES} bytes, counted {counted}"
+        );
+
+        // The client holds event 1 from its snapshot: its label is the first granted name. Another
+        // commit, as large, withdraws every grant; the flip that takes event 1 out still removes it.
+        let name = grants.column_index("name").unwrap();
+        let first = rows[0].0[name].clone();
+        let Value::Text(label_text) = &first else { panic!("a text projection") };
+        let held = events
+            .row_from_json(serde_json::json!({"id": 1, "label": label_text.to_string()}).as_object().unwrap())
+            .unwrap();
+        reg.fake_candidates = Some(Arc::new(FakeCandidates::with_rows([("events", vec![held])])));
+        let withdraw: Vec<Tup2<Row, ZWeight>> = rows.iter().cloned().map(|row| Tup2(row, -1)).collect();
+        let mut work = reg.on_table_delta(&grants, &withdraw, 0x20, None, None, None).await.unwrap();
+        work.retain(|(_, flip)| flip.value == first);
+        assert_eq!(work.len(), 1, "the withdrawal of the first name is one flip");
+        let registry = tokio::sync::Mutex::new(reg);
+        propagate(&registry, work, "0/20").await;
+
+        assert_eq!(
+            envs_for(&store, "shape/feed"),
+            vec![(TableRef::from("events").to_string(), "1".to_string(), "delete".to_string())]
         );
     }
 }

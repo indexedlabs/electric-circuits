@@ -753,8 +753,19 @@ sequencer feeds every table's deltas into:
   causes that do not: its membership rests on two inner sets that both drop it in one commit and a
   later commit reaches the registry before the query-backs run, or the row itself changes in a
   later commit while a flip that already removed it is still waiting for its query-back. Those
-  rows stay until the client's next snapshot. Only a key set seeded with what the client holds —
-  a materialized shape — is exact. Materialized shapes ignore the proof entirely.
+  rows stay until the client's next snapshot. An evaluation that runs after its commit's record
+  is gone can also say too much: a value that entered an inner set and left it again in that
+  commit reads as present before it, so a row that was never in the scope is sent a delete, and a
+  departure that two flips prove is said twice. A delete is only ever sent for a row that is not
+  a member now, so a client that does not hold the row drops it. Only a key set seeded with what
+  the client holds — a materialized shape — is exact. Materialized shapes ignore the proof
+  entirely.
+
+  The commit's record is owned heap while that commit is being ingested, so it is counted in the
+  registry's heap (`/memory`) and bounded: `COMMIT_PROOF_MAX_BYTES`, 8 MiB of transitions and
+  removals. A commit that outgrows it — a bulk change that moves some hundred thousand inner
+  values — gives the record up, and for the rest of that commit each evaluation is judged by its
+  own cause alone, exactly as one that belongs to an earlier commit is, with the same limits.
 - **Query-back recency** — absolute assertion makes cross-pk ordering irrelevant, but the *last*
   evaluation of a given pk still has to be the freshest one. A query-back reads its candidates at
   one Postgres snapshot with the registry lock released, so a direct outer-row change committed
