@@ -50,6 +50,15 @@ The engine sets everything else up for you on startup, per configured table:
 > instance. If you run more than one engine against the same database, give each a distinct
 > `ELECTRIC_CIRCUITS_PG_SLOT`.
 
+> **Time zone: any. Date style: ISO.** The engine works in UTC whatever the database, the role or
+> the server defaults to: its query sessions ask for `TimeZone=UTC` and `DateStyle=ISO` as they
+> start (so connect it to Postgres directly, or through a pooler that passes the `options` startup
+> parameter — a session that did not take them is refused), and replicated timestamps are respelled
+> in UTC as they arrive. The one thing it needs from the defaults is the **ISO date style for the
+> engine's role** (`ISO, MDY` is Postgres's own default): the replication connection takes no
+> startup options, and a role or database set to `German`, `SQL` or `Postgres` style is refused at
+> boot (exit `78`) with the `ALTER ROLE … SET datestyle` that fixes it.
+
 ## Step 2 — Run the engine
 
 Point it at Postgres, list the tables to watch, and give it the durable-streams URL:

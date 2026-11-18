@@ -2768,6 +2768,10 @@ impl Engine {
         // `waiting` while the engine is trying to reach Postgres, not `starting`.
         self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         let client = crate::pg::connect_owned(&url, &self.shutdown).await?;
+        // The replication session takes no startup options, so whether its dates are readable is
+        // the database's, the role's or the server's to say. Asked here, where the boot dials, and
+        // before anything is served from text the engine would misread — named, like `wal_level`.
+        crate::pg::check_replication_session(&url, &self.shutdown).await?;
         self.setup_postgres_connected(client, selectors, slot).await
     }
 

@@ -28,6 +28,8 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 | `conformance.test.ts`, `-postgres`, `-backfill` | core invariant: live replication, batched mutations, backfill ↔ live fencing |
 | `conformance-concurrency.test.ts` | concurrent writers |
 | `conformance-nulls.test.ts` | NULL three-valued logic (`NOT (col = x)` over NULL, `IS [NOT] NULL`) |
+| `conformance-timestamp-zones.test.ts` | timestamps under a non-UTC database default (a DST zone, a half-hour zone): window predicates, and one spelling of an instant in backfill and live rows; a non-ISO `DateStyle` is refused at boot |
+| `conformance-subset-feed-scope.test.ts` | a subset feed judges a `timestamptz` window as its snapshot's SQL did: a change to a row on the window's first UTC date reaches the client |
 | `conformance-subquery*.test.ts` | `IN (SELECT …)`: scenarios, cross-table matrix, nested subqueries, inner-node sharing |
 | `conformance-sharing`, `-shape-sharing` | identical shapes/feeds collapse to one stream, refcounted create/drop |
 | `conformance-subset-positioning.test.ts` | subset LSN positioning: a change in the page/feed overlap window is counted exactly once |

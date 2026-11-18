@@ -870,6 +870,41 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 *only* here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
+The page is judged by Postgres and the feed by the engine, so the two must read one predicate the
+same way. Timestamps are where they did not: a `timestamptz`/`timestamp`/`date` cell is text as
+Postgres prints it (`2026-10-19 16:00:00+00`) and the engine compares text, while a client may send
+any spelling of the bound (`2026-10-19T07:00:00Z`). A recognised literal for such a column is
+therefore respelled at compile time the way Postgres prints it (`pg_temporal`), which keeps every
+comparison a text comparison.
+
+Text order is instant order only when every cell is printed in one zone, and Postgres prints a
+`timestamptz` in the *session's*. So **every cell reaches the engine in UTC and ISO style, whatever
+the database, the role or the server defaults to**, by a different means on each road:
+
+- **Query sessions** (backfills, subset pages, seeds, query-backs — every connection
+  `pg::PgConnectionConfig` opens) send the startup options `-c TimeZone=UTC -c DateStyle=ISO`,
+  after any `options` the URL carries, so theirs win. The server reports both settings back as the
+  session starts; a session that did not take them (a pooler that drops startup options) is refused
+  rather than used, at no extra round-trip. This also fixes how SQL reads a `timestamptz` literal
+  with no zone: as UTC, which is how `pg_temporal` reads it.
+- **The replication session** takes no startup options at all (`pgwire-replication` sends none),
+  so its zone is whatever the defaults say. Each replicated cell of a zone-dependent type —
+  `timestamptz`, and arrays, ranges and multiranges of it — is respelled in UTC as it is decoded
+  (`pg_temporal::utc_cell`, from `replication::tuple_to_map`), in the new image and the old one
+  alike. A backfill row and that row's next live change therefore spell one instant with the same
+  bytes; a client comparing what it holds with what arrives sees no difference where there is
+  none.
+- Respelling needs the ISO style, and that the engine cannot give the replication session either.
+  The boot opens one session with no options — the same defaults the walsender will get — and
+  **refuses to start** (exit 78, naming `ALTER ROLE … SET datestyle`) unless its `DateStyle` is
+  ISO (`pg::check_replication_session`). The check is at boot only: a default changed under a
+  running engine takes effect at the next replication reconnect and is not re-checked there.
+
+Not respelled, and left as the session printed them: `infinity`/`-infinity` (the same in every
+zone), a `BC` year and a year the shift carries outside 0001–9999. Other session settings that
+shape a cell's text — `IntervalStyle`, `bytea_output`, `extra_float_digits` — are still the
+defaults' on both roads, and so agree with each other only while nothing sets them on one.
+
 Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
 backfills, seeds and query-backs. Each page the engine accepts (one `ensure_not_degraded` has not
 already refused) logs one `subset query finished` event (target
