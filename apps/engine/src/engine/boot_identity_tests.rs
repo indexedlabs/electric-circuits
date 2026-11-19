@@ -118,15 +118,15 @@ async fn boot_requests_no_exclusive_lock_on_a_table_that_is_already_full() -> Re
 
 /// A table that still needs `REPLICA IDENTITY FULL` while a reader holds it: boot gives up its lock
 /// wait with a retryable failure instead of queueing every later reader behind it, readers proceed,
-/// and the next attempt sets the identity once the reader is gone.
+/// and once the reader is gone the SAME engine's next attempt sets the identity, as the boot loop's
+/// retry does in production. A fresh engine then boots too, against the now-FULL table.
 #[tokio::test]
 #[ignore = "requires PostgreSQL via ELECTRIC_CIRCUITS_TEST_PG_URL; stream storage is scripted"]
 async fn boot_gives_up_a_held_identity_lock_and_retries_once_it_is_free() -> Result<()> {
     let fixture = Fixture::new("default").await?;
 
-    let first = fixture.engine();
-    let attempted = fixture.boot(&first).await;
-    first.close(Duration::from_secs(10)).await;
+    let engine = fixture.engine();
+    let attempted = fixture.boot(&engine).await;
 
     // While the reader is still open, another reader is not queued behind a parked boot.
     let other = crate::pg::connect(&fixture.url).await?;
@@ -137,11 +137,16 @@ async fn boot_gives_up_a_held_identity_lock_and_retries_once_it_is_free() -> Res
     .await;
     drop(other);
 
+    // The boot loop retries `setup_postgres` on the engine whose attempt failed, with whatever state
+    // that attempt left (epoch binding, change log, queued catalog events); so does this.
     fixture.reader.batch_execute("commit").await?;
-    let second = fixture.engine();
-    let retried = fixture.boot(&second).await;
-    second.close(Duration::from_secs(10)).await;
+    let retried = fixture.boot(&engine).await;
+    engine.close(Duration::from_secs(10)).await;
     let identity = fixture.replident().await;
+
+    let fresh = fixture.engine();
+    let restarted = fixture.boot(&fresh).await;
+    fresh.close(Duration::from_secs(10)).await;
     fixture.cleanup().await?;
 
     let err = match attempted {
@@ -152,9 +157,13 @@ async fn boot_gives_up_a_held_identity_lock_and_retries_once_it_is_free() -> Res
     assert_eq!(crate::pg::boot_disposition(&err), crate::pg::BootFailure::Retryable, "{err:#}");
     assert!(unblocked.is_ok_and(|r| r.is_ok()), "a later reader stayed queued behind the boot");
     match retried {
-        Ok(result) => result?,
-        Err(_) => anyhow::bail!("the retry did not finish within {DEADLINE:?} once the reader was gone"),
+        Ok(result) => result.context("the same engine's retry failed once the reader was gone")?,
+        Err(_) => anyhow::bail!("the same engine's retry did not finish within {DEADLINE:?} once the reader was gone"),
     }
     assert_eq!(identity?, "f");
+    match restarted {
+        Ok(result) => result.context("a fresh engine failed to boot against the now-FULL table")?,
+        Err(_) => anyhow::bail!("a fresh engine did not boot within {DEADLINE:?} against the now-FULL table"),
+    }
     Ok(())
 }
