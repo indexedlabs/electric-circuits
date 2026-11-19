@@ -2906,37 +2906,37 @@ impl Engine {
         if pubinfo.publish_generated {
             tracing::info!("publication '{publication}' publishes stored generated columns");
         }
-        // Which tables still need `REPLICA IDENTITY FULL`, read in one round trip. The `ALTER` takes
-        // `ACCESS EXCLUSIVE` even when it changes nothing, and while that request waits behind any
-        // open transaction on the table, every later reader of the table queues behind it, so a
-        // table that is already FULL must not be altered again on every boot.
-        let identities = if self.postgres_setup == PostgresSetup::EngineManaged {
-            crate::pg::fingerprints(&client, &tables, self.publish_generated.load(Ordering::Acquire)).await?
-        } else {
-            HashMap::new()
+        let is_full = |def: &crate::schema::TableDef| {
+            def.fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint.replident == crate::schema::REPLICA_IDENTITY_FULL)
         };
         let mut compiled = HashMap::new();
         for t in &tables {
-            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
-            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
-            // identity — which the ingestor's first `Relation` message would then report as drift
-            // on every single boot (ADR-0005). A table missing from `identities` is altered too,
-            // so a vanished table fails here as it always has.
-            if self.postgres_setup == PostgresSetup::EngineManaged
-                && identities
-                    .get(t)
-                    .is_none_or(|fingerprint| fingerprint.replident != crate::schema::REPLICA_IDENTITY_FULL)
-            {
+            // The identity is decided from the very definition that gets compiled, never from an
+            // earlier read: the compiled fingerprint includes `relreplident`, and drift is judged
+            // against it (ADR-0005). Compiling a non-FULL identity would be silent, since the wire
+            // would then agree with it and no `Relation` message would ever report drift.
+            //
+            // A table that is already FULL is not altered: the `ALTER` takes `ACCESS EXCLUSIVE` even
+            // when it changes nothing, and while that request waits behind any open transaction on
+            // the table, every later reader of the table queues behind it. One that is not FULL is
+            // altered with a bounded wait and introspected again, so the definition compiled is one
+            // read after the identity was set.
+            let mut def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
+            if !is_full(&def) {
+                if self.postgres_setup == PostgresSetup::ExternallyManaged {
+                    bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+                }
                 crate::pg::ensure_replica_identity_full(&client, t, crate::pg::BOOT_IDENTITY_LOCK_TIMEOUT).await?;
-            }
-            let def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
-            if self.postgres_setup == PostgresSetup::ExternallyManaged
-                && def
-                    .fingerprint
-                    .as_ref()
-                    .is_none_or(|fingerprint| fingerprint.replident != crate::schema::REPLICA_IDENTITY_FULL)
-            {
-                bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+                def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
+                if !is_full(&def) {
+                    // Only a concurrent `ALTER` between the two statements can do this; the engine
+                    // must not compile what it just tried and failed to fix.
+                    bail!(
+                        "table '{t}' lost REPLICA IDENTITY FULL right after the engine set it; a migration is changing it"
+                    );
+                }
             }
             let ts = self.compile_ingest_table(t, &def)?;
             compiled.insert(t.clone(), ts);

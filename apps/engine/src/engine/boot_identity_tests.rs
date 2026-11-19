@@ -71,6 +71,19 @@ impl Fixture {
             .await
     }
 
+    /// The `relreplident` of the schema the engine compiled for the table: what drift is judged
+    /// against, and so what must be FULL, whatever the catalog says afterwards.
+    fn compiled_replident(&self, engine: &Engine) -> Option<u8> {
+        engine
+            .tables_shared
+            .read()
+            .unwrap()
+            .get(&self.table)?
+            .fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.replident)
+    }
+
     async fn replident(&self) -> Result<String> {
         let row = self
             .client
@@ -105,6 +118,7 @@ async fn boot_requests_no_exclusive_lock_on_a_table_that_is_already_full() -> Re
     let fixture = Fixture::new("full").await?;
     let engine = fixture.engine();
     let booted = fixture.boot(&engine).await;
+    let compiled = fixture.compiled_replident(&engine);
     engine.close(Duration::from_secs(10)).await;
     let identity = fixture.replident().await;
     fixture.cleanup().await?;
@@ -113,6 +127,7 @@ async fn boot_requests_no_exclusive_lock_on_a_table_that_is_already_full() -> Re
         Err(_) => anyhow::bail!("boot did not finish within {DEADLINE:?} while a reader held an already-FULL table"),
     }
     assert_eq!(identity?, "f");
+    assert_eq!(compiled, Some(b'f'), "the engine compiled a non-FULL identity");
     Ok(())
 }
 
@@ -141,11 +156,13 @@ async fn boot_gives_up_a_held_identity_lock_and_retries_once_it_is_free() -> Res
     // that attempt left (epoch binding, change log, queued catalog events); so does this.
     fixture.reader.batch_execute("commit").await?;
     let retried = fixture.boot(&engine).await;
+    let compiled_after_retry = fixture.compiled_replident(&engine);
     engine.close(Duration::from_secs(10)).await;
     let identity = fixture.replident().await;
 
     let fresh = fixture.engine();
     let restarted = fixture.boot(&fresh).await;
+    let compiled_after_restart = fixture.compiled_replident(&fresh);
     fresh.close(Duration::from_secs(10)).await;
     fixture.cleanup().await?;
 
@@ -161,9 +178,11 @@ async fn boot_gives_up_a_held_identity_lock_and_retries_once_it_is_free() -> Res
         Err(_) => anyhow::bail!("the same engine's retry did not finish within {DEADLINE:?} once the reader was gone"),
     }
     assert_eq!(identity?, "f");
+    assert_eq!(compiled_after_retry, Some(b'f'), "the retry compiled the identity it read before setting FULL");
     match restarted {
         Ok(result) => result.context("a fresh engine failed to boot against the now-FULL table")?,
         Err(_) => anyhow::bail!("a fresh engine did not boot within {DEADLINE:?} against the now-FULL table"),
     }
+    assert_eq!(compiled_after_restart, Some(b'f'), "the fresh engine compiled a non-FULL identity");
     Ok(())
 }
