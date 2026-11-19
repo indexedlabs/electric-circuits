@@ -24,7 +24,10 @@
 //!   cells are respelled as they are decoded ([`utc_cell`]). The boot refuses a replication
 //!   session that would not print ISO at all ([`crate::pg::check_replication_session`]).
 //!
-//! Years are 0001–9999 (four digits, no `BC` suffix).
+//! A **literal** is read for years 0001–9999 (four digits, no `BC` suffix), the range in which
+//! text order is instant order. A **cell** is read over Postgres's whole range, 4713 BC to
+//! 294276: a row is whatever the table holds, and its replicated image has to be the bytes its
+//! backfilled image was.
 //!
 //! **A literal this module cannot read is refused, never compared as text**
 //! ([`UnreadableLiteral`]). Postgres reads far more than this grammar — month names, zone names
@@ -33,9 +36,14 @@
 //! text for one of those, SQL would judge the instant and the live path the spelling: the snapshot
 //! holds a row whose changes the feed never reports, which is the defect this module exists to
 //! remove. Reproducing Postgres's parser would mean reproducing its time zone database and its
-//! settings, so the engine reads the forms that need neither and says no to the rest. A **cell**
-//! it does not read (a `BC` year, a year the shift to UTC carries outside 0001–9999) is left as
-//! the session printed it; `infinity` and `-infinity` are the same in every zone.
+//! settings, so the engine reads the forms that need neither and says no to the rest.
+//!
+//! **A replicated cell that is not in the ISO date style is refused too**
+//! ([`check_cell_style`]). The check made before a replication connection is opened cannot see a
+//! `DateStyle` that a server reload changes inside the walsender afterwards, and a cell such as
+//! `19.10.2026 01:00:00 PDT` can be neither read nor respelled. It fails the decode: the
+//! connection is dropped unacknowledged, and the check before the next one names the setting.
+//! `infinity` and `-infinity` are the same in every zone and every style.
 
 /// A predicate compares a `timestamptz`, `timestamp` or `date` column with a literal the engine
 /// cannot read (see the module docs for why that is an error and not a text comparison).
@@ -99,7 +107,7 @@ fn spell(literal: &str, kind: Kind) -> Option<String> {
 
 /// Respell a replicated cell of a time-zone-dependent type the way a UTC session prints it, or
 /// `None` to leave the cell as it is: it is already UTC, its type's output does not depend on the
-/// session zone, or it is not something this module reads (see the module docs).
+/// session zone, or it is not a timestamp at all (`infinity`).
 ///
 /// The zone-dependent types are `timestamptz` and the arrays, ranges and multiranges built on it,
 /// by `pg_type.typname`. Every other type prints the same in every zone — `timestamp` and `date`
@@ -108,15 +116,12 @@ pub(crate) fn utc_cell(cell: &str, pg_type: &str) -> Option<String> {
     match pg_type {
         "timestamptz" => {
             // A zero offset prints as a bare `+00`: the common case once a deployment runs in UTC.
-            if cell.ends_with("+00") {
+            if cell.ends_with("+00") || cell.ends_with("+00 BC") {
                 return None;
             }
             let s = cell.as_bytes();
-            let (parsed, len) = parse_prefix(s, Spelling::Cell)?;
-            if len != s.len() {
-                return None;
-            }
-            render(parsed.local_micros - i64::from(parsed.offset_secs?) * MICROS, "+00")
+            let (stamp, len) = parse_cell(s)?;
+            (len == s.len()).then(|| stamp.in_utc())
         }
         "_timestamptz" | "tstzrange" | "_tstzrange" | "tstzmultirange" | "_tstzmultirange" => utc_elements(cell),
         _ => None,
@@ -124,13 +129,9 @@ pub(crate) fn utc_cell(cell: &str, pg_type: &str) -> Option<String> {
 }
 
 /// [`utc_cell`] for a container of `timestamptz`: every timestamp in it respelled in UTC, the
-/// punctuation around them (quotes, escapes, brackets, `NULL`) copied as it stands. `None` when
-/// nothing changes, or when any element is one this module does not read — a container is
-/// respelled whole or not at all.
+/// punctuation around them (quotes, escapes, brackets, `NULL`, `infinity`) copied as it stands.
+/// `None` when nothing changes.
 fn utc_elements(cell: &str) -> Option<String> {
-    if cell.contains(" BC") {
-        return None;
-    }
     let s = cell.as_bytes();
     let mut out = String::new();
     let mut copied = 0usize;
@@ -140,13 +141,11 @@ fn utc_elements(cell: &str) -> Option<String> {
         // parses as one.
         if s[at].is_ascii_digit()
             && (at == 0 || !s[at - 1].is_ascii_digit())
-            && let Some((parsed, len)) = parse_prefix(&s[at..], Spelling::Cell)
-            && let Some(offset) = parsed.offset_secs
+            && let Some((stamp, len)) = parse_cell(&s[at..])
         {
-            if offset != 0 {
-                let utc = render(parsed.local_micros - i64::from(offset) * MICROS, "+00")?;
+            if stamp.offset_secs != 0 {
                 out.push_str(&cell[copied..at]);
-                out.push_str(&utc);
+                out.push_str(&stamp.in_utc());
                 copied = at + len;
             }
             at += len;
@@ -159,6 +158,178 @@ fn utc_elements(cell: &str) -> Option<String> {
     }
     out.push_str(&cell[copied..]);
     Some(out)
+}
+
+/// One `timestamptz` as Postgres prints it in the ISO style, in whatever zone the session has:
+/// `Y{4,6}-MM-DD HH:MM[:SS[.ffffff]]±HH[:MM[:SS]][ BC]`.
+///
+/// Postgres's whole range is read. A year before year one is printed as a positive number with
+/// ` BC` after the zone (there is no year zero: 1 BC is the year before 1 AD), and a year past 9999
+/// simply has more digits. A zone long ago is the place's local mean time, to the second
+/// (`-07:52:58`). The date and the time are kept apart so that the far end of the range, which
+/// does not fit in an `i64` of microseconds since 1970, needs no wider arithmetic.
+struct CellStamp {
+    /// Days since 1970-01-01 of the cell's own (local) date, in the proleptic Gregorian calendar.
+    days: i64,
+    micros_of_day: i64,
+    /// Seconds east of UTC.
+    offset_secs: i32,
+}
+
+/// The [`CellStamp`] `s` begins with, and how many bytes of `s` it takes.
+fn parse_cell(s: &[u8]) -> Option<(CellStamp, usize)> {
+    let mut at = 0usize;
+    let year_digits = s.iter().take_while(|b| b.is_ascii_digit()).count();
+    if !(4..=6).contains(&year_digits) {
+        return None;
+    }
+    let year = digits(s, &mut at, year_digits)?;
+    expect(s, &mut at, b'-')?;
+    let month = digits(s, &mut at, 2)?;
+    expect(s, &mut at, b'-')?;
+    let day = digits(s, &mut at, 2)?;
+    expect(s, &mut at, b' ')?;
+    let (micros_of_day, end) = time_of_day(s, at)?;
+    at = end;
+    let offset_secs = zone(s, &mut at)?;
+    let before_christ = s.get(at..at + 3) == Some(b" BC".as_slice());
+    if before_christ {
+        at += 3;
+    }
+    if year == 0 {
+        return None;
+    }
+    // The astronomical year, which has a year zero: the one the calendar arithmetic counts in.
+    let year = if before_christ { 1 - year } else { year };
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some((CellStamp { days: days_from_civil(year, month, day), micros_of_day, offset_secs }, at))
+}
+
+impl CellStamp {
+    /// The same instant as a UTC session prints it.
+    fn in_utc(&self) -> String {
+        let shifted = self.micros_of_day - i64::from(self.offset_secs) * MICROS;
+        let (year, month, day) = civil_from_days(self.days + shifted.div_euclid(DAY_MICROS));
+        let of_day = shifted.rem_euclid(DAY_MICROS);
+        let (year, era) = if year <= 0 { (1 - year, " BC") } else { (year, "") };
+        let (seconds, fraction) = (of_day / MICROS, of_day % MICROS);
+        let mut out =
+            format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60);
+        if fraction != 0 {
+            let digits = format!("{fraction:06}");
+            out.push('.');
+            out.push_str(digits.trim_end_matches('0'));
+        }
+        out.push_str("+00");
+        out.push_str(era);
+        out
+    }
+}
+
+/// A replicated cell of a date or time type is not in the ISO date style (see the module docs).
+///
+/// Typed because of what the ingestor does with it: the decode fails, the replication connection
+/// is dropped without acknowledging the transaction, and the check before the next connection
+/// refuses it by name until the setting is ISO again — after which Postgres sends the transaction
+/// again, in a style the engine reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotIsoCell {
+    pub pg_type: String,
+    pub cell: String,
+}
+
+impl std::fmt::Display for NotIsoCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a replicated {} cell is not in the ISO date style ('{}'): the replication session's DateStyle is no \
+             longer ISO, and the engine reads no other",
+            self.pg_type, self.cell
+        )
+    }
+}
+
+impl std::error::Error for NotIsoCell {}
+
+/// Refuse a replicated cell of a `DateStyle`-dependent type that is not in the ISO style.
+///
+/// Those types are `timestamptz`, `timestamp` and `date`, and the arrays, ranges and multiranges
+/// built on them. In the ISO style every date in such a cell is spelled year first,
+/// `Y{4,6}-MM-DD`; the `German`, `SQL` and `Postgres` styles spell it `19.10.2026`, `10/19/2026`
+/// and `Mon Oct 19 … 2026` (or `10-19-2026` for a bare date). Everything that is not a date —
+/// `infinity`, `NULL`, `empty`, ` BC`, brackets and quotes — is the same in every style. A cell of
+/// any other type is never judged: its text is the application's.
+pub(crate) fn check_cell_style(cell: &str, pg_type: &str) -> Result<(), NotIsoCell> {
+    let styled = matches!(
+        pg_type,
+        "timestamptz"
+            | "timestamp"
+            | "date"
+            | "_timestamptz"
+            | "_timestamp"
+            | "_date"
+            | "tstzrange"
+            | "tsrange"
+            | "daterange"
+            | "_tstzrange"
+            | "_tsrange"
+            | "_daterange"
+            | "tstzmultirange"
+            | "tsmultirange"
+            | "datemultirange"
+            | "_tstzmultirange"
+            | "_tsmultirange"
+            | "_datemultirange"
+    );
+    if !styled || every_date_is_iso(cell.as_bytes()) {
+        return Ok(());
+    }
+    Err(NotIsoCell { pg_type: pg_type.to_string(), cell: cell.to_string() })
+}
+
+/// Whether every run of digits in `s` that starts a value starts an ISO-style date, with the time
+/// and the zone that may follow it.
+fn every_date_is_iso(s: &[u8]) -> bool {
+    // An array whose lower bounds are not 1 says so first (`[0:1]={…}`, `[-1:0][2:3]={{…}}`); those
+    // digits are no date. A range opens with `[` too, but never has `]=` after it.
+    let mut at = match s.first() {
+        Some(b'[') => s.windows(2).position(|w| w == b"]=").map_or(0, |end| end + 2),
+        _ => 0,
+    };
+    while at < s.len() {
+        if !s[at].is_ascii_digit() {
+            at += 1;
+            continue;
+        }
+        let Some(len) = iso_stamp_len(&s[at..]) else { return false };
+        at += len;
+    }
+    true
+}
+
+/// The length of the ISO-style date `s` begins with, and of the time and zone after it. A `date`
+/// reaches the year 5874897, so a year has four to seven digits.
+fn iso_stamp_len(s: &[u8]) -> Option<usize> {
+    let mut at = s.iter().take_while(|b| b.is_ascii_digit()).count();
+    if !(4..=7).contains(&at) {
+        return None;
+    }
+    expect(s, &mut at, b'-')?;
+    digits(s, &mut at, 2)?;
+    expect(s, &mut at, b'-')?;
+    digits(s, &mut at, 2)?;
+    if s.get(at) == Some(&b' ')
+        && let Some((_, end)) = time_of_day(s, at + 1)
+    {
+        at = end;
+        let mut zoned = at;
+        if zone(s, &mut zoned).is_some() {
+            at = zoned;
+        }
+    }
+    Some(at)
 }
 
 #[derive(Clone, Copy)]
@@ -181,31 +352,13 @@ struct Parsed {
     offset_secs: Option<i32>,
 }
 
-/// Whose text is being read. A cell is Postgres's own ISO output and is read strictly, so that
-/// nothing else inside an array or a range can pass for a timestamp. A literal is a client's, and
-/// is read in every spelling of the same fields that needs no zone database and no setting.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Spelling {
-    /// `YYYY-MM-DD HH:MM[:SS[.fraction]]` then `Z` or `±HH[[:]MM[[:]SS]]`.
-    Cell,
-    /// `YYYY-MM-DD[(T| )HH:MM[:SS[.fraction]]]`, then an optional zone after any spaces: `Z`,
-    /// `UTC`, `GMT`, `UT`, `UCT` or `ZULU` in any case, or `±H[H][:MM[:SS]]`, `±HMM`, `±HHMM`. A
-    /// zone may follow the date alone (midnight in that zone), except a `-` offset written straight
-    /// after it, which Postgres rejects as well.
-    Literal,
-}
-
-/// A literal in [`Spelling::Literal`], whole.
+/// A literal, whole: `YYYY-MM-DD[(T| )HH:MM[:SS[.fraction]]]`, then an optional zone after any
+/// spaces — `Z`, `UTC`, `GMT`, `UT`, `UCT` or `ZULU` in any case, or `±H[H][:MM[:SS]]`, `±HMM`,
+/// `±HHMM`. A zone may follow the date alone (midnight in that zone), except a `-` offset written
+/// straight after it, which Postgres rejects as well. Every spelling of these fields that needs no
+/// zone database and no setting; a cell is read by [`parse_cell`] instead, strictly.
 fn parse(literal: &str) -> Option<Parsed> {
     let s = literal.trim_matches(|c: char| c.is_ascii_whitespace()).as_bytes();
-    let (parsed, len) = parse_prefix(s, Spelling::Literal)?;
-    (len == s.len()).then_some(parsed)
-}
-
-/// The timestamp `s` begins with, in `spelling`'s grammar, and how many bytes of `s` it takes. A
-/// time or a zone that does not parse is simply not part of it: the caller decides whether what is
-/// left over matters.
-fn parse_prefix(s: &[u8], spelling: Spelling) -> Option<(Parsed, usize)> {
     let mut at = 0usize;
     let year = digits(s, &mut at, 4)?;
     expect(s, &mut at, b'-')?;
@@ -216,7 +369,6 @@ fn parse_prefix(s: &[u8], spelling: Spelling) -> Option<(Parsed, usize)> {
         return None;
     }
     let mut micros_of_day = 0i64;
-    let mut offset_secs = None;
     let timed = matches!(s.get(at), Some(b'T' | b't' | b' ')) && {
         match time_of_day(s, at + 1) {
             Some((micros, end)) => {
@@ -227,31 +379,24 @@ fn parse_prefix(s: &[u8], spelling: Spelling) -> Option<(Parsed, usize)> {
             None => false,
         }
     };
-    if timed || spelling == Spelling::Literal {
-        let mut zone_at = at;
-        while s.get(zone_at) == Some(&b' ') {
-            zone_at += 1;
-        }
-        // `2026-10-19-07` is not a date and a zone to Postgres either.
-        let glued_minus = !timed && zone_at == at && s.get(zone_at) == Some(&b'-');
-        let read = match spelling {
-            Spelling::Cell => zone(s, &mut zone_at),
-            Spelling::Literal if glued_minus => None,
-            Spelling::Literal => literal_zone(s, &mut zone_at),
-        };
-        if let Some(offset) = read {
-            offset_secs = Some(offset);
-            at = zone_at;
-        }
+    let mut zone_at = at;
+    while s.get(zone_at) == Some(&b' ') {
+        zone_at += 1;
     }
-    let parsed = Parsed {
+    // `2026-10-19-07` is not a date and a zone to Postgres either.
+    let glued_minus = !timed && zone_at == at && s.get(zone_at) == Some(&b'-');
+    let mut offset_secs = None;
+    if !glued_minus && let Some(offset) = literal_zone(s, &mut zone_at) {
+        offset_secs = Some(offset);
+        at = zone_at;
+    }
+    (at == s.len()).then_some(Parsed {
         year,
         month,
         day,
         local_micros: days_from_civil(year, month, day) * DAY_MICROS + micros_of_day,
         offset_secs,
-    };
-    Some((parsed, at))
+    })
 }
 
 /// `HH:MM[:SS[.fraction]]` starting at `at`: microseconds into the day, and where it ends.
@@ -682,9 +827,124 @@ mod tests {
         }
     }
 
+    /// Postgres's whole range, not only years 0001–9999. A year before year one is printed as a
+    /// positive number with ` BC` after the zone, and a year past 9999 simply has more digits; the
+    /// shift to UTC can cross either boundary, in either direction. Each pair is one instant as
+    /// PostgreSQL 18 prints it under `SET TimeZone` to a zone (America/Los_Angeles, Asia/Kolkata,
+    /// Etc/GMT-14, Etc/GMT+12) and to `UTC`.
+    #[test]
+    fn timestamptz_cells_before_year_one_and_past_9999_are_respelled_in_utc_too() {
+        for (printed, utc) in [
+            ("0044-03-15 04:07:02-07:52:58 BC", "0044-03-15 12:00:00+00 BC"),
+            ("0001-12-31 02:07:02-07:52:58 BC", "0001-12-31 10:00:00+00 BC"),
+            ("0001-12-31 16:07:02-07:52:58 BC", "0001-01-01 00:00:00+00"),
+            ("0001-12-31 16:07:01.5-07:52:58 BC", "0001-12-31 23:59:59.5+00 BC"),
+            ("4713-12-31 04:07:02-07:52:58 BC", "4713-12-31 12:00:00+00 BC"),
+            ("9999-12-31 15:00:00-08", "9999-12-31 23:00:00+00"),
+            ("10000-01-01 00:00:00-08", "10000-01-01 08:00:00+00"),
+            ("294276-12-31 15:59:59.999999-08", "294276-12-31 23:59:59.999999+00"),
+            ("0044-03-15 17:53:28+05:53:28 BC", "0044-03-15 12:00:00+00 BC"),
+            ("0001-01-01 05:53:27.5+05:53:28", "0001-12-31 23:59:59.5+00 BC"),
+            ("10000-01-01 04:30:00+05:30", "9999-12-31 23:00:00+00"),
+            ("294277-01-01 05:29:59.999999+05:30", "294276-12-31 23:59:59.999999+00"),
+            ("0044-03-16 02:00:00+14 BC", "0044-03-15 12:00:00+00 BC"),
+            ("0001-01-01 00:00:00+14", "0001-12-31 10:00:00+00 BC"),
+            ("4712-01-01 02:00:00+14 BC", "4713-12-31 12:00:00+00 BC"),
+            ("10000-01-01 13:00:00+14", "9999-12-31 23:00:00+00"),
+            ("0001-12-30 22:00:00-12 BC", "0001-12-31 10:00:00+00 BC"),
+            ("0001-12-31 12:00:00-12 BC", "0001-01-01 00:00:00+00"),
+            ("9999-12-31 20:00:00-12", "10000-01-01 08:00:00+00"),
+        ] {
+            assert_eq!(utc_cell(printed, "timestamptz").as_deref(), Some(utc), "{printed}");
+            assert_eq!(utc_cell(utc, "timestamptz"), None, "{utc} is already UTC");
+        }
+        // The same inside an array and a range.
+        assert_eq!(
+            utc_cell(
+                r#"{"0044-03-15 04:07:02-07:52:58 BC","2026-10-19 01:00:00-07","10000-01-01 00:00:00-08"}"#,
+                "_timestamptz"
+            )
+            .as_deref(),
+            Some(r#"{"0044-03-15 12:00:00+00 BC","2026-10-19 08:00:00+00","10000-01-01 08:00:00+00"}"#)
+        );
+        assert_eq!(
+            utc_cell(r#"["0044-03-15 04:07:02-07:52:58 BC","2026-10-19 01:00:00-07")"#, "tstzrange").as_deref(),
+            Some(r#"["0044-03-15 12:00:00+00 BC","2026-10-19 08:00:00+00")"#)
+        );
+        assert_eq!(utc_cell(r#"{"0044-03-15 12:00:00+00 BC","10000-01-01 08:00:00+00"}"#, "_timestamptz"), None);
+    }
+
+    /// The style check passes everything an ISO-style session prints for these types, as
+    /// PostgreSQL 18 printed it (`SET TimeZone = 'America/Los_Angeles'`): arrays that state their
+    /// bounds, both ends of each type's range, years BC, the infinities, empty and open ranges.
+    /// A wrong refusal would stop replication, so this list is the one that matters.
+    #[test]
+    fn the_style_check_passes_everything_an_iso_session_prints() {
+        for (pg_type, cell) in [
+            ("timestamptz", "2026-10-19 01:00:00-07"),
+            ("timestamptz", "2026-10-19 08:00:00.5+00"),
+            ("timestamptz", "0044-03-15 04:07:02-07:52:58 BC"),
+            ("timestamptz", "294276-12-31 15:59:59.999999-08"),
+            ("timestamptz", "infinity"),
+            ("timestamptz", "-infinity"),
+            ("timestamp", "2026-10-19 08:00:00"),
+            ("timestamp", "294276-12-31 23:59:59.999999"),
+            ("timestamp", "4713-11-24 00:00:00 BC"),
+            ("date", "2026-10-19"),
+            ("date", "5874897-12-31"),
+            ("date", "4713-01-01 BC"),
+            ("date", "infinity"),
+            ("_timestamptz", r#"[0:1]={"2026-10-19 01:00:00-07",NULL}"#),
+            ("_timestamptz", "{}"),
+            ("_date", r#"[-1:0][2:3]={{2026-10-19,2026-10-20},{infinity,"0044-03-15 BC"}}"#),
+            ("_date", "{}"),
+            ("tsrange", "empty"),
+            ("tsrange", r#"["2026-10-19 08:00:00",infinity)"#),
+            ("daterange", "[2026-10-19,2026-10-21)"),
+            ("daterange", "[2026-11-01,)"),
+            ("_tsrange", r#"{"[\"2026-10-19 08:00:00\",infinity)"}"#),
+            ("_tsrange", r#"{"[\"2026-10-19 01:00:00\",)",empty}"#),
+            ("tsmultirange", "{}"),
+            ("datemultirange", "{[2026-10-19,2026-10-21),[2026-11-01,)}"),
+            ("tstzmultirange", r#"{["0044-03-15 04:07:02-07:52:58 BC","2026-10-19 01:00:00.25-07")}"#),
+            ("_datemultirange", r#"{"{[2026-10-19,2026-10-21)}"}"#),
+        ] {
+            assert_eq!(check_cell_style(cell, pg_type), Ok(()), "{pg_type} {cell}");
+        }
+    }
+
+    /// ...and refuses what the `German`, `SQL` and `Postgres` styles print for them, naming the
+    /// type and the cell. Any other type's text is the application's and is never judged.
+    #[test]
+    fn the_style_check_refuses_a_date_in_any_other_style_and_only_in_a_date_or_time_type() {
+        for (pg_type, cell) in [
+            ("timestamptz", "19.10.2026 01:00:00 PDT"),
+            ("timestamptz", "10/19/2026 01:00:00 PDT"),
+            ("timestamptz", "Mon Oct 19 01:00:00 2026 PDT"),
+            ("timestamp", "19.10.2026 08:00:00"),
+            ("timestamp", "Mon Oct 19 08:00:00 2026"),
+            ("date", "19.10.2026"),
+            ("date", "10/19/2026"),
+            ("date", "10-19-2026"),
+            ("date", "15.03.0044 BC"),
+            ("_timestamptz", r#"{"19.10.2026 01:00:00 PDT"}"#),
+            ("_timestamptz", r#"[0:1]={"2026-10-19 01:00:00-07","Mon Oct 19 01:00:00 2026 PDT"}"#),
+            ("daterange", "[19.10.2026,21.10.2026)"),
+            ("daterange", "[10-19-2026,10-21-2026)"),
+            ("tsmultirange", r#"{["10/19/2026 08:00:00","10/20/2026 08:00:00")}"#),
+        ] {
+            let refused = check_cell_style(cell, pg_type).unwrap_err();
+            assert_eq!((refused.pg_type.as_str(), refused.cell.as_str()), (pg_type, cell));
+            assert!(refused.to_string().contains("not in the ISO date style"), "{refused}");
+        }
+        for pg_type in ["text", "jsonb", "_text", "timetz", "time", "interval", "int4", "_instant"] {
+            assert_eq!(check_cell_style("19.10.2026 01:00:00 PDT", pg_type), Ok(()), "{pg_type}");
+        }
+    }
+
     /// A cell that is already UTC needs nothing, a cell this module cannot read is not guessed at
-    /// (the infinities, a `BC` year, any non-ISO `DateStyle`), and only a type whose output
-    /// depends on the session zone is ever touched.
+    /// (the infinities, any non-ISO `DateStyle`), and only a type whose output depends on the
+    /// session zone is ever touched.
     #[test]
     fn utc_cells_unreadable_cells_and_zone_independent_types_are_left_alone() {
         for cell in [
@@ -692,7 +952,6 @@ mod tests {
             "2026-10-19 08:00:00.5+00",
             "infinity",
             "-infinity",
-            "0044-03-15 04:07:02-07:52:58 BC",
             "19.10.2026 01:00:00 PDT",
             "Mon Oct 19 01:00:00 2026 PDT",
             "10/19/2026 01:00:00 PDT",
@@ -739,7 +998,6 @@ mod tests {
             ("_timestamptz", r#"{"2026-10-19 08:00:00+00",NULL}"#),
             ("tstzrange", "empty"),
             ("tstzrange", r#"["2026-10-19 08:00:00+00",infinity)"#),
-            ("tstzrange", r#"["0044-03-15 04:07:02-07:52:58 BC","2026-10-19 01:00:00-07")"#),
         ] {
             assert_eq!(utc_cell(cell, pg_type), None, "{pg_type} {cell}");
         }

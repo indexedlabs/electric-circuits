@@ -222,10 +222,22 @@ mod tests {
 
     fn schema() -> TableSchema {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
-        columns.insert("score".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
-        columns.insert("active".to_string(), ColumnDef { ty: ColumnType::Bool, pg_type: None, has_default: false });
+        columns.insert(
+            "id".to_string(),
+            ColumnDef { ty: ColumnType::Int, pg_type: None, printed_as: None, has_default: false },
+        );
+        columns.insert(
+            "name".to_string(),
+            ColumnDef { ty: ColumnType::Text, pg_type: None, printed_as: None, has_default: false },
+        );
+        columns.insert(
+            "score".to_string(),
+            ColumnDef { ty: ColumnType::Float, pg_type: None, printed_as: None, has_default: false },
+        );
+        columns.insert(
+            "active".to_string(),
+            ColumnDef { ty: ColumnType::Bool, pg_type: None, printed_as: None, has_default: false },
+        );
         let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         TableSchema::from_def(&"users".into(), &def).unwrap()
     }
@@ -242,11 +254,16 @@ mod tests {
         let mut columns = BTreeMap::new();
         columns.insert(
             "id".to_string(),
-            ColumnDef { ty: ColumnType::Int, pg_type: Some("int4".to_string()), has_default: false },
+            ColumnDef { ty: ColumnType::Int, pg_type: Some("int4".to_string()), printed_as: None, has_default: false },
         );
         columns.insert(
             "label".to_string(),
-            ColumnDef { ty: ColumnType::Text, pg_type: Some(pg_type_of_label.to_string()), has_default: false },
+            ColumnDef {
+                ty: ColumnType::Text,
+                pg_type: Some(pg_type_of_label.to_string()),
+                printed_as: None,
+                has_default: false,
+            },
         );
         let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         TableSchema::from_def(&"users".into(), &def).unwrap()
@@ -334,7 +351,10 @@ mod tests {
     fn typed_schema(name: &str, cols: &[(&str, ColumnType, &str)]) -> TableSchema {
         let mut columns = BTreeMap::new();
         for (c, ty, pg) in cols {
-            columns.insert(c.to_string(), ColumnDef { ty: *ty, pg_type: Some(pg.to_string()), has_default: false });
+            columns.insert(
+                c.to_string(),
+                ColumnDef { ty: *ty, pg_type: Some(pg.to_string()), printed_as: None, has_default: false },
+            );
         }
         let def = TableDef { columns, primary_key: vec![cols[0].0.to_string()], fingerprint: None };
         TableSchema::from_def(&TableRef::parse(name).unwrap(), &def).unwrap()

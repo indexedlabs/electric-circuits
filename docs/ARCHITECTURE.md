@@ -906,7 +906,15 @@ the database, the role or the server defaults to**, by a different means on each
   (`pg_temporal::utc_cell`, from `replication::tuple_to_map`), in the new image and the old one
   alike. A backfill row and that row's next live change therefore spell one instant with the same
   bytes; a client comparing what it holds with what arrives sees no difference where there is
-  none.
+  none. That holds over Postgres's whole range, 4713 BC to 294276: a year before year one
+  (`0044-03-15 04:07:02-07:52:58 BC`) and a year past 9999 are read and written as Postgres
+  prints them, across either boundary.
+- The type that decides is the one the cell is **printed as**, not the column's name for it. An
+  array whose element type is a domain over `timestamptz` is reported as `_<domain>`;
+  introspection (`pg::introspect_opt`) walks domains and array elements down to the printing type
+  and records `_timestamptz` beside it (`ColumnDef::printed_as`). The column's own type is kept
+  for casting bound parameters, because Postgres has no `<domain>[] = timestamptz[]`. A scalar
+  domain column needs none of this: `information_schema` already reports its base type.
 - Respelling needs the ISO style, and that the engine cannot give the replication session either.
   The boot opens one session with no options — the same defaults the walsender will get — and
   **refuses to start** (exit 78, naming `ALTER ROLE … SET datestyle`) unless its `DateStyle` is
@@ -916,9 +924,18 @@ the database, the role or the server defaults to**, by a different means on each
   refusal is logged by name, and the ingestor asks again on its reconnect backoff until the style
   is ISO. Query sessions keep printing ISO throughout, so the engine serves what it has and
   ingests nothing it would misread.
+- A check at connect is not enough by itself. A **server-wide** style (`postgresql.conf`,
+  `ALTER SYSTEM`) takes effect at a reload inside the walsender that is already streaming. So
+  the decoder judges each cell too (`pg_temporal::check_cell_style`): in a `timestamptz`,
+  `timestamp` or `date` cell, or an array, range or multirange of one, every date must be spelled
+  year first. A cell that is not (`19.10.2026 01:00:00 PDT`) fails the decode of its transaction.
+  Nothing of that transaction is on the log yet and it is not acknowledged; the connection is
+  dropped, the check above refuses the next one by name, and Postgres sends the transaction again
+  once the style is ISO.
 
-Not respelled, and left as the session printed them: `infinity`/`-infinity` (the same in every
-zone), a `BC` year and a year the shift carries outside 0001–9999. Other session settings that
+Not respelled: `infinity`/`-infinity`, which are the same in every zone and every style. A custom
+range type over `timestamptz` (`CREATE TYPE … AS RANGE`) and a composite type with a `timestamptz`
+attribute are not recognised and keep the session's spelling. Other session settings that
 shape a cell's text — `IntervalStyle`, `bytea_output`, `extra_float_digits` — are still the
 defaults' on both roads, and so agree with each other only while nothing sets them on one.
 

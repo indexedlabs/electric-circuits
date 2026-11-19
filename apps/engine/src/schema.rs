@@ -171,6 +171,14 @@ pub struct ColumnDef {
     /// comparisons stay index-eligible (see `sql.rs`).
     #[serde(default, skip)]
     pub pg_type: Option<String>,
+    /// The type whose text output this column's cells are, when that is not [`Self::pg_type`]: an
+    /// array whose element type is a domain is named after the domain (`_instant`) and prints as an
+    /// array of the domain's base type (`_timestamptz`). `None` everywhere else — a scalar domain
+    /// column already reports its base type as `pg_type`. Kept apart from `pg_type` because a
+    /// bound parameter still has to be cast to the column's own type: Postgres has no
+    /// `instant[] = timestamptz[]`.
+    #[serde(default, skip)]
+    pub printed_as: Option<String>,
     /// Whether Postgres auto-supplies this column's value when omitted — i.e. it's an IDENTITY column
     /// or carries a `DEFAULT`. Captured at introspection; `false` in library mode. Lets the visualizer
     /// mark the column optional in its add-row form.
@@ -234,6 +242,9 @@ pub struct TableSchema {
     /// Raw Postgres type name per column (parallel to [`Self::columns`]); `None` in library mode. Used
     /// to cast bound text params to the native type in backfill SQL (index-eligible comparisons).
     pub pg_types: Vec<Option<String>>,
+    /// The type each column's cells are printed as, parallel to [`Self::columns`]:
+    /// [`ColumnDef::printed_as`], or the column's own type. Read through [`Self::printed_type`].
+    pub printed_types: Vec<Option<String>>,
     /// Whether each column is auto-defaulted (IDENTITY or `DEFAULT`), parallel to [`Self::columns`];
     /// all `false` in library mode. Surfaced by `GET /table/{name}/schema` so the add-row form can
     /// treat these columns as optional.
@@ -330,6 +341,7 @@ impl TableSchema {
         let mut projected = self.clone();
         projected.columns = indices.iter().map(|&i| self.columns[i].clone()).collect();
         projected.pg_types = indices.iter().map(|&i| self.pg_types[i].clone()).collect();
+        projected.printed_types = indices.iter().map(|&i| self.printed_types[i].clone()).collect();
         projected.has_defaults = indices.iter().map(|&i| self.has_defaults[i]).collect();
         projected.index = projected.columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
         projected.pk_cols = self.pk_cols.iter().map(|&i| projected.index[&self.columns[i].0]).collect();
@@ -340,6 +352,8 @@ impl TableSchema {
     pub fn from_def(table: &TableRef, def: &TableDef) -> Result<Self> {
         let columns: Vec<(String, ColumnType)> = def.columns.iter().map(|(c, d)| (c.clone(), d.ty)).collect();
         let pg_types: Vec<Option<String>> = def.columns.values().map(|d| d.pg_type.clone()).collect();
+        let printed_types: Vec<Option<String>> =
+            def.columns.values().map(|d| d.printed_as.clone().or_else(|| d.pg_type.clone())).collect();
         let has_defaults: Vec<bool> = def.columns.values().map(|d| d.has_default).collect();
         let index: HashMap<String, usize> = columns.iter().enumerate().map(|(i, (c, _))| (c.clone(), i)).collect();
         if def.primary_key.is_empty() {
@@ -362,6 +376,7 @@ impl TableSchema {
             pk_type,
             pk_cols,
             pg_types,
+            printed_types,
             has_defaults,
             fingerprint: def.fingerprint.clone(),
         })
@@ -394,6 +409,12 @@ impl TableSchema {
             None => false,
             Some(t) => matches!(t, "text" | "varchar" | "bpchar" | "char" | "name" | "citext"),
         }
+    }
+
+    /// The Postgres type a column's cells are printed as (see [`ColumnDef::printed_as`]): what
+    /// decides how a replicated cell's text is read. `None` in library mode.
+    pub fn printed_type(&self, col: usize) -> Option<&str> {
+        self.printed_types.get(col).and_then(|o| o.as_deref())
     }
 
     /// The raw Postgres type name of a column by name (for casting bound params to the native type).

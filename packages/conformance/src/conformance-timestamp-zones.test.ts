@@ -30,6 +30,8 @@ const schema: Schema = {
         name: { type: 'text' },
         marks: { type: 'text' },
         span: { type: 'text' },
+        stamps: { type: 'text' },
+        later: { type: 'text' },
       },
       primaryKey: 'id',
     },
@@ -37,6 +39,8 @@ const schema: Schema = {
 }
 
 const ddl = `
+  CREATE DOMAIN instant AS timestamptz;
+  CREATE DOMAIN later_instant AS instant CHECK (VALUE > '2000-01-01 00:00:00+00');
   CREATE TABLE records (id int PRIMARY KEY, visible boolean NOT NULL);
   ALTER TABLE records REPLICA IDENTITY FULL;
   CREATE TABLE events (
@@ -45,7 +49,9 @@ const ddl = `
     starts timestamptz NOT NULL,
     name text NOT NULL,
     marks timestamptz[],
-    span tstzrange
+    span tstzrange,
+    stamps instant[],
+    later later_instant[]
   );
   ALTER TABLE events REPLICA IDENTITY FULL;
 `
@@ -241,6 +247,73 @@ describe.each([
       expect(live![column], `live ${column}`).toBe(spelling)
     }
   }, 120000)
+
+  // An array whose ELEMENT type is a domain is named after the domain (`_instant`), not
+  // `_timestamptz`, and a domain may itself be over a domain. Its elements are timestamps printed
+  // in the session zone all the same.
+  it('spells an array of a domain over timestamptz the same in a backfill row and in a live change', async () => {
+    await pgQuery(
+      h,
+      `INSERT INTO events (id, record_id, starts, name, stamps, later) VALUES
+         (60, 1, '2026-10-21 12:00:00+00', 'domains',
+              ARRAY['2026-10-21 12:00:00+00', '2026-10-22 00:30:00+00']::instant[],
+              ARRAY['2026-10-21 12:00:00+00']::later_instant[])`,
+    )
+    await drainEngine(h)
+    const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'eq', value: 60 } })
+    await drainEngine(h)
+    await pgQuery(h, `UPDATE events SET name = 'domains (respelled?)' WHERE id = 60`)
+    await drainEngine(h)
+
+    const envs = (await readEnvelopes(shape.streamUrl)).filter((env) => env.key === '60')
+    expect(envs.map((env) => env.headers.lsn !== undefined), 'one backfill row, then one live change').toEqual([false, true])
+    const [backfill, live] = envs.map((env) => env.value as Row)
+    const utc = { stamps: '{"2026-10-21 12:00:00+00","2026-10-22 00:30:00+00"}', later: '{"2026-10-21 12:00:00+00"}' }
+    for (const [column, spelling] of Object.entries(utc)) {
+      expect(backfill![column], `backfill ${column}`).toBe(spelling)
+      expect(live![column], `live ${column}`).toBe(spelling)
+    }
+  }, 120000)
+
+  // The same at the edges of Postgres's range. A year before year one is printed with ` BC` after
+  // the zone, a year past 9999 with more digits, and in a non-UTC zone the walsender prints both
+  // with the zone's old local-mean-time offset or across the boundary.
+  it('spells an instant before year one, and one past 9999, the same in a backfill row and in a live change', async () => {
+    const utc: Record<number, { starts: string; marks: string }> = {
+      50: {
+        starts: '0044-03-15 12:00:00+00 BC',
+        marks: '{"0044-03-15 12:00:00+00 BC","2026-10-19 08:00:00+00"}',
+      },
+      51: { starts: '0001-12-31 10:00:00+00 BC', marks: '{"0001-01-01 00:00:00+00"}' },
+      52: { starts: '10000-01-01 08:00:00+00', marks: '{"9999-12-31 23:00:00+00","10000-01-01 08:00:00+00"}' },
+    }
+    for (const [id, row] of Object.entries(utc)) {
+      await pgQuery(
+        h,
+        `INSERT INTO events (id, record_id, starts, name, marks) VALUES ($1, 1, $2::timestamptz, 'edge', $3::timestamptz[])`,
+        [Number(id), row.starts, row.marks],
+      )
+    }
+    await drainEngine(h)
+    const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'gte', value: 50 } })
+    await drainEngine(h)
+    await pgQuery(h, `UPDATE events SET name = 'edge (respelled?)' WHERE id >= 50`)
+    await drainEngine(h)
+
+    const envs = await readEnvelopes(shape.streamUrl)
+    for (const [id, row] of Object.entries(utc)) {
+      const mine = envs.filter((env) => env.key === id)
+      expect(mine.map((env) => env.headers.lsn !== undefined), `row ${id}: one backfill row, then one live change`).toEqual([
+        false,
+        true,
+      ])
+      const [backfill, live] = mine.map((env) => env.value as Row)
+      for (const column of ['starts', 'marks'] as const) {
+        expect(backfill![column], `row ${id} backfill ${column}`).toBe(row[column])
+        expect(live![column], `row ${id} live ${column}`).toBe(row[column])
+      }
+    }
+  }, 120000)
 })
 
 // The boot's answer is about the defaults the boot saw. A default set later reaches the NEXT
@@ -297,6 +370,57 @@ describe('a date style changed under a running engine', () => {
     const edited = (await live())[0]!.value as Row
     expect(edited.name).toBe('edited under German')
     expect(edited.starts).toBe('2026-10-21 12:34:56.789+00')
+  }, 150000)
+
+  // A SERVER-wide style (postgresql.conf, `ALTER SYSTEM`) does not wait for a reconnect: a reload
+  // changes it inside the walsender that is already streaming. The check made when that connection
+  // was opened says nothing about it, so the decoder itself must refuse a cell that is not ISO.
+  it('is never decoded when a reload brings it to the replication connection that is already open', async () => {
+    const serverWide = async (sql: string) => {
+      await pgQuery(h!, sql)
+      await pgQuery(h!, 'SELECT pg_reload_conf()')
+    }
+    h = await bootHarness(schema, { ddl })
+    try {
+      await pgQuery(h, 'INSERT INTO records (id, visible) VALUES (1, true)')
+      await pgQuery(
+        h,
+        `INSERT INTO events (id, record_id, starts, name) VALUES (14, 1, '2026-10-21 12:34:56.789+00', 'midweek')`,
+      )
+      await drainEngine(h)
+      const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'eq', value: 14 } })
+      await drainEngine(h)
+      const live = async () => (await readEnvelopes(shape.streamUrl)).filter((env) => env.headers.lsn !== undefined)
+      const walsender = async () =>
+        (await pgQuery(h!, 'SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1', [h!.slot]))[0]?.active_pid
+      const connected = await walsender()
+      expect(connected, 'the walsender is connected').toBeTruthy()
+
+      // No reconnect: the same walsender now prints `21.10.2026 …`.
+      await serverWide(`ALTER SYSTEM SET datestyle TO 'German, DMY'`)
+      await pgQuery(h, `UPDATE events SET name = 'edited under German' WHERE id = 14`)
+
+      const utc = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?\+00$/
+      const until = Date.now() + 6000
+      while (Date.now() < until) {
+        for (const env of await live()) {
+          expect(String((env.value as Row).starts), 'a live timestamptz cell is spelled in ISO style, in UTC').toMatch(utc)
+        }
+        await sleep(250)
+      }
+      expect(await live(), 'nothing is ingested from a session that prints German dates').toHaveLength(0)
+      expect(h.engineStderr(), 'the decode names the cell').toContain('not in the ISO date style')
+      expect(h.engineStderr(), 'and the check before the next connection names the setting').toContain('DateStyle=German')
+
+      await serverWide('ALTER SYSTEM RESET datestyle')
+      await waitFor(async () => (await live()).length === 1, 'the edit to arrive once the date style is ISO again', 60000)
+      const edited = (await live())[0]!.value as Row
+      expect(edited.name).toBe('edited under German')
+      expect(edited.starts).toBe('2026-10-21 12:34:56.789+00')
+    } finally {
+      // The setting is the whole test cluster's: never leave it behind for the files that follow.
+      await serverWide('ALTER SYSTEM RESET datestyle')
+    }
   }, 150000)
 })
 

@@ -552,6 +552,10 @@ async fn stream_loop(
                     Decoded::Env(env) => t.push(env, data.len() as u64).context("buffering a change")?,
                     Decoded::Sync(n) => t.set_sync(n),
                     Decoded::None => {}
+                    // Nothing of this transaction is on the log yet (it is appended whole, at its
+                    // commit), and it is not acknowledged: Postgres sends it again on the next
+                    // connection, which the date-style check lets through only once it is ISO.
+                    Decoded::Refused(cell) => return Err(anyhow::Error::new(cell).context("decoding a change")),
                 }
             }
             ReplicationEvent::Commit { lsn, end_lsn, commit_time_micros } => {
@@ -670,6 +674,8 @@ enum Decoded {
     Env(Envelope),
     Sync(i64),
     None,
+    /// A cell the engine must not ingest: the connection is torn down unacknowledged.
+    Refused(crate::pg_temporal::NotIsoCell),
 }
 
 /// Relation metadata learned from `R` messages on this connection. The `R` message's namespace is
@@ -800,8 +806,9 @@ impl Decoder {
         let tables = self.tables.read().unwrap();
         let Some(ts) = tables.get(table) else { return Decoded::None };
         match build_envelope(table, ts, &rel.columns, msg) {
-            Some(env) => Decoded::Env(env),
-            None => Decoded::None,
+            Ok(Some(env)) => Decoded::Env(env),
+            Ok(None) => Decoded::None,
+            Err(cell) => Decoded::Refused(cell),
         }
     }
 }
@@ -868,7 +875,15 @@ fn sync_counter(rel: &RelMeta, tuple: &Tuple) -> Option<i64> {
 }
 
 /// Build an envelope from a decoded pgoutput DML message; LSN/xid/seq are stamped at `Commit`.
-fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: Message) -> Option<Envelope> {
+///
+/// `Err` when a cell is not in the ISO date style ([`crate::pg_temporal::check_cell_style`]): no
+/// envelope may be made of such a row.
+fn build_envelope(
+    table: &TableRef,
+    ts: &TableSchema,
+    columns: &[String],
+    msg: Message,
+) -> Result<Option<Envelope>, crate::pg_temporal::NotIsoCell> {
     let make = |operation: &str, value: Option<Json>, old: Option<Json>, key_src: &Json| Envelope {
         // The wire `type` is the canonical `schema.name` — always qualified, never bare.
         type_: table.to_string(),
@@ -885,14 +900,14 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
             commit_ts: None,
         },
     };
-    match msg {
+    Ok(match msg {
         Message::Insert { new, .. } => {
-            let new = Json::Object(tuple_to_map(&new, columns, ts));
+            let new = Json::Object(tuple_to_map(&new, columns, ts)?);
             Some(make("insert", Some(new.clone()), None, &new))
         }
         Message::Update { old, new, .. } => {
             let old_map = match old {
-                Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts)),
+                Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts)?),
                 Some(OldTuple::Key(_)) | None => {
                     // No full old image: this change was written while the table's REPLICA IDENTITY
                     // was not FULL. The preceding `R` reported that identity, so the engine has
@@ -906,7 +921,7 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
                     None
                 }
             };
-            let mut new_map = tuple_to_map(&new, columns, ts);
+            let mut new_map = tuple_to_map(&new, columns, ts)?;
             // TOASTed-but-unchanged columns are omitted from new (see tuple_to_map); fill from old.
             if let Some(ref om) = old_map {
                 for (k, v) in om {
@@ -926,13 +941,13 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
                     "replicator: DELETE on {table} carries no full old image (REPLICA IDENTITY was not \
                      FULL when it was written); the table's dependents have been retired"
                 );
-                return None;
+                return Ok(None);
             };
-            let old = Json::Object(tuple_to_map(&t, columns, ts));
+            let old = Json::Object(tuple_to_map(&t, columns, ts)?);
             Some(make("delete", None, Some(old.clone()), &old))
         }
         _ => None,
-    }
+    })
 }
 
 /// Zip a pgoutput tuple with its relation's column names into a JSON object, converting each text
@@ -945,7 +960,15 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
 /// configure: `pgwire-replication` sends no startup options, so its zone is the database's, the
 /// role's or the server's default. Query sessions print UTC, and a cell has to be the same bytes
 /// by either road — the old image as much as the new one, or a retraction misses its row.
-fn tuple_to_map(tuple: &Tuple, columns: &[String], ts: &TableSchema) -> Map<String, Json> {
+///
+/// The walsender's `DateStyle` is out of the engine's hands for the same reason, and a reload can
+/// change it under a connection that was checked when it was opened. A date or timestamp cell that
+/// is not in the ISO style is therefore refused here, before anything is made of the row.
+fn tuple_to_map(
+    tuple: &Tuple,
+    columns: &[String],
+    ts: &TableSchema,
+) -> Result<Map<String, Json>, crate::pg_temporal::NotIsoCell> {
     let mut out = Map::new();
     for (cell, name) in tuple.iter().zip(columns) {
         let Some(&idx) = ts.index.get(name) else { continue };
@@ -956,15 +979,18 @@ fn tuple_to_map(tuple: &Tuple, columns: &[String], ts: &TableSchema) -> Map<Stri
                 out.insert(name.clone(), Json::Null);
             }
             Cell::Text(text) => {
-                let utc = match (ty, ts.pg_types.get(idx).and_then(|t| t.as_deref())) {
-                    (ColumnType::Text, Some(pg_type)) => crate::pg_temporal::utc_cell(text, pg_type),
+                let utc = match (ty, ts.printed_type(idx)) {
+                    (ColumnType::Text, Some(printed)) => {
+                        crate::pg_temporal::check_cell_style(text, printed)?;
+                        crate::pg_temporal::utc_cell(text, printed)
+                    }
                     _ => None,
                 };
                 out.insert(name.clone(), utc.map_or_else(|| text_to_json(text, ty), Json::String));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Extract the primary-key string from a parsed row object. For composite primary keys the column
@@ -1104,9 +1130,18 @@ mod tests {
 
     fn users_def(fingerprint: Option<SchemaFingerprint>) -> TableDef {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
-        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
-        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
+        columns.insert(
+            "id".to_string(),
+            ColumnDef { ty: ColumnType::Int, pg_type: None, printed_as: None, has_default: false },
+        );
+        columns.insert(
+            "tenant".to_string(),
+            ColumnDef { ty: ColumnType::Int, pg_type: None, printed_as: None, has_default: false },
+        );
+        columns.insert(
+            "name".to_string(),
+            ColumnDef { ty: ColumnType::Text, pg_type: None, printed_as: None, has_default: false },
+        );
         TableDef { columns, primary_key: vec!["id".to_string()], fingerprint }
     }
 
@@ -1322,7 +1357,10 @@ mod tests {
             ("marks", ColumnType::Text, "_timestamptz"),
             ("note", ColumnType::Text, "text"),
         ] {
-            columns.insert(name.to_string(), ColumnDef { ty, pg_type: Some(pg_type.into()), has_default: false });
+            columns.insert(
+                name.to_string(),
+                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as: None, has_default: false },
+            );
         }
         let table = TableRef::parse("public.events").unwrap();
         let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
@@ -1357,6 +1395,7 @@ mod tests {
                 new: in_los_angeles("edited"),
             },
         )
+        .unwrap()
         .unwrap();
         assert_eq!(update.old, Some(in_utc(note)));
         assert_eq!(update.value, Some(in_utc("edited")));
@@ -1367,6 +1406,7 @@ mod tests {
             &names,
             Message::Delete { rel_id: 1, old: OldTuple::Full(in_los_angeles(note)) },
         )
+        .unwrap()
         .unwrap();
         assert_eq!(delete.old, Some(in_utc(note)));
 
@@ -1377,8 +1417,123 @@ mod tests {
             t(r#"{"2026-10-19 13:30:00+05:30","2026-10-20 14:00:00+05:30"}"#),
             t(note),
         ];
-        let insert = build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: in_kolkata }).unwrap();
+        let insert =
+            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: in_kolkata }).unwrap().unwrap();
         assert_eq!(insert.value, Some(in_utc(note)));
+    }
+
+    /// An array whose element type is a domain over `timestamptz` is named after the domain
+    /// (`_instant`), and introspection records what it prints as. Its elements are respelled like
+    /// any other array of timestamps; a column that only LOOKS like one by name is not.
+    #[test]
+    fn an_array_of_a_domain_over_timestamptz_is_decoded_in_utc_by_the_type_it_prints_as() {
+        let mut columns = BTreeMap::new();
+        for (name, ty, pg_type, printed_as) in [
+            ("id", ColumnType::Int, "int4", None),
+            ("stamps", ColumnType::Text, "_instant", Some("_timestamptz")),
+            ("labels", ColumnType::Text, "_label", Some("_text")),
+        ] {
+            let printed_as = printed_as.map(String::from);
+            columns.insert(
+                name.to_string(),
+                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as, has_default: false },
+            );
+        }
+        let table = TableRef::parse("public.events").unwrap();
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
+        let ts = TableSchema::from_def(&table, &def).unwrap();
+        assert_eq!(ts.pg_type_of("stamps"), Some("_instant"), "a bound parameter is still cast to the column's type");
+        let names: Vec<String> = ["id", "stamps", "labels"].map(String::from).to_vec();
+        let printed = r#"{"2026-10-19 01:00:00-07","2026-10-20 01:30:00-07"}"#;
+        let row = vec![t("1"), t(printed), t(printed)];
+        let insert = build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: row }).unwrap().unwrap();
+        assert_eq!(
+            insert.value,
+            Some(serde_json::json!({
+                "id": 1,
+                "stamps": r#"{"2026-10-19 08:00:00+00","2026-10-20 08:30:00+00"}"#,
+                "labels": printed,
+            }))
+        );
+    }
+
+    /// A date style set server-wide reaches a walsender that is ALREADY connected (a reload is
+    /// enough), so the check made before the connection was opened no longer holds. The cells
+    /// then arrive as `19.10.2026 01:00:00 PDT`, which the engine cannot read and query sessions
+    /// never print. Such a cell must never become an envelope: the decode fails, which drops the
+    /// connection, and the check before the next one names the setting. Cells of any other type,
+    /// whatever they look like, are the application's text.
+    #[tokio::test]
+    async fn a_cell_that_is_not_in_the_iso_date_style_is_never_decoded() {
+        let mut columns = BTreeMap::new();
+        for (name, ty, pg_type) in [
+            ("id", ColumnType::Int, "int4"),
+            ("starts", ColumnType::Text, "timestamptz"),
+            ("local", ColumnType::Text, "timestamp"),
+            ("day", ColumnType::Text, "date"),
+            ("marks", ColumnType::Text, "_timestamptz"),
+            ("span", ColumnType::Text, "daterange"),
+            ("note", ColumnType::Text, "text"),
+        ] {
+            columns.insert(
+                name.to_string(),
+                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as: None, has_default: false },
+            );
+        }
+        let table = TableRef::parse("public.events").unwrap();
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
+        let tables = shared(HashMap::from([(table.clone(), TableSchema::from_def(&table, &def).unwrap())]));
+        let ev = RecordingEvents::default();
+        let mut d = Decoder::new(tables.clone());
+        let oids = [
+            ("id", 23),
+            ("starts", 1184),
+            ("local", 1114),
+            ("day", 1082),
+            ("marks", 1185),
+            ("span", 3912),
+            ("note", 25),
+        ];
+        d.on_relation(rel_msg(1, "public", "events", &oids), &ev, None).await;
+
+        // One row in the ISO style, as every session prints it by default — the infinities, a year
+        // BC and an empty range included.
+        let iso = ["1", "2026-10-19 01:00:00-07", "2026-10-19 08:00:00", "2026-10-19", "{}", "empty", "19.10.2026"];
+        let decode = |cells: [&str; 7]| d.on_change(Message::Insert { rel_id: 1, new: cells.map(t).to_vec() });
+        assert!(matches!(decode(iso), Decoded::Env(_)));
+        for (column, cell) in [
+            (1, "infinity"),
+            (1, "0044-03-15 04:07:02-07:52:58 BC"),
+            (2, "-infinity"),
+            (3, "0044-03-15 BC"),
+            (4, r#"{"2026-10-19 01:00:00-07",NULL}"#),
+            (5, "[2026-10-19,2026-10-21)"),
+        ] {
+            let mut row = iso;
+            row[column] = cell;
+            assert!(matches!(decode(row), Decoded::Env(_)), "{cell:?} is ISO-style output");
+        }
+
+        // The same row as `German`, `SQL` and `Postgres` style sessions print it, one cell at a time.
+        for (column, cell) in [
+            (1, "19.10.2026 01:00:00 PDT"),
+            (1, "10/19/2026 01:00:00 PDT"),
+            (1, "Mon Oct 19 01:00:00 2026 PDT"),
+            (2, "19.10.2026 08:00:00"),
+            (2, "Mon Oct 19 08:00:00 2026"),
+            (3, "19.10.2026"),
+            (3, "10/19/2026"),
+            (3, "10-19-2026"),
+            (3, "15.03.0044 BC"),
+            (4, r#"{"19.10.2026 01:00:00 PDT"}"#),
+            (4, r#"{"2026-10-19 01:00:00-07","Mon Oct 19 01:00:00 2026 PDT"}"#),
+            (5, "[19.10.2026,21.10.2026)"),
+            (5, "[10-19-2026,10-21-2026)"),
+        ] {
+            let mut row = iso;
+            row[column] = cell;
+            assert!(!matches!(decode(row), Decoded::Env(_)), "{cell:?} must not be decoded into an envelope");
+        }
     }
 
     #[tokio::test]
@@ -1518,7 +1673,10 @@ mod tests {
     #[tokio::test]
     async fn float_pk_key_is_canonicalized() {
         let mut columns = BTreeMap::new();
-        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
+        columns.insert(
+            "id".to_string(),
+            ColumnDef { ty: ColumnType::Float, pg_type: None, printed_as: None, has_default: false },
+        );
         let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         let f = TableRef::parse("f").unwrap();
         let tables = shared(HashMap::from([(f.clone(), TableSchema::from_def(&f, &def).unwrap())]));
@@ -1563,7 +1721,10 @@ mod tests {
             pk: None, // as observed off the wire
         };
         let mut def = users_def(Some(altered.clone()));
-        def.columns.insert("extra".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
+        def.columns.insert(
+            "extra".to_string(),
+            ColumnDef { ty: ColumnType::Text, pg_type: None, printed_as: None, has_default: false },
+        );
         *ev.resolves_to.lock().unwrap() = Some(TableSchema::from_def(&t_ref, &def).unwrap());
         *ev.tables.lock().unwrap() = Some(tables.clone());
 

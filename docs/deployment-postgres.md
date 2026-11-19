@@ -58,13 +58,25 @@ The engine sets everything else up for you on startup, per configured table:
 > engine's role** (`ISO, MDY` is Postgres's own default): the replication connection takes no
 > startup options, and a role or database set to `German`, `SQL` or `Postgres` style is refused at
 > boot (exit `78`) with the `ALTER ROLE … SET datestyle` that fixes it. The engine asks again
-> before every replication connection: if the style is changed while it runs, it stops ingesting
-> at the next reconnect, logs the same message, and resumes by itself once the style is ISO.
+> before every replication connection, and checks every date and timestamp it decodes: if the
+> style is changed while it runs, it stops ingesting — at the next reconnect for a role or
+> database setting, at the first non-ISO value for a server-wide one that a reload applies
+> (`postgresql.conf`, `ALTER SYSTEM`) — logs the reason, and resumes by itself, losing nothing,
+> once the style is ISO.
 >
 > **Timestamp literals.** A predicate on a `timestamptz`, `timestamp` or `date` column takes its
 > literal in ISO 8601 form (`2026-10-19T07:00:00Z`, `2026-10-19 07:00:00+05:30`, `2026-10-19`),
 > with `Z`, `UTC`, `GMT` or a numeric offset as the zone, or `infinity`. Any other spelling is
 > refused with `400`, including ones Postgres itself reads, such as `… PST` or `Oct 19 2026`.
+>
+> **Upgrading from a version that compared timestamp bounds as text.** Shapes are restored from
+> the catalog with their predicates as the client wrote them, and a bound such as
+> `2026-10-19T07:00:00Z` is now read as an instant. A shape created before the upgrade keeps, in
+> its retained stream, the rows the old comparison put there: some outside the window, and on a
+> database whose default zone is not UTC, timestamps in local spelling. Nothing retracts them.
+> **Recreate every shape that has a predicate on a `timestamptz`, `timestamp` or `date` column
+> after upgrading**: `DELETE /shapes/{id}?purge=true`, then let the client create it again. The
+> engine does not do this by itself.
 
 ## Step 2 — Run the engine
 

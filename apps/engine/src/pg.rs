@@ -1082,6 +1082,38 @@ pub async fn introspect_opt(client: &Client, table: &TableRef, with_generated: b
         // nothing to compile — same answer as "not found".
         return Ok(None);
     }
+    // `information_schema` resolves a column whose type is a domain to the domain's base type,
+    // but stops at an array: an array whose ELEMENT type is a domain is reported under the
+    // domain's array type (`_instant`). Its cells are printed as an array of the base type all the
+    // same, so walk domains and array elements down to the type that does the printing and name
+    // the array type built on it.
+    let printed_rows = client
+        .query(
+            "with recursive walk as ( \
+                 select a.attname, a.atttypid as oid, false as in_array \
+                 from pg_attribute a \
+                 where a.attrelid = to_regclass($1) and a.attnum > 0 and not a.attisdropped \
+                 union all \
+                 select w.attname, \
+                        case when t.typtype = 'd' then t.typbasetype else t.typelem end, \
+                        w.in_array or t.typtype <> 'd' \
+                 from walk w join pg_type t on t.oid = w.oid \
+                 where t.typtype = 'd' or (t.typcategory = 'A' and t.typelem <> 0) \
+             ) \
+             select w.attname::text, arr.typname::text \
+             from walk w \
+             join pg_type leaf on leaf.oid = w.oid \
+             join pg_type arr on arr.oid = leaf.typarray \
+             join pg_attribute a on a.attrelid = to_regclass($1) and a.attname = w.attname \
+             where w.in_array \
+               and not (leaf.typtype = 'd' or (leaf.typcategory = 'A' and leaf.typelem <> 0)) \
+               and arr.oid <> a.atttypid",
+            &[&table.quote_qualified()],
+        )
+        .await
+        .context("introspect array element types")?;
+    let mut printed_as: HashMap<String, String> =
+        printed_rows.iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))).collect();
     let mut columns = BTreeMap::new();
     for r in &col_rows {
         let name: String = r.get(0);
@@ -1091,7 +1123,10 @@ pub async fn introspect_opt(client: &Client, table: &TableRef, with_generated: b
         let udt: String = r.get(2);
         // Auto-defaulted (IDENTITY or DEFAULT) → the add-row form can treat it as optional.
         let has_default: bool = r.get(3);
-        columns.insert(name, ColumnDef { ty: map_pg_type(&dt), pg_type: Some(udt), has_default });
+        // A domain over an array (`CREATE DOMAIN d AS timestamptz[]`) is already reported as the
+        // array, so the walk's answer adds nothing there.
+        let printed_as = printed_as.remove(&name).filter(|printed| *printed != udt);
+        columns.insert(name, ColumnDef { ty: map_pg_type(&dt), pg_type: Some(udt), printed_as, has_default });
     }
 
     // Composite primary keys are supported (e.g. Electric's `*_tags` tables); columns are ordered by
