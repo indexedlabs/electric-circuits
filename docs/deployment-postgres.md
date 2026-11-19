@@ -50,19 +50,13 @@ The engine sets everything else up for you on startup, per configured table:
 > instance. If you run more than one engine against the same database, give each a distinct
 > `ELECTRIC_CIRCUITS_PG_SLOT`.
 
-> **Time zone: any. Date style: ISO.** The engine works in UTC whatever the database, the role or
-> the server defaults to: its query sessions ask for `TimeZone=UTC` and `DateStyle=ISO` as they
-> start (so connect it to Postgres directly, or through a pooler that passes the `options` startup
-> parameter — a session that did not take them is refused), and replicated timestamps are respelled
-> in UTC as they arrive. The one thing it needs from the defaults is the **ISO date style for the
-> engine's role** (`ISO, MDY` is Postgres's own default): the replication connection takes no
-> startup options, and a role or database set to `German`, `SQL` or `Postgres` style is refused at
-> boot (exit `78`) with the `ALTER ROLE … SET datestyle` that fixes it. The engine asks again
-> before every replication connection, and checks every date and timestamp it decodes: if the
-> style is changed while it runs, it stops ingesting — at the next reconnect for a role or
-> database setting, at the first non-ISO value for a server-wide one that a reload applies
-> (`postgresql.conf`, `ALTER SYSTEM`) — logs the reason, and resumes by itself, losing nothing,
-> once the style is ISO.
+> **Time zone and date style: any.** The engine works in UTC whatever the database, the role or
+> the server defaults to: every session it opens, the replication connection included, asks for
+> `TimeZone=UTC` and `DateStyle=ISO` as it starts, and a setting asked for at startup outranks
+> every default. Connect the engine to Postgres directly, or through a pooler that passes the
+> `options` startup parameter: a query session that did not take them is refused by name, but the
+> engine cannot tell whether the replication connection took them, and one that did not would
+> print live rows in the defaults while backfills print UTC.
 >
 > **Timestamp literals.** A predicate on a `timestamptz`, `timestamp` or `date` column takes its
 > literal in ISO 8601 form (`2026-10-19T07:00:00Z`, `2026-10-19 07:00:00+05:30`, `2026-10-19`),
@@ -71,17 +65,12 @@ The engine sets everything else up for you on startup, per configured table:
 > So is any literal for an array, range or multirange of timestamps or dates: compare a scalar
 > column instead.
 >
-> **Composite types that hold a `timestamptz`.** The engine cannot respell a timestamp inside a
-> composite value. If a tracked table has such a column and the engine's role does not default to
-> UTC, the engine stops ingesting at the first non-`NULL` value in it and logs the column and the
-> fix: `ALTER ROLE <the engine's role> SET timezone = 'UTC'`, or leave the column out with
-> `ELECTRIC_CIRCUITS_PG_COLUMNS`. Nothing is lost; ingest resumes at the next connection.
->
 > **Upgrading from a version that compared timestamp bounds as text.** Shapes are restored from
 > the catalog with their predicates as the client wrote them, and a bound such as
 > `2026-10-19T07:00:00Z` is now read as an instant. A shape created before the upgrade keeps, in
 > its retained stream, the rows the old comparison put there: some outside the window, and on a
-> database whose default zone is not UTC, timestamps in local spelling. Nothing retracts them.
+> database whose default zone or date style is not UTC and ISO, timestamps in that spelling, which
+> the engine now spells in UTC. Nothing retracts them.
 > **Recreate every shape that has a predicate on a `timestamptz`, `timestamp` or `date` column
 > after upgrading**: `DELETE /shapes/{id}?purge=true`, then let the client create it again. The
 > engine does not do this by itself.

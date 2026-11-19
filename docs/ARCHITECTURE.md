@@ -890,69 +890,42 @@ Postgres's time zone database and its settings, so the engine reads the forms th
 shape record written before this rule that holds such a literal is retired at restore, like a
 shape whose schema changed while the engine was down, and its client's next create is told why.
 
-Text order is instant order only when every cell is printed in one zone, and Postgres prints a
-`timestamptz` in the *session's*. So **every cell reaches the engine in UTC and ISO style, whatever
-the database, the role or the server defaults to**, by a different means on each road:
+Text order is instant order only when every cell is printed in one zone and one style, and Postgres
+prints a `timestamptz` in the *session's* zone and every date in the session's `DateStyle`, both
+defaulting to whatever the database, the role or the server says. So **every session the engine
+opens starts with `-c TimeZone=UTC -c DateStyle=ISO`** (`pg::SESSION_OPTIONS`):
 
 - **Query sessions** (backfills, subset pages, seeds, query-backs — every connection
-  `pg::PgConnectionConfig` opens) send the startup options `-c TimeZone=UTC -c DateStyle=ISO`,
-  after any `options` the URL carries, so theirs win. The server reports both settings back as the
-  session starts; a session that did not take them (a pooler that drops startup options) is refused
-  rather than used, at no extra round-trip. This also fixes how SQL reads a `timestamptz` literal
-  with no zone: as UTC, which is how `pg_temporal` reads it.
-- **The replication session** takes no startup options at all (`pgwire-replication` sends none),
-  so its zone is whatever the defaults say. Each replicated cell of a zone-dependent type —
-  `timestamptz`, and arrays, ranges and multiranges of it — is respelled in UTC as it is decoded
-  (`pg_temporal::utc_cell`, from `replication::tuple_to_map`), in the new image and the old one
-  alike. A backfill row and that row's next live change therefore spell one instant with the same
-  bytes; a client comparing what it holds with what arrives sees no difference where there is
-  none. That holds over Postgres's whole range, 4713 BC to 294276: a year before year one
-  (`0044-03-15 04:07:02-07:52:58 BC`) and a year past 9999 are read and written as Postgres
-  prints them, across either boundary.
-- The type that decides is the one the cell is **printed as**, not the column's name for it. An
-  array whose element type is a domain over `timestamptz` is reported as `_<domain>`, and a range
-  or multirange type of the application's own (`CREATE TYPE … AS RANGE`) under its own name.
-  Introspection (`pg::introspect_opt`) walks each column's type down — through domains, array
-  elements, range subtypes and composite attributes — to the scalar that does the printing, and
-  records `_timestamptz` beside the column's own type (`ColumnDef::printed_as`). The column's own
-  type is kept for casting bound parameters, because Postgres has no `<domain>[] =
-  timestamptz[]`. A scalar domain column needs none of this: `information_schema` already
-  reports its base type.
-- **A composite that holds a `timestamptz` is not respelled; it is refused outside UTC.** Its
-  text carries the timestamp beside attributes that may be text holding anything, a timestamp's
-  spelling included, so no rewrite of it is exact. Under a UTC replication session it is already
-  the bytes a query session prints. Under any other zone the row is not decoded
-  (`pg_temporal::CompositeInLocalZone`): the connection is dropped unacknowledged, the error
-  names the column, the zone and the fix (`ALTER ROLE … SET timezone = 'UTC'`, or leave the
-  column out), and ingest resumes by itself once the session is UTC. A `NULL` in such a column
-  is not a cell and passes.
-- **A literal for a container is refused.** A predicate that compares an array, range,
-  multirange or such a composite of timestamps or dates with a literal is refused with the same
-  typed error as an unreadable scalar literal (`400`). The rows are respelled element by
-  element; reading the literal the same way would take Postgres's array and range input syntax,
-  quoting and range canonicalisation included.
-- Respelling needs the ISO style, and that the engine cannot give the replication session either.
-  The boot opens one session with no options — the same defaults the walsender will get — and
-  **refuses to start** (exit 78, naming `ALTER ROLE … SET datestyle`) unless its `DateStyle` is
-  ISO (`pg::check_replication_session`). The same check runs **before every replication
-  connection**, because a default changed under a running engine reaches the next walsender
-  session. There a session that would not print ISO is not opened: nothing is decoded, the
-  refusal is logged by name, and the ingestor asks again on its reconnect backoff until the style
-  is ISO. Query sessions keep printing ISO throughout, so the engine serves what it has and
-  ingests nothing it would misread.
-- A check at connect is not enough by itself. A **server-wide** style (`postgresql.conf`,
-  `ALTER SYSTEM`) takes effect at a reload inside the walsender that is already streaming. So
-  the decoder judges each cell too (`pg_temporal::check_cell_style`): in a `timestamptz`,
-  `timestamp` or `date` cell, or an array, range or multirange of one, every date must be spelled
-  year first. A cell that is not (`19.10.2026 01:00:00 PDT`) fails the decode of its transaction.
-  Nothing of that transaction is on the log yet and it is not acknowledged; the connection is
-  dropped, the check above refuses the next one by name, and Postgres sends the transaction again
-  once the style is ISO.
+  `pg::PgConnectionConfig` opens) send them after any `options` the URL carries, so theirs win. The
+  server reports both settings back as the session starts; a session that did not take them (a
+  pooler that drops startup options) is refused rather than used, at no extra round-trip
+  (`pg::check_query_session`). This also fixes how SQL reads a `timestamptz` literal with no zone:
+  as UTC, which is how `pg_temporal` reads it.
+- **The replication connection** sends the same two settings, and nothing else of the URL's
+  `options` (`PgConnectionConfig::replication_config`). pgoutput sends each cell as the text the
+  walsender's session prints, so a backfill row and that row's next live change spell one instant
+  with the same bytes — in the new image and the old one, and inside arrays, ranges, multiranges
+  and composites, which the engine never parses. A setting sent at startup outranks database and
+  role defaults and the server's own, including a server-wide value that a reload changes under a
+  walsender that is already streaming.
+- **The replication connection cannot be checked the way a query session is.**
+  `pgwire-replication` drops the `ParameterStatus` messages that would say what the walsender
+  ended up with. A pooler or proxy that stripped `options` from a replication connection would go
+  unnoticed, and live rows would be printed in the defaults while backfills print UTC. Connect the
+  engine to Postgres directly.
 
-Not respelled: `infinity`/`-infinity`, which are the same in every zone and every style. Not
-checked for date style: a composite's `date` and `timestamp` attributes. Other session settings that
-shape a cell's text — `IntervalStyle`, `bytea_output`, `extra_float_digits` — are still the
-defaults' on both roads, and so agree with each other only while nothing sets them on one.
+A **literal for a built-in array, range or multirange** of timestamps or dates is refused with the
+same typed error as an unreadable scalar literal (`400`): SQL reads its elements as instants, and
+reading them here would take Postgres's array and range input syntax, quoting and range
+canonicalisation included. A column of the application's own type — an array of a domain, a range
+type of its own, a composite — is named after that type, and a literal for one is compared as text,
+as before.
+
+Not covered: text order is instant order for years 0001–9999 only, the range a literal is read in. A
+cell outside it (`0044-03-15 12:00:00+00 BC`, `10000-01-01 00:00:00+00`) is compared with a bound as
+text, as before. Other session settings that shape a cell's text — `IntervalStyle`,
+`bytea_output`, `extra_float_digits` — are still the defaults' on both roads, and so agree with each
+other only while nothing sets them on one.
 
 Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
 backfills, seeds and query-backs. Each page the engine accepts (one `ensure_not_degraded` has not
