@@ -62,8 +62,10 @@ The engine sets everything else up for you on startup, per configured table:
 > literal in ISO 8601 form (`2026-10-19T07:00:00Z`, `2026-10-19 07:00:00+05:30`, `2026-10-19`),
 > with `Z`, `UTC`, `GMT` or a numeric offset as the zone, or `infinity`. Any other spelling is
 > refused with `400`, including ones Postgres itself reads, such as `… PST` or `Oct 19 2026`.
-> So is any literal for an array, range or multirange of timestamps or dates: compare a scalar
-> column instead.
+> So is a literal for a built-in array, range or multirange of timestamps or dates
+> (`timestamptz[]`, `tstzrange`, `datemultirange`, …). A literal for an array of a domain, a range
+> type of your own or a composite type is not refused: it is compared as text, as before, and can
+> disagree with the snapshot. Compare a scalar column instead.
 >
 > **Upgrading from a version that compared timestamp bounds as text.** Shapes are restored from
 > the catalog with their predicates as the client wrote them, and a bound such as
@@ -73,13 +75,16 @@ The engine sets everything else up for you on startup, per configured table:
 > `timestamp` or `date` column after upgrading**: `DELETE /shapes/{id}?purge=true`, then let the
 > client create it again. The engine does not do this by itself.
 >
-> On a database whose default zone or date style was **not** UTC and ISO, recreate **every shape
-> on a table that has a `timestamptz`, `timestamp` or `date` column**, whatever its predicate. Its
-> retained rows spell those columns in the old defaults (`19/10/2026 01:00:00 PDT`), and every
-> change after the upgrade spells them in UTC ISO (`2026-10-19 08:00:00+00`). Unchanged rows keep
-> the old spelling, and when such a column is part of the primary key the row's key changes too:
-> a later update or delete arrives under a key the client does not hold, and the client keeps the
-> old row beside the new one.
+> If the server, the database or the engine's role defaulted to a zone other than UTC or a date
+> style other than ISO before the upgrade, **recreate every shape on a table that has a
+> `timestamptz`, `timestamp` or `date` column, or a column that holds one** — an array, range,
+> multirange, domain or composite of those — whatever the shape's predicate. Its retained rows
+> spell those values in the old defaults (`19/10/2026 01:00:00 PDT`), and every change after the
+> upgrade spells them in UTC ISO (`2026-10-19 08:00:00+00`). Unchanged rows keep the old spelling,
+> and when such a column is part of the primary key the row's key changes too: a later update or
+> delete arrives under a key the client does not hold, and the client keeps the old row beside the
+> new one. Recreate them the same way, `DELETE /shapes/{id}?purge=true` and a new create from the
+> client, after the upgraded engine is running.
 
 ## Step 2 — Run the engine
 

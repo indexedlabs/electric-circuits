@@ -29,6 +29,7 @@ const schema: Schema = {
         record_id: { type: 'int' },
         starts: { type: 'text' },
         day: { type: 'text' },
+        local: { type: 'text' },
         name: { type: 'text' },
         marks: { type: 'text' },
         span: { type: 'text' },
@@ -48,6 +49,7 @@ const ddl = `
     record_id int NOT NULL,
     starts timestamptz NOT NULL,
     day date,
+    local timestamp,
     name text NOT NULL,
     marks timestamptz[],
     span tstzrange,
@@ -109,10 +111,12 @@ function setDefaults(timeZone: string, dateStyle: string) {
     )
 }
 
-/** Each column of event 14 as a UTC session in ISO style prints it. */
+/** Each date or time column of event 14 as a UTC session in ISO style prints it. */
 const row14 = {
   starts: '2026-10-21 12:34:56.789+00',
   day: '2026-10-21',
+  // A `timestamp` has no zone, so only the date style decides how it is printed.
+  local: '2026-10-21 12:34:56.789',
   marks: '{"2026-10-21 12:00:00+00","2026-10-22 00:30:00+00"}',
   span: '["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")',
   slot: '("2026-10-21 12:00:00+00","room 4")',
@@ -120,7 +124,7 @@ const row14 = {
 const columns = Object.keys(row14) as (keyof typeof row14)[]
 /** Event 14's timestamp-holding columns as an INSERT writes them: every instant with its offset,
  *  so the zone of the session that writes them does not matter. */
-const row14Sql = `'2026-10-21 12:34:56.789+00', '2026-10-21',
+const row14Sql = `'2026-10-21 12:34:56.789+00', '2026-10-21', '2026-10-21 12:34:56.789',
   ARRAY['2026-10-21 12:00:00+00', '2026-10-22 00:30:00+00']::timestamptz[],
   tstzrange('2026-10-21 12:00:00+00', '2026-10-21 13:30:00+00'),
   ROW('2026-10-21 12:00:00+00', 'room 4')::booking`
@@ -169,7 +173,7 @@ describe.each([
          (20, 1, '2026-11-01 08:45:00+00', 'before the repeated hour'),
          (21, 1, '2026-11-01 09:15:00+00', 'in the repeated hour')`,
     )
-    await pgQuery(h, `INSERT INTO events (id, record_id, starts, day, marks, span, slot, name) VALUES (14, 1, ${row14Sql}, 'midweek')`)
+    await pgQuery(h, `INSERT INTO events (id, record_id, starts, day, local, marks, span, slot, name) VALUES (14, 1, ${row14Sql}, 'midweek')`)
     await drainEngine(h)
   }, 90000)
   afterAll(async () => {
@@ -183,6 +187,10 @@ describe.each([
     try {
       await expectScope(h, week.sql, held, 'the snapshot to load the week')
       expect(label(held())).toEqual(['10:in the first hours', '12:in the last minutes', '14:midweek'])
+      expect(
+        String(held().find((row) => Number(row.id) === 14)?.local),
+        'a snapshot `timestamp`, which has no zone, is spelled in ISO style',
+      ).toBe('2026-10-21 12:34:56.789')
       expect(startsOf(14), 'a snapshot row is spelled in UTC').toBe('2026-10-21 12:34:56.789+00')
 
       // An edit to each row, inside the week and out of it: the feed must report the three inside
@@ -286,7 +294,7 @@ describe.each([
     // An insert inside the window and one just past it.
     await pgQuery(
       h,
-      `INSERT INTO events (id, record_id, starts, day, marks, span, slot, name) VALUES
+      `INSERT INTO events (id, record_id, starts, day, local, marks, span, slot, name) VALUES
          (31, 1, ${row14Sql.replace('12:34:56.789+00', '12:45:00+00')}, 'inserted live'),
          (32, 1, ${row14Sql.replace('12:34:56.789+00', '13:00:00+00')}, 'at the upper bound')`,
     )
@@ -352,7 +360,7 @@ describe('a server-wide time zone and date style reloaded under a running engine
   it('does not reach the replication connection that is already open', async () => {
     h = await bootHarness(schema, { ddl })
     try {
-      await pgQuery(h, `INSERT INTO events (id, record_id, starts, day, marks, span, slot, name) VALUES (14, 1, ${row14Sql}, 'midweek')`)
+      await pgQuery(h, `INSERT INTO events (id, record_id, starts, day, local, marks, span, slot, name) VALUES (14, 1, ${row14Sql}, 'midweek')`)
       await drainEngine(h)
       const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'eq', value: 14 } })
       await drainEngine(h)
