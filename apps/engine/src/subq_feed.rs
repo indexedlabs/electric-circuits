@@ -17,6 +17,12 @@
 //! indivisible step — the borrow checker itself enforces there is no window between them (the
 //! wake-storm gate, PR #30, made structural without a cross-thread circuit hop). The §3
 //! equivalence table of the spike is the contract; [`tests`] pins it row-by-row.
+//!
+//! **What the set is not.** It records what the STREAM delivered. For a materialized shape that is
+//! what the client holds (the set is seeded with the backfill). For a `changes_only` feed it is
+//! not: the stream opens empty while the client holds a separate snapshot's rows. The registry
+//! therefore opens the gate for such a feed on a second condition — proof that the row was a member
+//! just before the change (`crate::subquery::Prior`) — which this module knows nothing about.
 
 use std::collections::HashMap;
 

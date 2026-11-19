@@ -31,6 +31,7 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 | `conformance-subquery*.test.ts` | `IN (SELECT …)`: scenarios, cross-table matrix, nested subqueries, inner-node sharing |
 | `conformance-sharing`, `-shape-sharing` | identical shapes/feeds collapse to one stream, refcounted create/drop |
 | `conformance-subset-positioning.test.ts` | subset LSN positioning: a change in the page/feed overlap window is counted exactly once |
+| `conformance-subset-feed-removals.test.ts` | a subset feed removes rows the client holds only from the snapshot: soft-deleted, moved out of the window, deleted, or hidden through the inner table |
 | `conformance-expressiveness`, `-transitions` | full predicate grammar, rows entering/leaving shapes |
 | `conformance-fuzz`, `-fuzz-wide`, `-counterexample` | random-predicate fuzz vs the oracle + pinned counterexample replays |
 | `harness-mechanics.test.ts` | the harness itself (boot, teardown, engine discovery) |
