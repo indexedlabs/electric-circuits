@@ -68,12 +68,18 @@ The engine sets everything else up for you on startup, per configured table:
 > **Upgrading from a version that compared timestamp bounds as text.** Shapes are restored from
 > the catalog with their predicates as the client wrote them, and a bound such as
 > `2026-10-19T07:00:00Z` is now read as an instant. A shape created before the upgrade keeps, in
-> its retained stream, the rows the old comparison put there: some outside the window, and on a
-> database whose default zone or date style is not UTC and ISO, timestamps in that spelling, which
-> the engine now spells in UTC. Nothing retracts them.
-> **Recreate every shape that has a predicate on a `timestamptz`, `timestamp` or `date` column
-> after upgrading**: `DELETE /shapes/{id}?purge=true`, then let the client create it again. The
-> engine does not do this by itself.
+> its retained stream, the rows the old comparison put there, some of them outside the window.
+> Nothing retracts them. **Recreate every shape that has a predicate on a `timestamptz`,
+> `timestamp` or `date` column after upgrading**: `DELETE /shapes/{id}?purge=true`, then let the
+> client create it again. The engine does not do this by itself.
+>
+> On a database whose default zone or date style was **not** UTC and ISO, recreate **every shape
+> on a table that has a `timestamptz`, `timestamp` or `date` column**, whatever its predicate. Its
+> retained rows spell those columns in the old defaults (`19/10/2026 01:00:00 PDT`), and every
+> change after the upgrade spells them in UTC ISO (`2026-10-19 08:00:00+00`). Unchanged rows keep
+> the old spelling, and when such a column is part of the primary key the row's key changes too:
+> a later update or delete arrives under a key the client does not hold, and the client keeps the
+> old row beside the new one.
 
 ## Step 2 — Run the engine
 
