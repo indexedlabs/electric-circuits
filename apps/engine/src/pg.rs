@@ -255,7 +255,11 @@ impl PgConnectionConfig {
             .with_start_lsn(pgwire_replication::Lsn::ZERO)
             .with_status_interval(std::time::Duration::from_secs(1))
             .with_wakeup_interval(std::time::Duration::from_secs(10))
-            .with_buffer_size(8192))
+            .with_buffer_size(8192)
+            // Only the engine's own two settings, not the URL's `options`: they are what shapes the
+            // text the walsender prints, and the replication connection has never been given the
+            // URL's options, which were written for query sessions.
+            .with_options(SESSION_OPTIONS))
     }
 }
 
@@ -2590,15 +2594,17 @@ mod tests {
         );
     }
 
-    /// Every query session asks for the two settings the engine's text handling of timestamps
-    /// rests on, whatever the database, the role or the server defaults to. An operator's own
-    /// `options` are kept, and the engine's come after them: for a repeated setting Postgres takes
-    /// the last.
+    /// Every session asks for the two settings the engine's text handling of timestamps rests on,
+    /// whatever the database, the role or the server defaults to. A query session keeps an
+    /// operator's own `options`, and the engine's come after them: for a repeated setting Postgres
+    /// takes the last. The replication connection is sent the engine's two settings alone.
     #[test]
-    fn query_sessions_ask_for_utc_and_iso_dates_after_anything_the_url_asks_for() {
+    fn every_session_asks_for_utc_and_iso_dates_after_anything_the_url_asks_for() {
         let config =
             PgConnectionConfig::resolve("postgresql://postgres:password@postgres:5432/app", None, None).unwrap();
         assert_eq!(config.query.get_options(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.options.as_deref(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
 
         let config = PgConnectionConfig::resolve(
             "postgresql://postgres:password@postgres:5432/app?options=-cTimeZone%3DAsia/Kolkata",
@@ -2607,6 +2613,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.query.get_options(), Some("-cTimeZone=Asia/Kolkata -c TimeZone=UTC -c DateStyle=ISO"));
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.options.as_deref(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
     }
 
     /// The server reports the zone and date style a session ended up with. A session that did not
