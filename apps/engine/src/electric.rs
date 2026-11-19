@@ -2264,13 +2264,10 @@ mod tests {
     #[test]
     fn electric_schema_preserves_introspected_jsonb_type() {
         let columns = BTreeMap::from([
-            (
-                "id".to_string(),
-                ColumnDef { ty: ColumnType::Int, pg_type: Some("int8".into()), printed_as: None, has_default: false },
-            ),
+            ("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: Some("int8".into()), has_default: false }),
             (
                 "metadata".to_string(),
-                ColumnDef { ty: ColumnType::Text, pg_type: Some("jsonb".into()), printed_as: None, has_default: false },
+                ColumnDef { ty: ColumnType::Text, pg_type: Some("jsonb".into()), has_default: false },
             ),
         ]);
         let def = TableDef { columns, primary_key: vec!["id".into()], fingerprint: None };

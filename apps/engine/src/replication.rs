@@ -341,29 +341,6 @@ pub async fn run(
                 continue;
             }
         };
-        // The walsender's session takes no startup options, so its date style is whatever the
-        // database, the role or the server defaults to NOW — which need not be what the boot saw.
-        // A default changed under a running engine reaches the next replication connection, and a
-        // non-ISO one would hand the decoder cells it cannot read, which it would pass on as they
-        // are while every query session still prints ISO. So the same question the boot asks is
-        // asked before every connection, and a refusal is "not yet": no cell is decoded until the
-        // setting is put back, and the next attempt then connects.
-        // Raced against the shutdown like the backoff is: a dial that hangs must not hold a
-        // terminating process.
-        let checked = tokio::select! {
-            checked = crate::pg::check_replication_session(&pg_url, &shutdown) => checked,
-            _ = shutdown.wait() => continue,
-        };
-        let local_zone = match checked {
-            Ok(local_zone) => local_zone,
-            Err(refused) => {
-                tracing::error!("replicator: not connecting — {refused:#}");
-                let (base, next) = next_backoff(attempt, false);
-                backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
-                attempt = next;
-                continue;
-            }
-        };
         let mut connected = false;
         match stream_loop(
             cfg,
@@ -377,7 +354,6 @@ pub async fn run(
             &txn_cfg,
             &shutdown,
             &mut connected,
-            local_zone,
         )
         .await
         {
@@ -442,8 +418,6 @@ async fn stream_loop(
     // `START_REPLICATION` failures (a slot held by someone else, most of all) all surface on the
     // first `recv`. Setting it there would peg every one of those at the 1 s floor forever.
     connected: &mut bool,
-    // The replication session's time zone when it is not UTC (`pg::check_replication_session`).
-    local_zone: Option<String>,
 ) -> Result<StreamEnd> {
     // `ReplicationClient::connect` only spawns its worker; TCP/authentication and
     // START_REPLICATION happen before the worker can deliver its first frame. Bound both the
@@ -472,7 +446,6 @@ async fn stream_loop(
     };
     let mut dec = Decoder::new(tables.clone());
     dec.runtime_incarnation = Some(runtime_incarnation);
-    dec.local_zone = local_zone;
     // Dropped on every exit path (a replaced `Begin`, an error return, the stream ending), which is
     // what removes a spilled transaction's temporary file (ADR-0003).
     let mut txn: Option<TxnBuffer> = None;
@@ -559,10 +532,6 @@ async fn stream_loop(
                     Decoded::Env(env) => t.push(env, data.len() as u64).context("buffering a change")?,
                     Decoded::Sync(n) => t.set_sync(n),
                     Decoded::None => {}
-                    // Nothing of this transaction is on the log yet (it is appended whole, at its
-                    // commit), and it is not acknowledged: Postgres sends it again on the next
-                    // connection, which the date-style check lets through only once it is ISO.
-                    Decoded::Refused(cell) => return Err(cell.context("decoding a change")),
                 }
             }
             ReplicationEvent::Commit { lsn, end_lsn, commit_time_micros } => {
@@ -681,8 +650,6 @@ enum Decoded {
     Env(Envelope),
     Sync(i64),
     None,
-    /// A cell the engine must not ingest: the connection is torn down unacknowledged.
-    Refused(anyhow::Error),
 }
 
 /// Relation metadata learned from `R` messages on this connection. The `R` message's namespace is
@@ -724,13 +691,11 @@ struct Decoder {
     runtime_incarnation: Option<uuid::Uuid>,
     tables: SharedTables,
     rels: HashMap<u32, RelMeta>,
-    /// The time zone this connection's walsender prints in, when it is not UTC.
-    local_zone: Option<String>,
 }
 
 impl Decoder {
     fn new(tables: SharedTables) -> Self {
-        Decoder { tables, rels: HashMap::new(), runtime_incarnation: None, local_zone: None }
+        Decoder { tables, rels: HashMap::new(), runtime_incarnation: None }
     }
 
     /// Record a relation and, if what Postgres now reports differs from the compiled schema, report
@@ -814,10 +779,9 @@ impl Decoder {
         }
         let tables = self.tables.read().unwrap();
         let Some(ts) = tables.get(table) else { return Decoded::None };
-        match build_envelope(table, ts, &rel.columns, msg, self.local_zone.as_deref()) {
-            Ok(Some(env)) => Decoded::Env(env),
-            Ok(None) => Decoded::None,
-            Err(cell) => Decoded::Refused(cell),
+        match build_envelope(table, ts, &rel.columns, msg) {
+            Some(env) => Decoded::Env(env),
+            None => Decoded::None,
         }
     }
 }
@@ -884,16 +848,7 @@ fn sync_counter(rel: &RelMeta, tuple: &Tuple) -> Option<i64> {
 }
 
 /// Build an envelope from a decoded pgoutput DML message; LSN/xid/seq are stamped at `Commit`.
-///
-/// `Err` when a cell is one the engine must not ingest (see [`tuple_to_map`]): no envelope may be
-/// made of such a row. `local_zone` is the replication session's time zone when it is not UTC.
-fn build_envelope(
-    table: &TableRef,
-    ts: &TableSchema,
-    columns: &[String],
-    msg: Message,
-    local_zone: Option<&str>,
-) -> Result<Option<Envelope>> {
+fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: Message) -> Option<Envelope> {
     let make = |operation: &str, value: Option<Json>, old: Option<Json>, key_src: &Json| Envelope {
         // The wire `type` is the canonical `schema.name` — always qualified, never bare.
         type_: table.to_string(),
@@ -910,14 +865,14 @@ fn build_envelope(
             commit_ts: None,
         },
     };
-    Ok(match msg {
+    match msg {
         Message::Insert { new, .. } => {
-            let new = Json::Object(tuple_to_map(&new, columns, ts, local_zone)?);
+            let new = Json::Object(tuple_to_map(&new, columns, ts));
             Some(make("insert", Some(new.clone()), None, &new))
         }
         Message::Update { old, new, .. } => {
             let old_map = match old {
-                Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts, local_zone)?),
+                Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts)),
                 Some(OldTuple::Key(_)) | None => {
                     // No full old image: this change was written while the table's REPLICA IDENTITY
                     // was not FULL. The preceding `R` reported that identity, so the engine has
@@ -931,7 +886,7 @@ fn build_envelope(
                     None
                 }
             };
-            let mut new_map = tuple_to_map(&new, columns, ts, local_zone)?;
+            let mut new_map = tuple_to_map(&new, columns, ts);
             // TOASTed-but-unchanged columns are omitted from new (see tuple_to_map); fill from old.
             if let Some(ref om) = old_map {
                 for (k, v) in om {
@@ -951,71 +906,33 @@ fn build_envelope(
                     "replicator: DELETE on {table} carries no full old image (REPLICA IDENTITY was not \
                      FULL when it was written); the table's dependents have been retired"
                 );
-                return Ok(None);
+                return None;
             };
-            let old = Json::Object(tuple_to_map(&t, columns, ts, local_zone)?);
+            let old = Json::Object(tuple_to_map(&t, columns, ts));
             Some(make("delete", None, Some(old.clone()), &old))
         }
         _ => None,
-    })
+    }
 }
 
 /// Zip a pgoutput tuple with its relation's column names into a JSON object, converting each text
 /// value by the column's schema type. `UnchangedToast` cells are OMITTED so the caller can fill
 /// them from the old image; columns not in the schema are skipped.
-///
-/// A cell whose text depends on the session's time zone (`timestamptz` and containers of it) is
-/// respelled in UTC here ([`crate::pg_temporal::utc_cell`]). This is the one place the walsender's
-/// text enters the engine, and the walsender's session is the one session the engine cannot
-/// configure: `pgwire-replication` sends no startup options, so its zone is the database's, the
-/// role's or the server's default. Query sessions print UTC, and a cell has to be the same bytes
-/// by either road — the old image as much as the new one, or a retraction misses its row.
-///
-/// The walsender's `DateStyle` is out of the engine's hands for the same reason, and a reload can
-/// change it under a connection that was checked when it was opened. A date or timestamp cell that
-/// is not in the ISO style is therefore refused here, before anything is made of the row.
-///
-/// So is the one zone-dependent cell that cannot be respelled: a composite that holds a
-/// `timestamptz` ([`crate::pg_temporal::COMPOSITE_WITH_TIMESTAMPTZ`]), when the walsender's zone
-/// (`local_zone`) is not UTC. Under UTC it is the bytes a query session prints, and passes.
-fn tuple_to_map(
-    tuple: &Tuple,
-    columns: &[String],
-    ts: &TableSchema,
-    local_zone: Option<&str>,
-) -> Result<Map<String, Json>> {
+fn tuple_to_map(tuple: &Tuple, columns: &[String], ts: &TableSchema) -> Map<String, Json> {
     let mut out = Map::new();
     for (cell, name) in tuple.iter().zip(columns) {
-        let Some(&idx) = ts.index.get(name) else { continue };
-        let ty = ts.columns[idx].1;
+        let Some(ty) = ts.index.get(name).map(|&idx| ts.columns[idx].1) else { continue };
         match cell {
             Cell::UnchangedToast => {}
             Cell::Null => {
                 out.insert(name.clone(), Json::Null);
             }
             Cell::Text(text) => {
-                let utc = match (ty, ts.printed_type(idx)) {
-                    (ColumnType::Text, Some(crate::pg_temporal::COMPOSITE_WITH_TIMESTAMPTZ)) => {
-                        if let Some(zone) = local_zone {
-                            return Err(crate::pg_temporal::CompositeInLocalZone {
-                                column: format!("{}.{name}", ts.table),
-                                time_zone: zone.to_string(),
-                            }
-                            .into());
-                        }
-                        None
-                    }
-                    (ColumnType::Text, Some(printed)) => {
-                        crate::pg_temporal::check_cell_style(text, printed)?;
-                        crate::pg_temporal::utc_cell(text, printed)
-                    }
-                    _ => None,
-                };
-                out.insert(name.clone(), utc.map_or_else(|| text_to_json(text, ty), Json::String));
+                out.insert(name.clone(), text_to_json(text, ty));
             }
         }
     }
-    Ok(out)
+    out
 }
 
 /// Extract the primary-key string from a parsed row object. For composite primary keys the column
@@ -1155,18 +1072,9 @@ mod tests {
 
     fn users_def(fingerprint: Option<SchemaFingerprint>) -> TableDef {
         let mut columns = BTreeMap::new();
-        columns.insert(
-            "id".to_string(),
-            ColumnDef { ty: ColumnType::Int, pg_type: None, printed_as: None, has_default: false },
-        );
-        columns.insert(
-            "tenant".to_string(),
-            ColumnDef { ty: ColumnType::Int, pg_type: None, printed_as: None, has_default: false },
-        );
-        columns.insert(
-            "name".to_string(),
-            ColumnDef { ty: ColumnType::Text, pg_type: None, printed_as: None, has_default: false },
-        );
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
+        columns.insert("tenant".to_string(), ColumnDef { ty: ColumnType::Int, pg_type: None, has_default: false });
+        columns.insert("name".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
         TableDef { columns, primary_key: vec!["id".to_string()], fingerprint }
     }
 
@@ -1367,245 +1275,6 @@ mod tests {
         assert_eq!(e.value.as_ref().unwrap()["name"], "a b 'c' café ☃ 北京");
     }
 
-    /// The walsender prints a `timestamptz` in ITS session's zone, and that session takes no
-    /// startup options, so the zone is whatever the database, the role or the server defaults to.
-    /// Query sessions print UTC. One instant must reach the engine in one spelling by either
-    /// road, so replicated cells are respelled in UTC as they are decoded — new image and old
-    /// image alike, or a retraction would not match what it retracts. A text column that happens
-    /// to hold timestamp-shaped text is the application's text and is not touched.
-    #[test]
-    fn timestamptz_cells_are_decoded_in_utc_whatever_zone_the_walsender_printed_them_in() {
-        let mut columns = BTreeMap::new();
-        for (name, ty, pg_type) in [
-            ("id", ColumnType::Int, "int4"),
-            ("starts", ColumnType::Text, "timestamptz"),
-            ("marks", ColumnType::Text, "_timestamptz"),
-            ("note", ColumnType::Text, "text"),
-        ] {
-            columns.insert(
-                name.to_string(),
-                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as: None, has_default: false },
-            );
-        }
-        let table = TableRef::parse("public.events").unwrap();
-        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
-        let ts = TableSchema::from_def(&table, &def).unwrap();
-        let names: Vec<String> = ["id", "starts", "marks", "note"].map(String::from).to_vec();
-
-        let note = "2026-10-19 01:00:00-07";
-        let in_los_angeles = |note: &str| {
-            vec![
-                t("1"),
-                t("2026-10-19 01:00:00-07"),
-                t(r#"{"2026-10-19 01:00:00-07","2026-10-20 01:30:00-07"}"#),
-                t(note),
-            ]
-        };
-        let in_utc = |note: &str| {
-            serde_json::json!({
-                "id": 1,
-                "starts": "2026-10-19 08:00:00+00",
-                "marks": r#"{"2026-10-19 08:00:00+00","2026-10-20 08:30:00+00"}"#,
-                "note": note,
-            })
-        };
-
-        let update = build_envelope(
-            &table,
-            &ts,
-            &names,
-            Message::Update {
-                rel_id: 1,
-                old: Some(OldTuple::Full(in_los_angeles(note))),
-                new: in_los_angeles("edited"),
-            },
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(update.old, Some(in_utc(note)));
-        assert_eq!(update.value, Some(in_utc("edited")));
-
-        let delete = build_envelope(
-            &table,
-            &ts,
-            &names,
-            Message::Delete { rel_id: 1, old: OldTuple::Full(in_los_angeles(note)) },
-            None,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(delete.old, Some(in_utc(note)));
-
-        // The same instants printed in another zone decode to the same bytes.
-        let in_kolkata = vec![
-            t("1"),
-            t("2026-10-19 13:30:00+05:30"),
-            t(r#"{"2026-10-19 13:30:00+05:30","2026-10-20 14:00:00+05:30"}"#),
-            t(note),
-        ];
-        let insert =
-            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: in_kolkata }, None).unwrap().unwrap();
-        assert_eq!(insert.value, Some(in_utc(note)));
-    }
-
-    /// An array whose element type is a domain over `timestamptz` is named after the domain
-    /// (`_instant`), and introspection records what it prints as. Its elements are respelled like
-    /// any other array of timestamps; a column that only LOOKS like one by name is not.
-    #[test]
-    fn an_array_of_a_domain_over_timestamptz_is_decoded_in_utc_by_the_type_it_prints_as() {
-        let mut columns = BTreeMap::new();
-        for (name, ty, pg_type, printed_as) in [
-            ("id", ColumnType::Int, "int4", None),
-            ("stamps", ColumnType::Text, "_instant", Some("_timestamptz")),
-            ("labels", ColumnType::Text, "_label", Some("_text")),
-        ] {
-            let printed_as = printed_as.map(String::from);
-            columns.insert(
-                name.to_string(),
-                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as, has_default: false },
-            );
-        }
-        let table = TableRef::parse("public.events").unwrap();
-        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
-        let ts = TableSchema::from_def(&table, &def).unwrap();
-        assert_eq!(ts.pg_type_of("stamps"), Some("_instant"), "a bound parameter is still cast to the column's type");
-        let names: Vec<String> = ["id", "stamps", "labels"].map(String::from).to_vec();
-        let printed = r#"{"2026-10-19 01:00:00-07","2026-10-20 01:30:00-07"}"#;
-        let row = vec![t("1"), t(printed), t(printed)];
-        let insert =
-            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: row }, None).unwrap().unwrap();
-        assert_eq!(
-            insert.value,
-            Some(serde_json::json!({
-                "id": 1,
-                "stamps": r#"{"2026-10-19 08:00:00+00","2026-10-20 08:30:00+00"}"#,
-                "labels": printed,
-            }))
-        );
-    }
-
-    /// A range type of the application's own over `timestamptz` is recorded as printing like an
-    /// array of them, and is respelled. A composite that holds a `timestamptz` cannot be: under a
-    /// UTC replication session it is already the bytes a query session prints, and under any other
-    /// zone the row is refused, naming the column and the zone, rather than spelled two ways.
-    #[test]
-    fn a_custom_range_is_respelled_and_a_composite_is_refused_outside_utc() {
-        let mut columns = BTreeMap::new();
-        for (name, ty, pg_type, printed_as) in [
-            ("id", ColumnType::Int, "int4", None),
-            ("held", ColumnType::Text, "hold", Some("_timestamptz")),
-            ("slot", ColumnType::Text, "booking", Some(crate::pg_temporal::COMPOSITE_WITH_TIMESTAMPTZ)),
-        ] {
-            let printed_as = printed_as.map(String::from);
-            columns.insert(
-                name.to_string(),
-                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as, has_default: false },
-            );
-        }
-        let table = TableRef::parse("public.events").unwrap();
-        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
-        let ts = TableSchema::from_def(&table, &def).unwrap();
-        let names: Vec<String> = ["id", "held", "slot"].map(String::from).to_vec();
-        let insert = |held: &str, slot: Cell, zone: Option<&str>| {
-            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: vec![t("1"), t(held), slot] }, zone)
-        };
-
-        let local = r#"["2026-10-21 05:00:00-07","2026-10-21 06:30:00-07")"#;
-        let utc = r#"["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")"#;
-        let zone = Some("America/Los_Angeles");
-        let row = insert(local, Cell::Null, zone).unwrap().unwrap();
-        assert_eq!(row.value, Some(serde_json::json!({"id": 1, "held": utc, "slot": null})));
-
-        // Under UTC the composite is what a query session prints, and passes as it is.
-        let in_utc = r#"("2026-10-21 12:00:00+00","room 4")"#;
-        let row = insert(utc, t(in_utc), None).unwrap().unwrap();
-        assert_eq!(row.value, Some(serde_json::json!({"id": 1, "held": utc, "slot": in_utc})));
-
-        let refused = insert(local, t(r#"("2026-10-21 05:00:00-07","room 4")"#), zone).unwrap_err();
-        let refused = format!("{refused:#}");
-        assert!(refused.contains("public.events.slot") && refused.contains("America/Los_Angeles"), "{refused}");
-    }
-
-    /// A date style set server-wide reaches a walsender that is ALREADY connected (a reload is
-    /// enough), so the check made before the connection was opened no longer holds. The cells
-    /// then arrive as `19.10.2026 01:00:00 PDT`, which the engine cannot read and query sessions
-    /// never print. Such a cell must never become an envelope: the decode fails, which drops the
-    /// connection, and the check before the next one names the setting. Cells of any other type,
-    /// whatever they look like, are the application's text.
-    #[tokio::test]
-    async fn a_cell_that_is_not_in_the_iso_date_style_is_never_decoded() {
-        let mut columns = BTreeMap::new();
-        for (name, ty, pg_type) in [
-            ("id", ColumnType::Int, "int4"),
-            ("starts", ColumnType::Text, "timestamptz"),
-            ("local", ColumnType::Text, "timestamp"),
-            ("day", ColumnType::Text, "date"),
-            ("marks", ColumnType::Text, "_timestamptz"),
-            ("span", ColumnType::Text, "daterange"),
-            ("note", ColumnType::Text, "text"),
-        ] {
-            columns.insert(
-                name.to_string(),
-                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as: None, has_default: false },
-            );
-        }
-        let table = TableRef::parse("public.events").unwrap();
-        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
-        let tables = shared(HashMap::from([(table.clone(), TableSchema::from_def(&table, &def).unwrap())]));
-        let ev = RecordingEvents::default();
-        let mut d = Decoder::new(tables.clone());
-        let oids = [
-            ("id", 23),
-            ("starts", 1184),
-            ("local", 1114),
-            ("day", 1082),
-            ("marks", 1185),
-            ("span", 3912),
-            ("note", 25),
-        ];
-        d.on_relation(rel_msg(1, "public", "events", &oids), &ev, None).await;
-
-        // One row in the ISO style, as every session prints it by default — the infinities, a year
-        // BC and an empty range included.
-        let iso = ["1", "2026-10-19 01:00:00-07", "2026-10-19 08:00:00", "2026-10-19", "{}", "empty", "19.10.2026"];
-        let decode = |cells: [&str; 7]| d.on_change(Message::Insert { rel_id: 1, new: cells.map(t).to_vec() });
-        assert!(matches!(decode(iso), Decoded::Env(_)));
-        for (column, cell) in [
-            (1, "infinity"),
-            (1, "0044-03-15 04:07:02-07:52:58 BC"),
-            (2, "-infinity"),
-            (3, "0044-03-15 BC"),
-            (4, r#"{"2026-10-19 01:00:00-07",NULL}"#),
-            (5, "[2026-10-19,2026-10-21)"),
-        ] {
-            let mut row = iso;
-            row[column] = cell;
-            assert!(matches!(decode(row), Decoded::Env(_)), "{cell:?} is ISO-style output");
-        }
-
-        // The same row as `German`, `SQL` and `Postgres` style sessions print it, one cell at a time.
-        for (column, cell) in [
-            (1, "19.10.2026 01:00:00 PDT"),
-            (1, "10/19/2026 01:00:00 PDT"),
-            (1, "Mon Oct 19 01:00:00 2026 PDT"),
-            (2, "19.10.2026 08:00:00"),
-            (2, "Mon Oct 19 08:00:00 2026"),
-            (3, "19.10.2026"),
-            (3, "10/19/2026"),
-            (3, "10-19-2026"),
-            (3, "15.03.0044 BC"),
-            (4, r#"{"19.10.2026 01:00:00 PDT"}"#),
-            (4, r#"{"2026-10-19 01:00:00-07","Mon Oct 19 01:00:00 2026 PDT"}"#),
-            (5, "[19.10.2026,21.10.2026)"),
-            (5, "[10-19-2026,10-21-2026)"),
-        ] {
-            let mut row = iso;
-            row[column] = cell;
-            assert!(!matches!(decode(row), Decoded::Env(_)), "{cell:?} must not be decoded into an envelope");
-        }
-    }
-
     #[tokio::test]
     async fn toast_unchanged_value_filled_from_old() {
         let tables = shared(users());
@@ -1743,10 +1412,7 @@ mod tests {
     #[tokio::test]
     async fn float_pk_key_is_canonicalized() {
         let mut columns = BTreeMap::new();
-        columns.insert(
-            "id".to_string(),
-            ColumnDef { ty: ColumnType::Float, pg_type: None, printed_as: None, has_default: false },
-        );
+        columns.insert("id".to_string(), ColumnDef { ty: ColumnType::Float, pg_type: None, has_default: false });
         let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
         let f = TableRef::parse("f").unwrap();
         let tables = shared(HashMap::from([(f.clone(), TableSchema::from_def(&f, &def).unwrap())]));
@@ -1791,10 +1457,7 @@ mod tests {
             pk: None, // as observed off the wire
         };
         let mut def = users_def(Some(altered.clone()));
-        def.columns.insert(
-            "extra".to_string(),
-            ColumnDef { ty: ColumnType::Text, pg_type: None, printed_as: None, has_default: false },
-        );
+        def.columns.insert("extra".to_string(), ColumnDef { ty: ColumnType::Text, pg_type: None, has_default: false });
         *ev.resolves_to.lock().unwrap() = Some(TableSchema::from_def(&t_ref, &def).unwrap());
         *ev.tables.lock().unwrap() = Some(tables.clone());
 
