@@ -20,9 +20,13 @@ export interface StreamEnvelope {
     /** Stamped by the server on read; never sent by producers. */
     offset?: string
     /**
-     * Postgres commit LSN (`"HI/LO"` hex) of the change, stamped by the engine on live shape/feed
-     * envelopes. Lets a subset client position its live tail at the page snapshot — drop deltas with
-     * `lsn < snapshotLsn`. Absent on backfill rows and in library (no-Postgres) mode.
+     * The envelope's **position** (`"HI/LO"` hex, a Postgres LSN): the commit LSN of the
+     * transaction that caused it (`txid`), raised to the highest position already on the same
+     * stream when that is greater — so along one stream it never decreases, and equal positions are
+     * ordinary. Stamped by the engine on every live envelope of a shape, feed or group stream. Lets
+     * a subset client place its live tail against the page snapshot. Absent on backfill rows and in
+     * library (no-Postgres) mode. The contract is `docs/ARCHITECTURE.md` §7, "Native envelope
+     * positions".
      */
     lsn?: string
     /**

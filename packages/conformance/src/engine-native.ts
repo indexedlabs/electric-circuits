@@ -55,25 +55,31 @@ export async function waitFor(
   throw new Error(`timed out waiting for ${what}`)
 }
 
-/** Fold a shape stream (raw durable-streams reads, from the start) into its current key -> row map. */
-export async function foldStream(streamUrl: string): Promise<Map<string, Row>> {
-  const rows = new Map<string, Row>()
+/** Every envelope on a stream, in append order (raw durable-streams reads, from the start). */
+export async function readEnvelopes(streamUrl: string): Promise<StreamEnvelope[]> {
+  const all: StreamEnvelope[] = []
   let offset = '-1'
   for (let i = 0; i < 100; i++) {
     const res = await fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}`)
     if (res.status === 204) break
     if (!res.ok) throw new Error(`GET ${streamUrl} -> ${res.status}`)
     const body = (await res.text()).trim()
-    const envs: StreamEnvelope[] = body ? (JSON.parse(body) as StreamEnvelope[]) : []
-    for (const env of envs) {
-      if (env.headers.operation === 'delete') rows.delete(env.key)
-      else if (env.value) rows.set(env.key, env.value as Row)
-    }
+    if (body) all.push(...(JSON.parse(body) as StreamEnvelope[]))
     const next = res.headers.get('stream-next-offset')
     const upToDate = res.headers.get('stream-up-to-date') !== null
     if (!next || next === offset) break
     offset = next
     if (upToDate) break
+  }
+  return all
+}
+
+/** Fold a shape stream (raw durable-streams reads, from the start) into its current key -> row map. */
+export async function foldStream(streamUrl: string): Promise<Map<string, Row>> {
+  const rows = new Map<string, Row>()
+  for (const env of await readEnvelopes(streamUrl)) {
+    if (env.headers.operation === 'delete') rows.delete(env.key)
+    else if (env.value) rows.set(env.key, env.value as Row)
   }
   return rows
 }
