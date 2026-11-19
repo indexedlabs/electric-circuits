@@ -53,11 +53,28 @@ enum PgTlsPolicy {
 /// receives the equivalent pgwire `VerifyFull` policy.
 #[derive(Clone)]
 pub struct PgConnectionConfig {
+    /// Every query session: the URL's settings plus [`SESSION_OPTIONS`].
     query: tokio_postgres::Config,
     url: Url,
     connect_host: String,
     tls: PgTlsPolicy,
 }
+
+/// The startup options every session of the engine sends: each query session, after any options
+/// the URL carries (for a repeated setting Postgres takes the last, so these win), and the
+/// replication connection ([`PgConnectionConfig::replication_config`]).
+///
+/// The engine keeps `timestamptz`, `timestamp` and `date` cells as the text Postgres prints and
+/// compares that text (see [`crate::pg_temporal`]). Postgres prints a `timestamptz` in the
+/// session's time zone and every date in the session's style, and both default to whatever the
+/// database, the role or the server says — a database set to `America/Los_Angeles` prints 08:00
+/// UTC as `01:00:00-07`, which sorts below a `07:00:00+00` bound it is after. A setting a session
+/// sends at startup outranks all of those defaults, a server-wide one a reload changes included,
+/// so these two make a cell one spelling on every road: UTC, ISO. pgoutput sends a replicated cell
+/// as the text the walsender's session prints, so a backfill row and that row's next change carry
+/// the same bytes, timestamps inside arrays, ranges and composites included. They also fix how SQL
+/// reads a `timestamptz` literal that names no zone — as UTC, which is how the engine reads it.
+pub(crate) const SESSION_OPTIONS: &str = "-c TimeZone=UTC -c DateStyle=ISO";
 
 impl PgConnectionConfig {
     pub fn resolve(url: &str, ca_bundle: Option<&str>, server_name: Option<&str>) -> Result<Self> {
@@ -150,6 +167,11 @@ impl PgConnectionConfig {
         if query.get_connect_timeout().is_none() {
             query.connect_timeout(CONNECT_TIMEOUT);
         }
+        let options = match query.get_options() {
+            Some(own) if !own.trim().is_empty() => format!("{own} {SESSION_OPTIONS}"),
+            _ => SESSION_OPTIONS.to_string(),
+        };
+        query.options(options);
         Ok(Self { query, url: parsed, connect_host: host, tls })
     }
 
@@ -159,10 +181,14 @@ impl PgConnectionConfig {
         Self::resolve(url, ca_bundle.as_deref(), server_name.as_deref())
     }
 
+    /// Open a query session. It is handed back only if the server reports the zone and date style
+    /// [`SESSION_OPTIONS`] asked for ([`check_query_session`]); the server reports both while the
+    /// session starts, so reading them back costs no round-trip.
     async fn connect(&self, owner: Option<&crate::shutdown::ShutdownToken>) -> Result<Client> {
         match &self.tls {
             PgTlsPolicy::Disabled => {
                 let (client, connection) = self.query.connect(NoTls).await.context("connect postgres")?;
+                check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
                         tracing::error!("postgres connection error: {error}");
@@ -174,6 +200,7 @@ impl PgConnectionConfig {
                 let connector = MakeRustlsConnect::new(rustls_client_config(ca_bundle)?);
                 let (client, connection) =
                     self.query.connect(connector).await.context("connect postgres with verified TLS")?;
+                check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
                         tracing::error!("postgres TLS connection error: {error}");
@@ -203,21 +230,18 @@ impl PgConnectionConfig {
                 tls
             }
         };
-        Ok(ReplicationConfig {
-            host: self.connect_host.clone(),
-            port: self.url.port().unwrap_or(5432),
-            user,
-            password: self.url.password().map(percent_decode).unwrap_or_default(),
-            database,
-            tls,
-            slot: slot.to_string(),
-            publication: publication.to_string(),
-            start_lsn: pgwire_replication::Lsn::ZERO,
-            stop_at_lsn: None,
-            status_interval: std::time::Duration::from_secs(1),
-            idle_wakeup_interval: std::time::Duration::from_secs(10),
-            buffer_events: 8192,
-        })
+        let password = self.url.password().map(percent_decode).unwrap_or_default();
+        Ok(ReplicationConfig::new(self.connect_host.clone(), user, password, database, slot, publication)
+            .with_port(self.url.port().unwrap_or(5432))
+            .with_tls(tls)
+            .with_start_lsn(pgwire_replication::Lsn::ZERO)
+            .with_status_interval(std::time::Duration::from_secs(1))
+            .with_wakeup_interval(std::time::Duration::from_secs(10))
+            .with_buffer_size(8192)
+            // Only the engine's own two settings, not the URL's `options`: they are what shapes the
+            // text the walsender prints, and the replication connection has never been given the
+            // URL's options, which were written for query sessions.
+            .with_options(SESSION_OPTIONS))
     }
 }
 
@@ -508,6 +532,38 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `DateStyle` is `<output style>, <field order>`; only the output style shapes a printed cell.
+fn prints_iso_dates(date_style: Option<&str>) -> bool {
+    date_style
+        .is_some_and(|style| style.split(',').next().is_some_and(|output| output.trim().eq_ignore_ascii_case("ISO")))
+}
+
+/// Refuse a query session that is not in UTC with ISO dates — that did not take
+/// [`SESSION_OPTIONS`]. The engine asked for exactly `UTC`, so that is what the server reports
+/// when it was listened to; anything else, an equivalent zone included, means something between
+/// the engine and Postgres dropped the startup options, and then neither setting can be trusted.
+///
+/// The replication connection is sent the same options but cannot be checked this way:
+/// `pgwire-replication` reads the server's `ParameterStatus` messages and drops them. A pooler or
+/// proxy that strips the `options` startup parameter from a replication connection would
+/// therefore go unnoticed, and the walsender would print in the database's, the role's or the
+/// server's defaults while every query session prints UTC. Connect the engine to Postgres directly
+/// — a query session behind such a pooler is refused here, by name.
+fn check_query_session(time_zone: Option<&str>, date_style: Option<&str>) -> Result<()> {
+    if time_zone.is_some_and(|zone| zone.eq_ignore_ascii_case("UTC")) && prints_iso_dates(date_style) {
+        return Ok(());
+    }
+    bail!(
+        "a Postgres session did not take the engine's startup options ({SESSION_OPTIONS}): the server \
+         reports TimeZone={} and DateStyle={}. The engine compares timestamps as the text Postgres \
+         prints, so every session must print UTC in ISO style. A pooler between the engine and Postgres \
+         that drops the `options` startup parameter does this; connect the engine to Postgres directly, \
+         or let the pooler pass `options` through.",
+        time_zone.unwrap_or("(not reported)"),
+        date_style.unwrap_or("(not reported)"),
+    )
 }
 
 /// Maximum connections per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_SIZE` (default 20).
@@ -2394,6 +2450,53 @@ mod tests {
             config.replication_config("circuits", "circuits_pub").unwrap().tls.mode,
             pgwire_replication::SslMode::Disable
         );
+    }
+
+    /// Every session asks for the two settings the engine's text handling of timestamps rests on,
+    /// whatever the database, the role or the server defaults to. A query session keeps an
+    /// operator's own `options`, and the engine's come after them: for a repeated setting Postgres
+    /// takes the last. The replication connection is sent the engine's two settings alone.
+    #[test]
+    fn every_session_asks_for_utc_and_iso_dates_after_anything_the_url_asks_for() {
+        let config =
+            PgConnectionConfig::resolve("postgresql://postgres:password@postgres:5432/app", None, None).unwrap();
+        assert_eq!(config.query.get_options(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.options.as_deref(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+
+        let config = PgConnectionConfig::resolve(
+            "postgresql://postgres:password@postgres:5432/app?options=-cTimeZone%3DAsia/Kolkata",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.query.get_options(), Some("-cTimeZone=Asia/Kolkata -c TimeZone=UTC -c DateStyle=ISO"));
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.options.as_deref(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+    }
+
+    /// The server reports the zone and date style a session ended up with. A session that did not
+    /// take the engine's (a pooler that drops startup options) would print timestamps the engine
+    /// then compares wrongly, so it is refused rather than used — and named, not retried.
+    #[test]
+    fn a_query_session_that_did_not_take_utc_and_iso_dates_is_refused() {
+        for date_style in ["ISO, MDY", "ISO, DMY", "ISO, YMD", "ISO"] {
+            assert!(check_query_session(Some("UTC"), Some(date_style)).is_ok(), "{date_style}");
+        }
+        for (time_zone, date_style) in [
+            (Some("America/Los_Angeles"), Some("ISO, MDY")),
+            (Some("Etc/UTC"), Some("ISO, MDY")),
+            (Some("UTC"), Some("German, DMY")),
+            (Some("UTC"), Some("SQL, MDY")),
+            (None, Some("ISO, MDY")),
+            (Some("UTC"), None),
+        ] {
+            let e = check_query_session(time_zone, date_style)
+                .expect_err(&format!("TimeZone {time_zone:?}, DateStyle {date_style:?} must be refused"));
+            let msg = format!("{e:#}");
+            assert!(msg.contains("TimeZone=UTC") && msg.contains("DateStyle=ISO"), "{msg}");
+            assert_eq!(boot_disposition(&e), BootFailure::Fatal, "{msg}");
+        }
     }
 
     /// A boot failure that is not a Postgres failure at all — an unusable `PG_TABLES` entry, an

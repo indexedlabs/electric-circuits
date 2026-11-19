@@ -2301,6 +2301,8 @@ impl From<anyhow::Error> for AppError {
             StatusCode::CONFLICT
         } else if e.downcast_ref::<crate::engine::SchemaDefinitionUnsupported>().is_some()
             || e.downcast_ref::<crate::schema::UnknownColumn>().is_some()
+            // A timestamp literal the engine cannot read: the predicate is refused, with the reason.
+            || e.downcast_ref::<crate::pg_temporal::UnreadableLiteral>().is_some()
         {
             StatusCode::BAD_REQUEST
         } else if e.downcast_ref::<crate::engine::ReactivationRecreate>().is_some() {
