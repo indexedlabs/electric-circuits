@@ -2921,9 +2921,11 @@ impl Engine {
         let mut compiled = HashMap::new();
         for t in &tables {
             // The identity is decided from the very definition that gets compiled, never from an
-            // earlier read: the compiled fingerprint includes `relreplident`, and drift is judged
-            // against it (ADR-0005). Compiling a non-FULL identity would be silent, since the wire
-            // would then agree with it and no `Relation` message would ever report drift.
+            // earlier read, so boot never compiles a definition it already knows it cannot serve:
+            // shapes admitted on it would only be retired by the first drift check. A regression
+            // after this read is the drift path's (ADR-0005): `SchemaFingerprint::still_serves`
+            // requires an observed FULL whatever was compiled, and pgoutput sends the changed
+            // `Relation` before any change on the table.
             //
             // A table that is already FULL is not altered: the `ALTER` takes `ACCESS EXCLUSIVE` even
             // when it changes nothing, and while that request waits behind any open transaction on
