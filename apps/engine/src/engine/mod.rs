@@ -140,6 +140,13 @@ impl std::fmt::Display for DeploymentNotReady {
 
 impl std::error::Error for DeploymentNotReady {}
 
+/// A table lost `REPLICA IDENTITY FULL` between boot setting it and boot reading it back: a
+/// migration is changing it concurrently. Boot refuses to compile that definition, and the boot loop
+/// retries ([`crate::pg::boot_disposition`]), since the next attempt sets and re-reads it afresh.
+#[derive(Debug, thiserror::Error)]
+#[error("table '{0}' lost REPLICA IDENTITY FULL right after the engine set it; a migration is changing it")]
+pub struct IdentityChangedDuringBoot(pub TableRef);
+
 #[derive(Debug, thiserror::Error)]
 #[error("catalog restore found a sequencer at a different checkpoint; restart requested (75)")]
 pub(crate) struct CatalogRestoreMismatch;
@@ -2933,9 +2940,7 @@ impl Engine {
                 if !is_full(&def) {
                     // Only a concurrent `ALTER` between the two statements can do this; the engine
                     // must not compile what it just tried and failed to fix.
-                    bail!(
-                        "table '{t}' lost REPLICA IDENTITY FULL right after the engine set it; a migration is changing it"
-                    );
+                    return Err(IdentityChangedDuringBoot(t.clone()).into());
                 }
             }
             let ts = self.compile_ingest_table(t, &def)?;

@@ -37,8 +37,10 @@ Then restart Postgres (the `wal_level` change requires a restart).
 
 The engine sets everything else up for you on startup, per configured table:
 
-- `ALTER TABLE <t> REPLICA IDENTITY FULL` — so an UPDATE/DELETE carries the **full old row** (needed to
-  compute the exact delta). The role you connect with must own the tables (or be superuser) for this.
+- `ALTER TABLE <t> REPLICA IDENTITY FULL` on each table that is not already FULL — so an UPDATE/DELETE
+  carries the **full old row** (needed to compute the exact delta). The role you connect with must own
+  those tables (or be superuser) for this; a table already FULL is left alone. See the startup notes
+  below for the 2 s lock wait and retry.
 - `pg_create_logical_replication_slot('<slot>', 'pgoutput')` + `CREATE PUBLICATION <slot>_pub FOR
   ALL TABLES` (superuser) — the replication slot and its publication, created once
   and reused.

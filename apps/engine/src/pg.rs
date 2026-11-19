@@ -434,6 +434,10 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
     if e.chain().any(|cause| cause.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()) {
         return BootFailure::Retryable;
     }
+    // A migration racing boot's identity check: the next attempt sets and re-reads it afresh.
+    if e.chain().any(|cause| cause.downcast_ref::<crate::engine::IdentityChangedDuringBoot>().is_some()) {
+        return BootFailure::Retryable;
+    }
     if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
         return classify(failure_of(pg));
     }
@@ -462,6 +466,9 @@ pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
     }
     if crate::ds::is_unavailable(e) {
         return "durable-streams is unreachable";
+    }
+    if e.chain().any(|cause| cause.downcast_ref::<crate::engine::IdentityChangedDuringBoot>().is_some()) {
+        return "a migration changed a table's replica identity during boot";
     }
     "not a transient Postgres condition"
 }
@@ -2359,6 +2366,16 @@ mod tests {
     fn managed_standby_is_a_retryable_boot_observation() {
         let error = anyhow::Error::new(crate::engine::DeploymentNotReady);
         assert_eq!(boot_disposition(&error), BootFailure::Retryable);
+    }
+
+    /// A migration changing a table's identity while boot sets it is a race, not a misconfiguration:
+    /// the boot loop retries it rather than exiting as a configuration error.
+    #[test]
+    fn an_identity_changed_during_boot_is_retryable() {
+        let table = TableRef::parse("public.users").unwrap();
+        let error = anyhow::Error::new(crate::engine::IdentityChangedDuringBoot(table)).context("setup_postgres");
+        assert_eq!(boot_disposition(&error), BootFailure::Retryable);
+        assert_eq!(boot_failure_name(&error), "a migration changed a table's replica identity during boot");
     }
 
     #[test]
