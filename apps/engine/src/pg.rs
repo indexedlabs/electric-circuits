@@ -248,21 +248,14 @@ impl PgConnectionConfig {
                 tls
             }
         };
-        Ok(ReplicationConfig {
-            host: self.connect_host.clone(),
-            port: self.url.port().unwrap_or(5432),
-            user,
-            password: self.url.password().map(percent_decode).unwrap_or_default(),
-            database,
-            tls,
-            slot: slot.to_string(),
-            publication: publication.to_string(),
-            start_lsn: pgwire_replication::Lsn::ZERO,
-            stop_at_lsn: None,
-            status_interval: std::time::Duration::from_secs(1),
-            idle_wakeup_interval: std::time::Duration::from_secs(10),
-            buffer_events: 8192,
-        })
+        let password = self.url.password().map(percent_decode).unwrap_or_default();
+        Ok(ReplicationConfig::new(self.connect_host.clone(), user, password, database, slot, publication)
+            .with_port(self.url.port().unwrap_or(5432))
+            .with_tls(tls)
+            .with_start_lsn(pgwire_replication::Lsn::ZERO)
+            .with_status_interval(std::time::Duration::from_secs(1))
+            .with_wakeup_interval(std::time::Duration::from_secs(10))
+            .with_buffer_size(8192))
     }
 }
 
