@@ -2906,14 +2906,28 @@ impl Engine {
         if pubinfo.publish_generated {
             tracing::info!("publication '{publication}' publishes stored generated columns");
         }
+        // Which tables still need `REPLICA IDENTITY FULL`, read in one round trip. The `ALTER` takes
+        // `ACCESS EXCLUSIVE` even when it changes nothing, and while that request waits behind any
+        // open transaction on the table, every later reader of the table queues behind it, so a
+        // table that is already FULL must not be altered again on every boot.
+        let identities = if self.postgres_setup == PostgresSetup::EngineManaged {
+            crate::pg::fingerprints(&client, &tables, self.publish_generated.load(Ordering::Acquire)).await?
+        } else {
+            HashMap::new()
+        };
         let mut compiled = HashMap::new();
         for t in &tables {
             // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
             // includes `relreplident`, and reading it before the ALTER would record the pre-boot
             // identity — which the ingestor's first `Relation` message would then report as drift
-            // on every single boot (ADR-0005).
-            if self.postgres_setup == PostgresSetup::EngineManaged {
-                crate::pg::ensure_replica_identity_full(&client, t).await?;
+            // on every single boot (ADR-0005). A table missing from `identities` is altered too,
+            // so a vanished table fails here as it always has.
+            if self.postgres_setup == PostgresSetup::EngineManaged
+                && identities
+                    .get(t)
+                    .is_none_or(|fingerprint| fingerprint.replident != crate::schema::REPLICA_IDENTITY_FULL)
+            {
+                crate::pg::ensure_replica_identity_full(&client, t, crate::pg::BOOT_IDENTITY_LOCK_TIMEOUT).await?;
             }
             let def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
             if self.postgres_setup == PostgresSetup::ExternallyManaged
