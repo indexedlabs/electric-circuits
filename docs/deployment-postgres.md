@@ -37,8 +37,10 @@ Then restart Postgres (the `wal_level` change requires a restart).
 
 The engine sets everything else up for you on startup, per configured table:
 
-- `ALTER TABLE <t> REPLICA IDENTITY FULL` — so an UPDATE/DELETE carries the **full old row** (needed to
-  compute the exact delta). The role you connect with must own the tables (or be superuser) for this.
+- `ALTER TABLE <t> REPLICA IDENTITY FULL` on each table that is not already FULL — so an UPDATE/DELETE
+  carries the **full old row** (needed to compute the exact delta). The role you connect with must own
+  those tables (or be superuser) for this; a table already FULL is left alone. See the startup notes
+  below for the 2 s lock wait and retry.
 - `pg_create_logical_replication_slot('<slot>', 'pgoutput')` + `CREATE PUBLICATION <slot>_pub FOR
   ALL TABLES` (superuser) — the replication slot and its publication, created once
   and reused.
@@ -64,9 +66,16 @@ export ELECTRIC_CIRCUITS_BIND="0.0.0.0:9000"
 ./electric-circuits-engine
 ```
 
-On startup the engine sets `REPLICA IDENTITY FULL` on each table, introspects it, ensures the slot, starts
-the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUITS_BIND`. It prints
-`ENGINE_LISTENING <addr>` once ready.
+On startup the engine sets `REPLICA IDENTITY FULL` on each table that does not already have it, introspects
+it, ensures the slot, starts the replication ingestor, and begins serving the control API on
+`ELECTRIC_CIRCUITS_BIND`. It prints `ENGINE_LISTENING <addr>` once ready.
+
+A table that is already `REPLICA IDENTITY FULL` is left alone. Setting it needs an `ACCESS EXCLUSIVE`
+lock, and while that request waits Postgres queues every later reader of the table behind it, so the
+engine waits at most 2 s for it. If a transaction holds the table longer, startup fails with
+`Postgres refused a boot statement` (`55P03`, lock not available) and retries on the 1 s → 30 s
+backoff, with `GET /ready` reporting `waiting` and nothing served meanwhile. The cure is to end the
+transaction holding the table, or to set `REPLICA IDENTITY FULL` in the migration that creates it.
 
 ### Configuration reference
 
@@ -299,7 +308,10 @@ perform the idempotent exact-generation promotion.
   envelopes and must coordinate with deployment settings. Shape retirement supplies no consumer
   reset signal. See [ADR-0012](adr/0012-static-ingest-columns.md) for ordering and rollback limitations.
 - **Adding a table:** add it to `ELECTRIC_CIRCUITS_PG_TABLES` and restart the engine. It will set
-  replica identity on the new table and introspect it at startup.
+  replica identity on the new table and introspect it at startup. Setting it waits at most 2 s for the
+  table's lock (see startup above); if a long transaction holds the new table, the engine stays at
+  `waiting` and retries until it ends. Setting `REPLICA IDENTITY FULL` in the migration that adds the
+  table avoids the wait.
 - **Change-log disk is bounded by segment size/age and the retain window.** Every committed change
   rides one ordered log on the durable-streams server, which the engine rotates into segments
   (`changes/0`, `changes/1`, …) by `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` (1 GiB) or

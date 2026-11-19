@@ -26,6 +26,8 @@ use crate::value::{Row, Value};
 use std::time::Duration;
 
 #[cfg(test)]
+mod boot_identity_tests;
+#[cfg(test)]
 mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
@@ -137,6 +139,13 @@ impl std::fmt::Display for DeploymentNotReady {
 }
 
 impl std::error::Error for DeploymentNotReady {}
+
+/// A table lost `REPLICA IDENTITY FULL` between boot setting it and boot reading it back: a
+/// migration is changing it concurrently. Boot refuses to compile that definition, and the boot loop
+/// retries ([`crate::pg::boot_disposition`]), since the next attempt sets and re-reads it afresh.
+#[derive(Debug, thiserror::Error)]
+#[error("table '{0}' lost REPLICA IDENTITY FULL right after the engine set it; a migration is changing it")]
+pub struct IdentityChangedDuringBoot(pub TableRef);
 
 #[derive(Debug, thiserror::Error)]
 #[error("catalog restore found a sequencer at a different checkpoint; restart requested (75)")]
@@ -2904,23 +2913,37 @@ impl Engine {
         if pubinfo.publish_generated {
             tracing::info!("publication '{publication}' publishes stored generated columns");
         }
+        let is_full = |def: &crate::schema::TableDef| {
+            def.fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| fingerprint.replident == crate::schema::REPLICA_IDENTITY_FULL)
+        };
         let mut compiled = HashMap::new();
         for t in &tables {
-            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
-            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
-            // identity — which the ingestor's first `Relation` message would then report as drift
-            // on every single boot (ADR-0005).
-            if self.postgres_setup == PostgresSetup::EngineManaged {
-                crate::pg::ensure_replica_identity_full(&client, t).await?;
-            }
-            let def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
-            if self.postgres_setup == PostgresSetup::ExternallyManaged
-                && def
-                    .fingerprint
-                    .as_ref()
-                    .is_none_or(|fingerprint| fingerprint.replident != crate::schema::REPLICA_IDENTITY_FULL)
-            {
-                bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+            // The identity is decided from the very definition that gets compiled, never from an
+            // earlier read, so boot never compiles a definition it already knows it cannot serve:
+            // shapes admitted on it would only be retired by the first drift check. A regression
+            // after this read is the drift path's (ADR-0005): `SchemaFingerprint::still_serves`
+            // requires an observed FULL whatever was compiled, and pgoutput sends the changed
+            // `Relation` before any change on the table.
+            //
+            // A table that is already FULL is not altered: the `ALTER` takes `ACCESS EXCLUSIVE` even
+            // when it changes nothing, and while that request waits behind any open transaction on
+            // the table, every later reader of the table queues behind it. One that is not FULL is
+            // altered with a bounded wait and introspected again, so the definition compiled is one
+            // read after the identity was set.
+            let mut def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
+            if !is_full(&def) {
+                if self.postgres_setup == PostgresSetup::ExternallyManaged {
+                    bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+                }
+                crate::pg::ensure_replica_identity_full(&client, t, crate::pg::BOOT_IDENTITY_LOCK_TIMEOUT).await?;
+                def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
+                if !is_full(&def) {
+                    // Only a concurrent `ALTER` between the two statements can do this; the engine
+                    // must not compile what it just tried and failed to fix.
+                    return Err(IdentityChangedDuringBoot(t.clone()).into());
+                }
             }
             let ts = self.compile_ingest_table(t, &def)?;
             compiled.insert(t.clone(), ts);
