@@ -664,6 +664,19 @@ a dependency that comes up after its engine is the normal case, not a failure. A
 still waiting exits `0` — the whole boot is raced against the shutdown token, so it stops in
 milliseconds even mid-connect.
 
+**A boot asks for an exclusive table lock only when a table needs one, and never waits on it without a bound.**
+Each Postgres write the setup makes is skipped when the catalog already shows its result: the
+`<slot>_pub` publication and the slot are created only if absent, and `ALTER TABLE … REPLICA
+IDENTITY FULL` is issued only for a table whose `pg_class.relreplident` is not `f` — which, after
+the first boot, is none of them. That `ALTER` takes `ACCESS EXCLUSIVE` even when it changes
+nothing, and while it waits behind another session's open transaction every later statement on the
+table queues behind it, so the one a table does need waits at most **2 s** per attempt
+(`lock_timeout`), then withdraws, pauses **5 s** so the queued statements run, and tries again —
+for as long as it takes, since the engine cannot serve a table without full identity. Each
+timed-out attempt is one `WARN` naming the table and the attempt, and `GET /ready` reports
+`503 starting` meanwhile. Creating the slot (first boot only) takes no table lock but waits for the
+transactions that already hold an xid to end; nothing else waits behind it.
+
 ### Metrics
 
 `GET /metrics` (JSON) and `GET /metrics/prometheus` (OpenTelemetry exposition) now carry the same

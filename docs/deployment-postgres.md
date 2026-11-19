@@ -39,6 +39,11 @@ The engine sets everything else up for you on startup, per configured table:
 
 - `ALTER TABLE <t> REPLICA IDENTITY FULL` — so an UPDATE/DELETE carries the **full old row** (needed to
   compute the exact delta). The role you connect with must own the tables (or be superuser) for this.
+  It is issued only for a table that does not have full identity yet, so a restart locks no table
+  against your application. When it is needed it waits at most 2 s for its `ACCESS EXCLUSIVE` lock, then gives way for
+  5 s and tries again, logging each attempt: a table held by a long-running transaction delays the
+  engine's readiness, never that table's own queries by more than the 2 s. To keep a first boot off
+  a busy table entirely, set the identity yourself beforehand.
 - `pg_create_logical_replication_slot('<slot>', 'pgoutput')` + `CREATE PUBLICATION <slot>_pub FOR
   ALL TABLES` (superuser) — the replication slot and its publication, created once
   and reused.
@@ -100,8 +105,8 @@ export ELECTRIC_CIRCUITS_BIND="0.0.0.0:9000"
 ./electric-circuits-engine
 ```
 
-On startup the engine sets `REPLICA IDENTITY FULL` on each table, introspects it, ensures the slot, starts
-the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUITS_BIND`. It prints
+On startup the engine introspects each table, sets `REPLICA IDENTITY FULL` on any that lack it, ensures
+the slot, starts the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUITS_BIND`. It prints
 `ENGINE_LISTENING <addr>` once ready.
 
 ### Configuration reference

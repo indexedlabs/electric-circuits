@@ -65,7 +65,7 @@ identical either way.)
 | `ELECTRIC_CIRCUITS_PG_POLL_MS` | slot poll interval. |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
-keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
+keys ordered by index position), sets `REPLICA IDENTITY FULL` where it is missing, creates the replication slot,
 ensures the current `changes/<n>` change-log segment, and starts the ingestor.
 
 In production you run three processes — the `durable-streams-server`, the engine binary, and the

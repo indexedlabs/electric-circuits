@@ -156,7 +156,9 @@ async fn externally_managed_setup_validates_without_mutating_replica_identity() 
         .expect_err("the host must provision FULL identity before activation");
     let replident: String = client
         .query_one(
-            "select relreplident::text from pg_class where oid = $1::regclass",
+            // `$1::text` first: a bare `$1::regclass` makes the parameter itself a `regclass`, which
+            // the driver cannot bind a Rust string to.
+            "select relreplident::text from pg_class where oid = $1::text::regclass",
             &[&format!("public.{table_name}")],
         )
         .await?

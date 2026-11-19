@@ -110,6 +110,17 @@ const HEALTH_WAITING: u8 = 0;
 const HEALTH_STARTING: u8 = 1;
 const HEALTH_ACTIVE: u8 = 2;
 
+/// How long one boot-time `ALTER TABLE … REPLICA IDENTITY FULL` may wait for its `ACCESS EXCLUSIVE`
+/// lock. While the request waits, every other statement on that table queues behind it, so this is
+/// the longest a boot can stall an application table per attempt: long enough to get in between
+/// ordinary short transactions, short enough to stay under a client's own statement timeout.
+const BOOT_IDENTITY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The pause after an attempt that timed out. The statements that queued behind the request are
+/// released the moment it gives up; this is their time to run, and it leaves a table that a long
+/// transaction is holding available for most of every cycle instead of re-queueing it at once.
+const BOOT_IDENTITY_RETRY_PAUSE: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ManagedRole {
     Active,
@@ -2758,9 +2769,16 @@ impl Engine {
         }
     }
 
-    /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL`, create the
-    /// replication slot, register the schema, and start the replication ingestor. Idempotent: a second
-    /// call re-introspects but will NOT spawn a second ingestor (two ingestors would fight for the slot).
+    /// Introspect the configured tables from Postgres, set `REPLICA IDENTITY FULL` on any that lack
+    /// it, create the replication slot, register the schema, and start the replication ingestor.
+    /// Idempotent: a second call re-introspects but will NOT spawn a second ingestor (two ingestors
+    /// would fight for the slot).
+    ///
+    /// Every Postgres write here is skipped when the catalog already shows its result — the
+    /// publication and the slot are created only if absent, the identity `ALTER` is issued only for
+    /// a table that is not `FULL` — so a restart asks for nothing stronger than a reader's lock on
+    /// any table. The one statement that does need an exclusive table lock waits for it in bounded
+    /// attempts ([`Self::set_replica_identity_full_at_boot`]).
     pub async fn setup_postgres(&self, selectors: &[TableSelector], slot: &str) -> Result<()> {
         let url = self.pg_url.clone().context("setup_postgres called without a pg_url")?;
         // A retryable failure below brings the boot back here (see the binary's connect loop), so
@@ -2906,21 +2924,26 @@ impl Engine {
         }
         let mut compiled = HashMap::new();
         for t in &tables {
-            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
-            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
-            // identity — which the ingestor's first `Relation` message would then report as drift
-            // on every single boot (ADR-0005).
-            if self.postgres_setup == PostgresSetup::EngineManaged {
-                crate::pg::ensure_replica_identity_full(&client, t).await?;
-            }
-            let def = crate::pg::introspect(&client, t, self.publish_generated.load(Ordering::Acquire)).await?;
-            if self.postgres_setup == PostgresSetup::ExternallyManaged
-                && def
-                    .fingerprint
-                    .as_ref()
-                    .is_none_or(|fingerprint| fingerprint.replident != crate::schema::REPLICA_IDENTITY_FULL)
-            {
-                bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+            let with_generated = self.publish_generated.load(Ordering::Acquire);
+            // The catalog says whether the table needs the `ALTER` at all (`pg_class.relreplident`,
+            // read as part of the fingerprint). One that already has full identity — every table,
+            // on every boot after the first — is left alone: the `ALTER` takes `ACCESS EXCLUSIVE`
+            // even as a no-op, and queueing that behind an application's open transaction blocks
+            // the whole table for nothing.
+            let mut def = crate::pg::introspect(&client, t, with_generated).await?;
+            let full_identity = |def: &crate::schema::TableDef| {
+                def.fingerprint.as_ref().is_some_and(|f| f.replident == crate::schema::REPLICA_IDENTITY_FULL)
+            };
+            if !full_identity(&def) {
+                if self.postgres_setup == PostgresSetup::ExternallyManaged {
+                    bail!("externally managed table '{t}' must already use REPLICA IDENTITY FULL");
+                }
+                self.set_replica_identity_full_at_boot(&client, t).await?;
+                // Introspect AGAIN: the compiled schema carries a fingerprint that includes
+                // `relreplident`, and that fingerprint is the record of what the engine serves —
+                // stamped into every shape record, compared by the drift handler (ADR-0005). It
+                // has to be the identity the `ALTER` left, not the one the boot found.
+                def = crate::pg::introspect(&client, t, with_generated).await?;
             }
             let ts = self.compile_ingest_table(t, &def)?;
             compiled.insert(t.clone(), ts);
@@ -2991,6 +3014,53 @@ impl Engine {
         // and report `active` (200 on `/v1/health`).
         self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Set `REPLICA IDENTITY FULL` on a table the boot found without it, never holding the table
+    /// hostage to do so: each attempt waits [`BOOT_IDENTITY_LOCK_TIMEOUT`] for the lock, and one
+    /// that times out is followed by [`BOOT_IDENTITY_RETRY_PAUSE`].
+    ///
+    /// There is no attempt limit. The engine cannot serve a table whose updates and deletes arrive
+    /// without the old row, so the boot waits for the lock the way it waits for Postgres itself,
+    /// with `GET /ready` reporting `starting` throughout. Only the lock timeout is retried here:
+    /// any other failure (a missing privilege, a lost connection) is the boot's to classify.
+    async fn set_replica_identity_full_at_boot(&self, client: &tokio_postgres::Client, table: &TableRef) -> Result<()> {
+        let mut attempt: u32 = 0;
+        loop {
+            attempt = attempt.saturating_add(1);
+            let timed_out = match crate::pg::ensure_replica_identity_full_bounded_at_boot(
+                client,
+                table,
+                BOOT_IDENTITY_LOCK_TIMEOUT,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!("boot: set REPLICA IDENTITY FULL on {table} (attempt {attempt})");
+                    return Ok(());
+                }
+                Err(e) if crate::pg::is_lock_timeout(&e) => e,
+                Err(e) => return Err(e),
+            };
+            tracing::warn!(
+                "boot: REPLICA IDENTITY FULL on {table} did not get its lock within \
+                 {BOOT_IDENTITY_LOCK_TIMEOUT:?} (attempt {attempt}): another session holds the table, \
+                 usually in an open transaction. The request was withdrawn so the table's other \
+                 queries are not queued behind it; retrying in {BOOT_IDENTITY_RETRY_PAUSE:?}. \
+                 GET /ready reports `starting` until it succeeds."
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(BOOT_IDENTITY_RETRY_PAUSE) => {}
+                // Both callers race the whole setup against shutdown already; joining the token here
+                // as well keeps the pause from outliving it whoever calls. The lock timeout is what
+                // is returned, so the boot reads it as "not yet" (`pg::classify`), never as fatal.
+                _ = self.shutdown.wait() => {
+                    return Err(timed_out.context(format!(
+                        "shutdown requested while waiting to set REPLICA IDENTITY FULL on {table}"
+                    )));
+                }
+            }
+        }
     }
 
     /// Adopt the change log's segmentation state at boot and make the CURRENT segment exist

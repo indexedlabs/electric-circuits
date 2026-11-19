@@ -1040,16 +1040,48 @@ pub async fn introspect_opt(client: &Client, table: &TableRef, with_generated: b
     Ok(Some(TableDef { columns, primary_key, fingerprint: Some(fingerprint) }))
 }
 
-/// `ALTER TABLE … REPLICA IDENTITY FULL` so logical decoding carries the full old row. Used at
-/// boot, where waiting for the lock is the right thing to do.
-pub async fn ensure_replica_identity_full(client: &Client, table: &TableRef) -> Result<()> {
-    client
-        .batch_execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", table.quote_qualified()))
-        .await
-        .with_context(|| format!("set REPLICA IDENTITY FULL on {table}"))
+/// SQLSTATE `lock_not_available`: what a statement fails with when `lock_timeout` expires before it
+/// gets its lock.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+impl PgFailure<'_> {
+    /// The statement gave up waiting for a lock (`lock_timeout`), as opposed to being refused.
+    pub fn is_lock_timeout(&self) -> bool {
+        self.sqlstate == Some(LOCK_NOT_AVAILABLE)
+    }
 }
 
-/// [`ensure_replica_identity_full`] with a bounded wait for the `ACCESS EXCLUSIVE` lock.
+/// Did this failure come from a lock wait that `lock_timeout` cut short? The one outcome of a
+/// bounded `ALTER` that says "try again later" rather than "this will not work".
+pub fn is_lock_timeout(e: &anyhow::Error) -> bool {
+    e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()).is_some_and(|pg| failure_of(pg).is_lock_timeout())
+}
+
+/// `ALTER TABLE … REPLICA IDENTITY FULL`, so logical decoding carries the full old row, in one
+/// transaction whose lock wait is bounded.
+///
+/// There is deliberately no unbounded form. The `ALTER` takes `ACCESS EXCLUSIVE` — even when the
+/// table already has full identity — and while that request waits behind any open transaction that
+/// touched the table, every later statement on the table (a plain `SELECT` included) queues behind
+/// the request. An unbounded wait therefore blocks an application table for as long as someone
+/// else's transaction stays open; a bounded one blocks it for `lock_timeout` at most. `SET LOCAL`
+/// keeps the bound on this statement alone.
+async fn alter_replica_identity_full(
+    client: &Client,
+    table: &TableRef,
+    lock_timeout: std::time::Duration,
+) -> Result<()> {
+    client
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
+            lock_timeout.as_millis().max(1),
+            table.quote_qualified()
+        ))
+        .await
+        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"))
+}
+
+/// Set `REPLICA IDENTITY FULL` on a pooled connection, waiting at most `lock_timeout` for the lock.
 ///
 /// The drift handler runs INLINE in the ingestor: an unbounded lock wait there would stall the
 /// whole replication stream — every table's — behind one long-running reader of this one. With
@@ -1061,16 +1093,30 @@ pub async fn ensure_replica_identity_full_bounded(
     lock_timeout: std::time::Duration,
 ) -> Result<()> {
     client.transaction_started();
-    let result = client
-        .batch_execute(&format!(
-            "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
-            lock_timeout.as_millis().max(1),
-            table.quote_qualified()
-        ))
-        .await
-        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"));
+    let result = alter_replica_identity_full(client, table, lock_timeout).await;
     if result.is_ok() {
         client.transaction_finished();
+    }
+    result
+}
+
+/// [`ensure_replica_identity_full_bounded`] for the boot's own connection, which no pool checks in.
+///
+/// A statement refused inside the explicit transaction leaves the session in an aborted transaction,
+/// and nothing rolls a plain connection back for us. The failure path therefore ends the transaction
+/// here, so the caller can retry — and then introspect — on the same connection. If the rollback
+/// itself fails the connection is in an unknown state, and that error is returned instead of the
+/// `ALTER`'s so the caller does not retry on it.
+pub async fn ensure_replica_identity_full_bounded_at_boot(
+    client: &Client,
+    table: &TableRef,
+    lock_timeout: std::time::Duration,
+) -> Result<()> {
+    let result = alter_replica_identity_full(client, table, lock_timeout).await;
+    if let Err(refused) = &result {
+        client.batch_execute("ROLLBACK").await.with_context(|| {
+            format!("roll back the refused REPLICA IDENTITY FULL on {table} (refusal: {refused:#})")
+        })?;
     }
     result
 }
@@ -1081,6 +1127,11 @@ pub const PGOUTPUT: &str = "pgoutput";
 /// Create the logical replication slot (`pgoutput`) if it does not exist. A leftover slot with a
 /// different output plugin (e.g. `test_decoding` from an earlier engine version) is dropped and
 /// recreated — the plugin cannot be changed in place.
+///
+/// A slot that is already there costs one catalog read. Creating one takes no table lock, but it
+/// does wait for every transaction that already holds an xid to end (the slot's first consistent
+/// point), so a first boot can sit behind an application's open WRITE transaction. Only the boot
+/// waits: that wait is a share lock on the transaction id, which nothing else queues behind.
 pub async fn ensure_slot(client: &Client, slot: &str) -> Result<()> {
     let existing = client
         .query("select plugin from pg_replication_slots where slot_name = $1", &[&slot])
@@ -1204,6 +1255,12 @@ pub async fn observe_slot(client: &Client, slot: &str) -> Result<SlotObservation
 /// Create the publication the pgoutput stream filters on, if it does not exist. `FOR ALL TABLES`
 /// (requires superuser): the ingestor drops changes for untracked relations itself, and the set of
 /// tracked tables can grow via introspect-all restarts without publication surgery.
+///
+/// That is also why this never touches a table lock. A publication that is already there costs one
+/// catalog read, and creating a `FOR ALL TABLES` one writes a `pg_publication` row without opening
+/// any table. The forms that DO lock each table they name — `CREATE PUBLICATION … FOR TABLE`,
+/// `ALTER PUBLICATION … ADD/SET TABLE` — are not issued anywhere in the engine; keep it that way,
+/// or bound the wait as the identity `ALTER` does.
 pub async fn ensure_publication(client: &Client, publication: &str) -> Result<()> {
     let exists = client
         .query("select 1 from pg_publication where pubname = $1", &[&publication])
@@ -2380,6 +2437,23 @@ mod tests {
         // No SQLSTATE at all: DNS, connection refused, timeout, TLS — the server is not there yet.
         assert_eq!(classify(PgFailure { sqlstate: None, io: true }), BootFailure::Retryable);
         assert_eq!(classify(PgFailure::default()), BootFailure::Retryable);
+    }
+
+    /// A lock wait that `lock_timeout` cut short is the one failure of the bounded identity `ALTER`
+    /// that the boot retries in place. If it ever reaches the boot's own classifier instead (a
+    /// shutdown during the pause returns it) it must read as "not yet", never as a refusal.
+    #[test]
+    fn a_lock_timeout_is_recognised_and_is_not_a_refusal() {
+        let timed_out = PgFailure { sqlstate: Some("55P03"), io: false };
+        assert!(timed_out.is_lock_timeout());
+        assert_eq!(classify(timed_out), BootFailure::Retryable);
+
+        assert!(!PgFailure { sqlstate: Some("42501"), io: false }.is_lock_timeout(), "insufficient privilege");
+        assert!(!PgFailure { sqlstate: Some("57014"), io: false }.is_lock_timeout(), "statement_timeout, a cancel");
+        assert!(!PgFailure { sqlstate: Some("55006"), io: false }.is_lock_timeout(), "object in use");
+        assert!(!PgFailure { sqlstate: None, io: true }.is_lock_timeout(), "transport failure");
+        // No Postgres failure in the chain at all: the words alone decide nothing.
+        assert!(!is_lock_timeout(&anyhow::anyhow!("canceling statement due to lock timeout")));
     }
 
     #[test]
