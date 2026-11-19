@@ -279,7 +279,8 @@ describe.each([
     await pgQuery(h, `UPDATE events SET name = 'midweek (updated live)' WHERE id = 14`)
     await drainEngine(h)
     const updated = (await mine('14')).filter((env) => env.headers.lsn !== undefined)
-    expect(updated.map((env) => env.headers.operation), 'one live change to event 14').toEqual(['update'])
+    // A live change is written as the row's whole new value (`upsert`) or its removal.
+    expect(updated.map((env) => env.headers.operation), 'one live change to event 14').toEqual(['upsert'])
     expect(temporal(updated[0]!.value), 'the live update spells every value as the backfill did').toEqual(row14)
 
     // An insert inside the window and one just past it.
@@ -291,7 +292,7 @@ describe.each([
     )
     await drainEngine(h)
     const inserted = await mine('31')
-    expect(inserted.map((env) => env.headers.operation), 'the insert inside the window, once').toEqual(['insert'])
+    expect(inserted.map((env) => env.headers.operation), 'the insert inside the window, once').toEqual(['upsert'])
     const row31 = { ...row14, starts: '2026-10-21 12:45:00+00' }
     expect(temporal(inserted[0]!.value), 'the live insert').toEqual(row31)
     expect(await mine('32'), 'a row at the exclusive upper bound is not in the window').toHaveLength(0)
@@ -307,7 +308,7 @@ describe.each([
     // `starts` is judged inside the window.
     await pgQuery(h, 'DELETE FROM events WHERE id = 31')
     await drainEngine(h)
-    expect((await mine('31')).map((env) => env.headers.operation), 'the delete reaches the shape').toEqual(['insert', 'delete'])
+    expect((await mine('31')).map((env) => env.headers.operation), 'the delete reaches the shape').toEqual(['upsert', 'delete'])
     expect([...(await foldStream(shape.streamUrl)).keys()]).toEqual(['14'])
   }, 120000)
 
