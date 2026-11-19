@@ -707,7 +707,9 @@ pub struct NodeStat {
 
 /// Propagation work that reached a shape while it was still being created, deferred until it is
 /// installed (see [`PendingSubqueryShape::deferred`]). Every item retains its originating
-/// commit LSN; coalescing keeps the earliest origin whose effects this re-derivation covers.
+/// commit — its LSN and, where known, its transaction id — and coalescing keeps the earliest origin
+/// whose effects this re-derivation covers, as a PAIR: the emission stamps the LSN into
+/// `headers.lsn` and the txid into `headers.txid`, so the two must name the same transaction.
 pub enum DeferredShapeWork {
     /// An inner-set value flipped: re-derive the outer rows with `connecting_col = value`.
     Value { connecting_col: usize, value: Value, txid: Option<String>, commit_lsn: u64 },
@@ -722,9 +724,26 @@ impl DeferredShapeWork {
         }
     }
 
-    fn retain_earliest(&mut self, origin: u64) {
+    fn txid(&self) -> &Option<String> {
         match self {
-            Self::Value { commit_lsn, .. } | Self::Full { commit_lsn, .. } => *commit_lsn = (*commit_lsn).min(origin),
+            Self::Value { txid, .. } | Self::Full { txid, .. } => txid,
+        }
+    }
+
+    /// Coalesce `other` into this item, keeping whichever origin is earlier — its LSN and its txid
+    /// together. Lowering the LSN alone would leave the txid of a LATER commit beside the earlier
+    /// position whenever flip workers queue out of commit order, and the envelope this item becomes
+    /// would then name two different transactions. An earlier origin whose txid is unknown (`None`)
+    /// replaces a known one: the emission then resolves the txid from that earlier LSN.
+    fn retain_earliest(&mut self, other: &DeferredShapeWork) {
+        let (other_lsn, other_txid) = (other.commit_lsn(), other.txid());
+        match self {
+            Self::Value { commit_lsn, txid, .. } | Self::Full { commit_lsn, txid, .. } => {
+                if other_lsn < *commit_lsn {
+                    *commit_lsn = other_lsn;
+                    txid.clone_from(other_txid);
+                }
+            }
         }
     }
 }
@@ -1474,13 +1493,13 @@ impl SubqueryRegistry {
             return false;
         };
         if let Some(full) = pending.deferred.iter_mut().find(|w| matches!(w, DeferredShapeWork::Full { .. })) {
-            full.retain_earliest(work.commit_lsn());
+            full.retain_earliest(&work);
             return true;
         }
         match &work {
             DeferredShapeWork::Full { .. } => {
                 for previous in &pending.deferred {
-                    work.retain_earliest(previous.commit_lsn());
+                    work.retain_earliest(previous);
                 }
                 pending.deferred.clear();
                 pending.deferred.push_back(work);
@@ -1491,7 +1510,7 @@ impl SubqueryRegistry {
                         if c == connecting_col && v == value)
                 });
                 if let Some(dup) = dup {
-                    dup.retain_earliest(work.commit_lsn());
+                    dup.retain_earliest(&work);
                 } else {
                     pending.deferred.push_back(work);
                 }
@@ -4827,6 +4846,36 @@ pub(crate) mod tests {
         let queue = &reg.nodes[&mid].deferred;
         assert_eq!(queue.len(), 1);
         assert!(matches!(queue[0], DeferredNodeWork::Full { commit_lsn: 0x08 }));
+    }
+
+    /// **Coalescing keeps the earliest origin as a pair.** Flip workers can take the registry lock
+    /// out of commit order, so a later commit's flip may queue first. Whatever survives coalescing
+    /// is stamped into one envelope's `headers.lsn` AND `headers.txid`, so the txid must be the
+    /// earliest commit's, not the first-queued one's.
+    #[tokio::test]
+    async fn deferred_coalescing_keeps_the_earliest_commits_txid_with_its_lsn() {
+        let origin = |w: &DeferredShapeWork| (w.commit_lsn(), w.txid().clone());
+
+        // Same value, queued later commit first: T2 (0x30), then T1 (0x10), then T3 (0x40).
+        let (reg, _) = registry_mid_create();
+        let registry = tokio::sync::Mutex::new(reg);
+        for (lsn, txid) in [(0x30, "t2"), (0x10, "t1"), (0x40, "t3")] {
+            move_shape_for_value(&registry, "s1", 0, &Value::Int(7), Some(txid.into()), lsn).await.unwrap();
+        }
+        assert_eq!(origin(&registry.lock().await.pending_shapes[0].deferred[0]), (0x10, Some("t1".into())));
+
+        // A full re-derive that arrives later but subsumes earlier per-value work takes that work's
+        // origin, txid included…
+        rederive_shape(&registry, "s1", Some("t5".into()), 0x50).await.unwrap();
+        assert_eq!(origin(&registry.lock().await.pending_shapes[0].deferred[0]), (0x10, Some("t1".into())));
+        // …and one already queued takes an earlier flip's origin, an unknown txid included.
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(8), None, 0x08).await.unwrap();
+        assert_eq!(origin(&registry.lock().await.pending_shapes[0].deferred[0]), (0x08, None));
+        // A LATER flip changes nothing.
+        move_shape_for_value(&registry, "s1", 0, &Value::Int(9), Some("t6".into()), 0x60).await.unwrap();
+        let reg = registry.lock().await;
+        assert_eq!(reg.pending_shapes[0].deferred.len(), 1);
+        assert_eq!(origin(&reg.pending_shapes[0].deferred[0]), (0x08, None));
     }
 
     #[tokio::test]
