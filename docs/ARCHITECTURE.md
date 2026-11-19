@@ -765,7 +765,10 @@ sequencer feeds every table's deltas into:
   registry's heap (`/memory`) and bounded: `COMMIT_PROOF_MAX_BYTES`, 8 MiB of transitions and
   removals. The bound is on what the record owns at every moment: it is checked against the same
   figure the heap accounting reports, hash tables included, and before an entry is copied in, so
-  one value or key larger than the whole budget never enters it. A commit that would outgrow it —
+  one value or key larger than the whole budget never enters it. Nothing is taken out of the
+  record before the commit ends: a row that left a feed's scope and came back keeps its entry,
+  marked as back, because a hash table with removed entries can grow by more than the doubling
+  the budget is asked for. Such a row stays counted against the budget. A commit that would outgrow it —
   a bulk change that moves some hundred thousand inner values — gives the record up, and for the
   rest of that commit each evaluation is judged by its own cause alone, exactly as one that
   belongs to an earlier commit is, with the same limits.

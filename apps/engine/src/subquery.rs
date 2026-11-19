@@ -417,10 +417,17 @@ struct CommitScope {
     /// derived — a set whose inner table the commit changed, and a parent set that a flip's walk
     /// re-derived afterwards ([`SubqueryRegistry::note_commit_flip`]).
     undone: Undone,
-    /// The removals a changes-only feed has already emitted for this commit, as `feed -> pks`. One
-    /// commit can prove the same departure more than once — an outer-row change and the flip
-    /// behind it, or two flips that each took the row out — and the stream needs to hear it once.
-    removed: HashMap<i64, HashSet<String>>,
+    /// The removals a changes-only feed has already emitted for this commit, as
+    /// `feed -> pk -> still removed`. One commit can prove the same departure more than once — an
+    /// outer-row change and the flip behind it, or two flips that each took the row out — and the
+    /// stream needs to hear it once.
+    ///
+    /// A row that comes back into the scope keeps its entry, with the flag cleared, until the
+    /// commit ends. Taking the entry out would leave a tombstone in the table, and a table with
+    /// tombstones reports less room than it has: its next growth can be far more than the
+    /// doubling the budget is asked for ([`table_growth`]). No entry ever leaves, so no table
+    /// here has tombstones, and what a returned row holds stays counted against the budget.
+    removed: HashMap<i64, HashMap<String, bool>>,
     /// What `undone` and `removed` own — exactly the figure [`HeapSize`] reports for them, hash
     /// tables included — kept as they change, so the budget is asked without walking them.
     bytes: usize,
@@ -445,7 +452,8 @@ fn table_bytes<T>(capacity: usize) -> usize {
 }
 
 /// What one more entry of type `T` can make a hash table of `len` entries and room for `capacity`
-/// grow by. An upper bound: a full table at most doubles (and starts at no more than 8).
+/// grow by. An upper bound for a table nothing was ever removed from, which is every table of a
+/// [`CommitScope`]: a full one at most doubles (and starts at no more than 8).
 fn table_growth<T>(len: usize, capacity: usize) -> usize {
     if len < capacity {
         return 0;
@@ -454,7 +462,7 @@ fn table_growth<T>(len: usize, capacity: usize) -> usize {
 }
 
 type UndoneEntry = (SubquerySig, HashMap<Value, bool>);
-type RemovedEntry = (i64, HashSet<String>);
+type RemovedEntry = (i64, HashMap<String, bool>);
 
 impl CommitScope {
     /// Record one inner-set transition. When a value moves more than once the first transition is
@@ -504,12 +512,13 @@ impl CommitScope {
         if self.saturated {
             return true;
         }
-        let pks = self.removed.get(&feed_id);
-        if pks.is_some_and(|pks| pks.contains(pk)) {
-            return false;
+        if let Some(removed) = self.removed.get_mut(&feed_id).and_then(|pks| pks.get_mut(pk)) {
+            // Known to the record: said already, or back in the scope since and so news again.
+            return !std::mem::replace(removed, true);
         }
+        let pks = self.removed.get(&feed_id);
         let (len, capacity) = pks.map_or((0, 0), |pks| (pks.len(), pks.capacity()));
-        let mut more = pk.len() + table_growth::<String>(len, capacity);
+        let mut more = pk.len() + table_growth::<(String, bool)>(len, capacity);
         if pks.is_none() {
             more += table_growth::<RemovedEntry>(self.removed.len(), self.removed.capacity());
         }
@@ -519,28 +528,24 @@ impl CommitScope {
         let mut taken = 0;
         if !self.removed.contains_key(&feed_id) {
             let before = self.removed.capacity();
-            self.removed.insert(feed_id, HashSet::new());
+            self.removed.insert(feed_id, HashMap::new());
             taken += table_bytes::<RemovedEntry>(self.removed.capacity()) - table_bytes::<RemovedEntry>(before);
         }
         let pks = self.removed.get_mut(&feed_id).expect("inserted above");
         let before = pks.capacity();
         let pk = pk.to_string();
         taken += pk.heap_bytes();
-        pks.insert(pk);
-        taken += table_bytes::<String>(pks.capacity()) - table_bytes::<String>(before);
+        pks.insert(pk, true);
+        taken += table_bytes::<(String, bool)>(pks.capacity()) - table_bytes::<(String, bool)>(before);
         self.charge(taken);
         true
     }
 
-    /// `pk` is back in `feed_id`'s scope: a later departure in this commit is news again.
+    /// `pk` is back in `feed_id`'s scope: a later departure in this commit is news again. The entry
+    /// stays where it is (see [`Self::removed`]); only its flag changes.
     fn forget_removal(&mut self, feed_id: i64, pk: &str) {
-        let Some(pks) = self.removed.get_mut(&feed_id) else { return };
-        let before = pks.capacity();
-        if let Some(pk) = pks.take(pk) {
-            // The table keeps its storage, but a slot freed in the middle of a probe run leaves a
-            // tombstone, and the table then reports room for one entry fewer.
-            let tombstoned = table_bytes::<String>(before) - table_bytes::<String>(pks.capacity());
-            self.bytes -= pk.heap_bytes() + tombstoned;
+        if let Some(removed) = self.removed.get_mut(&feed_id).and_then(|pks| pks.get_mut(pk)) {
+            *removed = false;
         }
     }
 
@@ -6639,6 +6644,52 @@ pub(crate) mod tests {
         }
         assert!(scope.saturated, "400,000 removals do not fit in {COMMIT_PROOF_MAX_BYTES} bytes");
         assert!(largest <= COMMIT_PROOF_MAX_BYTES, "the record owned {largest} bytes on the way");
+    }
+
+    /// Removals a commit takes back, and then more of them. Taking an entry out of a hash table
+    /// leaves a tombstone, and a table with tombstones reports less room than it has: asked for
+    /// one more entry when that room is used up, it rehashes to its full size, which can be many
+    /// times the doubling the budget was asked for. Here one feed's rows leave until its table is
+    /// full, nearly all come back, others leave until the reported room is gone, a second feed
+    /// brings the record close to its budget, and then one more row of the first feed leaves.
+    #[test]
+    fn a_commits_proof_record_stays_inside_its_budget_when_removals_are_taken_back() {
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        let full = |scope: &CommitScope| scope.removed[&1].len() == scope.removed[&1].capacity();
+        let mut left = 0usize;
+        while left <= 100_000 || !full(&scope) {
+            scope.first_removal(1, &format!("pk-{left}"));
+            left += 1;
+        }
+        for i in 1_000..left {
+            scope.forget_removal(1, &format!("pk-{i}"));
+        }
+        while !full(&scope) {
+            scope.first_removal(1, &format!("pk-{left}"));
+            left += 1;
+        }
+        assert_eq!(scope.bytes, scope.heap_bytes(), "the running figure is the record's heap");
+        let mut other = 0usize;
+        while !scope.saturated && scope.bytes < COMMIT_PROOF_MAX_BYTES - 3_000_000 {
+            scope.first_removal(2, &format!("another-feeds-primary-key-{other:06}"));
+            other += 1;
+        }
+        scope.first_removal(1, "one more");
+        assert!(
+            scope.peak <= COMMIT_PROOF_MAX_BYTES,
+            "the record owned {} bytes at its largest, over its {COMMIT_PROOF_MAX_BYTES}",
+            scope.peak
+        );
+        assert_eq!(scope.bytes, scope.heap_bytes(), "the running figure is the record's heap");
+
+        // A row that left, came back and leaves again is news again, and is said once.
+        let mut scope = CommitScope { lsn: 0x10, ..CommitScope::default() };
+        assert!(scope.first_removal(1, "a"));
+        assert!(!scope.first_removal(1, "a"));
+        scope.forget_removal(1, "a");
+        assert!(scope.first_removal(1, "a"));
+        assert!(!scope.first_removal(1, "a"));
+        assert_eq!(scope.bytes, scope.heap_bytes());
     }
 
     /// One projected value, or one primary key, larger than the whole budget — Postgres text can be
