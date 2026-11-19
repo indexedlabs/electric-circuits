@@ -36,12 +36,7 @@ pub(crate) fn plan_circuit_agg(
         let (idx, keys) = match child {
             PredicateJson::Leaf { col, op: crate::predicate::LeafOp::Eq, value } => {
                 let i = *ts.index.get(col)?;
-                let v = Value::literal_for_column(
-                    value,
-                    ts.columns.get(i)?.1,
-                    ts.pg_types.get(i).and_then(|t| t.as_deref()),
-                )
-                .ok()?;
+                let v = Value::literal_for_column(value, ts.columns.get(i)?.1, ts.printed_type(i)).ok()?;
                 (i, std::iter::once(v).collect::<std::collections::HashSet<_>>())
             }
             PredicateJson::Or { or } if !or.is_empty() => {
@@ -55,14 +50,7 @@ pub(crate) fn plan_circuit_agg(
                     if *idx.get_or_insert(i) != i {
                         return None;
                     }
-                    keys.insert(
-                        Value::literal_for_column(
-                            value,
-                            ts.columns.get(i)?.1,
-                            ts.pg_types.get(i).and_then(|t| t.as_deref()),
-                        )
-                        .ok()?,
-                    );
+                    keys.insert(Value::literal_for_column(value, ts.columns.get(i)?.1, ts.printed_type(i)).ok()?);
                 }
                 (idx?, keys)
             }

@@ -910,11 +910,27 @@ the database, the role or the server defaults to**, by a different means on each
   (`0044-03-15 04:07:02-07:52:58 BC`) and a year past 9999 are read and written as Postgres
   prints them, across either boundary.
 - The type that decides is the one the cell is **printed as**, not the column's name for it. An
-  array whose element type is a domain over `timestamptz` is reported as `_<domain>`;
-  introspection (`pg::introspect_opt`) walks domains and array elements down to the printing type
-  and records `_timestamptz` beside it (`ColumnDef::printed_as`). The column's own type is kept
-  for casting bound parameters, because Postgres has no `<domain>[] = timestamptz[]`. A scalar
-  domain column needs none of this: `information_schema` already reports its base type.
+  array whose element type is a domain over `timestamptz` is reported as `_<domain>`, and a range
+  or multirange type of the application's own (`CREATE TYPE … AS RANGE`) under its own name.
+  Introspection (`pg::introspect_opt`) walks each column's type down — through domains, array
+  elements, range subtypes and composite attributes — to the scalar that does the printing, and
+  records `_timestamptz` beside the column's own type (`ColumnDef::printed_as`). The column's own
+  type is kept for casting bound parameters, because Postgres has no `<domain>[] =
+  timestamptz[]`. A scalar domain column needs none of this: `information_schema` already
+  reports its base type.
+- **A composite that holds a `timestamptz` is not respelled; it is refused outside UTC.** Its
+  text carries the timestamp beside attributes that may be text holding anything, a timestamp's
+  spelling included, so no rewrite of it is exact. Under a UTC replication session it is already
+  the bytes a query session prints. Under any other zone the row is not decoded
+  (`pg_temporal::CompositeInLocalZone`): the connection is dropped unacknowledged, the error
+  names the column, the zone and the fix (`ALTER ROLE … SET timezone = 'UTC'`, or leave the
+  column out), and ingest resumes by itself once the session is UTC. A `NULL` in such a column
+  is not a cell and passes.
+- **A literal for a container is refused.** A predicate that compares an array, range,
+  multirange or such a composite of timestamps or dates with a literal is refused with the same
+  typed error as an unreadable scalar literal (`400`). The rows are respelled element by
+  element; reading the literal the same way would take Postgres's array and range input syntax,
+  quoting and range canonicalisation included.
 - Respelling needs the ISO style, and that the engine cannot give the replication session either.
   The boot opens one session with no options — the same defaults the walsender will get — and
   **refuses to start** (exit 78, naming `ALTER ROLE … SET datestyle`) unless its `DateStyle` is
@@ -933,9 +949,8 @@ the database, the role or the server defaults to**, by a different means on each
   dropped, the check above refuses the next one by name, and Postgres sends the transaction again
   once the style is ISO.
 
-Not respelled: `infinity`/`-infinity`, which are the same in every zone and every style. A custom
-range type over `timestamptz` (`CREATE TYPE … AS RANGE`) and a composite type with a `timestamptz`
-attribute are not recognised and keep the session's spelling. Other session settings that
+Not respelled: `infinity`/`-infinity`, which are the same in every zone and every style. Not
+checked for date style: a composite's `date` and `timestamp` attributes. Other session settings that
 shape a cell's text — `IntervalStyle`, `bytea_output`, `extra_float_digits` — are still the
 defaults' on both roads, and so agree with each other only while nothing sets them on one.
 

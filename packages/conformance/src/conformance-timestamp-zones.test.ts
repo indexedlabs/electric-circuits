@@ -32,6 +32,8 @@ const schema: Schema = {
         span: { type: 'text' },
         stamps: { type: 'text' },
         later: { type: 'text' },
+        held: { type: 'text' },
+        slot: { type: 'text' },
       },
       primaryKey: 'id',
     },
@@ -41,6 +43,8 @@ const schema: Schema = {
 const ddl = `
   CREATE DOMAIN instant AS timestamptz;
   CREATE DOMAIN later_instant AS instant CHECK (VALUE > '2000-01-01 00:00:00+00');
+  CREATE TYPE hold AS RANGE (subtype = timestamptz);
+  CREATE TYPE booking AS (starts timestamptz, label text);
   CREATE TABLE records (id int PRIMARY KEY, visible boolean NOT NULL);
   ALTER TABLE records REPLICA IDENTITY FULL;
   CREATE TABLE events (
@@ -51,7 +55,9 @@ const ddl = `
     marks timestamptz[],
     span tstzrange,
     stamps instant[],
-    later later_instant[]
+    later later_instant[],
+    held hold,
+    slot booking
   );
   ALTER TABLE events REPLICA IDENTITY FULL;
 `
@@ -275,6 +281,51 @@ describe.each([
     }
   }, 120000)
 
+  // A range type of the application's own (`CREATE TYPE … AS RANGE (subtype = timestamptz)`) is
+  // not named `tstzrange`, and prints its bounds in the session zone exactly as one does.
+  it('spells a range type of the application\'s own over timestamptz the same in a backfill row and in a live change', async () => {
+    await pgQuery(
+      h,
+      `INSERT INTO events (id, record_id, starts, name, held) VALUES
+         (61, 1, '2026-10-21 12:00:00+00', 'a hold', hold('2026-10-21 12:00:00+00', '2026-10-21 13:30:00+00'))`,
+    )
+    await drainEngine(h)
+    const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'eq', value: 61 } })
+    await drainEngine(h)
+    await pgQuery(h, `UPDATE events SET name = 'a hold (respelled?)' WHERE id = 61`)
+    await drainEngine(h)
+
+    const envs = (await readEnvelopes(shape.streamUrl)).filter((env) => env.key === '61')
+    expect(envs.map((env) => env.headers.lsn !== undefined), 'one backfill row, then one live change').toEqual([false, true])
+    const [backfill, live] = envs.map((env) => env.value as Row)
+    expect(backfill!.held, 'backfill').toBe('["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")')
+    expect(live!.held, 'live').toBe('["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")')
+  }, 120000)
+
+  // A literal for an array or a range of timestamps is refused rather than compared as text: the
+  // rows are respelled element by element, and the snapshot's SQL reads the literal as instants.
+  it('refuses a predicate that compares an array or a range of timestamps to a literal', async () => {
+    for (const [col, type, literal] of [
+      ['marks', '_timestamptz', '{"2026-10-21 05:00:00-07","2026-10-21 17:30:00-07"}'],
+      ['span', 'tstzrange', '["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")'],
+      ['stamps', '_instant', '{"2026-10-21 12:00:00+00"}'],
+      ['held', 'hold', '["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")'],
+    ] as const) {
+      for (const path of ['/v1/subset-feeds', '/v1/subsets/query', '/v1/shapes']) {
+        const res = await fetch(`${h.engineUrl}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ table: 'events', where: { col, op: 'eq', value: literal } }),
+        })
+        const body = await res.text()
+        expect(res.status, `${path} on ${col}: ${body}`).toBe(400)
+        expect(body, `${path} names the column`).toContain(`'${col}'`)
+        expect(body, `${path} names the column's type`).toContain(type)
+        expect(body, `${path} says what is not read`).toContain('array, range')
+      }
+    }
+  }, 120000)
+
   // The same at the edges of Postgres's range. A year before year one is printed with ` BC` after
   // the zone, a year past 9999 with more digits, and in a non-UTC zone the walsender prints both
   // with the zone's old local-mean-time offset or across the boundary.
@@ -427,6 +478,54 @@ describe('a date style changed under a running engine', () => {
 // The live path's session cannot be given a date style (the replication connection takes no
 // startup options), and the engine can only read the ISO one. A database that prints dates another
 // way is refused, by name, before anything is served from it.
+// A composite type with a `timestamptz` attribute prints it in the session zone, inside text the
+// engine cannot respell exactly: a `text` attribute beside it may hold anything, a timestamp's
+// spelling included. Query sessions print it in UTC. So on a replication session whose zone is not
+// UTC the two roads would spell one row two ways, and the engine ingests nothing from such a
+// column until the zone is UTC, saying which column and how to fix it.
+describe('a composite column that holds a timestamptz, on a database whose default time zone is not UTC', () => {
+  let h: Harness | undefined
+  afterEach(async () => {
+    await h?.shutdown()
+    h = undefined
+  })
+
+  it('is never ingested in the local spelling: the engine waits, names the column, and resumes once the zone is UTC', async () => {
+    // The row is written before the engine's slot exists, so the engine first meets it in a
+    // backfill: every change to the table is decoded, whether or not a shape wants it.
+    const seeded = `${ddl}
+      INSERT INTO records (id, visible) VALUES (1, true);
+      INSERT INTO events (id, record_id, starts, name, slot) VALUES
+        (70, 1, '2026-10-21 12:00:00+00', 'booked', ROW('2026-10-21 12:00:00+00', 'room 4')::booking);`
+    h = await bootHarness(schema, { ddl: seeded, beforeEngine: setDatabaseDefault('timezone', 'America/Los_Angeles') })
+    const shape = await createShape(h, { table: 'events', where: { col: 'id', op: 'eq', value: 70 } })
+    await drainEngine(h)
+    const all = async () => (await readEnvelopes(shape.streamUrl)).filter((env) => env.key === '70')
+    const utc = '("2026-10-21 12:00:00+00","room 4")'
+    expect(((await all())[0]!.value as Row).slot, 'the backfill row, from a UTC query session').toBe(utc)
+
+    // The walsender prints ("2026-10-21 05:00:00-07","room 4").
+    await pgQuery(h, `UPDATE events SET name = 'booked (edited)' WHERE id = 70`)
+    const until = Date.now() + 5000
+    while (Date.now() < until) {
+      for (const env of await all()) expect((env.value as Row).slot, 'every image of the row spells the instant in UTC').toBe(utc)
+      await sleep(250)
+    }
+    expect(await all(), 'nothing is ingested from the local-zone session').toHaveLength(1)
+    expect(h.engineStderr(), 'the refusal names the column').toContain('events.slot')
+    expect(h.engineStderr(), 'and the zone').toContain('America/Los_Angeles')
+
+    // Fixed as the message says: the engine's sessions default to UTC, and the next replication
+    // connection prints the composite as the query sessions do.
+    await pgQuery(h, `DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET timezone TO ''UTC''', current_database()); END $$`)
+    await pgQuery(h, 'SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1', [h.slot])
+    await waitFor(async () => (await all()).length === 2, 'the edit to arrive once the zone is UTC', 60000)
+    const live = (await all())[1]!.value as Row
+    expect(live.name).toBe('booked (edited)')
+    expect(live.slot).toBe(utc)
+  }, 150000)
+})
+
 describe('a database whose sessions print dates in a non-ISO style', () => {
   let booted: Harness | undefined
   afterEach(async () => {

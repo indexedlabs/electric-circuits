@@ -289,12 +289,14 @@ impl CompiledPredicate {
                 let v = if *op == LeafOp::Like {
                     Value::literal_from_json(value, ts.column_type(idx))?
                 } else {
-                    Value::literal_for_column(
-                        value,
-                        ts.column_type(idx),
-                        ts.pg_types.get(idx).and_then(|t| t.as_deref()),
-                    )
-                    .map_err(|e| e.context(format!("predicate on column '{col}'")))?
+                    // By the type the column's cells are printed as, which is how they are spelled
+                    // when the literal is compared with them.
+                    Value::literal_for_column(value, ts.column_type(idx), ts.printed_type(idx)).map_err(|e| match ts
+                        .pg_type_of(col)
+                    {
+                        Some(declared) => e.context(format!("predicate on column '{col}' ({declared})")),
+                        None => e.context(format!("predicate on column '{col}'")),
+                    })?
                 };
                 CompiledPredicate::Cmp { col: idx, op: *op, value: v }
             }
@@ -1278,5 +1280,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A literal for an ARRAY, RANGE or MULTIRANGE of timestamps or dates is refused whatever it
+    /// says. Its cells are respelled element by element as they arrive, and Postgres reads the
+    /// literal's elements as instants (`{"2026-10-19 01:00:00-07"}` equals a row printed
+    /// `{"2026-10-19 08:00:00+00"}`), so comparing the literal's text would split the snapshot from
+    /// the live path. Reading one would mean Postgres's array and range input syntax, quoting and
+    /// range canonicalisation included; the engine does not.
+    #[test]
+    fn a_literal_for_an_array_or_range_of_timestamps_is_refused() {
+        let mut def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": {
+                "id": {"type":"int"}, "marks": {"type":"text"}, "span": {"type":"text"}, "days": {"type":"text"},
+                "spans": {"type":"text"}, "tags": {"type":"text"}
+            },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        for (col, pg) in [
+            ("marks", "_timestamptz"),
+            ("span", "tstzrange"),
+            ("days", "_date"),
+            ("spans", "tsmultirange"),
+            ("tags", "_text"),
+        ] {
+            def.columns.get_mut(col).unwrap().pg_type = Some(pg.into());
+        }
+        let ts = TableSchema::from_def(&"events".into(), &def).unwrap();
+        for (col, pg_type, literal) in [
+            ("marks", "_timestamptz", r#"{"2026-10-19 01:00:00-07"}"#),
+            ("marks", "_timestamptz", r#"{"2026-10-19 08:00:00+00"}"#),
+            ("span", "tstzrange", r#"["2026-10-19 08:00:00+00","2026-10-20 08:00:00+00")"#),
+            ("days", "_date", "{2026-10-19}"),
+            ("spans", "tsmultirange", "{}"),
+        ] {
+            for op in ["eq", "neq", "gte"] {
+                let pred: PredicateJson =
+                    serde_json::from_value(serde_json::json!({"col": col, "op": op, "value": literal})).unwrap();
+                let refused = match CompiledPredicate::compile(&pred, &ts) {
+                    Err(refused) => format!("{refused:#}"),
+                    Ok(_) => panic!("{literal:?} on a {pg_type} column must be refused"),
+                };
+                assert!(
+                    refused.contains(&format!("'{col}'"))
+                        && refused.contains(pg_type)
+                        && refused.contains("array, range"),
+                    "the refusal names the column and its type, and says what is not read: {refused}"
+                );
+            }
+        }
+        // An array of anything else is the application's text, as before.
+        let pred: PredicateJson =
+            serde_json::from_value(serde_json::json!({"col": "tags", "op": "eq", "value": "{a,b}"})).unwrap();
+        assert!(CompiledPredicate::compile(&pred, &ts).is_ok());
     }
 }

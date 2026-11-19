@@ -354,13 +354,16 @@ pub async fn run(
             checked = crate::pg::check_replication_session(&pg_url, &shutdown) => checked,
             _ = shutdown.wait() => continue,
         };
-        if let Err(refused) = checked {
-            tracing::error!("replicator: not connecting — {refused:#}");
-            let (base, next) = next_backoff(attempt, false);
-            backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
-            attempt = next;
-            continue;
-        }
+        let local_zone = match checked {
+            Ok(local_zone) => local_zone,
+            Err(refused) => {
+                tracing::error!("replicator: not connecting — {refused:#}");
+                let (base, next) = next_backoff(attempt, false);
+                backoff_wait(epoch.as_ref(), &shutdown, jitter(base, clock_nanos())).await;
+                attempt = next;
+                continue;
+            }
+        };
         let mut connected = false;
         match stream_loop(
             cfg,
@@ -374,6 +377,7 @@ pub async fn run(
             &txn_cfg,
             &shutdown,
             &mut connected,
+            local_zone,
         )
         .await
         {
@@ -438,6 +442,8 @@ async fn stream_loop(
     // `START_REPLICATION` failures (a slot held by someone else, most of all) all surface on the
     // first `recv`. Setting it there would peg every one of those at the 1 s floor forever.
     connected: &mut bool,
+    // The replication session's time zone when it is not UTC (`pg::check_replication_session`).
+    local_zone: Option<String>,
 ) -> Result<StreamEnd> {
     // `ReplicationClient::connect` only spawns its worker; TCP/authentication and
     // START_REPLICATION happen before the worker can deliver its first frame. Bound both the
@@ -466,6 +472,7 @@ async fn stream_loop(
     };
     let mut dec = Decoder::new(tables.clone());
     dec.runtime_incarnation = Some(runtime_incarnation);
+    dec.local_zone = local_zone;
     // Dropped on every exit path (a replaced `Begin`, an error return, the stream ending), which is
     // what removes a spilled transaction's temporary file (ADR-0003).
     let mut txn: Option<TxnBuffer> = None;
@@ -555,7 +562,7 @@ async fn stream_loop(
                     // Nothing of this transaction is on the log yet (it is appended whole, at its
                     // commit), and it is not acknowledged: Postgres sends it again on the next
                     // connection, which the date-style check lets through only once it is ISO.
-                    Decoded::Refused(cell) => return Err(anyhow::Error::new(cell).context("decoding a change")),
+                    Decoded::Refused(cell) => return Err(cell.context("decoding a change")),
                 }
             }
             ReplicationEvent::Commit { lsn, end_lsn, commit_time_micros } => {
@@ -675,7 +682,7 @@ enum Decoded {
     Sync(i64),
     None,
     /// A cell the engine must not ingest: the connection is torn down unacknowledged.
-    Refused(crate::pg_temporal::NotIsoCell),
+    Refused(anyhow::Error),
 }
 
 /// Relation metadata learned from `R` messages on this connection. The `R` message's namespace is
@@ -717,11 +724,13 @@ struct Decoder {
     runtime_incarnation: Option<uuid::Uuid>,
     tables: SharedTables,
     rels: HashMap<u32, RelMeta>,
+    /// The time zone this connection's walsender prints in, when it is not UTC.
+    local_zone: Option<String>,
 }
 
 impl Decoder {
     fn new(tables: SharedTables) -> Self {
-        Decoder { tables, rels: HashMap::new(), runtime_incarnation: None }
+        Decoder { tables, rels: HashMap::new(), runtime_incarnation: None, local_zone: None }
     }
 
     /// Record a relation and, if what Postgres now reports differs from the compiled schema, report
@@ -805,7 +814,7 @@ impl Decoder {
         }
         let tables = self.tables.read().unwrap();
         let Some(ts) = tables.get(table) else { return Decoded::None };
-        match build_envelope(table, ts, &rel.columns, msg) {
+        match build_envelope(table, ts, &rel.columns, msg, self.local_zone.as_deref()) {
             Ok(Some(env)) => Decoded::Env(env),
             Ok(None) => Decoded::None,
             Err(cell) => Decoded::Refused(cell),
@@ -876,14 +885,15 @@ fn sync_counter(rel: &RelMeta, tuple: &Tuple) -> Option<i64> {
 
 /// Build an envelope from a decoded pgoutput DML message; LSN/xid/seq are stamped at `Commit`.
 ///
-/// `Err` when a cell is not in the ISO date style ([`crate::pg_temporal::check_cell_style`]): no
-/// envelope may be made of such a row.
+/// `Err` when a cell is one the engine must not ingest (see [`tuple_to_map`]): no envelope may be
+/// made of such a row. `local_zone` is the replication session's time zone when it is not UTC.
 fn build_envelope(
     table: &TableRef,
     ts: &TableSchema,
     columns: &[String],
     msg: Message,
-) -> Result<Option<Envelope>, crate::pg_temporal::NotIsoCell> {
+    local_zone: Option<&str>,
+) -> Result<Option<Envelope>> {
     let make = |operation: &str, value: Option<Json>, old: Option<Json>, key_src: &Json| Envelope {
         // The wire `type` is the canonical `schema.name` — always qualified, never bare.
         type_: table.to_string(),
@@ -902,12 +912,12 @@ fn build_envelope(
     };
     Ok(match msg {
         Message::Insert { new, .. } => {
-            let new = Json::Object(tuple_to_map(&new, columns, ts)?);
+            let new = Json::Object(tuple_to_map(&new, columns, ts, local_zone)?);
             Some(make("insert", Some(new.clone()), None, &new))
         }
         Message::Update { old, new, .. } => {
             let old_map = match old {
-                Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts)?),
+                Some(OldTuple::Full(t)) => Some(tuple_to_map(&t, columns, ts, local_zone)?),
                 Some(OldTuple::Key(_)) | None => {
                     // No full old image: this change was written while the table's REPLICA IDENTITY
                     // was not FULL. The preceding `R` reported that identity, so the engine has
@@ -921,7 +931,7 @@ fn build_envelope(
                     None
                 }
             };
-            let mut new_map = tuple_to_map(&new, columns, ts)?;
+            let mut new_map = tuple_to_map(&new, columns, ts, local_zone)?;
             // TOASTed-but-unchanged columns are omitted from new (see tuple_to_map); fill from old.
             if let Some(ref om) = old_map {
                 for (k, v) in om {
@@ -943,7 +953,7 @@ fn build_envelope(
                 );
                 return Ok(None);
             };
-            let old = Json::Object(tuple_to_map(&t, columns, ts)?);
+            let old = Json::Object(tuple_to_map(&t, columns, ts, local_zone)?);
             Some(make("delete", None, Some(old.clone()), &old))
         }
         _ => None,
@@ -964,11 +974,16 @@ fn build_envelope(
 /// The walsender's `DateStyle` is out of the engine's hands for the same reason, and a reload can
 /// change it under a connection that was checked when it was opened. A date or timestamp cell that
 /// is not in the ISO style is therefore refused here, before anything is made of the row.
+///
+/// So is the one zone-dependent cell that cannot be respelled: a composite that holds a
+/// `timestamptz` ([`crate::pg_temporal::COMPOSITE_WITH_TIMESTAMPTZ`]), when the walsender's zone
+/// (`local_zone`) is not UTC. Under UTC it is the bytes a query session prints, and passes.
 fn tuple_to_map(
     tuple: &Tuple,
     columns: &[String],
     ts: &TableSchema,
-) -> Result<Map<String, Json>, crate::pg_temporal::NotIsoCell> {
+    local_zone: Option<&str>,
+) -> Result<Map<String, Json>> {
     let mut out = Map::new();
     for (cell, name) in tuple.iter().zip(columns) {
         let Some(&idx) = ts.index.get(name) else { continue };
@@ -980,6 +995,16 @@ fn tuple_to_map(
             }
             Cell::Text(text) => {
                 let utc = match (ty, ts.printed_type(idx)) {
+                    (ColumnType::Text, Some(crate::pg_temporal::COMPOSITE_WITH_TIMESTAMPTZ)) => {
+                        if let Some(zone) = local_zone {
+                            return Err(crate::pg_temporal::CompositeInLocalZone {
+                                column: format!("{}.{name}", ts.table),
+                                time_zone: zone.to_string(),
+                            }
+                            .into());
+                        }
+                        None
+                    }
                     (ColumnType::Text, Some(printed)) => {
                         crate::pg_temporal::check_cell_style(text, printed)?;
                         crate::pg_temporal::utc_cell(text, printed)
@@ -1394,6 +1419,7 @@ mod tests {
                 old: Some(OldTuple::Full(in_los_angeles(note))),
                 new: in_los_angeles("edited"),
             },
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1405,6 +1431,7 @@ mod tests {
             &ts,
             &names,
             Message::Delete { rel_id: 1, old: OldTuple::Full(in_los_angeles(note)) },
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1418,7 +1445,7 @@ mod tests {
             t(note),
         ];
         let insert =
-            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: in_kolkata }).unwrap().unwrap();
+            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: in_kolkata }, None).unwrap().unwrap();
         assert_eq!(insert.value, Some(in_utc(note)));
     }
 
@@ -1446,7 +1473,8 @@ mod tests {
         let names: Vec<String> = ["id", "stamps", "labels"].map(String::from).to_vec();
         let printed = r#"{"2026-10-19 01:00:00-07","2026-10-20 01:30:00-07"}"#;
         let row = vec![t("1"), t(printed), t(printed)];
-        let insert = build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: row }).unwrap().unwrap();
+        let insert =
+            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: row }, None).unwrap().unwrap();
         assert_eq!(
             insert.value,
             Some(serde_json::json!({
@@ -1455,6 +1483,48 @@ mod tests {
                 "labels": printed,
             }))
         );
+    }
+
+    /// A range type of the application's own over `timestamptz` is recorded as printing like an
+    /// array of them, and is respelled. A composite that holds a `timestamptz` cannot be: under a
+    /// UTC replication session it is already the bytes a query session prints, and under any other
+    /// zone the row is refused, naming the column and the zone, rather than spelled two ways.
+    #[test]
+    fn a_custom_range_is_respelled_and_a_composite_is_refused_outside_utc() {
+        let mut columns = BTreeMap::new();
+        for (name, ty, pg_type, printed_as) in [
+            ("id", ColumnType::Int, "int4", None),
+            ("held", ColumnType::Text, "hold", Some("_timestamptz")),
+            ("slot", ColumnType::Text, "booking", Some(crate::pg_temporal::COMPOSITE_WITH_TIMESTAMPTZ)),
+        ] {
+            let printed_as = printed_as.map(String::from);
+            columns.insert(
+                name.to_string(),
+                ColumnDef { ty, pg_type: Some(pg_type.into()), printed_as, has_default: false },
+            );
+        }
+        let table = TableRef::parse("public.events").unwrap();
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
+        let ts = TableSchema::from_def(&table, &def).unwrap();
+        let names: Vec<String> = ["id", "held", "slot"].map(String::from).to_vec();
+        let insert = |held: &str, slot: Cell, zone: Option<&str>| {
+            build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: vec![t("1"), t(held), slot] }, zone)
+        };
+
+        let local = r#"["2026-10-21 05:00:00-07","2026-10-21 06:30:00-07")"#;
+        let utc = r#"["2026-10-21 12:00:00+00","2026-10-21 13:30:00+00")"#;
+        let zone = Some("America/Los_Angeles");
+        let row = insert(local, Cell::Null, zone).unwrap().unwrap();
+        assert_eq!(row.value, Some(serde_json::json!({"id": 1, "held": utc, "slot": null})));
+
+        // Under UTC the composite is what a query session prints, and passes as it is.
+        let in_utc = r#"("2026-10-21 12:00:00+00","room 4")"#;
+        let row = insert(utc, t(in_utc), None).unwrap().unwrap();
+        assert_eq!(row.value, Some(serde_json::json!({"id": 1, "held": utc, "slot": in_utc})));
+
+        let refused = insert(local, t(r#"("2026-10-21 05:00:00-07","room 4")"#), zone).unwrap_err();
+        let refused = format!("{refused:#}");
+        assert!(refused.contains("public.events.slot") && refused.contains("America/Los_Angeles"), "{refused}");
     }
 
     /// A date style set server-wide reaches a walsender that is ALREADY connected (a reload is

@@ -59,6 +59,16 @@ pub struct UnreadableLiteral {
 
 impl std::fmt::Display for UnreadableLiteral {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if holds_timestamps(&self.pg_type) {
+            return write!(
+                f,
+                "cannot compare this column with a literal: its cells are an array, range, multirange or composite \
+                 of timestamps or dates (printed as {}). Postgres reads the elements of such a literal as instants; \
+                 the engine does not read them, and refuses the predicate rather than compare the literal's text \
+                 ('{}'), which would disagree with the snapshot query",
+                self.pg_type, self.literal
+            );
+        }
         write!(
             f,
             "cannot compare a {} column with the literal '{}': the engine reads a date, or a date and time, in \
@@ -80,6 +90,13 @@ pub(crate) fn literal_for(literal: &str, pg_type: &str) -> Result<Option<String>
         "timestamptz" => Kind::TimestampTz,
         "timestamp" => Kind::Timestamp,
         "date" => Kind::Date,
+        // An array, a range or a composite of them: its cells are respelled element by element,
+        // and reading the literal the same way would take Postgres's array and range input
+        // syntax, quoting and range canonicalisation included. Refused, like any literal the
+        // engine cannot read, so that the snapshot's SQL and the live path cannot disagree.
+        held if holds_timestamps(held) => {
+            return Err(UnreadableLiteral { literal: literal.to_string(), pg_type: pg_type.to_string() });
+        }
         _ => return Ok(None),
     };
     spell(literal, kind)
@@ -252,6 +269,67 @@ impl std::fmt::Display for NotIsoCell {
 }
 
 impl std::error::Error for NotIsoCell {}
+
+/// What introspection records as the printed type of a column whose composite type has a
+/// `timestamptz` attribute, at any depth (`pg::introspect_opt`). Not a type name: no `typname`
+/// has a parenthesis. Such a cell cannot be respelled exactly — the attributes beside the
+/// timestamp may be text that holds anything — so on a replication session whose zone is not UTC
+/// it is refused instead (`replication::tuple_to_map`).
+pub(crate) const COMPOSITE_WITH_TIMESTAMPTZ: &str = "(timestamptz)";
+
+/// Whether cells printed as `printed` are a container of timestamps or dates: an array, a range
+/// or a multirange of `timestamptz`, `timestamp` or `date`, or a composite that holds a
+/// `timestamptz`. A range or multirange type of the application's own is recorded by
+/// introspection as the array type of its element (`_timestamptz`), so the names here are all
+/// there is.
+pub(crate) fn holds_timestamps(printed: &str) -> bool {
+    printed == COMPOSITE_WITH_TIMESTAMPTZ
+        || matches!(
+            printed,
+            "_timestamptz"
+                | "_timestamp"
+                | "_date"
+                | "tstzrange"
+                | "tsrange"
+                | "daterange"
+                | "_tstzrange"
+                | "_tsrange"
+                | "_daterange"
+                | "tstzmultirange"
+                | "tsmultirange"
+                | "datemultirange"
+                | "_tstzmultirange"
+                | "_tsmultirange"
+                | "_datemultirange"
+        )
+}
+
+/// A replicated cell of a composite type that holds a `timestamptz`, printed by a replication
+/// session whose time zone is not UTC (see [`COMPOSITE_WITH_TIMESTAMPTZ`]).
+///
+/// Typed for the same reason [`NotIsoCell`] is: the decode fails, the connection is dropped
+/// without acknowledging the transaction, and Postgres sends it again on the next connection —
+/// which prints the composite as the query sessions do once the zone is UTC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompositeInLocalZone {
+    pub column: String,
+    pub time_zone: String,
+}
+
+impl std::fmt::Display for CompositeInLocalZone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "column {} is of a composite type that holds a timestamptz, and the replication session prints it in \
+             TimeZone={}. The engine cannot respell a timestamp inside a composite, and its query sessions print \
+             UTC, so the row would be spelled two ways. Set the zone for the engine's role — `ALTER ROLE <the \
+             engine's role> SET timezone = 'UTC'` — or leave the column out with ELECTRIC_CIRCUITS_PG_COLUMNS",
+            self.column, self.time_zone
+        )
+    }
+}
+
+impl std::error::Error for CompositeInLocalZone {}
 
 /// Refuse a replicated cell of a `DateStyle`-dependent type that is not in the ISO style.
 ///
@@ -872,6 +950,23 @@ mod tests {
             Some(r#"["0044-03-15 12:00:00+00 BC","2026-10-19 08:00:00+00")"#)
         );
         assert_eq!(utc_cell(r#"{"0044-03-15 12:00:00+00 BC","10000-01-01 08:00:00+00"}"#, "_timestamptz"), None);
+    }
+
+    /// A literal for a container of timestamps or dates is refused whatever it says, by the type
+    /// the column's cells are printed as; a container of anything else is left alone.
+    #[test]
+    fn a_literal_for_a_container_of_timestamps_is_refused() {
+        for printed in ["_timestamptz", "tstzrange", "_date", "tsmultirange", "_tstzrange", COMPOSITE_WITH_TIMESTAMPTZ]
+        {
+            assert!(holds_timestamps(printed), "{printed}");
+            let refused = literal_for(r#"{"2026-10-19 08:00:00+00"}"#, printed).unwrap_err();
+            assert_eq!(refused.pg_type, printed);
+            assert!(refused.to_string().contains("array, range"), "{refused}");
+        }
+        for printed in ["_text", "_int4", "int4range", "jsonb", "text", "_instant", "hold"] {
+            assert!(!holds_timestamps(printed), "{printed}");
+            assert_eq!(literal_for("{a}", printed), Ok(None), "{printed}");
+        }
     }
 
     /// The style check passes everything an ISO-style session prints for these types, as

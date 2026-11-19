@@ -46,7 +46,7 @@ fn reply(query: &str) -> Reply {
         Reply { params: vec![25, 25], types: vec![25, 25, 25, 16], rows }
     } else if query.starts_with("with recursive walk as") {
         // No column of the fixture's table is an array of a domain.
-        Reply { params: vec![25], types: vec![25, 25], rows: vec![] }
+        Reply { params: vec![25], types: vec![25, 16, 25], rows: vec![] }
     } else if query.starts_with("select a.attname from pg_index") {
         Reply { params: vec![25], types: vec![25], rows: strings(&[&["id"]]) }
     } else {

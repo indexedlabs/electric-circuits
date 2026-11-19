@@ -68,6 +68,14 @@ The engine sets everything else up for you on startup, per configured table:
 > literal in ISO 8601 form (`2026-10-19T07:00:00Z`, `2026-10-19 07:00:00+05:30`, `2026-10-19`),
 > with `Z`, `UTC`, `GMT` or a numeric offset as the zone, or `infinity`. Any other spelling is
 > refused with `400`, including ones Postgres itself reads, such as `… PST` or `Oct 19 2026`.
+> So is any literal for an array, range or multirange of timestamps or dates: compare a scalar
+> column instead.
+>
+> **Composite types that hold a `timestamptz`.** The engine cannot respell a timestamp inside a
+> composite value. If a tracked table has such a column and the engine's role does not default to
+> UTC, the engine stops ingesting at the first non-`NULL` value in it and logs the column and the
+> fix: `ALTER ROLE <the engine's role> SET timezone = 'UTC'`, or leave the column out with
+> `ELECTRIC_CIRCUITS_PG_COLUMNS`. Nothing is lost; ingest resumes at the next connection.
 >
 > **Upgrading from a version that compared timestamp bounds as text.** Shapes are restored from
 > the catalog with their predicates as the client wrote them, and a bound such as

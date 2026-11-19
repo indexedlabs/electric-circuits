@@ -2883,11 +2883,7 @@ impl SubqueryCollector for SubqueryRegistry {
         for (col, lit) in &bind_literals {
             let idx = inner_ts.column_index(col)?;
             param_cols.push(idx);
-            bind_vals.push(Value::literal_for_column(
-                lit,
-                inner_ts.column_type(idx),
-                inner_ts.pg_types.get(idx).and_then(|t| t.as_deref()),
-            )?);
+            bind_vals.push(Value::literal_for_column(lit, inner_ts.column_type(idx), inner_ts.printed_type(idx))?);
         }
         let bind = Row(bind_vals);
         if !self.templates.contains_key(&tkey) {
