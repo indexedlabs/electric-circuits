@@ -122,8 +122,23 @@ pub struct Metrics {
     /// than by halting. Every one of these is a WARN and a bigger buffer than the last.
     pub sequencer_read_cap_raised: AtomicU64,
     pub reactivation_spans: AtomicU64,
-    pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
-    pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
+    pub shapes_evicted: AtomicU64, // retention: shapes evicted (stream deleted), every reason
+    /// The same evictions by reason, indexed by [`crate::retention::EvictReason::index`]. A group
+    /// retired as a unit counts once per member.
+    pub shapes_evicted_by_reason: [AtomicU64; crate::retention::EvictReason::ALL.len()],
+    pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing left to evict
+    /// Creates refused because they would mint a shape past `ELECTRIC_CIRCUITS_MAX_SHAPES` with
+    /// nothing left to evict (`503` + `Retry-After`). A group load counts once.
+    pub shape_creates_refused: AtomicU64,
+    /// `POST /v1/subsets/rejoin` answers that took or renewed a group's claim without reading rows.
+    pub group_rejoins: AtomicU64,
+    /// The same route's "no such group" answers (`412`): each is a client that then loads.
+    pub group_rejoins_absent: AtomicU64,
+    /// GAUGE: shapes that are live (not dormant), by [`crate::retention::ShapeKind::index`] and
+    /// then by whether a subscription holds them (`[unsubscribed, subscribed]`). Republished by
+    /// every retention sweep. Unsubscribed subquery, changes-only and aggregate shapes are the ones
+    /// the engine still evaluates for nobody.
+    pub shapes_live: [[AtomicU64; 2]; crate::retention::ShapeKind::ALL.len()],
     /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
     /// within the idle window. A climbing value with healthy clients means the renewal cadence is
     /// longer than `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, not that anything crashed.
@@ -151,6 +166,16 @@ pub struct Metrics {
     /// Shape records retired during catalog restore because their durable stream was missing or
     /// already closed. The reason-tagged StatsD event is emitted alongside this Engine counter.
     pub catalog_restore_retired: AtomicU64,
+    /// Subquery shapes the catalog restore brought back from the registry state the last graceful
+    /// stop wrote (`crate::subq_state`), instead of dropping them.
+    pub subquery_shapes_restored: AtomicU64,
+    /// Subquery shapes the catalog restore dropped: the last stop wrote no usable registry state
+    /// (a crash, a degraded engine, effects still in flight), or the state could not vouch for
+    /// the shape. Each one is a stream its clients must reload.
+    pub subquery_shapes_dropped_at_restore: AtomicU64,
+    /// GAUGE: size of the registry state this boot restored from (0 = none). A boot measurement,
+    /// like `catalog_bytes`; preserved by `reset()`.
+    pub(crate) subquery_state_bytes: AtomicU64,
     /// GAUGE: response-body bytes read by the latest successful catalog fold (including framing
     /// and duplicate events). Excludes admission reads; preserved by `reset()`.
     pub(crate) catalog_bytes: AtomicU64,
@@ -262,7 +287,12 @@ impl Metrics {
             reactivation_bytes_scanned: AtomicU64::new(0),
             reactivation_spans: AtomicU64::new(0),
             shapes_evicted: AtomicU64::new(0),
+            shapes_evicted_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
             retention_pressure: AtomicU64::new(0),
+            shape_creates_refused: AtomicU64::new(0),
+            group_rejoins: AtomicU64::new(0),
+            group_rejoins_absent: AtomicU64::new(0),
+            shapes_live: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             subscriptions_lapsed: AtomicU64::new(0),
             subscriptions_live: AtomicU64::new(0),
             schema_drift: AtomicU64::new(0),
@@ -277,6 +307,9 @@ impl Metrics {
             changes_segments_retained: AtomicU64::new(0),
             catalog_append_retries: AtomicU64::new(0),
             catalog_restore_retired: AtomicU64::new(0),
+            subquery_shapes_restored: AtomicU64::new(0),
+            subquery_shapes_dropped_at_restore: AtomicU64::new(0),
+            subquery_state_bytes: AtomicU64::new(0),
             catalog_bytes: AtomicU64::new(0),
             memory_budget: crate::memory_budget::MemoryBudget::new(None),
             retirement_retries: AtomicU64::new(0),
@@ -315,6 +348,12 @@ impl Metrics {
         crate::statsd::Emitter::new(&self.stack_id, self.source_mode)
     }
 
+    /// Count one evicted shape, in the total and under its reason.
+    pub(crate) fn record_eviction(&self, reason: crate::retention::EvictReason) {
+        self.shapes_evicted.fetch_add(1, Ordering::Relaxed);
+        self.shapes_evicted_by_reason[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Start the untouched-age clock at boot when a TTL is set: until a keep-alive sweep finishes,
     /// every tracked stream has been untouched since then.
     pub(crate) fn arm_stream_ttl_age(&self) {
@@ -346,14 +385,43 @@ impl Metrics {
             ] {
                 counters.insert(name.into(), counter.load(Ordering::Relaxed).into());
             }
+            counters.insert(
+                "shape_creates_refused_total".into(),
+                self.shape_creates_refused.load(Ordering::Relaxed).into(),
+            );
+            counters.insert("group_rejoins_total".into(), self.group_rejoins.load(Ordering::Relaxed).into());
+            counters
+                .insert("group_rejoins_absent_total".into(), self.group_rejoins_absent.load(Ordering::Relaxed).into());
+            for reason in crate::retention::EvictReason::ALL {
+                let name = format!("shapes_evicted_{}_total", reason.as_str().replace('-', "_"));
+                counters.insert(name, self.shapes_evicted_by_reason[reason.index()].load(Ordering::Relaxed).into());
+            }
         }
         if let Some(gauges) = snapshot["gauges"].as_object_mut() {
             gauges.insert("stream_ttl_oldest_untouched_seconds".into(), self.stream_ttl_oldest_untouched_secs().into());
+            for kind in crate::retention::ShapeKind::ALL {
+                for (subscribed, state) in ["unsubscribed", "subscribed"].into_iter().enumerate() {
+                    let name = format!("shapes_live_{}_{state}", kind.as_str().replace('-', "_"));
+                    gauges.insert(name, self.shapes_live[kind.index()][subscribed].load(Ordering::Relaxed).into());
+                }
+            }
         }
         snapshot
     }
 
     fn snapshot_core(&self) -> serde_json::Value {
+        let mut core = self.snapshot_core_base();
+        // Added outside the literal below, which is as large as `json!` expands without a raised
+        // recursion limit.
+        core["counters"]["subquery_shapes_restored_total"] =
+            self.subquery_shapes_restored.load(Ordering::Relaxed).into();
+        core["counters"]["subquery_shapes_dropped_at_restore_total"] =
+            self.subquery_shapes_dropped_at_restore.load(Ordering::Relaxed).into();
+        core["gauges"]["subquery_state_bytes"] = self.subquery_state_bytes.load(Ordering::Relaxed).into();
+        core
+    }
+
+    fn snapshot_core_base(&self) -> serde_json::Value {
         serde_json::json!({
             "counters": {
                 "envelopes_processed": self.envelopes.load(Ordering::Relaxed),
@@ -443,7 +511,13 @@ impl Metrics {
         self.reactivation_bytes_scanned.store(0, Ordering::Relaxed);
         self.reactivation_spans.store(0, Ordering::Relaxed);
         self.shapes_evicted.store(0, Ordering::Relaxed);
+        for evicted in &self.shapes_evicted_by_reason {
+            evicted.store(0, Ordering::Relaxed);
+        }
         self.retention_pressure.store(0, Ordering::Relaxed);
+        self.shape_creates_refused.store(0, Ordering::Relaxed);
+        self.group_rejoins.store(0, Ordering::Relaxed);
+        self.group_rejoins_absent.store(0, Ordering::Relaxed);
         self.subscriptions_lapsed.store(0, Ordering::Relaxed);
         self.schema_drift.store(0, Ordering::Relaxed);
         self.schema_unresolved.store(0, Ordering::Relaxed);
@@ -455,6 +529,8 @@ impl Metrics {
         self.stream_ttl_touch_failures.store(0, Ordering::Relaxed);
         self.catalog_append_retries.store(0, Ordering::Relaxed);
         self.catalog_restore_retired.store(0, Ordering::Relaxed);
+        self.subquery_shapes_restored.store(0, Ordering::Relaxed);
+        self.subquery_shapes_dropped_at_restore.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);
         self.txn_spills.store(0, Ordering::Relaxed);
         self.sequencer_held_spills.store(0, Ordering::Relaxed);
@@ -467,7 +543,7 @@ impl Metrics {
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
         // (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `sequencer_held_bytes`,
-        // `shutdown_in_progress`,
+        // `shutdown_in_progress`, `shapes_live`,
         // `retirements_pending`, and the three replication-slot gauges the sampler republishes).
         self.process_envelope.reset();
         self.family_step.reset();

@@ -55,7 +55,9 @@ impl EmissionLanes {
             let (tx, mut rx) = mpsc::unbounded_channel::<Batch>();
             let ds = ds.clone();
             let pending = pending.clone();
-            shutdown.spawn_background(async move {
+            // Draining, not background: a batch enqueued before a shutdown still lands, which is
+            // what lets its commit be checkpointed and the registry be written (`subq_state`).
+            shutdown.spawn_draining(async move {
                 while let Some(b) = rx.recv().await {
                     // Reliable: a dropped subquery envelope is permanent divergence for the
                     // shape's subscribers. A retired stream (shape dropped/evicted mid-flight)
@@ -611,7 +613,7 @@ impl GroupEmissionLanes {
             epoch: tokio::sync::watch::Sender::new(0),
             shared: self.shared.clone(),
         });
-        self.shutdown.clone().spawn_background(run_group_lane(lane.clone(), self.ds.clone()));
+        self.shutdown.clone().spawn_draining(run_group_lane(lane.clone(), self.ds.clone()));
         lanes.insert(path.to_string(), lane.clone());
         if !self.monitor.swap(true, std::sync::atomic::Ordering::AcqRel) {
             self.spawn_monitor();
@@ -761,6 +763,37 @@ impl GroupEmissionLanes {
         if let Some(lane) = lane {
             lane.close();
         }
+    }
+
+    /// Every open lane's stream position ([`GroupLaneState::position`]), sorted by path: the part
+    /// of a group stream's state a graceful stop writes with the subquery registry
+    /// (`crate::subq_state`), so a restored group never places an envelope below one it already
+    /// appended.
+    pub(crate) fn positions(&self) -> Vec<(String, u64)> {
+        let lanes: Vec<_> = self.lanes.lock().unwrap().values().cloned().collect();
+        let mut positions: Vec<(String, u64)> = lanes
+            .into_iter()
+            .filter_map(|lane| {
+                let state = lane.state.lock().unwrap();
+                (!state.closed && state.position != 0).then(|| (lane.path.clone(), state.position))
+            })
+            .collect();
+        positions.sort();
+        positions
+    }
+
+    /// Whether any lane still has output it can land by itself: a queued batch, an append in
+    /// flight, a marker, or work a commit has in production. A DETACHED lane is not counted — it
+    /// takes no output until a probe reattaches it, so waiting on one waits for nothing; its
+    /// resume point is what the checkpoint records instead.
+    pub(crate) fn landing(&self) -> bool {
+        let lanes: Vec<_> = self.lanes.lock().unwrap().values().cloned().collect();
+        lanes.into_iter().any(|lane| {
+            let state = lane.state.lock().unwrap();
+            !state.closed
+                && !matches!(state.phase, Phase::Detached(_))
+                && (state.has_work() || !state.producing.is_empty())
+        })
     }
 
     /// Every group with output at or before `marker_lsn` that is not on its stream, with the

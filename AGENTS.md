@@ -61,7 +61,7 @@ valid YAML with string `interface.display_name` and `interface.short_description
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `subq_state.rs` (that registry's durable state: written at a graceful stop, restored at boot), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/api` | TypeScript tRPC compatibility adapter (`router.ts` + historical `core.ts`); lifecycle/query calls forward to the Rust engine's native `/v1` API. |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
 | `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
@@ -592,8 +592,10 @@ canvas update, screenshot.
   from its restored position through the current one is missing; a live read that later finds its
   segment gone requests a restart (exit 75), and that boot re-checks the chain.
 - **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
-  purge, eviction, drop-at-restore, schema drift, the degraded subquery reap. The close releases a tailing
-  long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
+  purge, eviction, a shape the restore cannot keep (its table moved, its stream is gone, or it is a
+  subquery shape with no registry state to restore from: see the restart invariant below), schema
+  drift, the degraded subquery reap. The close releases a tailing long-poll at once with
+  `stream-closed`. Closing is terminal, so the non-retirement paths never
   close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
   had no subscriber (plain `delete_stream`).
 - **The catalog writer never drops a lifecycle event, and the records a client is *promised* are durable
@@ -693,6 +695,15 @@ canvas update, screenshot.
   through it; if you add a release path, name the claim. A provisional claim taken before an await
   needs a guard (`JoinGuard`/`CreateGuard`): a client that disconnects mid-wait must not leave one
   behind, and the compensation is safe precisely because it names its own id.
+- **A claim has an identity, and a release names the one it was issued for** (ADR-0008, "A claim
+  has an identity"). Two sessions can use one subscription id, and a group's launches always do, so
+  the id does not say whose claim a late or retried release means. Every native grant answers
+  `claim`; a grant keeps the identity only for a request that names it (`?claim=…`) and mints a new
+  one otherwise, in the same critical section as the `subscribe` (`EngineState::grant_claim`); a
+  release that names an identity drops the claim only while it has it, and one that names none
+  drops whatever is held, as before. If you add a grant path, settle the identity where you take
+  the claim and return it; if you add a release or a compensation for a claim you took, pass the
+  identity (`release_claim_durable`, `release_group_lease_for`, `give_back_claim`).
 - **Every catalog event carries an `eid`, and the fold applies each one at most once** (ADR-0008).
   The id is assigned at ENQUEUE (`CatalogWriter::send*`), so every append attempt of one event —
   the first and every retry after a lost response — carries the same one; the boot fold keeps the
@@ -717,13 +728,38 @@ canvas update, screenshot.
   LOCALLY — the wire ack rides the replication client's status interval (1 s) and is not forced on
   the way out, so the last second's commits are re-delivered and de-duplicated by the sequencer
   highwater; mid-transaction it just stops, having appended nothing. **Shutdown never advances the
-  slot.** The sequencer then completes its batch and flushes. It emits a final `Offset` checkpoint
-  only if it completed a read and replay is not paused; the catalog writer applies the Postgres-mode
-  floor check above and drains accepted writes; exit 0. **Shape streams are left untouched**
+  slot.** The sequencer then completes its batch and flushes; deferred subquery work (flip
+  query-backs, lane appends) keeps running for `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS`
+  instead of being cancelled at the signal. It emits a final `Offset` checkpoint only if it
+  completed a read and replay is not paused (or, to name the subquery registry state, at the cursor
+  the restore gave it), never past a commit that still owes subquery effects; the catalog writer
+  applies the Postgres-mode floor check above and drains accepted writes; exit 0. **Shape streams
+  are left untouched**
   — closing a stream means "this shape is gone, re-subscribe", and a restart is not that. Every
   select that could block past the grace must join the shutdown token (the sequencer's change-log
   long-poll, the ingestor's `recv` and its backoff, `poll_live_until`); if you add a long-poll, join
   it, and if you add a task that must reach a safe point, register a `party`.
+- **Subquery shapes survive a graceful restart; a crash still drops them** (`src/subq_state.rs`;
+  `ARCHITECTURE.md` §6, *Surviving a restart*). A subquery shape's membership lives in memory (each
+  inner-set node's contributors, each shape's key set), and a node re-seeded from Postgres cannot
+  tell what entered or left while the engine was down. So a graceful stop that comes to rest writes
+  the registry (and each group lane's position) to `meta/subq-state/<nonce>` and names it from its
+  final `Offset`; the boot restores it and replays the change log from that checkpoint through the
+  ordinary live path, and the same streams continue: subquery shapes, changes-only subquery feeds
+  and groups with subquery members alike, with no client reload. The rules that keep this honest:
+  the pointer is durable BEFORE the state stream is written (durable-streams has no list API); the
+  state is written only when nothing is owed (no pending flip, lane append, query-back or
+  half-installed create, engine not degraded); it is trusted only when the catalog's LAST `Offset`
+  names it and every record, count, size, checksum, format version and position verifies; a node is
+  restored only if its inner table's schema fingerprint still matches; and it is used ONCE (the
+  checkpoint is rewritten naming no state, and the stream deleted, before the sequencer is
+  released). A storage failure while reading it is a restore error, so the boot retries rather than
+  drop shapes over an outage. With no usable state (`kill -9`, OOM, a forced exit `70`, a stop whose
+  effects were still in flight when the drain window closed, a degraded engine, a state that does
+  not verify) the restore drops those shapes as it always did, loudly: `Dropped`, close-then-delete,
+  `subquery_shapes_dropped_at_restore_total`. Because a restart can now resume past a checkpoint,
+  the sequencer holds each checkpoint until every commit at or before it has landed its subquery
+  effects (`SettledFrontier`); never write an `Offset` past a commit that still owes one.
 - **Shapes vs subset queries stay distinct.** Ranges/`orderBy`/`limit` live ONLY in subset queries
   (never live-tailed); a `changes_only` feed uses a passthrough gate and the client reads from the
   offset captured *before* the page snapshot.

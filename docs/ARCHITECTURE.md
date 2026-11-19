@@ -533,8 +533,9 @@ Any two **equal** shapes share one maintained stream, held by a set of named sub
   backfill to land** (a watch channel in the share entry) so no caller ever sees a stream whose
   snapshot isn't readable yet — and a *failed* creation propagates to every waiting joiner rather
   than handing them a dead stream. A join abandoned mid-wait (the client disconnected while storage
-  was slow) compensates with a `Left` for its own subscription — idempotent, so it cannot take
-  anyone else's claim.
+  was slow) compensates with a `Left` for its own subscription — idempotent, and it names the claim
+  the join took by its identity (below), so it cannot take anyone else's claim, nor one a later
+  request took under the same subscription.
 - **Subscriptions, not a refcount** (ADR-0008). The "refcount" is the SIZE of a per-shape set of
   caller-named subscription ids. Repeating a create with an id the shape already holds is a
   **renewal**: same handle, nothing counted, lease moved; an id held by a *different* shape is
@@ -543,6 +544,26 @@ Any two **equal** shapes share one maintained stream, held by a set of named sub
   subscription is also a **lease**: native reads bypass the engine entirely, so a claim counts as
   live only while renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, and the retention sweeper
   releases an unrenewed one exactly as an explicit delete would.
+- **A claim has an identity** (ADR-0008, "A claim has an identity"). A subscription id is the
+  caller's, so two sessions can share one, and a group's launches always do: the next launch
+  re-joins the group under the subscription the last one loaded with. The id therefore does not
+  say whose claim a late or retried release means. Each claim has an identity the engine mints
+  (`EngineState::claim_ids`, keyed by subscription and removed with the claim), and three rules:
+  - every create, load and re-join **answers** it (`claim`);
+  - a grant **keeps** it only for a request that names it (`?claim=…`): that is a renewal by the
+    claim's holder. Any other grant gives the claim a new identity, whether the claim is new or a
+    later session is taking over one that is still held (`EngineState::grant_claim`, under the
+    same hold of the state lock as the `subscribe` that takes or renews the claim);
+  - a release that names an identity (`DELETE …?subscription=…&claim=…`) drops the claim only
+    while it has that identity, and is otherwise a `200` that changes and records nothing. A
+    release that names none drops whatever claim is held, as it always did.
+
+  So a release reaches only the claim it was issued for: an earlier session's cannot leave a later
+  session's group unheld, where a create at the shape cap could evict it under its reader. The
+  identity is recorded by the `Created` or `Joined` that gave it and restored by the fold; a
+  renewal that kept it records none. A new claim's record is durable before the answer. An
+  identity replaced on a claim that was already held rides the renewal's queued record, so a
+  restart that loses it restores the earlier identity until the holder's next renewal replaces it.
 - **A join verifies the retained stream still exists** — one `HEAD` per join. The record is engine
   state; the stream is storage's, and storage can lose it (an operator `DELETE`, a restore from an
   older backup). Gone (404/410) or closed means the registry entry is stale: it is retired properly
@@ -556,7 +577,8 @@ Any two **equal** shapes share one maintained stream, held by a set of named sub
   retention lifecycle (idle → dormant → evicted, §"Shape retention" in the engine README) — the last
   release is not a teardown. N subscribers hold the same id, each releasing its own; the client
   still enforces one-shot `close()`, but a double or retried close is now harmless on the wire
-  because it names a claim that is already gone.
+  because it names a claim that is already gone. Where a later session has taken the claim again
+  under the same subscription id, it is harmless only for a release that names its claim's identity.
 - **Both public surfaces share.** The Electric `/v1/shape` adapter passes `share=true` as well and
   keys its per-request live state by the SHARED shape id (`electric.rs`), so identical Electric
   definitions collapse onto one maintained stream like everything else; `share=false` remains for a
@@ -723,9 +745,9 @@ sequencer feeds every table's deltas into:
   turns `degraded` (503), every membership-bearing route answers 503, and every subquery shape's
   durable stream is retired — closed, then deleted (§5.6) — so clients reading storage directly
   learn it too: a tailing read is released with `stream-closed` and must re-subscribe. Recovery is a
-  **restart**, which re-seeds every node from Postgres; it *drops* every subquery shape (their
-  inner-node state is not persisted — see the restart row of the durability table) and clients
-  recreate them with `POST /shapes`.
+  **restart**: a degraded engine never writes its registry on the way out (see *Surviving a
+  restart* below), so the restart *drops* every subquery shape and clients recreate them with
+  `POST /shapes`, each one seeding its nodes from Postgres.
 - **Absolute emission via the per-feed key set** — the correctness rule that keeps deferred
   flips convergent: for each touched pk the registry asserts the row's *current* membership into
   the shape's **feed set** (`subq_feed::FeedSet`, one host-side Roaring bitmap per feed), never a
@@ -808,6 +830,85 @@ sequencer feeds every table's deltas into:
   detached rollback unwinds exactly, retracting the partial seed with it.
 
 ---
+
+### Surviving a restart
+
+A subquery shape's membership is decided by state that lives only in memory: each node's
+contributors (which inner rows produce which value) and each shape's key set (what its stream has
+delivered). A node re-seeded from Postgres at boot holds the set as it is NOW, so it cannot tell
+which values entered or left while the engine was down — and a flip it cannot see is a move-in or a
+move-out that is never emitted. Re-seeding and treating every value as a *possible* flip does not
+fix it either: a row moved to another scope, whose old scope then lost access, is reached by no
+query-back (it no longer names the old value) and is judged "never a member" by its own change (the
+re-seeded set already lacks the old value), so it stays on the stream for good. Only the engine's
+own record of what each stream holds can remove it. So for a long time the catalog restore dropped
+every subquery shape, and each deploy made every client reload every subquery scope at once.
+
+The registry is instead **written at a graceful stop and restored at boot** (`subq_state.rs`), and
+the change log is then replayed from the checkpoint through the ordinary live path:
+
+- **What is written.** Per node: its signature, inner table (with that table's schema fingerprint),
+  seed gate, and contributors as `(pk, value)`. Per shape: its gate, stream position (§7) and key
+  set. Per group lane: its stream position. Primary keys are strings — the `u32` ids of the
+  membership circuit and the key sets are process-local. Nothing else is needed: edges, templates,
+  refcounts and the conjunct index are rebuilt by compiling each shape's predicate again, and the
+  per-commit and per-query-back state (`CommitScope`, `recent`) is empty at a checkpoint with
+  nothing in flight.
+- **Where.** A stream of its own, `meta/subq-state/<nonce>`: a header, the state in chunks of about
+  64 KiB (appended about 512 KiB at a time), a trailer. The final `Offset` checkpoint names it:
+  stream, format version, record count, byte size, SHA-256 over every record.
+- **Pointer first.** The `Offset` naming the stream is made durable BEFORE the stream is written.
+  Durable-streams has no list API, so a stream no catalog record names could never be found again;
+  a pointer to a stream that is missing or incomplete is harmless, because its checksum cannot match.
+- **When it may be written.** Only when the registry is exactly the registry AT the checkpoint with
+  nothing owed: the sequencer has stopped at a transaction boundary without abandoning one, no flip
+  batch and no lane append is pending (`pendingFlips == 0`, re-read under the registry lock), no
+  create sits between installing its shape and handing over the work it computed, no query-back is
+  in flight, and the engine is not degraded. A stopping engine gives that
+  `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` (5 s) to become true: flip workers, emission lanes,
+  the settle poller and reliable appends keep running through that **drain window** instead of
+  being cancelled at the signal. If it does not become true, nothing is written.
+- **When it is trusted.** Only the catalog's LAST `Offset` counts, and only if the stream verifies:
+  every record present and in order, the pointer's count, size and checksum, this build's format,
+  and the header's position and highwater equal to the checkpoint the boot resumes from. A node is
+  restored only if its inner table's schema fingerprint still matches. Anything else, and the
+  shapes it concerns are dropped exactly as before — loudly, `Dropped` then close-then-delete. A
+  storage failure while reading the state is a restore error instead (the boot retries).
+- **Used once.** The restore rebuilds each shape through the installation path a create uses
+  (`SubqueryRegistry::restore_shape`: `begin_create`, then the saved contributors and key set where
+  a create reads Postgres), appends nothing, and — before the sequencer is released — durably
+  writes the checkpoint again naming no state, then deletes the stream. From the first change read
+  on, the streams have moved past the state, and replaying it a second time would lose the key-set
+  transitions of the first replay.
+- **Groups** with subquery members are restored whole, with their lane's position; a group missing
+  any member is dropped as one, as before.
+
+What still drops every subquery shape: a crash (`kill -9`, OOM, a forced exit `70`), a stop with
+effects still in flight when the drain window closes, a degraded engine, and a registry state that
+does not verify. Counters `subquery_shapes_restored_total` and
+`subquery_shapes_dropped_at_restore_total` say which happened at the last boot.
+
+**Checkpoints wait for deferred effects.** A restart from an `Offset` past a commit whose flips
+have not landed would never deliver them — the inner set has already moved. That was harmless only
+while the shapes were dropped. The sequencer therefore keeps each checkpoint it reaches until every
+commit at or before it has landed its subquery effects (no pending flip batch with an origin at or
+before its highwater), and writes the newest one that has (`sequencer.rs`, `SettledFrontier`); the
+final `Offset` of a stop follows the same rule. Under sustained flips the durable checkpoint trails
+the sequencer by the commits still in flight. A degraded engine, whose effects are lost for good
+and whose shapes will be dropped anyway, checkpoints as before rather than pin the log.
+
+*Not built: a periodic state for crash recovery.* It would need more than writing the same state on
+a timer. (1) A quiescent instant under load: the export must happen on the sequencer task at a
+transaction boundary with nothing pending, which under sustained flips means holding reads back
+until the workers drain. (2) An incremental form: the whole registry is megabytes, so a periodic
+write wants a base plus a log of contributor and key-set changes. (3) Above all, a way to make the
+replay after a crash idempotent for key sets. Between the state and the crash the engine appended
+envelopes the state knows nothing of; a replay evaluates against Postgres as it is NOW, so it can
+decline to re-send an upsert the first run sent (the row has since moved away) and then find the
+key set without that key when the row's own change asks for a delete. Closing that needs each
+key-set transition journaled before its envelope is appended, or a replay that deletes on proof for
+materialized shapes too. The graceful path avoids all three by writing once, at rest, and using the
+state once.
 
 ## 6b. The circuit tier: counts pipelines + the membership circuit
 
@@ -1237,6 +1338,7 @@ later appends or estimate heap usage. The catalog remains append-only and uncomp
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
 | subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads, and durably by the resume that follows a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
+| live-only shapes (subquery, aggregate, changes-only feed, group) | cannot park, so one with no subscription is retired from active after `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` without a touch (create, join, renewal or engine-visible read; a lapse is not one), never sooner than the lease. `ELECTRIC_CIRCUITS_MAX_SHAPES` counts every registered shape: at the cap a create evicts dormant shapes, then the longest-idle unsubscribed live-only shapes (a group as a unit), and is refused `503` + `Retry-After` when none is left. A group's lease is released by the group's id or a member's, or by a lapse; the group is then retained and re-joined by its subscription like a single feed, and retired as one unit. `POST /v1/subsets/rejoin` is that re-join, and the lease renewal, without the load's snapshot: it claims or renews the group a subscription holds for exactly the named members, reads nothing from Postgres, never creates or retires a group, and answers `412` when there is none. A release is not tied to a session (a group's sessions share its subscription), so one that arrives after a later session re-joined leaves the group unheld, and evictable at the cap, until that session's next renewal | the shapes evaluated on every change, and the Postgres query-backs their flips cause, are bounded by live subscribers and the cap between restarts; a subscribed shape is never evicted |
 | catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
 | subset page ↔ live tail | settled page snapshot (§4) + per-pk versions (page snapshot visibility, then delta commit LSN) + delete tombstones | no double-count, no lost commit, no resurrections/ghosts across the seam |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
@@ -1245,10 +1347,10 @@ later appends or estimate heap usage. The catalog remains append-only and uncomp
 | shape removal → stream removal | `Dropped` (intent) is written BEFORE the retirement, `Retired` (completion) only after storage accepts the delete; failures go to a background queue that retries to completion, and every boot re-queues each `Dropped` with no `Retired` — ADR-0007 | no shape stream outlives its shape, whatever storage was doing at the moment it was retired or which process was alive at the time; this is also the orphan-`shape/*` GC, bounded by the catalog rather than a storage listing |
 | change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no dormant-shape or external-consumer pinning it; a stale pin is evicted durably first, while a reactivating shape is never evicted mid-replay) — ADR-0006, ADR-0010 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
 | Engine stop in either hosting mode | `Engine::close` drains parties/catalog, joins membership and counts threads, closes its pool and task set, fails unfinished retirement completions, and clears its DS callback | source restart frees the previous Engine's volatile state; other Engines keep serving; each Engine has its own publication settings, settle record, DS read caps and Electric registry |
-| engine restart | durable shape catalog (`meta/catalog`: create/join/leave (each naming a subscription + its lease time)/drop/retire + change-log position checkpoints + segment rotations, every event carrying an `eid`) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes are dropped loudly (inner-node state is not persisted) and recreated by clients; a restorable shape whose stream is definitively missing or closed is dropped and retired at boot, while a transport error while checking it still aborts the restore (the boot backs off and retries) |
+| engine restart | durable shape catalog (`meta/catalog`: create/join/leave (each naming a subscription + its lease time)/drop/retire + change-log position checkpoints + segment rotations, every event carrying an `eid`) | plain/routed shapes + aggregates restore without client re-registration (plain resume via replay + passthrough gates; aggregates re-seed with a fresh gate); counts pipelines reseed from a fresh group-aggregated snapshot (§6b); subquery shapes (and groups with subquery members) are restored from the registry state the last graceful stop wrote and named from its final `Offset` — inner sets, key sets and stream positions as they stood at the checkpoint, then the same replay (§6, *Surviving a restart*) — and are dropped loudly and recreated by clients when there is no such state (a crash, a degraded engine, effects still in flight at the stop) or it does not verify; a restorable shape whose stream is definitively missing or closed is dropped and retired at boot, while a transport error while checking it still aborts the restore (the boot backs off and retries) |
 | compiled schema ↔ Postgres | fingerprint compare on every `Relation` + a 60 s catalog reconciler; drift/TRUNCATE/identity regression retires that table's dependents, and a per-table schema generation refuses any create that overlapped it (ADR-0005) | never serves rows over a schema Postgres no longer has; the catalog records `schemaChanged` as the audit trail for the drops |
 | shape record ↔ schema at restart | each `ShapeRecord` carries its table's fingerprint; the catalog restore compares it with boot introspection | a migration applied while the engine was down retires that table's shapes instead of resuming streams shaped by the old schema |
-| graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, and writes a final `Offset` only after a completed, unpaused read (in Postgres mode an `Offset` below the durable floor is not appended) → catalog drains → exit 0; bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
+| graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch and flushes; deferred subquery effects (flip query-backs, lane appends) get the subquery drain window to land; the sequencer writes a final `Offset` only after a completed, unpaused read (or, to name the subquery registry state, at the cursor the restore gave it), never past a commit that still owes subquery effects, and — when nothing is owed — naming the registry state it then writes (in Postgres mode an `Offset` below the durable floor is not appended) → catalog drains → exit 0; bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
 
 Public library constructors `Engine::new` and `Engine::new_with_config` are async and return
@@ -1322,7 +1424,12 @@ ingestor's only safe point is *between* messages, so a commit that is being appe
 completion; a transaction still buffering just stops, having appended nothing, and Postgres
 re-delivers it. Acknowledgement is local: standby feedback rides the replication client's 1 s status
 interval and is not forced on the way out, so a shutdown never advances the slot and the last
-second's commits come back on the next boot, where the highwater drops them.
+second's commits come back on the next boot, where the highwater drops them. Deferred subquery work
+is the one thing the flip does NOT stop: flip workers, emission lanes, the settle poller and
+reliable appends run on through the token's **drain window**
+(`ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS`, ended early once the parties have finished), so
+the commits already read land their effects and the sequencer can write the subquery registry for
+the next boot (§6, *Surviving a restart*).
 
 The grace is a bound on the **process**, not on one await point: a watchdog is armed the instant the
 token flips, and forces the exit (naming whoever was outstanding) wherever the process happens to
@@ -1425,7 +1532,8 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | path | role |
 |------|------|
 | `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `drift.rs` (schema drift / TRUNCATE retirement + the reconciler), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
-| `apps/engine/src/subquery.rs` | subquery registry: shared nodes + templates, edges, absolute emission, atomic create/rollback |
+| `apps/engine/src/subquery.rs` | subquery registry: shared nodes + templates, edges, absolute emission, atomic create/rollback, `export_state` / `restore_shape` |
+| `apps/engine/src/subq_state.rs` | the registry's durable state: what a graceful stop writes to `meta/subq-state/*` and a boot verifies and restores (§6, *Surviving a restart*) |
 | `apps/engine/src/subq_circuit.rs` | the membership circuit: inner-set state + flip detection (dbsp distinct) |
 | `apps/engine/src/arrangements.rs` | the circuit: in-memory dbsp counts pipelines, group-aggregated boot seeding (§6b) |
 | `apps/engine/src/replication.rs` | ingestor: streaming pgoutput (decoder: `pgoutput.rs`), per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge, schema-drift/TRUNCATE reporting (`SchemaEvents`) |
@@ -1436,7 +1544,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_checked`, `append_reliable`, `head`, `close_stream`, `retire_stream`, `delete_stream`, reads |
 | `apps/engine/src/changelog.rs` | the segmented change log (ADR-0006): `LogPosition`, the control envelope, the rotation writer + boot walk-forward, the segment-deletion planner |
 | `apps/engine/src/http.rs` | control-plane HTTP |
-| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant eviction and active non-parkable retirement |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant eviction, retirement of unsubscribed live-only shapes (idle period and shape cap) and the cap's refusal of new shapes |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |

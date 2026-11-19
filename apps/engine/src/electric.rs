@@ -602,6 +602,8 @@ impl From<anyhow::Error> for ApiError {
             // A deferred reactivation is retryable on this surface too: the shape still exists, so
             // `must-refetch` would throw away a stream that is about to come back.
             || e.downcast_ref::<crate::engine::ReactivationDeferred>().is_some()
+            // A new shape refused at `ELECTRIC_CIRCUITS_MAX_SHAPES`: come back once something is released.
+            || e.downcast_ref::<crate::engine::ShapeCapReached>().is_some()
         {
             return ApiError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
@@ -2246,6 +2248,17 @@ mod tests {
     #[test]
     fn an_interrupted_fold_is_an_electric_retryable_response() {
         let error: ApiError = anyhow::Error::new(FoldInterrupted).into();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.retry_after, Some(1));
+        assert!(!error.must_refetch);
+    }
+
+    /// A snapshot that would mint a shape past `ELECTRIC_CIRCUITS_MAX_SHAPES` is told to come back,
+    /// as on the native surface: nothing about the request or the handle is wrong.
+    #[test]
+    fn a_shape_refused_at_the_cap_is_an_electric_retryable_response() {
+        let error: ApiError =
+            anyhow::Error::new(crate::engine::ShapeCapReached { shapes: 2, wanted: 1, max_shapes: 2 }).into();
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error.retry_after, Some(1));
         assert!(!error.must_refetch);

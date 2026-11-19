@@ -1,8 +1,9 @@
 // Engine-restart persistence: shapes survive an engine crash without any client re-registration.
 // The engine replays its durable shape catalog (`meta/catalog`) at boot, re-registers plain/routed
 // shapes with passthrough gates, resumes the change log from the persisted offset, and the SAME
-// shape streams keep receiving changes. Subquery shapes are deliberately NOT restored (their
-// inner-node state is not persisted) — their streams are deleted loudly so clients recreate.
+// shape streams keep receiving changes. Subquery shapes survive a GRACEFUL restart only (the engine
+// writes its subquery registry on the way out — `conformance-subquery-restart.test.ts`); after a
+// crash, as here, their streams are deleted loudly so clients recreate.
 
 import type { Schema } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
