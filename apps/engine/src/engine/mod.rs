@@ -26,6 +26,8 @@ use crate::value::{Row, Value};
 use std::time::Duration;
 
 #[cfg(test)]
+mod boot_identity_tests;
+#[cfg(test)]
 mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
