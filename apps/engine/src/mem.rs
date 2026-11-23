@@ -657,7 +657,46 @@ pub(crate) fn init_otel(
     engine_counter!("engine_family_steps", "Family circuit transactions", family_steps, "");
     engine_counter!("engine_shapes_dormanted", "Retention: active -> dormant transitions", shapes_dormanted, "");
     engine_counter!("engine_shapes_reactivated", "Retention: dormant -> active transitions", shapes_reactivated, "");
-    engine_counter!("engine_shapes_evicted", "Retention: dormant shapes evicted (stream deleted)", shapes_evicted, "");
+    engine_counter!("engine_shapes_evicted", "Retention: shapes evicted (stream deleted)", shapes_evicted, "");
+    {
+        let metrics = metrics.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_counter("engine_shapes_evicted_by_reason")
+            .with_description("Retention: shapes evicted (stream deleted), by reason")
+            .with_callback(move |obs| {
+                for reason in crate::retention::EvictReason::ALL {
+                    let mut labels = attributes.clone();
+                    labels.push(opentelemetry::KeyValue::new("reason", reason.as_str()));
+                    obs.observe(metrics.shapes_evicted_by_reason[reason.index()].load(Ordering::Relaxed), &labels);
+                }
+            })
+            .build();
+    }
+    engine_counter!(
+        "engine_shape_creates_refused",
+        "Creates refused at ELECTRIC_CIRCUITS_MAX_SHAPES with nothing left to evict",
+        shape_creates_refused,
+        ""
+    );
+    {
+        let metrics = metrics.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_gauge("engine_shapes_live")
+            .with_description("Live (not dormant) shapes by kind and by whether a subscription holds them")
+            .with_callback(move |obs| {
+                for kind in crate::retention::ShapeKind::ALL {
+                    for (subscribed, label) in ["false", "true"].into_iter().enumerate() {
+                        let mut labels = attributes.clone();
+                        labels.push(opentelemetry::KeyValue::new("kind", kind.as_str()));
+                        labels.push(opentelemetry::KeyValue::new("subscribed", label));
+                        obs.observe(metrics.shapes_live[kind.index()][subscribed].load(Ordering::Relaxed), &labels);
+                    }
+                }
+            })
+            .build();
+    }
     engine_counter!("engine_reactivations_started", "Dormant-shape reactivations begun", reactivations_started, "");
     engine_counter!(
         "engine_reactivations_coalesced",
