@@ -608,6 +608,9 @@ pub struct Engine {
     /// Independent of read health: false refuses new control-plane mutations while restored stream
     /// reads continue. The deployment controller closes this before writing a source fence.
     control_admission: Arc<ControlAdmission>,
+    /// Serializes shape-cap admission from the final lookup through slot reservation. Retention
+    /// sweeps may run concurrently, but two creates cannot plan the same victim or mint past the cap.
+    pub(crate) cap_admission: Arc<tokio::sync::Mutex<()>>,
     /// Source-fence receipts that have landed in the durable catalog, restored at boot. The map is
     /// the only authority behind the private drained-through endpoint; task exit and slot state do
     /// not populate it.
@@ -1903,6 +1906,7 @@ impl Engine {
             managed_deployment: Arc::new(std::sync::Mutex::new(None)),
             managed_wakeup: Arc::new(tokio::sync::Notify::new()),
             control_admission: ControlAdmission::new(),
+            cap_admission: Arc::new(tokio::sync::Mutex::new(())),
             source_receipts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             last_source_receipt: Arc::new(std::sync::Mutex::new(None)),
             source_receipt_progress: Arc::new(std::sync::Mutex::new(SourceReceiptProgress::default())),
@@ -3249,7 +3253,21 @@ impl Engine {
         member_subscriptions: &[String],
         reservation_id: &str,
     ) -> Result<()> {
+        let cap_admission = self.cap_admission.clone().lock_owned().await;
         let mut st = self.state.lock().await;
+        Self::validate_group_reservation(&st, subscription, member_subscriptions)?;
+        drop(st);
+        self.make_room_under_cap_locked(member_subscriptions.len() + 1).await;
+        st = self.state.lock().await;
+        Self::validate_group_reservation(&st, subscription, member_subscriptions)?;
+        self.ensure_room_under_cap(&st, member_subscriptions.len() + 1)?;
+        st.group_claims.reserve(subscription, reservation_id)?;
+        st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
+        drop(cap_admission);
+        Ok(())
+    }
+
+    fn validate_group_reservation(st: &EngineState, subscription: &str, member_subscriptions: &[String]) -> Result<()> {
         // Checked first: while assembling, member 0 already owns the subscription, and a retry
         // must hear "retry" rather than a conflict with its own in-flight load.
         if st.group_claims.is_reserved(subscription) && st.group_claims.get(subscription).is_none() {
@@ -3289,18 +3307,6 @@ impl Engine {
                 }));
             }
         }
-        if self.retention.max_shapes > 0
-            && st.shapes.len().saturating_add(member_subscriptions.len() + 1) > self.retention.max_shapes
-        {
-            self.metrics.shape_creates_refused.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow::Error::new(ShapeCapReached {
-                shapes: st.shapes.len(),
-                wanted: member_subscriptions.len() + 1,
-                max_shapes: self.retention.max_shapes,
-            }));
-        }
-        st.group_claims.reserve(subscription, reservation_id)?;
-        st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
         Ok(())
     }
 

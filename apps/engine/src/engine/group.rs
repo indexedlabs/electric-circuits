@@ -174,6 +174,24 @@ impl GroupClaims {
             self.private_members.insert(member, group.to_string());
         }
     }
+
+    /// Return the group identity owning a shape, including a reservation whose private member
+    /// claims have been installed before its shapes are complete. Group records remain present
+    /// while release retires members, so the retention snapshot protects that window too.
+    pub(crate) fn group_for_shape(&self, shape_id: &str, subscriptions: &[String]) -> Option<String> {
+        if let Some(group) =
+            self.records.values().find(|group| group.members.iter().any(|member| member.shape_id == shape_id))
+        {
+            return Some(group.id.clone());
+        }
+        subscriptions.iter().find_map(|subscription| {
+            if let Some(owner) = self.reservation_id(subscription) {
+                return Some(owner.clone());
+            }
+            let owner = self.private_members.get(subscription)?;
+            self.is_reserved(owner).then(|| owner.clone())
+        })
+    }
 }
 
 /// Completion shared by callers that race a group release. The release task is engine-owned, so

@@ -135,7 +135,8 @@ production HTTP does not use that bypass. PostgreSQL TLS requirements are indepe
 - `DS_MEMORY=1` (on the `ds` service) — in-memory streams: no fsync-per-append ceiling, no persistence.
 - Engine tuning: `ELECTRIC_CIRCUITS_PG_SLOT`, `ELECTRIC_CIRCUITS_PG_POLL_MS`, `ELECTRIC_CIRCUITS_LOG`,
   `ELECTRIC_HANDLE_TTL` (idle `/v1/shape` handle-state eviction; the shape is retained), and the
-  shape-retention knobs `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS`,
+  shape-retention knobs `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`,
+  `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS`, `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS`,
   `ELECTRIC_CIRCUITS_MAX_SHAPES`, `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` (see `apps/engine/README.md`).
 
 Related: `packages/loadgen/docker/` scales headless load-generator *clients* against a host-run stack.

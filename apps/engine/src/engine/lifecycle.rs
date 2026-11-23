@@ -319,7 +319,7 @@ impl Engine {
             None => bail!("unknown table '{table}'"),
         };
         let col_names = columns.clone();
-        let out_cols = resolve_columns(&ts, columns)?;
+        let out_cols = resolve_columns(&ts, columns.clone())?;
         // **`ts` and `gens` come from ONE critical section.** Everything this create derives from the
         // schema — the compiled predicate's column indices, the family key, the record's fingerprint,
         // the backfill's row expression — is built from the `ts` cloned just above, so the generations
@@ -453,13 +453,77 @@ impl Engine {
         ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
         ensure_subscription_free(&st, sub, "")?;
 
-        // A new shape needs room under the global cap. Existing joins above mint nothing and are
-        // deliberately unaffected. Make room outside the state lock, then check again under the
-        // lock that will install this record so concurrent creates cannot acknowledge past the cap.
+        // Validate all request-derived state before cap admission can evict anything. The same
+        // compiled predicate and table set are reused below after the admission lock is acquired.
+        let subquery_tables = where_.as_ref().filter(|where_| predicate_has_subquery(where_)).map(|where_| {
+            let mut tables = referenced_tables(where_);
+            tables.push(table.clone());
+            tables
+        });
+        if let Some(tables) = &subquery_tables {
+            for t in tables {
+                if !st.tables.contains_key(t) {
+                    bail!("unknown table '{t}' referenced by subquery");
+                }
+            }
+            self.ensure_schema_resolved(&st, tables)?;
+        } else {
+            self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+        }
+        let pred = if subquery_tables.is_none() {
+            Some(Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?))
+        } else {
+            None
+        };
+        let family_key = pred.as_ref().and_then(|pred| {
+            pred.equality_template()
+                .map(|pairs| pairs.iter().map(|(i, _)| ts.columns[*i].0.clone()).collect::<Vec<_>>())
+        });
+
+        // Serialize the final lookup, eviction plan and registration. A create that waited for
+        // another admission must join a shape that appeared in the meantime, preserving one id and
+        // stream for equal signatures.
+        drop(st);
+        let cap_admission = self.cap_admission.clone().lock_owned().await;
+        st = self.state.lock().await;
+        if let Some(sig) = &feed_sig {
+            if st.feed_by_sig.get(sig).and_then(|id| st.shapes.get(id)).is_some() {
+                drop(st);
+                drop(cap_admission);
+                return Box::pin(self.create_shape_once(
+                    table,
+                    where_.clone(),
+                    columns.clone(),
+                    changes_only,
+                    share,
+                    sub,
+                    stream_path_override.clone(),
+                ))
+                .await;
+            }
+        }
+        ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
+        ensure_subscription_free(&st, sub, "")?;
         if self.shape_cap_reached(&st, 1) {
             drop(st);
-            self.make_room_under_cap(1).await;
+            self.make_room_under_cap_locked(1).await;
             st = self.state.lock().await;
+            if let Some(sig) = &feed_sig {
+                if st.feed_by_sig.get(sig).and_then(|id| st.shapes.get(id)).is_some() {
+                    drop(st);
+                    drop(cap_admission);
+                    return Box::pin(self.create_shape_once(
+                        table,
+                        where_.clone(),
+                        columns.clone(),
+                        changes_only,
+                        share,
+                        sub,
+                        stream_path_override.clone(),
+                    ))
+                    .await;
+                }
+            }
             ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
             ensure_subscription_free(&st, sub, "")?;
         }
@@ -476,16 +540,8 @@ impl Engine {
         // Subquery shapes (`col IN (SELECT …)`) are maintained by the cross-table registry, not by a
         // tailer's local routing. Ensure a tailer exists for the outer table AND every referenced inner
         // table (so their deltas reach the registry), then register + backfill via the registry.
-        if where_.as_ref().is_some_and(predicate_has_subquery) {
+        if subquery_tables.is_some() {
             let where_json = where_.expect("subquery predicate present");
-            let mut tables = referenced_tables(&where_json);
-            tables.push(table.clone());
-            for t in &tables {
-                if !st.tables.contains_key(t) {
-                    bail!("unknown table '{t}' referenced by subquery");
-                }
-            }
-            self.ensure_schema_resolved(&st, &tables)?;
             // `gens` (outer + every inner table) was captured with `ts`, before the lock was released
             // for the join path's `HEAD` — see the capture site for why the two must be one snapshot.
             // The sequencer feeds every table's deltas to the registry; just make sure it runs.
@@ -539,6 +595,7 @@ impl Engine {
             // seeds, gated replay of buffered deltas, register the shape). Replay flips
             // propagate through the worker pool.
             drop(st);
+            drop(cap_admission);
             let mut creating = CreateGuard::new(self, &id, table, &stream_path, Registration::Registry);
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
@@ -621,15 +678,9 @@ impl Engine {
             }
         }
 
-        self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
         // `gens` was captured with `ts`, before the lock was released for the join path's `HEAD` —
-        // the predicate compiled on the next line uses that `ts`'s column indices.
-        let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
-        // Family placement (for graph introspection): an equality template routes by these key columns
-        // via a shared family; otherwise it's a standalone filter.
-        let family_key = pred
-            .equality_template()
-            .map(|pairs| pairs.iter().map(|(i, _)| ts.columns[*i].0.clone()).collect::<Vec<_>>());
+        // the predicate compiled above uses that `ts`'s column indices.
+        let pred = pred.expect("plain shape predicate compiled before admission");
 
         let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -685,6 +736,7 @@ impl Engine {
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
         // The sequencer keeps processing all tables meanwhile, buffering this shape's deltas.
         drop(st);
+        drop(cap_admission);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
             Err(e) => Err(e.context("creating shape stream")),
@@ -833,6 +885,7 @@ impl Engine {
         if matches!(func, AggFn::Sum | AggFn::Avg | AggFn::Min | AggFn::Max) && col_idx.is_none() {
             bail!("aggregation {func:?} requires a column");
         }
+        let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
 
         // Aggregate sharing: an identical aggregation (same table, predicate, function, column) is joined
         // by ref-count — one maintained fold feeds every subscriber (e.g. the same live COUNT opened by
@@ -889,16 +942,29 @@ impl Engine {
         ensure_group_subscription_available(&st, sub, false)?;
         ensure_subscription_free(&st, sub, "")?;
 
+        drop(st);
+        let cap_admission = self.cap_admission.clone().lock_owned().await;
+        st = self.state.lock().await;
+        if st.feed_by_sig.get(&agg_sig).and_then(|id| st.shapes.get(id)).is_some() {
+            drop(st);
+            drop(cap_admission);
+            return Box::pin(self.create_aggregate_once(table, where_.clone(), func, col.clone(), sub)).await;
+        }
+        ensure_group_subscription_available(&st, sub, false)?;
+        ensure_subscription_free(&st, sub, "")?;
         if self.shape_cap_reached(&st, 1) {
             drop(st);
-            self.make_room_under_cap(1).await;
+            self.make_room_under_cap_locked(1).await;
             st = self.state.lock().await;
+            if st.feed_by_sig.get(&agg_sig).and_then(|id| st.shapes.get(id)).is_some() {
+                drop(st);
+                drop(cap_admission);
+                return Box::pin(self.create_aggregate_once(table, where_.clone(), func, col.clone(), sub)).await;
+            }
             ensure_group_subscription_available(&st, sub, false)?;
             ensure_subscription_free(&st, sub, "")?;
         }
         self.ensure_room_under_cap(&st, 1)?;
-
-        let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -960,6 +1026,7 @@ impl Engine {
                             .insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
                         st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
                         drop(st);
+                        drop(cap_admission);
                         let mut creating =
                             CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
                         return match ready_rx2
@@ -1070,6 +1137,7 @@ impl Engine {
         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
         st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
         drop(st);
+        drop(cap_admission);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
             &self.ds,
@@ -1965,13 +2033,13 @@ impl Engine {
         }))
     }
 
-    /// Evict dormant shapes first, then unsubscribed live-only shapes, until `wanted` slots exist.
-    /// This is best effort; the caller rechecks the cap under the registration lock.
-    async fn make_room_under_cap(&self, wanted: usize) {
+    /// Make room while the caller owns the cap-admission mutex. Keeping planning and all
+    /// re-plans in that critical section means concurrent creates cannot select one victim.
+    pub(super) async fn make_room_under_cap_locked(&self, wanted: usize) {
         if self.retention.max_shapes == 0 {
             return;
         }
-        for _ in 0..3 {
+        loop {
             let snapshot = self.sweep_snapshot(false).await;
             match crate::retention::plan_cap_room(&self.retention, &snapshot, wanted) {
                 crate::retention::CapRoom::Fits | crate::retention::CapRoom::Full => return,
@@ -1989,10 +2057,6 @@ impl Engine {
                 return;
             }
         }
-    }
-
-    pub(crate) async fn make_room_for_group(&self, wanted: usize) {
-        self.make_room_under_cap(wanted).await;
     }
 
     /// Snapshot retention state for both the periodic sweep and cap admission.
@@ -2016,6 +2080,11 @@ impl Engine {
                         }
                     },
                 };
+                let subscriptions = st
+                    .feed_shares
+                    .get(&rec.id)
+                    .map(|share| share.subs.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
                 let refcount = st.feed_shares.get(&rec.id).map(FeedShare::refcount).unwrap_or(0);
                 if dormant_for.is_none() {
                     let kind =
@@ -2030,7 +2099,7 @@ impl Engine {
                     in_transition,
                     dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
                     lease_tracked: st.feed_shares.contains_key(&rec.id),
-                    group: None,
+                    group: st.group_claims.group_for_shape(&rec.id, &subscriptions),
                     stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
                     replay_span_bytes: None,
                     replay_span_deferred: false,
@@ -2125,6 +2194,14 @@ impl Engine {
         // No record: the shape is already gone, so whatever it held (a change-log segment pin
         // included) is released — that IS the outcome the caller asked for.
         let Some(rec) = st.shapes.get(id).cloned() else { return Ok(Evicted::Yes) };
+        let subscriptions =
+            st.feed_shares.get(id).map(|share| share.subs.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+        if st.group_claims.group_for_shape(id, &subscriptions).is_some() {
+            // Group members share one stream and are retired by the group coordinator as a unit.
+            // Re-check this under the state lock because a group can complete after the sweep
+            // snapshot was built.
+            return Ok(Evicted::Skipped);
+        }
         // `changes_only` feeds are intentionally never parked: recreating one from a snapshot
         // would lose the dormant-period change history promised by the client contract. They are
         // therefore treated like other live-only feeds and retired directly after the configured
@@ -2202,44 +2279,7 @@ impl Engine {
     pub async fn retention_sweep(&self) {
         let cfg = self.retention.clone();
         self.sweep_leases(&cfg).await;
-        let snapshot: Vec<SweepShape> = {
-            let st = self.state.lock().await;
-            let bytes = self.ds.appended_bytes_with_prefix("shape/");
-            let lives = self.lives.lock().unwrap();
-            st.shapes
-                .values()
-                .map(|rec| {
-                    let life = lives.get(&rec.id);
-                    let (idle, dormant_for, in_transition) = match life {
-                        None => (std::time::Duration::ZERO, None, true), // mid-create; leave alone
-                        Some(l) => match &l.state {
-                            LifeState::Active => (l.last_read.elapsed(), None, false),
-                            LifeState::Dormant { since, .. } => (l.last_read.elapsed(), Some(since.elapsed()), false),
-                            LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => {
-                                (l.last_read.elapsed(), None, true)
-                            }
-                        },
-                    };
-                    SweepShape {
-                        id: rec.id.clone(),
-                        refcount: st.feed_shares.get(&rec.id).map(FeedShare::refcount).unwrap_or(0),
-                        idle,
-                        dormant_for,
-                        in_transition,
-                        // `changes_only` feeds cannot be recreated from a snapshot without
-                        // losing the dormant-period change history promised by the client API;
-                        // keep them active until a correct replay/reconcile path exists.
-                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
-                        lease_tracked: st.feed_shares.contains_key(&rec.id),
-                        group: None,
-                        stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
-                        replay_span_bytes: None,
-                        replay_span_deferred: false,
-                        backfill_bytes: rec.backfill_bytes,
-                    }
-                })
-                .collect()
-        };
+        let snapshot = self.sweep_snapshot(true).await;
         let mut snapshot = snapshot;
         let mut result_cache = std::collections::HashMap::new();
         for s in &mut snapshot {
@@ -2261,8 +2301,8 @@ impl Engine {
         if plan.over_capacity {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
-                 every shape is actively subscribed or recently read; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
+                "retention: {} shapes exceed max_shapes={} but no eligible shape is left to evict — \
+                 every remaining shape is subscribed, active parkable, transitioning, unshared, or group-owned; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
                 snapshot.len(),
                 cfg.max_shapes
             );
@@ -2270,7 +2310,7 @@ impl Engine {
         if plan.over_budget {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                "retention: shape streams exceed the disk budget ({} bytes) but nothing dormant is left to evict — \
+                "retention: shape streams exceed the disk budget ({} bytes) but no eligible shape is left to evict — \
                  raise ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB or lower the idle timeout",
                 cfg.disk_budget_bytes
             );
