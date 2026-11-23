@@ -125,7 +125,6 @@ pub struct Metrics {
     pub shapes_evicted: AtomicU64, // retention: shapes evicted (stream deleted)
     pub shapes_evicted_by_reason: [AtomicU64; crate::retention::EvictReason::ALL.len()],
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing left to evict
-    pub shape_creates_refused: AtomicU64,
     pub shapes_live: [[AtomicU64; 2]; crate::retention::ShapeKind::ALL.len()],
     /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
     /// within the idle window. A climbing value with healthy clients means the renewal cadence is
@@ -267,7 +266,6 @@ impl Metrics {
             shapes_evicted: AtomicU64::new(0),
             shapes_evicted_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
             retention_pressure: AtomicU64::new(0),
-            shape_creates_refused: AtomicU64::new(0),
             shapes_live: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             subscriptions_lapsed: AtomicU64::new(0),
             subscriptions_live: AtomicU64::new(0),
@@ -354,7 +352,6 @@ impl Metrics {
                 ("electric_snapshot_reuses_total", &self.electric_snapshot_reuses),
                 ("stream_ttl_touches_total", &self.stream_ttl_touches),
                 ("stream_ttl_touch_failures_total", &self.stream_ttl_touch_failures),
-                ("shape_creates_refused_total", &self.shape_creates_refused),
             ] {
                 counters.insert(name.into(), counter.load(Ordering::Relaxed).into());
             }
@@ -471,7 +468,6 @@ impl Metrics {
             evicted.store(0, Ordering::Relaxed);
         }
         self.retention_pressure.store(0, Ordering::Relaxed);
-        self.shape_creates_refused.store(0, Ordering::Relaxed);
         self.subscriptions_lapsed.store(0, Ordering::Relaxed);
         self.schema_drift.store(0, Ordering::Relaxed);
         self.schema_unresolved.store(0, Ordering::Relaxed);

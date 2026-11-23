@@ -186,26 +186,6 @@ impl std::fmt::Display for Degraded {
 
 impl std::error::Error for Degraded {}
 
-/// A create would exceed `ELECTRIC_CIRCUITS_MAX_SHAPES` after all eligible eviction.
-#[derive(Debug)]
-pub struct ShapeCapReached {
-    pub shapes: usize,
-    pub wanted: usize,
-    pub max_shapes: usize,
-}
-
-impl std::fmt::Display for ShapeCapReached {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ELECTRIC_CIRCUITS_MAX_SHAPES={} reached ({} shapes, {} requested)",
-            self.max_shapes, self.shapes, self.wanted
-        )
-    }
-}
-
-impl std::error::Error for ShapeCapReached {}
-
 /// Live replay has stopped permanently for this engine instance. Refuse data until restart;
 /// unlike boot/ownership admission, retrying the same instance cannot restore progress.
 #[derive(Debug, thiserror::Error)]
@@ -3288,16 +3268,6 @@ impl Engine {
                     owner: format!("group {member}"),
                 }));
             }
-        }
-        if self.retention.max_shapes > 0
-            && st.shapes.len().saturating_add(member_subscriptions.len() + 1) > self.retention.max_shapes
-        {
-            self.metrics.shape_creates_refused.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow::Error::new(ShapeCapReached {
-                shapes: st.shapes.len(),
-                wanted: member_subscriptions.len() + 1,
-                max_shapes: self.retention.max_shapes,
-            }));
         }
         st.group_claims.reserve(subscription, reservation_id)?;
         st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());

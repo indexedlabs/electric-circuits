@@ -598,6 +598,8 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+
+Live-only shapes (subqueries, aggregates and changes-only feeds) cannot go dormant. An unsubscribed live-only shape is retired after `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` (default 24 hours, floored by the subscription lease); the shape stream is closed and deleted. The `ELECTRIC_CIRCUITS_MAX_SHAPES` cap evicts dormant shapes only and reports pressure when none remain.
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |

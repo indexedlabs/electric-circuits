@@ -70,7 +70,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Subscription lease window: a native claim not renewed within it is released. `0` disables lease expiry |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
 | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Retention: how long a **live-only** shape (subquery, aggregate, changes-only feed: the kinds that cannot go dormant) may go with no subscription and no touch before it is retired from active. A touch is a create, join, renewal or engine-visible read; a lease lapse is not. Never shorter than the subscription lease, and it only shortens the idle-plus-dormancy grace. `0` leaves only that grace |
-| `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: cap on **registered shapes of every kind and state**. At the cap a create that would mint a shape first evicts least-recently-read **dormant** shapes, then the longest-idle live-only shapes with **no subscription**. A subscribed shape is never evicted, and neither is a parkable shape that is still active. With nothing left to evict the create is refused with `503` and `Retry-After`; joining an existing shape is never refused. `0` = unlimited |
+| `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: cap on registered shapes. Over it, least-recently-read **dormant** shapes are evicted; active and live-only shapes remain protected. `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
 | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval (also drives change-log segment deletion) |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
@@ -976,13 +976,7 @@ idle-plus-dormancy grace when that grace is shorter. A lease lapse is not a touc
 runs from the last renewal. Active ordinary shapes are never evicted, and no subscribed shape is
 evicted.
 
-At `ELECTRIC_CIRCUITS_MAX_SHAPES`, a create that would mint a shape first evicts dormant shapes,
-then unsubscribed live-only shapes. If nothing eligible remains, the create answers `503` with
-`Retry-After`; joining an existing shape still succeeds. The sweep applies the same order when
-the count is over the cap and increments `retention_pressure` when no eligible shape remains.
-`GET /metrics` reports `shapes_evicted_<reason>_total`, `shape_creates_refused_total` and
-`shapes_live_<kind>_<subscribed|unsubscribed>`; Prometheus exposes the corresponding reason,
-refusal and live-shape labels.
+At `ELECTRIC_CIRCUITS_MAX_SHAPES`, the retention sweep evicts least-recently-read dormant shapes only. Active and live-only shapes remain protected, so the engine logs retention pressure when no dormant shape remains. `GET /metrics` reports `shapes_evicted_<reason>_total` and `shapes_live_<kind>_<subscribed|unsubscribed>`; Prometheus exposes the corresponding reason and live-shape labels.
 
 Lifecycle clocks are in memory today — restart recovery (persistent catalog, GH #8) will persist
 them. A restored dormant shape's dormancy age starts at process boot, so repeated restarts

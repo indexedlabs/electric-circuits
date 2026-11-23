@@ -1365,9 +1365,6 @@ async fn run_subset_load_group(
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
-    // A group mints one live-only member shape per requested member. Make room before the
-    // reservation, then reserve_group_with_id rechecks the exact count under the state lock.
-    engine.make_room_for_group(members.len()).await;
     engine
         .reserve_group_with_id(&group_sub, &member_subscriptions, &group_path)
         .await
@@ -2273,7 +2270,6 @@ impl From<anyhow::Error> for AppError {
         // engine is not. Matched by type, never by message text — lost membership effects
         // (`Degraded`) and a broken epoch (`EpochBroken`, ADR-0004) alike.
         let retry_after = e.downcast_ref::<crate::engine::CreateRaced>().is_some()
-            || e.downcast_ref::<crate::engine::ShapeCapReached>().is_some()
             // A snapshot that could not settle is waiting on Postgres (a synchronous standby), not
             // broken: the same request succeeds once the held commit is visible.
             || e.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some()
@@ -2632,15 +2628,6 @@ mod tests {
         assert!(!degraded.retry_after);
         assert!(preclose.retry_after);
         assert!(fresh.retry_after);
-    }
-
-    #[test]
-    fn a_create_refused_at_the_shape_cap_is_retryable() {
-        let refused: AppError =
-            anyhow::Error::new(crate::engine::ShapeCapReached { shapes: 20_000, wanted: 1, max_shapes: 20_000 }).into();
-        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(refused.retry_after);
-        assert!(refused.msg.contains("ELECTRIC_CIRCUITS_MAX_SHAPES"), "{}", refused.msg);
     }
 
     #[tokio::test]

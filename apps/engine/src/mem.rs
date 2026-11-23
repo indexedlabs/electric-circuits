@@ -673,12 +673,6 @@ pub(crate) fn init_otel(
             })
             .build();
     }
-    engine_counter!(
-        "engine_shape_creates_refused",
-        "Creates refused at ELECTRIC_CIRCUITS_MAX_SHAPES with nothing left to evict",
-        shape_creates_refused,
-        ""
-    );
     {
         let metrics = metrics.clone();
         let attributes = attributes.clone();

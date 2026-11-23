@@ -11,14 +11,10 @@
 //      `stream-closed`, and a later read finds the stream gone. After that a change to its table or
 //      to its subquery's table costs the engine nothing for it: it keeps no subquery node, and it
 //      sends Postgres no query (a lock on the feed's table would park one, as it does while live).
-//   2. `ELECTRIC_CIRCUITS_MAX_SHAPES` counts every registered shape. At the cap a create that would
-//      mint a shape first evicts what nobody holds; with nothing to evict it is refused with `503`
-//      and `Retry-After`, on every create route. Joining a shape that exists is never refused, and
-//      a subscribed shape is never evicted.
 // Second-scale knobs as in `conformance-retention.test.ts`. The production defaults are a 30 minute
 // lease, a 24 hour live-only period and a 60 second sweep.
 
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@electric-circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { lockTable, pgQuery, readEnvelopes, tableLockWaiters, waitFor } from './engine-native.js'
@@ -214,55 +210,33 @@ describe('an unsubscribed live-only feed is retired after the live-only idle per
   }, 90000)
 })
 
-describe('the shape cap evicts what nobody holds, then refuses new shapes', () => {
-  it('answers 503 with Retry-After on every create route at the cap, and succeeds after a release', async () => {
-    await boot({ ELECTRIC_CIRCUITS_MAX_SHAPES: '2', ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1' })
-    const a = await feed(inList(1), 'sub-a')
-    const b = await feed(inList(2), 'sub-b')
-    expect([a.status, b.status]).toEqual([200, 200])
-    const feedA = a.body as unknown as Feed
-    const feedB = b.body as unknown as Feed
+describe('live-shape gauges are refreshed by ordinary retention sweeps', () => {
+  it('reports subscribed and unsubscribed live-only feeds below the cap', async () => {
+    await boot({
+      ELECTRIC_CIRCUITS_MAX_SHAPES: '10',
+      ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
+      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '3',
+    })
+    const held = await feed(inList(1), 'gauge-held')
+    const released = await feed(inList(2), 'gauge-released')
+    expect([held.status, released.status]).toEqual([200, 200])
+    const releasedFeed = released.body as unknown as Feed
+    expect((await engine('DELETE', `/v1/shapes/${releasedFeed.shapeId}?subscription=gauge-released`)).status).toBe(200)
 
-    // Both shapes are subscribed: nothing may be evicted, so one more shape is refused, whichever
-    // route asks for it.
-    const refusals: Record<string, Answer> = {
-      'a changes-only feed': await feed(inList(3), 'sub-c'),
-      'a subquery feed': await feed(inMyLists, 'sub-c'),
-      'a row shape': await engine('POST', '/v1/shapes', { table: 'items', where: inList(3), subscription: 'sub-c' }),
-      'an aggregate': await engine('POST', '/v1/aggregates', { table: 'items', fn: 'count', subscription: 'sub-c' }),
-      'a group': await engine('POST', '/v1/subsets/load', { subscription: 'sub-c', members: [{ table: 'lists' }] }),
+    const gaugesAfterFirstSweep = async () => {
+      const { body } = await engine('GET', '/metrics')
+      const gauges = body.gauges as Record<string, number>
+      return gauges.shapes_live_changes_only_subscribed === 1 && gauges.shapes_live_changes_only_unsubscribed === 1
     }
-    for (const [what, refused] of Object.entries(refusals)) {
-      expect(refused.status, `${what}: ${JSON.stringify(refused.body)}`).toBe(503)
-      expect(refused.retryAfter, `${what} carries Retry-After`).toMatch(/^[1-9][0-9]*$/)
-      expect(String(refused.body.error), what).toContain('ELECTRIC_CIRCUITS_MAX_SHAPES')
-    }
-    expect(await counter('shape_creates_refused_total')).toBe(Object.keys(refusals).length)
-    expect(await counter('shapes_evicted_max_shapes_total'), 'a subscribed shape is never evicted').toBe(0)
-    expect([await shapeStatus(feedA.shapeId), await shapeStatus(feedB.shapeId)]).toEqual([200, 200])
-    expect(await cardinality('shapes'), 'a refused create leaves nothing behind').toBe(2)
-
-    // Joining a shape that exists mints nothing, so the cap does not apply to it.
-    const joined = await feed(inList(1), 'sub-a2')
-    expect(joined.status, JSON.stringify(joined.body)).toBe(200)
-    expect((joined.body as unknown as Feed).shapeId).toBe(feedA.shapeId)
-
-    // One release leaves an unsubscribed live-only shape. The next create evicts it and takes its
-    // place, without waiting for a sweep or for its idle period.
-    const release = await engine('DELETE', `/v1/shapes/${feedB.shapeId}?subscription=sub-b`)
-    expect(release.status).toBe(200)
-    const c = await feed(inList(3), 'sub-c')
-    expect(c.status, JSON.stringify(c.body)).toBe(200)
-    expect(await shapeStatus(feedB.shapeId), 'the released feed made the room').toBe(404)
-    expect(await shapeStatus(feedA.shapeId), 'the feed with two subscriptions is untouched').toBe(200)
-    await waitFor(() => streamIsGone(feedB.streamUrl), 'the evicted feed’s stream to be deleted')
-    expect(await counter('shapes_evicted_max_shapes_total')).toBe(1)
-    expect(await cardinality('shapes')).toBe(2)
-
-    // Full again, with both shapes held.
-    const d = await feed(inList(4), 'sub-d')
-    expect(d.status).toBe(503)
-    expect(d.retryAfter).not.toBeNull()
+    await waitFor(gaugesAfterFirstSweep, 'the ordinary sweep to refresh live-only gauges')
+    const releasedId = releasedFeed.shapeId
+    await waitFor(async () => (await shapeStatus(releasedId)) === 404, 'the sweep to evict the released live-only feed')
+    await waitFor(async () => {
+      const { body } = await engine('GET', '/metrics')
+      const gauges = body.gauges as Record<string, number>
+      return gauges.shapes_live_changes_only_subscribed === 1 && gauges.shapes_live_changes_only_unsubscribed === 0
+    }, 'the sweep to refresh gauges after eviction')
   }, 90000)
 })
 

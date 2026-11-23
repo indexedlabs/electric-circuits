@@ -453,18 +453,6 @@ impl Engine {
         ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
         ensure_subscription_free(&st, sub, "")?;
 
-        // A new shape needs room under the global cap. Existing joins above mint nothing and are
-        // deliberately unaffected. Make room outside the state lock, then check again under the
-        // lock that will install this record so concurrent creates cannot acknowledge past the cap.
-        if self.shape_cap_reached(&st, 1) {
-            drop(st);
-            self.make_room_under_cap(1).await;
-            st = self.state.lock().await;
-            ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
-            ensure_subscription_free(&st, sub, "")?;
-        }
-        self.ensure_room_under_cap(&st, 1)?;
-
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
@@ -888,15 +876,6 @@ impl Engine {
         }
         ensure_group_subscription_available(&st, sub, false)?;
         ensure_subscription_free(&st, sub, "")?;
-
-        if self.shape_cap_reached(&st, 1) {
-            drop(st);
-            self.make_room_under_cap(1).await;
-            st = self.state.lock().await;
-            ensure_group_subscription_available(&st, sub, false)?;
-            ensure_subscription_free(&st, sub, "")?;
-        }
-        self.ensure_room_under_cap(&st, 1)?;
 
         let pred = Arc::new(CompiledPredicate::compile_opt(where_.as_ref(), &ts)?);
 
@@ -1947,59 +1926,15 @@ impl Engine {
         }
     }
 
-    /// Whether minting `wanted` records would exceed the configured shape cap.
-    fn shape_cap_reached(&self, st: &EngineState, wanted: usize) -> bool {
-        self.retention.max_shapes > 0 && st.shapes.len().saturating_add(wanted) > self.retention.max_shapes
-    }
-
-    /// Refuse a create after room-making has had every eligible shape removed.
-    pub(super) fn ensure_room_under_cap(&self, st: &EngineState, wanted: usize) -> Result<()> {
-        if !self.shape_cap_reached(st, wanted) {
-            return Ok(());
-        }
-        self.metrics.shape_creates_refused.fetch_add(1, Ordering::Relaxed);
-        Err(anyhow::Error::new(crate::engine::ShapeCapReached {
-            shapes: st.shapes.len(),
-            wanted,
-            max_shapes: self.retention.max_shapes,
-        }))
-    }
-
-    /// Evict dormant shapes first, then unsubscribed live-only shapes, until `wanted` slots exist.
-    /// This is best effort; the caller rechecks the cap under the registration lock.
-    async fn make_room_under_cap(&self, wanted: usize) {
-        if self.retention.max_shapes == 0 {
-            return;
-        }
-        for _ in 0..3 {
-            let snapshot = self.sweep_snapshot(false).await;
-            match crate::retention::plan_cap_room(&self.retention, &snapshot, wanted) {
-                crate::retention::CapRoom::Fits | crate::retention::CapRoom::Full => return,
-                crate::retention::CapRoom::Evict(ids) => {
-                    for id in ids {
-                        let idle = snapshot.iter().find(|s| s.id == id).map(|s| s.idle);
-                        if let Err(error) = self.evict_shape_planned(&id, EvictReason::MaxShapes, idle).await {
-                            tracing::warn!(shape_id = %id, "cap eviction failed: {error:#}");
-                        }
-                    }
-                }
-            }
-            let st = self.state.lock().await;
-            if !self.shape_cap_reached(&st, wanted) {
-                return;
-            }
-        }
-    }
-
-    pub(crate) async fn make_room_for_group(&self, wanted: usize) {
-        self.make_room_under_cap(wanted).await;
-    }
-
-    /// Snapshot retention state for both the periodic sweep and cap admission.
+    /// Snapshot retention state for the periodic retention sweep and publish live-shape gauges.
     async fn sweep_snapshot(&self, with_bytes: bool) -> Vec<SweepShape> {
         let st = self.state.lock().await;
         let bytes = if with_bytes { self.ds.appended_bytes_with_prefix("shape/") } else { HashMap::new() };
         let lives = self.lives.lock().unwrap();
+        // Build group ownership once while the state lock is held. The retention planner then
+        // receives a marker on each member and can exclude shared streams without scanning the
+        // group records for every shape.
+        let group_by_shape = st.group_claims.shape_groups(&st.subs_by_id);
         let mut live = [[0u64; 2]; crate::retention::ShapeKind::ALL.len()];
         let snapshot = st
             .shapes
@@ -2029,8 +1964,7 @@ impl Engine {
                     dormant_for,
                     in_transition,
                     dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
-                    lease_tracked: st.feed_shares.contains_key(&rec.id),
-                    group: None,
+                    group: group_by_shape.get(&rec.id).cloned(),
                     stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
                     replay_span_bytes: None,
                     replay_span_deferred: false,
@@ -2112,15 +2046,10 @@ impl Engine {
     /// straight from active with a full teardown. Rechecks eligibility under the locks — a
     /// reactivation, rejoin or newer touch racing the sweep wins.
     pub(crate) async fn evict_shape(&self, id: &str, reason: EvictReason) -> Result<Evicted> {
-        self.evict_shape_planned(id, reason, None).await
+        self.evict_shape_planned(id, reason).await
     }
 
-    async fn evict_shape_planned(
-        &self,
-        id: &str,
-        reason: EvictReason,
-        planned_idle: Option<Duration>,
-    ) -> Result<Evicted> {
+    async fn evict_shape_planned(&self, id: &str, reason: EvictReason) -> Result<Evicted> {
         let mut st = self.state.lock().await;
         // No record: the shape is already gone, so whatever it held (a change-log segment pin
         // included) is released — that IS the outcome the caller asked for.
@@ -2135,14 +2064,13 @@ impl Engine {
             let evictable = match lives.get(id) {
                 Some(life) if matches!(life.state, LifeState::Dormant { .. }) => true,
                 // A live-only shape is evicted from active only if it is still idle past the
-                // threshold used by the plan. At the cap, only lease-tracked shapes are eligible.
+                // threshold used by the retention plan (a touch since the snapshot wins).
                 Some(life) if !parkable && matches!(life.state, LifeState::Active) => {
-                    let threshold = match reason {
-                        EvictReason::MaxShapes => planned_idle.unwrap_or_default(),
-                        _ => self.retention.live_only_evict_after().map(|(after, _)| after).unwrap_or(Duration::MAX),
-                    };
-                    life.last_read.elapsed() >= threshold
-                        && (reason != EvictReason::MaxShapes || st.feed_shares.contains_key(id))
+                    reason == EvictReason::LiveOnlyIdle
+                        && self
+                            .retention
+                            .live_only_evict_after()
+                            .is_some_and(|(after, _)| life.last_read.elapsed() >= after)
                 }
                 _ => false, // transitioning (or already evicted) since the sweep snapshot
             };
@@ -2202,45 +2130,7 @@ impl Engine {
     pub async fn retention_sweep(&self) {
         let cfg = self.retention.clone();
         self.sweep_leases(&cfg).await;
-        let snapshot: Vec<SweepShape> = {
-            let st = self.state.lock().await;
-            let bytes = self.ds.appended_bytes_with_prefix("shape/");
-            let lives = self.lives.lock().unwrap();
-            st.shapes
-                .values()
-                .map(|rec| {
-                    let life = lives.get(&rec.id);
-                    let (idle, dormant_for, in_transition) = match life {
-                        None => (std::time::Duration::ZERO, None, true), // mid-create; leave alone
-                        Some(l) => match &l.state {
-                            LifeState::Active => (l.last_read.elapsed(), None, false),
-                            LifeState::Dormant { since, .. } => (l.last_read.elapsed(), Some(since.elapsed()), false),
-                            LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => {
-                                (l.last_read.elapsed(), None, true)
-                            }
-                        },
-                    };
-                    SweepShape {
-                        id: rec.id.clone(),
-                        refcount: st.feed_shares.get(&rec.id).map(FeedShare::refcount).unwrap_or(0),
-                        idle,
-                        dormant_for,
-                        in_transition,
-                        // `changes_only` feeds cannot be recreated from a snapshot without
-                        // losing the dormant-period change history promised by the client API;
-                        // keep them active until a correct replay/reconcile path exists.
-                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
-                        lease_tracked: st.feed_shares.contains_key(&rec.id),
-                        group: None,
-                        stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
-                        replay_span_bytes: None,
-                        replay_span_deferred: false,
-                        backfill_bytes: rec.backfill_bytes,
-                    }
-                })
-                .collect()
-        };
-        let mut snapshot = snapshot;
+        let mut snapshot = self.sweep_snapshot(true).await;
         let mut result_cache = std::collections::HashMap::new();
         for s in &mut snapshot {
             let resume = self.lives.lock().unwrap().get(&s.id).and_then(|life| match &life.state {
@@ -2281,11 +2171,13 @@ impl Engine {
             }
         }
         for (id, reason) in &plan.evict {
-            let idle = snapshot.iter().find(|s| s.id == *id).map(|s| s.idle);
-            if let Err(e) = self.evict_shape_planned(id, *reason, idle).await {
+            if let Err(e) = self.evict_shape_planned(id, *reason).await {
                 tracing::warn!("retention: evicting shape {id} failed: {e:#}");
             }
         }
+        // Retirements and deactivations changed the world after the planning snapshot. Refresh
+        // the same gauges from the same snapshot path before the sweep returns.
+        let _ = self.sweep_snapshot(false).await;
         // Same tick, second half: the change log's own retention (ADR-0006).
         self.sweep_change_log().await;
     }
