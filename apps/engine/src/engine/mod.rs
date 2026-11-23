@@ -3257,14 +3257,19 @@ impl Engine {
         let mut st = self.state.lock().await;
         Self::validate_group_reservation(&st, subscription, member_subscriptions)?;
         drop(st);
-        self.make_room_under_cap_locked(member_subscriptions.len() + 1).await;
+        let wanted = member_subscriptions.len() + 1;
+        self.make_room_under_cap_locked(wanted).await;
         st = self.state.lock().await;
         Self::validate_group_reservation(&st, subscription, member_subscriptions)?;
-        self.ensure_room_under_cap(&st, member_subscriptions.len() + 1)?;
-        st.group_claims.reserve(subscription, reservation_id)?;
+        self.ensure_room_under_cap(&st, wanted, None)?;
+        st.group_claims.reserve_with_slots(subscription, reservation_id, wanted)?;
         st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
         drop(cap_admission);
         Ok(())
+    }
+
+    pub(crate) async fn restore_group_member_slot(&self, group: &str) {
+        self.state.lock().await.group_claims.restore_member_slot(group);
     }
 
     fn validate_group_reservation(st: &EngineState, subscription: &str, member_subscriptions: &[String]) -> Result<()> {

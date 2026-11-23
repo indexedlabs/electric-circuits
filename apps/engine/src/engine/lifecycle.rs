@@ -7,6 +7,24 @@ pub(crate) struct ReplayBatch {
     targets: Vec<(crate::engine::sequencer::ReplayTarget, tokio::sync::oneshot::Sender<Result<u64>>)>,
 }
 
+/// Compile a subquery predicate without registering nodes or changing registry refcounts.  Shape
+/// admission must reject malformed inner predicates before it can evict an existing shape.
+struct ValidateSubqueries<'a>(&'a HashMap<TableRef, TableSchema>);
+
+impl crate::predicate::SubqueryCollector for ValidateSubqueries<'_> {
+    fn collect(
+        &mut self,
+        table: &TableRef,
+        project: &str,
+        where_: Option<&PredicateJson>,
+    ) -> Result<crate::predicate::SubquerySig> {
+        let ts = self.0.get(table).with_context(|| format!("unknown subquery table '{table}'"))?;
+        ts.column_index(project)?;
+        CompiledPredicate::compile_opt_with(where_, ts, self)?;
+        Ok(crate::predicate::subquery_sig(table, project, where_))
+    }
+}
+
 /// How many times a create/join is redone after losing a race during its catalog durability wait
 /// (see [`Engine::recheck_after_durability`]). Three: the race needs an *external* retirement to
 /// land inside the wait, so a second loss is already unusual and a third means something is
@@ -217,8 +235,9 @@ impl Engine {
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res =
-                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None).await;
+            let res = self
+                .create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None, None)
+                .await;
             match retry_create(res, attempt, "shape", table) {
                 Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
@@ -239,8 +258,15 @@ impl Engine {
         changes_only: bool,
         subscription: Option<String>,
         stream_path: String,
+        group_reservation: Option<String>,
     ) -> Result<(ShapeRecord, String)> {
         let sub = self.resolve_subscription(subscription).await;
+        if let Some(group) = group_reservation.as_deref() {
+            let mut st = self.state.lock().await;
+            if !st.group_claims.begin_member_slot(group) {
+                bail!("group reservation has no remaining shape slot");
+            }
+        }
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
             let res = self
                 .create_shape_once(
@@ -251,10 +277,16 @@ impl Engine {
                     false,
                     &sub,
                     Some(stream_path.clone()),
+                    group_reservation.as_deref(),
                 )
                 .await;
             match retry_create(res, attempt, "shape group member", table) {
-                Ok(out) => return out.map(|rec| (rec, sub)),
+                Ok(out) => {
+                    if let Some(group) = group_reservation.as_deref() {
+                        self.state.lock().await.group_claims.finish_member_slot(group);
+                    }
+                    return out.map(|rec| (rec, sub));
+                }
                 Err(()) => redo_backoff().await,
             }
         }
@@ -303,6 +335,7 @@ impl Engine {
         share: bool,
         sub: &str,
         stream_path_override: Option<String>,
+        group_reservation: Option<&str>,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
         // so it refuses to make one rather than backfill from state it knows is wrong. This early
@@ -467,6 +500,8 @@ impl Engine {
                 }
             }
             self.ensure_schema_resolved(&st, tables)?;
+            let where_json = where_.as_ref().expect("subquery table set implies a predicate");
+            CompiledPredicate::compile_with(where_json, &ts, &mut ValidateSubqueries(&st.tables))?;
         } else {
             self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
         }
@@ -498,13 +533,14 @@ impl Engine {
                     share,
                     sub,
                     stream_path_override.clone(),
+                    group_reservation,
                 ))
                 .await;
             }
         }
         ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
         ensure_subscription_free(&st, sub, "")?;
-        if self.shape_cap_reached(&st, 1) {
+        if self.shape_cap_reached(&st, 1, group_reservation) {
             drop(st);
             self.make_room_under_cap_locked(1).await;
             st = self.state.lock().await;
@@ -520,6 +556,7 @@ impl Engine {
                         share,
                         sub,
                         stream_path_override.clone(),
+                        group_reservation,
                     ))
                     .await;
                 }
@@ -527,7 +564,7 @@ impl Engine {
             ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
             ensure_subscription_free(&st, sub, "")?;
         }
-        self.ensure_room_under_cap(&st, 1)?;
+        self.ensure_room_under_cap(&st, 1, group_reservation)?;
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -952,7 +989,7 @@ impl Engine {
         }
         ensure_group_subscription_available(&st, sub, false)?;
         ensure_subscription_free(&st, sub, "")?;
-        if self.shape_cap_reached(&st, 1) {
+        if self.shape_cap_reached(&st, 1, None) {
             drop(st);
             self.make_room_under_cap_locked(1).await;
             st = self.state.lock().await;
@@ -964,7 +1001,7 @@ impl Engine {
             ensure_group_subscription_available(&st, sub, false)?;
             ensure_subscription_free(&st, sub, "")?;
         }
-        self.ensure_room_under_cap(&st, 1)?;
+        self.ensure_room_under_cap(&st, 1, None)?;
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -2016,13 +2053,27 @@ impl Engine {
     }
 
     /// Whether minting `wanted` records would exceed the configured shape cap.
-    fn shape_cap_reached(&self, st: &EngineState, wanted: usize) -> bool {
-        self.retention.max_shapes > 0 && st.shapes.len().saturating_add(wanted) > self.retention.max_shapes
+    fn shape_cap_reached(&self, st: &EngineState, wanted: usize, group_reservation: Option<&str>) -> bool {
+        let group_credit =
+            usize::from(group_reservation.is_some_and(|group| st.group_claims.inflight_slots_for(group) > 0));
+        self.retention.max_shapes > 0
+            && st
+                .shapes
+                .len()
+                .saturating_add(st.group_claims.reserved_slots())
+                .saturating_add(wanted)
+                .saturating_sub(group_credit)
+                > self.retention.max_shapes
     }
 
     /// Refuse a create after room-making has had every eligible shape removed.
-    pub(super) fn ensure_room_under_cap(&self, st: &EngineState, wanted: usize) -> Result<()> {
-        if !self.shape_cap_reached(st, wanted) {
+    pub(super) fn ensure_room_under_cap(
+        &self,
+        st: &EngineState,
+        wanted: usize,
+        group_reservation: Option<&str>,
+    ) -> Result<()> {
+        if !self.shape_cap_reached(st, wanted, group_reservation) {
             return Ok(());
         }
         self.metrics.shape_creates_refused.fetch_add(1, Ordering::Relaxed);
@@ -2039,21 +2090,41 @@ impl Engine {
         if self.retention.max_shapes == 0 {
             return;
         }
+        let mut passes = 0usize;
+        let max_passes = self.retention.max_shapes.saturating_add(wanted).saturating_add(1);
         loop {
+            passes = passes.saturating_add(1);
+            if passes > max_passes {
+                tracing::warn!(wanted, passes, "cap admission made no eviction progress");
+                self.sweep_snapshot(false).await;
+                return;
+            }
+            let reserved_slots = self.state.lock().await.group_claims.reserved_slots();
             let snapshot = self.sweep_snapshot(false).await;
-            match crate::retention::plan_cap_room(&self.retention, &snapshot, wanted) {
-                crate::retention::CapRoom::Fits | crate::retention::CapRoom::Full => return,
+            match crate::retention::plan_cap_room(&self.retention, &snapshot, wanted.saturating_add(reserved_slots)) {
+                crate::retention::CapRoom::Fits | crate::retention::CapRoom::Full => {
+                    self.sweep_snapshot(false).await;
+                    return;
+                }
                 crate::retention::CapRoom::Evict(ids) => {
                     for id in ids {
                         let idle = snapshot.iter().find(|s| s.id == id).map(|s| s.idle);
-                        if let Err(error) = self.evict_shape_planned(&id, EvictReason::MaxShapes, idle).await {
-                            tracing::warn!(shape_id = %id, "cap eviction failed: {error:#}");
+                        match self.evict_shape_planned(&id, EvictReason::MaxShapes, idle).await {
+                            Ok(Evicted::Yes) => {}
+                            Ok(Evicted::Skipped) => {
+                                tracing::debug!(shape_id = %id, "cap eviction was skipped; replanning");
+                            }
+                            Err(error) => {
+                                tracing::warn!(shape_id = %id, "cap eviction failed: {error:#}");
+                            }
                         }
                     }
                 }
             }
             let st = self.state.lock().await;
-            if !self.shape_cap_reached(&st, wanted) {
+            if !self.shape_cap_reached(&st, wanted, None) {
+                drop(st);
+                self.sweep_snapshot(false).await;
                 return;
             }
         }
@@ -2064,49 +2135,52 @@ impl Engine {
         let st = self.state.lock().await;
         let bytes = if with_bytes { self.ds.appended_bytes_with_prefix("shape/") } else { HashMap::new() };
         let lives = self.lives.lock().unwrap();
+        let record_groups = st.group_claims.record_shape_groups();
         let mut live = [[0u64; 2]; crate::retention::ShapeKind::ALL.len()];
-        let snapshot = st
-            .shapes
-            .values()
-            .map(|rec| {
-                let life = lives.get(&rec.id);
-                let (idle, dormant_for, in_transition) = match life {
-                    None => (Duration::ZERO, None, true),
-                    Some(l) => match &l.state {
-                        LifeState::Active => (l.last_read.elapsed(), None, false),
-                        LifeState::Dormant { since, .. } => (l.last_read.elapsed(), Some(since.elapsed()), false),
-                        LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => {
-                            (l.last_read.elapsed(), None, true)
-                        }
-                    },
-                };
-                let subscriptions = st
-                    .feed_shares
-                    .get(&rec.id)
-                    .map(|share| share.subs.keys().cloned().collect::<Vec<_>>())
-                    .unwrap_or_default();
-                let refcount = st.feed_shares.get(&rec.id).map(FeedShare::refcount).unwrap_or(0);
-                if dormant_for.is_none() {
-                    let kind =
-                        crate::retention::ShapeKind::of(rec.is_subquery, rec.aggregate.is_some(), rec.changes_only);
-                    live[kind.index()][usize::from(refcount > 0)] += 1;
-                }
-                SweepShape {
-                    id: rec.id.clone(),
-                    refcount,
-                    idle,
-                    dormant_for,
-                    in_transition,
-                    dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
-                    lease_tracked: st.feed_shares.contains_key(&rec.id),
-                    group: st.group_claims.group_for_shape(&rec.id, &subscriptions),
-                    stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
-                    replay_span_bytes: None,
-                    replay_span_deferred: false,
-                    backfill_bytes: rec.backfill_bytes,
-                }
-            })
-            .collect();
+        let snapshot =
+            st.shapes
+                .values()
+                .map(|rec| {
+                    let life = lives.get(&rec.id);
+                    let (idle, dormant_for, in_transition) = match life {
+                        None => (Duration::ZERO, None, true),
+                        Some(l) => match &l.state {
+                            LifeState::Active => (l.last_read.elapsed(), None, false),
+                            LifeState::Dormant { since, .. } => (l.last_read.elapsed(), Some(since.elapsed()), false),
+                            LifeState::Deactivating { .. } | LifeState::Reactivating { .. } => {
+                                (l.last_read.elapsed(), None, true)
+                            }
+                        },
+                    };
+                    let subscriptions = st
+                        .feed_shares
+                        .get(&rec.id)
+                        .map(|share| share.subs.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    let refcount = st.feed_shares.get(&rec.id).map(FeedShare::refcount).unwrap_or(0);
+                    if dormant_for.is_none() {
+                        let kind =
+                            crate::retention::ShapeKind::of(rec.is_subquery, rec.aggregate.is_some(), rec.changes_only);
+                        live[kind.index()][usize::from(refcount > 0)] += 1;
+                    }
+                    SweepShape {
+                        id: rec.id.clone(),
+                        refcount,
+                        idle,
+                        dormant_for,
+                        in_transition,
+                        dormancy_eligible: !rec.is_subquery && rec.aggregate.is_none() && !rec.changes_only,
+                        lease_tracked: st.feed_shares.contains_key(&rec.id),
+                        group: record_groups.get(&rec.id).cloned().or_else(|| {
+                            subscriptions.iter().find_map(|sub| st.group_claims.group_for_subscription(sub))
+                        }),
+                        stream_bytes: bytes.get(&rec.stream_path).copied().unwrap_or(0),
+                        replay_span_bytes: None,
+                        replay_span_deferred: false,
+                        backfill_bytes: rec.backfill_bytes,
+                    }
+                })
+                .collect();
         for (kind, counts) in live.iter().enumerate() {
             for (subscribed, count) in counts.iter().enumerate() {
                 self.metrics.shapes_live[kind][subscribed].store(*count, Ordering::Relaxed);
@@ -2302,7 +2376,7 @@ impl Engine {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
                 "retention: {} shapes exceed max_shapes={} but no eligible shape is left to evict — \
-                 every remaining shape is subscribed, active parkable, transitioning, unshared, or group-owned; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
+                 every remaining shape is subscribed, active parkable, transitioning, or group-owned; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
                 snapshot.len(),
                 cfg.max_shapes
             );
@@ -2326,6 +2400,9 @@ impl Engine {
                 tracing::warn!("retention: evicting shape {id} failed: {e:#}");
             }
         }
+        // The planning snapshot published gauges before actions ran. Refresh once after the
+        // deactivation/eviction batch so an ordinary sweep reports the state it actually left.
+        self.sweep_snapshot(false).await;
         // Same tick, second half: the change log's own retention (ADR-0006).
         self.sweep_change_log().await;
     }

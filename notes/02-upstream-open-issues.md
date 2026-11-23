@@ -57,7 +57,7 @@ The URLs are the primary-source records.
 
 ### Closed issue
 
-* [#9 — Shape retention: active / dormant / evicted](https://github.com/electric-sql/electric-circuits/issues/9) was created 2026-07-06 and closed as completed on 2026-07-07 (age at close: 1d; no labels, assignee or milestone).  Its model is implemented locally in `apps/engine/src/retention.rs`: idle unsubscribed shapes go dormant, retained streams/replay reactivate them, and dormant-only TTL/count/disk-budget eviction applies. `packages/conformance/src/conformance-retention.test.ts` proves dormant replay, read reactivation, and eviction.  This is the direct dependency behind #12’s reclamation policy and a key mitigation for output-stream growth.
+* [#9 — Shape retention: active / dormant / evicted](https://github.com/electric-sql/electric-circuits/issues/9) was created 2026-07-06 and closed as completed on 2026-07-07 (age at close: 1d; no labels, assignee or milestone).  Its model is implemented locally in `apps/engine/src/retention.rs`: idle unsubscribed shapes go dormant, retained streams/replay reactivate them, and retention evicts dormant shapes before unsubscribed live-only shapes when their idle period elapses or the count/disk budget requires it. `packages/conformance/src/conformance-retention.test.ts` proves dormant replay, read reactivation, and eviction.  This is the direct dependency behind #12’s reclamation policy and a key mitigation for output-stream growth.
 
 ### Closed PRs relevant to interpreting the still-open tracker
 

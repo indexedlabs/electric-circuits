@@ -514,7 +514,7 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // the shape's bounded replay budget, is no longer safely reactivatable. Retire it now so the
     // next subscriber recreates from a fresh snapshot.
     for s in shapes {
-        if s.group.is_none() && s.dormant_for.is_some() {
+        if s.group.is_none() && s.dormant_for.is_some() && s.refcount == 0 && !s.in_transition {
             if s.replay_span_deferred {
                 continue;
             } else if s.replay_span_bytes.is_none() {
@@ -530,7 +530,11 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // Tier 1 — dormancy TTL (hygiene, independent of pressure).
     if !cfg.dormant_ttl.is_zero() {
         for s in shapes {
-            if s.group.is_none() && s.dormant_for.is_some_and(|d| d >= cfg.dormant_ttl) {
+            if s.group.is_none()
+                && s.dormant_for.is_some_and(|d| d >= cfg.dormant_ttl)
+                && s.refcount == 0
+                && !s.in_transition
+            {
                 plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
                 evicted.insert(&s.id);
             }
@@ -555,7 +559,13 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // Dormant shapes still standing after tier 1, least-recently-read first (largest idle first).
     let mut lru: Vec<&SweepShape> = shapes
         .iter()
-        .filter(|s| s.group.is_none() && s.dormant_for.is_some() && !evicted.contains(s.id.as_str()))
+        .filter(|s| {
+            s.group.is_none()
+                && s.dormant_for.is_some()
+                && s.refcount == 0
+                && !s.in_transition
+                && !evicted.contains(s.id.as_str())
+        })
         .collect();
     lru.sort_by_key(|s| std::cmp::Reverse(s.idle));
     let mut lru = lru.into_iter();
@@ -612,8 +622,10 @@ pub fn plan_cap_room(cfg: &RetentionConfig, shapes: &[SweepShape], wanted: usize
         return CapRoom::Fits;
     }
     let Some(target) = cfg.max_shapes.checked_sub(wanted) else { return CapRoom::Full };
-    let mut dormant: Vec<&SweepShape> =
-        shapes.iter().filter(|s| s.group.is_none() && s.dormant_for.is_some()).collect();
+    let mut dormant: Vec<&SweepShape> = shapes
+        .iter()
+        .filter(|s| s.group.is_none() && s.dormant_for.is_some() && s.refcount == 0 && !s.in_transition)
+        .collect();
     dormant.sort_by_key(|s| std::cmp::Reverse(s.idle));
     let unheld = unheld_live_only(shapes);
     let mut count = shapes.len();
@@ -907,6 +919,22 @@ mod tests {
         assert_eq!(plan_cap_room(&c, &shapes, 3), CapRoom::Full, "a subscribed shape is never evicted");
         assert_eq!(plan_cap_room(&RetentionConfig { max_shapes: 4, ..cfg() }, &shapes, 1), CapRoom::Fits);
         assert_eq!(plan_cap_room(&cfg(), &shapes, 1000), CapRoom::Fits, "0 is no cap at all");
+    }
+
+    #[test]
+    fn cap_room_skips_subscribed_and_transitioning_dormant_shapes() {
+        let c = RetentionConfig { max_shapes: 3, ..cfg() };
+        let mut subscribed = dormant("subscribed", 100, 100);
+        subscribed.refcount = 1;
+        let mut transitioning = dormant("transitioning", 90, 100);
+        transitioning.in_transition = true;
+        let eligible = dormant("eligible", 80, 100);
+        let shapes = vec![subscribed, transitioning, eligible];
+        assert_eq!(
+            plan_cap_room(&c, &shapes, 1),
+            CapRoom::Evict(vec!["eligible".to_string()]),
+            "cap admission must not repeatedly plan a shape that cannot be evicted"
+        );
     }
 
     #[test]
