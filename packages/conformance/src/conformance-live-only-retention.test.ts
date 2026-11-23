@@ -133,8 +133,8 @@ describe('an unsubscribed live-only feed is retired after the live-only idle per
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
       ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '8',
-      // Without the live-only period the feed would be kept for idle + dormancy: over an hour here,
-      // 7 days 6 hours by default.
+      // The explicit period keeps this feed around long enough to observe its live behavior before
+      // the one-second subscription lease floor permits retirement.
       ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
       ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '3600',
     })
