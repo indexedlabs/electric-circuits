@@ -158,6 +158,10 @@ pub struct Config {
     /// a load balancer's probe sees the drain (`ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS`). Comes out
     /// of `shutdown_grace`, not on top of it.
     pub shutdown_ready_drain: Duration,
+    /// How long deferred subquery work may keep running after a signal, so the subquery registry
+    /// can be written for the next boot (`ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS`). Comes
+    /// out of `shutdown_grace`, not on top of it.
+    pub shutdown_subquery_drain: Duration,
     /// Optional sources-table/file supervisor. `None` preserves the single-source boot path.
     pub sources: Option<SourcesConfig>,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
@@ -682,6 +686,9 @@ impl Config {
             );
         }
 
+        let shutdown_subquery_drain =
+            crate::shutdown::resolve_subquery_drain(g, shutdown_grace).context("shutdown configuration")?;
+
         let sources = match sources_mode {
             None => None,
             Some(mode) => {
@@ -758,6 +765,7 @@ impl Config {
             change_log,
             shutdown_grace,
             shutdown_ready_drain,
+            shutdown_subquery_drain,
             sources,
             noop_vars: Vec::new(),
         };
@@ -817,7 +825,8 @@ impl Config {
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
              secret={} control_secret={} managed_deployment={} storage_dir={} prometheus_port={:?} trace={} json_logs={} memory_log_period={:?} memory_bytes_log_period={:?} initialize_namespace={} log={} \
              txn_memory_bytes={} held_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
-             backfill_statement_timeout_ms={} stream_ttl_secs={} shutdown_grace={:?} shutdown_ready_drain={:?}",
+             backfill_statement_timeout_ms={} stream_ttl_secs={} shutdown_grace={:?} shutdown_ready_drain={:?} \
+             shutdown_subquery_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -846,6 +855,7 @@ impl Config {
             self.stream_ttl.map_or(0, |ttl| ttl.get()),
             self.shutdown_grace,
             self.shutdown_ready_drain,
+            self.shutdown_subquery_drain,
         );
         match &self.sources {
             None => base,

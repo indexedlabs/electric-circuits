@@ -101,6 +101,21 @@ impl Value {
         Value::from_json(j, ty)
     }
 
+    /// [`literal_from_json`](Self::literal_from_json) for a comparison against a column whose
+    /// Postgres type is known. A `timestamptz`, `timestamp` or `date` column is coarse `Text` whose
+    /// cells are Postgres's own output, compared in code-point order, so a literal for one is
+    /// respelled the way Postgres prints it ([`crate::pg_temporal`]) — otherwise another spelling of
+    /// the same instant compares differently here than it does in SQL. Everything else is
+    /// `literal_from_json` unchanged. Not for `LIKE` patterns, which are text, not timestamps.
+    pub fn literal_for_column(j: &serde_json::Value, ty: ColumnType, pg_type: Option<&str>) -> Result<Value> {
+        Ok(match (Self::literal_from_json(j, ty)?, pg_type) {
+            (Value::Text(s), Some(pg_type)) => {
+                Value::Text(crate::pg_temporal::canonical_literal(&s, pg_type).unwrap_or(s))
+            }
+            (v, _) => v,
+        })
+    }
+
     /// Parse a stringified primary-key (the durable-stream event `key`) into a typed `Value`.
     pub fn from_key_string(s: &str, ty: ColumnType) -> Result<Value> {
         Ok(match ty {

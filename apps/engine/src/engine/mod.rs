@@ -29,6 +29,8 @@ use std::time::Duration;
 mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
+#[cfg(test)]
+mod claim_identity_tests;
 mod drift;
 pub(crate) mod emission;
 pub use emission::GroupDrain;
@@ -36,6 +38,8 @@ pub(crate) mod epoch;
 mod executors;
 pub(crate) mod group;
 pub(crate) mod group_load_log;
+#[cfg(test)]
+mod group_rejoin_tests;
 mod held;
 mod introspection;
 mod lifecycle;
@@ -202,6 +206,76 @@ impl std::fmt::Display for CreateRaced {
 }
 
 impl std::error::Error for CreateRaced {}
+
+/// What a rows-free re-join found ([`Engine::rejoin_group`]).
+pub(crate) enum GroupRejoin {
+    /// The subscription's group, claimed or renewed, its stream's tail offset, and the identity of
+    /// the claim the caller now holds.
+    Joined { group: GroupRecord, offset: String, claim: String },
+    /// Nothing to re-join: the subscription holds no group (never loaded, or retired), holds one
+    /// with other members, or holds one that can no longer serve a reader.
+    Absent,
+}
+
+/// The claims a group **re-join** took before its durability wait, given back if the load never
+/// gets to answer — the group twin of the join guard in `lifecycle.rs` (ADR-0008).
+///
+/// A load's future is awaited straight from the HTTP handler, so a client that disconnects while
+/// storage is slow takes it away mid-wait. Without this the claims would stay until the lease
+/// lapsed, pinning a group nobody was told it holds. The compensation names the claims this
+/// re-join took and nothing else, by the identity it took them under: a `Left` for a claim that is
+/// no longer held is a no-op, and a claim a later load or re-join took has another identity, so
+/// it cannot release that one either.
+struct GroupRejoinGuard {
+    engine: Engine,
+    /// `(member shape id, subscription)` for each claim taken; emptied once they are durable.
+    claims: Vec<(String, String)>,
+    /// The group's subscription and the identity this re-join took its claim under.
+    subscription: String,
+    claim: String,
+}
+
+impl Drop for GroupRejoinGuard {
+    fn drop(&mut self) {
+        if self.claims.is_empty() {
+            return;
+        }
+        tracing::warn!("a group re-join was cancelled before its claims were durable; releasing them");
+        let (engine, claims) = (self.engine.clone(), std::mem::take(&mut self.claims));
+        let (subscription, claim) = (self.subscription.clone(), self.claim.clone());
+        self.engine.shutdown.spawn(async move {
+            engine.give_back_group_claims(claims, &subscription, &claim).await;
+        });
+    }
+}
+
+/// A create would mint a new shape while the engine is at `ELECTRIC_CIRCUITS_MAX_SHAPES` and
+/// nothing is left that the cap may evict: every remaining shape is subscribed, or parkable and not
+/// yet dormant.
+///
+/// Typed because it is a 503 with `Retry-After`, not a 500: the request is valid, and it succeeds
+/// once a subscription is released or lapses. Joining a shape that already exists never gets it.
+#[derive(Debug)]
+pub struct ShapeCapReached {
+    /// Registered shapes when the create was refused.
+    pub shapes: usize,
+    /// The shapes the create would have added (a group adds one per member).
+    pub wanted: usize,
+    pub max_shapes: usize,
+}
+
+impl std::fmt::Display for ShapeCapReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the engine holds {} shapes and ELECTRIC_CIRCUITS_MAX_SHAPES is {}; no room for {} more \
+             until a subscription is released; retry",
+            self.shapes, self.max_shapes, self.wanted
+        )
+    }
+}
+
+impl std::error::Error for ShapeCapReached {}
 
 /// A create named a **subscription id another shape already holds** (ADR-0008).
 ///
@@ -677,6 +751,14 @@ pub struct Engine {
         Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<crate::engine::lifecycle::ReplayBatch>>>>>,
     /// Set once the background retention sweeper has been spawned (lazy, idempotent).
     retention_started: Arc<std::sync::atomic::AtomicBool>,
+    /// The last time a create looked for room under `ELECTRIC_CIRCUITS_MAX_SHAPES` and found
+    /// nothing the cap may evict: `EngineState::evictable_gen` as it was, and when. While neither
+    /// has moved on, the next refused create is answered without another scan of every shape — a
+    /// full engine under a retry storm must not spend its state lock re-proving that it is full.
+    cap_full: Arc<std::sync::Mutex<Option<(u64, std::time::Instant)>>>,
+    /// `Metrics::shape_creates_refused` as of the last retention sweep, so each sweep reports the
+    /// refusals since the one before.
+    cap_refusals_reported: Arc<std::sync::atomic::AtomicU64>,
     /// Set once the background schema reconciler has been spawned (see `engine::drift`).
     reconciler_started: Arc<std::sync::atomic::AtomicBool>,
     /// Per-table serialisation of drift resolutions, plus the set currently running (see
@@ -1097,7 +1179,10 @@ fn spawn_flip_propagator(
 ) {
     let workers: usize =
         std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
-    shutdown.clone().spawn_background(async move {
+    // Draining, not background (dispatcher and workers alike): a flip already handed over when a
+    // shutdown begins is walked to the end of the drain window. Its effects are otherwise lost for
+    // good — the inner set has moved — and the registry could not be written for the next boot.
+    shutdown.clone().spawn_draining(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(workers));
         while let Some(fw) = rx.recv().await {
             let permit = sem.clone().acquire_owned().await.expect("flip semaphore");
@@ -1106,7 +1191,7 @@ fn spawn_flip_propagator(
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
             let group_lanes = group_lanes.clone();
-            shutdown.spawn_background(async move {
+            shutdown.spawn_draining(async move {
                 let commit_lsn = fw.commit_lsn();
                 let group_paths = fw.group_paths().to_vec();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
@@ -1220,10 +1305,23 @@ struct EngineState {
     /// refused (409) rather than silently accepted, because the caller would then hold one name for
     /// two shapes and be unable to release either without ambiguity.
     subs_by_id: HashMap<String, String>,
+    /// The identity of each held claim: `subscription id -> claim id` (ADR-0008, "A claim has an
+    /// identity"). Keyed like `subs_by_id`, and removed with the claim by the same two methods
+    /// ([`Self::unsubscribe`], [`Self::forget_subscriptions`]), so an identity never outlives the
+    /// claim it names. Set by [`Self::grant_claim`] and by a create.
+    ///
+    /// A claim taken by a path that tells nobody about it (a group's private member claims, the
+    /// `/v1/shape` adapter's local renewal) has no entry. A release that names an identity never
+    /// matches such a claim; one that names none releases it as before.
+    claim_ids: HashMap<String, String>,
     /// Counter behind the ids the engine mints for creates that named no subscription. Combined
     /// with a per-Engine-instance nonce (see [`Engine::mint_subscription`]), so a minted id is unique
     /// across restarts too — the catalog outlives the process that wrote it.
     next_minted_sub: u64,
+    /// Moves whenever a shape may have become evictable at the cap: a subscription left one
+    /// ([`Self::unsubscribe`]), or one went dormant. Read by [`Engine::make_room_under_cap`] to
+    /// tell "still full, nothing changed" from "worth looking again".
+    evictable_gen: u64,
 }
 
 /// The generations a create captured for everything that can invalidate it: the schema of each table
@@ -1300,13 +1398,49 @@ impl EngineState {
     fn unsubscribe(&mut self, shape: &str, sub: &str) -> bool {
         let removed = self.feed_shares.get_mut(shape).is_some_and(|s| s.subs.remove(sub).is_some());
         if removed {
+            self.evictable_gen += 1;
             // Only if it still points HERE: an id released from one shape and immediately claimed
             // on another must keep the newer owner.
             if self.subs_by_id.get(sub).is_some_and(|owner| owner == shape) {
                 self.subs_by_id.remove(sub);
+                self.claim_ids.remove(sub);
             }
         }
         removed
+    }
+
+    // --- claim identity (ADR-0008, "A claim has an identity") ------------------------------------
+
+    /// Whether a release that names `claim` is for the claim `sub` holds now. `None` names no
+    /// claim: the release an older client sends, which is for whatever claim is held.
+    fn release_names_held_claim(&self, sub: &str, claim: Option<&str>) -> bool {
+        claim.is_none_or(|named| self.claim_ids.get(sub).is_some_and(|held| held == named))
+    }
+
+    /// Settle the identity of the claim `sub` holds, right after [`Self::subscribe`] took or
+    /// renewed it (`fresh` is what that call returned), under the same hold of the state lock.
+    ///
+    /// The identity is kept only for a request that names it: that is a renewal by the claim's
+    /// holder, and the release that holder sends later must still name the claim. Every other
+    /// grant gives the claim a new identity: a new claim, and a claim that is held but whose
+    /// identity the request did not name. The second is a later session taking the claim over
+    /// under a subscription it shares with an earlier one, and from then on a release the earlier
+    /// session sent names a claim nobody holds.
+    fn grant_claim(&mut self, sub: &str, ask: &ClaimAsk, fresh: bool) -> GrantedClaim {
+        let held = if fresh { None } else { self.claim_ids.get(sub) };
+        let kept = match (held, ask) {
+            (Some(held), ClaimAsk::Keep) => Some(held.clone()),
+            (Some(held), ClaimAsk::Native(Some(named))) if held == named => Some(held.clone()),
+            _ => None,
+        };
+        match kept {
+            Some(id) => GrantedClaim { id, new: false },
+            None => {
+                let id = new_claim_id();
+                self.claim_ids.insert(sub.to_string(), id.clone());
+                GrantedClaim { id, new: true }
+            }
+        }
     }
 
     /// The legacy anonymous release (`DELETE /shapes/{id}` with no `subscription`): drop ONE
@@ -1349,6 +1483,7 @@ impl EngineState {
             for id in ids {
                 if self.subs_by_id.get(&id).is_some_and(|owner| owner == shape) {
                     self.subs_by_id.remove(&id);
+                    self.claim_ids.remove(&id);
                 }
             }
         }
@@ -1390,6 +1525,54 @@ impl EngineState {
         }
         out.sort();
         out
+    }
+}
+
+/// What a create, a load or a re-join says about the claim it takes or renews.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ClaimAsk {
+    /// A renewal by the engine itself, or by a surface that tells nobody the claim's identity
+    /// (the `/v1/shape` adapter, a library caller): a held claim keeps the identity it has.
+    #[default]
+    Keep,
+    /// A native request, and the identity it named in `?claim=…` if it named one. Naming the held
+    /// claim's identity keeps it; anything else, none included, is answered a new one.
+    Native(Option<String>),
+}
+
+/// The identity a grant left a claim with ([`EngineState::grant_claim`]).
+struct GrantedClaim {
+    id: String,
+    /// The identity was minted by this grant, so the grant's catalog record carries it. A renewal
+    /// that kept the identity records none: its record is the one it always was.
+    new: bool,
+}
+
+impl GrantedClaim {
+    /// The `claim` field of the catalog record of this grant.
+    fn recorded(&self) -> Option<String> {
+        self.new.then(|| self.id.clone())
+    }
+}
+
+/// A new claim identity: opaque, unique for all practical purposes across restarts (64 random
+/// bits; an identity is only ever compared with the one other its subscription holds), and short
+/// because it rides catalog records.
+fn new_claim_id() -> String {
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    random[..16].to_string()
+}
+
+/// The claim half of one create attempt: what the caller said it holds, and, once the attempt has
+/// taken or renewed the claim, the identity the claim was left with.
+pub(crate) struct ClaimSlot {
+    ask: ClaimAsk,
+    granted: Option<String>,
+}
+
+impl ClaimSlot {
+    pub(crate) fn new(ask: ClaimAsk) -> Self {
+        Self { ask, granted: None }
     }
 }
 
@@ -1779,6 +1962,11 @@ impl Engine {
         let source_id = restart_notify.as_ref().map(|_| metrics.stack_id.clone());
         let telemetry = crate::mem::init_otel(metrics.clone(), memory_gauges.clone(), source_id.as_deref());
         let shutdown = crate::shutdown::ShutdownToken::with_metrics(restart_notify, metrics.clone());
+        // A configured engine lets deferred subquery work finish after a signal (see
+        // `shutdown`'s drain window); without a config everything stops at the signal, as before.
+        if let Some(config) = config {
+            shutdown.set_drain_budget(config.shutdown_subquery_drain);
+        }
         let ds = ds.with_shutdown(shutdown.clone());
         let pg_pool = pg_url.as_ref().map(|url| {
             crate::pg::Pool::owned(
@@ -1862,7 +2050,9 @@ impl Engine {
                 unresolved: HashSet::new(),
                 epoch_gen: 0,
                 subs_by_id: HashMap::new(),
+                claim_ids: HashMap::new(),
                 next_minted_sub: 1,
+                evictable_gen: 0,
             })),
             pg_url,
             postgres_setup,
@@ -1918,6 +2108,8 @@ impl Engine {
             reactivation_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             reactivation_batches: Arc::new(std::sync::Mutex::new(HashMap::new())),
             retention_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cap_full: Arc::new(std::sync::Mutex::new(None)),
+            cap_refusals_reported: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reconciler_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             resolving: Arc::new(drift::Resolving::default()),
             retrying: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -2002,6 +2194,13 @@ impl Engine {
             tracing::warn!(parties = ?self.shutdown.outstanding(), "Engine close exceeded graceful drain");
             ShutdownOutcome::Forced
         };
+        // The sequencer has written its last checkpoint (or the grace ran out): nothing a flip
+        // worker or an emission lane still holds can change what the next boot restores. Close the
+        // drain window and let them stop before the membership circuit is shut down under them.
+        self.shutdown.end_drain();
+        if !self.shutdown.wait_for_drained(std::time::Duration::from_secs(1).min(remaining())).await {
+            tracing::warn!("Engine close: deferred subquery work was still running when its drain window closed");
+        }
         // Handles are volatile; durable subscriptions lapse by lease after restart.
         crate::electric::close_handles(self);
         if !self.drain_catalog(remaining().min(crate::shutdown::CATALOG_DRAIN)).await
@@ -2577,10 +2776,10 @@ impl Engine {
     /// Delete every registered subquery shape's durable stream. Clients read durable-streams
     /// directly, past the HTTP surface that now answers 503, so a deleted stream is the only way
     /// they learn their shape is no longer maintained. The shape RECORDS stay registered (the
-    /// engine answers 503, not 404). This destroys nothing a restart would have kept: a restart
-    /// re-seeds every node from Postgres but DROPS every subquery shape — their inner-node state
-    /// is not persisted, so the catalog restore deliberately does not restore them (see
-    /// `Engine::apply_catalog`) — and clients recreate them with `POST /shapes`.
+    /// engine answers 503, not 404). This destroys nothing a restart would have kept: a degraded
+    /// engine never writes its subquery registry on the way out (`sequencer_loop`'s final
+    /// checkpoint), so the catalog restore DROPS every subquery shape (see `Engine::apply_catalog`)
+    /// — and clients recreate them with `POST /shapes`.
     async fn reap_subquery_streams(&self) {
         let paths: Vec<String> = {
             let st = self.state.lock().await;
@@ -2768,6 +2967,10 @@ impl Engine {
         // `waiting` while the engine is trying to reach Postgres, not `starting`.
         self.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         let client = crate::pg::connect_owned(&url, &self.shutdown).await?;
+        // The replication session takes no startup options, so whether its dates are readable is
+        // the database's, the role's or the server's to say. Asked here, where the boot dials, and
+        // before anything is served from text the engine would misread — named, like `wal_level`.
+        crate::pg::check_replication_session(&url, &self.shutdown).await?;
         self.setup_postgres_connected(client, selectors, slot).await
     }
 
@@ -2952,6 +3155,12 @@ impl Engine {
             let mut st = self.state.lock().await;
             self.ensure_sequencer(&mut st);
         }
+        // The sequencer now runs from the cursor the restore installed, whether the restore spawned
+        // it or the line above did (an empty catalog, an epoch reset). Tell it so: a cursor the
+        // restore vouches for is a valid checkpoint before the first read completes, which is what
+        // lets an engine that stops while idle still write its subquery registry for the next
+        // boot (`sequencer_loop`'s final checkpoint).
+        self.release_restore_reads().await.context("vouching for the sequencer's start position")?;
         // Spawn the ingestor at most once, even if setup_postgres is called again.
         if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");
@@ -3246,6 +3455,8 @@ impl Engine {
                 }));
             }
         }
+        // A group mints one shape per member (the public claim's, and one per private member).
+        self.ensure_room_under_cap(&st, member_subscriptions.len() + 1)?;
         st.group_claims.reserve(subscription, reservation_id)?;
         st.group_claims.reserve_private_members(subscription, member_subscriptions.iter().cloned());
         Ok(())
@@ -3335,10 +3546,12 @@ impl Engine {
                     .iter()
                     .map(|member| {
                         st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                        // A lease touch: each member's claim keeps the identity its create gave it.
                         CatalogEvent::Joined {
                             id: member.shape_id.clone(),
                             subscription: member.subscription.clone(),
                             at: now,
+                            claim: None,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -3407,6 +3620,11 @@ impl Engine {
 
     pub(crate) async fn group_record(&self, subscription: &str) -> Option<GroupRecord> {
         self.state.lock().await.group_claims.get(subscription).cloned()
+    }
+
+    /// The group with this id (the `shapeId` a group load answers), whatever its subscription.
+    pub(crate) async fn group_record_by_id(&self, group_id: &str) -> Option<GroupRecord> {
+        self.state.lock().await.group_claims.records_iter().find(|group| group.id == group_id).cloned()
     }
 
     #[cfg(feature = "test-support")]
@@ -3495,32 +3713,82 @@ impl Engine {
         self.group_lanes.remove(stream_path);
     }
 
+    /// [`Self::renew_group_claim_as`] by a caller that names no claim and keeps whatever identity
+    /// the claim has: `true` where that answers an identity.
+    #[cfg(test)]
+    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+        Ok(self.renew_group_claim_as(group, &ClaimAsk::Keep).await?.is_some())
+    }
+
     /// Renew the public group lease and every private member claim together. A retried load is
     /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
     /// to the same wall-clock instant.
-    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+    ///
+    /// The same call **re-joins** a group that was released or whose lease lapsed and that has been
+    /// retained since (`Engine::release_group_lease_for`): a member that holds no claim takes its
+    /// own again. That is a NEW claim, so its `Joined` is durable before this returns (ADR-0008),
+    /// and a caller that goes away during that wait gives the claims back ([`GroupRejoinGuard`]).
+    /// `Ok(None)` = the group cannot be claimed (a member is gone, or its claim's name now belongs
+    /// to another shape) or was torn down meanwhile; the caller releases it and loads afresh.
+    ///
+    /// `Ok(Some(claim))` is the identity the group's claim has afterwards. A group's claim is one
+    /// claim with one identity, held on its public subscription (its first member's); the private
+    /// member claims have none. It is settled under the same hold of the state lock that takes or
+    /// renews the claims ([`EngineState::grant_claim`]): kept for a request that names it (`ask`),
+    /// new otherwise, and a new one is in the public member's `Joined`. That record is durable
+    /// before this returns when the claim itself is new. When only the identity is new (a later
+    /// session took over a claim that was still held) it is queued like any renewal's, and an
+    /// engine that stops before it lands restores the claim under its earlier identity, which
+    /// that session's next renewal replaces again.
+    pub(crate) async fn renew_group_claim_as(&self, group: &GroupRecord, ask: &ClaimAsk) -> Result<Option<String>> {
         let now = crate::changelog::now_secs();
-        let mut events = Vec::with_capacity(group.members.len());
+        let mut renewals = Vec::with_capacity(group.members.len());
+        let mut rejoins = Vec::new();
+        let mut retaken = Vec::new();
+        let mut granted = None;
         {
             let mut st = self.state.lock().await;
             let in_flight = self.group_releases.lock().unwrap().get(&group.id).cloned();
             if let Some(release) = in_flight {
                 drop(st);
                 release.wait().await?;
-                return Ok(false);
+                return Ok(None);
+            }
+            // All or nothing: a group is never left half-subscribed.
+            if !Self::group_claimable(&st, group) {
+                return Ok(None);
             }
             for member in &group.members {
-                if !(st.shapes.contains_key(&member.shape_id)
-                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id))
-                {
-                    return Ok(false);
-                }
-                st.subscribe(&member.shape_id, member.subscription.clone(), now);
-                events.push(CatalogEvent::Joined {
+                let fresh = st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                let claim = (member.subscription == group.subscription).then(|| {
+                    let claim = st.grant_claim(&member.subscription, ask, fresh);
+                    granted = Some(claim.id.clone());
+                    claim.recorded()
+                });
+                let event = CatalogEvent::Joined {
                     id: member.shape_id.clone(),
                     subscription: member.subscription.clone(),
                     at: now,
-                });
+                    claim: claim.flatten(),
+                };
+                if fresh {
+                    // Enqueued under the lock, so the log order matches the state order.
+                    rejoins.push(self.catalog_tx.send_durable(event));
+                    retaken.push((member.shape_id.clone(), member.subscription.clone()));
+                } else {
+                    renewals.push(event);
+                }
+            }
+            // A renewal is a touch (see `crate::retention`): it is the only sign of life a group's
+            // reader gives the engine, so every member's last-touch time moves with its lease.
+            {
+                let mut lives = self.lives.lock().unwrap();
+                let touched = std::time::Instant::now();
+                for member in &group.members {
+                    if let Some(life) = lives.get_mut(&member.shape_id) {
+                        life.last_read = touched;
+                    }
+                }
             }
             // Registration is part of the same state-locked admission as the claim check. A
             // release that wins this lock removes the lane after the renew; a release already in
@@ -3528,10 +3796,117 @@ impl Engine {
             self.group_lanes.register(&group.stream_path);
             st.publish_subscription_gauge(&self.metrics);
         }
-        for event in events {
+        for event in renewals {
             self.catalog_tx.send(event);
         }
-        Ok(true)
+        // Every group has a public member, so a claimable group was granted an identity.
+        let Some(claim) = granted else { return Ok(None) };
+        let mut rejoining = GroupRejoinGuard {
+            engine: self.clone(),
+            claims: retaken,
+            subscription: group.subscription.clone(),
+            claim: claim.clone(),
+        };
+        for durable in rejoins {
+            durable.await?;
+        }
+        rejoining.claims.clear();
+        Ok(Some(claim))
+    }
+
+    /// Claim or renew the group `subscription` holds, without reading a row: the engine half of
+    /// `POST /v1/subsets/rejoin`. `same_members` says whether a record is the group the caller
+    /// asked for (its members, in order).
+    ///
+    /// It is the renewal half of a load and nothing else. It never creates a group, and it never
+    /// retires one: a group that can no longer serve a reader (a member gone, the stream closed or
+    /// deleted) is [`GroupRejoin::Absent`] and is left for the load that follows, or retention, to
+    /// retire. `Absent` leaves no claim behind.
+    ///
+    /// A claim a re-join takes on a group nobody held is a NEW claim: its `Joined` is durable
+    /// before this returns, and the closing check after that wait is [`Self::group_is_current`],
+    /// under the lock a release begins under (see [`Self::renew_group_claim_as`]).
+    pub(crate) async fn rejoin_group(
+        &self,
+        subscription: &str,
+        ask: &ClaimAsk,
+        same_members: &(dyn Fn(&GroupRecord) -> bool + Sync),
+    ) -> Result<GroupRejoin> {
+        // Each pass answers, or re-reads the subscription's group after a teardown it waited for
+        // or a claim it lost again (a release or a lapse between the renewal and the answer).
+        const PASSES: usize = 3;
+        for _ in 0..PASSES {
+            let existing = {
+                let st = self.state.lock().await;
+                match st.group_claims.get(subscription) {
+                    Some(group) => group.clone(),
+                    // A load of this subscription is assembling its group, or compensating one:
+                    // the group may exist in a moment, so the caller retries, as a load would.
+                    None if st.group_claims.is_reserved(subscription) => {
+                        return Err(anyhow::Error::new(GroupLoadInFlight { subscription: subscription.to_string() }));
+                    }
+                    None => return Ok(GroupRejoin::Absent),
+                }
+            };
+            if !same_members(&existing) {
+                return Ok(GroupRejoin::Absent);
+            }
+            if let Some(release) = self.group_release_in_flight(&existing.id) {
+                // A teardown owns the group. Wait for it rather than claim a dying group, then
+                // read the subscription again: the record is gone, or a load replaced it.
+                release.wait().await?;
+                continue;
+            }
+            if !self.group_is_healthy(&existing).await? {
+                return Ok(GroupRejoin::Absent);
+            }
+            let Some(claim) = self.renew_group_claim_as(&existing, ask).await? else {
+                // Torn down meanwhile, or no longer claimable: the next pass says which.
+                continue;
+            };
+            let tail = self
+                .stream_tail(&existing.stream_path)
+                .await
+                .map_err(|error| anyhow::Error::new(GroupStreamUnavailable).context(error))?;
+            let Some(offset) = tail else {
+                // The stream closed between the health probe and here. Nothing can read this
+                // group any more, so the lease just taken is given back before saying so: an
+                // `Absent` answer never leaves a claim behind. It names the claim this re-join
+                // was granted, so it gives back no claim a later request took.
+                self.release_group_lease_for(subscription, &existing.id, Some(&claim)).await?;
+                return Ok(GroupRejoin::Absent);
+            };
+            // Recheck under the state lock, where a release begins: a release that has not begun
+            // by now is ordered after this answer.
+            if self.group_is_current(&existing).await {
+                return Ok(GroupRejoin::Joined { group: existing, offset, claim });
+            }
+        }
+        // The group kept losing its claim to a release or a lapse. It may well still be there, so
+        // this is a retry, not "no such group": that answer would cost the caller a snapshot.
+        Err(anyhow::Error::new(CreateRaced(format!(
+            "group of subscription '{subscription}' was released while it was being re-joined"
+        ))))
+    }
+
+    /// Whether every member of `group` exists and its claim's name is its own to hold: held by the
+    /// member already, or by nobody (the group was released, or its lease lapsed).
+    fn group_claimable(st: &EngineState, group: &GroupRecord) -> bool {
+        group.members.iter().all(|member| {
+            st.shapes.contains_key(&member.shape_id)
+                && st.subscription_owner(&member.subscription).is_none_or(|owner| owner == &member.shape_id)
+        })
+    }
+
+    /// Whether nothing holds `group`: no member has a subscription. Such a group is only being
+    /// retained (see `Engine::release_group_lease_for`), so a load that asks for other members under
+    /// its subscription may replace it.
+    pub(crate) async fn group_is_unheld(&self, group: &GroupRecord) -> bool {
+        let st = self.state.lock().await;
+        group
+            .members
+            .iter()
+            .all(|member| st.feed_shares.get(&member.shape_id).is_none_or(|share| share.refcount() == 0))
     }
 
     /// Whether `group` is still its subscription's record, no release of it has begun, and every
@@ -3547,14 +3922,11 @@ impl Engine {
             })
     }
 
+    /// Whether `group` can still serve its subscription: every member is registered and its claim
+    /// is the member's own or free to take again, and the shared stream is open. A group nobody
+    /// holds is healthy — it is what a returning client re-joins.
     pub(crate) async fn group_is_healthy(&self, group: &GroupRecord) -> Result<bool> {
-        let members_healthy = {
-            let st = self.state.lock().await;
-            group.members.iter().all(|member| {
-                st.shapes.contains_key(&member.shape_id)
-                    && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id)
-            })
-        };
+        let members_healthy = Self::group_claimable(&*self.state.lock().await, group);
         if !members_healthy {
             return Ok(false);
         }

@@ -69,7 +69,8 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). `0` disables dormancy |
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Subscription lease window: a native claim not renewed within it is released. `0` disables lease expiry |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
-| `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
+| `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Retention: how long a **live-only** shape (subquery, aggregate, changes-only feed: the kinds that cannot go dormant) may go with no subscription and no touch before it is retired from active. A touch is a create, join, renewal or engine-visible read; a lease lapse is not. Never shorter than `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`, and it only shortens the idle-plus-dormancy grace: when that grace is the shorter of the two, it still applies. `0` leaves only that grace |
+| `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: cap on **registered shapes of every kind and state** (the `engine_shapes` gauge: active, dormant and live-only shapes, each group member counted once, creates in flight included). At the cap a create that would mint a shape first evicts least-recently-read **dormant** shapes, then the longest-idle live-only shapes that have **no subscription** (a group as one unit). A subscribed shape is never evicted, and neither is a parkable shape that is still active. With nothing left to evict the create is refused with `503` and `Retry-After`; joining a shape that already exists is never refused. `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
 | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval (also drives change-log segment deletion) |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
@@ -102,6 +103,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS` | `16777216` | Bound on the record of sequenced transactions not yet seen visible (per-table sparse bitmaps, ~1 bit per transaction of dense backlog: the default is ~2 MiB). Normally a chunk or two — the visibility poller forgets what it sees visible every tick. At the bound the OLDEST recorded transactions are given up (counted as `settle.xidsDropped` and logged) and their tables are fenced: until the poller sees `xmin` pass the highest given-up xid, a snapshot of such a table is served only if its own `xmin` is past it and otherwise answers a retryable 503 (`settle.fencedTables`, `settle.overflowRefusals`); other tables are unaffected. 1048576 … 2^30 |
 | `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS` | `100` | Tick of the visibility poller (one per database, on its own dedicated connection, never a pooled one) while the record is non-empty and nobody waits; with a waiter it polls from 1 ms, backing off to 32 ms. Idle when the record is empty |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | `25` | Graceful shutdown: how long the whole drain may take before it is forced (exit `70`). Below a typical Kubernetes `terminationGracePeriodSeconds: 30`, so the engine finishes on its own terms rather than being `SIGKILL`ed part-way. Must be > 0 |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` | `5` | Graceful shutdown: how long deferred subquery work (flip query-backs, emission-lane appends, the sequencer's own flush) may keep running after the signal, so the commits already read land their effects and the subquery registry can be written for the next boot. Without it every subquery shape is dropped at restore and its clients reload. Comes **out of** the grace period; `0` = abandon that work at the signal (the registry is then written only if the engine happened to be idle). Must be < the grace; left unset it is 5 s or a fifth of the grace, whichever is shorter |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | `2` | Graceful shutdown: how long the HTTP port stays open after the signal, answering `GET /ready` with 503, so a load balancer's readiness probe observes the drain before the socket closes. Set it to at least your probe's `periodSeconds` × `failureThreshold`, or the socket closes while the poller still thinks the pod is ready. Comes **out of** the grace period, not on top of it; `0` = stop accepting at once. Must be < the grace |
 | `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
@@ -331,10 +333,10 @@ a non-zero `flipFailures`, `/v1/health` turns `degraded` (503), and `POST /shape
 deleted — clients read durable-streams directly, past the HTTP surface, so that is the only way they
 learn; the close releases a tailing long-poll at once with `stream-closed`. Observability
 (`/replication/lsn`, `/metrics*`, `/memory`, `/subqueries`, `/graph`, `/state`, `/trace`, `/tables/*`,
-`/health`) stays up. **Recovery is a restart**, which re-seeds every node from Postgres. A restart
-*drops* every subquery shape — their inner-node state is not persisted, so the catalog restore
-deliberately does not restore them — and clients recreate them with `POST /shapes`. Deleting the
-streams therefore destroys nothing a restart would have kept.
+`/health`) stays up. **Recovery is a restart.** A degraded engine never writes its subquery registry
+on the way out, so that restart *drops* every subquery shape (see *Subquery shapes across a
+restart* below) and clients recreate them with `POST /shapes`. Deleting the streams therefore
+destroys nothing a restart would have kept.
 
 **StatsD telemetry** (`statsd.rs`) is the fleet's only metrics channel — the datadog wire format
 (`name:value|type|#instance_id:<id>,...`), non-blocking (bounded channel → batched ≤1432-byte UDP
@@ -352,13 +354,15 @@ unchanged.
 | `POST /v1/shapes` · `GET/DELETE /v1/shapes/{id}` | Native shape creation/renewal, lookup and subscription release |
 | `POST /v1/subsets/query` | Native one-shot subset query |
 | `POST /v1/subset-feeds` | Native changes-only subset feed |
+| `POST /v1/subsets/load` | Native group load: one claim, one stream and one settled snapshot for several changes-only members. Repeating it under the same `subscription` and members renews or re-joins the group, and reads the snapshot again |
+| `POST /v1/subsets/rejoin` | Claim or renew the group a `subscription` already holds, with a load's body and a load's answer less `rows`, `lsn`, `snapshot` and `horizon`. Runs no Postgres query. Never creates or retires a group: `412` when the subscription holds none with those members (see "Subscriptions") |
 | `POST /v1/aggregates` | Native live scalar aggregate |
 | `GET /health` | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating") |
 | `GET /ready` | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise |
 | `POST /schema` | define the schema (library mode; Postgres mode self-configures by introspection) |
-| `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions") |
+| `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions"). The answer's `claim` is the identity of the claim; `?claim=…` on a renewal keeps it |
 | `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`, `subscription`) |
-| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash). Either form answers only once its catalog record is **durable**, so it blocks while storage is down and a timeout means "no answer", never "not done" — retry it (see *Durability of a create, and of a retirement*) |
+| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. With `&claim=…` it releases the subscription's claim only while it is the one that identity names, and is a `200` that changes nothing otherwise. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash). Either form answers only once its catalog record is **durable**, so it blocks while storage is down and a timeout means "no answer", never "not done" — retry it (see *Durability of a create, and of a retirement*) |
 | `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
 | `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
 | `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
@@ -447,12 +451,38 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
    (ADR-0003). If the ingestor is mid-transaction before the commit it simply stops, having
    appended nothing. **Shutdown never advances the slot**; at worst it costs a bounded, de-duplicated
    replay.
-4. The **sequencer** finishes the batch it is processing, flushes it, and writes a final `Offset`
-   checkpoint only if it completed a read and replay is not paused. In Postgres mode the catalog
-   writer rejects any checkpoint below the restored/last durable floor, including periodic and
-   shutdown checkpoints. It drains accepted writes (≤ 10 s) so the next boot resumes from there
-   rather than replaying since the last lazy 2 s checkpoint.
-5. Exit `0` on completion, or `71` if catalog drain or a source receipt missed the shutdown grace.
+4. The **sequencer** stops reading, finishes the batch it is processing and flushes it. What the
+   commits it has processed still owe — a flip's query-back, a batch on an emission lane — is NOT
+   cancelled at the signal: flip workers, lanes, the settle poller and reliable appends keep running
+   for `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` (5 s; the **subquery drain window**), and the
+   sequencer waits inside it for them to land.
+5. The sequencer writes a final `Offset` checkpoint, only if it completed a read and replay is not
+   paused, and never past a commit that still owes subquery effects (the newest checkpoint that owes
+   none is written instead). When nothing is owed, that `Offset` names the **subquery registry
+   state**, which is then written to its own stream — see *Subquery shapes across a restart*. In
+   Postgres mode the catalog writer rejects any checkpoint below the restored/last durable floor,
+   including periodic and shutdown checkpoints. It drains accepted writes (≤ 10 s) so the next boot
+   resumes from there rather than replaying since the last lazy 2 s checkpoint.
+6. Exit `0` on completion, or `71` if catalog drain or a source receipt missed the shutdown grace.
+
+#### Subquery shapes across a restart
+
+A subquery shape's membership is decided by in-memory state: its nodes' contributors and its own key
+set. On a graceful stop with nothing owed, the engine writes that state to
+`meta/subq-state/<nonce>` (inner sets as `(pk, value)`, key sets as pks, each stream's position) and
+names it from the final `Offset` with a record count, a size and a SHA-256. The next boot restores
+the registry from it when it verifies and the inner tables' schemas have not moved, replays the
+change log from the checkpoint through the ordinary live path, and so keeps every subquery shape
+and every group with subquery members on the stream it had: clients read on from their saved
+offsets and reload nothing. The boot uses the state once — it writes the checkpoint again naming
+nothing before the sequencer reads, and deletes the stream.
+
+A stop that could not come to rest inside the drain window, a degraded engine, and a crash write no
+state; a state that does not verify is not used. Subquery shapes are then dropped at boot as they
+always were — `Dropped`, close, delete — and their clients re-create them.
+`subquery_shapes_restored_total` / `subquery_shapes_dropped_at_restore_total` report which. For
+5,000 shapes over 500 inner sets (20,000 contributors, 300,000 uuid keys) the state is about
+14 MiB (`cargo test … restart_state_cost_at_a_realistic_size -- --ignored --nocapture`).
 
 **Streams are never closed or retired on shutdown.** A shape's stream is left exactly as it is and
 the restored shape continues it — clients see nothing, and there is no backfill storm. (Closing is
@@ -504,6 +534,47 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
   check whether it minted a given `~` id, so a returned one keeps working after the claim has lapsed,
   after it has been released, and after a restart, and a caller may name a `~` id of its own (all it
   achieves is making its own claim the expendable one).
+- **A group is released by its own id, and kept.** A group load (`POST /v1/subsets/load`) answers
+  one `shapeId`, the group's id, and one `subscription`. `DELETE /shapes/{groupId}?subscription=…`
+  releases the group's lease (every member's claim), exactly as naming one of its members' ids
+  does. Without `subscription` it is refused `409`, as an anonymous release of a member is, and a
+  `subscription` the group does not hold is the same no-op `200` it is for any shape. A released
+  group, like one whose lease lapsed, is **retained**: its members stay live and its stream stays
+  open, so a load that names the subscription again with the same members re-joins the same
+  `groupId` and stream, and its reader continues from the offset it stopped at. Asked for other
+  members, a group nobody holds gives way to the new one; a group that is held answers `409`.
+- **A group is re-joined without reading its rows.** A load reads every member's snapshot, which
+  a client that kept its rows and its stream offset throws away. `POST /v1/subsets/rejoin` takes
+  the load's body (`subscription`, required here, and `members`) and does only the claim half: it
+  takes the group's lease again, or renews it, and answers `groupId`, `shapeId`, `subscription`,
+  `leaseSeconds`, `claim`, `streamPath`, `streamUrl`, the stream's tail `offset` and `results`. It sends
+  Postgres nothing, so its cost follows the number of members, not their rows; a client uses it to
+  resume and for every lease renewal. It never creates a group and never retires one. When the
+  subscription holds no group for exactly those members (never loaded, retired, other members or
+  another order, or a group whose stream is closed) it answers `412` and has changed nothing, and
+  the client loads. `400` is a malformed request or one with no `subscription`; `503` with
+  `Retry-After` is an engine that cannot serve or a load of that subscription still in flight.
+  `group_rejoins_total` and `group_rejoins_absent_total` count the `200` and `412` answers, and each
+  request logs one `group re-join finished` event (target `electric_circuits_engine::group_rejoin`).
+- **A claim has an identity, and a release names it.** A subscription id can be used by two
+  sessions, one after the other, and a group's sessions always share theirs (the next launch
+  re-joins under the subscription the last one loaded with). So every create, load and re-join
+  answers `claim`, the identity of the claim the subscription now holds, and
+  `DELETE /shapes/{id}?subscription=…&claim=…` releases the claim only while it is that one. A
+  release an earlier session sent that arrives after a later session took the claim again, late or
+  retried, answers `200` and changes nothing: the later session's claim stays, and nothing can
+  evict its group at `ELECTRIC_CIRCUITS_MAX_SHAPES`. A session renews with `?claim=…` on the same
+  create, load or re-join: naming the claim it holds keeps the identity, so its own release still
+  works after any number of renewals. A request that names no claim, or one the subscription no
+  longer holds, is a new session's: it is answered a new identity, and the claim is its from then
+  on. This is true of a single shape, feed and aggregate as of a group.
+- **A release that names no claim is the old release.** `DELETE /shapes/{id}?subscription=…`
+  without `claim` releases whatever claim the subscription holds, as before claims had an
+  identity, so an older client or gateway keeps working and keeps the old exposure: its late
+  release drops a later session's claim. The group and its stream are kept, so the reader misses
+  nothing, and its next renewal (a third of the lease away at most) takes the claim again. Until
+  then nothing holds the group, so a create at the cap may evict it; its reader then sees
+  `stream-closed` and loads again.
 - **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
   sees them: a claim counts as live only while it is created or renewed within
   `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
@@ -685,6 +756,9 @@ gauges. Alongside the existing counters, the ops-relevant ones are:
 | `catalog_bytes` | gauge | response-body bytes read by the latest successful boot catalog fold, including JSON framing, whitespace, unknown events and duplicate events; excludes admission reads and HTTP headers. Exported as `engine_catalog_bytes` in Prometheus and logged once per successful fold as `catalog read complete` with `catalog_bytes`. This is a boot measurement, not a live size or heap estimate; metric reset preserves it |
 | `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
 | `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
+| `subquery_shapes_restored_total` | counter | subquery shapes the boot restored from the registry state the last graceful stop wrote: their streams continue and their clients reload nothing |
+| `subquery_shapes_dropped_at_restore_total` | counter | subquery shapes the boot dropped instead: the last stop wrote no usable registry state (a crash, a degraded engine, effects still in flight), or the state could not vouch for the shape. Each is a stream its clients must reload; non-zero after a planned restart means the stop did not come to rest inside `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` |
+| `subquery_state_bytes` | gauge | size of the registry state this boot restored from (0 = none). A boot measurement; metric reset preserves it |
 | `catalog_restore_retired_total` | counter | shape records retired at boot because storage answered their stream `HEAD` with 404/410 or `closed` (ADR-0011). StatsD emits the same as `electric.catalog.restore.retired.count` tagged `reason:missing` / `reason:closed`. Non-zero after a boot means a shape was orphaned by a crash (or storage lost a stream); a burst is worth a look |
 
 The three replication-slot gauges are sampled every ~10 s by an **engine-owned** sampler on a
@@ -968,13 +1042,39 @@ maintained:
   shape's stream is never closed — reactivation appends to it.)
 
 Eviction is layered, least-recently-read first: ordinary shapes retire from dormant (dormancy TTL,
-count cap, and disk budget), while active non-parkable shapes retire after the full idle+dormancy
-grace. Active ordinary shapes are never evicted: the `ELECTRIC_CIRCUITS_MAX_SHAPES` count cap (engine cost bound),
-and the disk budget (hard backstop). When a cap/budget is exceeded with nothing dormant to evict,
-the engine logs loudly and bumps the `retention_pressure` metric instead of evicting.
+count cap, and disk budget). Active ordinary shapes are never evicted, and no shape with a live
+subscription ever is.
 
-Subquery and aggregate shapes never go dormant (their state is not rebuildable from a bounded
-replay); once unsubscribed, the TTL layer instead evicts them straight from active after the same
-total grace an ordinary shape gets (idle timeout + dormancy TTL). Lifecycle state is in-memory
-today — restart recovery (persistent catalog, GH #8) will persist it. A restored dormant shape's
-dormancy age starts at process boot, so repeated restarts conservatively extend wall-clock retention.
+**Live-only shapes** (subquery shapes, aggregates, changes-only feeds and the groups made of them)
+never go dormant: their state is not rebuildable from a bounded replay, and a feed would lose the
+changes of its dormant period. They are evaluated on every change to their tables for as long as
+they are registered, subscribed or not, so the engine retires them straight from active:
+
+- **Idle**: after `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` (24 hours) with no subscription and no
+  touch. A touch is a create, join or renewal of a lease, or an engine-visible read. A lease lapse
+  is not a touch, so the period runs from the client's last renewal, and it is how long a client
+  that went away can still catch up from the feed's stream. It is never shorter than the lease.
+  The idle-plus-dormancy grace an ordinary shape gets still applies when it is the shorter one.
+- **At the cap**: `ELECTRIC_CIRCUITS_MAX_SHAPES` counts every registered shape. A create that would
+  mint a shape at the cap first evicts dormant shapes, then the longest-idle live-only shapes with
+  no subscription. With nothing left to evict, it is refused with `503` and `Retry-After`
+  (`shape_creates_refused_total`), on every create route: row shapes, feeds, aggregates and group
+  loads. The sweep applies the same order when the count is over the cap, and bumps
+  `retention_pressure` when nothing is left to evict. The disk budget still evicts dormant shapes
+  only.
+- **A group** is one unit. A lapse of any member's claim or a `DELETE` naming the group's id or a
+  member's releases every member's claim and keeps the group; the idle period and the cap then
+  retire it whole (members, shared stream and record), and never while a member is subscribed.
+
+A retired shape's reader learns it as for any eviction: `stream-closed` on the tail, then `404` or
+`410`. `/metrics` reports `shapes_evicted_<reason>_total` (`dormant_ttl`, `live_only_idle`,
+`max_shapes`, `disk_budget`, `change_log_retention`, `replay_budget`) and the gauges
+`shapes_live_<kind>_<subscribed|unsubscribed>` for the kinds `plain`, `changes_only`, `subquery`
+and `aggregate`, republished by every sweep; `/metrics/prometheus` has the same as
+`engine_shapes_evicted_by_reason_total{reason}`, `engine_shape_creates_refused_total` and
+`engine_shapes_live{kind,subscribed}`.
+
+The idle clocks are in memory: a restored shape's last touch, like a restored dormant shape's
+dormancy age, starts at process boot, so repeated restarts conservatively extend wall-clock
+retention. (A subquery shape restored from the saved registry state is retained the same way; one
+that is not restored is dropped at boot and its clients recreate it.)

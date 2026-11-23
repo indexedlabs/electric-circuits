@@ -31,6 +31,7 @@ mod memory_budget;
 pub mod metrics;
 pub mod params;
 pub mod pg;
+mod pg_temporal;
 pub mod pgoutput;
 pub mod pk_dict;
 pub mod predicate;
@@ -49,6 +50,9 @@ pub mod subq_circuit;
 // docs/notes/2026-07-16-feed-set-representation-spike.md.
 mod subq_feed;
 mod subq_index;
+// The subquery registry's durable state: written at a graceful stop, restored at the next boot so
+// subquery shapes keep their streams across a restart. See subq_state.rs.
+mod subq_state;
 pub mod subquery;
 pub mod table_ref;
 pub mod trace;

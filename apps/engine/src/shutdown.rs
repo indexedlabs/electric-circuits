@@ -30,6 +30,16 @@
 //! 4. Engine close drains the catalog, joins circuit threads and remaining tasks, and clears owned callbacks.
 //!    A source worker then drops its runtime; the standalone process reports the shutdown outcome.
 //!
+//! **The drain window.** Stopping to READ is immediate; finishing what was already read is not an
+//! abort. A commit the sequencer has processed can still have subquery effects in flight — a flip's
+//! query-back on a flip worker, a batch on an emission lane — and those are what decide whether the
+//! subquery registry can be written to storage for the next boot (`crate::subq_state`). So the
+//! tasks that carry them ([`ShutdownToken::spawn_draining`]) and the reliable appends they and the
+//! sequencer make keep running after the token flips, until the drain ends: when Engine close has
+//! seen its parties finish ([`ShutdownToken::end_drain`]), or [`ShutdownToken::set_drain_budget`]
+//! after the flip, whichever is first. The budget comes out of the grace period and defaults to
+//! zero, which is the old behaviour: everything stops at the flip.
+//!
 //! The whole thing is bounded (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`, default 25 s — under a
 //! typical Kubernetes `terminationGracePeriodSeconds: 30`), and a **second** signal during the grace
 //! period stops waiting and exits non-zero. Streams are never closed or retired on shutdown: a
@@ -79,6 +89,13 @@ pub const CATALOG_DRAIN: Duration = Duration::from_secs(10);
 /// out of the overall grace period, not on top of it.
 pub const DEFAULT_READY_DRAIN: Duration = Duration::from_secs(2);
 
+/// How long deferred subquery work — flip query-backs, emission-lane appends, the sequencer's own
+/// flush — may keep running after the token flips (the drain window; see the module docs). Long
+/// enough for the query-backs of the last commits read to land on a healthy store, which is what
+/// lets the subquery registry be written for the next boot; short enough to leave the catalog
+/// drain ([`CATALOG_DRAIN`]) its share of the grace when storage is down and nothing will land.
+pub const DEFAULT_SUBQUERY_DRAIN: Duration = Duration::from_secs(5);
+
 struct Inner {
     metrics: Arc<crate::metrics::Metrics>,
     tx: tokio::sync::watch::Sender<bool>,
@@ -91,6 +108,12 @@ struct Inner {
     tasks: std::sync::Mutex<Option<tokio::task::JoinSet<()>>>,
     restart_notify: Option<Arc<tokio::sync::Notify>>,
     restart_reason: std::sync::atomic::AtomicI32,
+    /// Flipped when the drain window is closed explicitly (see the module docs).
+    drain_ended: tokio::sync::watch::Sender<bool>,
+    /// How long after the token flips the drain window closes on its own, in milliseconds.
+    drain_budget_ms: std::sync::atomic::AtomicU64,
+    /// Tasks spawned with [`ShutdownToken::spawn_draining`] that have not finished.
+    draining: std::sync::atomic::AtomicUsize,
 }
 
 /// A cheap, cloneable handle to one Engine's shutdown state.
@@ -131,6 +154,9 @@ impl ShutdownToken {
                 tasks: std::sync::Mutex::new(Some(tokio::task::JoinSet::new())),
                 restart_notify,
                 restart_reason: std::sync::atomic::AtomicI32::new(0),
+                drain_ended: tokio::sync::watch::channel(false).0,
+                drain_budget_ms: std::sync::atomic::AtomicU64::new(0),
+                draining: std::sync::atomic::AtomicUsize::new(0),
             }),
         }
     }
@@ -191,6 +217,84 @@ impl ShutdownToken {
                 _ = future => {},
             }
         });
+    }
+
+    /// How long deferred subquery work may keep running after the token flips (see the module
+    /// docs). Set once, before anything is spawned, by whoever built the Engine from a config.
+    pub(crate) fn set_drain_budget(&self, budget: Duration) {
+        let ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+        self.inner.drain_budget_ms.store(ms, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Close the drain window now. Idempotent; only meaningful once the token has flipped.
+    pub(crate) fn end_drain(&self) {
+        self.inner.drain_ended.send_replace(true);
+    }
+
+    /// Resolves once shutdown has begun AND its drain window has closed: at [`Self::end_drain`], or
+    /// the drain budget after the flip. Immediately, if both already happened. With no budget this
+    /// is [`Self::wait`].
+    pub(crate) async fn wait_drain_end(&self) {
+        self.wait().await;
+        let budget = Duration::from_millis(self.inner.drain_budget_ms.load(std::sync::atomic::Ordering::Acquire));
+        let left = budget.saturating_sub(self.elapsed().unwrap_or_default());
+        if left.is_zero() {
+            return;
+        }
+        let mut ended = self.inner.drain_ended.subscribe();
+        tokio::select! {
+            _ = ended.wait_for(|ended| *ended) => {}
+            _ = tokio::time::sleep(left) => {}
+        }
+    }
+
+    /// Whether shutdown has begun and its drain window has closed: nothing that waits on
+    /// [`Self::wait_drain_end`] is still running.
+    pub(crate) fn drain_over(&self) -> bool {
+        if !self.is_shutting_down() {
+            return false;
+        }
+        let budget = Duration::from_millis(self.inner.drain_budget_ms.load(std::sync::atomic::Ordering::Acquire));
+        *self.inner.drain_ended.borrow() || self.elapsed().unwrap_or_default() >= budget
+    }
+
+    /// [`Self::spawn_background`] for work that must be allowed to FINISH what it holds when the
+    /// token flips: it is cancelled when the drain window closes, not when shutdown begins.
+    pub(crate) fn spawn_draining<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        struct Draining(Arc<Inner>);
+        impl Drop for Draining {
+            fn drop(&mut self) {
+                self.0.draining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+        let shutdown = self.clone();
+        self.inner.draining.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let guard = Draining(self.inner.clone());
+        self.spawn(async move {
+            let _guard = guard;
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_drain_end() => {},
+                _ = future => {},
+            }
+        });
+    }
+
+    /// Wait until every [`Self::spawn_draining`] task has stopped, or `timeout` elapses. Called by
+    /// Engine close after [`Self::end_drain`], so nothing is still inside the subquery registry
+    /// when the membership circuit is shut down under it.
+    pub(crate) async fn wait_for_drained(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while self.inner.draining.load(std::sync::atomic::Ordering::Acquire) > 0 {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        true
     }
 
     pub(crate) async fn join_tasks(&self) {
@@ -328,6 +432,31 @@ pub fn resolve_ready_drain(get: impl Fn(&str) -> Option<String>) -> anyhow::Resu
     Ok(Duration::from_secs(secs_var(&get, "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS", DEFAULT_READY_DRAIN.as_secs())?))
 }
 
+/// Resolve the subquery drain window (see [`DEFAULT_SUBQUERY_DRAIN`]) for a shutdown bounded by
+/// `grace`. `0` is legal and means "abandon deferred subquery work at the signal": correct, and it
+/// costs every subquery shape at the next boot unless the engine happened to be idle.
+///
+/// The window comes out of the grace, so an explicit value must be less than it. Left unset it is
+/// the default or a fifth of the grace, whichever is shorter — a deployment that configured a
+/// short grace must not be refused at boot for a knob it never set, and the rest of the grace
+/// still has to cover the final checkpoint and the catalog drain.
+pub fn resolve_subquery_drain(get: impl Fn(&str) -> Option<String>, grace: Duration) -> anyhow::Result<Duration> {
+    const NAME: &str = "ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS";
+    if get(NAME).is_none_or(|raw| raw.trim().is_empty()) {
+        return Ok(DEFAULT_SUBQUERY_DRAIN.min(grace / 5));
+    }
+    let drain = Duration::from_secs(secs_var(&get, NAME, DEFAULT_SUBQUERY_DRAIN.as_secs())?);
+    if drain >= grace {
+        anyhow::bail!(
+            "{NAME} ({}s) must be less than ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS ({}s): the drain comes OUT of \
+             the grace, and the final checkpoint still has to reach the catalog after it",
+            drain.as_secs(),
+            grace.as_secs(),
+        );
+    }
+    Ok(drain)
+}
+
 fn secs_var(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> anyhow::Result<u64> {
     let Some(raw) = get(name) else { return Ok(default) };
     let raw = raw.trim();
@@ -373,6 +502,90 @@ mod tests {
         assert!(t.begin(), "the first begin is the transition");
         assert!(!t.begin(), "a second signal is not a transition");
         assert!(t.is_shutting_down());
+    }
+
+    /// The subquery drain window comes out of the grace: an explicit value has to fit inside it,
+    /// and the default shrinks to fit a short grace rather than refusing a boot that set neither.
+    #[test]
+    fn the_subquery_drain_window_fits_inside_the_grace() {
+        let set =
+            |value: &'static str| move |name: &str| (name.ends_with("SUBQUERY_DRAIN_SECS")).then(|| value.to_string());
+        let unset = |_: &str| None;
+        assert_eq!(resolve_subquery_drain(unset, Duration::from_secs(25)).unwrap(), DEFAULT_SUBQUERY_DRAIN);
+        assert_eq!(resolve_subquery_drain(unset, Duration::from_secs(5)).unwrap(), Duration::from_secs(1));
+        assert_eq!(resolve_subquery_drain(set("0"), Duration::from_secs(25)).unwrap(), Duration::ZERO);
+        assert_eq!(resolve_subquery_drain(set("12"), Duration::from_secs(25)).unwrap(), Duration::from_secs(12));
+        assert!(resolve_subquery_drain(set("25"), Duration::from_secs(25)).is_err(), "all of the grace");
+        assert!(resolve_subquery_drain(set("soon"), Duration::from_secs(25)).is_err(), "not a number");
+    }
+
+    async fn is_pending(future: impl std::future::Future<Output = ()>) -> bool {
+        tokio::pin!(future);
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())).await
+    }
+
+    /// With no budget the drain window is empty: it closes the instant shutdown begins, which is
+    /// the behaviour every engine had before the window existed.
+    #[tokio::test]
+    async fn without_a_budget_the_drain_window_closes_when_shutdown_begins() {
+        let t = ShutdownToken::new();
+        assert!(is_pending(t.wait_drain_end()).await, "no shutdown, no end");
+        assert!(!t.drain_over());
+        t.begin();
+        tokio::time::timeout(Duration::from_secs(1), t.wait_drain_end()).await.expect("closed at the flip");
+        assert!(t.drain_over());
+    }
+
+    /// With a budget, deferred work outlives the signal: the window stays open until Engine close
+    /// ends it (or the budget runs out), and only then does a waiter resolve.
+    #[tokio::test]
+    async fn a_budgeted_drain_window_stays_open_until_it_is_ended() {
+        let t = ShutdownToken::new();
+        t.set_drain_budget(Duration::from_secs(3600));
+        t.begin();
+        assert!(is_pending(t.wait_drain_end()).await, "the signal alone does not close the window");
+        assert!(!t.drain_over());
+        t.end_drain();
+        tokio::time::timeout(Duration::from_secs(1), t.wait_drain_end()).await.expect("closed by end_drain");
+        assert!(t.drain_over());
+    }
+
+    /// The budget is a bound of its own: nobody has to end the window for it to close.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_window_closes_when_its_budget_runs_out() {
+        let t = ShutdownToken::new();
+        t.set_drain_budget(Duration::from_secs(5));
+        t.begin();
+        let started = tokio::time::Instant::now();
+        t.wait_drain_end().await;
+        assert!(started.elapsed() <= Duration::from_secs(5), "no later than the budget");
+    }
+
+    /// A draining task keeps running after the signal and is stopped — and accounted for — when
+    /// the window closes; a background task is stopped by the signal itself.
+    #[tokio::test]
+    async fn a_draining_task_outlives_the_signal_and_stops_with_the_window() {
+        let t = ShutdownToken::new();
+        t.set_drain_budget(Duration::from_secs(3600));
+        let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+        let (landed, mut did_land) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let draining = landed.clone();
+        t.spawn_draining(async move {
+            let _ = finished.await;
+            let _ = draining.send("draining");
+            std::future::pending::<()>().await;
+        });
+        t.spawn_background(async move {
+            std::future::pending::<()>().await;
+            let _ = landed.send("background");
+        });
+        t.begin();
+        finish.send(()).unwrap();
+        assert_eq!(did_land.recv().await, Some("draining"), "work held at the signal is finished");
+        assert!(!t.wait_for_drained(Duration::from_millis(20)).await, "and the task is still accounted for");
+        t.end_drain();
+        assert!(t.wait_for_drained(Duration::from_secs(1)).await, "it stops when the window closes");
+        assert_eq!(did_land.recv().await, None, "the background task was dropped at the signal, unfinished");
     }
 
     /// The property every `select!` arm depends on: a token flipped BEFORE the wait is awaited must

@@ -657,7 +657,58 @@ pub(crate) fn init_otel(
     engine_counter!("engine_family_steps", "Family circuit transactions", family_steps, "");
     engine_counter!("engine_shapes_dormanted", "Retention: active -> dormant transitions", shapes_dormanted, "");
     engine_counter!("engine_shapes_reactivated", "Retention: dormant -> active transitions", shapes_reactivated, "");
-    engine_counter!("engine_shapes_evicted", "Retention: dormant shapes evicted (stream deleted)", shapes_evicted, "");
+    engine_counter!("engine_shapes_evicted", "Retention: shapes evicted (stream deleted)", shapes_evicted, "");
+    {
+        let metrics = metrics.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_counter("engine_shapes_evicted_by_reason")
+            .with_description("Retention: shapes evicted (stream deleted), by reason")
+            .with_callback(move |obs| {
+                for reason in crate::retention::EvictReason::ALL {
+                    let mut labels = attributes.clone();
+                    labels.push(opentelemetry::KeyValue::new("reason", reason.as_str()));
+                    obs.observe(metrics.shapes_evicted_by_reason[reason.index()].load(Ordering::Relaxed), &labels);
+                }
+            })
+            .build();
+    }
+    engine_counter!(
+        "engine_shape_creates_refused",
+        "Creates refused at ELECTRIC_CIRCUITS_MAX_SHAPES with nothing left to evict",
+        shape_creates_refused,
+        ""
+    );
+    engine_counter!(
+        "engine_group_rejoins",
+        "Group re-joins that took or renewed a claim without reading rows",
+        group_rejoins,
+        ""
+    );
+    engine_counter!(
+        "engine_group_rejoins_absent",
+        "Group re-joins answered no such group (412); the client then loads",
+        group_rejoins_absent,
+        ""
+    );
+    {
+        let metrics = metrics.clone();
+        let attributes = attributes.clone();
+        meter
+            .u64_observable_gauge("engine_shapes_live")
+            .with_description("Live (not dormant) shapes by kind and by whether a subscription holds them")
+            .with_callback(move |obs| {
+                for kind in crate::retention::ShapeKind::ALL {
+                    for (subscribed, label) in ["false", "true"].into_iter().enumerate() {
+                        let mut labels = attributes.clone();
+                        labels.push(opentelemetry::KeyValue::new("kind", kind.as_str()));
+                        labels.push(opentelemetry::KeyValue::new("subscribed", label));
+                        obs.observe(metrics.shapes_live[kind.index()][subscribed].load(Ordering::Relaxed), &labels);
+                    }
+                }
+            })
+            .build();
+    }
     engine_counter!("engine_reactivations_started", "Dormant-shape reactivations begun", reactivations_started, "");
     engine_counter!(
         "engine_reactivations_coalesced",
@@ -711,7 +762,7 @@ pub(crate) fn init_otel(
     engine_counter!("engine_reactivation_spans", "Table-stream spans read by reactivations", reactivation_spans, "");
     engine_counter!(
         "engine_retention_pressure",
-        "Sweeps where a cap was exceeded with nothing dormant to evict",
+        "Sweeps where a cap was exceeded with nothing left to evict",
         retention_pressure,
         ""
     );
@@ -761,6 +812,24 @@ pub(crate) fn init_otel(
         "Shape records retired during catalog restore because their streams were missing or closed",
         catalog_restore_retired,
         ""
+    );
+    engine_counter!(
+        "engine_subquery_shapes_restored",
+        "Subquery shapes restored at boot from the registry state the last graceful stop wrote",
+        subquery_shapes_restored,
+        ""
+    );
+    engine_counter!(
+        "engine_subquery_shapes_dropped_at_restore",
+        "Subquery shapes dropped at boot because no usable registry state vouched for them",
+        subquery_shapes_dropped_at_restore,
+        ""
+    );
+    engine_gauge!(
+        "engine_subquery_state",
+        "Size of the subquery registry state this boot restored from (zero when it restored none)",
+        subquery_state_bytes,
+        "By"
     );
     engine_gauge!(
         "engine_catalog",

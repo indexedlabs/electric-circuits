@@ -17,6 +17,12 @@
 //! indivisible step — the borrow checker itself enforces there is no window between them (the
 //! wake-storm gate, PR #30, made structural without a cross-thread circuit hop). The §3
 //! equivalence table of the spike is the contract; [`tests`] pins it row-by-row.
+//!
+//! **What the set is not.** It records what the STREAM delivered. For a materialized shape that is
+//! what the client holds (the set is seeded with the backfill). For a `changes_only` feed it is
+//! not: the stream opens empty while the client holds a separate snapshot's rows. The registry
+//! therefore opens the gate for such a feed on a second condition — proof that the row was a member
+//! just before the change (`crate::subquery::Prior`) — which this module knows nothing about.
 
 use std::collections::HashMap;
 
@@ -60,6 +66,12 @@ impl FeedSet {
     #[cfg(test)]
     pub(crate) fn contains(&self, feed_id: i64, pk: u32) -> bool {
         self.feeds.get(&feed_id).is_some_and(|bm| bm.contains(pk))
+    }
+
+    /// Every pk id in `feed_id`, ascending: the feed as a graceful stop writes it
+    /// (`crate::subq_state`) so the next boot can restore the delete gate exactly.
+    pub(crate) fn pks(&self, feed_id: i64) -> Vec<u32> {
+        self.feeds.get(&feed_id).map(|bm| bm.iter().collect()).unwrap_or_default()
     }
 
     /// Drop a whole feed (shape teardown) — O(1), no per-pk enumeration or circuit round-trip.

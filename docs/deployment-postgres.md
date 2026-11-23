@@ -50,6 +50,15 @@ The engine sets everything else up for you on startup, per configured table:
 > instance. If you run more than one engine against the same database, give each a distinct
 > `ELECTRIC_CIRCUITS_PG_SLOT`.
 
+> **Time zone: any. Date style: ISO.** The engine works in UTC whatever the database, the role or
+> the server defaults to: its query sessions ask for `TimeZone=UTC` and `DateStyle=ISO` as they
+> start (so connect it to Postgres directly, or through a pooler that passes the `options` startup
+> parameter — a session that did not take them is refused), and replicated timestamps are respelled
+> in UTC as they arrive. The one thing it needs from the defaults is the **ISO date style for the
+> engine's role** (`ISO, MDY` is Postgres's own default): the replication connection takes no
+> startup options, and a role or database set to `German`, `SQL` or `Postgres` style is refused at
+> boot (exit `78`) with the `ALTER ROLE … SET datestyle` that fixes it.
+
 ## Step 2 — Run the engine
 
 Point it at Postgres, list the tables to watch, and give it the durable-streams URL:
@@ -96,6 +105,8 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` | no | `0` | Sliding `Stream-TTL` on every stream the engine creates (`0` = none). Must be at least twice the larger of idle-plus-dormancy and the retain window (14.5 days at the defaults), or the boot exits 78; a non-zero TTL is refused outright while idle or dormancy is `0` (disabled), and a retain window of `0` adds nothing to the floor, since dormancy eviction still unpins the segment. A keep-alive sweep, on its own timer at the `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` interval, keeps every tracked stream (`meta/catalog`, shape and group streams, retained segments) alive with a non-live tail `GET` once it has gone a quarter of the TTL without an append or read; after a boot the first sweep reads every stream nothing has read since. `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` must be under a quarter of the TTL, or the boot exits 78. `/metrics/prometheus` reports `engine_stream_ttl_touches_total`, `engine_stream_ttl_touch_failures_total` and the gauge `engine_stream_ttl_oldest_untouched_seconds`: the oldest untouched age at the latest finished sweep plus the time since, so it keeps rising if sweeps stop. |
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | no | `21600` | Dormancy idle threshold (6 hours; `0` disables dormancy). |
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | no | `1800` | Native subscription lease window (30 minutes; `0` disables lease expiry). |
+| `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | no | `86400` | How long a subquery shape, aggregate or changes-only feed may go with no subscription and no touch before it is retired (24 hours). Counted from the last create, join, renewal or engine-visible read, not from the lease lapse; never shorter than the lease; `0` leaves only the idle-plus-dormancy grace (7 days 6 hours). It is also how long a client that went away can still catch up from its feed's stream. The clock is in memory and restarts at boot. |
+| `ELECTRIC_CIRCUITS_MAX_SHAPES` | no | `10000` | Cap on registered shapes of every kind and state (the `engine_shapes` gauge; each group member counts once). At the cap a create that would mint a shape evicts dormant shapes, then the longest-idle live-only shapes with no subscription; with nothing left to evict it is refused `503` with `Retry-After` (`engine_shape_creates_refused_total`). A subscribed shape is never evicted, so set it above the peak of concurrently subscribed shapes. `0` = unlimited. |
 | `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | no | `16777216` / `67108864`, floored at `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | Client-side Durable Streams response cap. 16 MiB (four times the 4 MiB server page) when readiness advertises a page within it; 64 MiB when it advertises none, because such a store returns the whole remainder in one response and a smaller cap stalls the live loop instead of bounding it. Neither derived value is ever below the append budget (64 MiB by default): the store frames one append whole on read, so the engine must be able to read back what it writes. A value larger than the cap against a store whose `max_value_bytes` exceeds it raises the cap toward `ELECTRIC_CIRCUITS_DS_READ_MAX_CEILING_BYTES` and retries; it is never truncated. An explicit value always wins, and one below the append budget is refused at boot. |
 | `ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS` | no | `10` | Durable Streams connect deadline. |
 | `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` | no | `30` | Deadline for a bounded Durable Streams request (replay page, HEAD, append), applied both at the transport and around the replay read. |
@@ -117,6 +128,7 @@ the replication ingestor, and begins serving the control API on `ELECTRIC_CIRCUI
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
 | `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` | no | `5` | How long deferred subquery work may keep running after `SIGTERM`, so the subquery registry can be written and subquery shapes survive the restart. Comes out of the grace, must be less than it (unset: 5 s or a fifth of the grace, whichever is shorter); `0` = abandon it at the signal. |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | no | `2` | How long the port stays open after `SIGTERM` answering `/ready` with 503, so a load balancer drains first. Comes out of the grace, must be less than it; `0` = stop accepting at once. |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
@@ -347,7 +359,12 @@ perform the idempotent exact-generation promotion.
   re-delivered on the next boot and de-duplicated there. New `live=true` requests arriving during
   the drain are answered `503` + `Retry-After: 1` so clients back off to the successor instead of
   spinning. Shape streams are **never** closed or deleted on
-  shutdown — the restored shape continues its stream, so a restart costs clients nothing. The whole
+  shutdown — the restored shape continues its stream, so a restart costs clients nothing. That
+  includes subquery shapes: flip query-backs and lane appends already in flight get
+  `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` (5 s) to land, and the engine then writes its
+  subquery registry to `meta/subq-state/*` and names it from the final checkpoint, which the next
+  boot restores. A crash writes nothing: subquery shapes are then dropped at boot and their clients
+  reload (`subquery_shapes_dropped_at_restore_total`). The whole
   sequence is bounded by `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` (25 s); a second signal, or the
   grace running out, exits `70` immediately (nothing is corrupted: an unacknowledged commit is
   re-delivered and the previous checkpoint stands). Keep `terminationGracePeriodSeconds` above the

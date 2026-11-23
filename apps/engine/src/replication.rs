@@ -918,17 +918,29 @@ fn build_envelope(table: &TableRef, ts: &TableSchema, columns: &[String], msg: M
 /// Zip a pgoutput tuple with its relation's column names into a JSON object, converting each text
 /// value by the column's schema type. `UnchangedToast` cells are OMITTED so the caller can fill
 /// them from the old image; columns not in the schema are skipped.
+///
+/// A cell whose text depends on the session's time zone (`timestamptz` and containers of it) is
+/// respelled in UTC here ([`crate::pg_temporal::utc_cell`]). This is the one place the walsender's
+/// text enters the engine, and the walsender's session is the one session the engine cannot
+/// configure: `pgwire-replication` sends no startup options, so its zone is the database's, the
+/// role's or the server's default. Query sessions print UTC, and a cell has to be the same bytes
+/// by either road — the old image as much as the new one, or a retraction misses its row.
 fn tuple_to_map(tuple: &Tuple, columns: &[String], ts: &TableSchema) -> Map<String, Json> {
     let mut out = Map::new();
     for (cell, name) in tuple.iter().zip(columns) {
-        let Some(ty) = ts.index.get(name).map(|&idx| ts.columns[idx].1) else { continue };
+        let Some(&idx) = ts.index.get(name) else { continue };
+        let ty = ts.columns[idx].1;
         match cell {
             Cell::UnchangedToast => {}
             Cell::Null => {
                 out.insert(name.clone(), Json::Null);
             }
             Cell::Text(text) => {
-                out.insert(name.clone(), text_to_json(text, ty));
+                let utc = match (ty, ts.pg_types.get(idx).and_then(|t| t.as_deref())) {
+                    (ColumnType::Text, Some(pg_type)) => crate::pg_temporal::utc_cell(text, pg_type),
+                    _ => None,
+                };
+                out.insert(name.clone(), utc.map_or_else(|| text_to_json(text, ty), Json::String));
             }
         }
     }
@@ -1273,6 +1285,80 @@ mod tests {
             }));
         assert_eq!(e.value.as_ref().unwrap()["tenant"], Json::Null);
         assert_eq!(e.value.as_ref().unwrap()["name"], "a b 'c' café ☃ 北京");
+    }
+
+    /// The walsender prints a `timestamptz` in ITS session's zone, and that session takes no
+    /// startup options, so the zone is whatever the database, the role or the server defaults to.
+    /// Query sessions print UTC. One instant must reach the engine in one spelling by either
+    /// road, so replicated cells are respelled in UTC as they are decoded — new image and old
+    /// image alike, or a retraction would not match what it retracts. A text column that happens
+    /// to hold timestamp-shaped text is the application's text and is not touched.
+    #[test]
+    fn timestamptz_cells_are_decoded_in_utc_whatever_zone_the_walsender_printed_them_in() {
+        let mut columns = BTreeMap::new();
+        for (name, ty, pg_type) in [
+            ("id", ColumnType::Int, "int4"),
+            ("starts", ColumnType::Text, "timestamptz"),
+            ("marks", ColumnType::Text, "_timestamptz"),
+            ("note", ColumnType::Text, "text"),
+        ] {
+            columns.insert(name.to_string(), ColumnDef { ty, pg_type: Some(pg_type.into()), has_default: false });
+        }
+        let table = TableRef::parse("public.events").unwrap();
+        let def = TableDef { columns, primary_key: vec!["id".to_string()], fingerprint: None };
+        let ts = TableSchema::from_def(&table, &def).unwrap();
+        let names: Vec<String> = ["id", "starts", "marks", "note"].map(String::from).to_vec();
+
+        let note = "2026-10-19 01:00:00-07";
+        let in_los_angeles = |note: &str| {
+            vec![
+                t("1"),
+                t("2026-10-19 01:00:00-07"),
+                t(r#"{"2026-10-19 01:00:00-07","2026-10-20 01:30:00-07"}"#),
+                t(note),
+            ]
+        };
+        let in_utc = |note: &str| {
+            serde_json::json!({
+                "id": 1,
+                "starts": "2026-10-19 08:00:00+00",
+                "marks": r#"{"2026-10-19 08:00:00+00","2026-10-20 08:30:00+00"}"#,
+                "note": note,
+            })
+        };
+
+        let update = build_envelope(
+            &table,
+            &ts,
+            &names,
+            Message::Update {
+                rel_id: 1,
+                old: Some(OldTuple::Full(in_los_angeles(note))),
+                new: in_los_angeles("edited"),
+            },
+        )
+        .unwrap();
+        assert_eq!(update.old, Some(in_utc(note)));
+        assert_eq!(update.value, Some(in_utc("edited")));
+
+        let delete = build_envelope(
+            &table,
+            &ts,
+            &names,
+            Message::Delete { rel_id: 1, old: OldTuple::Full(in_los_angeles(note)) },
+        )
+        .unwrap();
+        assert_eq!(delete.old, Some(in_utc(note)));
+
+        // The same instants printed in another zone decode to the same bytes.
+        let in_kolkata = vec![
+            t("1"),
+            t("2026-10-19 13:30:00+05:30"),
+            t(r#"{"2026-10-19 13:30:00+05:30","2026-10-20 14:00:00+05:30"}"#),
+            t(note),
+        ];
+        let insert = build_envelope(&table, &ts, &names, Message::Insert { rel_id: 1, new: in_kolkata }).unwrap();
+        assert_eq!(insert.value, Some(in_utc(note)));
     }
 
     #[tokio::test]

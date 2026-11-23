@@ -268,10 +268,9 @@ subqueries).
    means "every computed effect has landed **or** the engine says it is degraded"), `flipFailures`
    counts it, and the engine degrades: every membership-bearing route answers 503, `/v1/health`
    reports `degraded`, every subquery shape's durable stream is deleted (clients read storage
-   directly, past the HTTP surface), and only a restart — which re-seeds every node from Postgres
-   — recovers. The restart *drops* every subquery shape (their inner-node state is not persisted,
-   so the catalog restore deliberately does not restore them); clients recreate them with
-   `POST /shapes`.
+   directly, past the HTTP surface), and only a restart recovers. A degraded engine writes no
+   registry state on the way out, so the restart *drops* every subquery shape; clients recreate
+   them with `POST /shapes`, which seeds each node from Postgres.
    A shape whose own create is still in flight has edges (registered before its backfill) but no
    installed shape to move: that work is **queued on the pending create** and replayed against the
    shape the moment it is installed, in the same step that removes the pending entry. So an inner
@@ -469,10 +468,13 @@ it and re-registers its shapes itself, so a restart is not a client re-registrat
 Plain/routed shapes resume with passthrough gates and replay the change log from the persisted
 offset (crash-window re-emission is idempotent absolute upserts); aggregates re-seed their fold
 from a fresh Postgres snapshot whose gate then skips the replayed history (circuit-served
-COUNTs re-seed from the reseeded counts pipelines). Subquery shapes are
-deliberately NOT restored — their inner-node contributor state is not persisted, and a
-fresh-seeded node cannot detect flips that happened while the engine was down (stale move-outs
-would persist forever) — so they are dropped loudly and clients recreate them. The catalog
+COUNTs re-seed from the reseeded counts pipelines). Subquery shapes are restored from the registry
+state a graceful stop writes and names from its final checkpoint — inner-node contributors, key
+sets and stream positions, then the same change-log replay (`ARCHITECTURE.md` §6, *Surviving a
+restart*). Without that state (a crash, a degraded engine, effects still in flight at the stop) they
+cannot be restored — a fresh-seeded node cannot detect flips that happened while the engine was
+down (stale move-outs would persist forever) — so they are dropped loudly and clients recreate
+them. The catalog
 stream is never compacted (append-only); if event volume ever matters, snapshot+truncate or an
 embedded KV (redb/lmdb/sled) is the natural next step. Admission decodes only event zero; the fold
 still reads every page and validates later bindings. Its response-body byte total is logged at boot

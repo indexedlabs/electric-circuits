@@ -15,7 +15,7 @@ use utoipa::{OpenApi, ToSchema};
 #[cfg(feature = "test-support")]
 use crate::engine::GroupLoadAwait;
 use crate::engine::group_load_log::{GroupLoadLog, GroupLoadPhase};
-use crate::engine::{Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
+use crate::engine::{ClaimAsk, Engine, GroupMember, GroupRecord, ShapeRecord, TableSchemaInfo, TableStats};
 use crate::predicate::PredicateJson;
 use crate::schema::Schema;
 use crate::table_ref::TableRef;
@@ -101,6 +101,10 @@ struct ShapeCreatedResponse {
     stream_url: String,
     subscription: String,
     lease_seconds: u64,
+    /// The identity of the claim this answer granted: opaque, compared only for equality. Name it
+    /// in `?claim=…` to renew the claim under the same identity, and to release this claim and no
+    /// later one.
+    claim: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -206,6 +210,7 @@ struct SubsetFeedRequest {
 #[utoipa::path(
     post,
     path = "/v1/shapes",
+    params(("claim" = Option<String>, Query, description = "The identity of the claim the caller holds under the request's subscription (the `claim` of its last answer). Named, the claim keeps that identity; omitted or stale, the answer carries a new one")),
     request_body = ShapeRequest,
     responses(
         (status = 200, description = "Shape created or renewed", body = ShapeCreatedResponse),
@@ -213,7 +218,7 @@ struct SubsetFeedRequest {
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -236,12 +241,14 @@ fn openapi_get_shape() {}
     delete,
     path = "/v1/shapes/{id}",
     params(
-        ("id" = String, Path, description = "Shape id"),
-        ("subscription" = Option<String>, Query, description = "Subscription claim to release")
+        ("id" = String, Path, description = "Shape id, or a group's id (the `shapeId` of a group load), which releases the group's lease"),
+        ("subscription" = Option<String>, Query, description = "Subscription claim to release"),
+        ("claim" = Option<String>, Query, description = "The identity of the claim to release (the `claim` of the answer that granted it). When the subscription holds another claim by now, or none, the release is accepted and changes nothing. Omitted, whatever claim the subscription holds is released")
     ),
     responses(
-        (status = 200, description = "Release accepted", body = DeleteResponse),
-        (status = 400, description = "Invalid request", body = ErrorResponse)
+        (status = 200, description = "Release accepted; also when it named a claim the subscription no longer holds", body = DeleteResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 409, description = "A group or one of its members was named without its subscription", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -265,6 +272,7 @@ fn openapi_subset_query() {}
 #[utoipa::path(
     post,
     path = "/v1/subset-feeds",
+    params(("claim" = Option<String>, Query, description = "The identity of the claim the caller holds under the request's subscription (the `claim` of its last answer). Named, the claim keeps that identity; omitted or stale, the answer carries a new one")),
     request_body = SubsetFeedRequest,
     responses(
         (status = 200, description = "Changes-only shape feed", body = ShapeCreatedResponse),
@@ -272,7 +280,7 @@ fn openapi_subset_query() {}
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -281,6 +289,7 @@ fn openapi_subset_feed() {}
 #[utoipa::path(
     post,
     path = "/v1/subsets/load",
+    params(("claim" = Option<String>, Query, description = "The identity of the claim the caller holds under the request's subscription (the `claim` of its last answer). Named, the claim keeps that identity; omitted or stale, the answer carries a new one")),
     request_body = SubsetLoadRequest,
     responses(
         (status = 200, description = "Changes-only feed and snapshot page", body = SubsetLoadResponse),
@@ -288,7 +297,7 @@ fn openapi_subset_feed() {}
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -296,7 +305,25 @@ fn openapi_subset_load() {}
 
 #[utoipa::path(
     post,
+    path = "/v1/subsets/rejoin",
+    params(("claim" = Option<String>, Query, description = "The identity of the claim the caller holds under the request's subscription (the `claim` of its last answer). Named, the claim keeps that identity; omitted or stale, the answer carries a new one")),
+    request_body = SubsetLoadRequest,
+    responses(
+        (status = 200, description = "The group's claim, taken again or renewed; no rows were read", body = SubsetRejoinResponse),
+        (status = 400, description = "Invalid request, or no subscription named", body = ErrorResponse),
+        (status = 412, description = "The subscription holds no group with these members; nothing was created or changed", body = ErrorResponse),
+        (status = 415, description = "Unsupported media type", body = ErrorResponse),
+        (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
+        (status = 503, description = "Engine unavailable, or a load of the subscription is in flight (`Retry-After`)", body = ErrorResponse)
+    )
+)]
+#[allow(dead_code)]
+fn openapi_subset_rejoin() {}
+
+#[utoipa::path(
+    post,
     path = "/v1/aggregates",
+    params(("claim" = Option<String>, Query, description = "The identity of the claim the caller holds under the request's subscription (the `claim` of its last answer). Named, the claim keeps that identity; omitted or stale, the answer carries a new one")),
     request_body = AggregateRequest,
     responses(
         (status = 200, description = "Aggregate shape", body = ShapeCreatedResponse),
@@ -304,7 +331,7 @@ fn openapi_subset_load() {}
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -337,6 +364,7 @@ fn openapi_deployment_promote() {}
         openapi_subset_query,
         openapi_subset_feed,
         openapi_subset_load,
+        openapi_subset_rejoin,
         openapi_aggregate,
         openapi_deployment_promote
     ),
@@ -356,6 +384,7 @@ fn openapi_deployment_promote() {}
         SubsetFeedRequest,
         SubsetLoadRequest,
         SubsetLoadResponse,
+        SubsetRejoinResponse,
         DeploymentPromoteRequest,
         ErrorResponse
     ))
@@ -397,6 +426,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/v1/subsets/query", post(query_subset))
         .route("/v1/subset-feeds", post(create_subset_feed))
         .route("/v1/subsets/load", post(subset_load))
+        .route("/v1/subsets/rejoin", post(subset_rejoin))
         .route("/v1/aggregates", post(create_aggregate))
         .route("/changes/position", get(changes_position))
         .route("/changes/{segment}", get(read_changes))
@@ -691,8 +721,15 @@ async fn normalize_extractor_rejection(request: axum::extract::Request, next: Ne
 }
 
 fn is_native_dto_path(path: &str) -> bool {
-    matches!(path, "/v1/shapes" | "/v1/subsets/query" | "/v1/subset-feeds" | "/v1/subsets/load" | "/v1/aggregates")
-        || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
+    matches!(
+        path,
+        "/v1/shapes"
+            | "/v1/subsets/query"
+            | "/v1/subset-feeds"
+            | "/v1/subsets/load"
+            | "/v1/subsets/rejoin"
+            | "/v1/aggregates"
+    ) || path.strip_prefix("/v1/shapes/").is_some_and(|suffix| !suffix.is_empty())
 }
 
 /// SSE stream of per-envelope [`crate::trace::TraceEvent`]s (one JSON object per `data:` line).
@@ -1188,17 +1225,43 @@ struct SubsetLoadResponse {
     lsn: String,
     snapshot: String,
     horizon: String,
+    /// The identity of the group's claim, as on `ShapeCreatedResponse`.
+    claim: String,
 }
 
-/// Create or renew one group of changes-only member shapes and read its members in one settled
-/// snapshot. The route is intentionally dark: no caller creates a group until the Record scope
+/// Documentation-only projection of the group re-join response: a load's, less `rows`, `lsn`,
+/// `snapshot` and `horizon`.
+#[derive(Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct SubsetRejoinResponse {
+    group_id: String,
+    /// The group's one shape id (equal to `groupId`); release and renew use it.
+    shape_id: String,
+    subscription: String,
+    lease_seconds: u64,
+    /// The group stream's tail when the claim was taken. A resuming client reads on from its own
+    /// stored offset, not from this one.
+    offset: String,
+    /// Members in request order: `key`, `table`, `shapeId`, `subscription`.
+    results: Vec<serde_json::Value>,
+    stream_path: String,
+    stream_url: String,
+    /// The identity of the group's claim, as on `ShapeCreatedResponse`.
+    claim: String,
+}
+
+/// Create, renew or re-join one group of changes-only member shapes and read its members in one
+/// settled snapshot. A group that was released, or whose lease lapsed, is kept until the live-only
+/// idle period or the shape cap retires it; a load that names its subscription with the same
+/// members takes it again and answers the same `groupId` and stream. The route is intentionally dark: no caller creates a group until the Record scope
 /// integration is enabled.
 async fn subset_load(
     State(engine): State<Engine>,
+    Query(claim): Query<ClaimQuery>,
     Json(req): Json<SubsetLoadReq>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     engine.ensure_not_degraded()?;
-    subset_load_group(&engine, req.subscription, req.members).await
+    subset_load_group(&engine, req.subscription, req.members, claim.ask()?).await
 }
 
 /// One-stream group form. Members still use the existing plain and subquery shape paths, while a
@@ -1210,21 +1273,23 @@ async fn subset_load_group(
     engine: &Engine,
     subscription: Option<String>,
     members: Vec<GroupMemberReq>,
+    claim: ClaimAsk,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let mut log = GroupLoadLog::start(members.iter().map(|member| member.table.as_str()));
-    let result = run_subset_load_group(engine, subscription, members, &mut log).await;
+    let result = run_subset_load_group(engine, subscription, members, &claim, &mut log).await;
     log.finish(result.as_ref().map(|_| ()).map_err(|error| error.status));
     result
 }
 
-async fn run_subset_load_group(
+/// The checks a group request must pass before it touches a claim, shared by a load and a re-join:
+/// 1..8 members, one per table, a well-formed subscription, and every member a shape and a subset
+/// read the engine's schemas accept. None of it opens Postgres or changes engine state.
+async fn validate_group_request(
     engine: &Engine,
     subscription: Option<String>,
-    members: Vec<GroupMemberReq>,
-    log: &mut GroupLoadLog,
-) -> Result<Json<serde_json::Value>, AppError> {
+    members: &[GroupMemberReq],
+) -> Result<(), AppError> {
     const MAX_GROUP_MEMBERS: usize = 8;
-    log.phase(GroupLoadPhase::Validate);
     if members.is_empty() || members.len() > MAX_GROUP_MEMBERS {
         return Err(AppError {
             status: StatusCode::BAD_REQUEST,
@@ -1233,7 +1298,7 @@ async fn run_subset_load_group(
         });
     }
     let mut tables = std::collections::HashSet::new();
-    for member in &members {
+    for member in members {
         if !tables.insert(member.table.clone()) {
             return Err(AppError {
                 status: StatusCode::BAD_REQUEST,
@@ -1242,8 +1307,8 @@ async fn run_subset_load_group(
             });
         }
     }
-    validate_new_subscription(subscription.clone())?;
-    for member in &members {
+    validate_new_subscription(subscription)?;
+    for member in members {
         let create = CreateShapeReq {
             table: member.table.clone(),
             where_: member.where_.clone(),
@@ -1261,6 +1326,30 @@ async fn run_subset_load_group(
                 retry_after: false,
             })?;
     }
+    Ok(())
+}
+
+/// Whether `existing` is the group a request names: the same members in the same order, each with
+/// the same key, table, predicate and columns.
+fn group_has_members(existing: &GroupRecord, members: &[GroupMemberReq]) -> bool {
+    existing.members.len() == members.len()
+        && existing.members.iter().zip(members).all(|(old, new)| {
+            old.key == new.key()
+                && old.table == new.table.to_string()
+                && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
+                && old.columns == new.columns
+        })
+}
+
+async fn run_subset_load_group(
+    engine: &Engine,
+    subscription: Option<String>,
+    members: Vec<GroupMemberReq>,
+    claim: &ClaimAsk,
+    log: &mut GroupLoadLog,
+) -> Result<Json<serde_json::Value>, AppError> {
+    log.phase(GroupLoadPhase::Validate);
+    validate_group_request(engine, subscription.clone(), &members).await?;
     // Capture every table the group reads before member creation begins. The completion path
     // rechecks this generation/epoch snapshot after GroupCreated is durable.
     let mut group_tables = Vec::new();
@@ -1278,22 +1367,23 @@ async fn run_subset_load_group(
     // Each pass either answers, or waits for a release of the group it read to finish and then
     // reads the subscription's group again: a same-members group that replaced it is renewed,
     // never answered as a conflict (#g-group-retry-renews).
+    let mut retakes = 0;
     while let Some(existing) = engine.group_record(&group_sub).await {
         log.group(&existing.stream_path);
         log.phase(GroupLoadPhase::Renew);
-        let same = existing.members.len() == members.len()
-            && existing.members.iter().zip(&members).all(|(old, new)| {
-                old.key == new.key()
-                    && old.table == new.table.to_string()
-                    && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
-                    && old.columns == new.columns
-            });
-        if !same {
-            return Err(AppError {
-                status: StatusCode::CONFLICT,
-                msg: format!("subscription '{}' belongs to another group", group_sub),
-                retry_after: false,
-            });
+        if !group_has_members(&existing, &members) {
+            // Other members under a subscription that HOLDS a group is the caller's conflict. A
+            // group nobody holds (released, or its lease lapsed) is only being retained for this
+            // subscription to come back to; asked for other members, it gives way to the new group.
+            if engine.group_release_in_flight(&existing.id).is_none() && !engine.group_is_unheld(&existing).await {
+                return Err(AppError {
+                    status: StatusCode::CONFLICT,
+                    msg: format!("subscription '{}' belongs to another group", group_sub),
+                    retry_after: false,
+                });
+            }
+            engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
+            continue;
         }
         if let Some(release) = engine.group_release_in_flight(&existing.id) {
             // A teardown already owns this group.  Join it before probing storage: a transient
@@ -1311,9 +1401,9 @@ async fn run_subset_load_group(
             // create path below then reserves a fresh group after teardown completes.
             release.wait().await.map_err(AppError::from)?;
         } else {
-            let renewed = engine.renew_group_claim(&existing).await.map_err(AppError::from)?;
-            let renewed_healthy = renewed && engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
-            if renewed_healthy {
+            let renewed = engine.renew_group_claim_as(&existing, claim).await.map_err(AppError::from)?;
+            let healthy = renewed.is_some() && engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
+            if let Some(granted) = renewed.filter(|_| healthy) {
                 // `None` once the stream has closed: a release that began after the renewal can
                 // have retired it while this request was between its probes.
                 #[cfg(feature = "test-support")]
@@ -1344,15 +1434,22 @@ async fn run_subset_load_group(
                     // Recheck under the state lock, where a release begins: a release that has
                     // not begun by now is ordered after this answer (#g-group-recheck).
                     if engine.group_is_current(&existing).await {
-                        return Ok(Json(group_answer(engine, &existing, &offset, page)));
+                        return Ok(Json(group_answer(engine, &existing, &offset, &granted, page)));
                     }
                 }
             }
-            // A member claim can lapse between the health probe and the renewal lock, the
-            // stream can close, or a release can begin before the answer. Treat each as an
-            // unhealthy existing group: join or start its release, then read the subscription's
-            // group again rather than answering the old stream or a conflict.
-            engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
+            // The stream can close, a member can be retired or a teardown can begin before the
+            // answer: tear the group down (or join its teardown) and read the subscription's group
+            // again rather than answering the old stream or a conflict. A group that is still
+            // healthy only lost its claims again — a release or a lapse between the renewal and
+            // the answer — and is simply taken again, a bounded number of times.
+            retakes += 1;
+            let retake = retakes < 3
+                && engine.group_release_in_flight(&existing.id).is_none()
+                && engine.group_is_healthy(&existing).await.map_err(AppError::from)?;
+            if !retake {
+                engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
+            }
         }
     }
     let group_path = engine.group_stream_path();
@@ -1365,6 +1462,9 @@ async fn run_subset_load_group(
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
+    // A new group mints one shape per member: make room under the cap before reserving. The
+    // reservation refuses the load (503 + Retry-After) when nothing may be evicted for it.
+    engine.make_room_for_group(members.len()).await;
     engine
         .reserve_group_with_id(&group_sub, &member_subscriptions, &group_path)
         .await
@@ -1374,6 +1474,7 @@ async fn run_subset_load_group(
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::AfterReservation).await;
     let mut created = Vec::with_capacity(members.len());
+    let mut group_claim = None;
     for (i, member) in members.iter().enumerate() {
         let sub = if i == 0 { group_sub.clone() } else { format!("{group_sub}:member:{i}") };
         #[cfg(feature = "test-support")]
@@ -1389,8 +1490,12 @@ async fn run_subset_load_group(
             )
             .await
         {
-            Ok((rec, _)) => {
+            Ok((rec, _, member_claim)) => {
                 reservation.member_created(&rec.id, &sub);
+                // The group's claim is its public member's, the first one.
+                if i == 0 {
+                    group_claim = member_claim;
+                }
                 created.push((rec, sub));
             }
             Err(error) => {
@@ -1468,7 +1573,9 @@ async fn run_subset_load_group(
         return Err(AppError::from(error));
     }
     reservation.complete();
-    Ok(Json(group_answer(engine, &group_record, &offset, page)))
+    // A group member always tracks its claim, so the public member's create answered an identity.
+    let group_claim = group_claim.unwrap_or_default();
+    Ok(Json(group_answer(engine, &group_record, &offset, &group_claim, page)))
 }
 
 /// A group load's answer: one `shapeId` (the group id) and stream, one snapshot fence, and the
@@ -1480,12 +1587,27 @@ fn group_answer(
     engine: &Engine,
     group: &GroupRecord,
     offset: &str,
+    claim: &str,
     page: crate::engine::SubsetBatchPage,
 ) -> serde_json::Value {
     let mut rows = Vec::new();
     for (member, member_rows) in group.members.iter().zip(page.pages) {
         rows.extend(member_rows.into_iter().map(|value| serde_json::json!({ "table": member.table, "value": value })));
     }
+    let mut answer = group_claim_answer(engine, group, offset, claim);
+    let fields = answer.as_object_mut().expect("a group answer is an object");
+    fields.insert("lsn".into(), page.lsn.into());
+    fields.insert("snapshot".into(), page.snapshot.into());
+    fields.insert("horizon".into(), page.horizon.into());
+    fields.insert("rows".into(), rows.into());
+    answer
+}
+
+/// The claim half of a group answer, which is all a re-join answers: the group's id (twice, as a
+/// load spells it), its subscription and lease, the identity of the claim this answer granted
+/// (`claim`), its stream and that stream's tail `offset`, and the members in request order. No
+/// `rows`, `lsn`, `snapshot` or `horizon`: nothing was read.
+fn group_claim_answer(engine: &Engine, group: &GroupRecord, offset: &str, claim: &str) -> serde_json::Value {
     let results = group
         .members
         .iter()
@@ -1503,15 +1625,95 @@ fn group_answer(
         "shapeId": group.id,
         "subscription": group.subscription,
         "leaseSeconds": engine.lease_seconds(),
+        "claim": claim,
         "streamUrl": engine.stream_url(&group.stream_path),
         "streamPath": group.stream_path,
         "offset": offset,
-        "lsn": page.lsn,
-        "snapshot": page.snapshot,
-        "horizon": page.horizon,
-        "rows": rows,
         "results": results,
     })
+}
+
+/// The status a re-join answers when the subscription holds no group for the members it named.
+/// One no other native route answers, so a client can tell it from a load's refusals, and one a
+/// server without the route cannot answer (that is a `404` or `405`).
+const NO_SUCH_GROUP: StatusCode = StatusCode::PRECONDITION_FAILED;
+
+/// `POST /v1/subsets/rejoin`: claim or renew the group a subscription already holds, without
+/// reading a row.
+///
+/// The body is a load's (`subscription`, which is required here, and `members`). The engine takes
+/// the group's lease again, or renews it, exactly as a load of the same request would, and answers
+/// a load's answer less the snapshot ([`group_claim_answer`]). It runs no Postgres query, so its
+/// cost and the size of its answer follow the number of members, never the group's rows: this is
+/// what a client that kept its rows and its stream offset sends to resume, and to renew its lease.
+///
+/// It never creates a group. When the subscription holds none for exactly those members (never
+/// loaded, retired, loaded with other members, or no longer readable) it answers `412` and has
+/// changed nothing; the client then loads. A load of the same subscription still in flight is a
+/// `503` with `Retry-After`, as it is for a load. Every re-join logs one `group re-join finished`
+/// event.
+async fn subset_rejoin(
+    State(engine): State<Engine>,
+    Query(claim): Query<ClaimQuery>,
+    Json(req): Json<SubsetLoadReq>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    engine.ensure_not_degraded()?;
+    let claim = claim.ask()?;
+    let started = std::time::Instant::now();
+    let tables = req.members.iter().map(|member| member.table.to_string()).collect::<Vec<_>>().join(",");
+    let member_count = req.members.len() as u64;
+    let result = run_subset_rejoin(&engine, req.subscription, req.members, &claim).await;
+    let (outcome, status, group) = match &result {
+        Ok(answer) => ("joined", None, answer.0["groupId"].as_str()),
+        Err(error) if error.status == NO_SUCH_GROUP => ("absent", Some(error.status), None),
+        Err(error) => ("error", Some(error.status), None),
+    };
+    match outcome {
+        "joined" => engine.metrics.group_rejoins.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        "absent" => engine.metrics.group_rejoins_absent.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        _ => 0,
+    };
+    // Member predicates never reach the event, as for a load.
+    tracing::info!(
+        target: "electric_circuits_engine::group_rejoin",
+        group,
+        tables = %tables,
+        member_count,
+        outcome,
+        status = status.map(|status| u64::from(status.as_u16())),
+        total_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "group re-join finished"
+    );
+    result
+}
+
+async fn run_subset_rejoin(
+    engine: &Engine,
+    subscription: Option<String>,
+    members: Vec<GroupMemberReq>,
+    claim: &ClaimAsk,
+) -> Result<Json<serde_json::Value>, AppError> {
+    // A re-join names the claim it takes: with none there is no group to look for, and minting
+    // one, as a load does, would only ever answer "no such group".
+    let Some(subscription) = subscription else {
+        return Err(AppError {
+            status: StatusCode::BAD_REQUEST,
+            msg: "subscription is required: a re-join names the group's claim".into(),
+            retry_after: false,
+        });
+    };
+    validate_group_request(engine, Some(subscription.clone()), &members).await?;
+    let _control = engine.admit_control()?;
+    match engine.rejoin_group(&subscription, claim, &|existing| group_has_members(existing, &members)).await? {
+        crate::engine::GroupRejoin::Joined { group, offset, claim } => {
+            Ok(Json(group_claim_answer(engine, &group, &offset, &claim)))
+        }
+        crate::engine::GroupRejoin::Absent => Err(AppError {
+            status: NO_SUCH_GROUP,
+            msg: format!("subscription '{subscription}' holds no group with these members; load it"),
+            retry_after: false,
+        }),
+    }
 }
 
 /// A changes-only feed uses the same shape lifecycle and subscription semantics as a materialized
@@ -1519,10 +1721,11 @@ fn group_answer(
 /// the engine, rather than being inferred from a path in the engine core.
 async fn create_subset_feed(
     State(engine): State<Engine>,
+    claim: Query<ClaimQuery>,
     Json(mut req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
     req.changes_only = true;
-    create_shape(State(engine), Json(req)).await
+    create_shape(State(engine), claim, Json(req)).await
 }
 
 async fn define_schema(
@@ -1596,6 +1799,44 @@ fn validate_new_subscription(sub: Option<String>) -> Result<Option<String>, AppE
     validate_subscription(sub)
 }
 
+/// `?claim=…` on a create, a load or a re-join: the identity of the claim the caller holds under
+/// the subscription its body names — the `claim` of the answer that granted or last renewed it.
+///
+/// A query parameter, not a body member, so the request body a client repeats to renew stays the
+/// one it created with, and so a gateway that validates bodies strictly needs no new member to
+/// pass an older client's request through.
+#[derive(Deserialize)]
+struct ClaimQuery {
+    #[serde(default)]
+    claim: Option<String>,
+}
+
+impl ClaimQuery {
+    /// What this native request says about its claim (see `EngineState::grant_claim`).
+    fn ask(self) -> Result<ClaimAsk, AppError> {
+        Ok(ClaimAsk::Native(validate_claim(self.claim)?))
+    }
+}
+
+/// The checks a claim identity must pass wherever a caller names one. The engine mints them (16
+/// hex digits today) and compares them only for equality, so the limits are those of anything
+/// that travels through a URL and a log line: not empty, at most 64 bytes, no control characters.
+/// A well-formed identity the engine never minted is simply one no claim has.
+fn validate_claim(claim: Option<String>) -> Result<Option<String>, AppError> {
+    let Some(claim) = claim else { return Ok(None) };
+    let bad = |msg: &str| AppError { status: StatusCode::BAD_REQUEST, msg: msg.to_string(), retry_after: false };
+    if claim.is_empty() {
+        return Err(bad("claim must not be empty (omit it when you hold none)"));
+    }
+    if claim.len() > 64 {
+        return Err(bad("claim must be at most 64 bytes"));
+    }
+    if claim.chars().any(char::is_control) {
+        return Err(bad("claim must not contain control characters"));
+    }
+    Ok(Some(claim))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShapeResp {
@@ -1613,6 +1854,11 @@ struct ShapeResp {
     /// The renewal cadence is the server's to set, so clients read it from here rather than guess.
     #[serde(skip_serializing_if = "Option::is_none")]
     lease_seconds: Option<u64>,
+    /// The identity of the claim this create granted or renewed (ADR-0008, "A claim has an
+    /// identity"). Renew with `?claim=…` to keep it; release with `?subscription=…&claim=…` to
+    /// release this claim and no later one. Absent on `GET /shapes/{id}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim: Option<String>,
     /// Retention lifecycle: `active` | `deactivating` | `dormant` | `reactivating` (see
     /// `crate::retention`). Shapes handed out by create are always active.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1633,17 +1879,19 @@ impl ShapeResp {
             stream_url,
             subscription: None,
             lease_seconds: None,
+            claim: None,
             state: None,
             subscriptions: None,
         }
     }
 
-    /// A create's answer: the record plus the subscription it was taken under and the lease window
-    /// that subscription must be renewed within.
-    fn created(engine: &Engine, rec: ShapeRecord, subscription: String) -> Self {
+    /// A create's answer: the record plus the subscription it was taken under, the lease window
+    /// that subscription must be renewed within, and the identity of the claim it holds.
+    fn created(engine: &Engine, rec: ShapeRecord, subscription: String, claim: Option<String>) -> Self {
         ShapeResp {
             subscription: Some(subscription),
             lease_seconds: Some(engine.lease_seconds()),
+            claim,
             ..ShapeResp::of(engine, rec)
         }
     }
@@ -1677,6 +1925,7 @@ async fn list_tables(State(engine): State<Engine>) -> Json<TablesResp> {
 
 async fn create_shape(
     State(engine): State<Engine>,
+    Query(claim): Query<ClaimQuery>,
     Json(req): Json<CreateShapeReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
     // Degradation outranks request validation: a degraded engine cannot safely answer for any
@@ -1685,10 +1934,12 @@ async fn create_shape(
     let _control = engine.admit_control()?;
     validate_create_shape_request(&engine, &req).await?;
     let subscription = validate_new_subscription(req.subscription)?;
+    let claim = claim.ask()?;
     // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
-    let (rec, sub) =
-        engine.create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription).await?;
-    Ok(Json(ShapeResp::created(&engine, rec, sub)))
+    let (rec, sub, claim) = engine
+        .create_shape_claimed(&req.table, req.where_, req.columns, req.changes_only, true, subscription, claim)
+        .await?;
+    Ok(Json(ShapeResp::created(&engine, rec, sub, claim)))
 }
 
 enum CreateShapeRequestError {
@@ -1739,13 +1990,16 @@ struct AggregateReq {
 /// Create a scalar aggregation shape (electric-circuits extension; not in the Electric protocol).
 async fn create_aggregate(
     State(engine): State<Engine>,
+    Query(claim): Query<ClaimQuery>,
     Json(req): Json<AggregateReq>,
 ) -> Result<Json<ShapeResp>, AppError> {
     engine.ensure_not_degraded()?;
     let _control = engine.admit_control()?;
     let subscription = validate_new_subscription(req.subscription)?;
-    let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
-    Ok(Json(ShapeResp::created(&engine, rec, sub)))
+    let claim = claim.ask()?;
+    let (rec, sub, claim) =
+        engine.create_aggregate_claimed(&req.table, req.where_, req.func, req.col, subscription, claim).await?;
+    Ok(Json(ShapeResp::created(&engine, rec, sub, claim)))
 }
 
 async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Result<Json<ShapeResp>, AppError> {
@@ -1948,12 +2202,28 @@ struct ReleaseShapeQuery {
     /// identified one. Ignored with `?purge=true`, which removes the whole shape.
     #[serde(default)]
     subscription: Option<String>,
+    /// Which CLAIM of that subscription to release: the `claim` of the answer that granted it. A
+    /// subscription id can be shared by two sessions, one after the other (a group's launches
+    /// always share theirs), so the id alone cannot say whose claim a late or retried release
+    /// means. With `claim`, a release for an earlier claim than the one held is answered `200` and
+    /// changes nothing. Omitted = whatever claim the subscription holds, as before claims had an
+    /// identity. Needs `subscription`; ignored with `?purge=true`.
+    #[serde(default)]
+    claim: Option<String>,
 }
 
 /// `DELETE /shapes/{id}?subscription=…` = unsubscribe. Releases THAT subscription — repeating it is
 /// a no-op, so a caller whose response was lost may safely retry — and the shape itself is retained
 /// and follows the retention lifecycle (idle → dormant → evicted; see `crate::retention`). Without
 /// `subscription` it is the legacy anonymous decrement.
+///
+/// With `&claim=…` it releases that subscription's claim only if it is still the one the caller
+/// was granted (`Engine::release_claim_durable`, `Engine::release_group_lease_for`): repeating it
+/// after a later session took the claim again is a no-op too.
+///
+/// A **group** is released by its own id (the `shapeId` of the load) or by a member's: every
+/// member's claim goes, and the group is retained like any live-only shape nobody holds, so the
+/// same subscription re-joins the same stream (`Engine::release_group_lease_for`).
 ///
 /// With `?purge=true` it instead force-drops the shape immediately (subscribed clients recreate via
 /// the normal 404 / must-refetch path).
@@ -1975,16 +2245,36 @@ async fn release_shape(
         engine.purge_shape_durable(&id).await?;
     } else {
         let subscription = validate_subscription(q.subscription)?;
+        let claim = validate_claim(q.claim)?;
+        if claim.is_some() && subscription.is_none() {
+            // A claim is one subscription's: without the subscription there is nothing it names,
+            // and the anonymous decrement must not be dressed up as a precise release.
+            return Err(AppError {
+                status: StatusCode::BAD_REQUEST,
+                msg: "claim names a subscription's claim: send subscription with it".into(),
+                retry_after: false,
+            });
+        }
         if let Some(subscription) = subscription.as_deref()
             && let Some(group) = engine.group_record(subscription).await
-            && group.members.iter().any(|member| member.shape_id == id)
+            && (group.id == id || group.members.iter().any(|member| member.shape_id == id))
         {
-            // The group claim is the only public lease.  Its private member claims are
-            // released together and each durable release is idempotent, so a cancelled or
-            // retried DELETE cannot leave a hidden member alive.
-            engine.release_group_claim(subscription, &group.id).await?;
+            // The group claim is the only public lease, and a group load answers the GROUP's id
+            // as its `shapeId`: that is the id a client releases with, so it releases the group's
+            // lease exactly as naming one of its members does. The private member claims are
+            // released together and each durable release is idempotent, so a cancelled or retried
+            // DELETE cannot leave a hidden member subscribed.
+            engine.release_group_lease_for(subscription, &group.id, claim.as_deref()).await?;
+        } else if subscription.is_none() && engine.group_record_by_id(&id).await.is_some() {
+            // A release that names no claim is refused for a group, as it is for a group's member
+            // (`release_subscription_inner`): the anonymous decrement must not be a way around
+            // the one claim that owns the group.
+            return Err(AppError::from(anyhow::Error::new(crate::engine::GroupConflict {
+                subscription: format!("shape:{id}"),
+                owner: "group claim".to_string(),
+            })));
         } else {
-            engine.release_subscription_durable(&id, subscription.as_deref()).await?;
+            engine.release_claim_durable(&id, subscription.as_deref(), claim.as_deref()).await?;
         }
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -2280,6 +2570,9 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()
             || e.downcast_ref::<crate::engine::GroupStreamUnavailable>().is_some()
             || e.downcast_ref::<crate::engine::GroupLoadInFlight>().is_some()
+            // At the shape cap with nothing left to evict: the request is fine, and it succeeds
+            // once a subscription is released or lapses.
+            || e.downcast_ref::<crate::engine::ShapeCapReached>().is_some()
             || e.downcast_ref::<crate::deployment::OwnershipBackend>().is_some()
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::PrecloseRequired))
             || matches!(ownership_error, Some(crate::deployment::OwnershipError::FreshReceiptRequired));
@@ -2628,6 +2921,17 @@ mod tests {
         assert!(!degraded.retry_after);
         assert!(preclose.retry_after);
         assert!(fresh.retry_after);
+    }
+
+    /// A create refused at `ELECTRIC_CIRCUITS_MAX_SHAPES` is the engine being full, not broken: the
+    /// same request succeeds once a subscription is released, so it answers `503` + `Retry-After`.
+    #[test]
+    fn a_create_refused_at_the_shape_cap_is_retryable() {
+        let refused: AppError =
+            anyhow::Error::new(crate::engine::ShapeCapReached { shapes: 20_000, wanted: 1, max_shapes: 20_000 }).into();
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(refused.retry_after);
+        assert!(refused.msg.contains("ELECTRIC_CIRCUITS_MAX_SHAPES"), "{}", refused.msg);
     }
 
     #[tokio::test]

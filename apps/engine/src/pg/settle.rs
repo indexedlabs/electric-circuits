@@ -796,7 +796,9 @@ impl SequencedXids {
     /// Start the poller if it is not running (never started, or its runtime went away). A set with
     /// no URL, or a caller outside a Tokio runtime, has none.
     fn ensure_poller(self: &Arc<Self>) {
-        if self.shutdown.is_shutting_down() {
+        // The poller outlives the shutdown signal by the drain window: a flip's query-back that is
+        // being finished inside it still takes settled snapshots (`ShutdownToken::wait_drain_end`).
+        if self.shutdown.drain_over() {
             return;
         }
         let Some(url) = self.url.clone() else { return };
@@ -810,7 +812,7 @@ impl SequencedXids {
         let set = self.clone();
         let shutdown = self.shutdown.clone();
         *slot = Some(self.shutdown.spawn(async move {
-            tokio::select! { _ = shutdown.wait() => {}, _ = poll_visibility(set, url) => {} }
+            tokio::select! { _ = shutdown.wait_drain_end() => {}, _ = poll_visibility(set, url) => {} }
         }));
     }
 
