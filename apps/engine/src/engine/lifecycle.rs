@@ -1479,6 +1479,10 @@ impl Engine {
     pub(crate) async fn renew_subscription_local(&self, id: &str, sub: &str) {
         let mut st = self.state.lock().await;
         st.subscribe(id, sub.to_string(), crate::changelog::now_secs());
+        drop(st);
+        // The Electric adapter can see reads that native durable-stream subscribers cannot. A
+        // poll is therefore both a lease renewal and a live-only retention touch.
+        self.touch_shape(id);
     }
 
     /// Record an engine-visible read of a shape (drives the retention idle timer + LRU order).
@@ -2042,7 +2046,7 @@ impl Engine {
     /// Evict a shape: delete its record, share entries, lifecycle entry, and durable stream. A
     /// returning `/v1/shape` client gets `409 must-refetch`; an extended-API client gets `404` and
     /// recreates. Normally only **dormant** shapes are evicted; the exception is non-parkable
-    /// shapes (subquery / aggregate — see [`crate::retention`]), which the TTL layer evicts
+    /// shapes (subquery / aggregate — see [`crate::retention`]), which the live-only layer evicts
     /// straight from active with a full teardown. Rechecks eligibility under the locks — a
     /// reactivation, rejoin or newer touch racing the sweep wins.
     pub(crate) async fn evict_shape(&self, id: &str, reason: EvictReason) -> Result<Evicted> {
@@ -2152,8 +2156,8 @@ impl Engine {
         if plan.over_capacity {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
-                 every shape is actively subscribed or recently read; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
+                "retention: {} shapes exceed max_shapes={} but no eligible dormant shape is left to evict — \
+                 grouped members and live-only shapes remain protected; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
                 snapshot.len(),
                 cfg.max_shapes
             );
@@ -2161,7 +2165,7 @@ impl Engine {
         if plan.over_budget {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                "retention: shape streams exceed the disk budget ({} bytes) but nothing dormant is left to evict — \
+                "retention: shape streams exceed the disk budget ({} bytes) but no eligible dormant shape is left to evict — \
                  raise ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB or lower the idle timeout",
                 cfg.disk_budget_bytes
             );
@@ -2277,8 +2281,9 @@ impl Engine {
     /// This is the only liveness signal the engine has for a native subscriber. Its reads go
     /// straight to durable-streams, so an un-renewed subscription is indistinguishable from a
     /// client that vanished — and treating it as live pins the shape (and its stream, and its
-    /// change-log segment) for ever. A shape whose live set empties this way then follows the
-    /// ordinary lifecycle: idle → dormant → evicted, with the same grace as any other.
+    /// change-log segment) for ever. A plain shape whose live set empties this way follows the
+    /// ordinary lifecycle: idle → dormant → evicted; a live-only shape is retired from active
+    /// after its configured live-only period.
     ///
     /// A lapse is a `Left` like any other, marked `lapsed` so the durable record says who released
     /// it. `subscription_lease_timeout == 0` disables lease expiry; dormancy is controlled
@@ -4759,6 +4764,75 @@ mod subscription_tests {
         assert_eq!(refcount(&engine, "s1").await, 1);
     }
 
+    /// A renewal visible to the engine resets the live-only clock as well as the lease. Once the
+    /// lease later lapses, the aggregate remains for a full live-only period after that renewal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewing_a_live_only_shape_delays_retirement_until_after_the_renewal() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let now = crate::changelog::now_secs();
+        {
+            let mut st = engine.state.lock().await;
+            let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+            drop(ready_tx);
+            let rec = ShapeRecord {
+                id: "aggregate-renewal".into(),
+                table: "items".into(),
+                stream_path: "shape/aggregate-renewal".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: Some(AggInfo { func: AggFn::Count, col: None }),
+                fingerprint: None,
+                backfill_rows: None,
+                backfill_bytes: None,
+            };
+            st.shapes.insert(rec.id.clone(), rec.clone());
+            st.feed_shares.insert(
+                rec.id.clone(),
+                FeedShare { sig: "aggregate-renewal-signature".into(), subs: Default::default(), ready },
+            );
+            st.subscribe(&rec.id, "renewed".into(), now - 10);
+        }
+        engine.lives.lock().unwrap().insert(
+            "aggregate-renewal".into(),
+            ShapeLife {
+                last_read: std::time::Instant::now() - std::time::Duration::from_secs(10),
+                state: LifeState::Active,
+            },
+        );
+        engine.retention = std::sync::Arc::new(crate::retention::RetentionConfig {
+            live_only_idle: std::time::Duration::from_secs(2),
+            subscription_lease_timeout: std::time::Duration::from_secs(1),
+            ..crate::retention::RetentionConfig::default()
+        });
+
+        engine.renew_subscription_local("aggregate-renewal", "renewed").await;
+        assert!(
+            engine.lives.lock().unwrap()["aggregate-renewal"].last_read.elapsed() < std::time::Duration::from_secs(1),
+            "renewal advances the live-only clock"
+        );
+
+        // Simulate the lease expiring after the renewal. The shape is now unheld, but its renewed
+        // live-only clock is fresh, so this sweep must leave the aggregate in place.
+        {
+            let mut st = engine.state.lock().await;
+            st.subscribe("aggregate-renewal", "renewed".into(), now - 2);
+        }
+        engine.retention_sweep().await;
+        assert!(engine.get_shape("aggregate-renewal").await.is_some(), "the post-renewal idle period still applies");
+
+        // Move the clock beyond the configured period and run the ordinary sweep again: now the
+        // same feed is retired as live-only idle.
+        engine.lives.lock().unwrap()["aggregate-renewal"].last_read =
+            std::time::Instant::now() - std::time::Duration::from_secs(3);
+        engine.retention_sweep().await;
+        assert!(engine.get_shape("aggregate-renewal").await.is_none(), "the period after renewal has elapsed");
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
     /// The boundary belongs to the client: a one-second window must last at least one second. The
     /// lease clock is wall-clock SECONDS, so a claim renewed at `now` and swept at `now + 1` has an
     /// age of "1" that may be a millisecond of real time — lapsing on `>=` would cut every window
@@ -4811,6 +4885,61 @@ mod subscription_tests {
         };
         engine.sweep_leases(&cfg).await;
         assert_eq!(refcount(&engine, "s1").await, 1);
+    }
+
+    /// The engine path retires an abandoned aggregate from active after the live-only period and
+    /// records the dedicated reason, rather than waiting for the dormant TTL (aggregates never park).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retention_sweep_retires_an_idle_aggregate() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        {
+            let mut st = engine.state.lock().await;
+            let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+            drop(ready_tx);
+            let rec = ShapeRecord {
+                id: "aggregate-idle".into(),
+                table: "items".into(),
+                stream_path: "shape/aggregate-idle".into(),
+                changes_only: false,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: Some(AggInfo { func: AggFn::Count, col: None }),
+                fingerprint: None,
+                backfill_rows: None,
+                backfill_bytes: None,
+            };
+            st.shapes.insert(rec.id.clone(), rec.clone());
+            st.feed_by_sig.insert("aggregate-signature".into(), rec.id.clone());
+            st.feed_shares.insert(
+                rec.id.clone(),
+                FeedShare { sig: "aggregate-signature".into(), subs: Default::default(), ready },
+            );
+        }
+        engine.lives.lock().unwrap().insert(
+            "aggregate-idle".into(),
+            ShapeLife {
+                last_read: std::time::Instant::now() - std::time::Duration::from_secs(2),
+                state: LifeState::Active,
+            },
+        );
+        engine.retention = std::sync::Arc::new(crate::retention::RetentionConfig {
+            live_only_idle: std::time::Duration::from_secs(1),
+            subscription_lease_timeout: std::time::Duration::ZERO,
+            ..crate::retention::RetentionConfig::default()
+        });
+
+        engine.retention_sweep().await;
+
+        assert!(engine.get_shape("aggregate-idle").await.is_none(), "the idle aggregate is retired by the sweep");
+        assert_eq!(
+            engine.metrics.shapes_evicted_by_reason[EvictReason::LiveOnlyIdle.index()]
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        engine.close(std::time::Duration::from_secs(1)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5323,6 +5452,57 @@ mod subscription_tests {
         }
         drop(st);
         (engine, group)
+    }
+
+    /// A retention sweep marks group ownership once in its snapshot and leaves every member
+    /// alone while the settled group record still owns the shared stream, even after all member
+    /// claims have been released.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_sweep_leaves_released_group_members_alone() {
+        let server = FakeDs::start().await;
+        let (engine, group) =
+            engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 3, true).await;
+        {
+            let mut st = engine.state.lock().await;
+            for member in &group.members {
+                st.unsubscribe(&member.shape_id, &member.subscription);
+            }
+        }
+        {
+            let mut lives = engine.lives.lock().unwrap();
+            for member in &group.members {
+                lives.insert(
+                    member.shape_id.clone(),
+                    ShapeLife {
+                        last_read: std::time::Instant::now() - std::time::Duration::from_secs(2),
+                        state: LifeState::Active,
+                    },
+                );
+            }
+        }
+        engine.retention = std::sync::Arc::new(crate::retention::RetentionConfig {
+            live_only_idle: std::time::Duration::from_secs(1),
+            subscription_lease_timeout: std::time::Duration::ZERO,
+            ..crate::retention::RetentionConfig::default()
+        });
+
+        engine.retention_sweep().await;
+
+        for member in &group.members {
+            assert!(
+                engine.get_shape(&member.shape_id).await.is_some(),
+                "{} remains owned by the group",
+                member.shape_id
+            );
+        }
+        assert!(engine.group_record(&group.subscription).await.is_some(), "the settled group still owns its members");
+        assert_eq!(server.deletes_of(&group.stream_path), 0, "the sweep never retires the shared group stream");
+        assert_eq!(
+            engine.metrics.shapes_evicted_by_reason[EvictReason::LiveOnlyIdle.index()]
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        engine.close(std::time::Duration::from_secs(1)).await;
     }
 
     /// Prod, 2026-11-01: releasing a group retired its one stream once per member and once more for

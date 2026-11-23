@@ -2,8 +2,8 @@
 //
 // A shape that cannot park (a subquery shape, an aggregate or a changes-only feed)
 // is evaluated on every change to its tables for as long as it is registered, subscribed or not.
-// Three rules keep that bounded between restarts, each checked here against the real engine,
-// Postgres and durable-streams through public signals only:
+// The live-only retirement rule keeps that bounded between restarts; this file checks it against
+// the real engine, Postgres and durable-streams through public signals only:
 //
 //   1. An unsubscribed live-only shape is retired after the live-only idle period
 //      (`ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS`), counted from its last touch. A lease lapse is not
@@ -17,7 +17,7 @@
 import type { Schema } from '@electric-circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { lockTable, pgQuery, readEnvelopes, tableLockWaiters, waitFor } from './engine-native.js'
+import { lockTable, pgQuery, readEnvelopes, sleep, tableLockWaiters, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -53,7 +53,6 @@ async function boot(engineEnv: Record<string, string>): Promise<Harness> {
 
 interface Answer {
   status: number
-  retryAfter: string | null
   body: Record<string, unknown>
 }
 
@@ -66,7 +65,6 @@ async function engine(method: string, path: string, body?: unknown): Promise<Ans
   const text = await res.text()
   return {
     status: res.status,
-    retryAfter: res.headers.get('retry-after'),
     body: text ? (JSON.parse(text) as Record<string, unknown>) : {},
   }
 }
@@ -79,6 +77,9 @@ interface Feed {
 
 const feed = (where: unknown, subscription: string) =>
   engine('POST', '/v1/subset-feeds', { table: 'items', where, subscription })
+
+const aggregate = (subscription: string) =>
+  engine('POST', '/v1/aggregates', { table: 'items', fn: 'count', subscription })
 
 const shapeStatus = async (id: string) => (await engine('GET', `/shapes/${encodeURIComponent(id)}`)).status
 
@@ -133,8 +134,8 @@ describe('an unsubscribed live-only feed is retired after the live-only idle per
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
       ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '8',
-      // The explicit period keeps this feed around long enough to observe its live behavior before
-      // the one-second subscription lease floor permits retirement.
+      // The explicit 8-second period, rather than the one-second lease floor, keeps this feed
+      // around long enough to observe its live behavior before retirement.
       ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
       ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '3600',
     })
@@ -216,7 +217,7 @@ describe('live-shape gauges are refreshed by ordinary retention sweeps', () => {
       ELECTRIC_CIRCUITS_MAX_SHAPES: '10',
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '0',
+      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
       ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '3',
     })
     const held = await feed(inList(1), 'gauge-held')
@@ -241,3 +242,30 @@ describe('live-shape gauges are refreshed by ordinary retention sweeps', () => {
   }, 90000)
 })
 
+describe('aggregate live-only retention', () => {
+  it('keeps a renewed aggregate through lease lapse, then retires it after the renewal period', async () => {
+    const h = await boot({
+      ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
+      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '3',
+    })
+    const first = await aggregate('aggregate-renewed')
+    expect(first.status, JSON.stringify(first.body)).toBe(200)
+    const feed = first.body as unknown as Feed
+
+    // Let the original live-only period pass, then renew the native claim. The renewal is a
+    // touch, so a later lease lapse does not immediately retire the aggregate.
+    await sleep(2200)
+    const renewed = await aggregate('aggregate-renewed')
+    expect(renewed.status, JSON.stringify(renewed.body)).toBe(200)
+    expect((renewed.body as unknown as Feed).shapeId).toBe(feed.shapeId)
+
+    await waitFor(
+      async () => (await engine('GET', `/shapes/${feed.shapeId}`)).body.subscriptions === 0,
+      'the renewed aggregate lease to lapse',
+    )
+    expect(await shapeStatus(feed.shapeId), 'the live-only period starts at the renewal').toBe(200)
+    await waitFor(async () => (await shapeStatus(feed.shapeId)) === 404, 'the renewed aggregate to be retired', 10000)
+    expect(await counter('shapes_evicted_live_only_idle_total')).toBe(1)
+  }, 90000)
+})
