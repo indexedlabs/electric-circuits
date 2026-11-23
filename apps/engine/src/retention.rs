@@ -28,9 +28,8 @@
 //!    idle-plus-dormancy grace a parkable shape gets when that is shorter.
 //! 2. **`max_shapes` count cap** (engine cost bound): when the total shape count exceeds
 //!    [`RetentionConfig::max_shapes`], evict least-recently-read dormant shapes until under, then
-//!    the longest-idle live-only shapes that have no subscription. Group-owned members are left
-//!    to the group retention/re-join contract, and are never selected here. A subscribed shape
-//!    is never evicted, and neither is a parkable shape that is still active.
+//!    the longest-idle live-only shapes that have no subscription (a group as one unit). A
+//!    subscribed shape is never evicted, and neither is a parkable shape that is still active.
 //!    When nothing is left to evict, a create that would mint a NEW shape is refused
 //!    (`503` + `Retry-After`); joining an existing shape is not.
 //! 3. **Disk budget** (hard backstop): when the tracked shape-stream bytes exceed
@@ -301,7 +300,7 @@ pub struct SweepShape {
     /// does not evict it from active.
     pub lease_tracked: bool,
     /// The id of the group this shape is a member of, if any. A group shares one stream and one
-    /// lease, so this issue's evictor leaves every member to the group retention/re-join path.
+    /// lease, so it is retired as a unit and only when no member is subscribed.
     pub group: Option<String>,
     /// Tracked bytes appended to the shape's stream (engine-side accounting).
     pub stream_bytes: u64,
@@ -427,27 +426,41 @@ pub struct SweepPlan {
     pub over_budget: bool,
 }
 
-/// Live-only shapes that nothing holds and are safe for this issue to retire. Group-owned shapes
-/// are intentionally absent: their shared-stream retention and re-join contract belongs to
-/// OTTO-13834.
+/// Live-only shapes that nothing holds, in the unit they are retired in: a shape on its own, or a
+/// whole group. `idle` is the time since the unit's most recent touch.
 struct Unheld<'a> {
     idle: Duration,
     members: Vec<&'a SweepShape>,
+    /// Every member has a subscription set, so "no subscription" is a fact about it and not the
+    /// absence of bookkeeping. The cap evicts only such units.
     lease_tracked: bool,
 }
 
 /// The unheld live-only units of a snapshot, longest idle first.
 ///
-/// A group-owned shape is never selected here, even when all its members are unheld. The engine
-/// snapshot marks records and in-flight reservations so this exclusion is reachable in production.
+/// A group is one unit and is unheld only when **no** member has a subscription and none is in
+/// transition: its members share a stream and a lease, so retiring some of them would close the
+/// stream under the rest.
 fn unheld_live_only(shapes: &[SweepShape]) -> Vec<Unheld<'_>> {
-    let free = |s: &SweepShape| {
-        s.group.is_none() && !s.dormancy_eligible && !s.in_transition && s.dormant_for.is_none() && s.refcount == 0
-    };
+    let free = |s: &SweepShape| !s.dormancy_eligible && !s.in_transition && s.dormant_for.is_none() && s.refcount == 0;
     let mut units = Vec::new();
+    let mut groups: std::collections::HashMap<&str, (bool, Vec<&SweepShape>)> = std::collections::HashMap::new();
     for s in shapes {
-        if free(s) {
-            units.push(Unheld { idle: s.idle, members: vec![s], lease_tracked: s.lease_tracked });
+        match &s.group {
+            Some(group) => {
+                let (unheld, members) = groups.entry(group.as_str()).or_insert((true, Vec::new()));
+                *unheld &= free(s);
+                members.push(s);
+            }
+            None if free(s) => units.push(Unheld { idle: s.idle, members: vec![s], lease_tracked: s.lease_tracked }),
+            None => {}
+        }
+    }
+    for (unheld, members) in groups.into_values() {
+        if unheld {
+            let idle = members.iter().map(|s| s.idle).min().unwrap_or_default();
+            let lease_tracked = members.iter().all(|s| s.lease_tracked);
+            units.push(Unheld { idle, members, lease_tracked });
         }
     }
     // Longest idle first; the id breaks a tie so the same snapshot always gives the same plan.
@@ -499,7 +512,6 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
             if s.dormancy_eligible
                 && !s.in_transition
                 && s.dormant_for.is_none()
-                && s.group.is_none()
                 && s.refcount == 0
                 && s.idle >= cfg.idle_timeout
             {
@@ -514,7 +526,7 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // the shape's bounded replay budget, is no longer safely reactivatable. Retire it now so the
     // next subscriber recreates from a fresh snapshot.
     for s in shapes {
-        if s.group.is_none() && s.dormant_for.is_some() {
+        if s.dormant_for.is_some() {
             if s.replay_span_deferred {
                 continue;
             } else if s.replay_span_bytes.is_none() {
@@ -530,7 +542,7 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // Tier 1 — dormancy TTL (hygiene, independent of pressure).
     if !cfg.dormant_ttl.is_zero() {
         for s in shapes {
-            if s.group.is_none() && s.dormant_for.is_some_and(|d| d >= cfg.dormant_ttl) {
+            if s.dormant_for.is_some_and(|d| d >= cfg.dormant_ttl) {
                 plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
                 evicted.insert(&s.id);
             }
@@ -553,10 +565,8 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     }
 
     // Dormant shapes still standing after tier 1, least-recently-read first (largest idle first).
-    let mut lru: Vec<&SweepShape> = shapes
-        .iter()
-        .filter(|s| s.group.is_none() && s.dormant_for.is_some() && !evicted.contains(s.id.as_str()))
-        .collect();
+    let mut lru: Vec<&SweepShape> =
+        shapes.iter().filter(|s| s.dormant_for.is_some() && !evicted.contains(s.id.as_str())).collect();
     lru.sort_by_key(|s| std::cmp::Reverse(s.idle));
     let mut lru = lru.into_iter();
 
@@ -612,8 +622,7 @@ pub fn plan_cap_room(cfg: &RetentionConfig, shapes: &[SweepShape], wanted: usize
         return CapRoom::Fits;
     }
     let Some(target) = cfg.max_shapes.checked_sub(wanted) else { return CapRoom::Full };
-    let mut dormant: Vec<&SweepShape> =
-        shapes.iter().filter(|s| s.group.is_none() && s.dormant_for.is_some()).collect();
+    let mut dormant: Vec<&SweepShape> = shapes.iter().filter(|s| s.dormant_for.is_some()).collect();
     dormant.sort_by_key(|s| std::cmp::Reverse(s.idle));
     let unheld = unheld_live_only(shapes);
     let mut count = shapes.len();
@@ -801,7 +810,7 @@ mod tests {
     /// A group shares one stream and one lease, so the cap takes all of it or none of it, and none
     /// of it while any member is subscribed.
     #[test]
-    fn max_shapes_leaves_group_members_protected_and_never_evicts_a_subscribed_one() {
+    fn max_shapes_evicts_a_group_as_a_unit_and_never_a_subscribed_one() {
         let c = RetentionConfig { max_shapes: 4, ..cfg() };
         let shapes = vec![
             group_member("held-a", "g-held", 1, 9000),
@@ -814,12 +823,18 @@ mod tests {
         // feed is the longer idle and goes alone.
         assert_eq!(plan_sweep(&c, &shapes).evict, vec![("feed".to_string(), EvictReason::MaxShapes)]);
 
-        // Two over: after the feed, the grouped members remain protected for OTTO-13834. `g-held`
-        // and `g-gone` are both left to that group's retention/rejoin implementation.
+        // Two over: after the feed, the unsubscribed group goes whole. `g-held` never does.
         let c = RetentionConfig { max_shapes: 3, ..cfg() };
         let plan = plan_sweep(&c, &shapes);
-        assert_eq!(plan.evict, vec![("feed".to_string(), EvictReason::MaxShapes)]);
-        assert!(plan.over_capacity);
+        assert_eq!(
+            plan.evict,
+            vec![
+                ("feed".to_string(), EvictReason::MaxShapes),
+                ("gone-a".to_string(), EvictReason::MaxShapes),
+                ("gone-b".to_string(), EvictReason::MaxShapes),
+            ]
+        );
+        assert!(!plan.over_capacity);
     }
 
     /// The live-only idle period retires an unsubscribed live-only shape long before the
@@ -871,9 +886,10 @@ mod tests {
         assert!(plan_sweep(&neither, &[live_only("kept", 0, 1 << 30)]).evict.is_empty());
     }
 
-    /// Group retention and re-join stay with OTTO-13834; this evictor leaves every member alone.
+    /// A group whose members are all unsubscribed is judged by its most recent touch, so it is
+    /// retired whole or not at all.
     #[test]
-    fn the_live_only_period_leaves_group_members_to_group_retention() {
+    fn the_live_only_period_retires_a_group_as_a_unit() {
         let c = RetentionConfig { live_only_idle: Duration::from_secs(3600), ..cfg() };
         let shapes = vec![
             group_member("a", "g-recent", 0, 7200),
@@ -881,17 +897,10 @@ mod tests {
             group_member("c", "g-old", 0, 7200),
             group_member("d", "g-old", 0, 3600),
         ];
-        assert!(plan_sweep(&c, &shapes).evict.is_empty());
-    }
-
-    #[test]
-    fn grouped_live_only_shapes_are_not_eviction_candidates() {
-        let c = RetentionConfig { max_shapes: 1, live_only_idle: Duration::from_secs(1), ..cfg() };
-        let shapes =
-            vec![group_member("group-member-a", "group", 0, 3600), group_member("group-member-b", "group", 0, 10)];
-        let plan = plan_sweep(&c, &shapes);
-        assert!(plan.evict.is_empty(), "group members must remain under OTTO-13834 retention");
-        assert!(plan.over_capacity);
+        assert_eq!(
+            plan_sweep(&c, &shapes).evict,
+            vec![("c".to_string(), EvictReason::LiveOnlyIdle), ("d".to_string(), EvictReason::LiveOnlyIdle)]
+        );
     }
 
     /// What a create needs before it mints `wanted` shapes: room under the cap, made from the

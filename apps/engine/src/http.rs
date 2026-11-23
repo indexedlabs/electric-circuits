@@ -1365,6 +1365,9 @@ async fn run_subset_load_group(
         members.iter().enumerate().filter_map(|(i, _)| (i > 0).then(|| format!("{group_sub}:member:{i}"))).collect();
     #[cfg(feature = "test-support")]
     engine.wait_group_load_gate_for_test(GroupLoadAwait::BeforeReservation).await;
+    // A group mints one live-only member shape per requested member. Make room before the
+    // reservation, then reserve_group_with_id rechecks the exact count under the state lock.
+    engine.make_room_for_group(members.len()).await;
     engine
         .reserve_group_with_id(&group_sub, &member_subscriptions, &group_path)
         .await
