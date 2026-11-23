@@ -130,6 +130,7 @@ async function bootWithShortRetention(): Promise<{ client: ElectricIvmClient; pr
     engineEnv: {
       ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
       ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '1',
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
     },
   })
@@ -242,7 +243,7 @@ describe('native subscription mutations with an ambiguous HTTP result', () => {
     const subscription = materialized.handle.subscription!
 
     // Native reads bypass the engine, so renewal is the only lease signal. Hold renewals outside
-    // the engine until the short lease+dormancy windows evict the old shape and stream.
+    // the engine until the short live-only period evicts the old shape and stream.
     proxy.failCreates(true)
     await waitFor(
       async () => (await fetch(`${h!.engineUrl}/shapes/${oldId}`)).status === 404,
