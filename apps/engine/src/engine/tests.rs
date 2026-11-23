@@ -1478,11 +1478,14 @@ fn translate_output_stamps_commit_lsn() {
 #[test]
 fn grouped_deletes_keep_table_identity_when_keys_collide() {
     let ts = users();
-    let deletes = delete_envelopes(&ts, vec!["same-key".into()], Some("tx".into()));
+    let deletes = delete_envelopes(&ts, vec!["same-key".into()], Some("tx".into()), Some("0/2A".into()));
     assert_eq!(deletes.len(), 1);
     assert_eq!(deletes[0].key, "same-key");
     assert_eq!(deletes[0].type_, ts.table.to_string());
     assert_eq!(deletes[0].headers.operation, "delete");
+    // A delete is placed like an upsert: transaction and position both.
+    assert_eq!(deletes[0].headers.txid.as_deref(), Some("tx"));
+    assert_eq!(deletes[0].headers.lsn.as_deref(), Some("0/2A"));
 }
 
 /// **Absolute emission**: in library mode an envelope with no before-image decides membership per

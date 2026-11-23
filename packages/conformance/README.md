@@ -33,6 +33,8 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 | `conformance-subquery*.test.ts` | `IN (SELECT …)`: scenarios, cross-table matrix, nested subqueries, inner-node sharing |
 | `conformance-sharing`, `-shape-sharing` | identical shapes/feeds collapse to one stream, refcounted create/drop |
 | `conformance-subset-positioning.test.ts` | subset LSN positioning: a change in the page/feed overlap window is counted exactly once |
+| `conformance-subquery-positions.test.ts` | every live envelope of a subquery shape, a changes-only feed and a group stream carries `headers.lsn` + `txid`, positions never fall along a stream, and a flip's verdict that follows a newer live change still reaches the real client |
+| `conformance-group-evaluation-order.test.ts` | a group stream (`/v1/subsets/load`) carries each key's envelopes in evaluation order: a nested flip's verdict that follows a newer live change to the same key is the stream's last word, and a verdict about other keys still lands in commit order |
 | `conformance-subset-feed-removals.test.ts` | a subset feed removes rows the client holds only from the snapshot: soft-deleted, moved out of the window, deleted, or hidden through the inner table |
 | `conformance-expressiveness`, `-transitions` | full predicate grammar, rows entering/leaving shapes |
 | `conformance-fuzz`, `-fuzz-wide`, `-counterexample` | random-predicate fuzz vs the oracle + pinned counterexample replays |

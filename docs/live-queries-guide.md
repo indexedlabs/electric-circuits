@@ -65,8 +65,9 @@ identical either way.)
 | `ELECTRIC_CIRCUITS_PG_POLL_MS` | slot poll interval. |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
-keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
-ensures the current `changes/<n>` change-log segment, and starts the ingestor.
+keys ordered by index position), sets `REPLICA IDENTITY FULL` where it is not already set, creates the replication slot,
+ensures the current `changes/<n>` change-log segment, and starts the ingestor. When a table still
+needs `REPLICA IDENTITY FULL`, the engine waits at most 2 s for the table's lock and, if a transaction holds it longer, retries with `/ready` at `waiting` until it ends (see [startup](deployment-postgres.md#step-2--run-the-engine)).
 
 In production you run three processes — the `durable-streams-server`, the engine binary, and the
 API server — pointed at your Postgres, and point the client at the API URL. The demos colocate

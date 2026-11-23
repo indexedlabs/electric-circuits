@@ -21,7 +21,9 @@
 //! accounting (a `FlipWork` token stays >0 until its batches are enqueued), so the counter
 //! never dips to zero with effects in flight. Each batch retains its originating commit LSN;
 //! receipt barriers check only outstanding origins at or before their marker, while the metric
-//! remains the total across all origins. The origin is internal accounting, not a wire LSN.
+//! remains the total across all origins. The origin is the accounting key; the position an
+//! envelope carries on the wire (`headers.lsn`) is placed by whoever fixes the stream's order —
+//! the registry for a single stream, [`GroupLane::take_appendable`] for a group.
 
 use super::*;
 
@@ -106,6 +108,19 @@ impl EmissionLanes {
 //     produced its rows yet) is registered with [`GroupEmissionLanes::begin_origin`] before the
 //     sequencer moves on, and no batch of a later commit is appended while it is outstanding. So
 //     T's delayed flip lands before T+1's plain output, without the sequencer waiting for it.
+//   * **Evaluation order per key.** Commit order never reorders one key. The registry's rule —
+//     append order equals evaluation order — is what makes the last envelope appended for a key
+//     its freshest verdict, and it holds here per key: **the envelopes of one key reach a group
+//     stream in the order they were handed to its lane.** A flip's verdict is absolute and is
+//     evaluated after its commit, so it can be handed over after a later commit's envelope for
+//     the same key — and with a nested subquery that earlier envelope is stale: T+1's live change
+//     was judged against a middle set T had already invalidated but not yet re-derived. Queued at
+//     its own commit, T's verdict would land ahead of it and the stale word would be the stream's
+//     last. So a batch is ordered at its own commit unless a batch already queued for a later
+//     commit carries one of its keys; then it is ordered at the last such batch's commit, behind
+//     everything already queued there ([`GroupLaneState::order_for`]), whole, and takes that
+//     position. Only the order moves: a batch stays its own commit's output for receipts, resume
+//     points and gaps ([`Queued::origin`]).
 //   * **Coalesced appends.** The lane's one writer appends every appendable queued batch, up to
 //     `append_bytes`, in one request. A stream whose appends are slow but answer therefore keeps
 //     up with the source instead of falling further behind with every commit.
@@ -287,14 +302,33 @@ impl Cap {
 }
 
 struct Queued {
+    /// The commit this batch is the output of: what a receipt, a resume point and a gap account
+    /// it under. The queue key's commit is where the batch is ORDERED, which is later than this
+    /// for a batch handed over after a later commit's envelope for one of its keys
+    /// ([`GroupLaneState::order_for`]).
+    origin: u64,
     envs: Vec<Envelope>,
     bytes: u64,
     /// Part of a member's activation drain, which the byte cap never counts.
     exempt: bool,
 }
 
+/// The distinct tables (`type`) of a batch, in first-seen order. Almost always one: a subquery
+/// member's batch is one shape's, and a group has at most a handful of members.
+fn batch_tables(envs: &[Envelope]) -> Vec<&str> {
+    let mut tables: Vec<&str> = Vec::new();
+    for env in envs {
+        let table = env.type_.as_str();
+        if tables.last() != Some(&table) && !tables.contains(&table) {
+            tables.push(table);
+        }
+    }
+    tables
+}
+
 struct InFlight {
-    /// The oldest and newest commit the append carries; `None` for the marker alone.
+    /// The oldest and newest commit the append carries output of ([`Queued::origin`]); `None` for
+    /// the marker alone.
     lsns: Option<(u64, u64)>,
     bytes: u64,
     batches: u64,
@@ -319,11 +353,24 @@ struct Probe {
 struct GroupLaneState {
     /// Commits with output for this group still in production (deferred flips), by commit LSN.
     producing: BTreeMap<u64, usize>,
+    /// The batches waiting to be appended, in append order: by `(the commit a batch is ordered
+    /// at, the order it was handed over)`. A batch is ordered at its own commit unless
+    /// [`order_for`](Self::order_for) placed it behind a later one.
     queued: BTreeMap<(u64, u64), Queued>,
+    /// Per table (`type`), the highest commit a batch holding one of its rows has been ordered
+    /// at. Never lowered, so it can only say "walk" when no such batch is queued any more — and
+    /// when it says "nothing later", [`order_for`](Self::order_for) has nothing to look for. One
+    /// entry per member of the group.
+    ordered_through: HashMap<String, u64>,
     queued_bytes: u64,
     /// Queued bytes from activation drains, still queued and outside the byte cap.
     exempt_bytes: u64,
     next_seq: u64,
+    /// **The stream's position**: the highest `headers.lsn` this lane has taken for an append
+    /// (`0` = nothing placed yet). The lane decides the group stream's order, so the lane places
+    /// its envelopes — see [`GroupLane::take_appendable`]. A lane restored at boot starts at the
+    /// restored checkpoint's highwater ([`GroupEmissionLanes::restore_position`]).
+    position: u64,
     marker: Option<Envelope>,
     in_flight: Option<InFlight>,
     /// Bumped whenever an in-flight append must be abandoned (detach, close).
@@ -362,9 +409,73 @@ impl GroupLaneState {
             || self.queued.keys().next().is_some_and(|(lsn, _)| *lsn <= barrier)
     }
 
+    /// Where a batch of `commit_lsn` is ordered in the queue: at its own commit, unless a batch
+    /// already queued for a LATER commit carries one of its keys — then at that batch's commit,
+    /// which (being handed over last) puts it directly behind every batch queued there.
+    ///
+    /// This is what keeps **each key's envelopes in the order they were handed over**, which for a
+    /// subquery member is the order the registry evaluated them in (it hands a batch over under
+    /// the lock it evaluated it under). Every queued batch holding one of this batch's keys is
+    /// then ahead of it: those at or below its own commit by commit, the later ones by this rule;
+    /// and whatever has already been taken for an append is on the stream first. Keys are told
+    /// apart by table and key (`type` + `key`): a group has one member per table, so that names
+    /// one member's row.
+    ///
+    /// The batch moves whole, so one evaluation's envelopes stay together. The cost is a walk of
+    /// the batches queued for later commits, bounded by the lane's byte cap, and it is paid only
+    /// by a batch that could meet one of its own table's rows there
+    /// ([`ordered_through`](Self::ordered_through)). Output handed over in commit order never
+    /// does — a plain member's, its activation drain included, and every live verdict — so the
+    /// sequencer never walks; a flip's late verdict does when its member has later output queued.
+    fn order_for(&self, commit_lsn: u64, envs: &[Envelope], tables: &[&str]) -> u64 {
+        use std::ops::Bound;
+        let later_rows_of =
+            |table: &&str| self.ordered_through.get(*table).is_some_and(|through| *through > commit_lsn);
+        if !tables.iter().any(later_rows_of) {
+            return commit_lsn;
+        }
+        let keys: HashSet<(&str, &str)> = envs.iter().map(|env| (env.type_.as_str(), env.key.as_str())).collect();
+        let shares_a_key = |queued: &Queued| {
+            queued.envs.iter().any(|env| {
+                tables.contains(&env.type_.as_str()) && keys.contains(&(env.type_.as_str(), env.key.as_str()))
+            })
+        };
+        self.queued
+            .range((Bound::Excluded((commit_lsn, u64::MAX)), Bound::Unbounded))
+            .rev()
+            .find(|(_, queued)| shares_a_key(queued))
+            .map_or(commit_lsn, |(order, _)| order.0)
+    }
+
+    /// Queue one batch of `commit_lsn`'s output where [`order_for`](Self::order_for) puts it, and
+    /// return the commit it was ordered at.
+    fn enqueue(&mut self, commit_lsn: u64, envs: Vec<Envelope>, bytes: u64, exempt: bool) -> u64 {
+        let tables = batch_tables(&envs);
+        let order = self.order_for(commit_lsn, &envs, &tables);
+        for table in tables {
+            match self.ordered_through.get_mut(table) {
+                Some(through) => *through = (*through).max(order),
+                None => {
+                    self.ordered_through.insert(table.to_string(), order);
+                }
+            }
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.queued.insert((order, seq), Queued { origin: commit_lsn, envs, bytes, exempt });
+        self.queued_bytes += bytes;
+        if exempt {
+            self.exempt_bytes += bytes;
+        }
+        self.peak_batches = self.peak_batches.max(self.queued.len() as u64);
+        self.peak_bytes = self.peak_bytes.max(self.queued_bytes);
+        order
+    }
+
     /// Queued bytes the byte cap counts: everything but activation drains and the largest queued
     /// commit. A walk of the queue, so callers take it only once the total could matter (the
-    /// counted bytes above a quarter of the cap, where threshold events re-arm).
+    /// counted bytes above a quarter of the cap, where threshold events re-arm). A batch ordered
+    /// behind a later commit counts with the commit it is ordered at: they are appended together.
     fn capped_bytes(&self) -> u64 {
         let mut largest = 0u64;
         let mut current: Option<(u64, u64)> = None;
@@ -391,7 +502,9 @@ impl GroupLaneState {
         self.detach_after + std::time::Duration::from_secs(in_flight / config.append_min_bytes_per_sec.max(1))
     }
 
-    /// The oldest commit whose output for this group is not on its stream, if any.
+    /// The oldest commit whose output for this group is not on its stream, if any. A queued batch
+    /// answers for the commit it is the output of, wherever it is ordered, so this walks the queue
+    /// (short unless the lane is held; its callers are receipts, checkpoints and threshold events).
     fn oldest_outstanding(&self) -> Option<u64> {
         let gap = match self.phase {
             Phase::Detached(gap) | Phase::Reattaching(gap) => Some(gap.resume_lsn),
@@ -400,7 +513,7 @@ impl GroupLaneState {
         [
             gap,
             self.producing.keys().next().copied(),
-            self.queued.keys().next().map(|(lsn, _)| *lsn),
+            self.queued.values().map(|queued| queued.origin).min(),
             self.in_flight.as_ref().and_then(|flight| flight.lsns).map(|(oldest, _)| oldest),
         ]
         .into_iter()
@@ -410,7 +523,7 @@ impl GroupLaneState {
 
     fn lag_commits(&self) -> u64 {
         let mut commits = std::collections::BTreeSet::new();
-        commits.extend(self.queued.keys().map(|(lsn, _)| *lsn));
+        commits.extend(self.queued.values().map(|queued| queued.origin));
         commits.extend(self.producing.keys().copied());
         commits.len() as u64 + self.in_flight.as_ref().map_or(0, |flight| flight.batches.min(1))
     }
@@ -472,9 +585,11 @@ impl GroupEmissionLanes {
             state: std::sync::Mutex::new(GroupLaneState {
                 producing: BTreeMap::new(),
                 queued: BTreeMap::new(),
+                ordered_through: HashMap::new(),
                 queued_bytes: 0,
                 exempt_bytes: 0,
                 next_seq: 0,
+                position: 0,
                 marker: None,
                 in_flight: None,
                 healed: None,
@@ -590,7 +705,9 @@ impl GroupEmissionLanes {
 
     /// Hand one complete batch of a commit's group output to its lane. Never waits: the lane
     /// orders it by commit, and a lane that cannot keep up detaches instead of slowing its
-    /// producer. Callers may hold the subquery registry lock, so evaluation order is queue order.
+    /// producer. The subquery registry calls this under the lock it evaluated the batch under, so
+    /// the order of these calls is evaluation order — which the lane keeps for every key
+    /// ([`GroupLaneState::order_for`]), whatever the commits.
     pub(crate) fn push(&self, path: &str, envs: Vec<Envelope>, commit_lsn: u64) {
         if envs.is_empty() {
             return;
@@ -613,6 +730,30 @@ impl GroupEmissionLanes {
     /// and restored detached, so a per-group receipt for it need not wait for a new commit.
     pub(crate) fn note_restored_highwater(&self, commit_lsn: u64) {
         self.shared.progress.lsn.fetch_max(commit_lsn, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Give a restored group's lane the position its stream had reached at the checkpoint the
+    /// engine restored from: that checkpoint's highwater. Every commit the checkpoint passed was
+    /// sequenced by the earlier process, so whatever of its output landed is at or below it
+    /// (a position is never above the newest commit handed to the lane). Without this a restored
+    /// lane starts at zero, and what it appends first — a must-refetch marker at its resume point,
+    /// a replay, a member's activation drain — is placed below envelopes the stream already
+    /// carries. Never lowers a position: the lane may already have placed newer output.
+    ///
+    /// What the earlier process appended AFTER its last checkpoint is in no record the restore
+    /// reads. Those commits are re-emitted by the replay, at their own positions, like the replays
+    /// on a plain shape's stream.
+    pub(crate) fn restore_position(&self, path: &str, position: u64) {
+        if let Some(lane) = self.existing_lane(path) {
+            let mut state = lane.state.lock().unwrap();
+            state.position = state.position.max(position);
+        }
+    }
+
+    /// A lane's stream position, for tests of the restore.
+    #[cfg(test)]
+    pub(crate) fn position(&self, path: &str) -> Option<u64> {
+        self.existing_lane(path).map(|lane| lane.state.lock().unwrap().position)
     }
 
     pub(crate) fn remove(&self, path: &str) {
@@ -703,6 +844,12 @@ impl GroupEmissionLanes {
         }
     }
 
+    /// Whether a lane has an append in flight, for a test to tell "queued" from "taken".
+    #[cfg(test)]
+    fn appending(&self, path: &str) -> bool {
+        self.existing_lane(path).is_some_and(|lane| lane.state.lock().unwrap().in_flight.is_some())
+    }
+
     /// Lanes without the background monitor, for tests that drive [`Self::tick_for_test`].
     #[cfg(test)]
     fn unmonitored(ds: DsClient, config: GroupLaneConfig) -> Self {
@@ -732,13 +879,7 @@ impl GroupLane {
             gap.dropped_batches += 1;
             return;
         }
-        let seq = state.next_seq;
-        state.next_seq += 1;
-        state.queued.insert((commit_lsn, seq), Queued { envs, bytes, exempt: false });
-        state.queued_bytes += bytes;
-        state.peak_batches = state.peak_batches.max(state.queued.len() as u64);
-        state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
-        self.backlog_changed(bytes as i64, 1);
+        self.queue(&mut state, commit_lsn, envs, bytes, false);
         let limit = self.shared.config.memory_bytes;
         let counted = state.queued_bytes - state.exempt_bytes;
         let capped = if counted >= limit / 4 { state.capped_bytes() } else { counted };
@@ -767,17 +908,25 @@ impl GroupLane {
                 continue;
             }
             let bytes: u64 = envs.iter().map(crate::ds::envelope_memory_bytes).sum();
-            let seq = state.next_seq;
-            state.next_seq += 1;
-            state.queued.insert((commit_lsn, seq), Queued { envs, bytes, exempt: true });
-            state.queued_bytes += bytes;
-            state.exempt_bytes += bytes;
-            state.peak_batches = state.peak_batches.max(state.queued.len() as u64);
-            state.peak_bytes = state.peak_bytes.max(state.queued_bytes);
-            self.backlog_changed(bytes as i64, 1);
+            self.queue(&mut state, commit_lsn, envs, bytes, true);
         }
         drop(state);
         self.worker_wake.notify_one();
+    }
+
+    /// Queue one batch on a lane that is taking output, and count it in the backlog.
+    fn queue(&self, state: &mut GroupLaneState, commit_lsn: u64, envs: Vec<Envelope>, bytes: u64, exempt: bool) {
+        let ordered_at = state.enqueue(commit_lsn, envs, bytes, exempt);
+        self.backlog_changed(bytes as i64, 1);
+        if ordered_at != commit_lsn {
+            tracing::debug!(
+                event = "group_batch_ordered_behind_later_commit",
+                group_id = %self.path,
+                commit_lsn = %lsn_text(commit_lsn),
+                ordered_at = %lsn_text(ordered_at),
+                "a batch was handed over after a later commit's envelope for one of its keys; it lands behind it"
+            );
+        }
     }
 
     fn backlog_changed(&self, bytes: i64, batches: i64) {
@@ -801,11 +950,32 @@ impl GroupLane {
 
     /// Take the next append: the marker alone if one is due, otherwise every queued batch no
     /// earlier in-production commit holds back, oldest first, up to the append budget.
+    ///
+    /// **This is where a group envelope gets its position** (`headers.lsn`), because this is where
+    /// the stream's order is decided. Each batch is placed at `max(the commit it is ordered at,
+    /// the lane's position)`: its own commit while the lane runs in commit order — a plain
+    /// member's output (which the sequencer already stamped so) and a subquery member's flip
+    /// verdict alike — and the stream's position when it lands late. Late is real, in two ways. A
+    /// verdict handed over after a later commit's envelope for one of its keys is ordered behind
+    /// that envelope ([`GroupLaneState::order_for`]). And a create's deferred replay registers its
+    /// origin only when the create finishes, after later commits have landed. Placed below what
+    /// it follows, a consumer that applies a change only at or above the position it holds for
+    /// the key would discard the later word; so a position never falls along the stream
+    /// (`docs/ARCHITECTURE.md` §7, *Native envelope positions*). A batch with no commit at all
+    /// (library mode) on a lane that has placed nothing stays unplaced.
     fn take_appendable(&self, state: &mut GroupLaneState) -> Option<(Vec<Envelope>, u64)> {
         if state.closed || state.in_flight.is_some() || matches!(state.phase, Phase::Detached(_)) {
             return None;
         }
-        if let Some(marker) = state.marker.take() {
+        if let Some(mut marker) = state.marker.take() {
+            // The marker stands in for every commit of its gap, so it is placed at the last of
+            // them: what follows it is then never below what it covered.
+            if let Phase::Reattaching(gap) = state.phase {
+                state.position = state.position.max(gap.through_lsn);
+            }
+            if state.position != 0 {
+                marker.headers.lsn = Some(lsn_text(state.position));
+            }
             state.in_flight =
                 Some(InFlight { lsns: None, bytes: 0, batches: 0, marker: true, started: tokio::time::Instant::now() });
             return Some((vec![marker], state.epoch));
@@ -821,12 +991,26 @@ impl GroupLane {
             bytes += queued.bytes;
             keys.push(*key);
         }
-        let (first, last) = (keys.first()?.0, keys.last()?.0);
+        if keys.is_empty() {
+            return None;
+        }
+        // The commits this append carries output of, which are not the commits it is ordered at
+        // when a batch was ordered behind a later one.
+        let (mut oldest, mut newest) = (u64::MAX, 0u64);
         let mut envs = Vec::new();
         for key in &keys {
-            if let Some(queued) = state.queued.remove(key) {
+            if let Some(mut queued) = state.queued.remove(key) {
                 if queued.exempt {
                     state.exempt_bytes -= queued.bytes;
+                }
+                oldest = oldest.min(queued.origin);
+                newest = newest.max(queued.origin);
+                state.position = state.position.max(key.0);
+                if state.position != 0 {
+                    let lsn = lsn_text(state.position);
+                    for env in &mut queued.envs {
+                        env.headers.lsn = Some(lsn.clone());
+                    }
                 }
                 envs.extend(queued.envs);
             }
@@ -834,7 +1018,7 @@ impl GroupLane {
         state.queued_bytes -= bytes;
         self.backlog_changed(-(bytes as i64), -(keys.len() as i64));
         state.in_flight = Some(InFlight {
-            lsns: Some((first, last)),
+            lsns: Some((oldest, newest)),
             bytes,
             batches: keys.len() as u64,
             marker: false,
@@ -944,7 +1128,8 @@ impl GroupLane {
             && state.in_flight.as_ref().is_some_and(|flight| {
                 !flight.marker && tokio::time::Instant::now().duration_since(flight.started) < flight.allowance(config)
             });
-        let mut lsns: Vec<u64> = state.queued.keys().map(|(lsn, _)| *lsn).collect();
+        // The commits whose output is dropped: each queued batch's own, not where it was ordered.
+        let mut lsns: Vec<u64> = state.queued.values().map(|queued| queued.origin).collect();
         lsns.extend(state.producing.keys().copied());
         if !keep_in_flight && let Some((oldest, newest)) = state.in_flight.as_ref().and_then(|flight| flight.lsns) {
             lsns.extend([oldest, newest]);
@@ -1394,6 +1579,304 @@ mod tests {
         assert_eq!(stamps, [Some(1_793_404_800_001), Some(1_793_404_800_002), Some(1_793_404_800_003)]);
     }
 
+    /// `(key, headers.lsn)` of every envelope appended to the group stream, in order.
+    fn appended_positions(store: &crate::ds::ScriptedStore) -> Vec<(String, Option<String>)> {
+        store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path.ends_with(GROUP))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+            .map(|event| {
+                (event["key"].as_str().unwrap().to_string(), event["headers"]["lsn"].as_str().map(str::to_string))
+            })
+            .collect()
+    }
+
+    fn placed(key: &str, lsn: &str) -> (String, Option<String>) {
+        (key.into(), Some(lsn.into()))
+    }
+
+    /// The lane decides a group stream's order, so the lane places its envelopes: each at its own
+    /// commit, whether or not its producer stamped it (the sequencer stamps a plain member's
+    /// output, the subquery registry hands over a flip's verdict with its origin).
+    #[tokio::test]
+    async fn every_envelope_of_a_group_stream_is_placed_at_its_commit() {
+        let (lanes, store, hold) = held_lanes(test_config());
+        let mut plain = group_env("plain");
+        plain.headers.lsn = Some("0/10".into());
+        lanes.push(GROUP, vec![plain], 0x10);
+        // T (0x20) has a flip in production; T+1's output must wait for it and land after it.
+        lanes.begin_origin(GROUP, 0x20);
+        lanes.push(GROUP, vec![group_env("t+1")], 0x1_0000_0030);
+        lanes.push(GROUP, vec![group_env("t-flip-a"), group_env("t-flip-b")], 0x20);
+        lanes.complete_origin(GROUP, 0x20);
+        hold.send_replace(false);
+        wait_appended(&store, 4).await;
+        assert_eq!(
+            appended_positions(&store),
+            [placed("plain", "0/10"), placed("t-flip-a", "0/20"), placed("t-flip-b", "0/20"), placed("t+1", "1/30")]
+        );
+    }
+
+    /// Work whose commit is older than what the stream already carries — a create's deferred
+    /// replay registers its origin only once the create finishes, after later commits landed —
+    /// lands late, and is placed at the stream's position instead of below it. A consumer that
+    /// applies a change only at or above the position it holds for that key would otherwise
+    /// discard the later word. The next commit is placed at itself again.
+    #[tokio::test]
+    async fn a_group_stream_position_never_falls() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            test_config(),
+        );
+        lanes.register(GROUP);
+        lanes.push(GROUP, vec![group_env("live")], 0x30);
+        wait_appended(&store, 1).await;
+        let mut stamped_low = group_env("late");
+        stamped_low.headers.lsn = Some("0/18".into());
+        lanes.push(GROUP, vec![stamped_low], 0x18);
+        wait_appended(&store, 2).await;
+        lanes.push(GROUP, vec![group_env("next")], 0x40);
+        wait_appended(&store, 3).await;
+        assert_eq!(
+            appended_positions(&store),
+            [placed("live", "0/30"), placed("late", "0/30"), placed("next", "0/40")]
+        );
+    }
+
+    /// A lane with no commit position at all (library mode) stamps nothing.
+    #[tokio::test]
+    async fn a_group_batch_with_no_commit_is_left_unplaced() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            test_config(),
+        );
+        lanes.register(GROUP);
+        lanes.push(GROUP, vec![group_env("unplaced")], 0);
+        wait_appended(&store, 1).await;
+        assert_eq!(appended_positions(&store), [("unplaced".to_string(), None)]);
+    }
+
+    /// One statement about `key`: `rev` tells the statements about one key apart, in the order
+    /// they were handed to the lane.
+    fn verdict(operation: &str, key: &str, rev: u64) -> Envelope {
+        let mut env = group_env(key);
+        env.headers.operation = operation.into();
+        env.value = (operation != "delete").then(|| serde_json::json!({ "id": key, "rev": rev }));
+        env.old = Some(serde_json::json!({ "rev": rev }));
+        env
+    }
+
+    /// `operation key @position` of every envelope appended to the group stream, in order.
+    fn appended_said(store: &crate::ds::ScriptedStore) -> Vec<String> {
+        store
+            .appended
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path.ends_with(GROUP))
+            .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+            .map(|event| {
+                format!(
+                    "{} {} @{}",
+                    event["headers"]["operation"].as_str().unwrap(),
+                    event["key"].as_str().unwrap(),
+                    event["headers"]["lsn"].as_str().unwrap_or("-")
+                )
+            })
+            .collect()
+    }
+
+    /// The defect this rule exists for. With a nested subquery, T's flip reaches the outer rows in
+    /// two deferred steps, so T+1's live change to row `1` is judged against a set T already made
+    /// stale ("member"), and T's own verdict — evaluated afterwards, and right — says it is gone.
+    /// Queued by commit alone, T's delete landed AHEAD of T+1's upsert and the stream's last word
+    /// for the row was the stale one. A key's envelopes land in the order they were handed over.
+    #[tokio::test]
+    async fn a_verdict_lands_after_an_envelope_for_its_key_that_was_evaluated_before_it() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            test_config(),
+        );
+        lanes.register(GROUP);
+        // T (0x10) has a flip in production when T+1 (0x20) is evaluated.
+        lanes.begin_origin(GROUP, 0x10);
+        lanes.push(GROUP, vec![verdict("upsert", "1", 1)], 0x20);
+        // T's verdict, evaluated last: rows 2 and 1 left the scope.
+        lanes.push(GROUP, vec![verdict("delete", "2", 2), verdict("delete", "1", 2)], 0x10);
+        lanes.complete_origin(GROUP, 0x10);
+        wait_appended(&store, 3).await;
+        // The verdict follows the envelope it corrects and takes its position: it is not placed
+        // below a change it lands after. One evaluation's envelopes stay together.
+        assert_eq!(appended_said(&store), ["upsert 1 @0/20", "delete 2 @0/20", "delete 1 @0/20"]);
+        settle().await;
+        assert!(lanes.drain(GROUP, 0x20).unwrap().drained);
+    }
+
+    /// Only a shared key reorders. A verdict about other rows, or about the same key of another
+    /// member's table, still lands ahead of the later commit, at its own commit's position.
+    #[tokio::test]
+    async fn a_verdict_about_other_keys_stays_in_commit_order() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes = GroupEmissionLanes::unmonitored(
+            DsClient::with_test_store("scripted://group".into(), store.clone()),
+            test_config(),
+        );
+        lanes.register(GROUP);
+        lanes.begin_origin(GROUP, 0x10);
+        lanes.push(GROUP, vec![verdict("upsert", "1", 1)], 0x20);
+        let mut other_table = verdict("delete", "1", 2);
+        other_table.type_ = "public.grants".into();
+        lanes.push(GROUP, vec![verdict("delete", "2", 2), other_table], 0x10);
+        lanes.complete_origin(GROUP, 0x10);
+        wait_appended(&store, 3).await;
+        assert_eq!(appended_said(&store), ["delete 2 @0/10", "delete 1 @0/10", "upsert 1 @0/20"]);
+    }
+
+    /// A batch ordered behind a later commit is still its own commit's output: while it is queued
+    /// and while its append is in flight, that commit's receipt is not drained and a checkpoint
+    /// records it as the group's resume point. (Nothing of commit 0x10 is in production here —
+    /// work that registers late, like a create's deferred replay — so only the batch itself can
+    /// answer for it.)
+    #[tokio::test]
+    async fn a_batch_ordered_behind_a_later_commit_still_answers_for_its_own_commit() {
+        let (lanes, store, hold) = held_lanes(test_config());
+        let outstanding = |lanes: &GroupEmissionLanes, state: &str| {
+            let receipt = lanes.drain(GROUP, 0x10).unwrap();
+            assert!(!receipt.drained && !receipt.must_refetch, "{state}: {receipt:?}");
+            assert_eq!(lanes.behind_at_or_before(0x10), BTreeMap::from([(GROUP.to_string(), 0x10)]), "{state}");
+        };
+        // Commit 0x18 has work in production, which holds 0x20's output on the queue.
+        lanes.begin_origin(GROUP, 0x18);
+        lanes.push(GROUP, vec![verdict("upsert", "1", 1)], 0x20);
+        lanes.push(GROUP, vec![verdict("delete", "1", 2)], 0x10);
+        settle().await;
+        assert!(!lanes.appending(GROUP), "the 0x10 verdict went ahead of the envelope it follows");
+        outstanding(&lanes, "queued");
+        // Both are taken for one append, which the stream holds.
+        lanes.complete_origin(GROUP, 0x18);
+        settle().await;
+        assert!(lanes.appending(GROUP) && appended(&store).0.is_empty());
+        outstanding(&lanes, "in flight");
+        hold.send_replace(false);
+        wait_appended(&store, 2).await;
+        assert_eq!(appended_said(&store), ["upsert 1 @0/20", "delete 1 @0/20"]);
+        settle().await;
+        assert!(lanes.drain(GROUP, 0x10).unwrap().drained);
+        assert!(lanes.behind_at_or_before(u64::MAX).is_empty());
+    }
+
+    /// A detach drops such a batch with the rest of the queue, and the gap it leaves starts at the
+    /// batch's own commit — not at the later commit it was ordered behind.
+    #[tokio::test]
+    async fn a_detach_resumes_from_the_commit_of_a_batch_ordered_behind_a_later_one() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let config = GroupLaneConfig { memory_bytes: 4096, ..test_config() };
+        let lanes =
+            GroupEmissionLanes::unmonitored(DsClient::with_test_store("scripted://group".into(), store), config);
+        lanes.register(GROUP);
+        lanes.begin_origin(GROUP, 0x18);
+        lanes.push(GROUP, vec![big_env("1")], 0x20);
+        lanes.push(GROUP, vec![big_env("1")], 0x10);
+        assert_eq!(detaches(&lanes), 0, "the batches ordered at one commit count as that commit's output");
+        lanes.push(GROUP, vec![big_env("over")], 0x30);
+        assert_eq!(detaches(&lanes), 1);
+        let receipt = lanes.drain(GROUP, 0x10).unwrap();
+        assert!(receipt.must_refetch && !receipt.drained, "{receipt:?}");
+        assert_eq!(receipt.resume_lsn.as_deref(), Some("0/10"));
+        assert_eq!(lanes.behind_at_or_before(u64::MAX), BTreeMap::from([(GROUP.to_string(), 0x10)]));
+    }
+
+    /// The rule as a law, over generated schedules: whatever commits the batches belong to,
+    /// whichever of them have work in production, and whenever the writer gets to run, every
+    /// key's envelopes reach the stream in the order they were handed to the lane, no position
+    /// falls, nothing is lost or repeated, and every commit's receipt ends drained.
+    #[tokio::test]
+    async fn every_key_reaches_the_stream_in_the_order_it_was_handed_over() {
+        for seed in 1..=64u64 {
+            let store = Arc::new(crate::ds::ScriptedStore::default());
+            let lanes = GroupEmissionLanes::unmonitored(
+                DsClient::with_test_store("scripted://group".into(), store.clone()),
+                test_config(),
+            );
+            lanes.register(GROUP);
+            // xorshift64: a fixed, replayable schedule per seed.
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            let mut producing: Vec<u64> = Vec::new();
+            let mut pushed = 0usize;
+            for rev in 1..=60u64 {
+                match next(10) {
+                    0 | 1 => {
+                        let commit = 0x10 * (1 + next(6));
+                        lanes.begin_origin(GROUP, commit);
+                        producing.push(commit);
+                    }
+                    2 | 3 if !producing.is_empty() => {
+                        let commit = producing.swap_remove(next(producing.len() as u64) as usize);
+                        lanes.complete_origin(GROUP, commit);
+                    }
+                    4 => settle().await,
+                    _ => {
+                        // One member's batch: a few rows of one of the group's two tables.
+                        let commit = 0x10 * (1 + next(6));
+                        let table = if next(3) == 0 { "public.grants" } else { "public.items" };
+                        let mut keys: Vec<u64> = (0..1 + next(3)).map(|_| next(4)).collect();
+                        keys.sort_unstable();
+                        keys.dedup();
+                        pushed += keys.len();
+                        let operation = if next(2) == 0 { "upsert" } else { "delete" };
+                        let batch = keys
+                            .iter()
+                            .map(|key| {
+                                let mut env = verdict(operation, &key.to_string(), rev);
+                                env.type_ = table.into();
+                                env
+                            })
+                            .collect();
+                        lanes.push(GROUP, batch, commit);
+                    }
+                }
+            }
+            for commit in producing {
+                lanes.complete_origin(GROUP, commit);
+            }
+            wait_appended(&store, pushed).await;
+            settle().await;
+            let events: Vec<serde_json::Value> = store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+                .collect();
+            assert_eq!(events.len(), pushed, "seed {seed}: an envelope was lost or repeated");
+            let mut last_rev: HashMap<String, u64> = HashMap::new();
+            let mut last_position = 0u64;
+            for event in &events {
+                let key = format!("{} {}", event["type"].as_str().unwrap(), event["key"].as_str().unwrap());
+                let rev = event["old"]["rev"].as_u64().unwrap();
+                let earlier = last_rev.insert(key.clone(), rev).unwrap_or(0);
+                assert!(rev > earlier, "seed {seed}: key {key} heard rev {rev} after rev {earlier}");
+                let position = crate::pg::lsn_to_u64(event["headers"]["lsn"].as_str().unwrap());
+                assert!(position >= last_position, "seed {seed}: a position fell at key {key} rev {rev}");
+                last_position = position;
+            }
+            assert!(lanes.drain(GROUP, 0x70).unwrap().drained, "seed {seed}: a receipt was left undrained");
+            assert!(lanes.behind_at_or_before(u64::MAX).is_empty(), "seed {seed}");
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_slow_but_answering_stream_never_detaches() {
         let store = Arc::new(crate::ds::ScriptedStore::default());
@@ -1479,6 +1962,9 @@ mod tests {
         assert_eq!(marker["value"]["control"], MUST_REFETCH);
         assert_eq!(marker["value"]["resumeLsn"], "0/10");
         assert_eq!(marker["value"]["groupId"], GROUP);
+        // The marker is placed too, at the last commit it stands in for, so a reader that places
+        // every envelope before it looks at its type never meets one it cannot place.
+        assert_eq!(appended_positions(&store), [placed(MUST_REFETCH, "0/10"), placed("after", "0/30")]);
         settle().await;
         let drain = lanes.drain(GROUP, 0x30).unwrap();
         assert!(drain.drained && !drain.must_refetch, "{drain:?}");
@@ -1708,6 +2194,12 @@ mod tests {
         let writer = log.clone();
         let subscriber = tracing_subscriber::fmt().json().with_writer(move || writer.clone()).finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // While this test's subscriber is the only one registered in the process, `tracing` decides
+        // a callsite's interest by asking the default of whichever thread reaches it FIRST — and
+        // the lane tests running beside this one reach the same `group_*` callsites with no
+        // subscriber, which caches "never" and drops this thread's events. A second registered
+        // dispatcher makes every callsite ask all of them instead.
+        let _every_dispatcher_is_asked = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let config = GroupLaneConfig { memory_bytes: 8 * 1024, ..test_config() };
         let (lanes, store, hold) = held_lanes(config);
         lanes.set_meta(GROUP, GroupMeta { subscription: "scope-1".into(), tables: vec!["public.items".into()] });
@@ -1914,6 +2406,61 @@ mod tests {
         assert!(lanes.drain(GROUP, 7).unwrap().drained);
         assert!(lanes.behind_at_or_before(u64::MAX).is_empty());
         assert!(lanes.drain("shape/group-unknown", 7).is_none());
+    }
+
+    /// A restart with **a later landed envelope and an older outstanding origin**. Before it,
+    /// commit 0x20's output had landed, and work for the older commit 0x10 — which registered late
+    /// — was still outstanding, so the checkpoint recorded 0x10 as the group's resume point. The
+    /// restored lane starts detached at 0x10. Its must-refetch marker, and the replay that follows
+    /// it, land AFTER the envelope at 0x20 that the stream already carries, so they are placed at
+    /// the position the stream had reached — the checkpoint's highwater — and not at 0x10.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_lane_never_places_its_marker_below_what_its_stream_already_carries() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        let lanes_over = |store: &Arc<crate::ds::ScriptedStore>| {
+            GroupEmissionLanes::unmonitored(
+                DsClient::with_test_store("scripted://group".into(), store.clone()),
+                test_config(),
+            )
+        };
+        // The run before the restart.
+        let before = lanes_over(&store);
+        before.register(GROUP);
+        before.push(GROUP, vec![group_env("landed")], 0x20);
+        wait_appended(&store, 1).await;
+        before.begin_origin(GROUP, 0x10);
+        assert_eq!(
+            before.behind_at_or_before(0x20),
+            BTreeMap::from([(GROUP.to_string(), 0x10)]),
+            "the checkpoint at highwater 0x20 records 0x10 as the group's resume point"
+        );
+        before.remove(GROUP);
+
+        // The next boot, as the catalog restore does it: the checkpoint's highwater, the group
+        // detached at its resume point, and the position its stream had reached.
+        let lanes = lanes_over(&store);
+        lanes.note_restored_highwater(0x20);
+        lanes.register_detached(GROUP, 0x10, GroupMeta::default());
+        lanes.restore_position(GROUP, 0x20);
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        lanes.tick_for_test(true).await;
+        // The replay re-emits the commit that was outstanding; then a new commit arrives.
+        lanes.push(GROUP, vec![group_env("replayed")], 0x10);
+        lanes.push(GROUP, vec![group_env("live")], 0x30);
+        wait_appended(&store, 4).await;
+        assert_eq!(
+            appended_positions(&store),
+            [
+                placed("landed", "0/20"),
+                placed(MUST_REFETCH, "0/20"),
+                placed("replayed", "0/20"),
+                placed("live", "0/30")
+            ]
+        );
+
+        // A restored position never lowers one the lane has already reached.
+        lanes.restore_position(GROUP, 0x18);
+        assert_eq!(lanes.position(GROUP), Some(0x30));
     }
 
     #[tokio::test(start_paused = true)]

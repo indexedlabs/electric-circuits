@@ -458,12 +458,16 @@ export function mergeFeedDelta(view: SubsetView, env: StreamEnvelope): MergeActi
   const deltaLsn = lsnToU64(env.headers.lsn)
   const txid = env.headers.txid
   // A page snapshot is consulted only below its horizon; once the tail has passed it, every change
-  // is newer than that page (the feed is in commit-LSN order), so it is marked passed for good.
+  // is newer than that page (positions never decrease along a feed), so it is marked passed for
+  // good.
   if (deltaLsn !== null) passHorizons(view, deltaLsn)
   // A null LSN (library/no-Postgres mode) always applies — the old idempotent-by-pk behaviour.
   // Otherwise the change is fresh unless the row's version (or, for a row the view does not hold,
-  // the page it was absent from) already includes it. (No per-call closures: this runs for every
-  // live change.)
+  // the page it was absent from) already includes it. Against a version that is itself a feed
+  // position the test is `>=`, never `>`: equal positions are ordinary (a transaction's second
+  // word about a key, or a flip's verdict raised to the feed's position), and the later envelope
+  // is the newer one — docs/ARCHITECTURE.md §7, "Native envelope positions". (No per-call
+  // closures: this runs for every live change.)
   const fresh = deltaLsn === null || isFresh(view, key, deltaLsn, txid)
   if (env.headers.operation === 'delete') {
     if (!fresh) return null

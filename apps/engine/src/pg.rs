@@ -458,6 +458,10 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
     if e.chain().any(|cause| cause.downcast_ref::<crate::engine::DeploymentNotReady>().is_some()) {
         return BootFailure::Retryable;
     }
+    // A migration racing boot's identity check: the next attempt sets and re-reads it afresh.
+    if e.chain().any(|cause| cause.downcast_ref::<crate::engine::IdentityChangedDuringBoot>().is_some()) {
+        return BootFailure::Retryable;
+    }
     if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
         return classify(failure_of(pg));
     }
@@ -486,6 +490,9 @@ pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
     }
     if crate::ds::is_unavailable(e) {
         return "durable-streams is unreachable";
+    }
+    if e.chain().any(|cause| cause.downcast_ref::<crate::engine::IdentityChangedDuringBoot>().is_some()) {
+        return "a migration changed a table's replica identity during boot";
     }
     "not a transient Postgres condition"
 }
@@ -1040,16 +1047,49 @@ pub async fn introspect_opt(client: &Client, table: &TableRef, with_generated: b
     Ok(Some(TableDef { columns, primary_key, fingerprint: Some(fingerprint) }))
 }
 
-/// `ALTER TABLE … REPLICA IDENTITY FULL` so logical decoding carries the full old row. Used at
-/// boot, where waiting for the lock is the right thing to do.
-pub async fn ensure_replica_identity_full(client: &Client, table: &TableRef) -> Result<()> {
-    client
-        .batch_execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", table.quote_qualified()))
-        .await
-        .with_context(|| format!("set REPLICA IDENTITY FULL on {table}"))
+/// How long boot's `ALTER … REPLICA IDENTITY FULL` may wait for its `ACCESS EXCLUSIVE` lock.
+///
+/// While that request waits, Postgres queues every later reader of the table behind it, so this
+/// bound is the longest boot can stall the application's reads of a live table. A request still
+/// waiting when it expires fails with `55P03`, which [`classify`] retries on the boot loop's
+/// backoff; between attempts nothing is queued and readers proceed.
+pub const BOOT_IDENTITY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One transaction that sets `REPLICA IDENTITY FULL` if it gets the `ACCESS EXCLUSIVE` lock within
+/// `lock_timeout`, and otherwise fails with `55P03` having changed nothing.
+fn bounded_identity_full_sql(table: &TableRef, lock_timeout: std::time::Duration) -> String {
+    format!(
+        "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
+        lock_timeout.as_millis().max(1),
+        table.quote_qualified()
+    )
 }
 
-/// [`ensure_replica_identity_full`] with a bounded wait for the `ACCESS EXCLUSIVE` lock.
+/// `ALTER TABLE … REPLICA IDENTITY FULL` at boot, so logical decoding carries the full old row.
+///
+/// The wait for the lock is bounded by `lock_timeout`, because an unbounded one is not just slow:
+/// while it waits, every later reader of the table queues behind it, so one transaction left open
+/// on the table freezes all of its reads for as long as the boot waits. On timeout the error keeps
+/// its `55P03` for [`boot_disposition`], and the boot loop tries again after its backoff. The caller
+/// skips tables that are already FULL, since the `ALTER` takes the lock even when it changes nothing.
+pub async fn ensure_replica_identity_full(
+    client: &Client,
+    table: &TableRef,
+    lock_timeout: std::time::Duration,
+) -> Result<()> {
+    let result = client
+        .batch_execute(&bounded_identity_full_sql(table, lock_timeout))
+        .await
+        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"));
+    if result.is_err() {
+        // The failure aborted the transaction; end it so the connection is usable again. Boot
+        // returns this error and drops the connection anyway, so a failed rollback adds nothing.
+        let _ = client.batch_execute("ROLLBACK").await;
+    }
+    result
+}
+
+/// The drift handler's bounded `ALTER … REPLICA IDENTITY FULL`, on a pooled connection.
 ///
 /// The drift handler runs INLINE in the ingestor: an unbounded lock wait there would stall the
 /// whole replication stream — every table's — behind one long-running reader of this one. With
@@ -1062,11 +1102,7 @@ pub async fn ensure_replica_identity_full_bounded(
 ) -> Result<()> {
     client.transaction_started();
     let result = client
-        .batch_execute(&format!(
-            "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
-            lock_timeout.as_millis().max(1),
-            table.quote_qualified()
-        ))
+        .batch_execute(&bounded_identity_full_sql(table, lock_timeout))
         .await
         .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"));
     if result.is_ok() {
@@ -2386,6 +2422,16 @@ mod tests {
     fn managed_standby_is_a_retryable_boot_observation() {
         let error = anyhow::Error::new(crate::engine::DeploymentNotReady);
         assert_eq!(boot_disposition(&error), BootFailure::Retryable);
+    }
+
+    /// A migration changing a table's identity while boot sets it is a race, not a misconfiguration:
+    /// the boot loop retries it rather than exiting as a configuration error.
+    #[test]
+    fn an_identity_changed_during_boot_is_retryable() {
+        let table = TableRef::parse("public.users").unwrap();
+        let error = anyhow::Error::new(crate::engine::IdentityChangedDuringBoot(table)).context("setup_postgres");
+        assert_eq!(boot_disposition(&error), BootFailure::Retryable);
+        assert_eq!(boot_failure_name(&error), "a migration changed a table's replica identity during boot");
     }
 
     #[test]

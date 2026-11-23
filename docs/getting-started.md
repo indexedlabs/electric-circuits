@@ -48,8 +48,9 @@ Requirements the engine puts on your tables:
   supported; the key is introspected from the catalog).
 - Column types map to the engine's four scalar types: `int` (bigint/int), `float`
   (double precision), `text`, `bool`.
-- The engine will run `ALTER TABLE … REPLICA IDENTITY FULL` on each table at startup, so the
-  connecting role must own the tables (or be superuser).
+- The engine will run `ALTER TABLE … REPLICA IDENTITY FULL` at startup on each table that is not
+  already FULL, so the connecting role must own those tables (or be superuser). For that ALTER the engine waits at most 2 s for the table's lock and, if a transaction holds it longer, retries with `/ready` at `waiting` until it ends (see [startup](deployment-postgres.md#step-2--run-the-engine)).
+  Setting `REPLICA IDENTITY FULL` in your migration avoids the wait.
 
 Seed a few rows so the live queries below have something to return:
 
@@ -109,10 +110,11 @@ DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
 `ELECTRIC_CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every `public` table that has a
 primary key* — never every schema. List entries individually as `schema.name` or a bare `name`
 (= `public.<name>`), or opt a whole schema in with `schema.*`. On boot, per table, the engine: introspects columns/types/pk, sets
-`REPLICA IDENTITY FULL`, ensures the current `changes/<n>` change-log segment, creates the logical
+`REPLICA IDENTITY FULL` if the table does not already have it, ensures the current `changes/<n>` change-log segment, creates the logical
 replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_CIRCUITS_PG_SLOT`,
 default `electric_circuits`),
-and starts the ingestor. Nothing else to migrate or install in the database.
+and starts the ingestor. Nothing else to migrate or install in the database. When a table still needs
+`REPLICA IDENTITY FULL`, the engine waits at most 2 s for the table's lock and, if a transaction holds it longer, retries with `/ready` at `waiting` until it ends (see [startup](deployment-postgres.md#step-2--run-the-engine)).
 
 The engine's circuit tier — disk-spillable table arrangements, counts pipelines, and circuit
 serving — is always on. Tune it (state dir, cache/spill budgets, which lookup indexes and

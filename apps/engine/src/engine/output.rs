@@ -180,7 +180,15 @@ pub(crate) fn translate_output(
 /// retraction IS the delete decision (structural spurious-delete gating), so this needs no
 /// row body — only the pk. Honors the TEST-ONLY `drop_deletes` fault exactly like
 /// [`translate_output`].
-pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<String>) -> Vec<Envelope> {
+///
+/// `lsn` is the envelopes' position, exactly as [`translate_output`] takes it: a delete is placed
+/// like the upserts beside it, or a consumer that orders by position cannot place it at all.
+pub(crate) fn delete_envelopes(
+    ts: &TableSchema,
+    pks: Vec<String>,
+    txid: Option<String>,
+    lsn: Option<String>,
+) -> Vec<Envelope> {
     if matches!(crate::fault::active(), crate::fault::Fault::DropDeletes) {
         return Vec::new();
     }
@@ -194,7 +202,7 @@ pub(crate) fn delete_envelopes(ts: &TableSchema, pks: Vec<String>, txid: Option<
                 operation: "delete".into(),
                 txid: txid.clone(),
                 offset: None,
-                lsn: None,
+                lsn: lsn.clone(),
                 seq: None,
                 last: None,
                 commit_ts: None,
