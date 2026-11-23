@@ -88,7 +88,7 @@ pub struct RetentionConfig {
     pub dormant_ttl: Duration,
     /// The live-only idle period as configured (`ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS`, default
     /// 24 hours; 0 = no period of its own). Read it through [`Self::live_only_evict_after`], which
-    /// applies the lease floor and the idle-plus-dormancy grace.
+    /// applies the subscription-lease floor.
     pub live_only_idle: Duration,
     /// Minimum dormant replay span in bytes (`ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES`).
     pub replay_min_bytes: u64,
