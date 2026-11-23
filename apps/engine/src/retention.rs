@@ -601,8 +601,9 @@ mod tests {
             SweepShape { idle: Duration::from_secs(3600), ..shape("s1") }, // idle past the timeout
             SweepShape { idle: Duration::from_secs(60), ..shape("s2") },   // recently read
             SweepShape { idle: Duration::from_secs(3600), refcount: 2, ..shape("s3") }, // subscribed
-            SweepShape { idle: Duration::from_secs(3600), dormancy_eligible: false, ..shape("s4") }, // aggregate/subquery
-            SweepShape { idle: Duration::from_secs(3600), in_transition: true, ..shape("s5") },      // mid-transition
+            // Keep the live-only fixture below the lease floor: this test covers dormancy only.
+            SweepShape { idle: Duration::from_secs(60), dormancy_eligible: false, ..shape("s4") }, // aggregate/subquery
+            SweepShape { idle: Duration::from_secs(3600), in_transition: true, ..shape("s5") },    // mid-transition
         ];
         let plan = plan_sweep(&cfg(), &shapes);
         assert_eq!(plan.deactivate, vec!["s1"]);
