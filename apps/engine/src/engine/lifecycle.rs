@@ -2046,10 +2046,10 @@ impl Engine {
     /// straight from active with a full teardown. Rechecks eligibility under the locks — a
     /// reactivation, rejoin or newer touch racing the sweep wins.
     pub(crate) async fn evict_shape(&self, id: &str, reason: EvictReason) -> Result<Evicted> {
-        self.evict_shape_planned(id, reason).await
+        self.evict_shape_planned(id, reason, false).await
     }
 
-    async fn evict_shape_planned(&self, id: &str, reason: EvictReason) -> Result<Evicted> {
+    async fn evict_shape_planned(&self, id: &str, reason: EvictReason, group_marked: bool) -> Result<Evicted> {
         let mut st = self.state.lock().await;
         // No record: the shape is already gone, so whatever it held (a change-log segment pin
         // included) is released — that IS the outcome the caller asked for.
@@ -2071,6 +2071,7 @@ impl Engine {
                             .retention
                             .live_only_evict_after()
                             .is_some_and(|(after, _)| life.last_read.elapsed() >= after)
+                        && !group_marked
                 }
                 _ => false, // transitioning (or already evicted) since the sweep snapshot
             };
@@ -2171,7 +2172,8 @@ impl Engine {
             }
         }
         for (id, reason) in &plan.evict {
-            if let Err(e) = self.evict_shape_planned(id, *reason).await {
+            let group_marked = snapshot.iter().find(|s| s.id == *id).and_then(|s| s.group.as_ref()).is_some();
+            if let Err(e) = self.evict_shape_planned(id, *reason, group_marked).await {
                 tracing::warn!("retention: evicting shape {id} failed: {e:#}");
             }
         }

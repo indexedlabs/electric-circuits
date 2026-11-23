@@ -971,10 +971,9 @@ maintained:
 Eviction is layered, least-recently-read first: ordinary shapes retire from dormant (dormancy TTL,
 count cap, and disk budget), while active **live-only** shapes (subqueries, aggregates and
 changes-only feeds) retire after the live-only idle period with no subscription or touch. The
-period defaults to 24 hours, is never shorter than the subscription lease, and only shortens the
-idle-plus-dormancy grace when that grace is shorter. A lease lapse is not a touch, so the period
-runs from the last renewal. Active ordinary shapes are never evicted, and no subscribed shape is
-evicted.
+period defaults to 24 hours and is never shorter than the subscription lease. A lease lapse is
+not a touch, so the period runs from the last renewal. Active ordinary shapes are never evicted,
+and no subscribed shape is evicted.
 
 At `ELECTRIC_CIRCUITS_MAX_SHAPES`, the retention sweep evicts least-recently-read dormant shapes only. Active and live-only shapes remain protected, so the engine logs retention pressure when no dormant shape remains. `GET /metrics` reports `shapes_evicted_<reason>_total` and `shapes_live_<kind>_<subscribed|unsubscribed>`; Prometheus exposes the corresponding reason and live-shape labels.
 
