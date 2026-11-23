@@ -215,7 +215,8 @@ describe('live-shape gauges are refreshed by ordinary retention sweeps', () => {
     await boot({
       ELECTRIC_CIRCUITS_MAX_SHAPES: '10',
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
-      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
+      ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
+      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '0',
       ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '3',
     })
     const held = await feed(inList(1), 'gauge-held')
