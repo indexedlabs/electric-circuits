@@ -1386,7 +1386,6 @@ async fn run_subset_load_group(
                 true,
                 Some(sub.clone()),
                 group_path.clone(),
-                Some(group_sub.clone()),
             )
             .await
         {
@@ -1395,7 +1394,6 @@ async fn run_subset_load_group(
                 created.push((rec, sub));
             }
             Err(error) => {
-                engine.restore_group_member_slot(&group_sub).await;
                 reservation.rollback().await;
                 return Err(AppError::from(error));
             }

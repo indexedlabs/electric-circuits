@@ -63,26 +63,12 @@ pub(crate) struct GroupStreamClosed {
 #[derive(Default)]
 pub(crate) struct GroupClaims {
     reserved: HashMap<String, String>,
-    /// Slots promised to a group load but not yet represented by a shape record.  A member
-    /// creation moves one slot to `inflight_slots` while it is registering, so concurrent
-    /// creates cannot consume capacity that the group still needs.
-    reserved_slots: HashMap<String, usize>,
-    inflight_slots: HashMap<String, usize>,
     records: HashMap<String, GroupRecord>,
     private_members: HashMap<String, String>,
 }
 
 impl GroupClaims {
     pub(crate) fn reserve(&mut self, subscription: &str, owner_hint: &str) -> anyhow::Result<()> {
-        self.reserve_with_slots(subscription, owner_hint, 0)
-    }
-
-    pub(crate) fn reserve_with_slots(
-        &mut self,
-        subscription: &str,
-        owner_hint: &str,
-        slots: usize,
-    ) -> anyhow::Result<()> {
         if self.reserved.contains_key(subscription) || self.records.contains_key(subscription) {
             return Err(anyhow::Error::new(GroupConflict {
                 subscription: subscription.to_string(),
@@ -90,16 +76,11 @@ impl GroupClaims {
             }));
         }
         self.reserved.insert(subscription.to_string(), owner_hint.to_string());
-        if slots > 0 {
-            self.reserved_slots.insert(subscription.to_string(), slots);
-        }
         Ok(())
     }
 
     pub(crate) fn complete(&mut self, record: GroupRecord) {
         self.reserved.remove(&record.subscription);
-        self.reserved_slots.remove(&record.subscription);
-        self.inflight_slots.remove(&record.subscription);
         for member in &record.members {
             if member.subscription != record.subscription {
                 self.private_members.insert(member.subscription.clone(), record.subscription.clone());
@@ -110,8 +91,6 @@ impl GroupClaims {
 
     pub(crate) fn release(&mut self, subscription: &str) -> Option<GroupRecord> {
         self.reserved.remove(subscription);
-        self.reserved_slots.remove(subscription);
-        self.inflight_slots.remove(subscription);
         self.private_members.retain(|_, owner| owner != subscription);
         self.records.remove(subscription)
     }
@@ -127,8 +106,6 @@ impl GroupClaims {
         let legacy = format!("group {subscription}");
         if self.reserved.get(subscription).is_some_and(|owner| owner == group_id || owner == &legacy) {
             self.reserved.remove(subscription);
-            self.reserved_slots.remove(subscription);
-            self.inflight_slots.remove(subscription);
             self.private_members.retain(|_, owner| owner != subscription);
         }
         None
@@ -138,8 +115,6 @@ impl GroupClaims {
         let legacy = format!("group {subscription}");
         if self.reserved.get(subscription).is_some_and(|owner| owner == group_id || owner == &legacy) {
             self.reserved.remove(subscription);
-            self.reserved_slots.remove(subscription);
-            self.inflight_slots.remove(subscription);
             self.private_members.retain(|_, owner| owner != subscription);
         }
     }
@@ -147,8 +122,6 @@ impl GroupClaims {
     pub(crate) fn release_if_matches(&mut self, subscription: &str, group_id: &str) -> Option<GroupRecord> {
         if self.records.get(subscription).is_some_and(|record| record.id == group_id) {
             self.reserved.remove(subscription);
-            self.reserved_slots.remove(subscription);
-            self.inflight_slots.remove(subscription);
             self.private_members.retain(|_, owner| owner != subscription);
             self.records.remove(subscription)
         } else {
@@ -170,61 +143,6 @@ impl GroupClaims {
 
     pub(crate) fn reservation_id(&self, subscription: &str) -> Option<&String> {
         self.reserved.get(subscription)
-    }
-
-    pub(crate) fn reserved_slots(&self) -> usize {
-        self.reserved_slots.values().sum::<usize>() + self.inflight_slots.values().sum::<usize>()
-    }
-
-    pub(crate) fn inflight_slots_for(&self, group: &str) -> usize {
-        self.inflight_slots.get(group).copied().unwrap_or(0)
-    }
-
-    pub(crate) fn begin_member_slot(&mut self, group: &str) -> bool {
-        let Some(remaining) = self.reserved_slots.get_mut(group) else { return false };
-        if *remaining == 0 {
-            return false;
-        }
-        *remaining -= 1;
-        *self.inflight_slots.entry(group.to_string()).or_default() += 1;
-        true
-    }
-
-    pub(crate) fn finish_member_slot(&mut self, group: &str) -> bool {
-        let Some(inflight) = self.inflight_slots.get_mut(group) else { return false };
-        if *inflight == 0 {
-            return false;
-        }
-        *inflight -= 1;
-        if *inflight == 0 {
-            self.inflight_slots.remove(group);
-        }
-        true
-    }
-
-    pub(crate) fn restore_member_slot(&mut self, group: &str) -> bool {
-        if !self.finish_member_slot(group) {
-            return false;
-        }
-        *self.reserved_slots.entry(group.to_string()).or_default() += 1;
-        true
-    }
-
-    pub(crate) fn group_for_subscription(&self, subscription: &str) -> Option<String> {
-        if let Some(owner) = self.reservation_id(subscription) {
-            return Some(owner.clone());
-        }
-        let owner = self.private_members.get(subscription)?;
-        self.is_reserved(owner).then(|| owner.clone())
-    }
-
-    /// Build the record-owned member map once for a retention snapshot.  Per-shape lookups then
-    /// stay O(1), rather than scanning every group member under the engine state lock.
-    pub(crate) fn record_shape_groups(&self) -> HashMap<String, String> {
-        self.records
-            .values()
-            .flat_map(|group| group.members.iter().map(move |member| (member.shape_id.clone(), group.id.clone())))
-            .collect()
     }
 
     /// True for the public reservation and every private member reservation belonging to it.
@@ -318,20 +236,6 @@ mod tests {
         let error = claims.reserve("scope-1", "shape:s1").unwrap_err();
         assert!(error.downcast_ref::<GroupConflict>().is_some());
         assert!(claims.is_reserved("scope-1"));
-    }
-
-    #[test]
-    fn a_group_reservation_holds_and_accounts_for_member_slots() {
-        let mut claims = GroupClaims::default();
-        claims.reserve_with_slots("scope-1", "group:scope-1", 3).unwrap();
-        assert_eq!(claims.reserved_slots(), 3);
-        assert!(claims.begin_member_slot("scope-1"));
-        assert_eq!(claims.reserved_slots(), 3, "an in-flight member still holds its slot");
-        assert!(claims.finish_member_slot("scope-1"));
-        assert_eq!(claims.reserved_slots(), 2);
-        assert!(claims.begin_member_slot("scope-1"));
-        assert!(claims.restore_member_slot("scope-1"));
-        assert_eq!(claims.reserved_slots(), 2);
     }
 
     #[test]
