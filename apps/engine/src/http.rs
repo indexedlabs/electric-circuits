@@ -1395,7 +1395,6 @@ async fn run_subset_load_group(
                 created.push((rec, sub));
             }
             Err(error) => {
-                engine.restore_group_member_slot(&group_sub).await;
                 reservation.rollback().await;
                 return Err(AppError::from(error));
             }

@@ -261,12 +261,6 @@ impl Engine {
         group_reservation: Option<String>,
     ) -> Result<(ShapeRecord, String)> {
         let sub = self.resolve_subscription(subscription).await;
-        if let Some(group) = group_reservation.as_deref() {
-            let mut st = self.state.lock().await;
-            if !st.group_claims.begin_member_slot(group) {
-                bail!("group reservation has no remaining shape slot");
-            }
-        }
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
             let res = self
                 .create_shape_once(
@@ -281,12 +275,7 @@ impl Engine {
                 )
                 .await;
             match retry_create(res, attempt, "shape group member", table) {
-                Ok(out) => {
-                    if let Some(group) = group_reservation.as_deref() {
-                        self.state.lock().await.group_claims.finish_member_slot(group);
-                    }
-                    return out.map(|rec| (rec, sub));
-                }
+                Ok(out) => return out.map(|rec| (rec, sub)),
                 Err(()) => redo_backoff().await,
             }
         }
@@ -541,8 +530,11 @@ impl Engine {
         ensure_group_subscription_available(&st, sub, stream_path_override.is_some())?;
         ensure_subscription_free(&st, sub, "")?;
         if self.shape_cap_reached(&st, 1, group_reservation) {
+            let reservation_credit =
+                usize::from(group_reservation.is_some_and(|group| st.group_claims.has_reserved_slot(group)));
+            let reserved_slots = st.group_claims.reserved_slots().saturating_sub(reservation_credit);
             drop(st);
-            self.make_room_under_cap_locked(1).await;
+            self.make_room_under_cap_locked(1, reserved_slots, group_reservation).await;
             st = self.state.lock().await;
             if let Some(sig) = &feed_sig {
                 if st.feed_by_sig.get(sig).and_then(|id| st.shapes.get(id)).is_some() {
@@ -565,6 +557,17 @@ impl Engine {
             ensure_subscription_free(&st, sub, "")?;
         }
         self.ensure_room_under_cap(&st, 1, group_reservation)?;
+
+        // A group member's reservation is held through the admission check above, but this
+        // transition happens immediately before registration under the same state lock. Once the
+        // record is inserted, `finish_member_slot` drops the reservation credit because the shape
+        // itself now counts against the cap. CreateGuard returns it if the registration later
+        // rolls back.
+        if let Some(group) = group_reservation {
+            if !st.group_claims.begin_member_slot(group) {
+                bail!("group reservation has no remaining shape slot");
+            }
+        }
 
         let num_id = st.next_shape_id;
         let id = format!("s{num_id}");
@@ -604,6 +607,13 @@ impl Engine {
             // `ensure_create_not_degraded`) or observes `degraded` here and never registers at all.
             self.ensure_not_degraded()?;
             st.shapes.insert(id.clone(), rec.clone());
+            if let Some(group) = group_reservation {
+                if !st.group_claims.finish_member_slot(group) {
+                    st.shapes.remove(&id);
+                    st.group_claims.restore_member_slot(group);
+                    bail!("group reservation lost its member slot");
+                }
+            }
             // Durable BEFORE the create is acknowledged (awaited at the bottom of the success
             // path): a `POST /shapes` that returns 200 promises a shape that survives a restart.
             let created = self.catalog_tx.send_durable(CatalogEvent::Created {
@@ -633,7 +643,14 @@ impl Engine {
             // propagate through the worker pool.
             drop(st);
             drop(cap_admission);
-            let mut creating = CreateGuard::new(self, &id, table, &stream_path, Registration::Registry);
+            let mut creating = CreateGuard::new(
+                self,
+                &id,
+                table,
+                &stream_path,
+                Registration::Registry,
+                group_reservation.map(str::to_owned),
+            );
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
                 let admission_started = std::time::Instant::now();
@@ -752,6 +769,13 @@ impl Engine {
         // for why this check and the one after the create's work are together sufficient.
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
+        if let Some(group) = group_reservation {
+            if !st.group_claims.finish_member_slot(group) {
+                st.shapes.remove(&id);
+                st.group_claims.restore_member_slot(group);
+                bail!("group reservation lost its member slot");
+            }
+        }
         // Durable before the create is acknowledged — see the subquery path above.
         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
             rec: rec.clone(),
@@ -774,7 +798,14 @@ impl Engine {
         // The sequencer keeps processing all tables meanwhile, buffering this shape's deltas.
         drop(st);
         drop(cap_admission);
-        let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
+        let mut creating = CreateGuard::new(
+            self,
+            &id,
+            table,
+            &rec.stream_path,
+            Registration::Sequencer,
+            group_reservation.map(str::to_owned),
+        );
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
             Err(e) => Err(e.context("creating shape stream")),
             Ok(()) => {
@@ -990,8 +1021,9 @@ impl Engine {
         ensure_group_subscription_available(&st, sub, false)?;
         ensure_subscription_free(&st, sub, "")?;
         if self.shape_cap_reached(&st, 1, None) {
+            let reserved_slots = st.group_claims.reserved_slots();
             drop(st);
-            self.make_room_under_cap_locked(1).await;
+            self.make_room_under_cap_locked(1, reserved_slots, None).await;
             st = self.state.lock().await;
             if st.feed_by_sig.get(&agg_sig).and_then(|id| st.shapes.get(id)).is_some() {
                 drop(st);
@@ -1065,7 +1097,7 @@ impl Engine {
                         drop(st);
                         drop(cap_admission);
                         let mut creating =
-                            CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
+                            CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer, None);
                         return match ready_rx2
                             .await
                             .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
@@ -1175,7 +1207,7 @@ impl Engine {
         st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
         drop(st);
         drop(cap_admission);
-        let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
+        let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer, None);
         let outcome = backfill_and_activate(
             &self.ds,
             &self.pg_pool,
@@ -2054,8 +2086,7 @@ impl Engine {
 
     /// Whether minting `wanted` records would exceed the configured shape cap.
     fn shape_cap_reached(&self, st: &EngineState, wanted: usize, group_reservation: Option<&str>) -> bool {
-        let group_credit =
-            usize::from(group_reservation.is_some_and(|group| st.group_claims.inflight_slots_for(group) > 0));
+        let group_credit = usize::from(group_reservation.is_some_and(|group| st.group_claims.has_reserved_slot(group)));
         self.retention.max_shapes > 0
             && st
                 .shapes
@@ -2078,7 +2109,7 @@ impl Engine {
         }
         self.metrics.shape_creates_refused.fetch_add(1, Ordering::Relaxed);
         Err(anyhow::Error::new(crate::engine::ShapeCapReached {
-            shapes: st.shapes.len(),
+            shapes: st.shapes.len().saturating_add(st.group_claims.reserved_slots()),
             wanted,
             max_shapes: self.retention.max_shapes,
         }))
@@ -2086,7 +2117,12 @@ impl Engine {
 
     /// Make room while the caller owns the cap-admission mutex. Keeping planning and all
     /// re-plans in that critical section means concurrent creates cannot select one victim.
-    pub(super) async fn make_room_under_cap_locked(&self, wanted: usize) {
+    pub(super) async fn make_room_under_cap_locked(
+        &self,
+        wanted: usize,
+        reserved_slots: usize,
+        group_reservation: Option<&str>,
+    ) {
         if self.retention.max_shapes == 0 {
             return;
         }
@@ -2099,7 +2135,6 @@ impl Engine {
                 self.sweep_snapshot(false).await;
                 return;
             }
-            let reserved_slots = self.state.lock().await.group_claims.reserved_slots();
             let snapshot = self.sweep_snapshot(false).await;
             match crate::retention::plan_cap_room(&self.retention, &snapshot, wanted.saturating_add(reserved_slots)) {
                 crate::retention::CapRoom::Fits | crate::retention::CapRoom::Full => {
@@ -2107,10 +2142,11 @@ impl Engine {
                     return;
                 }
                 crate::retention::CapRoom::Evict(ids) => {
+                    let mut evicted_any = false;
                     for id in ids {
                         let idle = snapshot.iter().find(|s| s.id == id).map(|s| s.idle);
                         match self.evict_shape_planned(&id, EvictReason::MaxShapes, idle).await {
-                            Ok(Evicted::Yes) => {}
+                            Ok(Evicted::Yes) => evicted_any = true,
                             Ok(Evicted::Skipped) => {
                                 tracing::debug!(shape_id = %id, "cap eviction was skipped; replanning");
                             }
@@ -2119,10 +2155,15 @@ impl Engine {
                             }
                         }
                     }
+                    if !evicted_any {
+                        tracing::debug!(wanted, "cap admission found no victim it could evict");
+                        self.sweep_snapshot(false).await;
+                        return;
+                    }
                 }
             }
             let st = self.state.lock().await;
-            if !self.shape_cap_reached(&st, wanted, None) {
+            if !self.shape_cap_reached(&st, wanted, group_reservation) {
                 drop(st);
                 self.sweep_snapshot(false).await;
                 return;
@@ -3363,18 +3404,27 @@ struct CreateGuard {
     table: TableRef,
     stream_path: String,
     registration: Registration,
+    group_reservation: Option<String>,
     admission: Option<SubqueryPermit>,
     armed: bool,
 }
 
 impl CreateGuard {
-    fn new(engine: &Engine, shape_id: &str, table: &TableRef, stream_path: &str, registration: Registration) -> Self {
+    fn new(
+        engine: &Engine,
+        shape_id: &str,
+        table: &TableRef,
+        stream_path: &str,
+        registration: Registration,
+        group_reservation: Option<String>,
+    ) -> Self {
         Self {
             engine: engine.clone(),
             shape_id: shape_id.to_string(),
             table: table.clone(),
             stream_path: stream_path.to_string(),
             registration,
+            group_reservation,
             admission: None,
             armed: true,
         }
@@ -3398,16 +3448,17 @@ impl CreateGuard {
         if !std::mem::take(&mut self.armed) {
             return None;
         }
-        let (engine, shape_id, table, stream_path, registration, admission) = (
+        let (engine, shape_id, table, stream_path, registration, group_reservation, admission) = (
             self.engine.clone(),
             self.shape_id.clone(),
             self.table.clone(),
             self.stream_path.clone(),
             self.registration,
+            self.group_reservation.clone(),
             self.admission.take(),
         );
         Some(self.engine.shutdown.spawn(async move {
-            engine.rollback_create(&shape_id, &table, &stream_path, registration).await;
+            engine.rollback_create(&shape_id, &table, &stream_path, registration, group_reservation.as_deref()).await;
             // Cleanup includes circuit retractions: release only once they have actually landed.
             drop(admission);
         }))
@@ -3731,9 +3782,19 @@ impl Engine {
     /// `RemoveShape` covers both states (it drops the pending buffer, the routed/standalone/
     /// aggregate registration, and the emit counter); commands are FIFO, so one sent while
     /// `BeginShape` is still queued still lands after it.
-    async fn rollback_create(&self, id: &str, table: &TableRef, stream_path: &str, registration: Registration) {
+    async fn rollback_create(
+        &self,
+        id: &str,
+        table: &TableRef,
+        stream_path: &str,
+        registration: Registration,
+        group_reservation: Option<&str>,
+    ) {
         let mut st = self.state.lock().await;
         let existed = st.shapes.remove(id).is_some();
+        if let Some(group) = group_reservation {
+            st.group_claims.restore_registered_member_slot(group);
+        }
         st.circuit_placement.remove(id);
         // The create's own subscription goes with it: a rolled-back create never happened, and
         // leaving its id claimed would refuse the client's very next attempt with a 409.
@@ -4031,7 +4092,7 @@ mod cancellation_tests {
         st.subscribe(id, "sub-a".to_string(), crate::changelog::now_secs());
         drop(st);
         engine.lives.lock().unwrap().insert(id.to_string(), ShapeLife::active());
-        CreateGuard::new(engine, id, &"outer_t".into(), &format!("shape/{id}"), Registration::Registry)
+        CreateGuard::new(engine, id, &"outer_t".into(), &format!("shape/{id}"), Registration::Registry, None)
     }
 
     /// The detached rollback must leave nothing a later identical create could join or conflict with.
@@ -4447,7 +4508,7 @@ mod cancellation_tests {
 
         // A distinct shape pins the already-live node in phase A, then pauses before phase B.
         // No I/O, sleeps or fabricated membership: use the registry's actual seed decision.
-        let mut next = CreateGuard::new(&engine, "s2", &"outer_t".into(), "shape/s2", Registration::Registry);
+        let mut next = CreateGuard::new(&engine, "s2", &"outer_t".into(), "shape/s2", Registration::Registry, None);
         next.admit_subquery(&where_json).await.unwrap();
         let begin = engine
             .subqueries
