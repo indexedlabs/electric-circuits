@@ -213,7 +213,7 @@ struct SubsetFeedRequest {
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -272,7 +272,7 @@ fn openapi_subset_query() {}
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -288,7 +288,7 @@ fn openapi_subset_feed() {}
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]
@@ -304,7 +304,7 @@ fn openapi_subset_load() {}
         (status = 415, description = "Unsupported media type", body = ErrorResponse),
         (status = 422, description = "Request entity cannot be processed", body = ErrorResponse),
         (status = 409, description = "Subscription belongs to another shape", body = ErrorResponse),
-        (status = 503, description = "Engine unavailable, or at its shape cap with nothing left to evict (`Retry-After`)", body = ErrorResponse)
+        (status = 503, description = "Engine unavailable", body = ErrorResponse)
     )
 )]
 #[allow(dead_code)]

@@ -512,8 +512,12 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     }
 
     // Dormant shapes still standing after tier 1, least-recently-read first (largest idle first).
-    let mut lru: Vec<&SweepShape> =
-        shapes.iter().filter(|s| s.dormant_for.is_some() && !evicted.contains(s.id.as_str())).collect();
+    // A group owns one shared stream. Its members are marked in the snapshot from the group
+    // records/reservations and must never be retired one at a time by any retention pressure.
+    let mut lru: Vec<&SweepShape> = shapes
+        .iter()
+        .filter(|s| s.group.is_none() && s.dormant_for.is_some() && !evicted.contains(s.id.as_str()))
+        .collect();
     lru.sort_by_key(|s| std::cmp::Reverse(s.idle));
     let mut lru = lru.into_iter();
 
@@ -682,6 +686,18 @@ mod tests {
         let plan = plan_sweep(&c, &shapes);
         assert!(plan.evict.is_empty());
         assert!(plan.over_capacity, "over the cap with nothing dormant must be surfaced, not resolved");
+    }
+
+    #[test]
+    fn max_shapes_does_not_evict_a_group_member() {
+        let c = RetentionConfig { max_shapes: 1, ..cfg() };
+        let shapes = vec![
+            SweepShape { group: Some("record:g".into()), ..dormant("member", 10_000, 60) },
+            dormant("standalone", 100, 60),
+        ];
+        let plan = plan_sweep(&c, &shapes);
+        assert_eq!(plan.evict, vec![("standalone".to_string(), EvictReason::MaxShapes)]);
+        assert!(!plan.over_capacity);
     }
 
     /// The live-only idle period retires an unsubscribed live-only shape after the configured
