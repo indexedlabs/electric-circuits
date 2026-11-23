@@ -2175,9 +2175,10 @@ impl Engine {
                 tracing::warn!("retention: deactivating shape {id} failed: {e:#}");
             }
         }
+        let group_marked: std::collections::HashSet<&str> =
+            snapshot.iter().filter(|s| s.group.is_some()).map(|s| s.id.as_str()).collect();
         for (id, reason) in &plan.evict {
-            let group_marked = snapshot.iter().find(|s| s.id == *id).and_then(|s| s.group.as_ref()).is_some();
-            if let Err(e) = self.evict_shape_planned(id, *reason, group_marked).await {
+            if let Err(e) = self.evict_shape_planned(id, *reason, group_marked.contains(id.as_str())).await {
                 tracing::warn!("retention: evicting shape {id} failed: {e:#}");
             }
         }
@@ -4769,7 +4770,7 @@ mod subscription_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn renewing_a_live_only_shape_delays_retirement_until_after_the_renewal() {
         let server = FakeDs::start().await;
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let mut engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         let now = crate::changelog::now_secs();
         {
             let mut st = engine.state.lock().await;
@@ -4826,7 +4827,7 @@ mod subscription_tests {
 
         // Move the clock beyond the configured period and run the ordinary sweep again: now the
         // same feed is retired as live-only idle.
-        engine.lives.lock().unwrap()["aggregate-renewal"].last_read =
+        engine.lives.lock().unwrap().get_mut("aggregate-renewal").unwrap().last_read =
             std::time::Instant::now() - std::time::Duration::from_secs(3);
         engine.retention_sweep().await;
         assert!(engine.get_shape("aggregate-renewal").await.is_none(), "the period after renewal has elapsed");
@@ -4892,7 +4893,7 @@ mod subscription_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_retention_sweep_retires_an_idle_aggregate() {
         let server = FakeDs::start().await;
-        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        let mut engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
         {
             let mut st = engine.state.lock().await;
             let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
@@ -5460,7 +5461,7 @@ mod subscription_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn retention_sweep_leaves_released_group_members_alone() {
         let server = FakeDs::start().await;
-        let (engine, group) =
+        let (mut engine, group) =
             engine_with_shared_group_stream(DsClient::new_for_in_process_test(server.url()), 3, true).await;
         {
             let mut st = engine.state.lock().await;

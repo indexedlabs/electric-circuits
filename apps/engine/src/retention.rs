@@ -192,12 +192,12 @@ impl RetentionConfig {
 }
 
 /// The shortest non-zero `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` the engine starts with: twice the
-/// larger of a shape's idle-plus-dormancy window and the change log's retain window, 14.5 days at
-/// the defaults. A live-only shape can be retained longer than that window; the keep-alive sweep
-/// keeps its tracked stream alive until the live-only period retires it. `None` when idle or
-/// dormancy is `0` (disabled): an ordinary shape may then stay forever, and no TTL is safe. A
-/// retain window of `0` adds nothing to the floor, since dormancy eviction still unpins the
-/// segment a dormant shape holds.
+/// larger of a shape's idle-plus-dormancy window, the effective live-only period and the change
+/// log's retain window, 14.5 days at the defaults. The live-only period is the catch-up window for
+/// a feed that has gone away, so its stream must not expire during that period (including across a
+/// restart). `None` when idle or dormancy is `0` (disabled): an ordinary shape may then stay
+/// forever, and no TTL is safe. A retain window of `0` adds nothing to the floor, since dormancy
+/// eviction still unpins the segment a dormant shape holds.
 ///
 /// The floor alone does not keep a tracked stream alive: a stream the engine neither appends to nor
 /// reads, such as a restored dormant shape whose dormancy clock restarted at boot, would still
@@ -208,7 +208,9 @@ pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog:
     if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() {
         return None;
     }
-    Some(retention.idle_timeout.saturating_add(retention.dormant_ttl).max(changes.retain).saturating_mul(2))
+    let ordinary = retention.idle_timeout.saturating_add(retention.dormant_ttl);
+    let live_only = retention.live_only_evict_after().map_or(Duration::ZERO, |(after, _)| after);
+    Some(ordinary.max(live_only).max(changes.retain).saturating_mul(2))
 }
 
 /// Where a shape is in the lifecycle. Held per shape id by the engine (`Engine::lives`).
