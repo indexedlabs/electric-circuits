@@ -810,8 +810,8 @@ mod tests {
         assert!(!plan.over_capacity);
     }
 
-    /// Group retention and re-join are owned by OTTO-13834, so this evictor leaves every member
-    /// alone while a group shares one stream and one lease.
+    /// A group shares one stream and one lease, so the cap takes all of it or none of it, and none
+    /// of it while any member is subscribed.
     #[test]
     fn max_shapes_leaves_group_members_protected_and_never_evicts_a_subscribed_one() {
         let c = RetentionConfig { max_shapes: 4, ..cfg() };

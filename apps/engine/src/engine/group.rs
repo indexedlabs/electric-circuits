@@ -68,15 +68,8 @@ pub(crate) struct GroupClaims {
     /// creates cannot consume capacity that the group still needs.
     reserved_slots: HashMap<String, usize>,
     inflight_slots: HashMap<String, usize>,
-    /// Member slots that have become shape records while the group reservation is still being
-    /// assembled. They are tracked only so a failed create can return the slot; `reserved_slots`
-    /// deliberately excludes them because the shape record already counts against the cap.
-    registered_slots: HashMap<String, usize>,
     records: HashMap<String, GroupRecord>,
     private_members: HashMap<String, String>,
-    /// Completed group member shape id -> group id. Retention's under-lock recheck must be O(1),
-    /// even when a deployment has many groups and members.
-    shape_groups: HashMap<String, String>,
 }
 
 impl GroupClaims {
@@ -107,12 +100,10 @@ impl GroupClaims {
         self.reserved.remove(&record.subscription);
         self.reserved_slots.remove(&record.subscription);
         self.inflight_slots.remove(&record.subscription);
-        self.registered_slots.remove(&record.subscription);
         for member in &record.members {
             if member.subscription != record.subscription {
                 self.private_members.insert(member.subscription.clone(), record.subscription.clone());
             }
-            self.shape_groups.insert(member.shape_id.clone(), record.id.clone());
         }
         self.records.insert(record.subscription.clone(), record);
     }
@@ -121,15 +112,8 @@ impl GroupClaims {
         self.reserved.remove(subscription);
         self.reserved_slots.remove(subscription);
         self.inflight_slots.remove(subscription);
-        self.registered_slots.remove(subscription);
         self.private_members.retain(|_, owner| owner != subscription);
-        let record = self.records.remove(subscription);
-        if let Some(record) = &record {
-            for member in &record.members {
-                self.shape_groups.remove(&member.shape_id);
-            }
-        }
-        record
+        self.records.remove(subscription)
     }
 
     /// Compensate one load attempt without being able to remove a replacement group that
@@ -145,7 +129,6 @@ impl GroupClaims {
             self.reserved.remove(subscription);
             self.reserved_slots.remove(subscription);
             self.inflight_slots.remove(subscription);
-            self.registered_slots.remove(subscription);
             self.private_members.retain(|_, owner| owner != subscription);
         }
         None
@@ -157,7 +140,6 @@ impl GroupClaims {
             self.reserved.remove(subscription);
             self.reserved_slots.remove(subscription);
             self.inflight_slots.remove(subscription);
-            self.registered_slots.remove(subscription);
             self.private_members.retain(|_, owner| owner != subscription);
         }
     }
@@ -167,15 +149,8 @@ impl GroupClaims {
             self.reserved.remove(subscription);
             self.reserved_slots.remove(subscription);
             self.inflight_slots.remove(subscription);
-            self.registered_slots.remove(subscription);
             self.private_members.retain(|_, owner| owner != subscription);
-            let record = self.records.remove(subscription);
-            if let Some(record) = &record {
-                for member in &record.members {
-                    self.shape_groups.remove(&member.shape_id);
-                }
-            }
-            record
+            self.records.remove(subscription)
         } else {
             None
         }
@@ -198,13 +173,11 @@ impl GroupClaims {
     }
 
     pub(crate) fn reserved_slots(&self) -> usize {
-        // Registered members are already present in `EngineState::shapes`; only future and
-        // in-flight members remain as reservation credit here.
         self.reserved_slots.values().sum::<usize>() + self.inflight_slots.values().sum::<usize>()
     }
 
-    pub(crate) fn has_reserved_slot(&self, group: &str) -> bool {
-        self.reserved_slots.get(group).is_some_and(|slots| *slots > 0)
+    pub(crate) fn inflight_slots_for(&self, group: &str) -> usize {
+        self.inflight_slots.get(group).copied().unwrap_or(0)
     }
 
     pub(crate) fn begin_member_slot(&mut self, group: &str) -> bool {
@@ -218,8 +191,6 @@ impl GroupClaims {
     }
 
     pub(crate) fn finish_member_slot(&mut self, group: &str) -> bool {
-        // The shape record is inserted under the same state lock immediately before this call,
-        // so the slot is now represented by `shapes.len()` and must leave the reservation count.
         let Some(inflight) = self.inflight_slots.get_mut(group) else { return false };
         if *inflight == 0 {
             return false;
@@ -228,35 +199,12 @@ impl GroupClaims {
         if *inflight == 0 {
             self.inflight_slots.remove(group);
         }
-        *self.registered_slots.entry(group.to_string()).or_default() += 1;
         true
     }
 
     pub(crate) fn restore_member_slot(&mut self, group: &str) -> bool {
-        if let Some(inflight) = self.inflight_slots.get_mut(group)
-            && *inflight > 0
-        {
-            *inflight -= 1;
-            if *inflight == 0 {
-                self.inflight_slots.remove(group);
-            }
-            *self.reserved_slots.entry(group.to_string()).or_default() += 1;
-            return true;
-        }
-        self.restore_registered_member_slot(group)
-    }
-
-    /// Return the slot of a member record that was registered successfully but whose create then
-    /// failed during backfill or durability. The record is removed by the create rollback, so the
-    /// reservation must regain the capacity before the next member attempt.
-    pub(crate) fn restore_registered_member_slot(&mut self, group: &str) -> bool {
-        let Some(registered) = self.registered_slots.get_mut(group) else { return false };
-        if *registered == 0 {
+        if !self.finish_member_slot(group) {
             return false;
-        }
-        *registered -= 1;
-        if *registered == 0 {
-            self.registered_slots.remove(group);
         }
         *self.reserved_slots.entry(group.to_string()).or_default() += 1;
         true
@@ -273,7 +221,10 @@ impl GroupClaims {
     /// Build the record-owned member map once for a retention snapshot.  Per-shape lookups then
     /// stay O(1), rather than scanning every group member under the engine state lock.
     pub(crate) fn record_shape_groups(&self) -> HashMap<String, String> {
-        self.shape_groups.clone()
+        self.records
+            .values()
+            .flat_map(|group| group.members.iter().map(move |member| (member.shape_id.clone(), group.id.clone())))
+            .collect()
     }
 
     /// True for the public reservation and every private member reservation belonging to it.
@@ -310,8 +261,10 @@ impl GroupClaims {
     /// claims have been installed before its shapes are complete. Group records remain present
     /// while release retires members, so the retention snapshot protects that window too.
     pub(crate) fn group_for_shape(&self, shape_id: &str, subscriptions: &[String]) -> Option<String> {
-        if let Some(group) = self.shape_groups.get(shape_id) {
-            return Some(group.clone());
+        if let Some(group) =
+            self.records.values().find(|group| group.members.iter().any(|member| member.shape_id == shape_id))
+        {
+            return Some(group.id.clone());
         }
         subscriptions.iter().find_map(|subscription| {
             if let Some(owner) = self.reservation_id(subscription) {
@@ -376,11 +329,9 @@ mod tests {
         assert_eq!(claims.reserved_slots(), 3, "an in-flight member still holds its slot");
         assert!(claims.finish_member_slot("scope-1"));
         assert_eq!(claims.reserved_slots(), 2);
-        assert!(claims.restore_member_slot("scope-1"));
-        assert_eq!(claims.reserved_slots(), 3, "a rolled-back registered member returns its slot");
         assert!(claims.begin_member_slot("scope-1"));
         assert!(claims.restore_member_slot("scope-1"));
-        assert_eq!(claims.reserved_slots(), 3);
+        assert_eq!(claims.reserved_slots(), 2);
     }
 
     #[test]
