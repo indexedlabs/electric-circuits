@@ -14,6 +14,8 @@
 // Second-scale knobs as in `conformance-retention.test.ts`. The production defaults are a 30 minute
 // lease, a 24 hour live-only period and a 60 second sweep.
 
+import { performance } from 'node:perf_hooks'
+
 import type { Schema } from '@electric-circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -244,31 +246,78 @@ describe('live-shape gauges are refreshed by ordinary retention sweeps', () => {
 
 describe('aggregate live-only retention', () => {
   it('keeps a renewed aggregate through lease lapse, then retires it after the renewal period', async () => {
-    const h = await boot({
+    // No step races a sweep: each waits on engine state, and the one sleep only spaces the renewal
+    // from the control feed. With a 24 s period, a 1 s lease and a 1 s sweep the timeline is roughly:
+    //   t0       the aggregate is created: its original deadline is t0 + 24
+    //   t0 + 3   its lease has lapsed; the control feed is created (deadline t0 + 27)
+    //   t0 + 11  the aggregate is renewed (deadline t0 + 35): 13 s before the original deadline
+    //   t0 + 27  the control feed is retired; the aggregate has 8 s left
+    //   t0 + 35  the aggregate is retired
+    // Without the renewal's touch the aggregate would go at t0 + 24, no later than the control.
+    // The waits before the renewal are capped so that, together with the spacing, they end at
+    // least 8 s before the original deadline even on a slow runner.
+    const period = 24
+    const spacing = 8000
+    await boot({
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
-      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '8',
+      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: String(period),
     })
     const first = await aggregate('aggregate-renewed')
     expect(first.status, JSON.stringify(first.body)).toBe(200)
-    const feed = first.body as unknown as Feed
+    const id = (first.body as unknown as Feed).shapeId
+    const subscriptions = async () => (await engine('GET', `/shapes/${id}`)).body.subscriptions
+    const lapsed = () => counter('subscriptions_lapsed_total')
+    const evicted = () => counter('shapes_evicted_live_only_idle_total')
 
-    // Let the original lease lapse while the shape is still inside its live-only period, then
-    // renew the native claim. The renewal is a touch, so a later lease lapse does not immediately
-    // retire the aggregate.
-    await sleep(2200)
+    // The original lease lapses: no claim holds the aggregate, and a lapse is not a touch. The
+    // lapse counter shows the create took a claim; a lease of 1 s is too short to catch it held.
+    await waitFor(
+      async () => (await subscriptions()) === 0 && (await lapsed()) === 1,
+      'the original aggregate lease to lapse',
+      spacing,
+    )
+
+    // A feed created now and never renewed. Its deadline is after the aggregate's original one
+    // and well before the renewed one, so its retirement marks the moment in between.
+    const controlAt = performance.now()
+    const control = await feed(inList(2), 'aggregate-control')
+    expect(control.status, JSON.stringify(control.body)).toBe(200)
+    const controlId = (control.body as unknown as Feed).shapeId
+    await waitFor(async () => (await lapsed()) === 2, 'the control feed lease to lapse', spacing)
+
+    // Renew well after the control was created and well before the original deadline. The
+    // renewal joins the same aggregate and is a touch: its live-only period starts again.
+    await sleep(Math.max(0, controlAt + spacing - performance.now()))
+    expect(await shapeStatus(id), 'the aggregate is still inside its original period').toBe(200)
+    const renewalSentAt = performance.now()
     const renewed = await aggregate('aggregate-renewed')
     expect(renewed.status, JSON.stringify(renewed.body)).toBe(200)
-    expect((renewed.body as unknown as Feed).shapeId).toBe(feed.shapeId)
+    expect((renewed.body as unknown as Feed).shapeId, 'the renewal keeps the same aggregate').toBe(id)
+    expect(await evicted(), 'nothing has been retired yet').toBe(0)
 
+    // Nobody reads it again: the renewed claim lapses too.
     await waitFor(
-      async () => (await engine('GET', `/shapes/${feed.shapeId}`)).body.subscriptions === 0,
+      async () => (await subscriptions()) === 0 && (await lapsed()) === 3,
       'the renewed aggregate lease to lapse',
     )
-    expect(await shapeStatus(feed.shapeId), 'the live-only period starts at the renewal').toBe(200)
-    await waitFor(async () => (await shapeStatus(feed.shapeId)) === 404, 'the renewed aggregate to be retired', 10000)
-    expect(await counter('shapes_evicted_live_only_idle_total')).toBe(1)
-  }, 90000)
+
+    // The original period has passed, and the aggregate is still there.
+    await waitFor(async () => (await shapeStatus(controlId)) === 404, 'the unrenewed control feed to be retired', 30000)
+    expect(await shapeStatus(id), 'the live-only period restarted at the renewal').toBe(200)
+
+    // Then the renewed period passes with no reader, and the aggregate is retired.
+    await waitFor(async () => (await shapeStatus(id)) === 404, 'the renewed aggregate to be retired', 30000)
+    // A lower bound: the touch landed after `renewalSentAt`, and both clocks are the host's
+    // monotonic clock. Timing from the response instead could undercount and flake.
+    const sinceRenewal = performance.now() - renewalSentAt
+    expect(sinceRenewal, 'retired no sooner than a full period after the renewal was sent').toBeGreaterThanOrEqual(
+      period * 1000,
+    )
+    // The record goes before the stream is closed and the eviction is counted, so wait for both.
+    await waitFor(() => streamIsGone((first.body as unknown as Feed).streamUrl), 'the retired stream to be deleted')
+    await waitFor(async () => (await evicted()) === 2, 'both retirements to be counted as live-only idle')
+  }, 120000)
 })
 
 describe('Electric live-only retention', () => {
