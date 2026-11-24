@@ -4128,6 +4128,15 @@ mod tests {
         assert_eq!(server.catalog_kinds(), vec!["joined".to_string()]);
     }
 
+    #[tokio::test]
+    async fn a_rate_limited_initial_catalog_append_is_retried_before_admission() {
+        let server = FakeDs::start().await;
+        server.rate_limit_appends(1);
+        let admission =
+            Engine::admit_store(DsClient::new_for_in_process_test(server.url()), expected_store_bound(), true).await;
+        assert!(admission.is_ok(), "429 must not refuse boot: {:?}", admission.err());
+    }
+
     /// `send_durable` is the durable-before-ack primitive: the future must not resolve while the
     /// append is still being refused.
     #[tokio::test(flavor = "multi_thread")]
