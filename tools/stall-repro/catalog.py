@@ -76,6 +76,29 @@ class GatewayShapes:
         where = await self.gateway.authorize_predicate(scope, collection, synthetic_id(f"user/{account}"), authority=authority, chat=chat, chat_authorization=authorization)
         return {"table": f"public.{table}", "columns": sorted(collection.columns), "where": where, "changesOnly": True, "subscription": self.gateway._internal_subscription(synthetic_id(f"user/{account}"), identity, authority)}
 
+    def keyed_body(self, table, account, *, owner=None, calendar=0, identity="keyed"):
+        owner = account if owner is None else owner
+        collection = self.gateway.registered_collection(table, allow_chat_projection_dependency=True)
+        key = synthetic_id(f"calendar/{owner}/{calendar}") if table == "calendar_event" else synthetic_id(f"space/{owner}")
+        predicate = {"and": [{"col": "audience_key", "op": "eq", "value": str(key)}, {"col": "reader_class", "op": "eq", "value": "live"}]}
+        return {"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key", "reader_class"}), "where": predicate, "changesOnly": True, "subscription": self.gateway._internal_subscription(synthetic_id(f"user/{account}"), identity, self.authority(account))}
+
+    async def keyed_catalog(self, requests, retained=False):
+        preserved = {"message", "workflow_run", "graph_edge", "resource", "resource_fact", "file", "user"}
+        result = {}
+        for request in requests:
+            table = request["body"]["table"].removeprefix("public.")
+            account = request["account"]
+            if retained and table in preserved:
+                bodies = [request["body"]]
+            else:
+                owners = [account]
+                bodies = [self.keyed_body(table, account, owner=owner, calendar=calendar) for owner in owners for calendar in (range(15) if table == "calendar_event" else [0])]
+            for body in bodies:
+                signature = json.dumps({key: value for key, value in body.items() if key != "subscription"}, sort_keys=True)
+                result[signature] = {"kind": "retained" if contains_subquery(body["where"]) else "audience-key", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])}
+        return list(result.values())
+
     def window_scope(self, table, ordinal, windows):
         start = datetime.date(2026, 9, 1) + datetime.timedelta(days=ordinal % windows)
         end = start + datetime.timedelta(days=14)

@@ -89,7 +89,22 @@ class SyntheticData:
             "standing_grant": {"grantor_user_id": row_id("user", (account + 1) % 18 if account < 18 else 17), "grantee_user_id": row_id("user", account), "state": "active", "scope": "all", "tier": "editor", "activated_at": datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)},
         }
         values.update({key: value for key, value in overrides.get(table, {}).items() if key in values})
+        if "audience_key" in values:
+            values["audience_key"] = row_id("calendar", account, ordinal % 15) if table == "calendar_event" else row_id("space", account)
+            values["reader_class"] = "live"
         return values
+
+    def add_audience_columns(self, postgres_url, tables):
+        statements = []
+        with psycopg.connect(postgres_url) as connection:
+            for table in tables:
+                if table in {"native_sync_authority_fence", "circuits_source_fence"}:
+                    continue
+                statement = sql.SQL("ALTER TABLE {} ADD COLUMN audience_key uuid, ADD COLUMN reader_class text").format(sql.Identifier("public", table))
+                connection.execute(statement)
+                statements.append(statement.as_string(connection))
+                self.columns[table].extend([{"name": name, "type": kind, "nullable": True, "primary_key": False, "server_default": None, "enum": None, "foreign_keys": []} for name, kind in (("audience_key", "UUID"), ("reader_class", "TEXT"))])
+        return statements
 
     def insert(self, connection, table, account, count, start=None):
         rows = self.rows.setdefault((table, account), [])

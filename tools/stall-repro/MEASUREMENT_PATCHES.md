@@ -22,3 +22,33 @@ builds and those tests run only in Actions. This is characterization, not a
 production-readiness regression or permission to merge. Full product/client,
 restart, fault and authorization qualification gates are intentionally not
 claimed for these scratch observations.
+
+## Audience-key prototypes
+
+`B` is the user's all-plain idealization, not a claim that every proposed access
+path can be replaced by a Space filter. Every tracked non-fence table gets nullable
+`audience_key uuid` and `reader_class text`. The synthetic writer derives a row's
+Space from its synthetic owning account, or its Calendar for `calendar_event`,
+and writes both columns on insert. This workload contains only live, home-owned
+rows; updates do not move parents and deletions remove the keyed rows normally.
+No additional parent lookup is charged where the importing writer already knows
+its Space/Calendar. General parent moves, hidden/deleted classes, share changes,
+constraint repair and migration costs are not measured.
+
+Historical windowed requests collapse to one equality feed per table/key/class;
+we retain the original gateway projection plus the two measured columns. The
+gateway token/access-list/relay implementation is not prototyped, and the original
+marker probe intentionally remains to compare engine work on the same basis.
+Only owner-key access is exercised. Equal payloads share a canonical shape.
+
+`B-retained` is an additional cautionary control: chat, graph edges, Resources,
+Files and User audiences retain their original gateway predicates and historical
+windows. Other scopes use the prototype keys. It does not claim complete proposal
+parity either; in particular it does not implement live share/revocation enforcement.
+Comparing B with B-retained prevents an all-plain best case being mislabeled as
+proof that the proposal's explicitly retained subqueries are free.
+
+Both use the same source accounts, row counts, transaction boundaries, synthetic
+payloads, disabled FK/cascade triggers, and other-account probe as A. The extra
+columns add real stored/replicated bytes. The prototype is not an authorization
+qualification and must never be deployed.

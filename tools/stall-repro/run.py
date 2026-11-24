@@ -105,6 +105,9 @@ async def run(args):
     fixture = folder / "results/fixture"
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
     data = load_data(fixture / "columns.json")
+    if args.variant in {"B", "B-retained"}:
+        statements = await asyncio.to_thread(data.add_audience_columns, PG_URL, [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]])
+        (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
     help_probe = subprocess.run([str(Path(args.store).resolve()), "--help"], capture_output=True, text=True)
     (output / "store-help.txt").write_text(help_probe.stdout + help_probe.stderr)
     supports_page_cap = b"--max-chunk-bytes" in Path(args.store).read_bytes()
@@ -162,6 +165,7 @@ async def run(args):
     }
     command("sudo", "systemd-run", "--unit", unit, "--collect", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
+    manifest["variant"] = args.variant
     save(output / "manifest.json", manifest)
     try:
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {SECRET}"}, timeout=120) as client:
@@ -171,6 +175,8 @@ async def run(args):
             process = psutil.Process(pid)
             save(output / "engine-threads-at-ready.json", {thread.id: Path(f"/proc/{pid}/task/{thread.id}/comm").read_text().strip() for thread in process.threads()})
             catalog = await gateway.generate(args.catalog, args.scale)
+            if args.variant in {"B", "B-retained"}:
+                catalog = await gateway.keyed_catalog(catalog, retained=args.variant == "B-retained")
             if args.smoke:
                 catalog = catalog[:20] + catalog[-20:]
             semaphore = asyncio.Semaphore(8)
@@ -188,8 +194,11 @@ async def run(args):
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
             for table in ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource"):
-                await create({"body": await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}")})
-            probe_body = await gateway.body("record", 0, identity="other-account-probe")
+                keyed = args.variant == "B" or args.variant == "B-retained" and table not in {"graph_edge", "resource"}
+                for calendar in (range(15) if keyed and table == "calendar_event" else [0]):
+                    body = gateway.keyed_body(table, IMPORT_ACCOUNT, calendar=calendar, identity=f"import-{table}") if keyed else await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}")
+                    await create({"body": body})
+            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in {"B", "B-retained"} else await gateway.body("record", 0, identity="other-account-probe")
             probe_feed = await create({"body": probe_body})
             head = await client.head(probe_feed["streamUrl"])
             head.raise_for_status()
@@ -357,4 +366,5 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
+    parser.add_argument("--variant", choices=("A", "B", "B-retained"), default="A")
     asyncio.run(run(parser.parse_args()))
