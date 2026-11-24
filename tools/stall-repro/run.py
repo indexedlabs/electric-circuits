@@ -55,10 +55,12 @@ async def until_ready(client, unit, timeout=300):
     raise TimeoutError("Engine did not become ready; inspect engine.log")
 
 
-async def wait_for_marker(client, validator, source_commit_id, user_id, generation, timeout):
+async def wait_for_marker(client, validator, source_commit_id, user_id, generation, timeout, process=None):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
+        if process is not None and not process.is_running():
+            raise RuntimeError("Engine exited while workload effects were outstanding; inspect engine.log and cgroup evidence")
         try:
             response = await client.get(f"{ENGINE_URL}/_runtime/drained-through/{source_commit_id}", params={"user_id": str(user_id), "generation": generation}, timeout=2)
             last = {"status": response.status_code, "body": response.text[:1000]}
@@ -88,7 +90,11 @@ def read_events(path, after, before=float("inf")):
 async def sample_cpu(process, cgroup, output, stopped):
     with output.open("w") as handle:
         while not stopped.is_set():
-            handle.write(json.dumps({"at": time.time(), "cpu_s": sum(process.cpu_times()[:2]), "rss_bytes": process.memory_info().rss, "threads": process.num_threads(), "cpu_stat": (cgroup / "cpu.stat").read_text()}) + "\n")
+            try:
+                sample = {"at": time.time(), "cpu_s": sum(process.cpu_times()[:2]), "rss_bytes": process.memory_info().rss, "threads": process.num_threads(), "cpu_stat": (cgroup / "cpu.stat").read_text()}
+            except (psutil.NoSuchProcess, FileNotFoundError):
+                break
+            handle.write(json.dumps(sample) + "\n")
             handle.flush()
             try:
                 await asyncio.wait_for(stopped.wait(), timeout=1)
@@ -232,7 +238,7 @@ async def run(args):
                         data.update(connection, "record", account, 1 if args.smoke else 9 if args.catalog == "nov23" else 19)
                     marker(connection, fence_user, fence_generation, warm_marker)
             await asyncio.to_thread(warm)
-            await wait_for_marker(client, validator, warm_marker, fence_user, fence_generation, 900)
+            await wait_for_marker(client, validator, warm_marker, fence_user, fence_generation, 900, process)
             memory = await client.get(f"{ENGINE_URL}/memory")
             memory.raise_for_status()
             save(output / "catalog-calibration.json", {"target": TARGETS[args.catalog], "actual": memory.json(), "source_shape_requests": len(catalog), "smoke_only": args.smoke})
@@ -277,14 +283,19 @@ async def run(args):
                     save(output / f"{workload}-writes.json", journal)
                     result["row_changes"] = sum(entry["rows"] for entry in journal)
                     result["source_write_s"] = time.monotonic() - began
-                    result["completion"] = await wait_for_marker(client, validator, fence_id, fence_user, fence_generation, args.timeout)
+                    result["completion"] = await wait_for_marker(client, validator, fence_id, fence_user, fence_generation, args.timeout, process)
                     result["completed"] = True
                 except Exception as error:
                     result["completed"] = False
                     result["error"] = repr(error)
                 result["elapsed_s"] = time.monotonic() - began
                 result["ended_wall"] = time.time()
-                cpu_after = sum(process.cpu_times()[:2])
+                try:
+                    cpu_after = sum(process.cpu_times()[:2])
+                except psutil.NoSuchProcess:
+                    samples = [json.loads(line) for line in (output / f"{workload}-cpu.jsonl").read_text().splitlines()]
+                    cpu_after = samples[-1]["cpu_s"] if samples else cpu_before
+                    result["cpu_incomplete"] = "process exited; CPU total stops at last retained one-second sample"
                 result["began_wall"] = began_wall
                 result["transactions"] = transactions
                 cpu_stopped.set()
@@ -308,7 +319,7 @@ async def run(args):
                 result["changes_per_s"] = result.get("row_changes", 0) / result["elapsed_s"] if result["completed"] else None
                 result["probe"] = summarize([sample for sample in probe.samples if began - probe.started <= sample["at_s"] <= began + result["elapsed_s"] - probe.started])
                 result["idle_probe"] = summarize([sample for sample in probe.samples if sample["at_s"] < began - probe.started])
-                if profile_before is not None:
+                if profile_before is not None and result["completed"]:
                     profile_after = (await client.get(f"{ENGINE_URL}/memory")).json()["stall_profile"]
                     result["wall_profile"] = {"before": profile_before, "after": profile_after, "delta": {category: {metric: values[metric] - profile_before["categories"][category][metric] for metric in values} for category, values in profile_after["categories"].items()}}
                 events = read_events(engine_log, began_wall, result["ended_wall"])

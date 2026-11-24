@@ -23,6 +23,8 @@ def summarize(roots):
             manifest = json.loads(manifest_path.read_text())
             if "engine_sha256" not in manifest:
                 continue
+            if not (folder / "import-result.json").exists():
+                continue
             for workload in ("import", "large-delete", "small-delete"):
                 result_path = folder / f"{workload}-result.json"
                 if not result_path.exists():
