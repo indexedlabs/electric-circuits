@@ -6091,3 +6091,61 @@ mod stream_ttl_tests {
         assert_eq!(engine.metrics.stream_ttl_touches.load(Ordering::Relaxed), 0);
     }
 }
+
+#[cfg(test)]
+mod rate_limited_create_tests {
+    use super::*;
+    use crate::schema::Schema;
+
+    fn puts_of(store: &crate::ds::ScriptedStore, suffix: &str) -> usize {
+        store.operations.lock().unwrap().iter().filter(|op| op.starts_with("create:") && op.ends_with(suffix)).count()
+    }
+
+    /// An aggregate's stream PUT waits out a rate-limited store (`DsClient::ensure_stream` retries a
+    /// 429 for as long as it lasts) without the engine-state lock: while it waits, a plain create,
+    /// which takes that lock to register, still completes, and the aggregate completes once the
+    /// store stops answering 429.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_aggregate_put_does_not_hold_the_state_lock() {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        *store.ensure_rate_limited.lock().unwrap() = Some("shape/s1".into());
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://agg-429".into(), store.clone()));
+        let schema: Schema = serde_json::from_value(serde_json::json!({"tables": {
+            "a":{"columns":{"id":{"type":"int"}},"primaryKey":"id"}
+        }}))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let aggregate = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.create_aggregate(&"a".into(), None, AggFn::Count, None).await }
+        });
+        // Refused twice: the aggregate holds id s1 and is inside its 429 retry wait.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while puts_of(&store, "shape/s1") < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the aggregate never reached its stream PUT");
+
+        let plain =
+            tokio::time::timeout(Duration::from_secs(30), engine.create_shape(&"a".into(), None, None, true, false))
+                .await
+                .expect("a plain create must not wait behind an aggregate's rate-limited PUT")
+                .unwrap();
+        assert_eq!(plain.stream_path, "shape/s2");
+        assert!(!aggregate.is_finished(), "the aggregate is still waiting on the store");
+
+        *store.ensure_rate_limited.lock().unwrap() = None;
+        let rec = tokio::time::timeout(Duration::from_secs(30), aggregate)
+            .await
+            .expect("the aggregate must complete once the store stops answering 429")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.stream_path, "shape/s1");
+        assert!(rec.aggregate.is_some());
+        assert!(engine.get_shape(&rec.id).await.is_some(), "the aggregate is registered");
+        engine.close(Duration::from_secs(5)).await;
+    }
+}

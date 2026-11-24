@@ -2997,6 +2997,9 @@ mod tests {
         /// creating anything; zero creates the stream and answers 201.
         pub(crate) ensure_status: u16,
         pub(crate) ensure_fault: std::sync::Mutex<Option<u16>>,
+        /// Answer 429 to every ensure whose path ends with this suffix while set: a store
+        /// rate-limiting one stream's PUT until the test clears it.
+        pub(crate) ensure_rate_limited: std::sync::Mutex<Option<String>>,
         pub(crate) ensure_closed: bool,
         /// The `Stream-TTL` each ensure carried, by path.
         pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
@@ -3168,6 +3171,9 @@ mod tests {
                 let gate = self.ensure_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
                     gate.hold().await;
+                }
+                if self.ensure_rate_limited.lock().unwrap().as_deref().is_some_and(|suffix| path.ends_with(suffix)) {
+                    return Ok(response(429));
                 }
                 self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
                 let status = self.ensure_fault.lock().unwrap().take().unwrap_or(self.ensure_status);
