@@ -531,7 +531,7 @@ pub(crate) fn spawn_catalog_writer(
                 if !ensured {
                     ensured = self::ensure_catalog(&ds, &mut ensure_logged).await;
                 }
-                match ds.append_json(CATALOG_STREAM, std::slice::from_ref(&json)).await {
+                match ds.append_json_once(CATALOG_STREAM, std::slice::from_ref(&json)).await {
                     Ok(()) => break,
                     Err(e) => match if ensured { classify_append(&e) } else { AppendVerdict::Retry } {
                         AppendVerdict::Refused => {

@@ -1627,6 +1627,22 @@ impl DsClient {
     /// Append envelopes as a JSON array (the server flattens one array level into N messages).
     /// Append raw JSON events (non-envelope streams, e.g. the shape catalog).
     pub async fn append_json(&self, path: &str, events: &[serde_json::Value]) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            match self.append_json_once(path, events).await {
+                Err(e) if e.downcast_ref::<DsRateLimited>().is_some() => {
+                    attempt = attempt.saturating_add(1);
+                    if !self.wait_rate_limit("POST", path, attempt, retry_after(&e)).await {
+                        return Err(e.context("append interrupted by engine shutdown"));
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// The ordered catalog writer owns retries and shutdown-party accounting for its queue.
+    pub(crate) async fn append_json_once(&self, path: &str, events: &[serde_json::Value]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
