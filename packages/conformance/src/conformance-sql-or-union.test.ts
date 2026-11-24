@@ -5,7 +5,8 @@
 //      known non-collatable SQL type (column collations are not available to the printer);
 //   2. an `OR` with `k IN (…)` on the table's single-column primary key gathers another branch B
 //      only if it is a positive IN or an AND containing one. A broad branch leaves the whole key
-//      OR unchanged. Gathering is only for filters, never under NOT.
+//      OR unchanged. Gathering is only for filters, never under NOT, and never in a subset query
+//      with a page limit (rule 1 still applies there).
 //
 // Both exist so Postgres can drive the table from a set of keys instead of scanning it; neither may
 // change a row. This suite runs generated predicates — nested `OR`s, subqueries on other tables
@@ -223,8 +224,11 @@ async function oldSqlIds(table: string, where: Predicate): Promise<number[]> {
   return rows.map((row) => Number(row.id)).sort((a, b) => a - b)
 }
 
-/** Query the production subset endpoint; text keys are kept as text for the collation case. */
-async function subsetRows(harness: Harness, table: string, where: Predicate, limit = 10000, offset = 0): Promise<Row[]> {
+/**
+ * Query the production subset endpoint; text keys are kept as text for the collation case. With no
+ * `limit` the query is unpaged, which is where rule 2 applies.
+ */
+async function subsetRows(harness: Harness, table: string, where: Predicate, limit?: number, offset?: number): Promise<Row[]> {
   const res = await fetch(`${harness.engineUrl}/v1/subsets/query`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -236,8 +240,8 @@ async function subsetRows(harness: Harness, table: string, where: Predicate, lim
   return (JSON.parse(text) as { rows: Row[] }).rows ?? []
 }
 
-async function engineIds(table: string, where: Predicate): Promise<number[]> {
-  return (await subsetRows(h, table, where)).map((row) => Number(row.id)).sort((a, b) => a - b)
+async function engineIds(table: string, where: Predicate, limit?: number): Promise<number[]> {
+  return (await subsetRows(h, table, where, limit)).map((row) => Number(row.id)).sort((a, b) => a - b)
 }
 
 /**
@@ -249,8 +253,8 @@ async function subsetWithSql(
   harness: Harness,
   table: string,
   where: Predicate,
-  limit = 10000,
-  offset = 0,
+  limit?: number,
+  offset?: number,
 ): Promise<{ sql: string; rows: Row[] }> {
   const lock = await lockTable(harness, `"public"."${table}"`)
   // Observe rejection immediately even while waiting for the relation-lock gate.
@@ -294,9 +298,10 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
       const where = gen.pred(table, 0)
       const expected = await oldSqlIds(table, where)
       if (expected.length > 0) nonEmpty++
-      expect(await engineIds(table, where), `predicate #${i} on ${table} (seed ${SEED}): ${JSON.stringify(where)}`).toEqual(
-        expected,
-      )
+      const named = `predicate #${i} on ${table} (seed ${SEED}): ${JSON.stringify(where)}`
+      expect(await engineIds(table, where), named).toEqual(expected)
+      // Paged (rule 1 only), with a limit no table reaches.
+      expect(await engineIds(table, where, 10000), `paged ${named}`).toEqual(expected)
     }
     // Actual execution of both rewrites is checked against pg_stat_activity below, independently
     // of these row comparisons; counting predicate shapes would not prove SQL was rewritten.
@@ -452,7 +457,7 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
     expect(rows.map((r) => Number(r.id))).toEqual((await oldSqlIds('items', where)).slice(0, 1))
   })
 
-  it('a rewritten positive key OR returns the same ordered pages as the old SQL', async () => {
+  it('a paged positive key OR reaches PostgreSQL as written and returns the same ordered pages', async () => {
     const where: Predicate = { or: [
       { col: 'id', in: { table: 'parents', project: 'id' } },
       { col: 'parent_id', in: { table: 'others', project: 'parent_id' } },
@@ -468,12 +473,34 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
     for (let offset = 0; offset < expected.length + pageSize; offset += pageSize) {
       const expectedPage = await pgQuery(h, `${orderedSql} LIMIT ${pageSize} OFFSET ${offset}`, old.params)
       const { sql, rows } = await subsetWithSql(h, 'items', where, pageSize, offset)
-      expect(sql).toContain('"id" IN (SELECT "id" FROM "public"."parents" UNION ALL SELECT "id" FROM "public"."items" WHERE "parent_id" IN (SELECT "parent_id" FROM "public"."others"))')
+      expect(sql).toContain('where ("id" IN (SELECT "id" FROM "public"."parents") OR "parent_id" IN (SELECT "parent_id" FROM "public"."others"))')
+      expect(sql).not.toContain('UNION ALL')
       expect(sql).toContain(`order by "id" asc, "id" asc limit ${pageSize}`)
       expect(rows, `page at offset ${offset}`).toEqual(expectedPage)
       pages.push(...rows)
     }
     expect(pages).toEqual(expected)
+
+    // The same predicate without a page limit is gathered into the key's union.
+    const { sql, rows } = await subsetWithSql(h, 'items', where)
+    expect(sql).toContain('where ("id" IN (SELECT "id" FROM "public"."parents" UNION ALL SELECT "id" FROM "public"."items" WHERE "parent_id" IN (SELECT "parent_id" FROM "public"."others")))')
+    expect(sql).not.toContain(' limit ')
+    expect(rows).toEqual(expected)
+  })
+
+  it('a paged query still receives the same-column union', async () => {
+    // A key OR: rule 1 joins the two key INs, and the parent_id branch stays a branch of its own.
+    const where: Predicate = { or: [
+      { col: 'id', in: { table: 'parents', project: 'id', where: { col: 'flag', op: 'eq', value: true } } },
+      { col: 'parent_id', in: { table: 'others', project: 'parent_id', where: { col: 'n', op: 'lt', value: 30 } } },
+      { col: 'id', in: { table: 'others', project: 'n' } },
+    ] }
+    const expected = await oldSqlIds('items', where)
+    expect(expected.length).toBeGreaterThan(5)
+    const { sql, rows } = await subsetWithSql(h, 'items', where, 5)
+    expect(sql).toContain('where ("id" IN (SELECT "id" FROM "public"."parents" WHERE "flag" = true UNION ALL SELECT "n" FROM "public"."others") OR "parent_id" IN (SELECT "parent_id" FROM "public"."others" WHERE "n" < 30))')
+    expect(sql).toContain('limit 5')
+    expect(rows.map((r) => Number(r.id))).toEqual(expected.slice(0, 5))
   })
 
   it('different projection collations keep the original SQL and rows for text keys and columns', async () => {
@@ -516,6 +543,83 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
       }
     } finally {
       await textHarness.shutdown()
+    }
+  }, 120000)
+
+  // Evidence, not an assertion on timings: PostgreSQL's plans for the statements the engine sends,
+  // on a copy of the tables large enough to show their shape, printed into the test log. The copy
+  // is UNLOGGED in its own schema, so logical decoding never sees it and the engine's tables keep
+  // the rows every other case expects. Each statement is the one the engine sent for the small
+  // tables (read from pg_stat_activity), pointed at the copy; "before" swaps in main's WHERE.
+  it('prints PostgreSQL plans for the unpaged week shape and a paged broad positive IN', async () => {
+    /** The copy: `keys` items named directly (the week query's grants), `parents` parents of
+     * recurring rows (10 items each), 40,000 items with `n` a day of the week, and every item's
+     * other_id among others' ids (a broad IN). */
+    const copy = (keys: number, parents: number) => pgQuery(h, `
+      DROP SCHEMA IF EXISTS plans CASCADE;
+      CREATE SCHEMA plans;
+      CREATE UNLOGGED TABLE plans.parents (id int PRIMARY KEY, flag boolean, tag text);
+      CREATE UNLOGGED TABLE plans.others (id int PRIMARY KEY, parent_id int, n int);
+      CREATE UNLOGGED TABLE plans.items (id int PRIMARY KEY, parent_id int, other_id int, n int, label text);
+      CREATE INDEX ON plans.items (parent_id);
+      INSERT INTO plans.parents SELECT g, g % 2 = 0, 'a' FROM generate_series(1, ${keys}) g;
+      INSERT INTO plans.others SELECT g, g * 37, g % 70 FROM generate_series(1, ${parents}) g;
+      INSERT INTO plans.items SELECT g, g % 4000 + 1, g % ${parents} + 1, g % 7, 'x' FROM generate_series(1, 40000) g;
+      ANALYZE plans.parents, plans.others, plans.items;
+    `)
+    const plan = async (label: string, statement: string, params: unknown[] = []): Promise<number> => {
+      const rows = await pgQuery(h, `EXPLAIN (ANALYZE, BUFFERS) ${statement}`, params)
+      const bound = params.length > 0 ? `\nparams: ${JSON.stringify(params)}` : ''
+      console.log(`\n--- ${label}\n${statement}${bound}\n${rows.map((r) => String(r['QUERY PLAN'])).join('\n')}`)
+      return (await pgQuery(h, statement, params)).length
+    }
+    const onCopy = (sql: string) => sql.replaceAll('"public".', '"plans".')
+    /** `sql` with its WHERE replaced by main's printing of `where`, and that printing's params. */
+    const withMainWhere = (sql: string, where: Predicate): [string, unknown[]] => {
+      const [head, rest] = sql.split(' t where ') as [string, string]
+      const old = predicateToSql(where)
+      return [`${head} t where ${old.text}${rest.slice(rest.indexOf(' order by '))}`, old.params]
+    }
+    const week: Predicate = { or: [
+      { col: 'id', in: { table: 'parents', project: 'id' } },
+      { and: [
+        { col: 'parent_id', in: { table: 'others', project: 'parent_id' } },
+        { col: 'n', op: 'gte', value: 3 },
+        { col: 'n', op: 'lt', value: 5 },
+      ] },
+    ] }
+    const broad: Predicate = { or: [
+      { col: 'id', in: { table: 'parents', project: 'id' } },
+      { col: 'other_id', in: { table: 'others', project: 'id' } },
+    ] }
+    const weekSql = (await subsetWithSql(h, 'items', week)).sql
+    expect(weekSql).toContain('UNION ALL SELECT "id" FROM "public"."items" WHERE')
+    const [mainSql, mainParams] = withMainWhere(weekSql, week)
+    const pagedSql = (await subsetWithSql(h, 'items', broad, 10)).sql
+    expect(pagedSql).not.toContain('UNION ALL')
+    // What rule 2 would have sent for the same page: the unpaged statement with the page's limit.
+    const gathered = (await subsetWithSql(h, 'items', broad)).sql
+    expect(gathered).toContain('UNION ALL')
+    try {
+      const version = String((await pgQuery(h, 'SELECT version()'))[0]!.version)
+      console.log(`\nPlans for conformance-sql-or-union on ${version}`)
+      for (const [keys, parents] of [[200, 100], [20, 10]] as const) {
+        await copy(keys, parents)
+        const data = `40,000 items, ${keys} keys, ${parents} parents`
+        // Twice each, so the second plan of a pair reads a warm cache.
+        let before = 0
+        let after = 0
+        for (let run = 1; run <= 2; run++) {
+          before = await plan(`(a) unpaged week shape, before (main), ${data}, run ${run}`, onCopy(mainSql), mainParams)
+          after = await plan(`(a) unpaged week shape, after (rule 2), ${data}, run ${run}`, onCopy(weekSql))
+        }
+        expect(after).toBe(before)
+        expect(after).toBeGreaterThan(0)
+        await plan(`(b) paged broad positive IN, as printed (no rule 2), ${data}`, onCopy(pagedSql))
+        await plan(`(b) paged broad positive IN, if rule 2 applied, ${data}`, `${onCopy(gathered)} limit 10`)
+      }
+    } finally {
+      await pgQuery(h, 'DROP SCHEMA IF EXISTS plans CASCADE')
     }
   }, 120000)
 

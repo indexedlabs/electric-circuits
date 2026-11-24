@@ -141,8 +141,32 @@ pub fn predicate_json_to_sql(
     schemas: &HashMap<TableRef, TableSchema>,
     table: &TableRef,
 ) -> (String, Vec<String>) {
+    json_sql(pred, start_param, schemas, table, true)
+}
+
+/// [`predicate_json_to_sql`] for a query with a page limit: the key union (rule 2 of
+/// [`JsonSql::or`]) is never made, and the same-column union still is. Gathering a broad branch
+/// into the key's set makes Postgres compute that whole set before `LIMIT` can stop the outer
+/// scan, so a page that main's SQL answers from a few index rows would scan the table each time.
+pub fn paged_predicate_json_to_sql(
+    pred: &PredicateJson,
+    start_param: usize,
+    schemas: &HashMap<TableRef, TableSchema>,
+    table: &TableRef,
+) -> (String, Vec<String>) {
+    json_sql(pred, start_param, schemas, table, false)
+}
+
+fn json_sql(
+    pred: &PredicateJson,
+    start_param: usize,
+    schemas: &HashMap<TableRef, TableSchema>,
+    table: &TableRef,
+    gather_keys: bool,
+) -> (String, Vec<String>) {
     let mut params: Vec<String> = Vec::new();
-    let text = JsonSql { start: start_param, params: &mut params, schemas }.build(pred, table, Use::Filter);
+    let text =
+        JsonSql { start: start_param, params: &mut params, schemas, gather_keys }.build(pred, table, Use::Filter);
     (text, params)
 }
 
@@ -211,12 +235,14 @@ enum Use {
     Verbatim,
 }
 
-/// The JSON emitter's state: where placeholders start, the text params bound so far, and every
-/// table's compiled schema (for native types and keys).
+/// The JSON emitter's state: where placeholders start, the text params bound so far, every
+/// table's compiled schema (for native types and keys), and whether the key union may be made.
 struct JsonSql<'a> {
     start: usize,
     params: &'a mut Vec<String>,
     schemas: &'a HashMap<TableRef, TableSchema>,
+    /// `false` for a query with a page limit (see [`paged_predicate_json_to_sql`]).
+    gather_keys: bool,
 }
 
 impl JsonSql<'_> {
@@ -313,7 +339,9 @@ impl JsonSql<'_> {
     ///    vetoes rewriting the whole key OR, including descendants, retaining main's SQL. The
     ///    key is unique and never NULL, so a row is in `SELECT k … WHERE B` exactly when `B` is TRUE
     ///    for it. `B` UNKNOWN becomes FALSE, which is why this is done only in a [`Use::Filter`].
-    ///    Every key subquery must project the key's known non-collatable type.
+    ///    Every key subquery must project the key's known non-collatable type. Not made in a query
+    ///    with a page limit ([`paged_predicate_json_to_sql`]), at any depth; the broad-branch veto
+    ///    still holds there.
     ///
     /// Left alone: `NOT IN` (its NULL semantics are not a union's), `IN` on different non-key
     /// columns, a key that is composite or of unknown type, and any projection whose type is unknown
@@ -342,7 +370,8 @@ impl JsonSql<'_> {
             if !keyed.is_empty() && branches.len() > 1 && !branches.iter().all(has_positive_in) {
                 return self.or(branches, table, Use::Verbatim);
             }
-            if !keyed.is_empty()
+            if self.gather_keys
+                && !keyed.is_empty()
                 && branches.len() > 1
                 && let Some(key_type) = union_type(ts, key_name)
                 && keyed.iter().all(|s| projects(s) == Some(key_type))
@@ -997,6 +1026,73 @@ mod tests {
             r#"("deleted_at" IS NULL AND "record_id" IN (SELECT "id" FROM "public"."records" WHERE ("id" IN (SELECT "id" FROM "public"."records" WHERE "owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $3::text::"uuid") UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $4::text::"uuid"))))"#
         );
         assert_eq!(p, vec!["u1".to_string(), "u1".to_string()]);
+    }
+
+    /// Under a page limit the key union is never made: the week query keeps its key `OR` as the
+    /// client wrote it, while the same predicate without a limit is still gathered.
+    #[test]
+    fn a_paged_query_keeps_its_key_or() {
+        let pj = crate::where_sql::parse_where(
+            "id IN (SELECT record_id FROM grants WHERE user_id = 'u1') OR \
+             (recurring_parent_id IN (SELECT id FROM records WHERE visible = true) \
+              AND original_start_time >= '2026-11-16' AND original_start_time < '2026-11-23')",
+        )
+        .unwrap()
+        .unwrap();
+        let range =
+            r#""original_start_time" >= $2::text::"timestamptz" AND "original_start_time" < $3::text::"timestamptz""#;
+        let (w, params) = paged_predicate_json_to_sql(&pj, 1, &app_schemas(), &"records".into());
+        assert_eq!(
+            w,
+            format!(
+                r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR ("recurring_parent_id" IN ({VISIBLE}) AND {range}))"#
+            )
+        );
+        assert_eq!(params, vec!["u1", "2026-11-16", "2026-11-23"]);
+
+        let (w, _) = predicate_json_to_sql(&pj, 1, &app_schemas(), &"records".into());
+        assert_eq!(
+            w,
+            format!(
+                r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."records" WHERE ("recurring_parent_id" IN ({VISIBLE}) AND {range})))"#
+            )
+        );
+    }
+
+    /// The same-column union is still made under a page limit, on the key and off it, at the top
+    /// and inside a subquery; the key union is made at no depth.
+    #[test]
+    fn a_paged_query_keeps_the_same_column_union() {
+        let paged = |table: &str, json: serde_json::Value| {
+            let pj: PredicateJson = serde_json::from_value(json).unwrap();
+            paged_predicate_json_to_sql(&pj, 1, &app_schemas(), &TableRef::parse(table).unwrap()).0
+        };
+        assert_eq!(
+            paged(
+                "events",
+                serde_json::json!({"or": [
+                    granted("id", "event_id", "u1"), on_visible_record("record_id"), granted("record_id", "record_id", "u2"),
+                ]}),
+            ),
+            format!(
+                r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "record_id" IN ({VISIBLE} UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid"))"#
+            )
+        );
+        assert_eq!(
+            paged("events", serde_json::json!({"or": [granted("id", "event_id", "u1"), on_visible_record("id")]})),
+            format!(
+                r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL {VISIBLE}))"#
+            )
+        );
+        assert_eq!(
+            paged(
+                "events",
+                serde_json::json!({"col": "record_id", "in": {"table": "records", "project": "id", "where": {"or": [
+                    granted("owner_id", "user_id", "u1"), granted("id", "record_id", "u1"),
+                ]}}}),
+            ),
+            r#""record_id" IN (SELECT "id" FROM "public"."records" WHERE ("owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid")))"#
+        );
     }
 
     /// An `OR` that neither rule applies to is printed exactly as before the rewrites existed.
