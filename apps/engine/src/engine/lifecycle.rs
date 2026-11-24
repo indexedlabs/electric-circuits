@@ -6174,4 +6174,110 @@ mod rate_limited_create_tests {
         assert!(engine.get_shape(&rec.id).await.is_some(), "the aggregate is registered");
         engine.close(Duration::from_secs(5)).await;
     }
+
+    /// An engine on `store` with table `a`, and a COUNT over it whose `PUT shape/s1` is answered
+    /// 429 until the test clears `store.ensure_rate_limited`; returns once that PUT is retrying.
+    async fn aggregate_waiting_on_its_put(
+        store: &Arc<crate::ds::ScriptedStore>,
+    ) -> (Engine, tokio::task::JoinHandle<Result<ShapeRecord>>) {
+        *store.ensure_rate_limited.lock().unwrap() = Some("shape/s1".into());
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://agg-429".into(), store.clone()));
+        let schema: Schema = serde_json::from_value(serde_json::json!({"tables": {
+            "a":{"columns":{"id":{"type":"int"}},"primaryKey":"id"}
+        }}))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let aggregate = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.create_aggregate(&"a".into(), None, AggFn::Count, None).await }
+        });
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while puts_of(store, "shape/s1") < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the aggregate never reached its stream PUT");
+        (engine, aggregate)
+    }
+
+    /// The engine degrades while an aggregate waits out 429s on its stream PUT. Once the PUT lands
+    /// the create is refused, and leaves nothing behind: no registration, no share, and its stream
+    /// deleted, or queued for retirement when that DELETE is refused too.
+    async fn degrade_during_an_aggregate_put(delete_refused: bool) {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        if delete_refused {
+            *store.fail_delete_path.lock().unwrap() = Some("shape/s1".into());
+        }
+        let (engine, aggregate) = aggregate_waiting_on_its_put(&store).await;
+        engine.force_degraded();
+        *store.ensure_rate_limited.lock().unwrap() = None;
+        let error = tokio::time::timeout(Duration::from_secs(30), aggregate)
+            .await
+            .expect("the aggregate must finish once the store stops answering 429")
+            .unwrap()
+            .expect_err("a create that overlapped a degradation must be refused");
+        assert!(error.downcast_ref::<Degraded>().is_some(), "wrong error: {error:#}");
+        assert!(engine.get_shape("s1").await.is_none(), "the refused aggregate stayed registered");
+        assert!(engine.state.lock().await.feed_by_sig.is_empty(), "the refused aggregate's share stayed");
+        let deletes = store
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.starts_with("delete:") && op.ends_with("shape/s1"))
+            .count();
+        assert!(deletes >= 1, "the refused aggregate's stream was never deleted");
+        if delete_refused {
+            assert_eq!(engine.pending_retirements(), 1, "a refused DELETE must queue the stream for retirement");
+        }
+        engine.close(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_degrade_during_an_aggregate_put_rolls_the_create_back() {
+        degrade_during_an_aggregate_put(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_delete_of_a_rolled_back_aggregate_stream_is_queued_for_retirement() {
+        degrade_during_an_aggregate_put(true).await;
+    }
+
+    /// Identical aggregates that arrive while the first one's PUT is rate-limited join its pending
+    /// share: one stream is made, and every create returns it.
+    #[tokio::test(start_paused = true)]
+    async fn identical_aggregates_during_a_rate_limited_put_share_one_stream() {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let (engine, first) = aggregate_waiting_on_its_put(&store).await;
+        let joiners: Vec<_> = (0..3)
+            .map(|_| {
+                let engine = engine.clone();
+                tokio::spawn(async move { engine.create_aggregate(&"a".into(), None, AggFn::Count, None).await })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        *store.ensure_rate_limited.lock().unwrap() = None;
+        for create in std::iter::once(first).chain(joiners) {
+            let rec = tokio::time::timeout(Duration::from_secs(30), create)
+                .await
+                .expect("every identical aggregate must complete")
+                .unwrap()
+                .unwrap();
+            assert_eq!(rec.stream_path, "shape/s1", "an identical aggregate made a stream of its own");
+        }
+        let shape_puts: std::collections::BTreeSet<_> = store
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|op| op.strip_prefix("create:").filter(|path| path.contains("shape/")).map(str::to_string))
+            .collect();
+        assert!(
+            shape_puts.len() == 1 && shape_puts.iter().all(|path| path.ends_with("shape/s1")),
+            "N identical creates must PUT one stream: {shape_puts:?}"
+        );
+        engine.close(Duration::from_secs(5)).await;
+    }
 }
