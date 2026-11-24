@@ -1,9 +1,10 @@
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
+M3: The all-plain audience-key prototype processes the 13,081-change import in 3.18 s and 29,793-change deletion in 1.79 s after first delivery, with zero backfills; its deletion still misses one of nine two-second drain/live probes.
 
 # OTTO-13916 — scratch measurements, never merge
 
-M3 and M4 are not yet complete. The corrected production-binary baseline
+M4 is not yet complete. The corrected production-binary baseline
 below supersedes the provisional timing runs. All data are synthetic; no prod or
 dev service was accessed. Nov23 also starves drain/live in this fixture, and clears
 in 2.75 minutes, not the observed 15 minutes. Nov24 clears in 8.81 minutes, not
@@ -142,6 +143,38 @@ measurement: the prototype reused one subscription identity for different
 tables/calendars, correctly rejected by the engine with HTTP 409. The fix gives
 each keyed table/key/class a distinct gateway-built subscription id. No workload
 result from that failed B attempt is counted; its unmodified-A control is separate.
+
+## Audience-key prototype — M3
+
+Run `45363301660`, harness `1489d8bbc474e4f6ebe7736d97827061f58f5845`, unchanged
+production engine `5b2cf3e`, 1 CPU. Exact command:
+`python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-B-nov24-1cpu --catalog nov24 --variant B --cpus 1`.
+Data/writes are the same synthetic fixture, with stored/replicated audience key
+and class columns added by the writer. Historical requests collapse to 725
+plain shapes in 24 equality families, zero subquery nodes/edges/contributors.
+The original 10,571 total is intentionally NOT retained in B; the separate
+all-plain cost control holds total shapes constant. Raw evidence and SQL schema
+additions: `model-B-1489d8b/`.
+
+| Workload | Rows | SQL → empty s | First delivery → empty s | Changes/s, SQL clock | CPU %, SQL window | Backfills / minute | Pinned | Drain ok/attempts; p50/p95/max s | Subset ok/attempts; p50/p95/max s | Live ok/attempts; p50/p95/max s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Import | 13,081 | 3.89 | 3.18 | 3,365.16 | 26.24 | 0 / 0 | 0 | 3/3; 0.034/0.034/0.200 | 3/3; 0.013/0.013/0.014 | 3/3; 0.044/0.044/0.137 |
+| Large deletion | 29,793 | 9.56 | 1.79 | 3,116.14 | 21.86 | 0 / 0 | 0 | 8/9; 0.032/0.550/1.428 | 9/9; 0.012/0.072/0.187 | 8/9; 0.030/0.406/1.406 |
+| Small deletion | 7,114 | 2.30 | 0.29 | 3,096.44 | 17.41 | 0 / 0 | 0 | 2/2; 0.030/0.030/0.347 | 2/2; 0.009/0.009/0.012 | 2/2; 0.028/0.028/0.222 |
+
+This removes minute-scale starvation **in the all-plain idealization**, not
+every two-second failure: large-deletion drain/live success is 88.9%, subset
+100%. With only three import observations, 100% is not a reliability estimate.
+The writer takes 6.24 s for the large deletion, before the engine's first
+completed delivery; the low CPU average includes that source time. The new
+log transaction is 121,912,564 bytes including its marker and new key columns.
+
+`B-retained`, which keeps the proposal's explicit chat/edge/Resource/File/User
+exceptions, and an unprofiled unchanged-engine A comparison are pending.
+Do not treat B's ideal result as the full proposal's gain. This prototype has
+no gateway token/relay revocation enforcement, direct-share equivalence,
+parent-move cascades, hidden/deleted cases or migration measurement. See
+`../MEASUREMENT_PATCHES.md` for the exact cuts; it is not safe to deploy.
 
 | Input | Identity |
 | --- | --- |
