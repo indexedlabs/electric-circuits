@@ -55,6 +55,31 @@ def validate_predicate(predicate, table, columns):
                 validate_predicate(member, table, columns)
 
 
+def plain_control_body(body, account, identity):
+    table = body["table"].removeprefix("public.")
+    columns = body["columns"]
+    column = next((name for name in ("space_id", "user_id", "created_by_user_id", "from_space_id") if name in columns), "id" if "id" in columns else "record_id")
+    key = "space" if column in {"space_id", "from_space_id"} else "user" if column in {"user_id", "created_by_user_id"} else "record" if column == "record_id" else table
+    label = f"{key}/{account}" if key in {"user", "space"} else f"{key}/{account}/0"
+    distinct = "id" if "id" in columns else "record_id"
+    return {**body, "where": {"and": [{"col": column, "op": "eq", "value": str(synthetic_id(label))}, {"col": distinct, "op": "neq", "value": str(synthetic_id(f"plain-control/{identity}"))}]}}
+
+
+def control_catalog(requests, retained_subqueries):
+    candidates = [index for index, request in enumerate(requests) if request["has_subquery"]]
+    candidates.sort(key=lambda index: hashlib.sha256(json.dumps(requests[index]["body"], sort_keys=True).encode()).digest())
+    retained = set(candidates[:retained_subqueries])
+    return [
+        request if not request["has_subquery"] or index in retained else {
+            **request,
+            "kind": "plain-cost-control",
+            "has_subquery": False,
+            "body": plain_control_body(request["body"], request["account"], request["body"]["subscription"]),
+        }
+        for index, request in enumerate(requests)
+    ]
+
+
 class GatewayShapes:
     def __init__(self, bundle: Path):
         self.loader = SourceLoader(bundle)

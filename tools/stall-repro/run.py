@@ -16,7 +16,7 @@ import httpx
 import psutil
 import psycopg
 
-from catalog import GatewayShapes, TARGETS
+from catalog import GatewayShapes, TARGETS, control_catalog, plain_control_body
 from data import IMPORT_ACCOUNT, LARGE_ACCOUNT, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
@@ -182,6 +182,9 @@ async def run(args):
             catalog = await gateway.generate(args.catalog, args.scale)
             if args.variant in {"B", "B-retained"}:
                 catalog = await gateway.keyed_catalog(catalog, retained=args.variant == "B-retained")
+            if args.variant in {"half-subqueries", "plain-only"}:
+                retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
+                catalog = control_catalog(catalog, retained)
             if args.smoke:
                 catalog = catalog[:20] + catalog[-20:]
             semaphore = asyncio.Semaphore(8)
@@ -202,8 +205,12 @@ async def run(args):
                 keyed = args.variant == "B" or args.variant == "B-retained" and table not in {"graph_edge", "resource"}
                 for calendar in (range(15) if keyed and table == "calendar_event" else [0]):
                     body = gateway.keyed_body(table, IMPORT_ACCOUNT, calendar=calendar, identity=f"import-{table}") if keyed else await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}")
+                    if args.variant == "plain-only":
+                        body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
             probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in {"B", "B-retained"} else await gateway.body("record", 0, identity="other-account-probe")
+            if args.variant == "plain-only":
+                probe_body = plain_control_body(probe_body, 0, "other-account-probe")
             probe_feed = await create({"body": probe_body})
             head = await client.head(probe_feed["streamUrl"])
             head.raise_for_status()
@@ -371,7 +378,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
-    parser.add_argument("--variant", choices=("A", "A-observed", "B", "B-retained", "marker-bypass", "commit-membership", "coalesced-base", "coalesced-head"), default="A")
+    parser.add_argument("--variant", choices=("A", "A-observed", "B", "B-retained", "marker-bypass", "commit-membership", "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
     parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

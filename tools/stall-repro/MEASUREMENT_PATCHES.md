@@ -102,3 +102,17 @@ changes available walk parallelism. The ordinary filters/aggregates retain their
 per-row path. It deliberately omits time slicing and spill, and therefore can
 hold the registry longer in a single acquisition. No production performance or
 correctness claim follows merely from the structural cost oracle passing.
+
+## Shape-count controls
+
+The half-subquery control keeps 2,144 of 4,287 subquery shapes (eight import/probe
+feeds included), replacing the removed half with distinct plain shapes to keep
+10,571 total. Selection is deterministic SHA256 order of request bodies, not a
+convenient subset chosen after timing. The all-plain control replaces all 4,287.
+Both retain table, projection and subscription identity, but replace permission
+subqueries with an existing owner/Space column equality plus a unique harmless
+primary-key inequality. For tables without a usable owner column, the equality
+selects one synthetic parent/key. Nullable owner columns can match fewer rows.
+These are shape-cost ablations, NOT authorization-equivalent app models; they
+must not be mistaken for B's maintained keys or a safe gateway change. The
+original plain shapes and the underlying synthetic data/writes are unchanged.

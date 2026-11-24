@@ -1,10 +1,17 @@
 import unittest
 from pathlib import Path
 
-from catalog import ACCOUNT_WEIGHTS, SUBQUERY_TABLE_WEIGHTS, TARGETS, GatewayShapes, apportion, contains_subquery, validate_predicate
+from catalog import ACCOUNT_WEIGHTS, SUBQUERY_TABLE_WEIGHTS, TARGETS, GatewayShapes, apportion, contains_subquery, control_catalog, validate_predicate
 
 
 class CatalogPlanningTests(unittest.TestCase):
+    def test_plain_controls_keep_total_and_exact_retained_count(self):
+        requests = [{"body": {"table": "public.record", "columns": ["id", "space_id"], "where": {"col": "id", "in": {"table": "record", "project": "id"}}, "subscription": str(index)}, "account": index, "has_subquery": True} for index in range(10)]
+        controlled = control_catalog(requests, 5)
+        self.assertEqual(len(controlled), 10)
+        self.assertEqual(sum(contains_subquery(request["body"]["where"]) for request in controlled), 5)
+        self.assertEqual(len({str(request["body"]) for request in controlled}), 10)
+
     def test_keyed_subscriptions_distinguish_table_and_calendar(self):
         gateway = GatewayShapes(Path(__file__).with_name("indexed-source.json.gz"))
         bodies = [gateway.keyed_body("record", 0), gateway.keyed_body("graph_edge", 0), gateway.keyed_body("calendar_event", 0, calendar=0), gateway.keyed_body("calendar_event", 0, calendar=1)]
