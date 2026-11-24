@@ -1768,7 +1768,10 @@ impl DsClient {
     /// no-op. Envelopes are absolute per-pk (`upsert`/`delete` by key), so an at-least-once retry
     /// that double-appends after an ambiguous network failure is idempotent for readers.
     /// Returns `Ok(false)` iff the stream is retired (404, 410, or closed). Shutdown returns an
-    /// error: the sequencer preserves the replay boundary instead of checkpointing the batch.
+    /// error: the sequencer preserves the replay boundary instead of checkpointing the batch. An
+    /// append is interrupted when the shutdown's DRAIN WINDOW closes, not when shutdown begins
+    /// (`ShutdownToken::wait_drain_end`): an append that would land is what lets the commit it
+    /// belongs to be checkpointed, and the subquery registry be written for the next boot.
     ///
     /// Treating a **closed** stream as terminal is sound only for shape streams: their envelopes are
     /// absolute per-pk and the stream is about to be deleted, so the discarded batch has no reader
@@ -1788,7 +1791,7 @@ impl DsClient {
         if let Some(shutdown) = &self.shutdown {
             tokio::select! {
                 biased;
-                _ = shutdown.wait() => bail!("Engine shutdown interrupted a reliable append"),
+                _ = shutdown.wait_drain_end() => bail!("Engine shutdown interrupted a reliable append"),
                 landed = self.append_reliable_inner(path, envelopes) => Ok(landed),
             }
         } else {

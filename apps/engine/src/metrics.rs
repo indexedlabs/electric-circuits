@@ -151,6 +151,16 @@ pub struct Metrics {
     /// Shape records retired during catalog restore because their durable stream was missing or
     /// already closed. The reason-tagged StatsD event is emitted alongside this Engine counter.
     pub catalog_restore_retired: AtomicU64,
+    /// Subquery shapes the catalog restore brought back from the registry state the last graceful
+    /// stop wrote (`crate::subq_state`), instead of dropping them.
+    pub subquery_shapes_restored: AtomicU64,
+    /// Subquery shapes the catalog restore dropped: the last stop wrote no usable registry state
+    /// (a crash, a degraded engine, effects still in flight), or the state could not vouch for
+    /// the shape. Each one is a stream its clients must reload.
+    pub subquery_shapes_dropped_at_restore: AtomicU64,
+    /// GAUGE: size of the registry state this boot restored from (0 = none). A boot measurement,
+    /// like `catalog_bytes`; preserved by `reset()`.
+    pub(crate) subquery_state_bytes: AtomicU64,
     /// GAUGE: response-body bytes read by the latest successful catalog fold (including framing
     /// and duplicate events). Excludes admission reads; preserved by `reset()`.
     pub(crate) catalog_bytes: AtomicU64,
@@ -277,6 +287,9 @@ impl Metrics {
             changes_segments_retained: AtomicU64::new(0),
             catalog_append_retries: AtomicU64::new(0),
             catalog_restore_retired: AtomicU64::new(0),
+            subquery_shapes_restored: AtomicU64::new(0),
+            subquery_shapes_dropped_at_restore: AtomicU64::new(0),
+            subquery_state_bytes: AtomicU64::new(0),
             catalog_bytes: AtomicU64::new(0),
             memory_budget: crate::memory_budget::MemoryBudget::new(None),
             retirement_retries: AtomicU64::new(0),
@@ -354,6 +367,18 @@ impl Metrics {
     }
 
     fn snapshot_core(&self) -> serde_json::Value {
+        let mut core = self.snapshot_core_base();
+        // Added outside the literal below, which is as large as `json!` expands without a raised
+        // recursion limit.
+        core["counters"]["subquery_shapes_restored_total"] =
+            self.subquery_shapes_restored.load(Ordering::Relaxed).into();
+        core["counters"]["subquery_shapes_dropped_at_restore_total"] =
+            self.subquery_shapes_dropped_at_restore.load(Ordering::Relaxed).into();
+        core["gauges"]["subquery_state_bytes"] = self.subquery_state_bytes.load(Ordering::Relaxed).into();
+        core
+    }
+
+    fn snapshot_core_base(&self) -> serde_json::Value {
         serde_json::json!({
             "counters": {
                 "envelopes_processed": self.envelopes.load(Ordering::Relaxed),
@@ -455,6 +480,8 @@ impl Metrics {
         self.stream_ttl_touch_failures.store(0, Ordering::Relaxed);
         self.catalog_append_retries.store(0, Ordering::Relaxed);
         self.catalog_restore_retired.store(0, Ordering::Relaxed);
+        self.subquery_shapes_restored.store(0, Ordering::Relaxed);
+        self.subquery_shapes_dropped_at_restore.store(0, Ordering::Relaxed);
         self.retirement_retries.store(0, Ordering::Relaxed);
         self.txn_spills.store(0, Ordering::Relaxed);
         self.sequencer_held_spills.store(0, Ordering::Relaxed);

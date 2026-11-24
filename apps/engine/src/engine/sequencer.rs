@@ -532,6 +532,17 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
+    // Checkpoints wait for deferred subquery effects (see `SettledFrontier`). Postgres mode only:
+    // a library-mode engine never restores from a checkpoint, and its flips carry no commit
+    // position to order them by.
+    let gate_checkpoints = !library_mode;
+    let mut frontier = SettledFrontier::default();
+    // The catalog restore has finished and this task's cursor is the one it installed (it sends
+    // `ResumeReads` only then). Such a cursor is a valid checkpoint before any read completes.
+    let mut cursor_vouched = false;
+    // A transaction was abandoned part-way (its highwater rewound): the subquery registry may hold
+    // a prefix of it, so the registry is no longer the registry AT the checkpoint.
+    let mut registry_ahead = false;
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -652,6 +663,7 @@ pub(crate) async fn sequencer_loop(
                 }
                 Some(SequencerCmd::ResumeReads { done }) => {
                     paused = false;
+                    cursor_vouched = true;
                     let _ = done.send(());
                 }
                 Some(SequencerCmd::PauseReads { done }) => {
@@ -743,6 +755,7 @@ pub(crate) async fn sequencer_loop(
                             tracing::error!(%error, "sequencer held spill failed; preserving replay boundary");
                             pos = held_replay_from.clone().unwrap_or_else(|| LogPosition { segment: pos.segment, offset: read_off.clone() });
                             held_from = held_replay_from;
+                            registry_ahead = true;
                             shutdown.begin();
                             break;
                         }
@@ -1036,6 +1049,7 @@ pub(crate) async fn sequencer_loop(
                         } else {
                             pos.offset = read_off;
                         }
+                        registry_ahead = true;
                         shutdown.begin();
                         break;
                     }
@@ -1103,26 +1117,46 @@ pub(crate) async fn sequencer_loop(
                             }
                         }
                     }
-                    let ckpt = published(&pos, &held_from);
-                    // Either half moving is progress worth persisting: the position, or — while the
-                    // position is pinned behind a held run — the de-duplication highwater.
-                    let ckpt_moved = ckpt != ckpt_pos || highwater != ckpt_hw;
-                    let groups = behind_groups(&subq, highwater);
-                    let groups_moved = groups != ckpt_groups;
-                    if crossed
-                        || (next.is_some()
-                            && (ckpt_moved || groups_moved)
-                            && last_ckpt.elapsed() >= std::time::Duration::from_secs(2))
-                    {
-                        ckpt_pos = ckpt.clone();
-                        ckpt_hw = highwater;
-                        ckpt_groups = groups.clone();
-                        last_ckpt = std::time::Instant::now();
-                        // The de-duplication highwater rides WITH the position (ADR-0003): a crash
-                        // after a prefix of a chunked commit was applied and checkpointed would
-                        // otherwise re-apply that prefix on re-delivery, and aggregate/subquery
-                        // weights are not idempotent under duplicates.
-                        catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater, groups });
+                    // The checkpoint that may be written: the one just reached, unless a commit at
+                    // or before it still owes subquery effects — then the newest one that does not
+                    // (see `SettledFrontier`). A degraded engine has lost effects for good and will
+                    // drop its subquery shapes at the next boot whatever it checkpoints, so it
+                    // checkpoints as it always did rather than pin the log forever.
+                    let reached = (published(&pos, &held_from), highwater);
+                    let target = if gate_checkpoints && !subq.degrade.degraded.load(Ordering::Acquire) {
+                        if next.is_some() || crossed {
+                            frontier.reached(reached);
+                        }
+                        frontier.newest_settled(|highwater| settled(&subq, highwater))
+                    } else {
+                        Some(reached)
+                    };
+                    if let Some((ckpt, ckpt_highwater)) = target {
+                        // Either half moving is progress worth persisting: the position, or — while
+                        // the position is pinned behind a held run — the de-duplication highwater.
+                        let ckpt_moved = ckpt != ckpt_pos || ckpt_highwater != ckpt_hw;
+                        let groups = behind_groups(&subq, ckpt_highwater);
+                        let groups_moved = groups != ckpt_groups;
+                        if (crossed && ckpt_moved)
+                            || (next.is_some()
+                                && (ckpt_moved || groups_moved)
+                                && last_ckpt.elapsed() >= std::time::Duration::from_secs(2))
+                        {
+                            ckpt_pos = ckpt.clone();
+                            ckpt_hw = ckpt_highwater;
+                            ckpt_groups = groups.clone();
+                            last_ckpt = std::time::Instant::now();
+                            // The de-duplication highwater rides WITH the position (ADR-0003): a
+                            // crash after a prefix of a chunked commit was applied and checkpointed
+                            // would otherwise re-apply that prefix on re-delivery, and
+                            // aggregate/subquery weights are not idempotent under duplicates.
+                            catalog_tx.send(CatalogEvent::Offset {
+                                pos: ckpt,
+                                highwater: ckpt_highwater,
+                                groups,
+                                subq_state: None,
+                            });
+                        }
                     }
                     if touched {
                         publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
@@ -1209,16 +1243,274 @@ pub(crate) async fn sequencer_loop(
     // de-duplication highwater riding with it) durable. Without it, everything since the last lazy
     // 2 s checkpoint would be replayed on the next boot: correct, but a needless storm, and for a
     // held run it would also re-read a transaction the ingestor never finished.
-    if !paused && completed_read {
-        let ckpt = published(&pos, &held_from);
-        let groups = behind_groups(&subq, highwater);
-        catalog_tx.send(CatalogEvent::Offset { pos: ckpt.clone(), highwater, groups });
-        tracing::info!("sequencer: stopped at {ckpt} (highwater {highwater:?})");
-    } else if paused {
+    //
+    // Two things changed when subquery shapes began to survive a restart (`crate::subq_state`).
+    // The checkpoint never passes a commit that still owes subquery effects, so what the last
+    // commits owe is given the shutdown's drain window to land first. And when nothing is owed, the
+    // subquery registry — which is then exactly the registry AT this checkpoint — is written to
+    // storage and named from the `Offset`, so the next boot restores it instead of dropping every
+    // subquery shape.
+    if paused {
         tracing::info!("sequencer: stopped while replay was paused; no checkpoint published");
-    } else {
-        tracing::info!("sequencer: stopped before completing a read; no checkpoint published");
+        return;
     }
+    if !completed_read && !cursor_vouched {
+        tracing::info!("sequencer: stopped before completing a read; no checkpoint published");
+        return;
+    }
+    let reached = (published(&pos, &held_from), highwater);
+    let mut state = None;
+    let target = if gate_checkpoints && !subq.degrade.degraded.load(Ordering::Acquire) {
+        let at_rest = effects_landed(&subq, &shutdown).await;
+        frontier.reached(reached.clone());
+        let target = frontier.newest_settled(|highwater| settled(&subq, highwater));
+        if at_rest && !registry_ahead && target.as_ref() == Some(&reached) {
+            state = registry_at_rest(&subq, &catalog_tx, &reached, &shutdown).await;
+        }
+        target
+    } else {
+        Some(reached)
+    };
+    match target {
+        // A stop that completed no read has no progress to checkpoint: it writes one only to name
+        // the registry state, at the cursor the catalog restore gave it.
+        Some((ckpt, ckpt_highwater)) if completed_read || state.is_some() => {
+            let groups = behind_groups(&subq, ckpt_highwater);
+            let written = match state {
+                Some(state) => write_registry_state(&ds, &catalog_tx, state, &ckpt, ckpt_highwater, groups).await,
+                None => {
+                    catalog_tx.send(CatalogEvent::Offset {
+                        pos: ckpt.clone(),
+                        highwater: ckpt_highwater,
+                        groups,
+                        subq_state: None,
+                    });
+                    false
+                }
+            };
+            tracing::info!(
+                "sequencer: stopped at {ckpt} (highwater {ckpt_highwater:?}, subquery state {})",
+                if written { "written" } else { "not written" }
+            );
+        }
+        Some(_) => tracing::info!("sequencer: stopped before completing a read; no checkpoint published"),
+        None => tracing::info!(
+            "sequencer: stopped with subquery effects still in flight for every commit since the last \
+             checkpoint; that checkpoint stands"
+        ),
+    }
+}
+
+/// A checkpoint the sequencer has reached: the position a restart replays from and the
+/// de-duplication highwater that goes with it.
+type Checkpoint = (LogPosition, Option<(u64, u64)>);
+
+/// Does any commit at or before `highwater` still owe a subquery effect — a flip being walked, a
+/// batch not yet on its stream? Unknown origins (zero) hold every checkpoint.
+fn settled(subq: &SubqueryHandle, highwater: Option<(u64, u64)>) -> bool {
+    !subq.pending_flips.has_at_or_before(highwater.map_or(0, |(lsn, _)| lsn))
+}
+
+/// How many reached-but-unsettled checkpoints [`SettledFrontier`] remembers. Past it the newest
+/// one is replaced, which only makes the next checkpoint coarser.
+const FRONTIER_CAP: usize = 1024;
+
+/// The checkpoints the sequencer has reached and may not write yet.
+///
+/// A commit the sequencer has processed can still owe its subquery effects: its flips are walked
+/// on the flip workers and their envelopes land through the emission lanes, after the sequencer
+/// has moved on. An `Offset` past such a commit says "a restart may resume after it" — and a
+/// restart that does never delivers those effects, because the inner set has already moved and
+/// nothing would re-derive them. That was harmless only while every subquery shape was dropped at
+/// restore; a shape that is restored (`crate::subq_state`) would be left stale.
+///
+/// So each checkpoint reached is kept here until every commit at or before it has landed its
+/// effects ([`settled`]), and what is written is the newest one that has. Being settled is
+/// monotone — a commit that holds back one checkpoint holds back every later one — so the queue
+/// is released from the front. It is bounded by [`FRONTIER_CAP`]; under sustained flips the
+/// durable checkpoint simply trails the sequencer by the commits still in flight.
+#[derive(Default)]
+struct SettledFrontier {
+    /// The newest checkpoint known to be settled.
+    settled: Option<Checkpoint>,
+    /// Checkpoints newer than that, oldest first.
+    waiting: std::collections::VecDeque<Checkpoint>,
+}
+
+impl SettledFrontier {
+    /// The sequencer reached `checkpoint`.
+    fn reached(&mut self, checkpoint: Checkpoint) {
+        let newest = self.waiting.back().or(self.settled.as_ref());
+        if newest == Some(&checkpoint) {
+            return;
+        }
+        if self.waiting.len() >= FRONTIER_CAP {
+            self.waiting.pop_back();
+        }
+        self.waiting.push_back(checkpoint);
+    }
+
+    /// The newest checkpoint every commit at or before which has landed its effects.
+    fn newest_settled(&mut self, is_settled: impl Fn(Option<(u64, u64)>) -> bool) -> Option<Checkpoint> {
+        while self.waiting.front().is_some_and(|(_, highwater)| is_settled(*highwater)) {
+            self.settled = self.waiting.pop_front();
+        }
+        self.settled.clone()
+    }
+}
+
+/// How often a stopping sequencer looks again while it waits for deferred effects to land.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Wait, inside the shutdown's drain window, for everything the processed commits owe: no flip
+/// batch pending and nothing a group lane still has to append. Returns whether nothing is pending
+/// — a group that is still behind does not make the registry wrong; the checkpoint records it and
+/// the group reattaches behind a must-refetch marker, as it does today.
+async fn effects_landed(subq: &SubqueryHandle, shutdown: &crate::shutdown::ShutdownToken) -> bool {
+    let quiet = || subq.pending_flips.count() == 0;
+    loop {
+        if subq.degrade.degraded.load(Ordering::Acquire) {
+            return false;
+        }
+        if quiet() && !subq.group_lanes.landing() {
+            return true;
+        }
+        // Not a shutdown (the command channel closed under a running engine): nothing would end
+        // the wait, so there is none.
+        if !shutdown.is_shutting_down() {
+            return quiet();
+        }
+        tokio::select! {
+            _ = shutdown.wait_drain_end() => return quiet(),
+            _ = tokio::time::sleep(SETTLE_POLL) => {}
+        }
+    }
+}
+
+/// The subquery registry, if it is at rest and holds something worth writing: nothing pending
+/// (re-read under the registry lock, where a finishing create counts its work), no create between
+/// installing its shape and handing its work over, no query-back in flight. `None` otherwise —
+/// the shapes are then dropped at the next boot, as after a crash.
+async fn registry_at_rest(
+    subq: &SubqueryHandle,
+    catalog_tx: &CatalogWriter,
+    reached: &Checkpoint,
+    shutdown: &crate::shutdown::ShutdownToken,
+) -> Option<crate::subq_state::RegistryState> {
+    // Only a stopping engine writes its registry: a state written under a running one would be
+    // stale by the next change, and nothing would ever invalidate it.
+    if !shutdown.is_shutting_down() {
+        return None;
+    }
+    // A cursor behind the durable floor is a stale one (the boot race the catalog writer refuses
+    // checkpoints for): its `Offset` would not be appended, so there would be nothing to name a
+    // state from.
+    if catalog_tx.durable_checkpoint().is_some_and(|floor| *reached < floor) {
+        return None;
+    }
+    loop {
+        {
+            let registry = subq.registry.lock().await;
+            if subq.pending_flips.count() != 0 || subq.degrade.degraded.load(Ordering::Acquire) {
+                return None;
+            }
+            match registry.export_state() {
+                Ok(mut state) => {
+                    state.group_positions = subq.group_lanes.positions();
+                    return (!state.is_empty()).then_some(state);
+                }
+                Err(error) => tracing::debug!("subquery registry is not at rest yet: {error:#}"),
+            }
+        }
+        tokio::select! {
+            _ = shutdown.wait_drain_end() => {
+                tracing::warn!(
+                    event = "subquery_state_not_written",
+                    reason = "registry_busy",
+                    "the subquery registry did not come to rest inside the shutdown drain window; subquery \
+                     shapes will be dropped at the next boot"
+                );
+                return None;
+            }
+            _ = tokio::time::sleep(SETTLE_POLL) => {}
+        }
+    }
+}
+
+/// How long each half of writing the registry state may take: making the `Offset` that names it
+/// durable, then appending the stream. Fixed rather than taken from the drain window, which may
+/// be over by now (and is zero for an engine built without a config): a state that is ready is
+/// worth these seconds of the grace, and storage that does not answer within them is down.
+const STATE_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// The slowest store the stream's appends wait out, on top of [`STATE_WRITE_BUDGET`].
+const STATE_WRITE_MIN_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
+
+/// Write the final checkpoint WITH the registry state for the next boot: make the `Offset` that
+/// names the state durable, THEN write its stream (`crate::subq_state` explains the order).
+/// Returns whether the state was written. Whatever happens, the final `Offset` is taken care of
+/// here: when the state cannot be written — before or after its pointer is durable — an `Offset`
+/// that names nothing is queued last, and the fold only ever trusts the last one.
+async fn write_registry_state(
+    ds: &DsClient,
+    catalog_tx: &CatalogWriter,
+    state: crate::subq_state::RegistryState,
+    pos: &LogPosition,
+    highwater: Option<(u64, u64)>,
+    groups: BTreeMap<String, u64>,
+) -> bool {
+    let started = std::time::Instant::now();
+    let checkpoint =
+        |subq_state| CatalogEvent::Offset { pos: pos.clone(), highwater, groups: groups.clone(), subq_state };
+    let pointer = match crate::subq_state::seal(&state, crate::subq_state::new_stream_name(), pos, highwater) {
+        Ok(pointer) => pointer,
+        Err(error) => {
+            tracing::error!(event = "subquery_state_not_written", reason = "encode", "{error:#}");
+            catalog_tx.send(checkpoint(None));
+            return false;
+        }
+    };
+    let named = catalog_tx.send_durable(checkpoint(Some(pointer.clone())));
+    if !matches!(tokio::time::timeout(STATE_WRITE_BUDGET, named).await, Ok(Ok(()))) {
+        // The `Offset` may still land (it is queued, and the writer retries). Whether it does or
+        // not, the one queued here follows it and names nothing.
+        tracing::warn!(
+            event = "subquery_state_not_written",
+            reason = "catalog_unavailable",
+            "the checkpoint naming the subquery state did not become durable in {STATE_WRITE_BUDGET:?}; subquery \
+             shapes will be dropped at the next boot"
+        );
+        catalog_tx.send(checkpoint(None));
+        return false;
+    }
+    let budget = STATE_WRITE_BUDGET + std::time::Duration::from_secs(pointer.bytes / STATE_WRITE_MIN_BYTES_PER_SEC);
+    let outcome = tokio::time::timeout(budget, crate::subq_state::write(ds, &state, &pointer, pos, highwater)).await;
+    let failure = match outcome {
+        Ok(Ok(())) => {
+            tracing::info!(
+                event = "subquery_state_written",
+                stream = %pointer.stream,
+                nodes = state.nodes.len(),
+                shapes = state.shapes.len(),
+                records = pointer.records,
+                bytes = pointer.bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "subquery registry written for the next boot"
+            );
+            return true;
+        }
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(_) => format!("not written within {budget:?}"),
+    };
+    tracing::warn!(
+        event = "subquery_state_not_written",
+        reason = "stream",
+        stream = %pointer.stream,
+        "the subquery state could not be written ({failure}); subquery shapes will be dropped at the next boot"
+    );
+    catalog_tx.send(checkpoint(None));
+    // Best effort: the next boot deletes whatever the last superseded pointer names.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), ds.delete_stream(&pointer.stream)).await;
+    false
 }
 
 /// A source receipt is stronger than "the sequencer task exited" or "the slot was released": it
@@ -3330,6 +3622,7 @@ mod held_spill_tests {
                 pos: floor.clone(),
                 highwater: Some((0x10, 2)),
                 groups: Default::default(),
+                subq_state: None,
             })
             .await
             .unwrap();
@@ -3343,6 +3636,173 @@ mod held_spill_tests {
             (floor, Some((0x10, 2))),
             "shutdown must preserve the durable restart cursor and highwater"
         );
+    }
+
+    impl Harness {
+        /// Stop the sequencer and return the last `Offset` that reached the catalog, whole.
+        async fn final_offset(&mut self) -> CatalogEvent {
+            self.finish().await;
+            self.store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+                .filter_map(|value| serde_json::from_value::<CatalogEvent>(value).ok())
+                .find(|ev| matches!(ev, CatalogEvent::Offset { .. }))
+                .expect("durable final offset")
+        }
+
+        /// The records appended to one stream, in order.
+        fn appended_to(&self, path: &str) -> Vec<serde_json::Value> {
+            self.store
+                .appended
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(appended, _, _)| appended.ends_with(path))
+                .flat_map(|(_, _, body)| serde_json::from_slice::<Vec<serde_json::Value>>(body).unwrap())
+                .collect()
+        }
+
+        /// One subquery shape in the engine's registry, created and settled as the engine does it.
+        async fn subquery_shape(&self) {
+            let mut registry = self.engine.subqueries.lock().await;
+            crate::subquery::tests::create_settled(
+                &mut registry,
+                "s9",
+                "events",
+                "shape/s9",
+                &crate::subquery::tests::live_events(),
+                false,
+                &[1, 2],
+                &["10", "11"],
+            )
+            .await;
+        }
+    }
+
+    // --- checkpoints and deferred subquery effects --------------------------------------------
+    //
+    // A commit the sequencer has processed can still owe its subquery effects: a flip's
+    // query-back on a flip worker, a batch on an emission lane. A restart from a checkpoint past
+    // such a commit never delivers them — the inner set has already moved, so nothing re-derives
+    // them. That was harmless only while every subquery shape was dropped at restore.
+
+    /// The final checkpoint stops at the last position BEFORE a commit that still owes effects.
+    #[tokio::test]
+    async fn the_final_checkpoint_does_not_pass_a_commit_whose_flips_are_pending() {
+        let mut h = Harness::new(u64::MAX);
+        h.shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 1, true)]).await;
+        // Commit 0/20 moved an inner set. The query-back that moves its dependents is still
+        // running when the engine stops, and does not finish.
+        h.engine.pending_flips.add(0x20);
+        h.page("p1", "p2", vec![change("2", "0/20", 1, true)]).await;
+
+        let checkpoint = h.finish().await;
+
+        assert_eq!(
+            checkpoint,
+            (LogPosition { segment: 0, offset: "p1".into() }, Some((0x10, 1))),
+            "a restart must replay commit 0/20: its effects never landed"
+        );
+    }
+
+    /// Once the effects have landed the checkpoint moves to the commit.
+    #[tokio::test]
+    async fn the_final_checkpoint_reaches_a_commit_whose_flips_have_landed() {
+        let mut h = Harness::new(u64::MAX);
+        h.shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 1, true)]).await;
+        h.engine.pending_flips.add(0x20);
+        h.page("p1", "p2", vec![change("2", "0/20", 1, true)]).await;
+        h.engine.pending_flips.complete(0x20);
+
+        let checkpoint = h.finish().await;
+
+        assert_eq!(checkpoint, (LogPosition { segment: 0, offset: "p2".into() }, Some((0x20, 1))));
+    }
+
+    /// A graceful stop with nothing owed writes the subquery registry and names it from the final
+    /// checkpoint: pointer first, then a stream holding exactly what the pointer promised.
+    #[tokio::test]
+    async fn a_graceful_stop_writes_the_registry_and_names_it_from_the_final_checkpoint() {
+        let mut h = Harness::new(u64::MAX);
+        h.shape().await;
+        h.subquery_shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 1, true)]).await;
+
+        let CatalogEvent::Offset { pos, highwater, subq_state, .. } = h.final_offset().await else { unreachable!() };
+
+        assert_eq!((pos, highwater), (LogPosition { segment: 0, offset: "p1".into() }, Some((0x10, 1))));
+        let pointer = subq_state.expect("the final checkpoint names the registry state");
+        let records = h.appended_to(&pointer.stream);
+        assert_eq!(records.len() as u64, pointer.records, "the stream holds what the pointer promised");
+        assert_eq!(records.first().unwrap()["k"], "header");
+        assert_eq!(records.first().unwrap()["pos"]["offset"], "p1", "written at exactly the checkpoint");
+        assert_eq!(records.last().unwrap()["k"], "end");
+        assert!(records.iter().any(|record| record["k"] == "shape" && record["id"] == "s9"));
+        // Pointer first: the `Offset` that names the stream is in the catalog before the stream
+        // has its first record, so a stream nothing names can never be left behind.
+        let order: Vec<String> = h.store.appended.lock().unwrap().iter().map(|(path, _, _)| path.clone()).collect();
+        let named = order.iter().rposition(|path| path.ends_with(CATALOG_STREAM)).unwrap();
+        let written = order.iter().position(|path| path.ends_with(&pointer.stream)).unwrap();
+        assert!(named < written, "the checkpoint was appended before the state: {order:?}");
+    }
+
+    /// With effects still owed when the drain window closes, nothing is written: the checkpoint
+    /// names no state (the shapes are dropped at the next boot, as after a crash) and does not
+    /// pass the commit that owes them.
+    #[tokio::test]
+    async fn a_stop_with_flips_still_pending_writes_no_registry_state() {
+        let mut h = Harness::new(u64::MAX);
+        h.shape().await;
+        h.subquery_shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 1, true)]).await;
+        h.engine.pending_flips.add(0x20);
+        h.page("p1", "p2", vec![change("2", "0/20", 1, true)]).await;
+
+        let CatalogEvent::Offset { pos, highwater, subq_state, .. } = h.final_offset().await else { unreachable!() };
+
+        assert_eq!(subq_state, None, "a registry that owes effects is not written");
+        assert_eq!((pos, highwater), (LogPosition { segment: 0, offset: "p1".into() }, Some((0x10, 1))));
+        assert!(h.appended_to(crate::subq_state::STREAM_PREFIX.trim_end_matches('/')).is_empty());
+    }
+
+    /// The drain window is what lets a flip that was in flight at the signal finish: the stop
+    /// waits for it, then writes the registry at the commit it belongs to.
+    #[tokio::test]
+    async fn a_flip_that_lands_inside_the_drain_window_is_waited_for() {
+        let mut h = Harness::new(u64::MAX);
+        h.engine.shutdown.set_drain_budget(Duration::from_secs(30));
+        h.shape().await;
+        h.subquery_shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 1, true)]).await;
+        h.engine.pending_flips.add(0x20);
+        h.page("p1", "p2", vec![change("2", "0/20", 1, true)]).await;
+
+        // The signal arrives while the flip's query-back is still running.
+        h.engine.shutdown.begin();
+        for _ in 0..3 {
+            std::future::poll_fn(|cx| {
+                assert!(h.future.as_mut().poll(cx).is_pending(), "the sequencer waits for the flip");
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tokio::task::yield_now().await;
+        }
+        h.engine.pending_flips.complete(0x20);
+
+        let CatalogEvent::Offset { pos, highwater, subq_state, .. } = h.final_offset().await else { unreachable!() };
+        assert_eq!((pos, highwater), (LogPosition { segment: 0, offset: "p2".into() }, Some((0x20, 1))));
+        assert!(subq_state.is_some(), "the registry is written once nothing is owed");
     }
 
     fn change(txid: &str, lsn: &str, seq: u64, last: bool) -> Envelope {

@@ -2408,7 +2408,12 @@ impl Engine {
                 // Both halves move together, in memory and durably, so a sequencer spawned later
                 // starts from exactly what the catalog says (ADR-0003).
                 *self.seq_highwater.lock().unwrap() = None;
-                self.catalog_tx.send(CatalogEvent::Offset { pos: target, highwater: None, groups: Default::default() });
+                self.catalog_tx.send(CatalogEvent::Offset {
+                    pos: target,
+                    highwater: None,
+                    groups: Default::default(),
+                    subq_state: None,
+                });
             }
         }
         // The floor. `None` = nothing durable yet (a first boot that has not checkpointed), which
@@ -2793,7 +2798,7 @@ async fn enqueue_finished_create_work_parts(
         }))
         .collect();
     let mut batches = batches;
-    let registry = registry.lock().await;
+    let mut registry = registry.lock().await;
     for batch in &mut batches {
         let paths = match batch {
             FlipWork::Walk { work, .. } => registry.group_paths_for_work(work),
@@ -2806,13 +2811,17 @@ async fn enqueue_finished_create_work_parts(
             | FlipWork::DeferredNode { group_paths, .. } => *group_paths = paths.into_iter().collect(),
         }
     }
-    drop(registry);
     for batch in &batches {
         for path in batch.group_paths() {
             group_lanes.begin_origin(path, batch.commit_lsn());
         }
     }
     pending_flips.add_all(batches.iter().map(FlipWork::commit_lsn));
+    // Counted, and marked handed over, in ONE hold of the registry lock: a graceful stop that
+    // writes the registry for the next boot reads both under that lock, and must never see this
+    // create's work on neither book (`SubqueryRegistry::export_state`).
+    registry.create_handed_off(id);
+    drop(registry);
     let mut batches = batches.into_iter();
     while let Some(batch) = batches.next() {
         let commit_lsn = batch.commit_lsn();

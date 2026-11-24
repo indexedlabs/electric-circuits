@@ -68,6 +68,12 @@ impl FeedSet {
         self.feeds.get(&feed_id).is_some_and(|bm| bm.contains(pk))
     }
 
+    /// Every pk id in `feed_id`, ascending: the feed as a graceful stop writes it
+    /// (`crate::subq_state`) so the next boot can restore the delete gate exactly.
+    pub(crate) fn pks(&self, feed_id: i64) -> Vec<u32> {
+        self.feeds.get(&feed_id).map(|bm| bm.iter().collect()).unwrap_or_default()
+    }
+
     /// Drop a whole feed (shape teardown) — O(1), no per-pk enumeration or circuit round-trip.
     /// The whole bitmap is freed; the `feed_id` is never reused.
     pub(crate) fn drop_feed(&mut self, feed_id: i64) {
