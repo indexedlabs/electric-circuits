@@ -102,6 +102,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS` | `16777216` | Bound on the record of sequenced transactions not yet seen visible (per-table sparse bitmaps, ~1 bit per transaction of dense backlog: the default is ~2 MiB). Normally a chunk or two — the visibility poller forgets what it sees visible every tick. At the bound the OLDEST recorded transactions are given up (counted as `settle.xidsDropped` and logged) and their tables are fenced: until the poller sees `xmin` pass the highest given-up xid, a snapshot of such a table is served only if its own `xmin` is past it and otherwise answers a retryable 503 (`settle.fencedTables`, `settle.overflowRefusals`); other tables are unaffected. 1048576 … 2^30 |
 | `ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_POLL_MS` | `100` | Tick of the visibility poller (one per database, on its own dedicated connection, never a pooled one) while the record is non-empty and nobody waits; with a waiter it polls from 1 ms, backing off to 32 ms. Idle when the record is empty |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | `25` | Graceful shutdown: how long the whole drain may take before it is forced (exit `70`). Below a typical Kubernetes `terminationGracePeriodSeconds: 30`, so the engine finishes on its own terms rather than being `SIGKILL`ed part-way. Must be > 0 |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` | `5` | Graceful shutdown: how long deferred subquery work (flip query-backs, emission-lane appends, the sequencer's own flush) may keep running after the signal, so the commits already read land their effects and the subquery registry can be written for the next boot. Without it every subquery shape is dropped at restore and its clients reload. Comes **out of** the grace period; `0` = abandon that work at the signal (the registry is then written only if the engine happened to be idle). Must be < the grace; left unset it is 5 s or a fifth of the grace, whichever is shorter |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | `2` | Graceful shutdown: how long the HTTP port stays open after the signal, answering `GET /ready` with 503, so a load balancer's readiness probe observes the drain before the socket closes. Set it to at least your probe's `periodSeconds` × `failureThreshold`, or the socket closes while the poller still thinks the pod is ready. Comes **out of** the grace period, not on top of it; `0` = stop accepting at once. Must be < the grace |
 | `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
 | `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` (Electric parity) retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
@@ -331,10 +332,10 @@ a non-zero `flipFailures`, `/v1/health` turns `degraded` (503), and `POST /shape
 deleted — clients read durable-streams directly, past the HTTP surface, so that is the only way they
 learn; the close releases a tailing long-poll at once with `stream-closed`. Observability
 (`/replication/lsn`, `/metrics*`, `/memory`, `/subqueries`, `/graph`, `/state`, `/trace`, `/tables/*`,
-`/health`) stays up. **Recovery is a restart**, which re-seeds every node from Postgres. A restart
-*drops* every subquery shape — their inner-node state is not persisted, so the catalog restore
-deliberately does not restore them — and clients recreate them with `POST /shapes`. Deleting the
-streams therefore destroys nothing a restart would have kept.
+`/health`) stays up. **Recovery is a restart.** A degraded engine never writes its subquery registry
+on the way out, so that restart *drops* every subquery shape (see *Subquery shapes across a
+restart* below) and clients recreate them with `POST /shapes`. Deleting the streams therefore
+destroys nothing a restart would have kept.
 
 **StatsD telemetry** (`statsd.rs`) is the fleet's only metrics channel — the datadog wire format
 (`name:value|type|#instance_id:<id>,...`), non-blocking (bounded channel → batched ≤1432-byte UDP
@@ -447,12 +448,42 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
    (ADR-0003). If the ingestor is mid-transaction before the commit it simply stops, having
    appended nothing. **Shutdown never advances the slot**; at worst it costs a bounded, de-duplicated
    replay.
-4. The **sequencer** finishes the batch it is processing, flushes it, and writes a final `Offset`
-   checkpoint only if it completed a read and replay is not paused. In Postgres mode the catalog
-   writer rejects any checkpoint below the restored/last durable floor, including periodic and
-   shutdown checkpoints. It drains accepted writes (≤ 10 s) so the next boot resumes from there
-   rather than replaying since the last lazy 2 s checkpoint.
-5. Exit `0` on completion, or `71` if catalog drain or a source receipt missed the shutdown grace.
+4. The **sequencer** stops reading, finishes the batch it is processing and flushes it. What the
+   commits it has processed still owe — a flip's query-back, a batch on an emission lane — is NOT
+   cancelled at the signal: flip workers, lanes, the settle poller and reliable appends keep running
+   for `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` (5 s; the **subquery drain window**), and the
+   sequencer waits inside it for them to land.
+5. The sequencer writes a final `Offset` checkpoint after a completed, unpaused read, or to name
+   saved registry state at the cursor vouched for by boot. It never passes a commit that still owes
+   subquery effects (the newest checkpoint that owes none is written instead). When nothing is owed, that `Offset` names the **subquery registry
+   state**, which is then written to its own stream — see *Subquery shapes across a restart*. In
+   Postgres mode the catalog writer rejects any checkpoint below the restored/last durable floor,
+   including periodic and shutdown checkpoints. It drains accepted writes (≤ 10 s) so the next boot
+   resumes from there rather than replaying since the last lazy 2 s checkpoint.
+6. Exit `0` on completion, or `71` if catalog drain or a source receipt missed the shutdown grace.
+
+#### Subquery shapes across a restart
+
+A subquery shape's membership is decided by in-memory state: its nodes' contributors and its own key
+set. On a graceful stop with nothing owed, the engine writes that state to
+`meta/subq-state/<nonce>` (inner sets as `(pk, value)`, key sets as pks, each stream's position) and
+names it from the final `Offset` with a record count, a size and a SHA-256. The next boot restores
+the registry from it when it verifies and the inner tables' schemas have not moved, replays the
+change log from the checkpoint through the ordinary live path, and so keeps every subquery shape
+and every group with restorable members and a live lease on the stream it had: clients read on from their saved
+offsets and reload nothing. The boot uses the state once — it writes the checkpoint again naming
+nothing before the sequencer reads, and deletes the stream.
+
+A stop that could not come to rest inside the drain window, a degraded engine, and a crash write no
+state; a state that does not verify is not used. Subquery shapes are then dropped at boot as they
+always were — `Dropped`, close, delete — and their clients re-create them.
+`subquery_shapes_restored_total` / `subquery_shapes_dropped_at_restore_total` report which.
+`subquery_state_bytes` reports the size restored at boot. `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR`
+continues to control the membership circuit's spill directory; the saved state lives in durable
+streams, not in that directory. Measure export, encoding and in-memory append costs with
+`STATE_USERS=380 STATE_MEMBERS=395 cargo test -p electric-circuits-engine --features test-support --lib
+restart_state_cost_at_a_realistic_size -- --ignored --nocapture` (3,800 shapes and 150,100 contributors);
+network and durable-store latency must be allowed for separately within the shutdown grace.
 
 **Streams are never closed or retired on shutdown.** A shape's stream is left exactly as it is and
 the restored shape continues it — clients see nothing, and there is no backfill storm. (Closing is
