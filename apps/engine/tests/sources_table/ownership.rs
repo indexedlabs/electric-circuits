@@ -3012,7 +3012,7 @@ async fn group_restart(f: &Fixture, usable_state: bool) -> Result<()> {
                 .collect();
             let expected = BTreeSet::from([format!("public.{}", f.outer), format!("public.{}", f.inner)]);
             ensure!(
-                delivered == expected.iter().map(String::as_str).collect(),
+                delivered == expected.iter().map(String::as_str).collect::<BTreeSet<_>>(),
                 "group {path} missed a plain or subquery member's live output: {events:?}"
             );
         }
