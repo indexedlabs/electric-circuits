@@ -213,14 +213,35 @@ impl Engine {
         share: bool,
         subscription: Option<String>,
     ) -> Result<(ShapeRecord, String)> {
+        self.create_shape_claimed(table, where_, columns, changes_only, share, subscription, ClaimAsk::Keep)
+            .await
+            .map(|(rec, sub, _)| (rec, sub))
+    }
+
+    /// [`Self::create_shape_as`] for a request that may name the claim it holds (`ask`), returning
+    /// the identity of the claim it was granted as well: `None` only for a shape that tracks no
+    /// subscription (`share == false`). See [`EngineState::grant_claim`] for when a repeat keeps
+    /// its claim's identity and when it is answered a new one.
+    pub(crate) async fn create_shape_claimed(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        columns: Option<Vec<String>>,
+        changes_only: bool,
+        share: bool,
+        subscription: Option<String>,
+        ask: ClaimAsk,
+    ) -> Result<(ShapeRecord, String, Option<String>)> {
         // Minted ONCE, outside the redo loop: a redone attempt must be the same subscription, or
         // the retry would take a second claim — the very thing the id exists to prevent.
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res =
-                self.create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None).await;
+            let mut claim = ClaimSlot::new(ask.clone());
+            let res = self
+                .create_shape_once(table, where_.clone(), columns.clone(), changes_only, share, &sub, None, &mut claim)
+                .await;
             match retry_create(res, attempt, "shape", table) {
-                Ok(out) => return out.map(|rec| (rec, sub)),
+                Ok(out) => return out.map(|rec| (rec, sub, claim.granted)),
                 Err(()) => redo_backoff().await,
             }
         }
@@ -239,9 +260,12 @@ impl Engine {
         changes_only: bool,
         subscription: Option<String>,
         stream_path: String,
-    ) -> Result<(ShapeRecord, String)> {
+    ) -> Result<(ShapeRecord, String, Option<String>)> {
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
+            // A member is minted for its group, so its claim is new and so is its identity. The
+            // group's own is its public member's, which the load answers.
+            let mut claim = ClaimSlot::new(ClaimAsk::Keep);
             let res = self
                 .create_shape_once(
                     table,
@@ -251,10 +275,11 @@ impl Engine {
                     false,
                     &sub,
                     Some(stream_path.clone()),
+                    &mut claim,
                 )
                 .await;
             match retry_create(res, attempt, "shape group member", table) {
-                Ok(out) => return out.map(|rec| (rec, sub)),
+                Ok(out) => return out.map(|rec| (rec, sub, claim.granted)),
                 Err(()) => redo_backoff().await,
             }
         }
@@ -303,6 +328,7 @@ impl Engine {
         share: bool,
         sub: &str,
         stream_path_override: Option<String>,
+        claim: &mut ClaimSlot,
     ) -> Result<ShapeRecord> {
         // A degraded engine cannot say what belongs in a shape (see `Engine::ensure_not_degraded`),
         // so it refuses to make one rather than backfill from state it knows is wrong. This early
@@ -380,13 +406,24 @@ impl Engine {
                     // lease moves.
                     let now = crate::changelog::now_secs();
                     let fresh = st.subscribe(&existing_id, sub.to_string(), now);
-                    let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
+                    // The claim's identity is settled with the claim, under this hold of the lock:
+                    // kept for a request that names it, new otherwise, and a new one is recorded.
+                    let granted = st.grant_claim(sub, &claim.ask, fresh);
+                    let ev = CatalogEvent::Joined {
+                        id: existing_id.clone(),
+                        subscription: sub.to_string(),
+                        at: now,
+                        claim: granted.recorded(),
+                    };
+                    claim.granted = Some(granted.id);
                     // A NEW claim is enqueued here (under the lock, so the log order matches the
                     // state order) and WAITED on immediately before the join is acknowledged: a
                     // subscription the durable record does not carry is one a restart forgets. A
                     // renewal promises nothing new — the claim is already in the log — so its
                     // record is queued like any engine-initiated event and the caller is not made
-                    // to wait on storage to keep a lease it already holds.
+                    // to wait on storage to keep a lease it already holds. That includes a renewal
+                    // that replaced the claim's identity: a restart that loses the record restores
+                    // the earlier identity, and the holder's next renewal replaces it again.
                     let joined_durable = if fresh {
                         Some(self.catalog_tx.send_durable(ev))
                     } else {
@@ -400,7 +437,7 @@ impl Engine {
                     drop(st);
                     // Everything the join has claimed before its first await, given back if it
                     // never reaches its own end — including when the CLIENT disappears mid-wait.
-                    let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
+                    let mut joining = JoinGuard::new(self, &existing_id, sub, claim.granted.clone(), fresh);
                     if let Err(e) = await_share_ready(ready, &existing_id).await {
                         // The failed creator already removed the share entries; undo nothing.
                         // A degraded outcome arrives typed, so this joiner answers 503 with the
@@ -501,11 +538,14 @@ impl Engine {
             st.shapes.insert(id.clone(), rec.clone());
             // Durable BEFORE the create is acknowledged (awaited at the bottom of the success
             // path): a `POST /shapes` that returns 200 promises a shape that survives a restart.
+            // The creator's claim is new, and so is its identity: in the same record.
+            let claim_id = feed_sig.is_some().then(new_claim_id);
             let created = self.catalog_tx.send_durable(CatalogEvent::Created {
                 rec: rec.clone(),
                 sig: feed_sig.clone(),
                 subscription: sub.to_string(),
                 at: crate::changelog::now_secs(),
+                claim: claim_id.clone(),
             });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             self.ensure_retention_sweeper();
@@ -520,6 +560,8 @@ impl Engine {
                 st.feed_by_sig.insert(sig.clone(), id.clone());
                 st.feed_shares.insert(id.clone(), FeedShare { sig, subs: Default::default(), ready: ready_rx });
                 st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
+                st.claim_ids.extend(claim_id.clone().map(|claim_id| (sub.to_string(), claim_id)));
+                claim.granted = claim_id;
             }
             // Release the engine-state lock before the registry work. Creation is three-phase:
             // begin (brief registry lock: nodes/edges/pending buffer registered) → Postgres
@@ -653,11 +695,13 @@ impl Engine {
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
         // Durable before the create is acknowledged — see the subquery path above.
+        let claim_id = feed_sig.is_some().then(new_claim_id);
         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
             rec: rec.clone(),
             sig: feed_sig.clone(),
             subscription: sub.to_string(),
             at: crate::changelog::now_secs(),
+            claim: claim_id.clone(),
         });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
@@ -668,6 +712,8 @@ impl Engine {
             st.feed_by_sig.insert(sig.clone(), id.clone());
             st.feed_shares.insert(id.clone(), FeedShare { sig, subs: Default::default(), ready: share_rx });
             st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
+            st.claim_ids.extend(claim_id.clone().map(|claim_id| (sub.to_string(), claim_id)));
+            claim.granted = claim_id;
         }
         // Release the engine-state lock, then run the two-phase backfill+activate so the shape's
         // snapshot is readable when we return (the Electric adapter folds the stream immediately).
@@ -782,11 +828,28 @@ impl Engine {
         col: Option<String>,
         subscription: Option<String>,
     ) -> Result<(ShapeRecord, String)> {
+        self.create_aggregate_claimed(table, where_, func, col, subscription, ClaimAsk::Keep)
+            .await
+            .map(|(rec, sub, _)| (rec, sub))
+    }
+
+    /// [`Self::create_aggregate_as`] for a request that may name the claim it holds, returning
+    /// the identity of the claim it was granted as well — as [`Self::create_shape_claimed`].
+    pub(crate) async fn create_aggregate_claimed(
+        &self,
+        table: &TableRef,
+        where_: Option<PredicateJson>,
+        func: AggFn,
+        col: Option<String>,
+        subscription: Option<String>,
+        ask: ClaimAsk,
+    ) -> Result<(ShapeRecord, String, Option<String>)> {
         let sub = self.resolve_subscription(subscription).await;
         for attempt in 1..=CREATE_RACE_ATTEMPTS {
-            let res = self.create_aggregate_once(table, where_.clone(), func, col.clone(), &sub).await;
+            let mut claim = ClaimSlot::new(ask.clone());
+            let res = self.create_aggregate_once(table, where_.clone(), func, col.clone(), &sub, &mut claim).await;
             match retry_create(res, attempt, "aggregate", table) {
-                Ok(out) => return out.map(|rec| (rec, sub)),
+                Ok(out) => return out.map(|rec| (rec, sub, claim.granted)),
                 Err(()) => redo_backoff().await,
             }
         }
@@ -800,6 +863,7 @@ impl Engine {
         func: AggFn,
         col: Option<String>,
         sub: &str,
+        claim: &mut ClaimSlot,
     ) -> Result<ShapeRecord> {
         // Same refusal as `create_shape`: a degraded engine does not get to answer for a fold over
         // rows whose membership it can no longer vouch for.
@@ -839,7 +903,14 @@ impl Engine {
                 ensure_subscription_free(&st, sub, &existing_id)?;
                 let now = crate::changelog::now_secs();
                 let fresh = st.subscribe(&existing_id, sub.to_string(), now);
-                let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
+                let granted = st.grant_claim(sub, &claim.ask, fresh);
+                let ev = CatalogEvent::Joined {
+                    id: existing_id.clone(),
+                    subscription: sub.to_string(),
+                    at: now,
+                    claim: granted.recorded(),
+                };
+                claim.granted = Some(granted.id);
                 // Durable for a new claim, queued for a renewal — see the row-shape join path.
                 let joined = if fresh {
                     Some(self.catalog_tx.send_durable(ev))
@@ -849,7 +920,7 @@ impl Engine {
                 };
                 let ready = st.feed_shares.get(&existing_id).expect("share entry for aggregate").ready.clone();
                 drop(st);
-                let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
+                let mut joining = JoinGuard::new(self, &existing_id, sub, claim.granted.clone(), fresh);
                 if let Err(e) = await_share_ready(ready, &existing_id).await {
                     joining.rollback().await;
                     return Err(e);
@@ -925,11 +996,13 @@ impl Engine {
                         st.circuit_placement
                             .insert(id.clone(), CircuitPlacement { label: "counts".into(), col: None, counts: true });
                         // Durable before the create is acknowledged — see `create_shape`.
+                        let claim_id = new_claim_id();
                         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
                             rec: rec.clone(),
                             sig: Some(agg_sig.clone()),
                             subscription: sub.to_string(),
                             at: crate::changelog::now_secs(),
+                            claim: Some(claim_id.clone()),
                         });
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
                         self.ensure_retention_sweeper();
@@ -938,6 +1011,8 @@ impl Engine {
                         st.feed_shares
                             .insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
                         st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
+                        st.claim_ids.insert(sub.to_string(), claim_id.clone());
+                        claim.granted = Some(claim_id);
                         drop(st);
                         let mut creating =
                             CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
@@ -1035,11 +1110,13 @@ impl Engine {
         self.ensure_not_degraded()?;
         st.shapes.insert(id.clone(), rec.clone());
         // Durable before the create is acknowledged — see `create_shape`.
+        let claim_id = new_claim_id();
         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
             rec: rec.clone(),
             sig: Some(agg_sig.clone()),
             subscription: sub.to_string(),
             at: crate::changelog::now_secs(),
+            claim: Some(claim_id.clone()),
         });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
@@ -1048,6 +1125,8 @@ impl Engine {
         st.feed_by_sig.insert(agg_sig.clone(), id.clone());
         st.feed_shares.insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
         st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
+        st.claim_ids.insert(sub.to_string(), claim_id.clone());
+        claim.granted = Some(claim_id);
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
         let outcome = backfill_and_activate(
@@ -1139,7 +1218,16 @@ impl Engine {
     /// [`Self::release_subscription_durable`] instead: an acknowledged release must survive even
     /// when leases are disabled with `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`.
     pub async fn release_subscription(&self, id: &str, sub: Option<&str>) {
-        if let Err(error) = self.release_subscription_inner(id, sub, false, false).await {
+        if let Err(error) = self.release_subscription_inner(id, sub, None, false, false).await {
+            tracing::error!(%error, "engine-internal subscription release lost its catalog writer");
+        }
+    }
+
+    /// [`Self::release_subscription`] of one claim by its identity: the compensation of a join
+    /// that took `claim` and is giving it back. A claim a later request took under the same
+    /// subscription has another identity and is left alone.
+    async fn give_back_claim(&self, id: &str, sub: &str, claim: Option<&str>) {
+        if let Err(error) = self.release_subscription_inner(id, Some(sub), claim, false, false).await {
             tracing::error!(%error, "engine-internal subscription release lost its catalog writer");
         }
     }
@@ -1151,17 +1239,29 @@ impl Engine {
     /// that times out and drops this future therefore loses only its answer — the `Left` is the
     /// writer's from the moment it was enqueued, and lands regardless.
     pub async fn release_subscription_durable(&self, id: &str, sub: Option<&str>) -> Result<()> {
-        self.release_subscription_inner(id, sub, true, false).await
+        self.release_subscription_inner(id, sub, None, true, false).await
+    }
+
+    /// [`Self::release_subscription_durable`] for a release that names the claim it was issued
+    /// for (`DELETE /shapes/{id}?subscription=…&claim=…`). A subscription id can be shared by two
+    /// sessions, one after the other, so the id alone does not say whose claim a late or retried
+    /// release means: with `claim` it releases only the claim that has that identity, and when
+    /// the subscription holds another by now (or none) it changes nothing, records nothing and
+    /// still waits on the durability barrier, exactly as a repeat of an applied release does.
+    /// `None` is the release that names no claim, which releases whatever claim is held.
+    pub(crate) async fn release_claim_durable(&self, id: &str, sub: Option<&str>, claim: Option<&str>) -> Result<()> {
+        self.release_subscription_inner(id, sub, claim, true, false).await
     }
 
     pub(crate) async fn release_group_member_durable(&self, id: &str, sub: &str) -> Result<()> {
-        self.release_subscription_inner(id, Some(sub), true, true).await
+        self.release_subscription_inner(id, Some(sub), None, true, true).await
     }
 
     async fn release_subscription_inner(
         &self,
         id: &str,
         sub: Option<&str>,
+        claim: Option<&str>,
         durable: bool,
         internal_group: bool,
     ) -> Result<()> {
@@ -1192,6 +1292,8 @@ impl Engine {
             }
         }
         let released = match sub {
+            // A release for an earlier claim than the one held is a success that changes nothing.
+            Some(s) if !st.release_names_held_claim(s, claim) => None,
             Some(s) => st.unsubscribe(id, s).then(|| s.to_string()),
             None => st.unsubscribe_anonymous(id),
         };
@@ -2329,7 +2431,23 @@ impl Engine {
     }
 
     pub(crate) async fn release_group_claim(&self, subscription: &str, expected_id: &str) -> Result<()> {
-        let Some((group, release, joined_existing)) = self.begin_group_release(subscription, expected_id).await else {
+        self.release_group_claim_for(subscription, expected_id, None).await
+    }
+
+    /// [`Self::release_group_claim`] for a client's release that may name the claim it was issued
+    /// for (`DELETE /shapes/{id}?subscription=…&claim=…`). A group's sessions share its
+    /// subscription, so the subscription and the group do not say whose claim a late or retried
+    /// release means, and `claim` does: the group is released only while its claim still has that
+    /// identity. When a later load took the claim under another identity, the release is a
+    /// success that changes nothing. `None` names no claim and releases whatever claim is held.
+    pub(crate) async fn release_group_claim_for(
+        &self,
+        subscription: &str,
+        expected_id: &str,
+        claim: Option<&str>,
+    ) -> Result<()> {
+        let Some((group, release, joined_existing)) = self.begin_group_release(subscription, expected_id, claim).await
+        else {
             return Ok(());
         };
         if joined_existing {
@@ -2924,17 +3042,21 @@ struct JoinGuard {
     engine: Engine,
     shape_id: String,
     subscription: String,
+    /// The identity the join took its claim under: the compensation gives back that claim and no
+    /// other, so it cannot release one a later request took under the same subscription.
+    claim: Option<String>,
     /// Armed only for a NEW claim: `fresh == false` is a renewal, which claimed nothing and must
     /// survive its request failing.
     armed: bool,
 }
 
 impl JoinGuard {
-    fn new(engine: &Engine, shape_id: &str, subscription: &str, fresh: bool) -> Self {
+    fn new(engine: &Engine, shape_id: &str, subscription: &str, claim: Option<String>, fresh: bool) -> Self {
         Self {
             engine: engine.clone(),
             shape_id: shape_id.to_string(),
             subscription: subscription.to_string(),
+            claim,
             armed: fresh,
         }
     }
@@ -2950,7 +3072,7 @@ impl JoinGuard {
         if !std::mem::take(&mut self.armed) {
             return;
         }
-        self.engine.release_subscription(&self.shape_id, Some(&self.subscription)).await;
+        self.engine.give_back_claim(&self.shape_id, &self.subscription, self.claim.as_deref()).await;
     }
 }
 
@@ -2969,8 +3091,9 @@ impl Drop for JoinGuard {
             self.subscription
         );
         let (engine, shape_id, subscription) = (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
+        let claim = self.claim.take();
         self.engine.shutdown.spawn(async move {
-            engine.release_subscription(&shape_id, Some(&subscription)).await;
+            engine.give_back_claim(&shape_id, &subscription, claim.as_deref()).await;
         });
     }
 }
@@ -4989,7 +5112,7 @@ mod subscription_tests {
     async fn a_cancelled_join_releases_its_own_subscription() {
         let engine = engine_with_share("s1", &[("held", 10), ("joining", 10)]).await;
 
-        drop(JoinGuard::new(&engine, "s1", "joining", true));
+        drop(JoinGuard::new(&engine, "s1", "joining", None, true));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while refcount(&engine, "s1").await > 1 {
@@ -5008,7 +5131,7 @@ mod subscription_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cancelled_renewal_keeps_the_claim_it_did_not_take() {
         let engine = engine_with_share("s1", &[("held", 10)]).await;
-        drop(JoinGuard::new(&engine, "s1", "held", false));
+        drop(JoinGuard::new(&engine, "s1", "held", None, false));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(refcount(&engine, "s1").await, 1);
     }

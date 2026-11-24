@@ -543,6 +543,12 @@ Any two **equal** shapes share one maintained stream, held by a set of named sub
   subscription is also a **lease**: native reads bypass the engine entirely, so a claim counts as
   live only while renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, and the retention sweeper
   releases an unrenewed one exactly as an explicit delete would.
+- **A claim has an identity** (ADR-0008). Every native grant answers `claim`, an opaque id the
+  engine mints; a renewal that names it (`?claim=…`) keeps it, and any other grant under the same
+  subscription mints a new one. A release that names a `claim` drops the claim only while it still
+  has that identity, so a late or retried release from an earlier session cannot drop the claim a
+  later session took under the same subscription id; a release that names none behaves as before.
+  `Created`/`Joined` carry the identity, so a restart keeps it.
 - **A join verifies the retained stream still exists** — one `HEAD` per join. The record is engine
   state; the stream is storage's, and storage can lose it (an operator `DELETE`, a restore from an
   older backup). Gone (404/410) or closed means the registry entry is stale: it is retired properly

@@ -94,3 +94,54 @@ phantom unrecoverable, the second lets any dead client pin a shape forever.
 - **The lease boundary belongs to the client**: the clock is wall-clock seconds, so a claim lapses
   once its age is strictly greater than the window. Lapsing at `>=` would end a one-second window
   after a millisecond.
+
+## A claim has an identity
+
+Added when a group's sessions began to share one subscription: the subscription id alone stopped
+being enough to say whose claim a release means.
+
+A subscription id is the caller's to choose, so two sessions can use one, one after the other. A
+group's sessions always do: the next app launch loads the group under the subscription the last
+launch loaded it with. A release names the subscription and the shape (or a group's member), so a
+release an earlier session sent, arriving late or retried after a later session took the claim
+again, dropped the later session's claim.
+
+So each claim has an identity, minted by the engine: 16 hex digits, opaque, compared only for
+equality.
+
+- **Every grant answers it.** `POST /v1/shapes`, `/v1/subset-feeds`, `/v1/aggregates` and
+  `/v1/subsets/load` answer `claim`: the identity of the claim the subscription holds once the
+  request has taken or renewed it.
+- **A renewal names it to keep it.** Those requests take `?claim=…`, the identity the caller holds.
+  When it is the held claim's, the grant is a renewal by the claim's holder and the identity is
+  kept, so the release that holder sends later still names its claim however many renewals came
+  between, and whether or not their answers arrived. Any other grant gives the claim a new
+  identity: a new claim, and a claim that is held whose identity the request did not name. The
+  second is a later session taking over, and it is why the rule is not "a renewal always keeps the
+  identity": a session that loads while an earlier one is still held (it was killed, or its
+  release is still on the way) must not share that session's identity.
+- **A release names it.** `DELETE /shapes/{id}?subscription=…&claim=…` releases the claim only
+  while it is the one with that identity. When the subscription holds another by now, or none, the
+  release answers `200` and changes nothing, exactly as a repeat of an applied release does.
+  `claim` needs `subscription` (`400` without it).
+- **A release that names no claim is unchanged.** It releases whatever claim the subscription
+  holds. That is the release an older client or gateway sends, and it keeps the exposure above.
+- **It applies to a single shape as to a group.** Wherever two sessions share a subscription id
+  they share a claim; the engine cannot tell, so every native grant and release follows the rule.
+  A group's claim is one claim with one identity, held on its public subscription.
+- **It is in the catalog.** `Created` and `Joined` carry `claim` when they gave the claim its
+  identity, and the fold restores it. A new claim's record is durable before the answer, as it was.
+  When only the identity is new (a takeover of a claim that was still held), the record is the
+  renewal's and is queued like any renewal's: an engine that stops before it lands restores the
+  claim under its earlier identity, and the holder's next renewal, which names an identity the
+  claim no longer has, replaces it again. A renewal that kept the identity records none. Older
+  engines ignore the field.
+- **The engine's own compensations name it too.** A join that is abandoned mid-wait gives back
+  the claim it took by its identity, so it cannot release one a later request took under the same
+  subscription.
+
+The identity travels as a query parameter on requests and a body member on answers. Not a request
+body member: a client renews by repeating the request it created with, and a gateway that validates
+bodies strictly would refuse a member it does not know. Not a counter: nothing needs an order, and
+an identity that says how many claims an engine has granted is a number a gateway would have to
+hide.

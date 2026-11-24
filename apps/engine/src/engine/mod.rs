@@ -31,6 +31,8 @@ mod boot_identity_tests;
 mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
+#[cfg(test)]
+mod claim_identity_tests;
 mod drift;
 pub(crate) mod emission;
 pub use emission::GroupDrain;
@@ -1229,6 +1231,15 @@ struct EngineState {
     /// refused (409) rather than silently accepted, because the caller would then hold one name for
     /// two shapes and be unable to release either without ambiguity.
     subs_by_id: HashMap<String, String>,
+    /// The identity of each held claim: `subscription id -> claim id` (ADR-0008, "A claim has an
+    /// identity"). Keyed like `subs_by_id`, and removed with the claim by the same two methods
+    /// ([`Self::unsubscribe`], [`Self::forget_subscriptions`]), so an identity never outlives the
+    /// claim it names. Set by [`Self::grant_claim`] and by a create.
+    ///
+    /// A claim taken by a path that tells nobody about it (a group's private member claims, the
+    /// `/v1/shape` adapter's local renewal) has no entry. A release that names an identity never
+    /// matches such a claim; one that names none releases it as before.
+    claim_ids: HashMap<String, String>,
     /// Counter behind the ids the engine mints for creates that named no subscription. Combined
     /// with a per-Engine-instance nonce (see [`Engine::mint_subscription`]), so a minted id is unique
     /// across restarts too — the catalog outlives the process that wrote it.
@@ -1313,9 +1324,44 @@ impl EngineState {
             // on another must keep the newer owner.
             if self.subs_by_id.get(sub).is_some_and(|owner| owner == shape) {
                 self.subs_by_id.remove(sub);
+                self.claim_ids.remove(sub);
             }
         }
         removed
+    }
+
+    // --- claim identity (ADR-0008, "A claim has an identity") ------------------------------------
+
+    /// Whether a release that names `claim` is for the claim `sub` holds now. `None` names no
+    /// claim: the release an older client sends, which is for whatever claim is held.
+    fn release_names_held_claim(&self, sub: &str, claim: Option<&str>) -> bool {
+        claim.is_none_or(|named| self.claim_ids.get(sub).is_some_and(|held| held == named))
+    }
+
+    /// Settle the identity of the claim `sub` holds, right after [`Self::subscribe`] took or
+    /// renewed it (`fresh` is what that call returned), under the same hold of the state lock.
+    ///
+    /// The identity is kept only for a request that names it: that is a renewal by the claim's
+    /// holder, and the release that holder sends later must still name the claim. Every other
+    /// grant gives the claim a new identity: a new claim, and a claim that is held but whose
+    /// identity the request did not name. The second is a later session taking the claim over
+    /// under a subscription it shares with an earlier one, and from then on a release the earlier
+    /// session sent names a claim nobody holds.
+    fn grant_claim(&mut self, sub: &str, ask: &ClaimAsk, fresh: bool) -> GrantedClaim {
+        let held = if fresh { None } else { self.claim_ids.get(sub) };
+        let kept = match (held, ask) {
+            (Some(held), ClaimAsk::Keep) => Some(held.clone()),
+            (Some(held), ClaimAsk::Native(Some(named))) if held == named => Some(held.clone()),
+            _ => None,
+        };
+        match kept {
+            Some(id) => GrantedClaim { id, new: false },
+            None => {
+                let id = new_claim_id();
+                self.claim_ids.insert(sub.to_string(), id.clone());
+                GrantedClaim { id, new: true }
+            }
+        }
     }
 
     /// The legacy anonymous release (`DELETE /shapes/{id}` with no `subscription`): drop ONE
@@ -1358,6 +1404,7 @@ impl EngineState {
             for id in ids {
                 if self.subs_by_id.get(&id).is_some_and(|owner| owner == shape) {
                     self.subs_by_id.remove(&id);
+                    self.claim_ids.remove(&id);
                 }
             }
         }
@@ -1399,6 +1446,54 @@ impl EngineState {
         }
         out.sort();
         out
+    }
+}
+
+/// What a create or a load says about the claim it takes or renews.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum ClaimAsk {
+    /// A renewal by the engine itself, or by a surface that tells nobody the claim's identity
+    /// (the `/v1/shape` adapter, a library caller): a held claim keeps the identity it has.
+    #[default]
+    Keep,
+    /// A native request, and the identity it named in `?claim=…` if it named one. Naming the held
+    /// claim's identity keeps it; anything else, none included, is answered a new one.
+    Native(Option<String>),
+}
+
+/// The identity a grant left a claim with ([`EngineState::grant_claim`]).
+struct GrantedClaim {
+    id: String,
+    /// The identity was minted by this grant, so the grant's catalog record carries it. A renewal
+    /// that kept the identity records none: its record is the one it always was.
+    new: bool,
+}
+
+impl GrantedClaim {
+    /// The `claim` field of the catalog record of this grant.
+    fn recorded(&self) -> Option<String> {
+        self.new.then(|| self.id.clone())
+    }
+}
+
+/// A new claim identity: opaque, unique for all practical purposes across restarts (64 random
+/// bits; an identity is only ever compared with the one other its subscription holds), and short
+/// because it rides catalog records.
+fn new_claim_id() -> String {
+    let random = uuid::Uuid::new_v4().simple().to_string();
+    random[..16].to_string()
+}
+
+/// The claim half of one create attempt: what the caller said it holds, and, once the attempt has
+/// taken or renewed the claim, the identity the claim was left with.
+pub(crate) struct ClaimSlot {
+    ask: ClaimAsk,
+    granted: Option<String>,
+}
+
+impl ClaimSlot {
+    pub(crate) fn new(ask: ClaimAsk) -> Self {
+        Self { ask, granted: None }
     }
 }
 
@@ -1871,6 +1966,7 @@ impl Engine {
                 unresolved: HashSet::new(),
                 epoch_gen: 0,
                 subs_by_id: HashMap::new(),
+                claim_ids: HashMap::new(),
                 next_minted_sub: 1,
             })),
             pg_url,
@@ -3362,6 +3458,7 @@ impl Engine {
                             id: member.shape_id.clone(),
                             subscription: member.subscription.clone(),
                             at: now,
+                            claim: None,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -3481,14 +3578,19 @@ impl Engine {
         self.group_seed_test_gate.wait_if_armed().await;
     }
 
+    /// Start (or join) the release of `subscription`'s group when it is still `expected_id` and,
+    /// for a release that names a `claim`, the group's claim still has that identity. Checked under
+    /// the state lock a renewal settles the identity under, so a load that took the claim over is
+    /// either ordered before this check (and the release is a no-op) or after the release began.
     pub(crate) async fn begin_group_release(
         &self,
         subscription: &str,
         expected_id: &str,
+        claim: Option<&str>,
     ) -> Option<(GroupRecord, Arc<GroupRelease>, bool)> {
         let st = self.state.lock().await;
         let group = st.group_claims.get(subscription).cloned()?;
-        if group.id != expected_id {
+        if group.id != expected_id || !st.release_names_held_claim(subscription, claim) {
             return None;
         }
         let mut releases = self.group_releases.lock().unwrap();
@@ -3518,31 +3620,54 @@ impl Engine {
         self.group_lanes.remove(stream_path);
     }
 
+    /// [`Self::renew_group_claim_as`] by a caller that names no claim and keeps whatever identity
+    /// the claim has: `true` where that answers an identity.
+    #[cfg(test)]
+    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+        Ok(self.renew_group_claim_as(group, &ClaimAsk::Keep).await?.is_some())
+    }
+
     /// Renew the public group lease and every private member claim together. A retried load is
     /// one idempotent lease touch, so no member claim is duplicated and all member leases advance
     /// to the same wall-clock instant.
-    pub(crate) async fn renew_group_claim(&self, group: &GroupRecord) -> Result<bool> {
+    ///
+    /// `Ok(Some(claim))` is the identity the group's claim has afterwards. A group's claim is one
+    /// claim with one identity, held on its public subscription (its first member's); the private
+    /// member claims have none. It is settled under the same hold of the state lock that renews
+    /// the claims ([`EngineState::grant_claim`]): kept for a request that names it (`ask`), new
+    /// otherwise, and a new one is in the public member's `Joined`. That record is queued like any
+    /// renewal's, and an engine that stops before it lands restores the claim under its earlier
+    /// identity, which the session's next renewal replaces again. `Ok(None)` = the group cannot
+    /// be renewed (a member lost its claim, or a release of the group was in flight).
+    pub(crate) async fn renew_group_claim_as(&self, group: &GroupRecord, ask: &ClaimAsk) -> Result<Option<String>> {
         let now = crate::changelog::now_secs();
         let mut events = Vec::with_capacity(group.members.len());
+        let mut granted = None;
         {
             let mut st = self.state.lock().await;
             let in_flight = self.group_releases.lock().unwrap().get(&group.id).cloned();
             if let Some(release) = in_flight {
                 drop(st);
                 release.wait().await?;
-                return Ok(false);
+                return Ok(None);
             }
             for member in &group.members {
                 if !(st.shapes.contains_key(&member.shape_id)
                     && st.subscription_owner(&member.subscription).is_some_and(|owner| owner == &member.shape_id))
                 {
-                    return Ok(false);
+                    return Ok(None);
                 }
-                st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                let fresh = st.subscribe(&member.shape_id, member.subscription.clone(), now);
+                let claim = (member.subscription == group.subscription).then(|| {
+                    let claim = st.grant_claim(&member.subscription, ask, fresh);
+                    granted = Some(claim.id.clone());
+                    claim.recorded()
+                });
                 events.push(CatalogEvent::Joined {
                     id: member.shape_id.clone(),
                     subscription: member.subscription.clone(),
                     at: now,
+                    claim: claim.flatten(),
                 });
             }
             // Registration is part of the same state-locked admission as the claim check. A
@@ -3554,7 +3679,8 @@ impl Engine {
         for event in events {
             self.catalog_tx.send(event);
         }
-        Ok(true)
+        // Every group has a public member, so a renewed group was granted an identity.
+        Ok(granted)
     }
 
     /// Whether `group` is still its subscription's record, no release of it has begun, and every
