@@ -73,13 +73,13 @@ async def wait_for_marker(client, validator, source_commit_id, user_id, generati
     raise TimeoutError(f"Workload did not drain in {timeout}s; last observation: {last}")
 
 
-def read_events(path, after):
+def read_events(path, after, before=float("inf")):
     with path.open(errors="replace") as handle:
         for line in handle:
             try:
                 event = json.loads(line)
                 timestamp = datetime.datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
-                if timestamp >= after:
+                if after <= timestamp <= before:
                     yield event
             except (ValueError, KeyError, TypeError):
                 continue
@@ -249,12 +249,18 @@ async def run(args):
                     result["error"] = repr(error)
                 result["elapsed_s"] = time.monotonic() - began
                 result["ended_wall"] = time.time()
+                cpu_after = sum(process.cpu_times()[:2])
                 result["began_wall"] = began_wall
                 result["transactions"] = transactions
+                cpu_stopped.set()
+                probe.stop()
                 if profiler:
                     subprocess.run(["sudo", "kill", "-INT", "--", f"-{profiler.pid}"], check=False)
                     profiler.wait(timeout=30)
                     perf_log.close()
+                await cpu_task
+                await probe_task
+                if profiler:
                     with (output / "import.perf.script").open("w") as handle:
                         extracted = subprocess.run(["sudo", perf, "script", "-i", str(output / "import.perf.data")], stdout=handle, stderr=subprocess.PIPE, text=True)
                     stacks = fold((output / "import.perf.script").read_text())
@@ -262,15 +268,11 @@ async def run(args):
                     if stacks:
                         (output / "import.folded").write_text("\n".join(f"{stack} {count}" for stack, count in sorted(stacks.items())) + "\n")
                         (output / "import.svg").write_text(render(stacks, f"{args.name} import CPU"))
-                cpu_stopped.set()
-                await cpu_task
-                result["engine_cpu_percent"] = (sum(process.cpu_times()[:2]) - cpu_before) / result["elapsed_s"] * 100
+                result["engine_cpu_percent"] = (cpu_after - cpu_before) / result["elapsed_s"] * 100
                 result["changes_per_s"] = result.get("row_changes", 0) / result["elapsed_s"] if result["completed"] else None
-                probe.stop()
-                await probe_task
-                result["probe"] = summarize([sample for sample in probe.samples if sample["at_s"] >= began - probe.started])
+                result["probe"] = summarize([sample for sample in probe.samples if began - probe.started <= sample["at_s"] <= began + result["elapsed_s"] - probe.started])
                 result["idle_probe"] = summarize([sample for sample in probe.samples if sample["at_s"] < began - probe.started])
-                events = read_events(engine_log, began_wall)
+                events = read_events(engine_log, began_wall, result["ended_wall"])
                 by_table = Counter()
                 empty = Counter()
                 result["pinned_warnings"] = 0
@@ -298,6 +300,12 @@ async def run(args):
                         result["first_change_read_time"] = min(event["ended"] for event in matching)
                         result["first_read_to_empty_s"] = result["ended_wall"] - result["first_change_read_time"]
                         result["first_read_definition"] = "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy"
+                        result["engine_changes_per_s"] = result.get("row_changes", 0) / result["first_read_to_empty_s"] if result["completed"] else None
+                        with (output / f"{workload}-cpu.jsonl").open() as handle:
+                            samples = [sample for line in handle if result["first_change_read_time"] <= (sample := json.loads(line))["at"] <= result["ended_wall"]]
+                        if len(samples) >= 2:
+                            result["cpu_sample_window_s"] = samples[-1]["at"] - samples[0]["at"]
+                            result["engine_cpu_after_first_read_percent"] = (samples[-1]["cpu_s"] - samples[0]["cpu_s"]) * 100 / result["cpu_sample_window_s"]
                 save(output / f"{workload}-result.json", result)
                 print(json.dumps(result, default=str), flush=True)
                 if not result["completed"]:
