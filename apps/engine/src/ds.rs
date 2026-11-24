@@ -397,6 +397,7 @@ pub type GoneReconciler = std::sync::Arc<
 /// exact error/retry behavior while keeping HTTP mechanics below the port.
 pub(crate) struct StoreResponse {
     status: u16,
+    retry_after: Option<std::time::Duration>,
     /// The response body is deliberately retained as an outcome rather than normalized to text.
     /// Successful stream reads must fail if their body cannot be acquired: accepting the advertised
     /// next offset with an empty page could checkpoint past envelopes that never reached Circuits.
@@ -1039,7 +1040,7 @@ impl HttpDurableStreamsStore {
         } else {
             None
         };
-        StoreResponse { status, permit, body, next_offset, up_to_date, closed }
+        StoreResponse { status, retry_after: None, permit, body, next_offset, up_to_date, closed }
     }
 }
 
@@ -2871,6 +2872,8 @@ mod tests {
         pub(crate) append_notifiers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_read_body: bool,
+        /// Retry-After attached to the one scripted 429 read response.
+        pub(crate) retry_after: Option<std::time::Duration>,
         pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
         /// Pages keyed by the offset the reader asked for. A single ordered log two readers share
         /// (the sequencer's live tail and a replay scan) cannot be modelled by one pop-front queue:
@@ -2925,6 +2928,7 @@ mod tests {
     pub(crate) enum AppendFault {
         Hold(Arc<BodyGate>),
         Unavailable,
+        RateLimited(Option<std::time::Duration>),
         /// The append is atomic, but its acknowledgement is lost (an ambiguous failure).
         CommitThenUnavailable,
     }
@@ -2951,6 +2955,7 @@ mod tests {
     fn response(status: u16) -> StoreResponse {
         StoreResponse {
             status,
+            retry_after: None,
             permit: crate::memory_budget::Permit::default(),
             body: Some(Ok(String::new())),
             next_offset: Some("opaque-provider-token".to_string()),
@@ -3063,6 +3068,11 @@ mod tests {
                 match &fault {
                     Some(AppendFault::Hold(gate)) => gate.hold().await,
                     Some(AppendFault::Unavailable) => return Ok(response(503)),
+                    Some(AppendFault::RateLimited(retry_after)) => {
+                        let mut res = response(429);
+                        res.retry_after = *retry_after;
+                        return Ok(res);
+                    }
                     _ => {}
                 }
                 if let Some(streams) = &self.streams {
@@ -3124,7 +3134,9 @@ mod tests {
                 {
                     let mut fault = self.read_fault.lock().unwrap();
                     if live && fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
-                        return Ok(response(fault.take().unwrap().1));
+                        let mut res = response(fault.take().unwrap().1);
+                        res.retry_after = self.retry_after;
+                        return Ok(res);
                     }
                 }
                 let gate = self.read_gate.lock().unwrap().clone();
@@ -3442,6 +3454,22 @@ mod tests {
             format!("{json_err:#}").contains("scripted stream body failure"),
             "the source body failure must survive the facade boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_read_is_retried_until_the_store_recovers() {
+        let store = Arc::new(ScriptedStore {
+            read_fault: std::sync::Mutex::new(Some(("changes/0".to_string(), 429))),
+            retry_after: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
+
+        let page = client
+            .read("changes/0", "prior-offset", true)
+            .await
+            .expect("a 429 read must be retried until the store answers normally");
+        assert!(page.envelopes.is_empty());
     }
 
     #[tokio::test]

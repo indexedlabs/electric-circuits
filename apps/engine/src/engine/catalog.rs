@@ -2006,6 +2006,8 @@ pub(crate) mod testing {
     pub(crate) struct FakeDsState {
         /// Remaining `POST /meta/catalog` calls to answer 503 (transient).
         fail_appends: AtomicU32,
+        /// Remaining `POST /meta/catalog` calls to answer 429 with an immediate retry.
+        rate_limited_appends: AtomicU32,
         /// Remaining `POST /meta/catalog` calls to COMMIT and then answer 503 — a response lost
         /// after the write landed, which is what makes the writer's retry append a second copy.
         lose_responses: AtomicU32,
@@ -2092,14 +2094,25 @@ pub(crate) mod testing {
                              body: String| async move {
                                 if logical_path(&path) != "meta/catalog" {
                                     st.closes.fetch_add(1, Ordering::SeqCst);
-                                    return axum::http::StatusCode::NO_CONTENT;
+                                    return axum::http::StatusCode::NO_CONTENT.into_response();
                                 }
                                 if st
                                     .fail_appends
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
-                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                                }
+                                if st
+                                    .rate_limited_appends
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return (
+                                        [(axum::http::header::RETRY_AFTER, "0")],
+                                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    )
+                                        .into_response();
                                 }
                                 let is_retired = serde_json::from_str::<serde_json::Value>(&body)
                                     .ok()
@@ -2127,9 +2140,9 @@ pub(crate) mod testing {
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
-                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                                 }
-                                axum::http::StatusCode::NO_CONTENT
+                                axum::http::StatusCode::NO_CONTENT.into_response()
                             },
                         )
                         .delete(
@@ -2203,6 +2216,11 @@ pub(crate) mod testing {
         /// Answer the next `n` catalog appends with 503.
         pub(crate) fn fail_appends(&self, n: u32) {
             self.state.fail_appends.store(n, Ordering::SeqCst);
+        }
+
+        /// Answer the next `n` catalog appends with 429 and `Retry-After: 0`.
+        pub(crate) fn rate_limit_appends(&self, n: u32) {
+            self.state.rate_limited_appends.store(n, Ordering::SeqCst);
         }
 
         /// Commit the next `n` catalog appends and then answer 503 (a lost success response).
@@ -4092,6 +4110,21 @@ mod tests {
             vec!["joined".to_string(), "left".to_string()],
             "both events land, exactly once each, in send order"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limited_append_is_retried_in_place_and_lands() {
+        let server = FakeDs::start().await;
+        server.rate_limit_appends(1);
+        let shutdown = ShutdownToken::new();
+        let w = spawn_catalog_writer(DsClient::new_for_in_process_test(server.url()), shutdown.clone(), false);
+        tokio::select! {
+            biased;
+            code = shutdown.wait_for_restart() => panic!("429 must not request engine restart (exit {code})"),
+            result = w.send_durable(joined("s1", "sub-a", 100)) => result.expect("append must land"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => panic!("append did not finish"),
+        }
+        assert_eq!(server.catalog_kinds(), vec!["joined".to_string()]);
     }
 
     /// `send_durable` is the durable-before-ack primitive: the future must not resolve while the
