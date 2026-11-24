@@ -1,10 +1,84 @@
-# OTTO-13916 — measurements pending
+M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 
-No M1, M2, M3, or M4 milestone has been reached. No stall, CPU attribution,
-throughput, or improvement is yet claimed as the final prod-matched experiment.
-Preliminary runs now demonstrate minute-scale drain/live starvation, but their
-startup quota and profiling-artifact limitations below require corrected runs.
-No model B or bridge verdict has been measured.
+# OTTO-13916 — scratch measurements, never merge
+
+M2, M3 and M4 are not yet complete. The corrected production-binary baseline
+below supersedes the provisional timing runs. All data are synthetic; no prod or
+dev service was accessed. Nov23 also starves drain/live in this fixture, and clears
+in 2.75 minutes, not the observed 15 minutes. Nov24 clears in 8.81 minutes, not
+50 minutes. Thus M1 is a **partial reproduction of CPU-bound cross-account
+starvation and catalog sensitivity**, not a claim to have recreated the whole
+production incident. The calibrated case already stalls for many minutes;
+the user's conditional 1.5x/2x escalation is not needed to create starvation.
+
+## Corrected baseline — M1
+
+Actions run `45357274431`; harness `8a60659dbc68c3118954715e0b559d05e3b6de99`;
+engine source `5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363`, unchanged binary with
+SHA256 in Provenance. One CPU quota **from process start**, eight flip tasks,
+release symbols/frame pointers. PostgreSQL and store are outside the quota.
+Each catalog has a fresh database and runs import, large deletion, then small
+deletion in that order. Counts exclude probe writes and transaction fence rows.
+
+| Catalog / workload | Rows | SQL start → empty s | First delivery → empty s | Changes/s, SQL clock | CPU %, one core | Backfills / minute | Pinned | Drain ok/attempts; p50/p95/max s | Subset ok/attempts; p50/p95/max s | Live ok/attempts; p50/p95/max s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Nov23 / import | 13,081 | 165.85 | 165.12 | 78.87 | 95.85 | 15,420 / 5,578.50 | 0 | 2/165; 0.923/0.923/1.924 | 146/165; 0.196/1.195/1.778 | 2/165; 0.869/0.869/1.827 |
+| Nov23 / large deletion | 29,793 | 69.38 | 61.69 | 429.43 | 85.07 | 15,973 / 13,813.90 | 0 | 6/69; 0.035/0.037/0.070 | 64/69; 0.091/0.941/1.963 | 6/69; 0.081/0.090/0.112 |
+| Nov23 / small deletion | 7,114 | 91.42 | 89.37 | 77.82 | 96.36 | 15,422 / 10,122.17 | 0 | 1/91; 0.046/0.046/0.046 | 61/91; 0.146/0.236/1.213 | 1/91; 0.096/0.096/0.096 |
+| Nov24 / import | 13,081 | 529.15 | 528.49 | 24.72 | 98.50 | 15,420 / 1,748.46 | 0 | 0/529; — | 362/529; 0.532/1.573/1.982 | 0/529; — |
+| Nov24 / large deletion | 29,793 | 161.20 | 153.14 | 184.81 | 93.84 | 17,717 / 6,594.23 | 0 | 6/161; 0.046/0.058/0.236 | 127/161; 0.253/0.855/1.853 | 6/161; 0.166/0.244/0.245 |
+| Nov24 / small deletion | 7,114 | 257.78 | 254.60 | 27.60 | 99.09 | 15,422 / 3,589.58 | 0 | 0/257; — | 149/257; 0.324/0.471/1.582 | 0/257; — |
+
+Each row uses `python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-CATALOG --catalog CATALOG`
+with `CATALOG=nov23` or `nov24`, default `--cpus 1 --timeout 3600`, and
+`STALL_REPRO_PROFILE=1`. Exact commands and all three workload results are in
+`baseline-8a60659/CATALOG/manifest.json` and `*-result.json`. Raw probe/CPU samples,
+write manifests and compressed engine logs are beside them. A successful probe
+must complete in two seconds; latency percentiles exclude censored failures.
+These are single runs, not confidence intervals. First delivery is the first
+completed proxy response containing a workload xid, not an instrumented
+sequencer-entry timestamp. Completion requires the exact final receipt plus
+zero pending flips and failing appends.
+
+| Catalog metric | Nov23 target | Nov23 actual | Nov24 target | Nov24 actual |
+| --- | ---: | ---: | ---: | ---: |
+| Shapes | 8,376 | 8,376 | 10,571 | 10,571 |
+| Standalone | 5,991 | 6,022 | 6,251 | 6,284 |
+| Family shapes / families | 31 / 1 | 0 / 0 | 33 / 1 | 0 / 0 |
+| Subquery shapes | 2,354 | 2,354 | 4,287 | 4,287 |
+| Subquery nodes | 808 | 856 | 1,382 | 1,406 |
+| Subquery edges | 14,339 | 14,340 | 25,219 | 26,367 |
+| Contributors | 141,628 | 144,765 | 235,310 | 237,341 |
+| Distinct values | 141,614 | 144,765 | 235,292 | 237,341 |
+| Feed entries | 5,850 | 4,620 | 16,388 | 13,656 |
+| Tailers | 34 | 12 | 37 | 12 |
+| Tables | 44 | 44 | 44 | 44 |
+
+The engine's complete memory snapshots are retained as `catalog-calibration.json`.
+The Nov24 import is 3.20x slower than Nov23 by first-delivery clock. It has
+1,748 backfills/minute rather than the incident's approximately 200. No pinned
+warning occurred. In particular, this pinned file-backed store does not support
+prod's 4 MiB read-page cap; absence of page-spanning pinned warnings is not proof
+that the production replay pin is irrelevant. Family/tailer and feed-entry
+counts remain unmatched. The fixture is sufficiently close to expose the
+membership cost, not a faithful reproduction of every production scheduling detail.
+
+## CPU profile evidence — M2 wall-time supplement pending
+
+The unchanged Nov24 engine was sampled for 529.15 seconds with
+`sudo perf record -e cpu-clock -F 99 -g --call-graph fp -p PID`, producing 51,471
+samples. `baseline-8a60659/nov24/import.svg` and `import.folded.gz` retain the
+flamegraph and all folded stacks; Nov23 equivalents are alongside its results.
+Raw `perf.data` and `perf.script` remain in Actions artifacts. Folded compression
+command: `gzip -n -c import.folded > import.folded.gz`.
+
+Preliminary deepest-recognized-frame attribution is 91.630% row/membership,
+5.257% lock-related CPU, 0.861% flip propagation, 0.820% PostgreSQL client,
+0.041% stream append and 1.391% other/unresolved. No sample was attributed to
+marker waiting. These CPU categories are not off-CPU wall time and are not a
+claim that every sampled mutex is the registry mutex. Async ancestry can be
+missing. The separate observational build supplies registry/marker/worker wall
+times before M2 is claimed.
 
 ## Provenance
 
