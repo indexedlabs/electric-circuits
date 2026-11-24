@@ -36,6 +36,20 @@ class SourceModule(types.ModuleType):
         return self.namespace[name]
 
 
+class OmitFunctionAnnotations(ast.NodeTransformer):
+    def visit_FunctionDef(self, node):
+        node.returns = None
+        for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+            argument.annotation = None
+        if node.args.vararg:
+            node.args.vararg.annotation = None
+        if node.args.kwarg:
+            node.args.kwarg.annotation = None
+        return self.generic_visit(node)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
 class ResolveGlobals(ast.NodeTransformer):
     def __init__(self, source, descriptor):
         self.scope = symtable.symtable(source, descriptor["path"], "exec")
@@ -128,16 +142,7 @@ class SourceLoader:
                 namespace[name] = getattr(imported, attribute) if attribute else imported
             elif name in descriptor["definitions"]:
                 source = descriptor["definitions"][name]
-                syntax = ast.parse(source)
-                node = syntax.body[0]
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    node.returns = None
-                    for argument in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
-                        argument.annotation = None
-                    if node.args.vararg:
-                        node.args.vararg.annotation = None
-                    if node.args.kwarg:
-                        node.args.kwarg.annotation = None
+                syntax = OmitFunctionAnnotations().visit(ast.parse(source))
                 source = ast.unparse(syntax)
                 syntax = ResolveGlobals(source, descriptor).visit(ast.parse(source))
                 exec(compile(ast.fix_missing_locations(syntax), descriptor["path"], "exec", dont_inherit=True), namespace)
