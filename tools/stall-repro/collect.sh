@@ -10,7 +10,7 @@ call() {
 }
 call "$repository/actions/runs/$run_id/artifacts" > "$output/artifacts.json"
 while IFS=$'\t' read -r artifact_id artifact_name; do
-  if [[ "$artifact_name" != stall-experiment-* && "$artifact_name" != stall-fixture-* ]]; then continue; fi
+  if [[ "$artifact_name" != stall-experiment-* && "$artifact_name" != stall-fixture-* && "$artifact_name" != stall-checkpoint-* ]]; then continue; fi
   receipt=$(mktemp)
   call "$repository/actions/artifacts/$artifact_id/zip" > "$receipt"
   location=$(jq -r '.headers[] | select(.name=="location") | .value' "$receipt")

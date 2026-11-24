@@ -231,7 +231,7 @@ async def run(args):
                 perf = os.environ.get("STALL_REPRO_PERF")
                 if perf and workload == "import":
                     perf_log = (output / "perf.log").open("w")
-                    profiler = subprocess.Popen(["sudo", perf, "record", "-F", "99", "-g", "--call-graph", "fp", "-p", str(pid), "-o", str(output / "import.perf.data"), "--", "sleep", str(args.timeout + 120)], stdout=perf_log, stderr=subprocess.STDOUT, start_new_session=True)
+                    profiler = subprocess.Popen(["sudo", perf, "record", "-e", "cpu-clock", "-F", "99", "-g", "--call-graph", "fp", "-p", str(pid), "-o", str(output / "import.perf.data"), "--", "sleep", str(args.timeout + 120)], stdout=perf_log, stderr=subprocess.STDOUT, start_new_session=True)
                 cpu_before = sum(process.cpu_times()[:2])
                 cpu_stopped = asyncio.Event()
                 cpu_task = asyncio.create_task(sample_cpu(process, quota.parent, output / f"{workload}-cpu.jsonl", cpu_stopped))

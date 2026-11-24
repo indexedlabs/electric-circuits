@@ -36,7 +36,7 @@ jobs:
           PERF=$(find /usr/lib/linux-tools -type f -name perf | sort -V | tail -1)
           test -x "$PERF"
           echo "STALL_REPRO_PERF=$PERF" >> "$GITHUB_ENV"
-          sudo "$PERF" stat -e cycles -- true
+          sudo "$PERF" stat -e cpu-clock -- true
       - uses: actions/download-artifact@v4
         with:
           name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937
@@ -60,16 +60,35 @@ jobs:
           done
           docker exec -i stall-experiment-pg psql -v ON_ERROR_STOP=1 -U postgres -d stall_repro < tools/stall-repro/results/fixture/schema.sql
           { date -u; git rev-parse HEAD; uname -a; lscpu; df -h; docker image inspect postgres:18; } > tools/stall-repro/results/fixture/experiment-machine.txt
-      - name: Run isolated engine smoke or measurement
+      - name: Start isolated driver and retain catalog checkpoint
         env:
           SMOKE: ${{ contains(github.event.head_commit.message, '[smoke]') && '1' || '0' }}
         run: |
           ARGS=()
           if [ "$SMOKE" = 1 ]; then ARGS=(--smoke --timeout 120); fi
-          python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.catalog }} --catalog ${{ matrix.catalog }} "${ARGS[@]}"
+          nohup bash -c 'set +e; python "$@"; echo "$?" > "$RUNNER_TEMP/stall-driver-exit"' _ tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.catalog }} --catalog ${{ matrix.catalog }} "${ARGS[@]}" > "$RUNNER_TEMP/stall-driver.log" 2>&1 &
+          while ! test -f tools/stall-repro/results/run-${{ matrix.catalog }}/catalog-before-warmup.json; do
+            if test -f "$RUNNER_TEMP/stall-driver-exit"; then cat "$RUNNER_TEMP/stall-driver.log"; exit "$(cat "$RUNNER_TEMP/stall-driver-exit")"; fi
+            sleep 5
+          done
+          cat "$RUNNER_TEMP/stall-driver.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stall-checkpoint-${{ matrix.catalog }}-${{ github.sha }}
+          path: |
+            tools/stall-repro/results/run-*/catalog-before-warmup.json
+            tools/stall-repro/results/run-*/manifest.json
+            tools/stall-repro/results/fixture/experiment-machine.txt
+      - name: Await driver completion
+        run: |
+          while ! test -f "$RUNNER_TEMP/stall-driver-exit"; do sleep 5; done
+          cat "$RUNNER_TEMP/stall-driver.log"
+          exit "$(cat "$RUNNER_TEMP/stall-driver-exit")"
       - name: Stop disposable database
         if: always()
-        run: docker rm -f stall-experiment-pg || true
+        run: |
+          cp "$RUNNER_TEMP/stall-driver.log" tools/stall-repro/results/fixture/driver.log || true
+          docker rm -f stall-experiment-pg || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
