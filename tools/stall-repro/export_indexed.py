@@ -4,6 +4,7 @@ import argparse
 import ast
 import gzip
 import hashlib
+import importlib.util
 import json
 import subprocess
 from pathlib import Path
@@ -44,6 +45,7 @@ def export(root: Path, destination: Path) -> None:
     paths += sorted((source_root / "api/types").rglob("*.py"))
     paths += sorted((source_root / "api/lib").rglob("*.py"))
     paths += sorted((source_root / "api/services").glob("circuits_sync*.py"))
+    paths += [source_root / "api/services/monitored_url/config.py"]
     bundle = {}
     table_classes = {}
     for path in paths:
@@ -56,8 +58,8 @@ def export(root: Path, destination: Path) -> None:
         definitions = {}
         for statement in syntax.body:
             if isinstance(statement, ast.ImportFrom):
-                parent = module.split(".")[:-statement.level] if statement.level else []
-                imported_module = ".".join(parent + ([statement.module] if statement.module else []))
+                package = module if path.name == "__init__.py" else module.rsplit(".", 1)[0]
+                imported_module = importlib.util.resolve_name("." * statement.level + (statement.module or ""), package) if statement.level else statement.module
                 for alias in statement.names:
                     imports[alias.asname or alias.name] = [imported_module, alias.name]
             elif isinstance(statement, ast.Import):
