@@ -756,8 +756,23 @@ About the same. Same runner (EPYC 7763), same catalog and workloads:
 
 The difference is within the 5% same-runner noise. PR 69 (timestamp-bound comparison) neither
 helps nor hurts this workload, and the second vCPU still goes unused by the serialized path
-(the engine uses 1.00–1.04 cores). The `cpu-split` job (`5b2cf3e` at 2 CPU, `b42f70d` at 1 CPU)
-separates the two changes and is added below when it lands.
+(the engine uses 1.00–1.04 cores). The `cpu-split` job separates the two changes. On one EPYC 7763, the rows are `5b2cf3e` at 2 CPU,
+`b42f70d` at 1 CPU, then `5b2cf3e` at 1 CPU as the control:
+
+| Engine | Runner CPU | Workload | First delivery → empty s | × `5b2cf3e` 1 CPU | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| A, 2 CPU | EPYC 7763 | import | 553.0 | 1.03 | 103 | 15,420 | 0% (0/553); p95 — | 100% (553/553); p95 0.02 | 0% (0/553); p95 — | no |
+| A, 2 CPU | EPYC 7763 | large-delete | 153.4 | 0.95 | 100 | 17,717 | 0% (0/204); p95 — | 100% (204/204); p95 0.02 | 0% (0/204); p95 — | no |
+| A, 2 CPU | EPYC 7763 | small-delete | 259.5 | 1.03 | 104 | 15,422 | 0% (0/279); p95 — | 100% (279/279); p95 0.02 | 0% (0/279); p95 — | no |
+| A | EPYC 7763 | import | 548.8 | 1.03 | 99 | 15,420 | 0% (0/549); p95 — | 66% (363/549); p95 1.64 | 0% (0/549); p95 — | no |
+| A | EPYC 7763 | large-delete | 158.6 | 0.98 | 95 | 17,717 | 0% (0/212); p95 — | 83% (177/212); p95 1.01 | 0% (0/212); p95 — | no |
+| A | EPYC 7763 | small-delete | 253.6 | 1.01 | 99 | 15,422 | 0% (0/257); p95 — | 58% (149/257); p95 0.50 | 0% (0/257); p95 — | no |
+| A | EPYC 7763 | import | 535.4 | 1.00 | 99 | 15,420 | 0% (0/536); p95 — | 64% (345/536); p95 1.73 | 0% (0/536); p95 — | no |
+| A | EPYC 7763 | large-delete | 161.5 | 1.00 | 95 | 17,717 | 0% (0/213); p95 — | 83% (177/213); p95 1.09 | 0% (0/213); p95 — | no |
+| A | EPYC 7763 | small-delete | 251.8 | 1.00 | 99 | 15,422 | 0% (1/255); p95 1.84 | 58% (147/255); p95 0.49 | 0% (1/255); p95 1.85 | no |
+
+Neither the second vCPU nor PR 69 changes the stall's length (0.95–1.03x). The second vCPU only
+moves subsets to 100%.
 
 ### Bisect: PR 70 carries the slowdown since `1be10fb`
 
@@ -899,7 +914,8 @@ every subquery set through `MembershipCircuit::contains` and `seek`.
 synthetic feeds deliver nothing before the workloads. So every deleted or moved row pays a full
 predicate re-evaluation against every candidate shape that rejects it.
 
-The same path costs the import 1.29x and the large deletion 3.5–3.8x on one runner. Prod's feeds
+On one runner, PR 70 costs the import 1.29x and the large deletion 3.5–3.8x. Only the deletion was
+profiled, so that its import cost goes through the same path is likely but not shown. Prod's feeds
 have delivered rows, which may shortcut some of these proofs: an estimate in prod's favour, not
 measured. Whether to keep, bound or cache this proof is a product and correctness question (it
 exists so that rows a client holds only from its snapshot are removed when they leave scope), and
