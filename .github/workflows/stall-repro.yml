@@ -54,8 +54,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]')) && '["nov24"]' || '["nov23","nov24"]') }}
-        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained"]' || '["A"]') }}
+        catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]') || contains(github.event.head_commit.message, '[observe]')) && '["nov24"]' || '["nov23","nov24"]') }}
+        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
         cpus: ${{ fromJSON(contains(github.event.head_commit.message, '[cpu-variants]') && '[2,4]' || '[1]') }}
     steps:
       - uses: actions/checkout@v4
@@ -79,9 +79,17 @@ jobs:
           echo "STALL_REPRO_PERF=$PERF" >> "$GITHUB_ENV"
           sudo "$PERF" stat -e cpu-clock -- true
       - uses: actions/download-artifact@v4
+        if: ${{ !contains(github.event.head_commit.message, '[observe]') }}
         with:
           name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937
           run-id: 45342910224
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin
+      - uses: actions/download-artifact@v4
+        if: contains(github.event.head_commit.message, '[observe]')
+        with:
+          name: stall-observed-engine-894b2cca2ec9c1ba547e130e275159c61e178e59
+          run-id: 45358360702
           github-token: ${{ github.token }}
           path: tools/stall-repro/bin
       - uses: actions/download-artifact@v4
@@ -105,10 +113,12 @@ jobs:
         env:
           SMOKE: ${{ contains(github.event.head_commit.message, '[smoke]') && '1' || '0' }}
           CALIBRATE: ${{ contains(github.event.head_commit.message, '[calibrate]') && '1' || '0' }}
+          OBSERVE: ${{ contains(github.event.head_commit.message, '[observe]') && '1' || '0' }}
         run: |
           ARGS=()
           if [ "$SMOKE" = 1 ]; then ARGS=(--smoke --timeout 120); fi
           if [ "$CALIBRATE" = 1 ]; then ARGS+=(--calibrate-only); fi
+          if [ "$OBSERVE" = 1 ]; then ARGS+=(--workloads import --engine-source 894b2cca2ec9c1ba547e130e275159c61e178e59); fi
           nohup bash -c 'set +e; python "$@"; echo "$?" > "$RUNNER_TEMP/stall-driver-exit"' _ tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.variant }}-${{ matrix.catalog }}-${{ matrix.cpus }}cpu --catalog ${{ matrix.catalog }} --variant ${{ matrix.variant }} --cpus ${{ matrix.cpus }} "${ARGS[@]}" > "$RUNNER_TEMP/stall-driver.log" 2>&1 &
           while ! test -f tools/stall-repro/results/run-${{ matrix.variant }}-${{ matrix.catalog }}-${{ matrix.cpus }}cpu/catalog-before-warmup.json; do
             if test -f "$RUNNER_TEMP/stall-driver-exit"; then cat "$RUNNER_TEMP/stall-driver.log"; exit "$(cat "$RUNNER_TEMP/stall-driver-exit")"; fi
@@ -121,6 +131,8 @@ jobs:
           path: |
             tools/stall-repro/results/run-*/catalog-before-warmup.json
             tools/stall-repro/results/run-*/manifest.json
+            tools/stall-repro/results/run-*/store-config.json
+            tools/stall-repro/results/run-*/engine-threads-at-ready.json
             tools/stall-repro/results/fixture/experiment-machine.txt
       - name: Await driver completion
         run: |

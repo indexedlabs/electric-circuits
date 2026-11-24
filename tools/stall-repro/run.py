@@ -168,6 +168,7 @@ async def run(args):
     command("sudo", "systemd-run", "--unit", unit, "--collect", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
     manifest["variant"] = args.variant
+    manifest["engine_source"] = args.engine_source
     save(output / "manifest.json", manifest)
     try:
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {SECRET}"}, timeout=120) as client:
@@ -239,7 +240,7 @@ async def run(args):
             subset = {key: value for key, value in probe_body.items() if key not in {"subscription", "changesOnly"}}
             subset["where"] = {"and": [subset["where"], {"col": "id", "op": "eq", "value": str(row_id("record", 0))}]}
             subset["limit"] = 1
-            for workload in ("import", "large-delete", "small-delete"):
+            for workload in args.workloads:
                 probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl")
                 probe_task = asyncio.create_task(probe.run())
                 await asyncio.sleep(3)
@@ -368,5 +369,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
-    parser.add_argument("--variant", choices=("A", "B", "B-retained", "marker-bypass"), default="A")
+    parser.add_argument("--variant", choices=("A", "A-observed", "B", "B-retained", "marker-bypass"), default="A")
+    parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))
