@@ -411,4 +411,409 @@ mod tests {
         assert_eq!(w, r#""name"::text = $1"#);
         assert_eq!(p, vec!["x'); DROP TABLE users;--".to_string()]);
     }
+
+    // --- the OR rewrites (`JsonSql::or`) ------------------------------------------------------------
+    //
+    // An app scope in miniature, introspected (every column's Postgres type known): `events` and
+    // `records` keyed by a uuid `id`, `grants` linking users to both, `legacy` keyed by an int4 with
+    // an int8 column, and `pairs` with a composite key.
+
+    fn app_schemas() -> HashMap<TableRef, TableSchema> {
+        use ColumnType::{Int, Text};
+        let mut schemas = HashMap::new();
+        for ts in [
+            typed_schema(
+                "events",
+                &[
+                    ("id", Text, "uuid"),
+                    ("record_id", Text, "uuid"),
+                    ("owner_id", Text, "uuid"),
+                    ("name", Text, "text"),
+                    ("deleted_at", Text, "timestamptz"),
+                ],
+            ),
+            typed_schema(
+                "records",
+                &[
+                    ("id", Text, "uuid"),
+                    ("owner_id", Text, "uuid"),
+                    ("recurring_parent_id", Text, "uuid"),
+                    ("original_start_time", Text, "timestamptz"),
+                    ("visible", ColumnType::Bool, "bool"),
+                ],
+            ),
+            typed_schema(
+                "grants",
+                &[
+                    ("id", Text, "uuid"),
+                    ("user_id", Text, "uuid"),
+                    ("record_id", Text, "uuid"),
+                    ("event_id", Text, "uuid"),
+                ],
+            ),
+            typed_schema("legacy", &[("id", Int, "int4"), ("record_id", Text, "text"), ("big", Int, "int8")]),
+        ] {
+            schemas.insert(ts.table.clone(), ts);
+        }
+        let mut columns = BTreeMap::new();
+        for (c, ty, pg) in [("a", Text, "uuid"), ("b", Text, "uuid"), ("c", Int, "int4")] {
+            columns.insert(c.to_string(), ColumnDef { ty, pg_type: Some(pg.to_string()), has_default: false });
+        }
+        let def = TableDef { columns, primary_key: vec!["a".to_string(), "b".to_string()], fingerprint: None };
+        let pairs = TableSchema::from_def(&TableRef::parse("pairs").unwrap(), &def).unwrap();
+        schemas.insert(pairs.table.clone(), pairs);
+        schemas
+    }
+
+    fn app_sql(table: &str, json: serde_json::Value) -> (String, Vec<String>) {
+        let pj: PredicateJson = serde_json::from_value(json).unwrap();
+        predicate_json_to_sql(&pj, 1, &app_schemas(), &TableRef::parse(table).unwrap())
+    }
+
+    /// `col IN (SELECT id FROM records WHERE visible = true)`: a uuid projection.
+    fn on_visible_record(col: &str) -> serde_json::Value {
+        serde_json::json!({"col": col, "in": {"table": "records", "project": "id",
+            "where": {"col": "visible", "op": "eq", "value": true}}})
+    }
+    const VISIBLE: &str = r#"SELECT "id" FROM "public"."records" WHERE "visible" = true"#;
+
+    /// `col IN (SELECT <project> FROM grants WHERE user_id = <user>)`: a uuid projection.
+    fn granted(col: &str, project: &str, user: &str) -> serde_json::Value {
+        serde_json::json!({"col": col, "in": {"table": "grants", "project": project,
+            "where": {"col": "user_id", "op": "eq", "value": user}}})
+    }
+
+    #[test]
+    fn same_column_in_siblings_become_one_union() {
+        let (w, p) = app_sql(
+            "events",
+            serde_json::json!({"or": [on_visible_record("record_id"), granted("record_id", "record_id", "u1")]}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"("record_id" IN ({VISIBLE} UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))"#
+            )
+        );
+        assert_eq!(p, vec!["u1".to_string()]);
+    }
+
+    /// A union stands where its first member stood; the other branches keep their order, and the
+    /// placeholders stay numbered in the order their params were bound.
+    #[test]
+    fn a_union_stands_where_its_first_member_stood() {
+        let (w, p) = app_sql(
+            "events",
+            serde_json::json!({"or": [
+                {"col": "name", "op": "eq", "value": "a"},
+                granted("record_id", "record_id", "u1"),
+                {"col": "deleted_at", "isNull": true},
+                on_visible_record("record_id"),
+                granted("record_id", "record_id", "u2"),
+            ]}),
+        );
+        let grants =
+            |n: usize| format!(r#"SELECT "record_id" FROM "public"."grants" WHERE "user_id" = ${n}::text::"uuid""#);
+        assert_eq!(
+            w,
+            format!(
+                r#"("name" = $1::text::"text" OR "record_id" IN ({} UNION ALL {VISIBLE} UNION ALL {}) OR "deleted_at" IS NULL)"#,
+                grants(2),
+                grants(3)
+            )
+        );
+        assert_eq!(p, vec!["a".to_string(), "u1".to_string(), "u2".to_string()]);
+    }
+
+    /// `NOT IN` is never a union member: over a NULL in its subquery it is UNKNOWN for every row,
+    /// which no union of `IN`s reproduces. The plain `IN` siblings beside it still merge.
+    #[test]
+    fn not_in_is_left_alone() {
+        let not_in =
+            serde_json::json!({"col": "record_id", "negated": true, "in": {"table": "grants", "project": "record_id"}});
+        let (w, _) = app_sql("events", serde_json::json!({"or": [not_in.clone(), on_visible_record("record_id")]}));
+        assert_eq!(
+            w,
+            format!(
+                r#"("record_id" NOT IN (SELECT "record_id" FROM "public"."grants") OR "record_id" IN ({VISIBLE}))"#
+            )
+        );
+
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"or": [not_in, on_visible_record("record_id"), granted("record_id", "record_id", "u1")]}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"("record_id" NOT IN (SELECT "record_id" FROM "public"."grants") OR "record_id" IN ({VISIBLE} UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))"#
+            )
+        );
+    }
+
+    /// `IN` tests on two different non-key columns are not one set.
+    #[test]
+    fn in_tests_on_different_columns_are_left_alone() {
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"or": [on_visible_record("record_id"), granted("owner_id", "user_id", "u1")]}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"("record_id" IN ({VISIBLE}) OR "owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))"#
+            )
+        );
+    }
+
+    /// A uuid projection and a text one would make a union of another type (or none at all), and
+    /// each `IN` compare differently: left alone. So is a column whose type is not known.
+    #[test]
+    fn projections_of_different_or_unknown_types_are_left_alone() {
+        let legacy = serde_json::json!({"col": "record_id", "in": {"table": "legacy", "project": "record_id"}});
+        let (w, _) = app_sql("events", serde_json::json!({"or": [on_visible_record("record_id"), legacy]}));
+        assert_eq!(
+            w,
+            format!(r#"("record_id" IN ({VISIBLE}) OR "record_id" IN (SELECT "record_id" FROM "public"."legacy"))"#)
+        );
+
+        // Library mode: no Postgres types at all.
+        let (w, _) = jsql(serde_json::json!({"or": [
+            {"col": "parent_id", "in": {"table": "a", "project": "id"}},
+            {"col": "parent_id", "in": {"table": "b", "project": "id"}},
+        ]}));
+        assert_eq!(
+            w,
+            r#"("parent_id" IN (SELECT "id" FROM "public"."a") OR "parent_id" IN (SELECT "id" FROM "public"."b"))"#
+        );
+    }
+
+    /// The week-query shape: key subqueries plus a parent IN and an original-start range.
+    /// Literal IN lists already reach the printer as same-column equality ORs.
+    #[test]
+    fn the_week_query_gathers_a_parent_in_and_time_range() {
+        for (parent, expected_parent, expected_params) in [
+            (
+                "recurring_parent_id IN (SELECT id FROM records WHERE visible = true)",
+                format!(r#""recurring_parent_id" IN ({VISIBLE})"#),
+                vec!["u1", "2026-11-16", "2026-11-23"],
+            ),
+            (
+                "recurring_parent_id IN ('p1', 'p2')",
+                r#"("recurring_parent_id" = $2::text::"uuid" OR "recurring_parent_id" = $3::text::"uuid")"#.to_string(),
+                vec!["u1", "p1", "p2", "2026-11-16", "2026-11-23"],
+            ),
+            (
+                "recurring_parent_id IN ('p1')",
+                r#"("recurring_parent_id" = $2::text::"uuid")"#.to_string(),
+                vec!["u1", "p1", "2026-11-16", "2026-11-23"],
+            ),
+        ] {
+            let pj = crate::where_sql::parse_where(&format!(
+                "id IN (SELECT record_id FROM grants WHERE user_id = 'u1') OR \
+                 ({parent} AND original_start_time >= '2026-11-16' AND original_start_time < '2026-11-23')"
+            ))
+            .unwrap()
+            .unwrap();
+            let (w, params) = predicate_json_to_sql(&pj, 1, &app_schemas(), &"records".into());
+            let end = expected_params.len();
+            assert_eq!(
+                w,
+                format!(
+                    r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."records" WHERE ({expected_parent} AND "original_start_time" >= ${}::text::"timestamptz" AND "original_start_time" < ${end}::text::"timestamptz")))"#,
+                    end - 1,
+                )
+            );
+            assert_eq!(params, expected_params);
+        }
+    }
+
+    #[test]
+    fn the_key_in_gathers_only_in_branches_and_conjunctions() {
+        let (w, p) = app_sql(
+            "events",
+            serde_json::json!({"or": [
+                on_visible_record("record_id"),
+                granted("id", "event_id", "u1"),
+                {"and": [
+                    {"col": "deleted_at", "isNull": true},
+                    {"and": [granted("owner_id", "user_id", "u2"), {"col": "name", "op": "eq", "value": "a"}]},
+                ]},
+            ]}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"("id" IN (SELECT "id" FROM "public"."events" WHERE "record_id" IN ({VISIBLE}) UNION ALL SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."events" WHERE ("deleted_at" IS NULL AND ("owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid") AND "name" = $3::text::"text"))))"#
+            )
+        );
+        assert_eq!(p, vec!["u1", "u2", "a"]);
+    }
+
+    /// A broad branch vetoes the entire key OR, including sibling/nested unions. A mere nested
+    /// OR containing an IN, a NOT IN, and equalities on different columns are not positive IN lists.
+    #[test]
+    fn a_key_or_with_any_broad_branch_is_unchanged() {
+        for (broad, printed) in [
+            (serde_json::json!({"col": "deleted_at", "isNull": true}), r#""deleted_at" IS NULL"#.to_string()),
+            (
+                serde_json::json!({"col": "owner_id", "op": "eq", "value": "u2"}),
+                r#""owner_id" = $2::text::"uuid""#.to_string(),
+            ),
+            (
+                serde_json::json!({"col": "id", "negated": true, "in": {"table": "records", "project": "id"}}),
+                r#""id" NOT IN (SELECT "id" FROM "public"."records")"#.to_string(),
+            ),
+            (
+                serde_json::json!({"or": [on_visible_record("record_id"), on_visible_record("record_id")]}),
+                format!(r#"("record_id" IN ({VISIBLE}) OR "record_id" IN ({VISIBLE}))"#),
+            ),
+            (
+                serde_json::json!({"or": [{"col": "owner_id", "op": "eq", "value": "u2"}, {"col": "record_id", "op": "eq", "value": "r"}]}),
+                r#"("owner_id" = $2::text::"uuid" OR "record_id" = $3::text::"uuid")"#.to_string(),
+            ),
+            (
+                serde_json::json!({"and": [{"not": on_visible_record("record_id")}, {"col": "deleted_at", "isNull": true}]}),
+                format!(r#"((NOT "record_id" IN ({VISIBLE})) AND "deleted_at" IS NULL)"#),
+            ),
+        ] {
+            let (w, _) = app_sql(
+                "events",
+                serde_json::json!({"or": [
+                    granted("id", "event_id", "u1"), on_visible_record("id"), broad,
+                ]}),
+            );
+            assert_eq!(
+                w,
+                format!(
+                    r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "id" IN ({VISIBLE}) OR {printed})"#
+                )
+            );
+        }
+    }
+
+    /// Introspection carries no column collation. Do not assume matching type names mean matching
+    /// collations: leave text (and unclassified/domain types) alone, even for the key rule.
+    #[test]
+    fn projections_without_known_collation_compatibility_are_left_alone() {
+        for ty in ["text", "varchar", "bpchar", "name", "citext", "custom_domain"] {
+            let mut schemas = HashMap::new();
+            for table in ["outer", "a", "b"] {
+                let ts = typed_schema(table, &[("id", ColumnType::Text, ty), ("value", ColumnType::Text, ty)]);
+                schemas.insert(ts.table.clone(), ts);
+            }
+            for col in ["id", "value"] {
+                let pj = serde_json::from_value(serde_json::json!({"or": [
+                    {"col": col, "in": {"table": "a", "project": "id"}},
+                    {"col": col, "in": {"table": "b", "project": "id"}},
+                ]}))
+                .unwrap();
+                let (w, _) = predicate_json_to_sql(&pj, 1, &schemas, &"outer".into());
+                assert_eq!(
+                    w,
+                    format!(
+                        r#"("{col}" IN (SELECT "id" FROM "public"."a") OR "{col}" IN (SELECT "id" FROM "public"."b"))"#
+                    )
+                );
+            }
+        }
+    }
+
+    /// Gathering makes an UNKNOWN branch FALSE, which a `NOT` would tell apart: under a `NOT` the
+    /// `OR` keeps its branches. The exact same-column union still applies there.
+    #[test]
+    fn the_key_union_is_not_made_under_not() {
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"not": {"or": [granted("id", "event_id", "u1"), on_visible_record("record_id")]}}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"(NOT ("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "record_id" IN ({VISIBLE})))"#
+            )
+        );
+
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"not": {"and": [{"or": [on_visible_record("record_id"), granted("record_id", "record_id", "u1")]}]}}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"(NOT (("record_id" IN ({VISIBLE} UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))))"#
+            )
+        );
+
+        // A subquery's WHERE is a filter again, even under a NOT: the set it selects is the same.
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"not": {"col": "record_id", "in": {"table": "records", "project": "id",
+                "where": {"or": [granted("id", "record_id", "u1"), on_visible_record("owner_id")]}}}}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"(NOT "record_id" IN (SELECT "id" FROM "public"."records" WHERE ("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."records" WHERE "owner_id" IN ({VISIBLE})))))"#
+            )
+        );
+    }
+
+    /// Only the table's key gathers: an `IN` on another column, a composite key, and a key
+    /// subquery that projects another type all leave the `OR` as it was.
+    #[test]
+    fn only_a_single_column_key_of_the_projected_type_gathers() {
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"or": [on_visible_record("record_id"), {"col": "name", "op": "eq", "value": "a"}]}),
+        );
+        assert_eq!(w, format!(r#"("record_id" IN ({VISIBLE}) OR "name" = $1::text::"text")"#));
+
+        let (w, _) =
+            app_sql("pairs", serde_json::json!({"or": [on_visible_record("a"), {"col": "c", "op": "eq", "value": 1}]}));
+        assert_eq!(w, format!(r#"("a" IN ({VISIBLE}) OR "c" = 1)"#));
+
+        let (w, _) = app_sql(
+            "legacy",
+            serde_json::json!({"or": [{"col": "id", "in": {"table": "legacy", "project": "big"}}, {"col": "record_id", "op": "eq", "value": "r"}]}),
+        );
+        assert_eq!(w, r#"("id" IN (SELECT "big" FROM "public"."legacy") OR "record_id" = $1::text::"text")"#);
+
+        // One key `IN` alone has nothing to gather.
+        let (w, _) = app_sql("events", serde_json::json!({"or": [granted("id", "event_id", "u1")]}));
+        assert_eq!(w, r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))"#);
+    }
+
+    /// Both rules apply to every `OR` at every depth: under an `AND`, inside a subquery's `WHERE`
+    /// (on the inner table's own key), and in a subquery nested in that one. Placeholders start
+    /// where the caller says.
+    #[test]
+    fn the_rewrites_apply_at_every_depth() {
+        let pj: PredicateJson = serde_json::from_value(serde_json::json!({"and": [
+            {"col": "deleted_at", "isNull": true},
+            {"col": "record_id", "in": {"table": "records", "project": "id", "where": {"or": [
+                granted("owner_id", "user_id", "u1"),
+                granted("id", "record_id", "u1"),
+            ]}}},
+        ]}))
+        .unwrap();
+        let (w, p) = predicate_json_to_sql(&pj, 3, &app_schemas(), &"events".into());
+        assert_eq!(
+            w,
+            r#"("deleted_at" IS NULL AND "record_id" IN (SELECT "id" FROM "public"."records" WHERE ("id" IN (SELECT "id" FROM "public"."records" WHERE "owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $3::text::"uuid") UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $4::text::"uuid"))))"#
+        );
+        assert_eq!(p, vec!["u1".to_string(), "u1".to_string()]);
+    }
+
+    /// An `OR` that neither rule applies to is printed exactly as before the rewrites existed.
+    #[test]
+    fn an_or_neither_rule_applies_to_is_unchanged() {
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"or": [{"col": "name", "op": "eq", "value": "a"}, {"col": "deleted_at", "isNull": true}]}),
+        );
+        assert_eq!(w, r#"("name" = $1::text::"text" OR "deleted_at" IS NULL)"#);
+        let (w, _) = app_sql("events", serde_json::json!({"or": [on_visible_record("record_id")]}));
+        assert_eq!(w, format!(r#"("record_id" IN ({VISIBLE}))"#));
+    }
 }
