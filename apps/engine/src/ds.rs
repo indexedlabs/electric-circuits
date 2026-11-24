@@ -315,8 +315,25 @@ impl std::fmt::Display for DsUnavailable {
 
 impl std::error::Error for DsUnavailable {}
 
+/// The durable-streams server asked the caller to try again later because it is currently
+/// rate-limited. Unlike other 4xx answers this is transient; the optional delay is the provider's
+/// `Retry-After` instruction.
+#[derive(Debug, thiserror::Error)]
+#[error("{op} {path} -> 429 (durable-streams rate limited): {body}")]
+struct DsRateLimited {
+    op: &'static str,
+    path: String,
+    retry_after: Option<std::time::Duration>,
+    body: String,
+}
+
+/// Return the provider's requested delay when an error came from a 429 response.
+pub(crate) fn retry_after(e: &anyhow::Error) -> Option<std::time::Duration> {
+    e.chain().find_map(|cause| cause.downcast_ref::<DsRateLimited>().and_then(|rate| rate.retry_after))
+}
+
 /// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
-/// connection, a timeout, a connection dropped mid-response, or a 5xx?
+/// connection, a timeout, a connection dropped mid-response, a 429, or a 5xx?
 ///
 /// This is the read the **boot** takes: a storage server that comes up after its engine is the
 /// normal case in a compose/Kubernetes start, so it must back off rather than exit `EX_CONFIG`.
@@ -333,6 +350,9 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
     if e.chain().any(|c| c.downcast_ref::<StreamGone>().is_some()) {
         return false;
     }
+    if e.chain().any(|c| c.downcast_ref::<DsRateLimited>().is_some()) {
+        return true;
+    }
     if e.chain().any(|c| c.downcast_ref::<DsUnavailable>().is_some()) {
         return true;
     }
@@ -342,8 +362,21 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
 }
 
 /// Build the error for a non-2xx durable-streams response: typed when the server said it is
-/// unavailable (5xx), an ordinary message otherwise.
+/// unavailable (429/5xx), an ordinary message otherwise.
 fn status_error(op: &'static str, path: &str, status: u16, body: &str) -> anyhow::Error {
+    status_error_with_retry_after(op, path, status, body, None)
+}
+
+fn status_error_with_retry_after(
+    op: &'static str,
+    path: &str,
+    status: u16,
+    body: &str,
+    retry_after: Option<std::time::Duration>,
+) -> anyhow::Error {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16() {
+        return anyhow::Error::new(DsRateLimited { op, path: path.to_string(), retry_after, body: body.to_string() });
+    }
     if (500..600).contains(&status) {
         return anyhow::Error::new(DsUnavailable { op, path: path.to_string(), status });
     }
@@ -1016,6 +1049,7 @@ impl HttpDurableStreamsStore {
         limit: u64,
     ) -> StoreResponse {
         let status = res.status().as_u16();
+        let retry_after = header(&res, "retry-after").and_then(|value| parse_retry_after(&value));
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
         let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
@@ -1040,7 +1074,7 @@ impl HttpDurableStreamsStore {
         } else {
             None
         };
-        StoreResponse { status, retry_after: None, permit, body, next_offset, up_to_date, closed }
+        StoreResponse { status, retry_after, permit, body, next_offset, up_to_date, closed }
     }
 }
 
@@ -1313,7 +1347,7 @@ impl DsClient {
     /// [`StreamGone`].
     pub(crate) async fn touch(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
-        let res = self.store.read(&physical_path, "now", false).await?;
+        let res = self.retry_rate_limited(path, || self.store.read(&physical_path, "now", false)).await?;
         if res.status == 404 || res.status == 410 {
             return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
         }
@@ -1509,6 +1543,48 @@ impl DsClient {
         self.scope.qualify(logical_path)
     }
 
+    async fn wait_rate_limit(
+        &self,
+        op: &'static str,
+        path: &str,
+        attempt: u32,
+        retry_after: Option<std::time::Duration>,
+    ) -> bool {
+        let delay = retry_after.unwrap_or_else(|| rate_limit_backoff(attempt));
+        tracing::warn!(op, path, attempt, ?delay, "durable-streams rate limited request; retrying");
+        if let Some(shutdown) = &self.shutdown {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => true,
+                _ = shutdown.wait() => false,
+            }
+        } else {
+            tokio::time::sleep(delay).await;
+            true
+        }
+    }
+
+    /// Keep the port single-attempt. Release response buffers/permits before waiting and leave
+    /// the caller's offset unchanged until a complete successful page arrives.
+    async fn retry_rate_limited<F, Fut>(&self, path: &str, mut request: F) -> Result<StoreResponse>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<StoreResponse>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            let res = request().await?;
+            if res.status != 429 {
+                return Ok(res);
+            }
+            let retry_after = res.retry_after;
+            drop(res);
+            attempt = attempt.saturating_add(1);
+            if !self.wait_rate_limit("GET", path, attempt, retry_after).await {
+                bail!("GET {path} rate-limit retry interrupted by engine shutdown");
+            }
+        }
+    }
+
     /// Idempotently create a JSON stream (PUT), with the client's sliding `Stream-TTL` if it has
     /// one. Existing stream with same config -> 200.
     ///
@@ -1560,7 +1636,8 @@ impl DsClient {
         self.note_access(path, res.status);
         if !(200..300).contains(&res.status) {
             let status = res.status;
-            return Err(status_error("POST", path, status, &res.body_or_default()));
+            let retry_after = res.retry_after;
+            return Err(status_error_with_retry_after("POST", path, status, &res.body_or_default(), retry_after));
         }
         Ok(())
     }
@@ -1605,11 +1682,21 @@ impl DsClient {
     ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if first_only {
-            self.store.read_first(&physical_path, offset, &self.memory_budget, self.read_max_bytes()).await?
+            self.retry_rate_limited(path, || {
+                self.store.read_first(&physical_path, offset, &self.memory_budget, self.read_max_bytes())
+            })
+            .await?
         } else {
-            self.store
-                .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
-                .await?
+            self.retry_rate_limited(path, || {
+                self.store.read_budgeted(
+                    &physical_path,
+                    offset,
+                    false,
+                    Some(&self.memory_budget),
+                    self.read_max_bytes(),
+                )
+            })
+            .await?
         };
         self.note_access(path, res.status);
         if res.status == 204 || res.status == 404 {
@@ -1629,10 +1716,9 @@ impl DsClient {
     /// [`Self::append_reliable`], which discards instead, and the change log uses
     /// [`Self::append_checked`], which routes around it.
     pub async fn append(&self, path: &str, envelopes: &[Envelope]) -> Result<()> {
-        match self.append_once(path, envelopes).await {
-            Ok(_) => Ok(()),
-            Err(AppendError::Gone(status)) => bail!("POST {path} -> {status} (stream retired)"),
-            Err(AppendError::Other(e)) => Err(e),
+        match self.append_checked(path, envelopes).await? {
+            Appended::Ok { .. } => Ok(()),
+            Appended::Retired(status) => bail!("POST {path} -> {status} (stream retired)"),
         }
     }
 
@@ -1643,13 +1729,13 @@ impl DsClient {
 
     /// Append on a path where **failing costs the shape**: activation, the catalog restore's
     /// re-seed, a dormant shape's replay. Transient storage failures (`ds::is_unavailable`:
-    /// transport, timeout, 5xx) are retried with capped backoff until `budget` runs out or the
+    /// transport, timeout, 429, 5xx) are retried with capped backoff until `budget` runs out or the
     /// shutdown token fires.
     ///
-    /// The plain [`Self::append`] propagates the first error, and these callers turn an error into
+    /// The plain [`Self::append`] propagates errors other than 429, and these callers turn an error into
     /// a **retirement** — so one 503 during a boot used to permanently delete an acknowledged
     /// subscription and its stream. Permanent removal is for records that are genuinely
-    /// unrecoverable: a definite refusal (a 4xx, an unserialisable event), a stream storage confirms
+    /// unrecoverable: a definite refusal (a 4xx other than 429, an unserialisable event), a stream storage confirms
     /// is gone (`HEAD` → 404/410/closed), or an exhausted budget. A service that is merely
     /// unavailable is backpressure, not loss.
     ///
@@ -1666,12 +1752,12 @@ impl DsClient {
         budget: std::time::Duration,
         shutdown: &crate::shutdown::ShutdownToken,
     ) -> Result<()> {
-        let deadline = std::time::Instant::now() + budget;
+        let deadline = tokio::time::Instant::now() + budget;
         let mut attempt = 0u32;
         loop {
-            let e = match self.append_checked(path, envelopes).await {
-                Ok(Appended::Ok { .. }) => return Ok(()),
-                Ok(Appended::Retired(status)) => match self.head(path).await {
+            let e = match self.append_once(path, envelopes).await {
+                Ok(_) => return Ok(()),
+                Err(AppendError::Gone(status)) => match self.head(path).await {
                     // There and appendable: the terminal status did not come from storage.
                     Ok(Some(head)) if !head.closed => anyhow::anyhow!(
                         "POST {path} -> {status}, contradicted by HEAD (the stream is there): treating it as transient"
@@ -1682,7 +1768,7 @@ impl DsClient {
                     // an acknowledged subscription.
                     Err(he) => anyhow::anyhow!("POST {path} -> {status}; HEAD could not confirm it ({he:#})"),
                 },
-                Err(e) => {
+                Err(AppendError::Other(e)) => {
                     if !is_unavailable(&e) {
                         return Err(e);
                     }
@@ -1695,12 +1781,18 @@ impl DsClient {
                 }
             };
             attempt += 1;
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(e.context(format!("appending to {path} kept failing for {budget:?} ({attempt} attempts)")));
             }
-            let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+            let backoff = retry_after(&e).unwrap_or_else(|| {
+                std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000))
+            });
             tracing::warn!("append to {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
             tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(e.context(format!("appending to {path} kept failing for {budget:?} ({attempt} attempts)")));
+                }
                 _ = tokio::time::sleep(backoff) => {}
                 _ = shutdown.wait() => {
                     return Err(e.context(format!("appending to {path} abandoned: shutting down")));
@@ -1714,13 +1806,22 @@ impl DsClient {
     ///
     /// The change log's writer needs both (ADR-0006): the tail offset IS the segment's size (the
     /// rotation decision), and a closed segment is a routing signal — walk forward to the successor
-    /// — not a loss. Transient failures still surface as `Err` so the ingestor can tear its
+    /// — not a loss. Transient failures other than 429 still surface as `Err` so the ingestor can tear its
     /// connection down unacknowledged rather than lose the commit.
     pub async fn append_checked(&self, path: &str, envelopes: &[Envelope]) -> Result<Appended> {
-        match self.append_once(path, envelopes).await {
-            Ok(next_offset) => Ok(Appended::Ok { next_offset }),
-            Err(AppendError::Gone(status)) => Ok(Appended::Retired(status)),
-            Err(AppendError::Other(e)) => Err(e),
+        let mut attempt = 0u32;
+        loop {
+            match self.append_once(path, envelopes).await {
+                Ok(next_offset) => return Ok(Appended::Ok { next_offset }),
+                Err(AppendError::Gone(status)) => return Ok(Appended::Retired(status)),
+                Err(AppendError::Other(e)) if e.downcast_ref::<DsRateLimited>().is_some() => {
+                    attempt = attempt.saturating_add(1);
+                    if !self.wait_rate_limit("POST", path, attempt, retry_after(&e)).await {
+                        return Err(e.context("append interrupted by engine shutdown"));
+                    }
+                }
+                Err(AppendError::Other(e)) => return Err(e),
+            }
         }
     }
 
@@ -1754,8 +1855,9 @@ impl DsClient {
             Err(AppendError::Gone(res.status))
         } else {
             let status = res.status;
+            let retry_after = res.retry_after;
             Err(AppendError::Other(
-                status_error("POST", path, status, &res.body_or_default())
+                status_error_with_retry_after("POST", path, status, &res.body_or_default(), retry_after)
                     .context(format!("append rejected: {} envelopes, {payload_len} request bytes", envelopes.len())),
             ))
         }
@@ -1833,8 +1935,9 @@ impl DsClient {
                 Err(AppendError::Other(e)) => {
                     failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     attempt += 1;
-                    let backoff =
-                        std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+                    let backoff = retry_after(&e).unwrap_or_else(|| {
+                        std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000))
+                    });
                     if attempt.is_multiple_of(10) {
                         tracing::error!("append to {path} still failing after {attempt} attempts: {e:#}");
                     } else {
@@ -1968,11 +2071,12 @@ impl DsClient {
     ) -> Result<(RawPage, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if budgeted {
-            self.store
-                .read_budgeted(&physical_path, offset, live, Some(&self.memory_budget), self.read_max_bytes())
-                .await?
+            self.retry_rate_limited(path, || {
+                self.store.read_budgeted(&physical_path, offset, live, Some(&self.memory_budget), self.read_max_bytes())
+            })
+            .await?
         } else {
-            self.store.read(&physical_path, offset, live).await?
+            self.retry_rate_limited(path, || self.store.read(&physical_path, offset, live)).await?
         };
         self.note_access(path, res.status);
         let permit = std::mem::take(&mut res.permit);
@@ -2016,18 +2120,25 @@ impl DsClient {
         let physical_path = self.physical_path(path)?;
         // A replay page is a bounded request, so it gets a deadline of its own; a long-poll is not
         // and keeps the store's own idle semantics.
-        let res = if live {
-            self.store.read(&physical_path, offset, live).await?
-        } else {
-            let deadline = ds_read_deadline();
-            match tokio::time::timeout(deadline, self.store.read(&physical_path, offset, live)).await {
-                Ok(res) => res?,
-                Err(_) => {
-                    tracing::error!(path, deadline_secs = deadline.as_secs(), "durable-streams read never completed");
-                    return Err(anyhow::Error::new(DsReadTimeout { path: path.to_string(), after: deadline }));
+        let res = self
+            .retry_rate_limited(path, || async {
+                if live {
+                    return self.store.read(&physical_path, offset, live).await;
                 }
-            }
-        };
+                let deadline = ds_read_deadline();
+                match tokio::time::timeout(deadline, self.store.read(&physical_path, offset, live)).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        tracing::error!(
+                            path,
+                            deadline_secs = deadline.as_secs(),
+                            "durable-streams read never completed"
+                        );
+                        Err(anyhow::Error::new(DsReadTimeout { path: path.to_string(), after: deadline }))
+                    }
+                }
+            })
+            .await?;
         self.note_access(path, res.status);
         if res.status == 204 {
             return Ok(ReadResult {
@@ -2063,6 +2174,19 @@ impl DsClient {
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
     res.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(std::time::SystemTime::now()).unwrap_or_default())
+}
+
+fn rate_limit_backoff(attempt: u32) -> std::time::Duration {
+    let step = attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << step)).min(std::time::Duration::from_secs(5))
 }
 
 #[derive(Deserialize)]
@@ -2850,7 +2974,7 @@ mod tests {
         pub(crate) uncreated: std::sync::Mutex<Vec<String>>,
         /// Hold every ensure before it creates its stream, as a PUT still in flight.
         pub(crate) ensure_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
-        /// One live GET response for a matching path suffix, without deleting storage.
+        /// One live GET response (or 429 on any GET) for a matching path suffix, without deleting storage.
         pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
         pub(crate) head_fault: std::sync::Mutex<Option<(String, u16)>>,
@@ -3133,7 +3257,8 @@ mod tests {
                 }
                 {
                     let mut fault = self.read_fault.lock().unwrap();
-                    if live && fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
+                    if fault.as_ref().is_some_and(|(suffix, status)| path.ends_with(suffix) && (live || *status == 429))
+                    {
                         let mut res = response(fault.take().unwrap().1);
                         res.retry_after = self.retry_after;
                         return Ok(res);
@@ -3470,6 +3595,118 @@ mod tests {
             .await
             .expect("a 429 read must be retried until the store answers normally");
         assert!(page.envelopes.is_empty());
+    }
+
+    #[test]
+    fn rate_limited_classification_and_retry_after_formats() {
+        for status in 400..500 {
+            assert_eq!(is_unavailable(&status_error("POST", "meta/catalog", status, "")), status == 429);
+        }
+        assert_eq!(parse_retry_after("7"), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), Some(std::time::Duration::ZERO));
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+        assert!((58..=60).contains(&parse_retry_after(&date).unwrap().as_secs()));
+        assert_eq!(parse_retry_after("nonsense"), None);
+        assert_eq!(parse_retry_after("-1"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_read_modes_wait_and_preserve_the_cursor() {
+        for delay in [None, Some(std::time::Duration::from_secs(60))] {
+            for mode in 0..6 {
+                let store = Arc::new(ScriptedStore {
+                    read_fault: std::sync::Mutex::new(Some(("changes/0".into(), 429))),
+                    retry_after: delay,
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+                let started = tokio::time::Instant::now();
+                match mode {
+                    0 => {
+                        client.read("changes/0", "prior", true).await.unwrap();
+                    }
+                    1 => {
+                        client.read_json("changes/0", "prior").await.unwrap();
+                    }
+                    2 => {
+                        client.read_json_prefix("changes/0", "prior").await.unwrap();
+                    }
+                    3 => {
+                        client.read_budgeted("changes/0", "prior", false).await.unwrap();
+                    }
+                    4 => {
+                        client.read_for_table("changes/0", "prior", false, "public.items").await.unwrap();
+                    }
+                    _ => {
+                        client.touch("changes/0").await.unwrap();
+                    }
+                }
+                assert!(started.elapsed() >= delay.unwrap_or(std::time::Duration::from_millis(100)));
+                let offset = if mode == 5 { "now" } else { "prior" };
+                assert_eq!(*store.read_offsets.lock().unwrap(), vec![offset, offset]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_envelope_appends_wait_without_double_accounting() {
+        let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+            {"type":"public.items", "key":"1", "value":{"id":1}, "headers":{"operation":"upsert"}}
+        ]))
+        .unwrap();
+        for mode in 0..4 {
+            let store = Arc::new(ScriptedStore {
+                append_fault: std::sync::Mutex::new(Some((
+                    "shape/s1".into(),
+                    0,
+                    AppendFault::RateLimited(Some(std::time::Duration::from_secs(2))),
+                ))),
+                ..Default::default()
+            });
+            let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+            let started = tokio::time::Instant::now();
+            match mode {
+                0 => client.append("shape/s1", &envelopes).await.unwrap(),
+                1 => assert!(client.append_reliable("shape/s1", &envelopes).await.unwrap()),
+                _ => {
+                    let budget = std::time::Duration::from_secs(if mode == 2 { 3 } else { 1 });
+                    let result = client
+                        .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
+                        .await;
+                    if mode == 3 {
+                        assert!(result.is_err(), "Retry-After must not extend the restore budget");
+                        assert_eq!(started.elapsed(), budget);
+                        assert!(store.appended.lock().unwrap().is_empty());
+                        continue;
+                    }
+                    result.unwrap();
+                }
+            }
+            assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+            assert_eq!(store.appended.lock().unwrap().len(), 1);
+            assert_eq!(client.appended_bytes("shape/s1"), serde_json::to_vec(&envelopes).unwrap().len() as u64);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_read_wait_is_cancelled_on_shutdown() {
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let store = Arc::new(ScriptedStore {
+            read_fault: std::sync::Mutex::new(Some(("changes/0".into(), 429))),
+            retry_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let client =
+            DsClient::with_test_store("scripted://provider".into(), store.clone()).with_shutdown(shutdown.clone());
+        let read = client.read("changes/0", "prior", true);
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("must wait for Retry-After"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => shutdown.begin(),
+        }
+        assert!(read.await.is_err());
+        assert_eq!(*store.read_offsets.lock().unwrap(), vec!["prior"]);
     }
 
     #[tokio::test]

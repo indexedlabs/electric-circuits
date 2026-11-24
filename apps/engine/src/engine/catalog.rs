@@ -222,7 +222,7 @@ pub(crate) const EXIT_CATALOG_REFUSED: i32 = 74;
 /// "exit the process" branch is unit-testable without exiting anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppendVerdict {
-    /// Transport, timeout or 5xx: storage is having a moment. Retry THIS event, in place, forever —
+    /// Transport, timeout, 429 or 5xx: storage is having a moment. Retry THIS event, in place, forever —
     /// the queue is ordered and single-consumer, so everything behind it waits, which is exactly
     /// right (a later event must never reach the log before an earlier one).
     Retry,
@@ -232,7 +232,7 @@ pub(crate) enum AppendVerdict {
 }
 
 /// Classify a failed catalog append. `is_unavailable` is deliberately the ONLY forgiving side (see
-/// [`crate::ds::is_unavailable`]): it forgives the transport and 5xx, and nothing else.
+/// [`crate::ds::is_unavailable`]): it forgives the transport, 429 and 5xx, and nothing else.
 pub(crate) fn classify_append(e: &anyhow::Error) -> AppendVerdict {
     if crate::ds::is_unavailable(e) { AppendVerdict::Retry } else { AppendVerdict::Refused }
 }
@@ -425,7 +425,7 @@ impl CatalogWriter {
 /// while holding the engine-state lock, so the log order matches the state-mutation order).
 ///
 /// **The writer never drops a lifecycle event.** In Postgres mode, a stale Offset is rejected when
-/// a newer durable floor already covers it. A transient failure (transport, timeout, 5xx) retries THAT
+/// a newer durable floor already covers it. A transient failure (transport, timeout, 429, 5xx) retries THAT
 /// event in place, forever, so the log keeps its order and a restart cannot under-restore; a
 /// definite refusal requests a source restart (standalone: [`EXIT_CATALOG_REFUSED`]), because memory and the durable
 /// record disagree has no honest way to continue. The retry loop is bounded in practice by the
@@ -552,9 +552,10 @@ pub(crate) fn spawn_catalog_writer(
                                      with it. No event is dropped."
                                 );
                             }
-                            let base = catalog_backoff(attempt);
-                            tokio::time::sleep(crate::replication::jitter(base, crate::replication::clock_nanos()))
-                                .await;
+                            let wait = crate::ds::retry_after(&e).unwrap_or_else(|| {
+                                crate::replication::jitter(catalog_backoff(attempt), crate::replication::clock_nanos())
+                            });
+                            tokio::time::sleep(wait).await;
                         }
                     },
                 }
