@@ -371,7 +371,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
-    parser.add_argument("--variant", choices=("A", "A-observed", "B", "B-retained", "marker-bypass", "commit-membership"), default="A")
+    parser.add_argument("--variant", choices=("A", "A-observed", "B", "B-retained", "marker-bypass", "commit-membership", "coalesced-base", "coalesced-head"), default="A")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
     parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))
