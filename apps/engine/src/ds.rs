@@ -3661,7 +3661,7 @@ mod tests {
                         client.touch("changes/0").await.unwrap();
                     }
                 }
-                assert!(started.elapsed() >= delay.unwrap_or(std::time::Duration::from_millis(100)));
+                assert_eq!(started.elapsed(), delay.unwrap_or(std::time::Duration::from_millis(100)).min(std::time::Duration::from_secs(5)));
                 let offset = if mode == 5 { "now" } else { "prior" };
                 assert_eq!(*store.read_offsets.lock().unwrap(), vec![offset, offset]);
             }
@@ -3729,16 +3729,17 @@ mod tests {
         assert_eq!(*store.read_offsets.lock().unwrap(), vec!["prior"]);
     }
 
-    #[tokio::test]
-    async fn rate_limited_readiness_and_catalog_put_are_retried_before_empty_boot() {
+    async fn admit_rate_limited_empty_namespace(readiness_fault: Option<u16>) {
         let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
         let store = Arc::new(ScriptedStore {
-            readiness_fault: std::sync::Mutex::new(Some(429)),
+            readiness_fault: std::sync::Mutex::new(readiness_fault),
             readiness_body: std::sync::Mutex::new(Some(readiness_json(&identity))),
             ensure_fault: std::sync::Mutex::new(Some(429)),
+            read_appended: true,
+            streams: Some(std::sync::Mutex::new(HashMap::new())),
             ..Default::default()
         });
-        let client = DsClient::with_test_store("scripted://provider".into(), store);
+        let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
         client.refresh_readiness(&identity).await.expect("a readiness 429 must retry");
         crate::engine::Engine::admit_store(
             client,
@@ -3747,56 +3748,107 @@ mod tests {
         )
         .await
         .expect("a catalog PUT 429 must retry before first boot");
+        assert_eq!(store.appended.lock().unwrap().len(), 1, "the binding must be durable");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn retry_after_zero_and_past_date_have_a_floor_and_large_values_have_a_ceiling() {
-        let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
-        let past = parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT");
-        for retry_after in [Some(std::time::Duration::ZERO), past] {
-            let mut wait = Box::pin(client.wait_rate_limit("GET", "changes/0", 1, retry_after));
-            tokio::task::yield_now().await;
-            tokio::time::advance(std::time::Duration::from_millis(99)).await;
-            assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut wait).await.is_err());
-            tokio::time::advance(std::time::Duration::from_millis(1)).await;
-            assert!(wait.await);
-        }
-        let mut wait =
-            Box::pin(client.wait_rate_limit("GET", "changes/0", 1, Some(std::time::Duration::from_secs(3600))));
-        tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(5)).await;
-        assert!(wait.await, "a provider delay must be capped");
+    async fn rate_limited_readiness_and_catalog_put_are_retried_before_empty_boot() {
+        admit_rate_limited_empty_namespace(Some(429)).await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn rate_limited_restore_append_does_not_reconcile_head_past_its_budget() {
-        let gate = Arc::new(BodyGate::default());
+    async fn rate_limited_catalog_put_is_retried_before_empty_boot() {
+        admit_rate_limited_empty_namespace(None).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_ensure_head_fallback_is_retried() {
         let store = Arc::new(ScriptedStore {
-            append_fault: std::sync::Mutex::new(Some((
-                "shape/s1".into(),
-                0,
-                AppendFault::RateLimited(Some(std::time::Duration::ZERO)),
-            ))),
-            head_gate: std::sync::Mutex::new(Some(gate.clone())),
-            head_gate_path: std::sync::Mutex::new(Some("shape/s1".into())),
+            ensure_status: 409,
+            head_fault: std::sync::Mutex::new(Some(("meta/catalog".into(), 429))),
             ..Default::default()
         });
         let client = DsClient::with_test_store("scripted://provider".into(), store);
-        let shutdown = crate::shutdown::ShutdownToken::new();
+        client.ensure_stream("meta/catalog").await.expect("a HEAD 429 after PUT 409 must retry");
+    }
+
+    async fn assert_rate_limited_floor(header: &str) {
+        let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
+        for (attempt, millis) in [(1, 100), (2, 200), (3, 400)] {
+            let started = tokio::time::Instant::now();
+            assert!(client.wait_rate_limit("GET", "changes/0", attempt, parse_retry_after(header)).await);
+            assert_eq!(started.elapsed(), std::time::Duration::from_millis(millis), "{header}: growing backoff floor");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_zero_retry_after_has_a_backoff_floor() {
+        assert_rate_limited_floor("0").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_past_retry_after_has_a_backoff_floor() {
+        assert_rate_limited_floor("Sun, 06 Nov 1994 08:49:37 GMT").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_large_retry_after_has_a_ceiling() {
+        let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
+        let started = tokio::time::Instant::now();
+        assert!(client.wait_rate_limit("GET", "changes/0", 1, parse_retry_after("3600")).await);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5), "provider delays must be bounded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_restore_append_skips_head_and_respects_budget_and_shutdown() {
+        use std::future::Future;
+        for delay in [None, Some(std::time::Duration::from_secs(2))] {
+            for cancel in [false, true] {
+                let store = Arc::new(ScriptedStore {
+                    append_fault: std::sync::Mutex::new(Some(("shape/s1".into(), 0, AppendFault::RateLimited(delay)))),
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+                let shutdown = crate::shutdown::ShutdownToken::new();
+                let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+                    {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
+                ])).unwrap();
+                let budget = std::time::Duration::from_millis(50);
+                let started = tokio::time::Instant::now();
+                let op = client.append_retrying("shape/s1", &envelopes, budget, &shutdown);
+                tokio::pin!(op);
+                std::future::poll_fn(|cx| {
+                    assert!(op.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                }).await;
+                assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 0,
+                    "a 429 must wait without HEAD reconciliation, even without Retry-After");
+                if cancel { shutdown.begin(); }
+                let error = op.await.expect_err("restore must remain bounded");
+                assert!(error.to_string().contains(if cancel { "shutting down" } else { "kept failing" }));
+                assert_eq!(started.elapsed(), if cancel { std::time::Duration::ZERO } else { budget });
+                assert!(store.appended.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_repeated_restore_appends_stop_at_the_deadline() {
+        let store = Arc::new(ScriptedStore {
+            terminal_append_status: std::sync::atomic::AtomicU16::new(429),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
         let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
             {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
-        ]))
-        .unwrap();
-        let op = tokio::spawn(async move {
-            client.append_retrying("shape/s1", &envelopes, std::time::Duration::from_secs(1), &shutdown).await
-        });
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), gate.entered.notified()).await;
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        let result = tokio::time::timeout(std::time::Duration::ZERO, op).await;
-        assert!(
-            matches!(result, Ok(Ok(Err(_)))),
-            "429 restore must finish at its budget before HEAD reconciliation: {result:?}"
-        );
+        ])).unwrap();
+        let budget = std::time::Duration::from_millis(350);
+        let started = tokio::time::Instant::now();
+        let error = client.append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
+            .await.expect_err("persistent 429 must exhaust the restore budget");
+        assert!(error.to_string().contains("kept failing"));
+        assert_eq!(started.elapsed(), budget);
+        assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
