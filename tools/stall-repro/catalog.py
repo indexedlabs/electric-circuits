@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
@@ -41,7 +42,7 @@ class GatewayShapes:
         self.authority_module = self.loader.module("api.services.circuits_sync_authority")
 
     def authority(self, account, generation=0):
-        return self.authority_module.NativeSyncAuthority(record_scoped=True, fingerprint=f"synthetic-{account}-{generation}", authorized_space_ids=(synthetic_id(f"space/{account}"),), direct_content_policy_enabled=True, direct_calendar_grantor_user_ids=(synthetic_id(f"user/{(account + 1) % 18}"),) if account < 18 else (), generation=f"synthetic-{account}")
+        return self.authority_module.NativeSyncAuthority(record_scoped=True, fingerprint=f"synthetic-{account}-{generation}", authorized_space_ids=(synthetic_id(f"space/{account}"),), direct_content_policy_enabled=True, direct_calendar_grantor_user_ids=(synthetic_id(f"user/{(account + 1) % 18}"),) if account < 18 else (), generation=hashlib.sha256(f"synthetic-generation-{account}".encode()).hexdigest())
 
     async def body(self, table, account, scope=None, identity="fixture", chat=False, generation=0):
         collection = self.gateway.registered_collection(table, allow_chat_projection_dependency=True)

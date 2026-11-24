@@ -74,7 +74,7 @@ class SyntheticData:
             "space_member": {"user_id": row_id("user", account), "space_id": row_id("space", account)},
             "record": {"type": "event", "space_id": row_id("space", account), "created_by_user_id": row_id("user", account)},
             "record_date_index": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account), "field_id": "start", "field_type": "start_at", "date_value": datetime.date(2026, 9, 1) + datetime.timedelta(days=ordinal % 84)},
-            "record_recurrence": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account)},
+            "record_recurrence": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account), "rrule": "FREQ=DAILY;COUNT=10"},
             "record_completed_index": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account)},
             "record_assignee_index": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account)},
             "assignment": {"record_id": row_id("record", account, ordinal), "target_type": "resource", "target_id": row_id("resource", account, ordinal % 100), "source": "user", "scope": None, "instance_date": None},
@@ -86,7 +86,7 @@ class SyntheticData:
             "message": {"target_type": "record", "target_id": row_id("record", account, ordinal % 1000), "source_type": "user", "source_id": row_id("user", account)},
             "activity": {"target_type": "user", "target_id": row_id("user", account), "is_hidden": False},
             "workflow": {"record_id": row_id("record", account, ordinal)},
-            "standing_grant": {"grantor_user_id": row_id("user", (account + 1) % 18 if account < 18 else account), "grantee_user_id": row_id("user", account), "state": "active", "scope": "all", "tier": "editor"},
+            "standing_grant": {"grantor_user_id": row_id("user", (account + 1) % 18 if account < 18 else 17), "grantee_user_id": row_id("user", account), "state": "active", "scope": "all", "tier": "editor", "activated_at": datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)},
         }
         values.update({key: value for key, value in overrides.get(table, {}).items() if key in values})
         return values

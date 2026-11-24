@@ -36,13 +36,17 @@ jobs:
       - run: python tools/stall-repro/catalog.py
       - name: Apply exported schema to disposable PostgreSQL 18
         run: |
-          docker run -d --name stall-schema-pg -e POSTGRES_PASSWORD=synthetic -e POSTGRES_DB=stall_repro postgres:18 -c wal_level=logical
+          docker run -d --name stall-schema-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=synthetic -e POSTGRES_DB=stall_repro postgres:18 -c wal_level=logical
           for attempt in $(seq 1 60); do
             if docker exec stall-schema-pg pg_isready -U postgres -d stall_repro; then break; fi
             sleep 1
           done
           docker exec -i stall-schema-pg psql -v ON_ERROR_STOP=1 -U postgres -d stall_repro < tools/stall-repro/results/fixture/schema.sql
           docker exec stall-schema-pg psql -U postgres -d stall_repro -c 'SELECT version()' -c '\dt' > tools/stall-repro/results/fixture/postgres-schema.txt
+      - name: Validate synthetic writes without an engine
+        run: python tools/stall-repro/data_smoke.py
+        env:
+          STALL_REPRO_PG_URL: postgresql://postgres:synthetic@127.0.0.1:55432/stall_repro
       - name: Clean up fixture database
         if: always()
         run: docker rm -f stall-schema-pg || true
