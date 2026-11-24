@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import time
+from collections import Counter
 from pathlib import Path
 from uuid import uuid4
 
@@ -72,16 +73,26 @@ async def wait_for_marker(client, validator, source_commit_id, user_id, generati
 
 
 def read_events(path, after):
-    events = []
-    for line in path.read_text(errors="replace").splitlines():
-        try:
-            event = json.loads(line)
-            timestamp = datetime.datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
-            if timestamp >= after:
-                events.append(event)
-        except (ValueError, KeyError, TypeError):
-            continue
-    return events
+    with path.open(errors="replace") as handle:
+        for line in handle:
+            try:
+                event = json.loads(line)
+                timestamp = datetime.datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+                if timestamp >= after:
+                    yield event
+            except (ValueError, KeyError, TypeError):
+                continue
+
+
+async def sample_cpu(process, cgroup, output, stopped):
+    with output.open("w") as handle:
+        while not stopped.is_set():
+            handle.write(json.dumps({"at": time.time(), "cpu_s": sum(process.cpu_times()[:2]), "rss_bytes": process.memory_info().rss, "threads": process.num_threads(), "cpu_stat": (cgroup / "cpu.stat").read_text()}) + "\n")
+            handle.flush()
+            try:
+                await asyncio.wait_for(stopped.wait(), timeout=1)
+            except TimeoutError:
+                pass
 
 
 async def run(args):
@@ -193,12 +204,16 @@ async def run(args):
                 probe_task = asyncio.create_task(probe.run())
                 await asyncio.sleep(3)
                 fence_id = uuid4()
+                transactions = []
                 def mark(connection, transaction):
                     current = uuid4() if workload == "import" and transaction != 5 else fence_id
                     marker(connection, fence_user, fence_generation, current)
+                    transactions.append({"transaction": transaction, "txid": connection.execute("SELECT pg_current_xact_id()::text").fetchone()[0], "before_commit": time.time(), "marker": str(current)})
                 began_wall = time.time()
                 began = time.monotonic()
                 cpu_before = sum(process.cpu_times()[:2])
+                cpu_stopped = asyncio.Event()
+                cpu_task = asyncio.create_task(sample_cpu(process, quota.parent, output / f"{workload}-cpu.jsonl", cpu_stopped))
                 result = {"workload": workload, "measurement": "source SQL start to workload receipt and zero pending flips/appends", "first_change_read_time": None, "timeout_s": args.timeout}
                 try:
                     operation = data.calendar_import if workload == "import" else lambda url, callback: data.delete_account(url, LARGE_ACCOUNT if workload == "large-delete" else IMPORT_ACCOUNT, callback)
@@ -212,15 +227,45 @@ async def run(args):
                     result["completed"] = False
                     result["error"] = repr(error)
                 result["elapsed_s"] = time.monotonic() - began
+                result["ended_wall"] = time.time()
+                result["began_wall"] = began_wall
+                result["transactions"] = transactions
+                cpu_stopped.set()
+                await cpu_task
                 result["engine_cpu_percent"] = (sum(process.cpu_times()[:2]) - cpu_before) / result["elapsed_s"] * 100
                 result["changes_per_s"] = result.get("row_changes", 0) / result["elapsed_s"] if result["completed"] else None
                 probe.stop()
                 await probe_task
                 result["probe"] = summarize([sample for sample in probe.samples if sample["at_s"] >= began - probe.started])
+                result["idle_probe"] = summarize([sample for sample in probe.samples if sample["at_s"] < began - probe.started])
                 events = read_events(engine_log, began_wall)
-                result["backfills"] = sum(event.get("fields", {}).get("message") == "backfill finished" for event in events)
+                by_table = Counter()
+                empty = Counter()
+                result["pinned_warnings"] = 0
+                result["large_transactions"] = []
+                for event in events:
+                    fields = event.get("fields", {})
+                    if fields.get("message") == "backfill finished":
+                        by_table[fields["table"]] += 1
+                        if fields.get("rows") == 0:
+                            empty[fields["table"]] += 1
+                    if "replay position is pinned" in str(fields.get("message", "")):
+                        result["pinned_warnings"] += 1
+                    if fields.get("message") == "large transaction appended to the change log":
+                        result["large_transactions"].append(fields)
+                result["backfills"] = sum(by_table.values())
+                result["backfills_by_table"] = dict(by_table)
+                result["empty_backfills_by_table"] = dict(empty)
                 result["backfills_per_minute"] = result["backfills"] * 60 / result["elapsed_s"]
-                result["pinned_warnings"] = sum("replay position is pinned" in str(event.get("fields", {}).get("message", "")) for event in events)
+                txids = {entry["txid"] for entry in transactions}
+                stream_events = output / "store-proxy.json.events.jsonl"
+                if stream_events.exists():
+                    with stream_events.open() as handle:
+                        matching = [event for line in handle if txids.intersection((event := json.loads(line)).get("transactions", {}))]
+                    if matching:
+                        result["first_change_read_time"] = min(event["ended"] for event in matching)
+                        result["first_read_to_empty_s"] = result["ended_wall"] - result["first_change_read_time"]
+                        result["first_read_definition"] = "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy"
                 save(output / f"{workload}-result.json", result)
                 print(json.dumps(result, default=str), flush=True)
                 if not result["completed"]:
