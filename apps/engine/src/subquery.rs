@@ -7408,8 +7408,9 @@ pub(crate) mod tests {
     }
 
     /// **Measurement, not a gate** (`--ignored --nocapture`): what a graceful stop writes and a
-    /// boot restores for a registry the size of a busy deployment — `STATE_USERS` access sets of 40
-    /// members each, 10 scopes per user, 60 rows on each scope's stream, uuid keys. Prints the
+    /// boot restores for a registry the size of a busy deployment — `STATE_USERS` access sets of
+    /// `STATE_MEMBERS` contributors each (default 40), 10 scopes per user, 60 rows on each scope's
+    /// stream, uuid keys. Prints the
     /// state's size and the time of each step against an in-memory store, so it measures the
     /// engine's own work (export, encoding, checksum, rebuild) and not a network.
     #[tokio::test(flavor = "multi_thread")]
@@ -7501,6 +7502,11 @@ pub(crate) mod tests {
         crate::subq_state::write(&ds, &state, &pointer, &at, Some((1, 1))).await.unwrap();
         let written = started.elapsed();
 
+        // A replacement starts after the old process stops. Release its circuit before opening
+        // the next one, including when the measurement uses an explicit SUBQ_STORAGE_DIR.
+        reg.circuit.shutdown().await;
+        drop(reg);
+
         let started = std::time::Instant::now();
         let crate::subq_state::Loaded::State(read_back) =
             crate::subq_state::read(&ds, &pointer, &at, Some((1, 1))).await.unwrap()
@@ -7547,6 +7553,7 @@ pub(crate) mod tests {
             "stop: export {exported:?} + seal (encode + sha256) {sealed:?} + write (encode + append, in-memory store) \
              {written:?}; boot: read + verify {read:?} + rebuild {rebuilt:?}; (building the registry took {built:?})"
         );
+        restored.circuit.shutdown().await;
     }
 
     // --- envelope positions (`headers.lsn`, `headers.txid`) ------------------------------------
