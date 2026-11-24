@@ -13,7 +13,7 @@ from pathlib import Path
 
 class Namespace(dict):
     def __init__(self, loader, module):
-        super().__init__(__name__=module, __builtins__=vars(builtins))
+        super().__init__(__name__=module, __builtins__={**vars(builtins), "__import__": loader.import_module})
         self.loader = loader
         self.module = module
         self["__source_lookup__"] = lambda name: loader.resolve(module, name)
@@ -118,7 +118,21 @@ class SourceLoader:
         if name not in self.modules:
             self.modules[name] = SourceModule(self, name)
             sys.modules[name] = self.modules[name]
+            if "." in name:
+                parent, child = name.rsplit(".", 1)
+                self.module(parent).namespace[child] = self.modules[name]
         return self.modules[name]
+
+    def import_module(self, name, globals=None, locals=None, fromlist=(), level=0):
+        if level:
+            owner = globals["__name__"]
+            descriptor = self.bundle["modules"][owner]
+            package = owner if descriptor["path"].endswith("/__init__.py") else owner.rsplit(".", 1)[0]
+            name = importlib.util.resolve_name("." * level + name, package)
+        if name == "api" or name.startswith("api."):
+            module = self.module(name)
+            return module if fromlist else self.module(name.split(".")[0])
+        return builtins.__import__(name, globals, locals, fromlist, 0)
 
     def resolve(self, module, name):
         namespace = self.module(module).namespace

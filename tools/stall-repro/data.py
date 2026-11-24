@@ -30,6 +30,7 @@ class SyntheticData:
         self.columns = columns
         self.padding = padding
         self.rows = {}
+        self.next_ordinal = {}
 
     def make(self, table, account, ordinal):
         values = {}
@@ -92,7 +93,7 @@ class SyntheticData:
 
     def insert(self, connection, table, account, count, start=None):
         rows = self.rows.setdefault((table, account), [])
-        start = len(rows) if start is None else start
+        start = self.next_ordinal.get((table, account), 0) if start is None else start
         generated = [self.make(table, account, ordinal) for ordinal in range(start, start + count)]
         columns = [column["name"] for column in self.columns[table]]
         command = sql.SQL("COPY {} ({}) FROM STDIN").format(sql.Identifier("public", table), sql.SQL(",").join(map(sql.Identifier, columns)))
@@ -100,6 +101,7 @@ class SyntheticData:
             for row in generated:
                 copier.write_row([row[column] for column in columns])
         rows.extend(generated)
+        self.next_ordinal[(table, account)] = start + count
         return count
 
     def update(self, connection, table, account, count):
