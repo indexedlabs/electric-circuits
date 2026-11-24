@@ -2,7 +2,7 @@
 set -euo pipefail
 run_id=${1:?Usage: collect.sh ACTIONS_RUN_ID OUTPUT_DIRECTORY}
 output=${2:?Usage: collect.sh ACTIONS_RUN_ID OUTPUT_DIRECTORY}
-attachment=att-25b07cbe1e7e2f0be253ff42
+attachment=att-1cf77c1950bff6295166b8ff
 repository=/repos/indexedlabs/electric-circuits
 mkdir -p "$output"
 call() {
