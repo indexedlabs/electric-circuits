@@ -1,9 +1,15 @@
 import unittest
+from pathlib import Path
 
-from catalog import ACCOUNT_WEIGHTS, SUBQUERY_TABLE_WEIGHTS, TARGETS, apportion, contains_subquery, validate_predicate
+from catalog import ACCOUNT_WEIGHTS, SUBQUERY_TABLE_WEIGHTS, TARGETS, GatewayShapes, apportion, contains_subquery, validate_predicate
 
 
 class CatalogPlanningTests(unittest.TestCase):
+    def test_keyed_subscriptions_distinguish_table_and_calendar(self):
+        gateway = GatewayShapes(Path(__file__).with_name("indexed-source.json.gz"))
+        bodies = [gateway.keyed_body("record", 0), gateway.keyed_body("graph_edge", 0), gateway.keyed_body("calendar_event", 0, calendar=0), gateway.keyed_body("calendar_event", 0, calendar=1)]
+        self.assertEqual(len({body["subscription"] for body in bodies}), len(bodies))
+
     def test_apportion_keeps_exact_counts(self):
         for day in TARGETS.values():
             self.assertEqual(sum(apportion(day["subquery_shapes"], SUBQUERY_TABLE_WEIGHTS).values()), day["subquery_shapes"])

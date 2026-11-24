@@ -81,7 +81,7 @@ class GatewayShapes:
         collection = self.gateway.registered_collection(table, allow_chat_projection_dependency=True)
         key = synthetic_id(f"calendar/{owner}/{calendar}") if table == "calendar_event" else synthetic_id(f"space/{owner}")
         predicate = {"and": [{"col": "audience_key", "op": "eq", "value": str(key)}, {"col": "reader_class", "op": "eq", "value": "live"}]}
-        return {"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key", "reader_class"}), "where": predicate, "changesOnly": True, "subscription": self.gateway._internal_subscription(synthetic_id(f"user/{account}"), identity, self.authority(account))}
+        return {"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key", "reader_class"}), "where": predicate, "changesOnly": True, "subscription": self.gateway._internal_subscription(synthetic_id(f"user/{account}"), f"{identity}:{table}:{key}:live", self.authority(account))}
 
     async def keyed_catalog(self, requests, retained=False):
         preserved = {"message", "workflow_run", "graph_edge", "resource", "resource_fact", "file", "user"}

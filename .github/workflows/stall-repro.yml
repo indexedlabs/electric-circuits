@@ -111,7 +111,7 @@ jobs:
       fail-fast: false
       matrix:
         catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]') || contains(github.event.head_commit.message, '[cheap-variants]') || contains(github.event.head_commit.message, '[observe]')) && '["nov24"]' || '["nov23","nov24"]') }}
-        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained","A"]' || contains(github.event.head_commit.message, '[cheap-variants]') && '["marker-bypass","A-observed"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
+        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained"]' || contains(github.event.head_commit.message, '[cheap-variants]') && '["marker-bypass","A-observed"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
         cpus: ${{ fromJSON(contains(github.event.head_commit.message, '[cpu-variants]') && '[2,4]' || '[1]') }}
         include: ${{ fromJSON(contains(github.event.head_commit.message, '[cheap-variants]') && '[{"catalog":"nov24","variant":"A","cpus":2},{"catalog":"nov24","variant":"A","cpus":4}]' || '[]') }}
     steps:

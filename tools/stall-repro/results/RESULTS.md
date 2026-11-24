@@ -137,6 +137,12 @@ test passed in build run `45358360702`, with `cargo fmt --check` clean.
 
 ## Provenance
 
+B's first attempt, run `45362175258` at harness `b187502`, failed before
+measurement: the prototype reused one subscription identity for different
+tables/calendars, correctly rejected by the engine with HTTP 409. The fix gives
+each keyed table/key/class a distinct gateway-built subscription id. No workload
+result from that failed B attempt is counted; its unmodified-A control is separate.
+
 | Input | Identity |
 | --- | --- |
 | Production engine base | `5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363` |
