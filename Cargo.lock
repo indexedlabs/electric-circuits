@@ -3360,9 +3360,9 @@ dependencies = [
 
 [[package]]
 name = "pgwire-replication"
-version = "0.3.2"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eec6334b2466a0163bd91c29e06a25b391c155231934aee80381b99560e240e"
+checksum = "20f9e5e3d56a31f59f606cedb6526b6e16dc06e4b34790804796c009940d70c2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

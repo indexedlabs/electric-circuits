@@ -597,11 +597,13 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/ds.rs` | durable-streams HTTP client + `Envelope` |
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
-| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle, dormant eviction, and the effective live-only retirement period |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
+
+Live-only shapes (subqueries, aggregates and changes-only feeds) cannot go dormant. An unsubscribed live-only shape is retired after the effective `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` period: the smaller of that value and idle-plus-dormancy (W). Dormant TTL `0` makes W infinite; idle timeout `0` still leaves W equal to the dormant TTL. A live-only value of `0` preserves W. The lease sets no minimum period. The shape stream is closed and deleted. The `ELECTRIC_CIRCUITS_MAX_SHAPES` cap evicts dormant shapes only and reports pressure when none remain.
 
 ## 8. Related documents
 

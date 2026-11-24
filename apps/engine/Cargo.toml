@@ -74,7 +74,7 @@ opentelemetry-prometheus = "0.27"
 # Prometheus reader. The standard OTEL_EXPORTER_OTLP_HEADERS secret is consumed by the exporter.
 opentelemetry-otlp = { version = "0.27", default-features = false, features = ["metrics", "http-proto", "reqwest-client", "reqwest-rustls"] }
 prometheus = "0.13"
-pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram", "tls-rustls"] }
+pgwire-replication = { version = "0.4.1", default-features = false, features = ["scram", "tls-rustls"] }
 url = "2"
 libc = "0.2.186"
 tikv-jemallocator = "0.6"

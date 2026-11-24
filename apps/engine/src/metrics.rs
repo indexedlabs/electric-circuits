@@ -122,8 +122,10 @@ pub struct Metrics {
     /// than by halting. Every one of these is a WARN and a bigger buffer than the last.
     pub sequencer_read_cap_raised: AtomicU64,
     pub reactivation_spans: AtomicU64,
-    pub shapes_evicted: AtomicU64,     // retention: dormant shapes evicted (stream deleted)
-    pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
+    pub shapes_evicted: AtomicU64, // retention: shapes evicted (stream deleted)
+    pub shapes_evicted_by_reason: [AtomicU64; crate::retention::EvictReason::ALL.len()],
+    pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing left to evict
+    pub shapes_live: [[AtomicU64; 2]; crate::retention::ShapeKind::ALL.len()],
     /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
     /// within the idle window. A climbing value with healthy clients means the renewal cadence is
     /// longer than `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, not that anything crashed.
@@ -262,7 +264,9 @@ impl Metrics {
             reactivation_bytes_scanned: AtomicU64::new(0),
             reactivation_spans: AtomicU64::new(0),
             shapes_evicted: AtomicU64::new(0),
+            shapes_evicted_by_reason: std::array::from_fn(|_| AtomicU64::new(0)),
             retention_pressure: AtomicU64::new(0),
+            shapes_live: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             subscriptions_lapsed: AtomicU64::new(0),
             subscriptions_live: AtomicU64::new(0),
             schema_drift: AtomicU64::new(0),
@@ -315,6 +319,11 @@ impl Metrics {
         crate::statsd::Emitter::new(&self.stack_id, self.source_mode)
     }
 
+    pub(crate) fn record_eviction(&self, reason: crate::retention::EvictReason) {
+        self.shapes_evicted.fetch_add(1, Ordering::Relaxed);
+        self.shapes_evicted_by_reason[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Start the untouched-age clock at boot when a TTL is set: until a keep-alive sweep finishes,
     /// every tracked stream has been untouched since then.
     pub(crate) fn arm_stream_ttl_age(&self) {
@@ -349,6 +358,18 @@ impl Metrics {
         }
         if let Some(gauges) = snapshot["gauges"].as_object_mut() {
             gauges.insert("stream_ttl_oldest_untouched_seconds".into(), self.stream_ttl_oldest_untouched_secs().into());
+            for kind in crate::retention::ShapeKind::ALL {
+                for (subscribed, state) in ["unsubscribed", "subscribed"].into_iter().enumerate() {
+                    let name = format!("shapes_live_{}_{state}", kind.as_str().replace('-', "_"));
+                    gauges.insert(name, self.shapes_live[kind.index()][subscribed].load(Ordering::Relaxed).into());
+                }
+            }
+        }
+        if let Some(counters) = snapshot["counters"].as_object_mut() {
+            for reason in crate::retention::EvictReason::ALL {
+                let name = format!("shapes_evicted_{}_total", reason.as_str().replace('-', "_"));
+                counters.insert(name, self.shapes_evicted_by_reason[reason.index()].load(Ordering::Relaxed).into());
+            }
         }
         snapshot
     }
@@ -443,6 +464,9 @@ impl Metrics {
         self.reactivation_bytes_scanned.store(0, Ordering::Relaxed);
         self.reactivation_spans.store(0, Ordering::Relaxed);
         self.shapes_evicted.store(0, Ordering::Relaxed);
+        for evicted in &self.shapes_evicted_by_reason {
+            evicted.store(0, Ordering::Relaxed);
+        }
         self.retention_pressure.store(0, Ordering::Relaxed);
         self.subscriptions_lapsed.store(0, Ordering::Relaxed);
         self.schema_drift.store(0, Ordering::Relaxed);

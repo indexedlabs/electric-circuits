@@ -907,6 +907,63 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 *only* here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
+The page is judged by Postgres and the feed by the engine, so the two must read one predicate the
+same way. Timestamps are where they did not: a `timestamptz`/`timestamp`/`date` cell is text as
+Postgres prints it (`2026-10-19 16:00:00+00`) and the engine compares text, while a client may send
+any spelling of the bound (`2026-10-19T07:00:00Z`). A literal for such a column is therefore
+respelled at compile time the way Postgres prints it (`pg_temporal`), which keeps every comparison
+a text comparison.
+
+The engine reads a date, or a date and time, in ISO 8601 form with an optional zone: `Z`, a name
+for UTC (`UTC`, `GMT`), or a numeric offset as Postgres reads one (`+05:30`, `+0530`, `+5`). A zone
+may follow the date alone. It also reads `infinity` and `-infinity`. **A literal it cannot read is
+refused, never compared as text**: the create, the subset feed and the subset query all answer
+`400` and name the column's type and the literal (`pg_temporal::UnreadableLiteral`). Postgres reads
+many more spellings — zone names and abbreviations, month names, `now`, field orders that depend
+on `DateStyle` — from its own tables and settings, and the snapshot query hands it the literal as
+written. Kept as text, one of those would be judged as an instant by SQL and as a spelling by the
+live path, which is the split this section exists to close. Reading them would mean carrying
+Postgres's time zone database and its settings, so the engine reads the forms that need neither. A
+shape record written before this rule that holds such a literal is retired at restore, like a
+shape whose schema changed while the engine was down, and its client's next create is told why.
+
+Text order is instant order only when every cell is printed in one zone and one style, and Postgres
+prints a `timestamptz` in the *session's* zone and every date in the session's `DateStyle`, both
+defaulting to whatever the database, the role or the server says. So **every session the engine
+opens starts with `-c TimeZone=UTC -c DateStyle=ISO`** (`pg::SESSION_OPTIONS`):
+
+- **Query sessions** (backfills, subset pages, seeds, query-backs — every connection
+  `pg::PgConnectionConfig` opens) send them after any `options` the URL carries, so theirs win. The
+  server reports both settings back as the session starts; a session that did not take them (a
+  pooler that drops startup options) is refused rather than used, at no extra round-trip
+  (`pg::check_query_session`). This also fixes how SQL reads a `timestamptz` literal with no zone:
+  as UTC, which is how `pg_temporal` reads it.
+- **The replication connection** sends the same two settings, and nothing else of the URL's
+  `options` (`PgConnectionConfig::replication_config`). pgoutput sends each cell as the text the
+  walsender's session prints, so a backfill row and that row's next live change spell one instant
+  with the same bytes — in the new image and the old one, and inside arrays, ranges, multiranges
+  and composites, which the engine never parses. A setting sent at startup outranks database and
+  role defaults and the server's own, including a server-wide value that a reload changes under a
+  walsender that is already streaming.
+- **The replication connection cannot be checked the way a query session is.**
+  `pgwire-replication` drops the `ParameterStatus` messages that would say what the walsender
+  ended up with. A pooler or proxy that stripped `options` from a replication connection would go
+  unnoticed, and live rows would be printed in the defaults while backfills print UTC. Connect the
+  engine to Postgres directly.
+
+A **literal for a built-in array, range or multirange** of timestamps or dates is refused with the
+same typed error as an unreadable scalar literal (`400`): SQL reads its elements as instants, and
+reading them here would take Postgres's array and range input syntax, quoting and range
+canonicalisation included. A column of the application's own type — an array of a domain, a range
+type of its own, a composite — is named after that type, and a literal for one is compared as text,
+as before.
+
+Not covered: text order is instant order for years 0001–9999 only, the range a literal is read in. A
+cell outside it (`0044-03-15 12:00:00+00 BC`, `10000-01-01 00:00:00+00`) is compared with a bound as
+text, as before. Other session settings that shape a cell's text — `IntervalStyle`,
+`bytea_output`, `extra_float_digits` — are still the defaults' on both roads, and so agree with each
+other only while nothing sets them on one.
+
 Each page query takes a connection from the shared `ELECTRIC_DB_POOL_SIZE` pool, so it competes with
 backfills, seeds and query-backs. Each page the engine accepts (one `ensure_not_degraded` has not
 already refused) logs one `subset query finished` event (target
