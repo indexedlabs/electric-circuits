@@ -1,0 +1,93 @@
+{
+  "workload": "small-delete",
+  "measurement": "source SQL start to workload receipt and zero pending flips/appends",
+  "first_change_read_time": 1795516663.517,
+  "timeout_s": 3600,
+  "row_changes": 7114,
+  "source_write_s": 1.5793686510000953,
+  "completed": false,
+  "error": "RuntimeError('Engine exited while workload effects were outstanding; inspect engine.log and cgroup evidence')",
+  "elapsed_s": 144.44404709900004,
+  "ended_wall": 1795516805.8005188,
+  "cpu_incomplete": "process exited; CPU total stops at last retained one-second sample",
+  "began_wall": 1795516661.35647,
+  "transactions": [
+    {
+      "transaction": 0,
+      "txid": "2852",
+      "before_commit": 1795516662.9278092,
+      "marker": "c62d17e3-51b1-4c8e-9e1a-1e1582162053"
+    }
+  ],
+  "engine_cpu_percent": 94.80487617890073,
+  "changes_per_s": null,
+  "probe": {
+    "drain": {
+      "attempts": 144,
+      "successes": 1,
+      "success_rate": 0.006944444444444444,
+      "successful_p50_s": 0.03654354500008594,
+      "successful_p95_s": 0.03654354500008594,
+      "successful_max_s": 0.03654354500008594,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 144,
+      "successes": 2,
+      "success_rate": 0.013888888888888888,
+      "successful_p50_s": 0.014872383000010814,
+      "successful_p95_s": 0.014872383000010814,
+      "successful_max_s": 0.023900519999870085,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 144,
+      "successes": 1,
+      "success_rate": 0.006944444444444444,
+      "successful_p50_s": 0.1757942690001073,
+      "successful_p95_s": 0.1757942690001073,
+      "successful_max_s": 0.1757942690001073,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "idle_probe": {
+    "drain": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.043151371000021754,
+      "successful_p95_s": 0.08937464199993883,
+      "successful_max_s": 0.16163548100007574,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.011865921999969942,
+      "successful_p95_s": 0.07215302400004475,
+      "successful_max_s": 0.14187910999999076,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.15617066799995882,
+      "successful_p95_s": 0.1908763460000955,
+      "successful_max_s": 0.28170898899998065,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "pinned_warnings": 0,
+  "large_transactions": [],
+  "backfills": 0,
+  "backfills_by_table": {},
+  "empty_backfills_by_table": {},
+  "backfills_per_minute": 0.0,
+  "first_read_to_empty_s": 142.28351879119873,
+  "first_read_definition": "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy",
+  "engine_changes_per_s": null,
+  "cpu_sample_window_s": 140.42989301681519,
+  "engine_cpu_after_first_read_percent": 96.18322502305593
+}

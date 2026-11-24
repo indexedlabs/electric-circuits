@@ -1,0 +1,157 @@
+{
+  "cardinalities": {
+    "bytes_circuit_integral": 12297372,
+    "bytes_circuit_snapshots": 11032096,
+    "bytes_electric_adapter": 0,
+    "bytes_executors": 2838665,
+    "bytes_feed_sets": 0,
+    "bytes_membership_circuit": 23329468,
+    "bytes_pk_dict": 2037832,
+    "bytes_retention": 2717382,
+    "bytes_shape_records": 101385374,
+    "bytes_subquery_registry": 425825639,
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 10571,
+    "shapes_dormant": 0,
+    "standalone": 6284,
+    "subquery_contributors": 237341,
+    "subquery_distinct_values": 237341,
+    "subquery_edges": 26367,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 1406,
+    "subquery_shapes": 4287,
+    "tables": 44,
+    "tailers": 11
+  },
+  "process": {
+    "allocator_allocated_bytes": 860968528,
+    "allocator_config": {
+      "background_thread": true,
+      "dirty_decay_ms": 1000,
+      "muzzy_decay_ms": 1000
+    },
+    "allocator_resident_bytes": 893464576,
+    "allocator_retained_bytes": 91308032,
+    "rss_bytes": 906309632,
+    "rss_mib": 864,
+    "virtual_bytes": 1540239360
+  },
+  "samples": 1,
+  "stall_profile": {
+    "active_flip_batches": 0,
+    "categories": {
+      "flip_batch": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "flip_one": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "flip_registry_hold": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "flip_registry_wait": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "marker_wait": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "membership": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "sampler_registry_hold": {
+        "calls": 18,
+        "gt_5s": 0,
+        "le_100ms": 7,
+        "le_10ms": 0,
+        "le_1ms": 11,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.063312574,
+        "wall_seconds": 0.343245195
+      },
+      "sampler_registry_wait": {
+        "calls": 18,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 1,
+        "le_1ms": 17,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.001069048,
+        "wall_seconds": 0.001073477
+      },
+      "sequencer_registry_hold": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      },
+      "sequencer_registry_wait": {
+        "calls": 0,
+        "gt_5s": 0,
+        "le_100ms": 0,
+        "le_10ms": 0,
+        "le_1ms": 0,
+        "le_1s": 0,
+        "le_5s": 0,
+        "max_seconds_since_boot": 0.0,
+        "wall_seconds": 0.0
+      }
+    },
+    "peak_flip_batches": 0
+  }
+}

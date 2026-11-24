@@ -1,0 +1,477 @@
+{"kind": "subset", "at_s": 0.004949949999996761, "duration_s": 0.00878319099999203, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 0.004579552999985026, "duration_s": 0.02678969999999481, "success": true, "polls": 2, "receipt": {"drained": true, "receipt": {"commitLsn": "0/529B428", "generation": "efc11b67dd5ffc1d5fbe2ca740fd01e2723bf02cceefbafd91446d54ba8dee9a", "sourceCommitId": "c3179f8e-817e-42fe-b5b8-617a595c6abe", "userId": "2e5d94a6-80c2-5fc2-afbf-0b45e6c6abfd"}, "sourceCommitId": "c3179f8e-817e-42fe-b5b8-617a595c6abe"}, "marker": "c3179f8e-817e-42fe-b5b8-617a595c6abe"}
+{"kind": "live_delivery", "at_s": 0.005332377999991422, "duration_s": 0.027885360999988507, "success": true, "token": "stall-probe-029e4937-a63f-4d95-b74c-1c0217978faf", "delivery_s": 0.027881925999992063}
+{"kind": "live", "at_s": 0.005332377999991422, "duration_s": 0.03360668400000577, "success": true, "token": "stall-probe-029e4937-a63f-4d95-b74c-1c0217978faf", "delivery_s": 0.027881925999992063}
+{"kind": "subset", "at_s": 1.001768717999994, "duration_s": 0.004912108000013404, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 1.0013024349999853, "duration_s": 0.023242183999997224, "success": true, "polls": 2, "receipt": {"drained": true, "receipt": {"commitLsn": "0/529B768", "generation": "efc11b67dd5ffc1d5fbe2ca740fd01e2723bf02cceefbafd91446d54ba8dee9a", "sourceCommitId": "4e655b1c-bf13-456e-bcaf-c272829a0a24", "userId": "2e5d94a6-80c2-5fc2-afbf-0b45e6c6abfd"}, "sourceCommitId": "4e655b1c-bf13-456e-bcaf-c272829a0a24"}, "marker": "4e655b1c-bf13-456e-bcaf-c272829a0a24"}
+{"kind": "live_delivery", "at_s": 1.0023569530000032, "duration_s": 0.023841254999979355, "success": true, "token": "stall-probe-3325d085-abca-4e48-9402-678e0901b3f1", "delivery_s": 0.02383896899999627}
+{"kind": "live", "at_s": 1.0023569530000032, "duration_s": 0.032528189000004204, "success": true, "token": "stall-probe-3325d085-abca-4e48-9402-678e0901b3f1", "delivery_s": 0.02383896899999627}
+{"kind": "subset", "at_s": 2.0026224300000024, "duration_s": 0.005135688999985177, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 2.002207378999998, "duration_s": 0.0237105530000008, "success": true, "polls": 2, "receipt": {"drained": true, "receipt": {"commitLsn": "0/529BAC0", "generation": "efc11b67dd5ffc1d5fbe2ca740fd01e2723bf02cceefbafd91446d54ba8dee9a", "sourceCommitId": "f9d12800-4661-4b82-af72-39b55279d0b8", "userId": "2e5d94a6-80c2-5fc2-afbf-0b45e6c6abfd"}, "sourceCommitId": "f9d12800-4661-4b82-af72-39b55279d0b8"}, "marker": "f9d12800-4661-4b82-af72-39b55279d0b8"}
+{"kind": "live_delivery", "at_s": 2.0032425249999903, "duration_s": 0.024437032000008685, "success": true, "token": "stall-probe-3ac365e4-8422-4bc9-baff-c9949f18ddef", "delivery_s": 0.02443510599999854}
+{"kind": "live", "at_s": 2.0032425249999903, "duration_s": 0.031099600000004557, "success": true, "token": "stall-probe-3ac365e4-8422-4bc9-baff-c9949f18ddef", "delivery_s": 0.02443510599999854}
+{"kind": "subset", "at_s": 3.0026409870000066, "duration_s": 0.06744427299997824, "success": true, "rows": 1}
+{"kind": "live_delivery", "at_s": 3.0030104770000037, "duration_s": 0.09926290100000301, "success": true, "token": "stall-probe-d14a1d76-7b73-4075-8302-485d8aab75c8", "delivery_s": 0.09926136299998234}
+{"kind": "live", "at_s": 3.0030104770000037, "duration_s": 0.11254461699999752, "success": true, "token": "stall-probe-d14a1d76-7b73-4075-8302-485d8aab75c8", "delivery_s": 0.09926136299998234}
+{"kind": "drain", "at_s": 3.0022853429999827, "duration_s": 0.12401022100002024, "success": true, "polls": 2, "receipt": {"drained": true, "receipt": {"commitLsn": "0/529BE18", "generation": "efc11b67dd5ffc1d5fbe2ca740fd01e2723bf02cceefbafd91446d54ba8dee9a", "sourceCommitId": "55bf6ccc-9a1d-400b-92e6-3f89648e714c", "userId": "2e5d94a6-80c2-5fc2-afbf-0b45e6c6abfd"}, "sourceCommitId": "55bf6ccc-9a1d-400b-92e6-3f89648e714c"}, "marker": "55bf6ccc-9a1d-400b-92e6-3f89648e714c"}
+{"kind": "subset", "at_s": 4.0115627060000065, "duration_s": 0.13929300099999864, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 5.000778873000002, "duration_s": 0.11181940899999177, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 4.005991996999995, "duration_s": 2.0019617030000063, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "4191df79-7cb4-411c-abb8-5eb1f4f89599", "censored": true}
+{"kind": "live", "at_s": 4.017468791999988, "duration_s": 2.000360408000006, "success": false, "token": "stall-probe-8f05eb3c-fbe6-4974-8288-143becc7615e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 6.001103948000008, "duration_s": 0.0634910039999852, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 5.000432044000007, "duration_s": 2.0012481159999993, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "32db72ff-ab90-49a1-85b9-a8f2b3fef034", "censored": true}
+{"kind": "live", "at_s": 5.0012999120000075, "duration_s": 2.000521180999982, "success": false, "token": "stall-probe-e625d47d-5016-4453-ad97-530d7dbee9d8", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 7.002181947999986, "duration_s": 0.04676362200001449, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 6.000779797999996, "duration_s": 2.001439877999985, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "cdc4e2f5-a5fc-400e-ab49-7027835698a0", "censored": true}
+{"kind": "live", "at_s": 6.001499212999988, "duration_s": 2.000863704000011, "success": false, "token": "stall-probe-bdbe171c-3df1-4ad1-9093-c299de4204d2", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 8.001080846999997, "duration_s": 0.05960123500000236, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 7.001874447999995, "duration_s": 2.000443808, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "5d1fd2db-22b0-430d-b480-44bee8cf4ad5", "censored": true}
+{"kind": "live", "at_s": 7.002728802000007, "duration_s": 2.0007026669999846, "success": false, "token": "stall-probe-9448df08-39bf-4a6e-8233-68cb4d08af66", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 9.001034070000003, "duration_s": 0.061330454000000145, "success": true, "rows": 1}
+{"kind": "live", "at_s": 8.001581525000006, "duration_s": 2.0014162059999876, "success": false, "token": "stall-probe-de714832-418c-472c-8dda-ab869f88382f", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 8.000624856999991, "duration_s": 2.002980954999998, "success": false, "polls": 10, "error": "TimeoutError()", "marker": "10d543a2-3fe4-4d2c-b459-bad79f7c7b45", "censored": true}
+{"kind": "subset", "at_s": 10.001212248000002, "duration_s": 0.4350582429999861, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 9.000656407999998, "duration_s": 2.0019429660000014, "success": false, "polls": 8, "error": "TimeoutError()", "marker": "219a89da-ecd0-4ffa-93c7-233a53029417", "censored": true}
+{"kind": "live", "at_s": 9.00164781799998, "duration_s": 2.0013830710000207, "success": false, "token": "stall-probe-b990b1b1-3217-4891-8cbc-419c088936c4", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 10.000574221999983, "duration_s": 2.002063968000016, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "babf2ec8-618b-41c2-ae26-d20ed8e02705", "censored": true}
+{"kind": "live", "at_s": 10.001968970999997, "duration_s": 2.001051201999985, "success": false, "token": "stall-probe-c34aef33-db6d-4d58-ae6d-3c1ebeee5137", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 11.002065287999983, "duration_s": 2.0008840070000247, "success": false, "token": "stall-probe-54c3f94a-7a18-4eea-a019-b6fbd391508f", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 11.001128438999984, "duration_s": 2.0021869950000166, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "be52b188-10da-498a-97e2-afd8ab0fa245", "censored": true}
+{"kind": "subset", "at_s": 11.001513485999993, "duration_s": 2.0020344030000103, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 12.001489816999992, "duration_s": 1.3324923689999935, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 13.001470828999999, "duration_s": 0.3448526880000031, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 12.001091895000002, "duration_s": 2.000718175000003, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "f955e1ea-e23c-4897-917c-a213995ed238", "censored": true}
+{"kind": "live", "at_s": 12.002046272000001, "duration_s": 2.000086974999988, "success": false, "token": "stall-probe-59584e2a-9168-4f44-a5c3-173ccac3a59f", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 13.002063244999988, "duration_s": 2.0004694830000176, "success": false, "token": "stall-probe-2a41fa1f-71ef-4abb-b816-4751368470e4", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 13.001051996000001, "duration_s": 2.0019891940000036, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "25bdf79d-378b-4127-8063-9779f3802771", "censored": true}
+{"kind": "live", "at_s": 14.00124178599998, "duration_s": 2.000686736000006, "success": false, "token": "stall-probe-291fc292-f0da-4512-b759-bae6a177593c", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 14.000375966999997, "duration_s": 2.0031893229999866, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "4510dd6a-43b9-4681-a662-ce70f361e5c4", "censored": true}
+{"kind": "subset", "at_s": 14.000750909999994, "duration_s": 2.003137095999989, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 15.001895926999993, "duration_s": 2.0004732200000035, "success": false, "token": "stall-probe-5a008f53-78e5-40d3-954b-19395b60e8ce", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 15.000986695999984, "duration_s": 2.001688010999999, "success": false, "polls": 3, "error": "TimeoutError()", "marker": "15735469-9484-4bca-91c7-e2db6aec5729", "censored": true}
+{"kind": "subset", "at_s": 15.001373962000002, "duration_s": 2.0015334259999804, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 16.002097012999997, "duration_s": 2.000255694999993, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "da2420f2-b53c-42ef-9691-b66ebd6c65af", "censored": true}
+{"kind": "subset", "at_s": 16.002452965000003, "duration_s": 2.0005145589999813, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 16.002975825999982, "duration_s": 2.000151948000024, "success": false, "token": "stall-probe-43c2ddfe-b951-4026-b069-4e3182d63038", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 17.001127730999997, "duration_s": 1.4374961709999923, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 18.00148043599998, "duration_s": 0.6575592300000039, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 17.000809634000007, "duration_s": 2.001494790999999, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "2d01da0a-9a18-4a33-a161-18e5d2b2e4c5", "censored": true}
+{"kind": "live", "at_s": 17.001536512, "duration_s": 2.000896160999986, "success": false, "token": "stall-probe-2729d363-93bb-4167-84e0-10ebbdfca4ba", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 18.001150660000008, "duration_s": 2.000734115, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "bc4963cb-d264-4368-a76c-643070f52eda", "censored": true}
+{"kind": "live", "at_s": 18.00188964199998, "duration_s": 2.0003474890000064, "success": false, "token": "stall-probe-c8ccb683-e373-457f-a237-aec456e1dcb1", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 19.001146747999996, "duration_s": 1.872007778000011, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 19.000745437999996, "duration_s": 2.0003782899999862, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "cbf36d72-fb8c-4042-8f7e-84823beb216e", "censored": true}
+{"kind": "live", "at_s": 19.001723054999985, "duration_s": 2.001111019999996, "success": false, "token": "stall-probe-07c891a9-0fcc-4125-83af-9d52917f48a0", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 20.00027968399999, "duration_s": 2.0001643429999945, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "bde9c9a4-e678-480e-9fb4-ff00d8b972bf", "censored": true}
+{"kind": "live", "at_s": 20.001238029000007, "duration_s": 2.0009956629999976, "success": false, "token": "stall-probe-db2b0705-39fe-43bf-8718-42a8f3e16e8a", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 20.000639041, "duration_s": 2.0020140190000006, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 21.00158642599999, "duration_s": 1.7942081410000128, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 21.00125540799999, "duration_s": 2.001083953999995, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "b8498927-7a75-4fa9-9f3f-0ab4929dd74b", "censored": true}
+{"kind": "live", "at_s": 21.002161529000006, "duration_s": 2.00033673599998, "success": false, "token": "stall-probe-cb835cc5-cb72-4304-af34-a2c6c6e14197", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 22.001045272, "duration_s": 1.5661441240000045, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 23.000906380999993, "duration_s": 0.899592188000014, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 22.000605393, "duration_s": 2.002787885999993, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "8f480547-5564-4554-8109-168282de7b6a", "censored": true}
+{"kind": "live", "at_s": 22.001530621, "duration_s": 2.0022704520000048, "success": false, "token": "stall-probe-fc1f3129-d0f1-429a-98b1-f1c063bafec9", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 23.000471492000003, "duration_s": 2.0005865609999773, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "15c8a03b-312a-4b88-b0a4-80a2d0ff62da", "censored": true}
+{"kind": "live", "at_s": 23.001402198999983, "duration_s": 2.0011525330000097, "success": false, "token": "stall-probe-0c5ba9b7-a580-4878-aad5-7753613ebdc1", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 24.001238506999982, "duration_s": 2.001151947000011, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "c6725643-e05b-473d-bc5b-deb158831c82", "censored": true}
+{"kind": "subset", "at_s": 24.002581090999996, "duration_s": 2.0005697050000038, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 24.002968108000005, "duration_s": 2.0006587229999866, "success": false, "token": "stall-probe-18718489-8b42-4595-81e8-98b84315ab50", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 25.001566085999997, "duration_s": 1.5775166329999877, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 26.000819527999994, "duration_s": 0.5793428350000056, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 25.001218704999985, "duration_s": 2.0015102860000127, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "4f6353c2-5cab-43a0-a4e5-6d7d3ac4a437", "censored": true}
+{"kind": "live", "at_s": 25.002062152999997, "duration_s": 2.0008349979999878, "success": false, "token": "stall-probe-c3973cba-944f-435e-b5e8-d8ac6e48ef00", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 27.001260287999997, "duration_s": 0.1459344069999986, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 26.000331639999985, "duration_s": 2.000617618000007, "success": false, "polls": 11, "error": "TimeoutError()", "marker": "7cbdf921-376f-41c3-b3fc-6918d60e143b", "censored": true}
+{"kind": "live", "at_s": 26.001436525000003, "duration_s": 2.0011512789999983, "success": false, "token": "stall-probe-c642ef0f-60f8-481c-a8c6-6ae5909d29a4", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 28.001457045999985, "duration_s": 0.07240757900001427, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 27.000765962000003, "duration_s": 2.0010430199999973, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "53381f90-77e9-4fb4-bfaf-199ccfa4380f", "censored": true}
+{"kind": "live", "at_s": 27.001989711999983, "duration_s": 2.000130157000001, "success": false, "token": "stall-probe-d076c192-a2ac-40a9-a8a2-7f786f35e34e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 29.000650492999995, "duration_s": 0.07275630199998773, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 28.001082757999995, "duration_s": 2.0010925370000052, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "68176643-b6fb-4f18-8d5d-c709a26763f1", "censored": true}
+{"kind": "live", "at_s": 28.001964737999998, "duration_s": 2.0004932299999894, "success": false, "token": "stall-probe-5d12e319-63c6-44ba-9828-facbc46ff0d9", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 30.001240661999987, "duration_s": 0.05323524100001009, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 29.000319865999984, "duration_s": 2.0008277880000094, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "842f0eaa-3223-4717-b608-bfb16a493d38", "censored": true}
+{"kind": "live", "at_s": 29.001191137000006, "duration_s": 2.0012192209999853, "success": false, "token": "stall-probe-ef90a881-4094-4860-8c3e-7c800bac67fe", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 31.001631586000002, "duration_s": 0.06664570399999548, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 30.00093805199998, "duration_s": 2.0017854580000005, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "34720a48-dfe9-4bbe-ba16-603312387a00", "censored": true}
+{"kind": "live", "at_s": 30.001624539999995, "duration_s": 2.0015516899999852, "success": false, "token": "stall-probe-abe59cee-14da-402e-ad14-ff5088e6bf8a", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 32.001536568000006, "duration_s": 0.10508268399999565, "success": true, "rows": 1}
+{"kind": "live", "at_s": 31.00213384099999, "duration_s": 2.0009063539999943, "success": false, "token": "stall-probe-5102f81e-3e55-4180-82db-b57f8e6f97c6", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 31.00130427099998, "duration_s": 2.002247395000012, "success": false, "polls": 11, "error": "TimeoutError()", "marker": "9a1cd317-b5a0-48f8-a0b1-d191e00777ff", "censored": true}
+{"kind": "subset", "at_s": 33.00062622299998, "duration_s": 0.6211488920000079, "success": true, "rows": 1}
+{"kind": "live", "at_s": 32.002284153000005, "duration_s": 2.0005620109999995, "success": false, "token": "stall-probe-b6ca7a8f-8c4e-4911-94a7-8cd9206c94fc", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 32.000953799, "duration_s": 2.0022909429999913, "success": false, "polls": 9, "error": "TimeoutError()", "marker": "15a2730e-1b5a-4221-816e-f06353abfa2c", "censored": true}
+{"kind": "drain", "at_s": 33.000213650999996, "duration_s": 2.0026157309999917, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "96ccd54a-b3cd-4561-9283-307dbade7098", "censored": true}
+{"kind": "live", "at_s": 33.001229198999994, "duration_s": 2.0017729509999924, "success": false, "token": "stall-probe-395cab82-49a5-49fd-bde3-e02625b6bd29", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 34.000788874999984, "duration_s": 2.001448991000018, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "0aee2e3b-d2fe-4937-acce-687565d3261b", "censored": true}
+{"kind": "subset", "at_s": 34.00130845199999, "duration_s": 2.0012189889999945, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 34.001975063, "duration_s": 2.000690168999995, "success": false, "token": "stall-probe-4e54be89-3ddb-437b-9673-4c8341100121", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 35.002225377, "duration_s": 2.000681087000004, "success": false, "token": "stall-probe-a20329a0-17a8-4376-a8cf-b82e2127cf99", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 35.00135086899999, "duration_s": 2.001863175000011, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "517d6a46-7860-4250-827b-6fd75485452c", "censored": true}
+{"kind": "subset", "at_s": 35.00172475099998, "duration_s": 2.0016838310000082, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 36.000143734000005, "duration_s": 2.0023034159999895, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "9825e9ff-9a58-48f8-a045-3e8d0fa537fe", "censored": true}
+{"kind": "live", "at_s": 36.001182588000006, "duration_s": 2.0017667689999996, "success": false, "token": "stall-probe-d19a62b2-5345-49ec-9cc1-a9f22b5f7456", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 36.00057190300001, "duration_s": 2.002626728999985, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 38.001323533000004, "duration_s": 0.5590191119999872, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 37.001225659, "duration_s": 1.5593654139999842, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 37.000686312, "duration_s": 2.0017518869999833, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "838c0d9e-8a1a-4c89-a5f7-f739feb974a7", "censored": true}
+{"kind": "live", "at_s": 37.001913116, "duration_s": 2.0009834189999935, "success": false, "token": "stall-probe-35e37c95-69fa-48b0-ad2e-a9a8a60d9a34", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 39.00147736700001, "duration_s": 0.32450263499998755, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 38.000925467, "duration_s": 2.002042614000004, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "e3b3a852-97b2-4104-94ce-75ed3a2f0432", "censored": true}
+{"kind": "live", "at_s": 38.001868005000006, "duration_s": 2.001544459999991, "success": false, "token": "stall-probe-dda7ad32-498c-4838-9175-9c862b4ccbfd", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 39.001106066999995, "duration_s": 2.0010050790000093, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "e67e8f39-6138-45f1-8d53-5b87134e7159", "censored": true}
+{"kind": "live", "at_s": 39.001977125999986, "duration_s": 2.0004093880000084, "success": false, "token": "stall-probe-307af1c4-4cbf-4999-ba83-e499106a3387", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 40.001427127, "duration_s": 2.0016694389999827, "success": false, "polls": 2, "error": "TimeoutError()", "marker": "82076b75-e08c-49d7-ab2c-28af0aeb30af", "censored": true}
+{"kind": "subset", "at_s": 40.00191820499998, "duration_s": 2.0014297990000216, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 40.00243684999998, "duration_s": 2.0010567360000096, "success": false, "token": "stall-probe-57b5d64b-645f-431c-88d5-bb8f19526a4b", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 41.00077619300001, "duration_s": 2.0001751289999845, "success": false, "polls": 2, "error": "TimeoutError()", "marker": "775063f7-802b-4fe0-8323-66ef29e3f43b", "censored": true}
+{"kind": "live", "at_s": 41.001572493, "duration_s": 2.000879440999995, "success": false, "token": "stall-probe-50804b77-9d0b-476d-b727-5fb659205965", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 41.00111884199998, "duration_s": 2.0017721359999996, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 42.00204235199999, "duration_s": 2.0015872470000033, "success": false, "token": "stall-probe-599723d9-f77b-4813-87a5-2751dfc91265", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 42.001173945999994, "duration_s": 2.0028057060000037, "success": false, "polls": 3, "error": "TimeoutError()", "marker": "326f7ad9-a1b0-4dc0-b383-af3f936426a3", "censored": true}
+{"kind": "subset", "at_s": 42.00151652599999, "duration_s": 2.0026521409999987, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 43.001391601999984, "duration_s": 1.0392725410000025, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 44.001137306000004, "duration_s": 0.05050568199999361, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 43.001080220000006, "duration_s": 2.001176980999986, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "46b3e0ea-f5c6-420b-b578-03abd16f3104", "censored": true}
+{"kind": "live", "at_s": 43.001789282000004, "duration_s": 2.0006457719999844, "success": false, "token": "stall-probe-36d7d660-7ed4-4e73-8a9a-56e677f76635", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 44.00072557199999, "duration_s": 2.002153805000006, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "cfba9023-a376-47a3-b18d-374f1d77a9db", "censored": true}
+{"kind": "live", "at_s": 44.00172182999998, "duration_s": 2.001514204000017, "success": false, "token": "stall-probe-d986ca6c-97ac-4da0-82ef-615294c62265", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 45.001171503999984, "duration_s": 2.000895959000019, "success": false, "token": "stall-probe-046a587e-da9b-485e-a6a5-27366b2ecc8a", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 45.00030223599998, "duration_s": 2.0021009290000222, "success": false, "polls": 3, "error": "TimeoutError()", "marker": "6ba5c2b8-c7c0-4e52-a498-0c17b6584267", "censored": true}
+{"kind": "subset", "at_s": 45.00065687699998, "duration_s": 2.001928716000009, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 46.00223455899999, "duration_s": 2.0006421209999985, "success": false, "token": "stall-probe-5cb35e4f-3e02-4495-b2ca-a80a864adbbe", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 46.001250696, "duration_s": 2.0019164459999956, "success": false, "polls": 3, "error": "TimeoutError()", "marker": "ac056bad-3246-4a3c-8e53-6ba2f27932b7", "censored": true}
+{"kind": "subset", "at_s": 46.00164907999999, "duration_s": 2.00168790699999, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 47.000152963999994, "duration_s": 2.002263723999988, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "b369e351-1656-4039-9bcc-2c82d78ed79d", "censored": true}
+{"kind": "live", "at_s": 47.00115617099999, "duration_s": 2.0017816339999968, "success": false, "token": "stall-probe-b5c69010-6a59-4e09-9c8f-195927e6c6b6", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 47.00056913399999, "duration_s": 2.0025859540000113, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 48.001204605, "duration_s": 1.5401059410000073, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 49.00124308399998, "duration_s": 0.5426098070000194, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 48.000668918, "duration_s": 2.0015112899999963, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "415e98f4-a060-422d-9113-381278c6c462", "censored": true}
+{"kind": "live", "at_s": 48.001892446, "duration_s": 2.0004306520000057, "success": false, "token": "stall-probe-8af0c2cd-d9be-4a9e-a75a-faad58fe36fc", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 50.00088684299999, "duration_s": 0.26577548500000603, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 49.00076464599999, "duration_s": 2.001732473000004, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "c22ed010-1a73-4733-9f92-f67ec02d42c7", "censored": true}
+{"kind": "live", "at_s": 49.001815706, "duration_s": 2.0008363059999965, "success": false, "token": "stall-probe-3de58789-cc73-4010-9527-1cb87e5cae88", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 50.00047932799998, "duration_s": 2.0026618440000163, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "1eb7bdeb-de3d-4ab4-91fd-d7ec64b3e14d", "censored": true}
+{"kind": "live", "at_s": 50.00130690899999, "duration_s": 2.001988807999993, "success": false, "token": "stall-probe-6b057088-0dfe-45f4-bed0-3b9e929619bc", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 51.000851815999994, "duration_s": 1.3800471220000077, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 52.001921756, "duration_s": 0.38497943999999507, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 51.00031971499999, "duration_s": 2.0001451010000153, "success": false, "polls": 8, "error": "TimeoutError()", "marker": "992b5e22-f6a0-4b19-81b5-429a08b54b5a", "censored": true}
+{"kind": "live", "at_s": 51.001443679999994, "duration_s": 2.000520920000014, "success": false, "token": "stall-probe-f1e6c865-4785-4879-93ec-a144d3344559", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 53.001007555, "duration_s": 0.061021078999999645, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 52.001427320000005, "duration_s": 2.0011313059999907, "success": false, "polls": 12, "error": "TimeoutError()", "marker": "59f902d4-2f8c-43e0-acc0-ed1a71ec769b", "censored": true}
+{"kind": "live", "at_s": 52.00249900099999, "duration_s": 2.0003887969999994, "success": false, "token": "stall-probe-6a95dac7-887b-472c-952e-de08aa1f72e1", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 54.00133661799998, "duration_s": 0.052122192000013, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 53.00060239999999, "duration_s": 2.0012655550000034, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "c9084825-9f45-4268-a697-9f1e59a5b8fc", "censored": true}
+{"kind": "live", "at_s": 53.00144827899999, "duration_s": 2.0005550959999994, "success": false, "token": "stall-probe-42b9b6db-8bd6-4ae2-82be-1a5e3a9bbba5", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 55.000847109999995, "duration_s": 0.048655311999993955, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 54.000249889, "duration_s": 2.000175777999999, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "f6d53a3c-6348-46cb-88a9-cc1ce6872004", "censored": true}
+{"kind": "live", "at_s": 54.00192350699999, "duration_s": 2.001524877999998, "success": false, "token": "stall-probe-431abb64-9860-41ed-b55f-f654867829f9", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 56.00102143699999, "duration_s": 0.058548551000001225, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 55.00045387999998, "duration_s": 2.001441404000019, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "d1e78bf4-21ea-4589-bc17-07844c785b73", "censored": true}
+{"kind": "live", "at_s": 55.00133792899999, "duration_s": 2.000689507000004, "success": false, "token": "stall-probe-9bb18156-7727-4588-9956-becb30cb8ea5", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 57.000548952, "duration_s": 0.026278133000005255, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 56.00057515099999, "duration_s": 2.0004774450000014, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "e44ff79f-9446-4aaf-9b44-03586894360a", "censored": true}
+{"kind": "live", "at_s": 56.002249925, "duration_s": 2.0003771890000053, "success": false, "token": "stall-probe-7ade7684-5693-4a13-aaa3-159f3ab70d1e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 58.001542978, "duration_s": 0.05818912299997692, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 57.00018886199999, "duration_s": 2.002851148000019, "success": false, "polls": 11, "error": "TimeoutError()", "marker": "8c597be7-f6fc-49c0-958c-d1a157f401bd", "censored": true}
+{"kind": "live", "at_s": 57.001210383, "duration_s": 2.0020041359999823, "success": false, "token": "stall-probe-804e01e0-ec27-4806-aa85-05e5e52e8d37", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 59.001802548, "duration_s": 0.5369495839999843, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 58.001196712999985, "duration_s": 2.001555369000016, "success": false, "polls": 8, "error": "TimeoutError()", "marker": "38f0fbd4-fe70-4ea0-81f1-b89e28cd7935", "censored": true}
+{"kind": "live", "at_s": 58.00208297399999, "duration_s": 2.000840948000018, "success": false, "token": "stall-probe-ed14d659-47af-422d-be94-882c0ece5587", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 59.002433389000004, "duration_s": 2.0027333049999925, "success": false, "token": "stall-probe-7aab75eb-95ca-4fc0-b973-b1e5a91ad7ff", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 59.00125898900001, "duration_s": 2.004272616999998, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "e2a96c09-c4c6-4d58-96de-9286c9da8101", "censored": true}
+{"kind": "live", "at_s": 60.00166276799999, "duration_s": 2.0009947700000055, "success": false, "token": "stall-probe-519cb266-c1e5-4674-9033-127d5a94289d", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 60.00047101999999, "duration_s": 2.002520311000012, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "cd1a02b7-b3a6-4b0d-8b22-2cf1c0852300", "censored": true}
+{"kind": "subset", "at_s": 60.00100670699999, "duration_s": 2.0022007660000156, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 61.00183978499999, "duration_s": 2.000738651000006, "success": false, "token": "stall-probe-ea7e96ad-6f2e-4c9d-a098-a8608def869e", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 61.000875463, "duration_s": 2.0020908699999893, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "15975d4a-5494-446a-8b0c-6e69a8d75e7f", "censored": true}
+{"kind": "subset", "at_s": 61.00125344200001, "duration_s": 2.001906006999974, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 62.00054305399999, "duration_s": 2.002105219000015, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "a583c24d-31be-443d-9765-c2d49b00710f", "censored": true}
+{"kind": "live", "at_s": 62.00171520499998, "duration_s": 2.0014615520000234, "success": false, "token": "stall-probe-8cda73ce-c651-4dfc-988e-8f91126b7d9f", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 62.00104886599999, "duration_s": 2.0023826679999956, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 63.00164405999999, "duration_s": 2.0006053920000113, "success": false, "token": "stall-probe-a633df88-5d1d-434c-b333-bc3a60a89407", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 63.00040483799998, "duration_s": 2.0021582390000106, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "78aad957-aa43-4eb5-8303-9ce7029265cf", "censored": true}
+{"kind": "subset", "at_s": 63.000960155, "duration_s": 2.001830299000005, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 65.00080130499998, "duration_s": 0.10716906100000756, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 64.00160602, "duration_s": 1.1078716600000007, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 64.00127057699999, "duration_s": 2.001501982999997, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "e6c1207e-78e8-4865-be40-1048272d458e", "censored": true}
+{"kind": "live", "at_s": 64.002098278, "duration_s": 2.0008381649999762, "success": false, "token": "stall-probe-98114c2e-6d18-4538-bee4-d1f510ece065", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 65.001328462, "duration_s": 2.000769233999989, "success": false, "token": "stall-probe-9d923775-6f54-460f-b226-ae0441500748", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 65.000415248, "duration_s": 2.002028354999993, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "5f3482eb-4d6b-4ed8-a73f-4e936bf9e110", "censored": true}
+{"kind": "drain", "at_s": 66.000785019, "duration_s": 2.000252003999975, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "65e40ca5-778a-4cd4-a13c-60ce149a7fe6", "censored": true}
+{"kind": "live", "at_s": 66.00168371499998, "duration_s": 2.0014425500000073, "success": false, "token": "stall-probe-48b521a7-08e4-4177-9e70-317669de8255", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 66.00116535000001, "duration_s": 2.0023010999999826, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 67.000716824, "duration_s": 1.6532007970000109, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 68.001684649, "duration_s": 0.8857323929999836, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 67.000284806, "duration_s": 2.002755697999987, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "743f6a0b-b7ec-46ce-9006-81666319d2aa", "censored": true}
+{"kind": "live", "at_s": 67.00130233299998, "duration_s": 2.003289044000013, "success": false, "token": "stall-probe-b8acbdd0-2051-4f51-9806-6ea1d45eb3b5", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 68.00123689899999, "duration_s": 2.0010645639999893, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "6615ddda-419e-4c10-8dab-35405861ed1c", "censored": true}
+{"kind": "live", "at_s": 68.00233378599998, "duration_s": 2.000278924000014, "success": false, "token": "stall-probe-477279e6-38ff-4196-a5b6-d7758d647766", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 69.00162268899999, "duration_s": 1.7712422590000187, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 70.00067671099998, "duration_s": 0.7758744660000048, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 69.00119041299999, "duration_s": 2.0013793170000156, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "ced79035-2b92-4198-95dd-c55ff4e4e830", "censored": true}
+{"kind": "live", "at_s": 69.00242044499998, "duration_s": 2.0003534340000044, "success": false, "token": "stall-probe-0972319e-e079-440b-ba0a-64c5c70272a6", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 70.00132985599998, "duration_s": 2.0020704009999974, "success": false, "token": "stall-probe-6951b962-20b9-4013-a8bd-d49de5aad4df", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 70.000193722, "duration_s": 2.004288932999998, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "46c267cc-3bf3-4d20-9816-5fa4bf248905", "censored": true}
+{"kind": "live", "at_s": 71.001423733, "duration_s": 2.0006956899999864, "success": false, "token": "stall-probe-fc7a67b7-4d0e-43da-9f4c-f3ba94ea29aa", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 71.00035308399998, "duration_s": 2.0021316760000047, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "935379f8-985b-443c-ac45-a82f96298149", "censored": true}
+{"kind": "subset", "at_s": 71.000795788, "duration_s": 2.0018758979999802, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 72.00021349, "duration_s": 2.000736122999996, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "1c3fef54-0095-4d8c-996c-d63da9fe0168", "censored": true}
+{"kind": "subset", "at_s": 72.000721567, "duration_s": 2.0018641249999973, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 72.00134856099999, "duration_s": 2.001618694000001, "success": false, "token": "stall-probe-4729f7e4-0d79-4427-aa96-520408c91f39", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 73.00061079899999, "duration_s": 1.2700161710000089, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 73.00025946, "duration_s": 2.002183163000012, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "b5fb2812-ad2e-4b66-846d-96173bde1eda", "censored": true}
+{"kind": "live", "at_s": 73.00116088299998, "duration_s": 2.0017135300000177, "success": false, "token": "stall-probe-0305015a-ee4b-4e08-b524-3455048965a3", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 74.00161324799998, "duration_s": 1.0243966590000184, "success": true, "rows": 1}
+{"kind": "live", "at_s": 74.002100738, "duration_s": 2.0005359920000103, "success": false, "token": "stall-probe-854093de-0e40-4fb0-b2b0-8077b9eeb31e", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 74.001271936, "duration_s": 2.001862646999996, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "6b9b3549-50f9-411b-bfdf-014565805343", "censored": true}
+{"kind": "subset", "at_s": 75.001384062, "duration_s": 1.38111882299998, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 76.001403756, "duration_s": 0.38469979499998885, "success": true, "rows": 1}
+{"kind": "live", "at_s": 75.001953297, "duration_s": 2.000477601, "success": false, "token": "stall-probe-d265507d-6d62-4e08-8eba-c541a13bb827", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 75.000927327, "duration_s": 2.002063201999988, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "d70e2cfc-c6c7-4181-bfa6-0483e230b53e", "censored": true}
+{"kind": "drain", "at_s": 76.00094812999998, "duration_s": 2.0009272270000054, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "b5078123-5153-4ef8-a772-5e128e00d6bd", "censored": true}
+{"kind": "live", "at_s": 76.001950827, "duration_s": 2.000248233999997, "success": false, "token": "stall-probe-b83f54cc-e84c-4aba-8620-473571623b6e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 77.001204524, "duration_s": 1.9824995989999934, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 77.000839635, "duration_s": 2.0001886999999954, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "030357e5-25d3-4bd2-b58d-3031d8cc2f31", "censored": true}
+{"kind": "live", "at_s": 77.001750106, "duration_s": 2.0007420499999853, "success": false, "token": "stall-probe-784a83b5-8e2a-421a-9f6e-05852ff4d94d", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 78.00070466, "duration_s": 1.2179780459999847, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 79.00148425499998, "duration_s": 0.21956730500002664, "success": true, "rows": 1}
+{"kind": "live_delivery", "at_s": 4.017468791999988, "duration_s": 75.388941482, "success": true, "token": "stall-probe-8f05eb3c-fbe6-4974-8288-143becc7615e", "delivery_s": 75.38893939100001}
+{"kind": "drain", "at_s": 78.000228263, "duration_s": 2.0009568509999838, "success": false, "polls": 8, "error": "TimeoutError()", "marker": "e12e5366-d8f3-4f42-aedc-3aa24638badb", "censored": true}
+{"kind": "live", "at_s": 78.00127364899998, "duration_s": 2.0015128390000143, "success": false, "token": "stall-probe-743e49c2-b384-472c-8d3d-4e4c79329f93", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 80.00182658699998, "duration_s": 0.05560579300001223, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 79.001140325, "duration_s": 2.000813746999995, "success": false, "polls": 12, "error": "TimeoutError()", "marker": "833ce9cd-7376-46b8-940f-2b867e995217", "censored": true}
+{"kind": "live", "at_s": 79.00196837299998, "duration_s": 2.000235996000015, "success": false, "token": "stall-probe-c7cd2af9-1381-441b-8c2d-f31f1dbcf071", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 81.000886756, "duration_s": 0.04347309599998539, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 80.001371941, "duration_s": 2.0010752019999813, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "033e7106-d0be-47bf-a7cd-5e023938dbfd", "censored": true}
+{"kind": "live", "at_s": 80.00239178199999, "duration_s": 2.0004387909999934, "success": false, "token": "stall-probe-ca1c8ad2-6dfd-4e35-979e-95cb83a4ba5c", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 82.00102825799999, "duration_s": 0.06483118100001661, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 81.00052600999999, "duration_s": 2.0005838780000147, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "f5c4ca19-7b98-4c3c-858e-1922a9058be3", "censored": true}
+{"kind": "live", "at_s": 81.00139219100001, "duration_s": 2.0011513969999726, "success": false, "token": "stall-probe-0cd883c7-3275-42bb-8271-79a36b404f7b", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 83.00153994599998, "duration_s": 0.10168809300000703, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 82.000529693, "duration_s": 2.001061139000001, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "1cb894a5-8d63-44c2-b1f9-2a40eca54d7a", "censored": true}
+{"kind": "live", "at_s": 82.00176534099998, "duration_s": 2.000122047000019, "success": false, "token": "stall-probe-c707c5d4-073e-4914-a56d-498507f4f51f", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 84.00061807, "duration_s": 0.05179906600000095, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 83.00122899799999, "duration_s": 2.0010715370000014, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "9a592d4a-7080-46f2-992a-ffd3a3326cc8", "censored": true}
+{"kind": "live", "at_s": 83.002021399, "duration_s": 2.0005071539999904, "success": false, "token": "stall-probe-d8c1af56-600d-4730-a139-33214b2c7d9b", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 85.001313961, "duration_s": 0.052597585999990315, "success": true, "rows": 1}
+{"kind": "live", "at_s": 84.001089477, "duration_s": 2.000831306000009, "success": false, "token": "stall-probe-5f56abfe-17cd-4954-8a9e-46458acfd603", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 84.00030207399999, "duration_s": 2.0021089699999948, "success": false, "polls": 11, "error": "TimeoutError()", "marker": "53299b15-09c0-4054-8dfd-15b77847cfa3", "censored": true}
+{"kind": "subset", "at_s": 86.00062072, "duration_s": 0.4775335049999967, "success": true, "rows": 1}
+{"kind": "live", "at_s": 85.001740692, "duration_s": 2.000973120999987, "success": false, "token": "stall-probe-39a9bfb8-eb4a-4574-8c24-edead94166b9", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 85.000994918, "duration_s": 2.0021718679999765, "success": false, "polls": 8, "error": "TimeoutError()", "marker": "bbfbb1ba-5178-4b1f-84ba-19b1390ba201", "censored": true}
+{"kind": "drain", "at_s": 86.00023475699999, "duration_s": 2.0025076759999934, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "b65398d2-f800-48dd-b3f5-1939dd5f3701", "censored": true}
+{"kind": "live", "at_s": 86.00117248699999, "duration_s": 2.0019628020000084, "success": false, "token": "stall-probe-dd16f9dd-5167-4e8b-bc70-9485aaf4a99c", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 87.001014629, "duration_s": 2.0015361510000105, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "9d8e82db-d156-4630-8623-b85aff4c1391", "censored": true}
+{"kind": "subset", "at_s": 87.00140036299999, "duration_s": 2.001468490999997, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 87.00196044499998, "duration_s": 2.0010502890000055, "success": false, "token": "stall-probe-cfcd9a75-dd79-4cf9-9e84-8008019c7973", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 88.00099415099999, "duration_s": 2.0016250369999966, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "1363930d-8a69-41c7-90f3-80c4a9cfad2e", "censored": true}
+{"kind": "subset", "at_s": 88.001491698, "duration_s": 2.0014286919999904, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 88.002110122, "duration_s": 2.0009466459999885, "success": false, "token": "stall-probe-00ff1bb2-0f4d-4715-881f-223819c4baaf", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 90.00083264699998, "duration_s": 0.5351252920000036, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 89.000928227, "duration_s": 1.5364639759999932, "success": true, "rows": 1}
+{"kind": "live", "at_s": 89.00145300599999, "duration_s": 2.001487157000014, "success": false, "token": "stall-probe-67a437ca-7f7e-4664-9f4d-3fd6e189ff28", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 89.00053046599999, "duration_s": 2.0029453190000197, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "f700e555-731d-41bf-a1f1-529fdbd789e0", "censored": true}
+{"kind": "drain", "at_s": 90.00028827599999, "duration_s": 2.0008752230000084, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "26ec9f71-1bb6-4657-9760-b6ed5bb5e38d", "censored": true}
+{"kind": "live", "at_s": 90.00150499399999, "duration_s": 2.0013562940000043, "success": false, "token": "stall-probe-1274054a-186d-4b8e-8d2b-25d9ec48f28a", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 91.000327293, "duration_s": 2.000520098999999, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "22e624f8-3962-4e9d-9d58-2e9722b6577a", "censored": true}
+{"kind": "subset", "at_s": 91.000670415, "duration_s": 2.0016913929999873, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 91.00122334399998, "duration_s": 2.0014365629999986, "success": false, "token": "stall-probe-602ed169-e3a4-4d15-a931-78a66bc0c03e", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 92.001303514, "duration_s": 2.0018237010000064, "success": false, "polls": 3, "error": "TimeoutError()", "marker": "4b513d38-3aa4-4fca-8132-72e85df99765", "censored": true}
+{"kind": "live", "at_s": 92.002232195, "duration_s": 2.001388741999989, "success": false, "token": "stall-probe-398380e1-29eb-4d1b-a17d-63ff28b09306", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 92.00162778199999, "duration_s": 2.0022468630000105, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 93.001933106, "duration_s": 2.001331184999998, "success": false, "token": "stall-probe-e7570e45-e95d-4fd5-9c8d-f6ed8b51c7a7", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 93.00116220999999, "duration_s": 2.0024630679999973, "success": false, "polls": 2, "error": "TimeoutError()", "marker": "006b9863-1fc3-45c2-ae11-eb977daf1a84", "censored": true}
+{"kind": "subset", "at_s": 93.00149568199998, "duration_s": 2.002337386000022, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 94.002546868, "duration_s": 2.000650350000001, "success": false, "token": "stall-probe-2ac5299b-1d81-4621-83df-bb713a829beb", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 94.00166273099998, "duration_s": 2.001840557999998, "success": false, "polls": 3, "error": "TimeoutError()", "marker": "92e1fffa-2b1f-4821-9521-0b9da6451627", "censored": true}
+{"kind": "subset", "at_s": 94.00208547099999, "duration_s": 2.0016316779999954, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 95.001659268, "duration_s": 1.2857264520000058, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 96.00162660799998, "duration_s": 0.2887983430000247, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 95.0011486, "duration_s": 2.001492199000012, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "e51f76d0-af3e-4870-88a5-4096f74edc44", "censored": true}
+{"kind": "live", "at_s": 95.00231809499999, "duration_s": 2.000481150000013, "success": false, "token": "stall-probe-66d7ef2a-0c24-4d0f-959d-1877677ed8b9", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 96.002031477, "duration_s": 2.000847757999992, "success": false, "token": "stall-probe-16bc435f-acc6-40ca-a529-d5ecd06d4075", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 96.001300119, "duration_s": 2.00206425799999, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "68f161e7-4615-4881-9da0-849778809b01", "censored": true}
+{"kind": "subset", "at_s": 97.001480842, "duration_s": 1.4893321359999732, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 97.001116441, "duration_s": 2.0009781910000015, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "59723348-7520-4832-a526-aa50270b353b", "censored": true}
+{"kind": "live", "at_s": 97.002064802, "duration_s": 2.001311942000001, "success": false, "token": "stall-probe-b373fe9d-9411-450b-aee1-ea6febc6f765", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 98.00156672099999, "duration_s": 1.8640438230000314, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 98.00112600899999, "duration_s": 2.001110051000012, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "069e7b84-ebb0-4fc0-b9ff-72b6ed313c09", "censored": true}
+{"kind": "live", "at_s": 98.00215435199999, "duration_s": 2.001449307999991, "success": false, "token": "stall-probe-0970c6cb-ee96-49ec-b692-df8f7b38f1a3", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 99.00225235299999, "duration_s": 2.0008023820000176, "success": false, "polls": 4, "error": "TimeoutError()", "marker": "b776e37b-eef1-447f-a8c6-f6c3960c37db", "censored": true}
+{"kind": "subset", "at_s": 99.002582736, "duration_s": 2.000801564000028, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 99.00305414299999, "duration_s": 2.000494663000012, "success": false, "token": "stall-probe-9a8c9a82-8c1b-4c19-a3c0-bc16557b1d6f", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 100.00280033099997, "duration_s": 1.8600472620000232, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 100.00241411699997, "duration_s": 2.000604832000022, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "951c9b52-ae7e-4eb5-8d3e-539c148c2486", "censored": true}
+{"kind": "live", "at_s": 100.00329104900001, "duration_s": 2.0039697679999904, "success": false, "token": "stall-probe-d61b5bf4-05f6-4cb4-bb04-f94e20623c77", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 101.00103937399999, "duration_s": 1.0625008570000318, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 102.00089541899999, "duration_s": 0.06597884600000725, "success": true, "rows": 1}
+{"kind": "live", "at_s": 101.00152491200001, "duration_s": 2.0004237009999883, "success": false, "token": "stall-probe-49079c74-4f60-46f3-876b-aa75f676952c", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 101.00062023399997, "duration_s": 2.001731818000053, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "27201035-e0b4-4471-b532-a2e3f48e4704", "censored": true}
+{"kind": "drain", "at_s": 102.00056658700001, "duration_s": 2.0010508919999666, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "d96a9b89-da04-4ad8-8bfb-eab7a0892177", "censored": true}
+{"kind": "live", "at_s": 102.00128118799998, "duration_s": 2.000745921000032, "success": false, "token": "stall-probe-e7f1a380-b59f-4f08-9b27-3dd18f6b5e55", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 103.00098290600002, "duration_s": 1.584548624999968, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 104.00100878499998, "duration_s": 0.761574644999996, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 103.00061727099998, "duration_s": 2.0010338260000253, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "37bc1007-3844-4d97-8127-b0ef4500ac6e", "censored": true}
+{"kind": "live", "at_s": 103.00135670699999, "duration_s": 2.000431978999984, "success": false, "token": "stall-probe-0e056d37-3bc6-473f-bd31-30e555302902", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 105.00073332600002, "duration_s": 0.09352131099996086, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 104.00064135400001, "duration_s": 2.0029098169999884, "success": false, "polls": 10, "error": "TimeoutError()", "marker": "a601d30f-b3d3-41fd-b542-1424e90bc706", "censored": true}
+{"kind": "live", "at_s": 104.001397002, "duration_s": 2.0022838790000037, "success": false, "token": "stall-probe-eab96910-c663-4a85-9d07-ee27cfe62637", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 106.001059303, "duration_s": 0.042532741999991686, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 105.000407524, "duration_s": 2.0002205050000157, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "6182ecb3-2c7d-48de-b1ff-ae4121ee8cd6", "censored": true}
+{"kind": "live", "at_s": 105.00110710200002, "duration_s": 2.0011027979999767, "success": false, "token": "stall-probe-6938916f-9089-4130-83bc-0502043f8d8e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 107.00112459199997, "duration_s": 0.048234495000031075, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 106.00062062999999, "duration_s": 2.000452024000026, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "4b272991-3bf1-44ed-b74c-7bb4f4f91601", "censored": true}
+{"kind": "live", "at_s": 106.00156751099999, "duration_s": 2.0012396380000155, "success": false, "token": "stall-probe-31f41d83-ac91-4754-91f7-1c9cb7fe830e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 108.001645336, "duration_s": 0.04113844900001595, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 107.00078117000001, "duration_s": 2.00043752199997, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "5c2471c9-39af-47ea-af1b-ac1870ef5975", "censored": true}
+{"kind": "live", "at_s": 107.00161298399999, "duration_s": 2.001176584999996, "success": false, "token": "stall-probe-57c4f0b4-1966-4a12-904f-592917342684", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 109.00171338200002, "duration_s": 0.05511714899995468, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 108.00122487799999, "duration_s": 2.000493571999982, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "9c48630e-bfdd-49ca-8a8a-a7cc5bed4846", "censored": true}
+{"kind": "live", "at_s": 108.00219770200002, "duration_s": 2.00058596599996, "success": false, "token": "stall-probe-fafbbcdd-a20b-4235-9f51-9539e757ce1e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 110.00084586699998, "duration_s": 0.05169565500000317, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 109.00135196300002, "duration_s": 2.001487645999987, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "9bc61f01-b1be-4b7b-8c53-ce7071b66d82", "censored": true}
+{"kind": "live", "at_s": 109.00218214700001, "duration_s": 2.0008171129999823, "success": false, "token": "stall-probe-422dd63c-3110-4376-bf03-0a9991ad07e1", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 111.00148201199997, "duration_s": 0.8781895440000085, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 110.000508521, "duration_s": 2.0010220510000067, "success": false, "polls": 10, "error": "TimeoutError()", "marker": "3184de7f-5984-447e-9d7f-9c5669d03577", "censored": true}
+{"kind": "live", "at_s": 110.00123429300001, "duration_s": 2.0006460269999593, "success": false, "token": "stall-probe-efead0f0-f4ef-4d41-bdeb-7c32a1cc3ec8", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 112.00087026399999, "duration_s": 0.03209251900000254, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 111.00096297000002, "duration_s": 2.001920878999954, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "2bdf8fb4-eb81-4926-9303-217ce4811141", "censored": true}
+{"kind": "live", "at_s": 111.00214039799997, "duration_s": 2.0009100850000436, "success": false, "token": "stall-probe-145c4435-963c-4794-abb2-75dca633cffa", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 112.00052774999997, "duration_s": 2.002028537000001, "success": false, "polls": 2, "error": "TimeoutError()", "marker": "e25d9ce2-629a-411e-92d8-63ea21a5da3f", "censored": true}
+{"kind": "live", "at_s": 112.00124661700002, "duration_s": 2.001686357999972, "success": false, "token": "stall-probe-38a61f89-256f-489a-9103-0a4ddd0e434b", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 113.00182127999997, "duration_s": 2.0007444980000173, "success": false, "token": "stall-probe-fd339d70-3aa1-4262-90b9-43f168ff9ff7", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 113.00058595699997, "duration_s": 2.0023518590000435, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "bb0b9f53-8d61-473f-80f5-a9f524f282d9", "censored": true}
+{"kind": "subset", "at_s": 113.00113108999997, "duration_s": 2.001995254999997, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 114.00108531099997, "duration_s": 2.0015422360000343, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "e6af5bca-d202-44b8-81c8-7f90d5b35ee9", "censored": true}
+{"kind": "subset", "at_s": 114.00145211899999, "duration_s": 2.0015853159999892, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 114.00198920400001, "duration_s": 2.0012127399999713, "success": false, "token": "stall-probe-242d73b4-65e4-4202-91f4-ddd1ef984c8e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 116.00063190900002, "duration_s": 0.9214026089999834, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 115.00095641599998, "duration_s": 1.9224406910000198, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 115.00041273999997, "duration_s": 2.002311108000015, "success": false, "polls": 2, "error": "TimeoutError()", "marker": "22642714-efa1-460b-b865-248e24078749", "censored": true}
+{"kind": "live", "at_s": 115.00163186299997, "duration_s": 2.001488115000029, "success": false, "token": "stall-probe-0d568c16-f91c-4aba-9f5a-b1aa2bd99e48", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 116.00011604300002, "duration_s": 2.001677365999967, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "00fc9082-9a1d-40a6-9374-42dc823c1029", "censored": true}
+{"kind": "live", "at_s": 116.00132679999999, "duration_s": 2.0008757030000197, "success": false, "token": "stall-probe-0c263b2d-c64e-4d4d-a2c7-3bace7954791", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 117.00163521599998, "duration_s": 1.8163236920000259, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 117.00131564, "duration_s": 2.0007781730000147, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "187fa1e9-8954-47e0-954f-2d4f2238fb37", "censored": true}
+{"kind": "live", "at_s": 117.002161804, "duration_s": 2.00024842199997, "success": false, "token": "stall-probe-e7e5ab7d-50b6-4158-915b-4270fe32d41a", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 118.000871182, "duration_s": 1.8795661390000191, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 118.00047555, "duration_s": 2.0018525319999867, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "30e6876d-4594-4d5a-bc2e-50bf0abc72a0", "censored": true}
+{"kind": "live", "at_s": 118.00131988500002, "duration_s": 2.0014280389999612, "success": false, "token": "stall-probe-097ad3b5-ca19-417e-8698-816ffdae11d8", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 119.00090424499999, "duration_s": 1.211533234000001, "success": true, "rows": 1}
+{"kind": "live", "at_s": 119.00148488199997, "duration_s": 2.0005167490000417, "success": false, "token": "stall-probe-334b2f1a-36d3-4421-b787-324adf05f4a3", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 119.00040829299999, "duration_s": 2.0019771560000095, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "4932a69e-e00a-41bc-8da3-acc20e7e1686", "censored": true}
+{"kind": "subset", "at_s": 120.00132328200002, "duration_s": 1.3055424350000067, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 120.00089662999997, "duration_s": 2.0014151240000047, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "31db4dbe-2c4d-4d87-9857-da2a4ffa38fe", "censored": true}
+{"kind": "live", "at_s": 120.00183658099999, "duration_s": 2.0006277279999836, "success": false, "token": "stall-probe-b4c8aa0f-560d-4e2a-b024-e689e65ef26c", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 121.00067766800001, "duration_s": 1.198330220999992, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 122.00113674499997, "duration_s": 0.20122095200002832, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 121.00029550499997, "duration_s": 2.0002947360000007, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "60957cf4-4089-4201-b8f3-b5e8b3dce1a0", "censored": true}
+{"kind": "live", "at_s": 121.00122786699998, "duration_s": 2.0007523680000077, "success": false, "token": "stall-probe-22bbacc4-40b7-4376-b1cd-9234dbf6a522", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 122.00067510900001, "duration_s": 2.001637834999997, "success": false, "polls": 7, "error": "TimeoutError()", "marker": "44d17e32-f00c-43a5-b75d-60c791ca0632", "censored": true}
+{"kind": "live", "at_s": 122.00172149799997, "duration_s": 2.00100042400004, "success": false, "token": "stall-probe-14eccc3b-aba9-4c70-aa4b-4567e28940f6", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 123.00149799099998, "duration_s": 2.000824403000024, "success": false, "token": "stall-probe-88f702c7-4901-4ae2-9cc3-b26d28b45ec0", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 123.00075935700002, "duration_s": 2.00190237999999, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "f804f654-ea7d-4bc9-83c5-216889bd3bfa", "censored": true}
+{"kind": "subset", "at_s": 123.00109063300002, "duration_s": 2.0017971739999894, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 124.00146863299997, "duration_s": 1.6253734170000484, "success": true, "rows": 1}
+{"kind": "live", "at_s": 124.00189335999997, "duration_s": 2.0009703489999993, "success": false, "token": "stall-probe-41ea9329-71d3-4ad1-a3ab-e5a8cd90185d", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 124.00114449700001, "duration_s": 2.0021775839999805, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "0b5addb3-c812-4f14-a165-1274cf42e69a", "censored": true}
+{"kind": "drain", "at_s": 125.000681915, "duration_s": 2.0017635969999787, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "d5330682-e484-4bfb-a06f-012c9051c909", "censored": true}
+{"kind": "live", "at_s": 125.00145954799999, "duration_s": 2.0014907249999965, "success": false, "token": "stall-probe-164d6d51-36f8-4cd7-95be-6a0a5bac8e0c", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 125.00104049699999, "duration_s": 2.0021383270000115, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 126.00062225399998, "duration_s": 1.4165614199999936, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 127.00141999299998, "duration_s": 0.46530217500003346, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 126.00025836699999, "duration_s": 2.001722548000032, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "90c5413e-923d-452e-9dd8-c9ca187ab73f", "censored": true}
+{"kind": "live", "at_s": 126.00112867599998, "duration_s": 2.001212203000023, "success": false, "token": "stall-probe-5a81b79d-5cea-4965-8916-62fd587f953a", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 127.00099515399998, "duration_s": 2.00148059899999, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "18ff9f4b-ac0d-4e9e-903c-115387535489", "censored": true}
+{"kind": "live", "at_s": 127.00189417499999, "duration_s": 2.00073275699998, "success": false, "token": "stall-probe-d5236a26-5c4e-4403-9fe8-84d1c5fbbd1d", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 128.00106845499997, "duration_s": 1.3659230410000305, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 128.000675169, "duration_s": 2.0017144919999623, "success": false, "polls": 6, "error": "TimeoutError()", "marker": "47ada4a7-ec3a-4f8e-9217-5a4cdb15b18b", "censored": true}
+{"kind": "live", "at_s": 128.001520817, "duration_s": 2.0013133229999767, "success": false, "token": "stall-probe-077a7314-63d1-4dca-9195-7a0790a64904", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 129.000896005, "duration_s": 1.0870201700000166, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 130.00149537899998, "duration_s": 0.08905069000002186, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 129.000430197, "duration_s": 2.000675207000029, "success": false, "polls": 9, "error": "TimeoutError()", "marker": "8a414004-abff-4e1b-943d-ba1a3837ea91", "censored": true}
+{"kind": "live", "at_s": 129.001445968, "duration_s": 2.0011594669999795, "success": false, "token": "stall-probe-c31f7739-8e44-4c45-bb90-44ab4bad59bd", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 131.001617865, "duration_s": 0.041752260000009755, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 130.001157593, "duration_s": 2.00135061200001, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "0101f72a-9abb-4bbf-b421-c10cbf18f568", "censored": true}
+{"kind": "live", "at_s": 130.001937174, "duration_s": 2.0007071349999705, "success": false, "token": "stall-probe-c1ae2f56-3a64-46a4-ba61-14046ef6f462", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 132.001468277, "duration_s": 0.046711813999991136, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 131.001266979, "duration_s": 2.0007888910000133, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "feecf2d5-a6f1-4060-84b4-2882bacebfee", "censored": true}
+{"kind": "live", "at_s": 131.002162707, "duration_s": 2.0008032420000177, "success": false, "token": "stall-probe-a7bfb291-eccc-4df3-a0fd-b96ac3b9d5e5", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 133.000811745, "duration_s": 0.09225501800000302, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 132.001118074, "duration_s": 2.0015015120000044, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "2188f331-7cc9-4945-bbb2-d539584ff671", "censored": true}
+{"kind": "live", "at_s": 132.00195839799997, "duration_s": 2.0007959950000327, "success": false, "token": "stall-probe-9a1ed856-5d47-43ec-8f4f-84f7dcb8abbf", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 134.00140402899999, "duration_s": 0.05408507200002077, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 133.00032819599997, "duration_s": 2.0002193030000512, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "ac10903f-6fb4-409e-baa6-f80f743ed30a", "censored": true}
+{"kind": "live", "at_s": 133.00144663199998, "duration_s": 2.000828468000009, "success": false, "token": "stall-probe-37d6a92c-746a-4052-a200-47ffa74ff02c", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 135.00106934699997, "duration_s": 0.05642157900001621, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 134.001011558, "duration_s": 2.0018118940000136, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "c8a4743b-ed6a-4eee-8f08-5be1ca08619f", "censored": true}
+{"kind": "live", "at_s": 134.00203274599997, "duration_s": 2.000959352000052, "success": false, "token": "stall-probe-6e5e7f86-c788-48fd-8caa-9b4c0dd6d565", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 136.00133870300002, "duration_s": 0.054467513999952644, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 135.00071776500002, "duration_s": 2.00150765799998, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "45150eee-451b-4377-9277-57f96025ccb9", "censored": true}
+{"kind": "live", "at_s": 135.001646222, "duration_s": 2.000731459000008, "success": false, "token": "stall-probe-e2518378-e2b3-4c88-992a-f41dbdb35d38", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 136.000854588, "duration_s": 2.0025355039999795, "success": false, "polls": 10, "error": "TimeoutError()", "marker": "5f1d24f4-efa1-44c6-82b6-ebcd3d036bea", "censored": true}
+{"kind": "live", "at_s": 136.00207366099997, "duration_s": 2.001797803000045, "success": false, "token": "stall-probe-e49fc118-48d3-4dc3-ad05-9c23818dad05", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 137.001062162, "duration_s": 1.1208615209999948, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 138.001906828, "duration_s": 0.13081959999999526, "success": true, "rows": 1}
+{"kind": "drain", "at_s": 137.000577995, "duration_s": 2.002138441999989, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "42efc41d-d740-449a-99b5-ba87b34e313f", "censored": true}
+{"kind": "live", "at_s": 137.001567236, "duration_s": 2.0015869810000027, "success": false, "token": "stall-probe-b15eb30c-7874-493d-9c44-68f23f208b3e", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 138.00134392700002, "duration_s": 2.001792229999978, "success": false, "polls": 5, "error": "TimeoutError()", "marker": "202ee815-9cd1-4337-959f-f19f0c9d0fe7", "censored": true}
+{"kind": "live", "at_s": 138.00257834699997, "duration_s": 2.0007811190000098, "success": false, "token": "stall-probe-7a0b7028-f5e1-45b6-86d8-5a318d2de614", "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 139.002133718, "duration_s": 2.000943723999967, "success": false, "token": "stall-probe-6c13485d-c68b-42f0-b421-75d7b8cb048d", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 139.0010788, "duration_s": 2.002316033999989, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "6b0fd780-aeb7-4922-95e1-8a7e5e8e894f", "censored": true}
+{"kind": "subset", "at_s": 139.001514082, "duration_s": 2.0021359450000205, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 140.00099802499997, "duration_s": 2.0023676200000295, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "2fd5aeab-75ae-4d59-85d8-734dcef471dc", "censored": true}
+{"kind": "live", "at_s": 140.00207601600002, "duration_s": 2.001905690000001, "success": false, "token": "stall-probe-d7bcc7d0-6a03-44f5-8d2f-3ca91b3df158", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 140.001420964, "duration_s": 2.0028081830000133, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 141.001133479, "duration_s": 2.0016454749999752, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "19c86ca2-5057-46ca-918e-223eea03d866", "censored": true}
+{"kind": "subset", "at_s": 141.00153240299997, "duration_s": 2.001520602000028, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 141.00213695799997, "duration_s": 2.0010491980000324, "success": false, "token": "stall-probe-a28f334b-c9a3-43ec-8d5f-f8839ae5fbc0", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 142.001554605, "duration_s": 2.001640737999992, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "ce932ee6-7163-45d0-81bd-91670b3cfc9f", "censored": true}
+{"kind": "subset", "at_s": 142.00211159, "duration_s": 2.001379586999974, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 142.00274362500002, "duration_s": 2.0009064609999996, "success": false, "token": "stall-probe-a28befef-d683-422d-97e6-03aada1f59c0", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 143.00043587399998, "duration_s": 2.0025171490000275, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "352175f8-0945-46b7-8837-a636140815a2", "censored": true}
+{"kind": "live", "at_s": 143.00164754199997, "duration_s": 2.0018468650000045, "success": false, "token": "stall-probe-78d7f402-d48a-401e-9c85-a7a523179511", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 143.000974904, "duration_s": 2.002772843999992, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 144.001983959, "duration_s": 2.001058021999995, "success": false, "token": "stall-probe-b3954ea5-87f6-4dfb-8f37-ca74e3eb5cbd", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 144.00089396899997, "duration_s": 2.002507857000012, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "10e8ca26-c11f-4ee9-abb0-d6e1db737493", "censored": true}
+{"kind": "subset", "at_s": 144.00131964699997, "duration_s": 2.0023142599999915, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 145.001202323, "duration_s": 2.0011139060000005, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "d05f1cc0-7d19-4d88-a4c9-2017b35a3eef", "censored": true}
+{"kind": "subset", "at_s": 145.001713513, "duration_s": 2.001021073000004, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 145.002304839, "duration_s": 2.0006443770000146, "success": false, "token": "stall-probe-c9669dde-40b7-4ce8-b2d7-87f242c5663e", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 146.00072915399997, "duration_s": 2.0022230450000507, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "3e34464e-8453-42c0-86ba-a4a531aae7bb", "censored": true}
+{"kind": "live", "at_s": 146.001936754, "duration_s": 2.001570547999961, "success": false, "token": "stall-probe-98345798-0cf6-4f8a-8d65-cbffbc2531cc", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 146.00119433, "duration_s": 2.0025881729999924, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 147.001269124, "duration_s": 2.0011413699999707, "success": false, "token": "stall-probe-0b6d9178-a4d8-434f-b936-68fee0ca30c8", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 147.00027706299997, "duration_s": 2.0025098790000015, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "896bb2da-e362-457d-b063-58a51a2d1039", "censored": true}
+{"kind": "subset", "at_s": 147.00067452, "duration_s": 2.0023070889999985, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 148.002304894, "duration_s": 2.000995106000005, "success": false, "token": "stall-probe-59d26cd4-6004-402f-abcc-be82b6a39af0", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 148.001184354, "duration_s": 2.0025237560000164, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "77061eed-97c1-4f7f-9b53-0c1c8b36cab9", "censored": true}
+{"kind": "subset", "at_s": 148.00168337300002, "duration_s": 2.0022295929999814, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 149.001461519, "duration_s": 2.000840819000018, "success": false, "token": "stall-probe-a55155b8-9c5f-4b53-bd53-d2a6015d36f3", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 149.00021593900001, "duration_s": 2.004056752999986, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "3db87bd6-3894-4923-bf4f-0a469e81d264", "censored": true}
+{"kind": "subset", "at_s": 149.000783612, "duration_s": 2.003725787999997, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 150.001120048, "duration_s": 2.001393200999985, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "8bd37d16-8e05-4e4c-b8b5-6e70fb09bef2", "censored": true}
+{"kind": "subset", "at_s": 150.001640214, "duration_s": 2.001218644000005, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 150.00232292899997, "duration_s": 2.000734413000032, "success": false, "token": "stall-probe-7c1a7d85-2ec5-438d-addd-e638ac13e375", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 151.002499186, "duration_s": 2.0005599149999966, "success": false, "polls": 0, "error": "TimeoutError()", "marker": "d3c931ef-2b53-4960-bebf-5f4b6efb8b61", "censored": true}
+{"kind": "subset", "at_s": 151.002991987, "duration_s": 2.0009118720000174, "success": false, "error": "TimeoutError()", "censored": true}
+{"kind": "live", "at_s": 151.003592097, "duration_s": 2.0005106009999736, "success": false, "token": "stall-probe-105d4b17-487a-4180-891a-8073c6cefd5e", "error": "TimeoutError()", "censored": true}
+{"kind": "subset", "at_s": 152.000833643, "duration_s": 1.194371928999999, "success": true, "rows": 1}
+{"kind": "subset", "at_s": 153.001365262, "duration_s": 0.19715252899999314, "success": true, "rows": 1}
+{"kind": "live_delivery", "at_s": 5.0012999120000075, "duration_s": 148.505367379, "success": true, "token": "stall-probe-e625d47d-5016-4453-ad97-530d7dbee9d8", "delivery_s": 148.505365041}
+{"kind": "live_delivery", "at_s": 6.001499212999988, "duration_s": 147.515335991, "success": true, "token": "stall-probe-bdbe171c-3df1-4ad1-9093-c299de4204d2", "delivery_s": 147.51533432200003}
+{"kind": "live_delivery", "at_s": 7.002728802000007, "duration_s": 146.524208864, "success": true, "token": "stall-probe-9448df08-39bf-4a6e-8233-68cb4d08af66", "delivery_s": 146.52420743599998}
+{"kind": "live_delivery", "at_s": 8.001581525000006, "duration_s": 145.53488012699998, "success": true, "token": "stall-probe-de714832-418c-472c-8dda-ab869f88382f", "delivery_s": 145.53487896}
+{"kind": "live_delivery", "at_s": 9.00164781799998, "duration_s": 144.54427716, "success": true, "token": "stall-probe-b990b1b1-3217-4891-8cbc-419c088936c4", "delivery_s": 144.544276033}
+{"kind": "live_delivery", "at_s": 10.001968970999997, "duration_s": 143.553260611, "success": true, "token": "stall-probe-c34aef33-db6d-4d58-ae6d-3c1ebeee5137", "delivery_s": 143.55325912499998}
+{"kind": "live_delivery", "at_s": 11.002065287999983, "duration_s": 142.562704368, "success": true, "token": "stall-probe-54c3f94a-7a18-4eea-a019-b6fbd391508f", "delivery_s": 142.562702782}
+{"kind": "live_delivery", "at_s": 12.002046272000001, "duration_s": 141.57203990199997, "success": true, "token": "stall-probe-59584e2a-9168-4f44-a5c3-173ccac3a59f", "delivery_s": 141.572038761}
+{"kind": "live_delivery", "at_s": 13.002063244999988, "duration_s": 140.582091406, "success": true, "token": "stall-probe-2a41fa1f-71ef-4abb-b816-4751368470e4", "delivery_s": 140.582089901}
+{"kind": "live_delivery", "at_s": 14.00124178599998, "duration_s": 139.59216764100003, "success": true, "token": "stall-probe-291fc292-f0da-4512-b759-bae6a177593c", "delivery_s": 139.59216606600003}
+{"kind": "drain", "at_s": 152.000376912, "duration_s": 2.0005030929999634, "success": false, "polls": 8, "error": "TimeoutError()", "marker": "8d0d26d1-9aa5-42eb-9912-64ebadc453d0", "censored": true}
+{"kind": "live", "at_s": 152.001432724, "duration_s": 2.000763137999968, "success": false, "token": "stall-probe-4993c780-50cd-4536-b2ed-e4d0be7e9c6f", "error": "TimeoutError()", "censored": true}
+{"kind": "drain", "at_s": 153.000930463, "duration_s": 2.000405108999985, "success": false, "polls": 13, "error": "TimeoutError()", "marker": "95f5cd85-831e-4432-996d-88035c00c123", "censored": true}
+{"kind": "live", "at_s": 153.00197071099998, "duration_s": 2.0005732779999903, "success": false, "token": "stall-probe-9afdbb6a-5bf8-46ab-b0af-219d39fdb72d", "error": "TimeoutError()", "censored": true}

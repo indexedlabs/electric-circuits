@@ -244,6 +244,104 @@ jobs:
             tools/stall-repro/results/fixture/
             !tools/stall-repro/results/run-*/store-data/**
             !tools/stall-repro/results/run-*/engine-data/**
+  paired:
+    # Control and variants run back to back on ONE runner, each on a fresh database, because
+    # hosted runners differ by CPU model (EPYC 7763/9V45/9V74, Xeon 8370C/8573C/6975P-C) and
+    # cross-runner ratios mostly measure the CPU.
+    if: contains(github.event.head_commit.message, '[paired]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 11
+      matrix:
+        include:
+          - {pair: noise, runs: 'A:prod:1 A:prod:1'}
+          - {pair: cpu2, runs: 'A:prod:1 A:prod:2'}
+          - {pair: binary, runs: 'A:prod:1 bridge-control:bridge:1'}
+          - {pair: sampler-off, runs: 'A:prod:1 sampler-off:bridge:1'}
+          - {pair: sampler-10x, runs: 'A:prod:1 sampler-10x:bridge:1'}
+          - {pair: yield, runs: 'A:prod:1 yield-rows:bridge:1'}
+          - {pair: commit, runs: 'A:prod:1 commit-membership-slices:bridge:1 commit-membership:bridge:1'}
+          - {pair: marker, runs: 'A:prod:1 marker-bypass:bridge:1'}
+          - {pair: half, runs: 'A:prod:1 half-subqueries:prod:1'}
+          - {pair: pr68, runs: 'coalesced-base:base:1 coalesced-head:head:1 A:prod:1'}
+          - {pair: retained, runs: 'B-retained:prod:1 B-retained-key-edge:prod:1 B-retained-key-chat:prod:1 B-retained-key-resource:prod:1 B-retained-key-file:prod:1 B-retained-key-user:prod:1'}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install 'sqlalchemy==2.0.44' sqlalchemy-utils passlib 'pydantic>=2.11,<3' whenever fastapi logfire uuid-utils pgvector httpx 'psycopg[binary]' psutil
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937
+          run-id: 45342910224
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin/prod
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-observed-engine-caf9e2d3db42e87f6f885f2eca4632dfad51a942
+          run-id: 45372211215
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin/bridge
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-historical-engine-1be10fb8313af3247c5dbc8b3190d355419c4c79
+          run-id: 45362388808
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin/base
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-historical-engine-3a0ce4047e1f5a2ad3ea2712f64ff9c06bcee606
+          run-id: 45362388808
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin/head
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-stream-store
+          run-id: 45347325335
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin
+      - name: Run each measurement on this runner with a fresh database
+        run: |
+          chmod +x tools/stall-repro/bin/*/electric-circuits-engine tools/stall-repro/bin/durable-streams-server
+          python tools/stall-repro/export_fixture.py
+          mkdir -p tools/stall-repro/results/fixture
+          { date -u; git rev-parse HEAD; uname -a; lscpu; } > tools/stall-repro/results/fixture/experiment-machine.txt
+          declare -A SOURCE=([prod]=5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363 [bridge]=caf9e2d3db42e87f6f885f2eca4632dfad51a942 [base]=1be10fb8313af3247c5dbc8b3190d355419c4c79 [head]=3a0ce4047e1f5a2ad3ea2712f64ff9c06bcee606)
+          index=0
+          for spec in ${{ matrix.runs }}; do
+            IFS=: read -r variant binary cpus <<< "$spec"
+            index=$((index + 1))
+            label="paired-${{ matrix.pair }}-$index-$variant-${cpus}cpu"
+            docker rm -f stall-experiment-pg >/dev/null 2>&1 || true
+            docker run -d --name stall-experiment-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=synthetic -e POSTGRES_DB=stall_repro postgres:18 -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+            for attempt in $(seq 1 60); do
+              if docker exec stall-experiment-pg pg_isready -h 127.0.0.1 -U postgres -d stall_repro; then break; fi
+              sleep 1
+            done
+            sleep 3
+            docker exec -i stall-experiment-pg psql -v ON_ERROR_STOP=1 -U postgres -d stall_repro < tools/stall-repro/results/fixture/schema.sql
+            echo "::group::$label"
+            python tools/stall-repro/run.py --engine tools/stall-repro/bin/$binary/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name "run-$label" --label "$label" --catalog nov24 --variant "$variant" --cpus "$cpus" --engine-source "${SOURCE[$binary]}" > "tools/stall-repro/results/$label.driver.log" 2>&1 || echo "$label failed with $?"
+            tail -5 "tools/stall-repro/results/$label.driver.log"
+            echo "::endgroup::"
+          done
+          docker rm -f stall-experiment-pg || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stall-experiment-paired-${{ matrix.pair }}-${{ github.sha }}
+          path: |
+            tools/stall-repro/results/run-*/
+            tools/stall-repro/results/*.driver.log
+            tools/stall-repro/results/fixture/
+            !tools/stall-repro/results/run-*/store-data/**
+            !tools/stall-repro/results/run-*/engine-data/**
   stream-store:
     if: contains(github.event.head_commit.message, '[store]')
     runs-on: ubuntu-latest

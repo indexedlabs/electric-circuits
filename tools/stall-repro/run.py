@@ -194,6 +194,7 @@ async def run(args):
     command("sudo", "systemd-run", "--unit", unit, "--collect", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
     manifest["variant"] = args.variant
+    manifest["label"] = args.label
     manifest["engine_source"] = args.engine_source
     save(output / "manifest.json", manifest)
     try:
@@ -408,6 +409,7 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
     parser.add_argument("--variant", choices=("A", "A-observed", *sorted(KEYED_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
+    parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
     parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))
