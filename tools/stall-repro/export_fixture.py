@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import traceback
 from pathlib import Path
 from uuid import UUID, uuid5
 
@@ -27,14 +28,23 @@ async def export() -> None:
     gateway = loader.module("api.services.circuits_sync")
     authority_module = loader.module("api.services.circuits_sync_authority")
     schemas = {}
+    failures = {}
     pending = [table.removeprefix("public.") for table in loader.bundle["publication"]]
     while pending:
         name = pending.pop()
-        if name in schemas:
+        if name in schemas or name in failures:
             continue
-        table = loader.table_model(name).__table__
-        schemas[name] = table
-        pending.extend(foreign_key.target_fullname.split(".")[-2] for foreign_key in table.foreign_keys)
+        try:
+            table = loader.table_model(name).__table__
+            schemas[name] = table
+            pending.extend(foreign_key.target_fullname.split(".")[-2] for foreign_key in table.foreign_keys)
+        except Exception:
+            failures[name] = traceback.format_exc()
+    (output / "schema-import-status.json").write_text(json.dumps({"loaded": sorted(schemas), "failures": failures}, indent=2))
+    if failures:
+        for name, failure in failures.items():
+            print(f"{name}: {failure.splitlines()[-1]}")
+        raise RuntimeError(f"{len(failures)} model declarations could not be imported; see schema-import-status.json")
     dialect = postgresql.dialect()
     ddl = []
     columns = {}
