@@ -174,6 +174,31 @@ impl GroupClaims {
             self.private_members.insert(member, group.to_string());
         }
     }
+
+    /// Build the shape-to-group map used by one retention snapshot. Records cover settled groups;
+    /// reservations cover the public claim and private member claims while a load or release is
+    /// in flight. The caller supplies the state lock's subscription index so this walks the
+    /// claims once, rather than scanning it once for every shape.
+    pub(crate) fn shape_groups(&self, owners: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut groups = HashMap::new();
+        for group in self.records.values() {
+            let group_id = format!("record:{}", group.id);
+            for member in &group.members {
+                groups.insert(member.shape_id.clone(), group_id.clone());
+            }
+        }
+        for (subscription, group) in &self.private_members {
+            if let Some(shape) = owners.get(subscription) {
+                groups.entry(shape.clone()).or_insert_with(|| format!("reservation:{group}"));
+            }
+        }
+        for subscription in self.reserved.keys() {
+            if let Some(shape) = owners.get(subscription) {
+                groups.entry(shape.clone()).or_insert_with(|| format!("reservation:{subscription}"));
+            }
+        }
+        groups
+    }
 }
 
 /// Completion shared by callers that race a group release. The release task is engine-owned, so
