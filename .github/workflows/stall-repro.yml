@@ -92,7 +92,7 @@ jobs:
           cargo fmt --check > tools/stall-repro/results/observer-build/format.txt 2>&1 || true
           cargo build --release --locked -p electric-circuits-engine
           sha256sum target/release/electric-circuits-engine > tools/stall-repro/results/observer-build/binary.sha256
-          cargo test --release --locked -p electric-circuits-engine --features test-support --lib stall_profile::tests
+          cargo test --release --locked -p electric-circuits-engine --features test-support --lib stall_
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -803,6 +803,7 @@ pub(crate) async fn sequencer_loop(
                         // flush partial output or publish partial highwater.
                         let mut txn_arr_deltas = Vec::new();
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        let mut txn_membership = crate::stall_batch::enabled().then(crate::stall_batch::Commit::default);
                         // The commit time the ingestor stamped on this transaction's changes.
                         let mut commit_ts: Option<i64> = None;
                         loop {
@@ -904,10 +905,10 @@ pub(crate) async fn sequencer_loop(
                                         );
                                     }
                                 }
-                                if let Err(e) = process_envelope(
+                                if let Err(e) = process_envelope_deferred(
                                     ds.metrics(), &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
                                     &mut exec.aggregates, &exec.agg_index, env, &mut txn_pending,
-                                    &subq, &trace_tx, library_mode,
+                                    &subq, &trace_tx, library_mode, txn_membership.as_mut(),
                                 )
                                 .await
                                 {
@@ -928,6 +929,14 @@ pub(crate) async fn sequencer_loop(
                             // Do not run the count fold or flush the partial transaction. The
                             // failed transaction is retried from its page boundary on restart.
                             break;
+                        }
+                        if let Some(batch) = txn_membership {
+                            if let Err(error) = flush_commit_membership(batch, &subq, commit_ts, txid.clone(), lsn.clone()).await {
+                                tracing::error!(%error, "scratch commit membership failed; preserving replay boundary");
+                                highwater = txn_highwater;
+                                processing_failed = true;
+                                break;
+                            }
                         }
                         // Do not mutate the arrangement until every envelope has fanned out
                         // successfully; a failed transaction must leave no circuit-side prefix.
@@ -1943,6 +1952,63 @@ async fn stream_backfill(
     Ok((fences.gate, agg_seed, emitted_seed, BackfillStats { rows: rows_total, estimated_bytes }))
 }
 
+async fn flush_commit_membership(
+    batch: crate::stall_batch::Commit,
+    subq: &SubqueryHandle,
+    commit_ts: Option<i64>,
+    txid: Option<String>,
+    lsn: Option<String>,
+) -> Result<()> {
+    let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+    let xid = txid.as_deref().and_then(|value| value.parse::<u64>().ok());
+    for (schema, delta) in batch.finish() {
+        if delta.is_empty() {
+            continue;
+        }
+        let (work, group_paths) = {
+            let mut registry = crate::stall_profile::lock(
+                &subq.registry,
+                crate::stall_profile::SEQUENCER_WAIT,
+                crate::stall_profile::SEQUENCER_HOLD,
+            )
+            .await;
+            if !registry.touches(&schema.table) {
+                continue;
+            }
+            if let Some(commit_ts) = commit_ts {
+                registry.note_commit_time(lsn_u64, commit_ts);
+            }
+            let measurement = crate::stall_profile::Timer::start(crate::stall_profile::MEMBERSHIP);
+            let work = registry.on_table_delta(&schema, &delta, lsn_u64, xid, txid.clone(), None).await?;
+            drop(measurement);
+            let group_paths = registry.group_paths_for_work(&work);
+            for path in &group_paths {
+                subq.group_lanes.begin_origin(path, lsn_u64);
+            }
+            (work, group_paths)
+        };
+        if !work.is_empty() {
+            subq.pending_flips.add(lsn_u64);
+            if subq
+                .flip_tx
+                .send(FlipWork::Walk {
+                    work,
+                    txid: txid.clone(),
+                    lsn: lsn.clone(),
+                    group_paths: group_paths.iter().cloned().collect(),
+                })
+                .is_err()
+            {
+                subq.pending_flips.complete(lsn_u64);
+                for path in &group_paths {
+                    subq.group_lanes.complete_origin(path, lsn_u64);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn process_envelope(
     metrics: &crate::metrics::Metrics,
@@ -1957,6 +2023,40 @@ pub(crate) async fn process_envelope(
     subq: &SubqueryHandle,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     library_mode: bool,
+) -> Result<()> {
+    process_envelope_deferred(
+        metrics,
+        ts,
+        shapes,
+        shape_index,
+        families,
+        aggregates,
+        agg_index,
+        env,
+        pending,
+        subq,
+        trace_tx,
+        library_mode,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_envelope_deferred(
+    metrics: &crate::metrics::Metrics,
+    ts: &TableSchema,
+    shapes: &HashMap<String, StandaloneShape>,
+    shape_index: &StandaloneIndex,
+    families: &HashMap<Vec<usize>, KeyRouter>,
+    aggregates: &mut HashMap<String, AggShape>,
+    agg_index: &StandaloneIndex,
+    env: Envelope,
+    pending: &mut HashMap<String, Vec<Envelope>>,
+    subq: &SubqueryHandle,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    library_mode: bool,
+    membership_batch: Option<&mut crate::stall_batch::Commit>,
 ) -> Result<()> {
     let (delta, txid, lsn) = apply_envelope(ts, &env)?;
     let commit_ts = env.headers.commit_ts;
@@ -2161,7 +2261,9 @@ pub(crate) async fn process_envelope(
     // Postgres query-backs are handed to the engine's flip-propagator task so they never block
     // this tailer. The convergence barrier is processed offsets + a drained flip queue
     // (`pending_flips == 0`).
-    {
+    if let Some(batch) = membership_batch {
+        batch.push(ts, &delta)?;
+    } else {
         let mut group_paths = HashSet::new();
         let work = {
             let mut reg = crate::stall_profile::lock(

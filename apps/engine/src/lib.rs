@@ -41,6 +41,7 @@ pub mod schema;
 pub mod shutdown;
 pub mod sources;
 pub mod sql;
+mod stall_batch;
 mod stall_profile;
 pub mod statsd;
 pub mod store_identity;

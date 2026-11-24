@@ -85,3 +85,20 @@ the highwater through the existing sequencer error path. The prototype will not
 claim time slicing, scratch spill, fair round scheduling, crash-safe deferred
 walk recovery, or comprehensive intermediate authorization equivalence. Full
 production invariants require those missing parts; this experiment is unmergeable.
+
+Red provenance: Actions `45363068569`, test-only harness `57b23ec`, checked the
+immutable real observer evidence and failed the intended cost assertion
+(`11941` membership calls above the per-table/commit bound). The job verifies
+that specific assertion failure; its green job status means red was retained,
+not that production already batches. The prototype preserves the same oracle.
+
+The implementation adds private `stall_batch::Commit`, selected only by
+`STALL_REPRO_COMMIT_MEMBERSHIP=1`, and folds first-old/last-new by key before
+calling existing `on_table_delta` once per nonempty touched table. It still
+evaluates each candidate shape against every relevant row, and still performs
+per-value Postgres walks: it is NOT a membership-result cache or PR68's round
+coalescing. It enqueues one walk batch per table rather than per row, which also
+changes available walk parallelism. The ordinary filters/aggregates retain their
+per-row path. It deliberately omits time slicing and spill, and therefore can
+hold the registry longer in a single acquisition. No production performance or
+correctness claim follows merely from the structural cost oracle passing.
