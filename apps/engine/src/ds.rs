@@ -2980,6 +2980,7 @@ mod tests {
         /// Answer every ensure with this status (and `stream-closed` when `ensure_closed`) without
         /// creating anything; zero creates the stream and answers 201.
         pub(crate) ensure_status: u16,
+        pub(crate) ensure_fault: std::sync::Mutex<Option<u16>>,
         pub(crate) ensure_closed: bool,
         /// The `Stream-TTL` each ensure carried, by path.
         pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
@@ -3053,6 +3054,7 @@ mod tests {
         pub(crate) page_delay: Option<std::time::Duration>,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
+        pub(crate) readiness_fault: std::sync::Mutex<Option<u16>>,
         pub(crate) head_status: u16,
         /// Return a transport error from HEAD instead of a response (health outage cut).
         pub(crate) head_error: bool,
@@ -3136,7 +3138,8 @@ mod tests {
         fn ready<'a>(&'a self) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push("ready".to_string());
-                let mut response = response(if self.readiness_status == 0 { 200 } else { self.readiness_status });
+                let status = self.readiness_fault.lock().unwrap().take().unwrap_or(self.readiness_status);
+                let mut response = response(if status == 0 { 200 } else { status });
                 response.body = Some(Ok(self.readiness_body.lock().unwrap().clone().unwrap_or_default()));
                 Ok(response)
             })
@@ -3151,8 +3154,9 @@ mod tests {
                     gate.hold().await;
                 }
                 self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
-                if self.ensure_status != 0 {
-                    let mut res = response(self.ensure_status);
+                let status = self.ensure_fault.lock().unwrap().take().unwrap_or(self.ensure_status);
+                if status != 0 {
+                    let mut res = response(status);
                     res.closed = self.ensure_closed;
                     return Ok(res);
                 }
@@ -3723,6 +3727,72 @@ mod tests {
         }
         assert!(read.await.is_err());
         assert_eq!(*store.read_offsets.lock().unwrap(), vec!["prior"]);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_readiness_and_catalog_put_are_retried_before_empty_boot() {
+        let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+        let store = Arc::new(ScriptedStore {
+            readiness_fault: std::sync::Mutex::new(Some(429)),
+            readiness_body: std::sync::Mutex::new(Some(readiness_json(&identity))),
+            ensure_fault: std::sync::Mutex::new(Some(429)),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".into(), store);
+        client.refresh_readiness(&identity).await.expect("a readiness 429 must retry");
+        crate::engine::Engine::admit_store(
+            client,
+            crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope()),
+            true,
+        )
+        .await
+        .expect("a catalog PUT 429 must retry before first boot");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_zero_and_past_date_have_a_floor_and_large_values_have_a_ceiling() {
+        let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
+        let past = parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT");
+        for retry_after in [Some(std::time::Duration::ZERO), past] {
+            let mut wait = Box::pin(client.wait_rate_limit("GET", "changes/0", 1, retry_after));
+            tokio::task::yield_now().await;
+            tokio::time::advance(std::time::Duration::from_millis(99)).await;
+            assert!(tokio::time::timeout(std::time::Duration::ZERO, &mut wait).await.is_err());
+            tokio::time::advance(std::time::Duration::from_millis(1)).await;
+            assert!(wait.await);
+        }
+        let mut wait =
+            Box::pin(client.wait_rate_limit("GET", "changes/0", 1, Some(std::time::Duration::from_secs(3600))));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        assert!(wait.await, "a provider delay must be capped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_restore_append_does_not_reconcile_head_past_its_budget() {
+        let gate = Arc::new(BodyGate::default());
+        let store = Arc::new(ScriptedStore {
+            append_fault: std::sync::Mutex::new(Some((
+                "shape/s1".into(),
+                0,
+                AppendFault::RateLimited(Some(std::time::Duration::ZERO)),
+            ))),
+            head_gate: std::sync::Mutex::new(Some(gate.clone())),
+            head_gate_path: std::sync::Mutex::new(Some("shape/s1".into())),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".into(), store);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let op = tokio::spawn(async move {
+            client.append_retrying("shape/s1", &[], std::time::Duration::from_secs(1), &shutdown).await
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1), gate.entered.notified()).await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let result = tokio::time::timeout(std::time::Duration::ZERO, op).await;
+        assert!(
+            matches!(result, Ok(Ok(Err(_)))),
+            "429 restore must finish at its budget before HEAD reconciliation: {result:?}"
+        );
     }
 
     #[tokio::test]
