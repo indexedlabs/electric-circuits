@@ -2156,8 +2156,8 @@ impl Engine {
         if plan.over_capacity {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
-                 every shape is actively subscribed or recently read; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
+                "retention: {} shapes exceed max_shapes={} but no eligible dormant shape is left to evict — \
+                 active and live-only shapes remain protected; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
                 snapshot.len(),
                 cfg.max_shapes
             );

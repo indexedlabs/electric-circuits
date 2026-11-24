@@ -603,7 +603,7 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
 
-Live-only shapes (subqueries, aggregates and changes-only feeds) cannot go dormant. An unsubscribed live-only shape is retired after the effective `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` period: the smaller of that value and idle-plus-dormancy, floored by the subscription lease; `0` uses the ordinary window unchanged. The shape stream is closed and deleted. The `ELECTRIC_CIRCUITS_MAX_SHAPES` cap evicts dormant shapes only and reports pressure when none remain.
+Live-only shapes (subqueries, aggregates and changes-only feeds) cannot go dormant. An unsubscribed live-only shape is retired after the effective `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` period: the smaller of that value and idle-plus-dormancy when both ordinary windows are enabled, floored by the subscription lease. If either ordinary window is disabled, a non-zero value stands on its own; `0` keeps main's live-only rule disabled. The shape stream is closed and deleted. The `ELECTRIC_CIRCUITS_MAX_SHAPES` cap evicts dormant shapes only and reports pressure when none remain.
 
 ## 8. Related documents
 

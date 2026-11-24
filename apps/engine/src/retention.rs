@@ -24,9 +24,10 @@
 //! 1. **Dormancy TTL** (hygiene): dormant longer than [`RetentionConfig::dormant_ttl`] → evict.
 //!    Reaps dead shapes even with no resource pressure. A live-only shape with no subscription is
 //!    retired after [`RetentionConfig::live_only_evict_after`] without a touch. The configured
-//!    live-only period can shorten the ordinary idle-plus-dormancy window, but never lengthen it,
-//!    and the subscription lease is the floor. A value of `0` uses the ordinary window unchanged;
-//!    when the ordinary dormant TTL is disabled, main's live-only layer remains disabled too.
+//!    live-only period is the smaller of the ordinary idle-plus-dormancy window and its configured
+//!    value when both ordinary windows are enabled, and the subscription lease is the floor. A
+//!    value of `0` uses the ordinary window unchanged; when either ordinary window is disabled, a
+//!    non-zero live-only value stands on its own, while zero keeps main's live-only rule disabled.
 //! 2. **`max_shapes` count cap** (engine cost bound): when the total shape count exceeds
 //!    [`RetentionConfig::max_shapes`], evict least-recently-read dormant shapes until under. A
 //!    subscribed shape is never evicted, and neither is a parkable shape that is still active.
@@ -48,9 +49,10 @@
 //! engine retires it **straight from active** (full teardown) once it has gone the live-only idle
 //! period with no subscription and no touch. A **touch** is a lease create, join or renewal, or an
 //! engine-visible read; a lease lapse is not one, so the period runs from the last renewal. The
-//! effective period is the smaller of the configured live-only period and idle-plus-dormancy,
-//! floored by the subscription lease; a configured `0` uses the ordinary window. Like any evicted
-//! shape, a returning client recreates it.
+//! effective period is the smaller of the configured live-only period and idle-plus-dormancy when
+//! both ordinary windows are enabled, floored by the subscription lease; when either ordinary
+//! window is disabled, a non-zero configured period stands on its own, while `0` keeps main's
+//! live-only rule disabled. Like any evicted shape, a returning client recreates it.
 //!
 //! This module holds the configuration, the lifecycle state machine types, and the **pure** sweep
 //! planner ([`plan_sweep`]); `crate::engine` owns the state and executes plans. Persistence of the
@@ -73,7 +75,7 @@ use crate::pg::SnapshotGate;
 /// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
 /// | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Time since the last renewal before a native subscription lease lapses. `0` disables lease expiry. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
-/// | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Maximum idle period for an unsubscribed live-only shape (subquery, aggregate or changes-only feed). The effective period is the smaller of this value and the ordinary idle-plus-dormancy window, floored by the subscription lease. `0` uses the ordinary window unchanged; a disabled dormant TTL keeps main's live-only layer disabled. |
+/// | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Maximum idle period for an unsubscribed live-only shape (subquery, aggregate or changes-only feed). The effective period is the smaller of this value and the ordinary idle-plus-dormancy window when both ordinary windows are enabled, floored by the subscription lease. If either ordinary window is disabled, a non-zero value stands on its own; `0` keeps main's live-only rule disabled. |
 /// | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum change-log span budget for dormant replay. |
 /// | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Replay budget multiplier applied to the shape's recorded backfill bytes. |
 /// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Cap on registered shapes (active, dormant and live-only; each group member is one). Over it, least-recently-read dormant shapes are evicted; active live-only shapes remain protected. `0` = unlimited. |
@@ -90,7 +92,8 @@ pub struct RetentionConfig {
     pub dormant_ttl: Duration,
     /// The live-only idle period as configured (`ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS`, default
     /// 24 hours; 0 = no period of its own). Read it through [`Self::live_only_evict_after`], which
-    /// caps it at the ordinary idle-plus-dormancy window and applies the subscription-lease floor.
+    /// caps it at the ordinary idle-plus-dormancy window when both ordinary windows are enabled,
+    /// otherwise uses the non-zero value on its own, and applies the subscription-lease floor.
     pub live_only_idle: Duration,
     /// Minimum dormant replay span in bytes (`ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES`).
     pub replay_min_bytes: u64,
@@ -142,18 +145,23 @@ impl RetentionConfig {
 
     /// How long a live-only shape may go with no subscription and no touch before it is retired
     /// from active, and the reason that retirement is counted under. `None` = no finite window.
-    /// The configured period can only shorten the ordinary idle-plus-dormancy window, and the
-    /// subscription lease is the floor. A configured `0` means the ordinary window is unchanged.
-    /// If the ordinary dormant TTL is disabled, main's live-only layer has no finite window and
-    /// remains disabled.
+    /// The configured period can shorten the ordinary idle-plus-dormancy window when both ordinary
+    /// windows are enabled, and the subscription lease is the floor. A configured `0` means the
+    /// ordinary window is unchanged; when an ordinary window is disabled, a non-zero configured
+    /// period stands on its own and `0` keeps the live-only rule disabled.
     pub fn live_only_evict_after(&self) -> Option<(Duration, EvictReason)> {
-        if self.dormant_ttl.is_zero() {
-            return None;
-        }
-        let ordinary = self.idle_timeout.saturating_add(self.dormant_ttl);
-        let configured = if self.live_only_idle.is_zero() { ordinary } else { ordinary.min(self.live_only_idle) };
-        let after = configured.max(self.subscription_lease_timeout);
-        (!after.is_zero()).then_some((after, EvictReason::LiveOnlyIdle))
+        let ordinary = (!self.idle_timeout.is_zero() && !self.dormant_ttl.is_zero())
+            .then(|| self.idle_timeout.saturating_add(self.dormant_ttl));
+        let configured = match (ordinary, self.live_only_idle.is_zero()) {
+            (Some(ordinary), false) => Some(ordinary.min(self.live_only_idle)),
+            (Some(ordinary), true) => Some(ordinary),
+            (None, false) => Some(self.live_only_idle),
+            (None, true) => None,
+        };
+        configured
+            .map(|after| after.max(self.subscription_lease_timeout))
+            .filter(|after| !after.is_zero())
+            .map(|after| (after, EvictReason::LiveOnlyIdle))
     }
 
     pub fn from_env() -> Self {
@@ -200,11 +208,12 @@ impl RetentionConfig {
 }
 
 /// The shortest non-zero `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` the engine starts with: twice the
-/// larger of a shape's idle-plus-dormancy window and the change log's retain window, 14.5 days at
-/// the defaults. Those windows bound how long the engine's own lifecycle holds a stream before it
-/// deletes it, so the TTL stays well clear of them. `None` when idle or dormancy is `0`
-/// (disabled): a shape may then stay forever, and no TTL is safe. A retain window of `0` adds
-/// nothing to the floor, since dormancy eviction still unpins the segment a dormant shape holds.
+/// larger of a shape's ordinary idle-plus-dormancy window, its effective live-only period, and the
+/// change log's retain window, 14.5 days at the defaults. Those windows bound how long the
+/// engine's own lifecycle holds a stream before it deletes it, so the TTL stays well clear of them.
+/// `None` when an ordinary window is disabled: a parkable shape may then stay forever, even if a
+/// non-zero live-only period bounds the non-parkable shapes. A retain window of `0` adds nothing to
+/// the floor, since dormancy eviction still unpins the segment a dormant shape holds.
 ///
 /// The floor alone does not keep a tracked stream alive: a stream the engine neither appends to nor
 /// reads, such as a restored dormant shape whose dormancy clock restarted at boot, would still
@@ -212,10 +221,18 @@ impl RetentionConfig {
 /// sweep interval) reads each of them at its tail at least once per quarter TTL; `HEAD` does not
 /// slide the TTL.
 pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog::ChangeLogConfig) -> Option<Duration> {
-    if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() {
+    let ordinary = (!retention.idle_timeout.is_zero() && !retention.dormant_ttl.is_zero())
+        .then(|| retention.idle_timeout.saturating_add(retention.dormant_ttl));
+    if ordinary.is_none() {
         return None;
     }
-    Some(retention.idle_timeout.saturating_add(retention.dormant_ttl).max(changes.retain).saturating_mul(2))
+    let effective_live_only = retention.live_only_evict_after().map(|(after, _)| after);
+    let retention_window = match (ordinary, effective_live_only) {
+        (Some(ordinary), Some(live_only)) => ordinary.max(live_only),
+        (Some(ordinary), None) => ordinary,
+        (None, Some(_)) | (None, None) => return None,
+    };
+    Some(retention_window.max(changes.retain).saturating_mul(2))
 }
 
 /// Where a shape is in the lifecycle. Held per shape id by the engine (`Engine::lives`).
@@ -764,10 +781,36 @@ mod tests {
     }
 
     #[test]
-    fn disabled_dormant_ttl_keeps_live_only_shapes_forever() {
+    fn disabled_ordinary_window_uses_a_nonzero_live_only_period() {
         let c = RetentionConfig {
-            live_only_idle: Duration::from_secs(1),
+            live_only_idle: Duration::from_secs(5),
             subscription_lease_timeout: Duration::ZERO,
+            dormant_ttl: Duration::ZERO,
+            ..cfg()
+        };
+        assert_eq!(c.live_only_evict_after(), Some((Duration::from_secs(5), EvictReason::LiveOnlyIdle)));
+        assert!(plan_sweep(&c, &[live_only("released", 0, 4)]).evict.is_empty());
+        assert_eq!(
+            plan_sweep(&c, &[live_only("released", 0, 5)]).evict,
+            vec![("released".to_string(), EvictReason::LiveOnlyIdle)]
+        );
+
+        let idle_disabled = RetentionConfig {
+            live_only_idle: Duration::from_secs(5),
+            subscription_lease_timeout: Duration::ZERO,
+            idle_timeout: Duration::ZERO,
+            dormant_ttl: Duration::from_secs(2),
+            ..cfg()
+        };
+        assert_eq!(idle_disabled.live_only_evict_after(), Some((Duration::from_secs(5), EvictReason::LiveOnlyIdle)));
+    }
+
+    #[test]
+    fn disabled_ordinary_window_and_zero_live_only_period_never_retire() {
+        let c = RetentionConfig {
+            live_only_idle: Duration::ZERO,
+            subscription_lease_timeout: Duration::from_secs(1800),
+            idle_timeout: Duration::ZERO,
             dormant_ttl: Duration::ZERO,
             ..cfg()
         };

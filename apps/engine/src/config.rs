@@ -786,7 +786,7 @@ impl Config {
         if Duration::from_secs(ttl.get()) < floor {
             bail!(
                 "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
-                 idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
+                 idle-plus-dormancy window, the effective live-only period and the change-log retain window. A shorter TTL could expire a \
                  stream the engine still tracks",
                 floor.as_secs()
             );
@@ -1521,8 +1521,8 @@ mod tests {
     }
 
     /// `#c-ttl-floor`: unset or `0` is no TTL; a non-zero TTL under twice the larger of
-    /// idle-plus-dormancy and the change-log retain window (14.5 days at the defaults) refuses the
-    /// boot, and the floor follows those windows' own settings.
+    /// idle-plus-dormancy, the effective live-only period and the change-log retain window (14.5
+    /// days at the defaults) refuses the boot, and the floor follows those windows' own settings.
     #[test]
     fn stream_ttl_is_off_by_default_and_refused_under_the_floor() {
         assert_eq!(cfg(&[]).stream_ttl, None);
@@ -1540,7 +1540,8 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") && msg.contains("1252800"), "{msg}");
 
-        // The live-only knob may shorten the ordinary window, but does not extend the stream-TTL floor.
+        // The live-only knob may shorten the ordinary window. A lease longer than that window
+        // extends the effective live-only period and therefore the stream-TTL floor.
         // Keep the sweep explicit so this case reaches the floor check rather than the quarter-TTL check.
         let live_only = [
             ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "50"),
@@ -1556,6 +1557,23 @@ mod tests {
         live_only_under[6] = ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "199");
         let err = try_cfg(&live_only_under).expect_err("a TTL under the ordinary floor refuses");
         assert!(format!("{err:#}").contains("200"), "{err:#}");
+
+        // A lease longer than the ordinary window becomes the live-only floor, so the stream
+        // TTL must still cover twice that effective period.
+        let lease_floor = [
+            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "10"),
+            ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "10"),
+            ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "200"),
+            ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "400"),
+        ];
+        assert!(try_cfg(&lease_floor).is_ok(), "the TTL at twice the lease floor boots");
+        let mut lease_floor_under = lease_floor;
+        lease_floor_under[6] = ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "399");
+        let err = try_cfg(&lease_floor_under).expect_err("a TTL under the lease floor refuses");
+        assert!(format!("{err:#}").contains("400"), "{err:#}");
 
         // The retain window wins when it is the larger.
         let retain =
