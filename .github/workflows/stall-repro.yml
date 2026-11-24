@@ -8,8 +8,61 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  experiment:
+    if: contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[measure]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install 'sqlalchemy==2.0.44' sqlalchemy-utils passlib 'pydantic>=2.11,<3' whenever fastapi logfire uuid-utils pgvector httpx 'psycopg[binary]' psutil
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937
+          run-id: 45342910224
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: stall-stream-store
+          run-id: 45347325335
+          github-token: ${{ github.token }}
+          path: tools/stall-repro/bin
+      - name: Prepare disposable schema and machine evidence
+        run: |
+          chmod +x tools/stall-repro/bin/*
+          python tools/stall-repro/export_fixture.py
+          docker run -d --name stall-experiment-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=synthetic -e POSTGRES_DB=stall_repro postgres:18 -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
+          for attempt in $(seq 1 60); do
+            if docker exec stall-experiment-pg pg_isready -U postgres -d stall_repro; then break; fi
+            sleep 1
+          done
+          docker exec -i stall-experiment-pg psql -v ON_ERROR_STOP=1 -U postgres -d stall_repro < tools/stall-repro/results/fixture/schema.sql
+          { date -u; git rev-parse HEAD; uname -a; lscpu; df -h; docker image inspect postgres:18; } > tools/stall-repro/results/fixture/experiment-machine.txt
+      - name: Run isolated engine smoke or measurement
+        env:
+          SMOKE: ${{ contains(github.event.head_commit.message, '[smoke]') && '1' || '0' }}
+        run: |
+          ARGS=()
+          if [ "$SMOKE" = 1 ]; then ARGS=(--smoke --timeout 120); fi
+          python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-nov24 --catalog nov24 "${ARGS[@]}"
+      - name: Stop disposable database
+        if: always()
+        run: docker rm -f stall-experiment-pg || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stall-experiment-${{ github.sha }}
+          path: |
+            tools/stall-repro/results/run-*/
+            tools/stall-repro/results/fixture/
+            !tools/stall-repro/results/run-*/store-data/**
+            !tools/stall-repro/results/run-*/engine-data/**
   stream-store:
     if: contains(github.event.head_commit.message, '[store]')
     runs-on: ubuntu-latest
