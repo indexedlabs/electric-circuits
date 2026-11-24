@@ -1,0 +1,4577 @@
+{
+ "postgres": "PostgreSQL 18.7 (Debian 18.7-1.pgdg13+5) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
+ "snapshot": "1303:1303:",
+ "snapshot_at_end": "1303:1303:",
+ "taken_at": "2026-11-24 16:08:35.847996+00:00",
+ "tables": {
+  "record": {
+   "admitted_a": 22786,
+   "admitted_b": 22786,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "record_date_index": {
+   "admitted_a": 21686,
+   "admitted_b": 21686,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "record_recurrence": {
+   "admitted_a": 7247,
+   "admitted_b": 7247,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "record_assignee_index": {
+   "admitted_a": 26,
+   "admitted_b": 26,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "record_completed_index": {
+   "admitted_a": 20,
+   "admitted_b": 20,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "assignment": {
+   "admitted_a": 7847,
+   "admitted_b": 7847,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "calendar_event": {
+   "admitted_a": 5400,
+   "admitted_b": 5400,
+   "a_only": 0,
+   "b_only": 0,
+   "a_only_rows": 0,
+   "b_only_rows": 0,
+   "examples_a_only": [],
+   "examples_b_only": [],
+   "reasons_a_only": {},
+   "reasons_b_only": {}
+  },
+  "graph_edge": {
+   "admitted_a": 6707,
+   "admitted_b": 6151,
+   "a_only": 556,
+   "b_only": 0,
+   "a_only_rows": 468,
+   "b_only_rows": 0,
+   "examples_a_only": [
+    "0060f6ae-d6da-5906-be58-aec73c1dd003",
+    "02b8b5de-1cab-58a1-96db-d0a0401dc4d3",
+    "03a3e6af-1504-56d0-9d08-b5391ea898e7",
+    "04082e08-6558-5b8d-adbe-98ed4925b28f",
+    "04446901-b23b-5da5-b876-793268feecfe"
+   ],
+   "examples_b_only": [],
+   "reasons_a_only": {
+    "edge on a directly shared Record: S as written gives graph_edge no share list": 556
+   },
+   "reasons_b_only": {}
+  }
+ },
+ "differences": [
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fb04e7c3-b868-5fc1-859b-b48e58ef1538",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8680b5d9-932e-58e0-a55d-2bfb751da2bb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "82185345-0430-5517-9637-09d6b17e0ebd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f628f147-f2b7-59f3-b982-ae6f4aa1d92b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bbfa2663-2334-59ab-8905-634cbba06812",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "03a3e6af-1504-56d0-9d08-b5391ea898e7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4199ff98-ab72-5e29-958e-49f1a6a92047",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0060f6ae-d6da-5906-be58-aec73c1dd003",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4ec6417d-1c8e-5bcf-83c0-c7f3fcc74728",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "18a6e3cc-863e-5ae1-9d1a-c810cf3a864d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d303dc22-d3a8-5883-a1f5-60b98d79a088",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4389bd0a-0abc-5c97-b98e-b378b5e7fd19",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "596df057-6b04-5329-aea9-6a919871bacc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "09b2ff2c-cea2-5692-ae9d-4b9154ea373a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2de7d0d7-b971-5729-8f36-b9ad594b6f80",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b09a83b7-ab40-5dfa-a9e8-b1c5aac945a9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c51e4a04-1ec3-5ab4-8178-8b4117e6465f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "653d76bd-7885-5f64-900c-acab3590ccad",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8a7943f0-ba61-5bdb-8e67-aff03938115f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "91ea44ac-5c43-5850-b1b2-7f0b37251c69",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "097b52bf-0fbc-514e-9db3-8b4f3f419767",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3277e8be-bf4e-56b9-90a8-f5bd9658326d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bba73c86-6e4b-5963-92f7-a117d8c03459",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d88cc391-f0a9-500a-a7f4-d8ef70b438fd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ab4dbca0-5902-50e9-8107-807639bfe205",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e1d369d7-0f5c-52fe-89f1-849fbc14c630",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3c6cf4c8-7d8d-5834-b126-194c8faa13bf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "10972a5f-a134-5df3-a424-720763b85e65",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cb889a57-f27d-5bf0-bde0-df87bbc25aa7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f1c56445-8f6b-58aa-9fd1-53ef870a4030",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 0,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b732c576-3391-524d-bf05-c3e2f078216b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8c02a9b9-8eea-5a58-a81e-155479510a53",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c90b1e26-3bdf-5427-b4dd-3ab3c03a7058",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8eab88bf-706b-5c99-a2a1-02a91b82b1d1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8fe9a23f-777e-52ff-b710-8da7eeeaf4e3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e7a55b6c-408a-5a39-bc74-ef46885ba403",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1a691ed9-ba7f-564a-b805-ecb70b962b95",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "baa60763-6182-5012-b6de-aff9805f5c02",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bae88bdf-75de-5027-bf9f-741975e6808d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ae0da9e7-7fcb-5eac-812e-f4a1eddd5ec6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "447c052e-b8d6-5fb4-9fb3-d9ff4adab11c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fb324c06-1d3b-50e5-9d3d-2803a5e6094f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "33edbcf7-d217-5d1e-a62c-41dee0f3a30b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d9586618-b19f-520c-ba19-8b1dd76d1f5a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ec510fa5-4bc3-5763-8a44-ccbb0acfd8e0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "25a16d3a-e7f4-5e47-b7dd-e04f6ed9f568",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b401f2eb-46d7-5352-96d8-f0fe0ff8a8d6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "55f30bcd-7cdc-5ba3-ba65-c2f2b8dbdaba",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b4d338b4-3749-52af-ae78-9ca25e744548",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "86b13f1a-7be6-52be-8ee5-b7a62bde30b6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f52a6301-15ed-5843-ae88-4af12f880c59",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9004d6a9-401f-5221-9452-e2e0db31055c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ca9c64d0-d5cc-5c57-b627-07acd2e90959",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b6a4a564-538d-556e-9672-01662ce61431",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d386551b-9da1-566e-8016-68f2b427f1e4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "dce59cd3-bc63-5a61-97d9-8c6e8cfc82e9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e2c9c351-7718-5cc1-8942-98fbb2cf72d9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6d1c1c67-a973-5917-8b30-7e08f269bc0a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "453fba5e-27ab-524b-8e38-d7c30a6dc402",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "70ecd8f8-5232-53b6-b4f1-9cbe70207d78",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3d93c6ec-d850-5f33-b2db-78053436e143",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 1,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2a3d1404-d01f-5c24-92d5-83ded81141a7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b515d9b3-90f4-5695-b763-b9e400820f86",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "89c6fcc9-b0be-5dd5-8e1c-d95a04c8feb5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fcbac3ee-4694-575f-a3fe-bf56f3508584",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b559e4d6-6c17-5c75-8d20-37918de265c2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "458cfe5c-ceda-5cc4-874e-6269de971150",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c2c5d8fc-2a8c-51bd-9482-e30f559dd58d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4d874894-cc83-5466-9bb6-a014d090005b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "62b15a02-03a0-5446-9362-44bab79d32bd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c7e348ad-fcc7-5cd9-a39d-c92712f9f4f9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a9e4d31f-7230-567f-87d5-fe1e318cc346",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7529fa74-527d-5a2b-a9d7-cce017782070",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3a345cd0-7657-52f2-bd41-223e173a460d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "68bd073d-db49-5cb3-bc8c-0434c5eb0159",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4006a338-32fa-50aa-941c-390d01f5bac6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0a8d7ec0-14f8-550c-9100-9571b583c678",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a4009744-6fe6-50ad-a456-316eab030d6f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5cc500c5-98dd-5a35-8662-add9e4e15c5a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4ddafb98-8422-569d-b5f1-a6b8c0fca760",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "238843c0-7111-5cfb-88ca-06ffc244ea1d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "895b64ba-931c-5f33-a401-6859e263b5dd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "781b042e-712f-5c7c-8a50-6bd2305b928e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "41cb71aa-c9c7-5840-ac48-6619545e439a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "13628c83-1bf3-5e83-9fed-e78d98cb8345",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "20cafb42-4af3-5262-a3c2-6dc448105d73",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0a604eaf-a053-5ead-9223-84dc1c6a94e6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "123dfb75-c806-5a25-9006-94a545f722e4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "aa436d9b-2adb-5056-a611-1e5ebd61a200",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3bf1af33-1f57-5f45-bfbd-a4cb2576efc3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1a6fe7fa-38d5-54bb-8ef0-b745d1e8b7a3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "137bd258-964f-5339-9c85-03f9cd7f68bd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 2,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "745bac00-1157-5fe1-931f-c40b66b7d4b0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "793e07fe-d9d8-5571-b352-6ac4c927db4b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c2ff533f-e007-5746-9bb6-82f26fb63c08",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cf06e51f-186b-541a-9196-eaf4be0253d0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8e2a7f66-d764-565a-9c4d-ab241e3522cf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3076b9a0-c065-5ccb-9be1-59b27d8c5da5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5cd43ffd-bf40-5201-9f66-e009c02de204",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "70e12825-f13f-5049-b933-ab6b0d107c9b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "652b573e-13d9-544c-9825-516cae1c8271",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d6d83f5a-d439-5aa2-a383-f8f703bc4870",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "46ca156e-ea8e-5617-8d3a-e0a3dbd82d78",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8b04061a-d51c-5eea-9a51-74cfb9001efe",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a0c39465-fc85-5b67-9a70-353693a44129",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "daf95295-fe67-518c-84e2-902a8e760aff",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "53c1624d-6009-5c4a-a88e-f208f5ee5139",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "15f880c0-d4d5-5aa4-8526-812e9e66e127",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "adeb3842-9113-5708-9081-6e956f5c3427",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "93167d21-49bc-5026-a4c6-f81ce6aec06c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8012879d-59b7-5bfc-a5f9-995f8972f77c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "31096d8b-18a7-5f2e-8079-29026d85bad5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "65f8cf5c-69fd-5d6b-aba6-ed5fbf5f65ba",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c7855752-ba8a-5ba9-ba1b-fadb0ff18314",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3ee0e830-a8d1-5cef-a926-f333ab1b7fb3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9049ecae-3919-5312-8c97-02e954a8cd13",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2a6296b7-1618-56c9-a5e5-a1b030090015",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "68e711c2-9f3d-5db5-9804-3e81e16348c7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "516f16f0-395d-54f5-baf5-e78390247e18",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5e7a1bd6-22aa-5468-bbb5-823a1da45bd4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "797d5063-29d1-54ab-a834-1f49ed0a4c7a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0c7205e9-2a49-5726-8da9-f7bd83d49a45",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f8108e9b-9500-5493-a4df-88ae26bb2918",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 3,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "68187a8d-dccf-5e9a-b85e-d3dcf9411a4a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "30addfd2-14dc-5676-9fed-c2a6c212daa0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e30be07c-ff2f-5ff5-a6dc-c13df2073848",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4d6764ef-f44b-583e-ab5a-f48f46556704",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7157d765-a227-5449-8c2f-d9a90e04103e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6076aba5-8742-527e-97f3-2a690e1699e7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "db109e99-f9f6-54c2-9ca6-38633b6e3c3d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "deada63b-9ac2-5ca0-bf4d-aa53128c024f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8e3f052e-71e0-598f-8ebd-0ddff7db7a4b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "39319f0e-a5c2-5b12-934f-d3219882d2cc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d22a48ea-202b-57c3-ad42-60377487497e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "916a5f42-bd6e-5f5b-9fa1-841856f78986",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "30736f71-98c4-5ada-8089-4ef226e2daa8",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "28678c53-2f0d-532b-87c1-ef6a3d774d62",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7442dc3a-5ef5-591d-91c8-cc5eaf4fb178",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bc022d17-900b-5e68-8f0e-fd5131839b62",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "42eb85e0-78cd-5ffa-9d0b-9df3bf1f36b6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a8396cfc-6d78-5bbc-aa70-c32a6ffb63c6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "98ae8174-bd35-5a85-a8e6-69cb4990f35e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d8617b81-1cbf-5f21-8754-13203706cf54",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ee33c9e3-dac1-5b22-9c64-3dec36857877",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "200937c8-cb6d-5d37-8414-86c882dd945d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c63bc029-e669-5578-9ce4-f73150e6eab5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b53c9795-6a52-5aea-80a9-8cca488f97b7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9c560d1c-fcb0-52df-8bdc-c31ea02cded5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bbd75fd3-5f1c-5699-adb9-8264dfbc7817",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "26c8df04-0e4d-5f29-be53-ad731742b2c8",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "95186632-5b5d-5bf8-81b7-1ee2b8494792",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c566179d-0d8f-5dd6-bd7d-55c03e35bcaf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9c59e3cd-3877-51e3-9f6d-f0d760f6fbaf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7da79092-ccc0-5ac0-9746-eaf1019467b2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 4,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "04446901-b23b-5da5-b876-793268feecfe",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3cfa7946-fcb0-5bca-b385-4f71612c3e6f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "75f83900-484c-57ad-bdb5-757589a2cf4c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "148600e8-1a8b-5a1e-8452-3a6c72f05f0e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7eb54546-a8ed-5a57-9262-3a4611e1a792",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4f30eb8d-9e38-529e-b0c0-8f90ae06e30b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d3d54d4a-0134-5764-9559-7fcbb48e32a7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2bf82ad9-78dc-5ff9-a467-87dfc7be8037",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c07ce629-55fa-5233-8ad3-88ff13016d5d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "044eec74-1522-5443-a1e8-9c72d055234b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3d6bbeb8-b513-5760-8ee5-82c456812f16",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d2b30d6a-770a-5c1f-9d4e-5ae0cadac692",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "be3a9a35-9f64-51a9-a835-309ac2805abf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9bbcfdcc-17a6-52c6-8621-d403b4e6bcf9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "09de3b50-b047-5775-9200-5e7b7805b11e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "66ade0ac-e90a-5382-a89a-8951c11d1d7a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f88d3cd2-3f7f-59ae-9025-0053756ca8ef",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f95e890c-ba6f-5f65-8a4d-0cb6172ab00e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "673b94f1-fc8d-593c-be32-33cb1d77ea62",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0d714715-e613-524b-af3f-27e034e0acb7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "046390b0-b6b1-5983-8a1e-9a6e182e5666",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ab2c27ca-0ec2-5807-8052-2bf324ae831a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1614ed1b-9002-57d5-8d8e-3d3fa7e036a9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "41d1d4e8-cbf6-5735-9760-581398aa9b55",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0584ee31-d2b0-5d57-8d60-083faa23e98b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "30b6e91c-f46c-5801-a842-c543b43ff07c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "446bdc7b-6f27-5bb4-a4cb-b8d766173008",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "055873aa-e4d8-5fbe-ab92-e56cf5eafdac",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ed7a2de5-c9d8-5c44-b52b-a9e3f16598bf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2cf26785-4ac3-5917-a8f0-206c04b6ba82",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "32ed8f9a-a97d-532e-ad20-cf1fe0503294",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "57a2dd83-8236-5250-863f-bf9987f2b6c6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 5,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "21f5b704-bd9e-5161-a636-d9fb1e7af189",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4c856c56-a7b1-599b-9266-56a25eaec217",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "234356cc-6861-5e49-b502-cd6e11aa3d73",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cf0d8561-f8c7-5be5-9045-e1c0e3661aff",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4d2193f8-d6f5-5700-88c0-8807d6106e1d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "18e3c7df-260c-55fa-b3f7-b575fc07fe1c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "64187e0a-1006-55a6-8ae2-63d4f24cf26f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "65c06580-e554-5fff-8cb6-aeebca38c33d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5545aac3-3412-5aee-964c-45ff484ff206",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "326e470e-cbd7-57be-b8e9-76f6021b6ae3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1ef68f21-df36-57b8-9bb6-fbeffa41fbd6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "747da7ae-8364-5ec5-844d-62ec847c828a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "df2c19d2-a1a8-50d3-8d51-28b4fda08f71",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1926d09d-000d-535f-ab78-ac268c5f05da",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f6e067f9-c03c-5126-8719-6ac29c55a4f1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c6a4ed46-8468-50dd-b7ed-a6a4178b84b7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c030d821-ac04-575b-b9d4-ddd3b6c140d6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "80d668fd-83b3-5e5a-9f9c-5bd9d6e0c294",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b09a83b7-ab40-5dfa-a9e8-b1c5aac945a9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e5d1fe2a-9bf8-527d-9de0-357709e70380",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "653d76bd-7885-5f64-900c-acab3590ccad",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2cf051ca-d36b-538a-a784-022d454f77d2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "91ea44ac-5c43-5850-b1b2-7f0b37251c69",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fcb5b8cf-0fa7-50de-af06-1644b24d7911",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3277e8be-bf4e-56b9-90a8-f5bd9658326d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "17279b06-c023-5be3-a461-17c0047f2f2c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d88cc391-f0a9-500a-a7f4-d8ef70b438fd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "251971b2-4eb3-5fa0-88f1-1ba0d275be37",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e1d369d7-0f5c-52fe-89f1-849fbc14c630",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "db8792f3-6467-5b08-8b0e-19b6a5a20ae9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "10972a5f-a134-5df3-a424-720763b85e65",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fc25c20d-9a81-518f-98a2-8da04258273e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 6,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a228b3c3-1c65-555f-b60c-9bbf32d17014",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "054670b3-2a8d-55c2-8abc-1cd98b72720a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f6d4db0e-aecb-5e8d-85c3-3f1cd07fa7e9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "77342cb2-a7bc-51ae-b5a3-4162ba3b666e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7729cfb1-403f-5613-816f-0ddeee712fbb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e3295f2e-fec9-5bb3-b745-c77ea696c241",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c6dd201d-8376-5106-9670-39dd6d1eb214",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "74943c4d-6abd-5dca-a48e-0019a461a725",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "33a4f80c-1765-5df7-b6a2-6207c9fe0c2c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c862e77c-6451-5625-b50f-8f0eabff0c72",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f4c3805b-3793-5482-885c-d7f5d63e6d82",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8d1b86e8-9f43-5d5d-b429-7f4f05a3320d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cc119466-4874-5ed5-bca8-d59a0904e161",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d8f8a977-06e2-5c7b-b430-580b9f570d29",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "90f85af0-23bb-5ac4-b063-c508a5b6b7b3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "421ba81e-ec7f-51ea-aa8a-c5b3905aa1d9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3ef501aa-2b3b-5c4f-969f-1ed941499556",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "497a9b90-ad93-5576-86fd-0e7f0cbd29c5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b4d338b4-3749-52af-ae78-9ca25e744548",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0f2ee351-91d2-5a9d-9d84-af6cedeedd4c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f52a6301-15ed-5843-ae88-4af12f880c59",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d9bc8965-8f57-53bb-86e6-ef2254e6b65d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ca9c64d0-d5cc-5c57-b627-07acd2e90959",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b0daac5b-f65c-5376-ac48-1fe69f9f67df",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d386551b-9da1-566e-8016-68f2b427f1e4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "df363a9b-9aae-5e5a-9762-2224241f06ce",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e2c9c351-7718-5cc1-8942-98fbb2cf72d9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "67608649-b8b4-54ba-aa91-4531503622c4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "453fba5e-27ab-524b-8e38-d7c30a6dc402",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "76687670-c764-5ae7-b22e-60879df0e9ab",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3d93c6ec-d850-5f33-b2db-78053436e143",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ae695206-0349-5bde-b5ff-d29ccc25fab2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 7,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "78a40933-d261-5b5a-b4ed-3eb1e7acde5b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4e829df1-9abf-576f-a666-e0872b360453",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "de9e102d-4345-5bb9-8267-2b59cac880bb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bbed772a-c94b-5de8-850d-252455d7ecdb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6323b028-fee7-5ddd-a57f-d4f53d65699f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3e0c627e-c698-5913-8a28-17855de33f6a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8ff0b8cc-c619-5f35-8d2e-2066cbecc14a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5cd53b41-c27f-54e1-8639-4a82f8f6f78c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "75efc76f-f23c-5e75-8207-5f4ce16abe47",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2803f00a-36c7-5362-925a-56b5374627e3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "86e69dcf-f265-5808-929e-1987796d792e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "16023aa2-3a8c-5eca-b053-169c3912349b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9b1c4031-72c5-54d1-83ec-57964f097f18",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9eb0769b-0dd1-5f83-bde8-5b121358e2aa",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d8f607e7-d38e-5a0f-85b6-5ff784724be1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "167bd9ff-3de6-5965-a7d0-fca6a4cad1b1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b2e892c2-6026-5064-abbc-afedf34da3af",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "19920a1b-0dda-5c4c-beba-b71f612181ab",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4ddafb98-8422-569d-b5f1-a6b8c0fca760",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c23fb059-6b7c-58ab-919f-f2d3414c40ee",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "895b64ba-931c-5f33-a401-6859e263b5dd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "06f90cec-a17f-56a9-9df1-0b2506095f20",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "41cb71aa-c9c7-5840-ac48-6619545e439a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5dd786cd-5ad4-597b-abc2-c84599b56041",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "20cafb42-4af3-5262-a3c2-6dc448105d73",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "29e0cbf3-6b63-562a-b2e0-c84c5c0327be",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "123dfb75-c806-5a25-9006-94a545f722e4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6fc99d16-c781-51e7-b553-69dfb5823b3b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3bf1af33-1f57-5f45-bfbd-a4cb2576efc3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "99e7f83c-0cfc-5007-9584-922f2c2b98be",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "137bd258-964f-5339-9c85-03f9cd7f68bd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1848fdc5-f4af-5f88-9ea5-1ac157df6860",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 8,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b9915c21-30b4-5c13-a840-2232945adc42",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "df239e16-5ba2-564a-9034-249d09cddcd3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c71af218-b7c9-5a04-a140-986a0d20dd15",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "edd2d626-9618-5859-85bc-a3c0c98cc80c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ec088ee9-7050-5b3e-a2b1-3c9661f6ff9d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "aabdcc4c-8801-530f-9692-22ff47e28fe3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "937e7c03-725a-5ce2-a768-5fb8770b6c82",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "347cb385-240c-583a-b397-530bf83a2045",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2d6fca06-c741-5b1d-a810-3c555bf3f9d7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cd0da398-0ae7-5e9d-b2b5-d92806ea7934",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fe8fad4f-2eaf-5ca0-bed2-aab4860b4867",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "64e65760-7614-56a3-b4a0-4bc5718753cc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f10c14bb-ff4e-5634-87f9-3a08641d3588",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3587d3c4-29b8-5cb7-96c8-f7443457cd38",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "deaddf88-db3e-57bd-aa26-1cc14eb5071e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0c445b33-f0ef-590c-80a9-25ca8fd9c107",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "992d636b-8768-59bd-a05c-ed3f0ab264be",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "02b8b5de-1cab-58a1-96db-d0a0401dc4d3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8012879d-59b7-5bfc-a5f9-995f8972f77c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4520f521-90d7-510d-bd58-709e52120894",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "65f8cf5c-69fd-5d6b-aba6-ed5fbf5f65ba",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "41ff4155-4210-5aac-9270-fb7055aa709c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3ee0e830-a8d1-5cef-a926-f333ab1b7fb3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9eec634e-e654-5697-8810-4fd30a024b49",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2a6296b7-1618-56c9-a5e5-a1b030090015",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "35c9d39a-20e0-50fe-bf5d-612eee362e29",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "516f16f0-395d-54f5-baf5-e78390247e18",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d296aed8-5ca4-5cd3-955d-10e8eb482069",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "797d5063-29d1-54ab-a834-1f49ed0a4c7a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "375cc4ff-4ae2-5baa-a577-a659dadd800e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f8108e9b-9500-5493-a4df-88ae26bb2918",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "989cc9c9-c497-5bec-8e3f-33875b46f56b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 9,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2431789e-0458-5a3e-b3fb-0e64c722474e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e45d1a77-92a9-57b0-bd3d-39924fda8ff9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "405a58d6-0d7d-555a-b464-04eff7ef142f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "beab190b-17bb-575a-9137-58cb8474a183",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6b3bc719-9b65-585d-b378-5494d2c2484d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "79518e77-61f2-5b12-b2d2-1185bac7606a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1b4938e0-f8eb-55d2-920e-40356492552f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1c3451ef-07d2-505c-aa62-762effb27d24",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1b9fcdf2-e89e-597f-9d9b-d25d3d36b1da",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a0f918d4-2e5a-530d-ab16-b9fe0e70be2b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "90824686-023d-5bb3-ab1b-f0b99f3fd64d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f0dd71f8-9d27-53b9-8b54-261221490de4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "dd3dc260-6be6-5b07-8bae-bb846a1a0f40",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "81229462-ca35-52f5-ad02-5d399671b656",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5e85e8ec-a67c-5d13-938c-48ed0792f707",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7d61b9fa-ff3e-5873-aaa3-77e00c144cd7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "346e7f39-7451-506a-b1dd-79da463cd00e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f282a7e3-118a-5fef-92e7-df7a147d31e3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "98ae8174-bd35-5a85-a8e6-69cb4990f35e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cdcca2b9-c5a7-546d-82d1-5ce65dc384dd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ee33c9e3-dac1-5b22-9c64-3dec36857877",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "920cfe05-6add-57e1-9df1-662fcccda2b0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c63bc029-e669-5578-9ce4-f73150e6eab5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "53eb87e0-f3cd-544d-b08e-ca7e7f388a47",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9c560d1c-fcb0-52df-8bdc-c31ea02cded5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2e6e179b-1db4-55ad-a8c3-6620f462b22c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "26c8df04-0e4d-5f29-be53-ad731742b2c8",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f32215ec-77a6-5eb3-bc5b-6f6caf09c93d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c566179d-0d8f-5dd6-bd7d-55c03e35bcaf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "aa9cac76-bdfd-508b-aec5-2aa8752f34db",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7da79092-ccc0-5ac0-9746-eaf1019467b2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 10,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c5c7508f-c42c-51ad-8cf6-2caf94b08bef",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "90e80c56-cc02-50a8-a987-9e4e8b905eea",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "de53d460-c3a5-521b-8c73-194d5aafad16",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e88852ba-6c68-593c-baaa-b029337daddc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c6cddbdb-df5d-5cc4-aabc-b41b580ac737",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "abaebbad-4be4-56ce-af10-b4c56960f37a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "423879ff-9a02-5a3a-83a3-afe16814c483",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "74453cf0-bb33-5f3d-b08c-a4a4b5cc1301",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d99db14b-1ee5-5119-b24b-2ffce4c4943f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "757fc26f-7adc-5c28-8e00-fa70cf3b6367",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ec93e94a-7706-5856-b75d-66aaa34a5864",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d9d0aeb7-8b19-5a7d-89c5-8e7b81638cc0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c1c20637-23eb-5cdf-b801-7dee8690ee5a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a520697b-6a44-53da-8b72-0131f80aa243",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bd011055-f19a-5f1f-b935-3000d838cf0b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f8092fc3-865d-53b9-8f93-f7e59d71b7a3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "45e42e98-a033-52ff-8183-a74bebf9701b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "aad64b65-1c80-50d5-8150-2f1a6ea07e1d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0d714715-e613-524b-af3f-27e034e0acb7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fbb9dba4-645a-52ba-bf8a-9ea736c50524",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ab2c27ca-0ec2-5807-8052-2bf324ae831a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ea88999b-acd9-5c26-be82-0c5f14a14af3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "41d1d4e8-cbf6-5735-9760-581398aa9b55",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6c4f604d-aeb0-5e0e-b462-9754c17f6cad",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "30b6e91c-f46c-5801-a842-c543b43ff07c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "04082e08-6558-5b8d-adbe-98ed4925b28f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "055873aa-e4d8-5fbe-ab92-e56cf5eafdac",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d583039c-e90a-5a1e-815e-90655505d521",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2cf26785-4ac3-5917-a8f0-206c04b6ba82",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c5de6123-09c5-5065-9405-63d61347810b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "57a2dd83-8236-5250-863f-bf9987f2b6c6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 11,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "39c07e8b-0f3e-58ea-8523-045e84b3f079",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7f28b1af-c974-56dc-80ba-2373a6dfe344",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "48c36bf1-401e-5639-a040-83fe2c25b508",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b8367767-1659-5010-9c5d-742cdbc34227",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "38c10cc7-6064-57bc-8f34-dc9170a677f5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5661d551-62b0-5024-ac5a-e0feca1c9b42",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "12716806-4641-5349-aef4-fc3c218e3188",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "18251b98-4b74-58bc-910e-ef4a96ed3511",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "578f8db4-4e28-5a11-afa5-8e27810b8b7f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9b10c23f-dba1-5cb4-8dd8-2baf8720caa3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "385829dd-e172-5b4e-a8e2-d71b3e2f4abd",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e690fa63-f770-5450-a5aa-e37d4feb55f9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f52f87ad-ac7a-5052-ade2-2a7eaf653797",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1c4816b2-d797-57aa-87a4-2d591957aaea",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c6866f23-194f-5a89-bc3a-420000407508",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d809ccd3-9ffb-53c1-a02a-ddd97d61e805",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9c8e5591-9974-5d88-bc4a-d794a29d38e3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b0e9948e-2273-5326-b812-4702b4233d32",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e5d1fe2a-9bf8-527d-9de0-357709e70380",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "df58d982-4988-5eb8-a87c-19faa7868300",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2cf051ca-d36b-538a-a784-022d454f77d2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "db57ef41-2e36-5f44-aee3-e0eba4652c62",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fcb5b8cf-0fa7-50de-af06-1644b24d7911",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e992b5fa-f563-5cb8-b542-cb034ce6e9e6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "17279b06-c023-5be3-a461-17c0047f2f2c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7619859d-a5b1-5d02-8948-d97817799ef2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "251971b2-4eb3-5fa0-88f1-1ba0d275be37",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a9176737-9292-58fa-b53b-7061b632255f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "db8792f3-6467-5b08-8b0e-19b6a5a20ae9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4d8ecae2-a430-5976-abe0-fed2388c8df5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "fc25c20d-9a81-518f-98a2-8da04258273e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 12,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bf182643-f008-526c-aa83-e5644f4e6376",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bfb286b1-78b9-5d6e-9a9b-0899acc9b53d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b754b70f-c086-5870-9f8f-fce5875faef4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "886dfaee-45c8-55c0-8c09-67eab03fe34c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "10afdfc0-427b-5002-a7cf-50c32d0bc2a2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1ea6b8c0-c97b-5c0b-89f6-ca1de00fcb84",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "43b210a2-a4b7-5fa5-bdec-9a48ea34e177",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6c132a8a-05b3-5e77-9daa-10d1f5f8e30e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ad4ba589-710b-5e85-afb1-8b8ee16fe125",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4f073235-99c6-5938-9285-f5f705fd24d0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9fc3725e-254c-50a4-af08-aecf99e31542",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7454595c-8895-5b71-9c90-583955751203",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6ff6dec9-ee0b-5d9a-98e8-6f2c82420a90",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a02db3d8-7e42-5f90-b080-539d1f764073",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "06699511-5dcb-5624-a239-614cb1c6e52c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ff343684-3191-5291-8db5-9daa0ac21565",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7faf88bd-535a-5ca5-b502-e8421c375712",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "78c46f42-4d94-5073-b82c-2060b49157cf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0f2ee351-91d2-5a9d-9d84-af6cedeedd4c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c51e4a04-1ec3-5ab4-8178-8b4117e6465f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d9bc8965-8f57-53bb-86e6-ef2254e6b65d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8a7943f0-ba61-5bdb-8e67-aff03938115f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b0daac5b-f65c-5376-ac48-1fe69f9f67df",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "097b52bf-0fbc-514e-9db3-8b4f3f419767",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "df363a9b-9aae-5e5a-9762-2224241f06ce",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bba73c86-6e4b-5963-92f7-a117d8c03459",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "67608649-b8b4-54ba-aa91-4531503622c4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ab4dbca0-5902-50e9-8107-807639bfe205",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "76687670-c764-5ae7-b22e-60879df0e9ab",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3c6cf4c8-7d8d-5834-b126-194c8faa13bf",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ae695206-0349-5bde-b5ff-d29ccc25fab2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 13,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "faab61c5-5c38-5357-9a97-fbf32f71a668",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "96832deb-9386-5b75-b57d-b13cee104bda",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "06a66773-2e07-53e2-820a-e2d66384042b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c207bf35-8678-5a98-aa97-da4b2cd140e0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cb1aec56-4620-5012-b5e5-35b7e7056705",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "469bb8e3-7187-5259-8b8f-7fce65420e96",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0bb543af-d00e-5adc-88fe-8f84bc2c1c30",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "dbafd925-e7b8-5c3d-97db-25af61b64e37",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "eeec1464-7783-5757-84a7-ae1b5e28d055",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f19d83ad-d2b7-5012-a2a0-a296eebd2677",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8a5f2642-44a5-58ac-9703-a1f889f00672",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c0cc60eb-83f5-555d-adf4-4890ebd1a237",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6d347e80-bd9d-5457-b030-9f4542b24091",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ef28ca16-dabc-5107-8f22-1bb2933649a2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a377374c-eeb5-5cb3-b3d8-b8740f0c3c24",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0a69a57d-68f1-56f8-be48-ab397b361fb9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f7d1af85-2b6b-5421-b195-970e310ac2de",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "69e62184-e5f8-58ff-b0a8-62f7b4f334a4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c23fb059-6b7c-58ab-919f-f2d3414c40ee",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "86b13f1a-7be6-52be-8ee5-b7a62bde30b6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "06f90cec-a17f-56a9-9df1-0b2506095f20",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9004d6a9-401f-5221-9452-e2e0db31055c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5dd786cd-5ad4-597b-abc2-c84599b56041",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b6a4a564-538d-556e-9672-01662ce61431",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "29e0cbf3-6b63-562a-b2e0-c84c5c0327be",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "dce59cd3-bc63-5a61-97d9-8c6e8cfc82e9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6fc99d16-c781-51e7-b553-69dfb5823b3b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6d1c1c67-a973-5917-8b30-7e08f269bc0a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "99e7f83c-0cfc-5007-9584-922f2c2b98be",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "70ecd8f8-5232-53b6-b4f1-9cbe70207d78",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1848fdc5-f4af-5f88-9ea5-1ac157df6860",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 14,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "99b96e4b-8db7-5d5c-9af3-944f4bdb6aed",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "85a938a1-713e-5843-9d93-bf0a23125e8c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "98ef490a-3e0d-55d3-ad77-64a5a0df978f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b3e23b51-f1f6-55e2-a830-4df58c62574f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "2190eeb7-3c98-5f9b-8c0a-007c0480fbc0",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "263f4361-7e80-5a8b-9327-897bd1d0edfb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "696a3c3c-439a-56d5-ba68-1490296dea3a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "066bb4ab-aee6-5d1e-af85-4fd459b7b8e4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6f94dccc-9cdb-5066-861a-32043bb4776f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "e938d3fd-4cab-5270-8620-f71c4a56ec3d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "43d00f15-0a60-5611-ab39-64547447b335",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "21084ffe-33f4-56f7-b4e7-1b9b3442cb12",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "8a549903-d4c5-57e5-9453-32ea035a8ee1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "cdae5bef-0df1-5575-9480-67a2ae2d6795",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "44f35fb2-232a-5d70-b0fa-70c042703c1e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "18ff3f84-413d-5aba-afc5-ed5cf794cab7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "dcb78648-92c1-5ef3-af08-bf2b50cdc1cb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "5503ae95-e5b4-5ce5-9218-f5c5fcd1cde5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4520f521-90d7-510d-bd58-709e52120894",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "238843c0-7111-5cfb-88ca-06ffc244ea1d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "41ff4155-4210-5aac-9270-fb7055aa709c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "781b042e-712f-5c7c-8a50-6bd2305b928e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "9eec634e-e654-5697-8810-4fd30a024b49",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "13628c83-1bf3-5e83-9fed-e78d98cb8345",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "35c9d39a-20e0-50fe-bf5d-612eee362e29",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "0a604eaf-a053-5ead-9223-84dc1c6a94e6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d296aed8-5ca4-5cd3-955d-10e8eb482069",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "aa436d9b-2adb-5056-a611-1e5ebd61a200",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "375cc4ff-4ae2-5baa-a577-a659dadd800e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1a6fe7fa-38d5-54bb-8ef0-b745d1e8b7a3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "989cc9c9-c497-5bec-8e3f-33875b46f56b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 15,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "22ee96ba-154b-5b3c-9bca-d86602958e75",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b11879a9-50c4-5842-a25d-ef8031eb9eb2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "d3350af7-e379-5328-bd86-b8262681c051",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7e7e3efe-4dc2-5082-abf9-1e93f4f9a3c7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a108c8e7-80ed-5ae7-a6da-adbd58fe03b5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6aab72f7-bc62-5505-a9a7-c8db7ca05e7a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3d4780db-58e6-5ff5-9aaa-f4ee88a317d8",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1cd5fd68-7019-5b10-8288-10d6093d3aef",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "42782212-649c-5dad-aaf8-d0b3ce4ca73b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "74cca5f6-9e04-5058-827a-1b203ff780d4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3bc46ca5-9b95-5627-918e-0799e8aa9148",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "72f3d256-49a1-5cab-a2d3-738538b6ab64",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "71879aa4-ff00-50b3-aef3-ded599cf3077",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "feb875aa-8ad0-5390-a7e6-dce7662e55f1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ebfe0883-dba8-5c0f-8375-bf6f461c2cc4",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "c6015029-46a8-56d6-b5d9-58299e0accb9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "73ab1d71-f3a8-50d0-b38a-9390d284e157",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "3b841fff-1b45-5c77-98d1-8b2406f98793",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "712eb24f-8cac-543e-94ca-dd1e616c5f3b",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 16,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a1ceeeb0-bb0b-5852-bb8a-1f8092da99eb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "24cb442b-365d-58cf-afb9-aa41ce25aadb",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "32c5d686-593e-57cc-b7a2-9e7d70cca914",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f987e9a2-d382-5367-bdec-fb8fcec9861e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7a5d9972-a6a2-5303-b7d2-28197e8c21d9",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a561bf27-d3f4-5622-89b9-0cb9b58b9080",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6d1194fe-8acc-5b79-bf2f-7ab6e21968e3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "05893d2e-997e-5a4d-9639-bae0eb64b994",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "29680afd-b802-5e88-8651-f36a80ab03cc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "345776ed-7eb5-5883-9ba2-e5fd619272fc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f57aa0ce-da5a-5d78-88f5-bb01094c4779",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bdd54c13-4676-5c2c-9228-09b0c73b6138",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "86d20d18-2a63-545b-bd0b-ca699bed07af",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "1882adc0-7a64-5da8-bfd3-a1ae8eda31b1",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "93782e37-1ae7-5c1f-b68e-06596fa423d2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b17412cc-b51d-571f-933c-378e5014ff9a",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f271431f-890b-52d9-b601-f26992aa7c67",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "180d264d-4bb4-51d6-b422-1f05436a68c3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "90966c6b-5f6a-5f0b-9ff0-c996cbc1d3c7",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 17,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "151e5763-6e07-5358-bed5-1afe28a3c420",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7fa548f0-739e-5928-a4d3-32f9d84617f2",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "11698f6c-0fcb-53c7-92cb-eda1c310fe18",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "bbf6d583-b7db-557b-b02d-5c0e298dfcf3",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7c482d2e-0823-536f-a0bd-cc7919586db6",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "7a7a3175-125a-5359-9842-c220bb9096dc",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "284e9333-1b29-5393-b73d-e0d588c7f33c",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "98b32974-78b9-53e5-9933-1f126e8f1b7f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a36d4442-83d9-5629-b318-7ac82a8c2e2d",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "dca8c7fd-6a43-53cd-b959-14e062e58c25",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "94648411-3436-541d-a465-0247f362353e",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "678fcbcf-4d72-5a01-8669-62b6dd2b6f7f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "6bc0aca3-6d1f-51b6-a8b6-829d744380e5",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "b1416ffe-c65c-5f00-9a60-cefb5f7cc2fe",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "f097b53a-5d17-549e-8353-ce92623ec0ad",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "4d59bd78-e635-55ca-a4d1-a39a1c1b3eab",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "a719c19e-44dc-529b-95db-c8ba806ae61f",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  },
+  {
+   "account": 18,
+   "table": "graph_edge",
+   "side": "a",
+   "key": "ef22e402-325a-524e-8781-f47b69cc70ba",
+   "reason": "edge on a directly shared Record: S as written gives graph_edge no share list",
+   "expected_by_brief": false
+  }
+ ],
+ "graph_edge_alternates": {
+  "graph_edge with the direct-share Record list": {
+   "a_only": 0,
+   "b_only": 0
+  },
+  "graph_edge with generic and relates_to tested against member Spaces only": {
+   "a_only": 556,
+   "b_only": 0
+  },
+  "both": {
+   "a_only": 0,
+   "b_only": 0
+  }
+ },
+ "drift_check": {}
+}
