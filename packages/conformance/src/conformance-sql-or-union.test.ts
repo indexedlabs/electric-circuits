@@ -224,11 +224,11 @@ async function oldSqlIds(table: string, where: Predicate): Promise<number[]> {
 }
 
 /** Query the production subset endpoint; text keys are kept as text for the collation case. */
-async function subsetRows(harness: Harness, table: string, where: Predicate, limit = 10000): Promise<Row[]> {
+async function subsetRows(harness: Harness, table: string, where: Predicate, limit = 10000, offset = 0): Promise<Row[]> {
   const res = await fetch(`${harness.engineUrl}/v1/subsets/query`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ table, where, orderBy: { col: 'id' }, limit }),
+    body: JSON.stringify({ table, where, orderBy: { col: 'id' }, limit, offset }),
     signal: AbortSignal.timeout(20000),
   })
   const text = await res.text()
@@ -245,11 +245,17 @@ async function engineIds(table: string, where: Predicate): Promise<number[]> {
  * received, then release it and collect its rows. The lock is the causal gate: no log timing,
  * extension, engine instrumentation, or copy of the SQL printer is needed.
  */
-async function subsetWithSql(harness: Harness, table: string, where: Predicate, limit = 10000): Promise<{ sql: string; rows: Row[] }> {
+async function subsetWithSql(
+  harness: Harness,
+  table: string,
+  where: Predicate,
+  limit = 10000,
+  offset = 0,
+): Promise<{ sql: string; rows: Row[] }> {
   const lock = await lockTable(harness, `"public"."${table}"`)
   // Observe rejection immediately even while waiting for the relation-lock gate.
   let failure: unknown
-  const pending = subsetRows(harness, table, where, limit).catch((error: unknown) => {
+  const pending = subsetRows(harness, table, where, limit, offset).catch((error: unknown) => {
     failure = error
     return []
   })
@@ -444,6 +450,30 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
     expect(sql).not.toContain('UNION ALL')
     expect(sql).toContain('limit 1')
     expect(rows.map((r) => Number(r.id))).toEqual((await oldSqlIds('items', where)).slice(0, 1))
+  })
+
+  it('a rewritten positive key OR returns the same ordered pages as the old SQL', async () => {
+    const where: Predicate = { or: [
+      { col: 'id', in: { table: 'parents', project: 'id' } },
+      { col: 'parent_id', in: { table: 'others', project: 'parent_id' } },
+    ] }
+    const old = predicateToSql(where)
+    const orderedSql = `SELECT * FROM "public"."items" WHERE ${old.text} ORDER BY "id" ASC`
+    const expected = await pgQuery(h, orderedSql, old.params)
+    const pageSize = 7
+    expect(expected.length).toBeGreaterThan(2 * pageSize)
+    const pages: Row[] = []
+    // Include the empty final page. Compare each SQL page and the combined result without sorting
+    // either response in JS, so an ordering or page-boundary regression cannot hide in set equality.
+    for (let offset = 0; offset < expected.length + pageSize; offset += pageSize) {
+      const expectedPage = await pgQuery(h, `${orderedSql} LIMIT ${pageSize} OFFSET ${offset}`, old.params)
+      const { sql, rows } = await subsetWithSql(h, 'items', where, pageSize, offset)
+      expect(sql).toContain('"id" IN (SELECT "id" FROM "public"."parents" UNION ALL SELECT "id" FROM "public"."items" WHERE "parent_id" IN (SELECT "parent_id" FROM "public"."others"))')
+      expect(sql).toContain(`order by "id" asc, "id" asc limit ${pageSize}`)
+      expect(rows, `page at offset ${offset}`).toEqual(expectedPage)
+      pages.push(...rows)
+    }
+    expect(pages).toEqual(expected)
   })
 
   it('different projection collations keep the original SQL and rows for text keys and columns', async () => {

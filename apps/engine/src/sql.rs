@@ -960,6 +960,24 @@ mod tests {
         assert_eq!(w, r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))"#);
     }
 
+    /// Both arms are positive INs, so the broad-branch veto cannot hide a missing key-type guard.
+    /// The key is int4, while its subquery projects int8; these must remain separate branches.
+    #[test]
+    fn a_positive_key_or_requires_the_key_projection_type() {
+        let (w, params) = app_sql(
+            "legacy",
+            serde_json::json!({"or": [
+                {"col": "id", "in": {"table": "legacy", "project": "big"}},
+                {"col": "big", "in": {"table": "legacy", "project": "big"}},
+            ]}),
+        );
+        assert_eq!(
+            w,
+            r#"("id" IN (SELECT "big" FROM "public"."legacy") OR "big" IN (SELECT "big" FROM "public"."legacy"))"#
+        );
+        assert!(params.is_empty());
+    }
+
     /// Both rules apply to every `OR` at every depth: under an `AND`, inside a subquery's `WHERE`
     /// (on the inner table's own key), and in a subquery nested in that one. Placeholders start
     /// where the caller says.
