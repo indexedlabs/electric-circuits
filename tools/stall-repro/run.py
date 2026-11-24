@@ -105,12 +105,13 @@ async def run(args):
     fixture = folder / "results/fixture"
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
     data = load_data(fixture / "columns.json")
-    store_help = subprocess.check_output([str(Path(args.store).resolve()), "--help"], text=True)
-    (output / "store-help.txt").write_text(store_help)
+    help_probe = subprocess.run([str(Path(args.store).resolve()), "--help"], capture_output=True, text=True)
+    (output / "store-help.txt").write_text(help_probe.stdout + help_probe.stderr)
+    supports_page_cap = b"--max-chunk-bytes" in Path(args.store).read_bytes()
     store_arguments = [str(Path(args.store).resolve()), "--host", "127.0.0.1", "--port", "8791", "--data-dir", str(output / "store-data"), "--durability", "wal"]
-    if "--max-chunk-bytes" in store_help:
+    if supports_page_cap:
         store_arguments.extend(["--max-chunk-bytes", "4194304"])
-    save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": "--max-chunk-bytes" in store_help})
+    save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
     save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL))
     store_log = (output / "store.log").open("w")
