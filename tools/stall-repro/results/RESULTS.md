@@ -1,9 +1,10 @@
-B-cold (amended, `variant-b-cold.md`) FAILS its pass line. Import 10.1 s, drains 20% and live changes 0% during it. Large and small deletions take 5.2 and 5.3 s with drains and live changes at 50-60%. The share deletion takes 10.1 s with drains at 20%. B on the same runner passes (2.5, 1.2 and 0.2 s, all probes 100%). Every import backfill is `graph_edge`, from the edge branches kept on today's filter. E-only (edges keyed on today's model) still stalls: 273 s, 0.51x. E+R takes 9.8 s on the import (0.02x) but is not served (drains 20%).
-Today vs yesterday (Nov 24, same runner): prod's engine today (`b42f70d`, 2 vCPU) stalls as long as yesterday's (`5b2cf3e`, 1 vCPU). Import 547 s against 532 s (1.03x), large deletion 153 s against 159 s (0.96x), small deletion 265 s against 253 s (1.04x). The other account's drains and live changes are 0% on both; only subsets improve (100% against 58-84%). Bisect: PR 70 (`e10c4bd`) carries the slowdown since `1be10fb`, 1.29x on the import and 3.8x on the large deletion; PRs 71, 72 and 69 change nothing.
-M4: Today the time goes to per-row membership evaluation (about 19 to 23 ms per changed row, 69% of CPU), serialized on one registry mutex. The other account starves because its drain and live change wait behind the workload in the single change log. No engine-side bridge keeps that account served (drain and live success at most 22% in every A variant, including 2 CPUs). The audience-key model removes the stall only if graph edges are keyed as well: B-retained takes 132 s with drains at 0 to 1%, against 3.9 s with graph edges keyed. Build that first. Prod's second vCPU does not help this path (0.96x), and the estimate is that prod is safe tonight but exposed to hour-scale outages from Nov 26 to 28, depending on regrowth.
+M4 (revised after rounds 2 and 3): Per-row membership evaluation under one registry lock is where the time goes, and the other account starves behind the workload in the single change log. Today's prod engine (`b42f70d`, 2 vCPU) stalls as long as yesterday's (1.03x). PR 70's snapshot-removal proof (`Prior::was_member`) makes the import 1.29x and the large deletion 3.5-3.8x slower. No engine-side change keeps the other account served. Among model variants only those that key every `graph_edge` branch and the Record family do. B-cold with all edges keyed passes (2.0, 1.2 and 0.5 s, every probe served). B-cold as amended fails (10.1 s import, drains 20%). E-only still takes 273 s, and E+R takes 9.8 s but is not served.
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
 M3: The all-plain audience-key prototype processes import/deletion in 3.18/1.79 s with zero backfills, but retaining the proposal's exceptional scopes still starves drain/live for the 148.42-second import.
+Earlier M4 (before rounds 2 and 3): Today the time goes to per-row membership evaluation (about 19 to 23 ms per changed row, 69% of CPU), serialized on one registry mutex. The other account starves because its drain and live change wait behind the workload in the single change log. No engine-side bridge keeps that account served (drain and live success at most 22% in every A variant, including 2 CPUs). The audience-key model removes the stall only if graph edges are keyed as well: B-retained takes 132 s with drains at 0 to 1%, against 3.9 s with graph edges keyed. Build that first. Prod's second vCPU does not help this path (0.96x), and the estimate is that prod is safe tonight but exposed to hour-scale outages from Nov 26 to 28, depending on regrowth.
+Today vs yesterday (Nov 24, same runner): prod's engine today (`b42f70d`, 2 vCPU) stalls as long as yesterday's (`5b2cf3e`, 1 vCPU). Import 547 s against 532 s (1.03x), large deletion 153 s against 159 s (0.96x), small deletion 265 s against 253 s (1.04x). The other account's drains and live changes are 0% on both; only subsets improve (100% against 58-84%). Bisect: PR 70 (`e10c4bd`) carries the slowdown since `1be10fb`, 1.29x on the import and 3.8x on the large deletion; PRs 71, 72 and 69 change nothing.
+B-cold (amended, `variant-b-cold.md`) FAILS its pass line. Import 10.1 s, drains 20% and live changes 0% during it. Large and small deletions take 5.2 and 5.3 s with drains and live changes at 50-60%. The share deletion takes 10.1 s with drains at 20%. B on the same runner passes (2.5, 1.2 and 0.2 s, all probes 100%). Every import backfill is `graph_edge`, from the edge branches kept on today's filter. E-only (edges keyed on today's model) still stalls: 273 s, 0.51x. E+R takes 9.8 s on the import (0.02x) but is not served (drains 20%).
 
 # OTTO-13916 — scratch measurements, never merge
 
@@ -957,3 +958,96 @@ samples, so the unresolved share is large.
 | Large deletion | 4.2 | 53 | 377 | 14.1% | 2.4% | 8.8% | 7.2% | 2.7% | 63.7% |
 | Small deletion | 4.6 | 83 | 433 | 22.4% | 2.3% | 9.2% | 1.8% | 2.3% | 60.7% |
 | Share deletion | 7.2 | 81 | 588 | 8.0% | 4.6% | 20.4% | 2.6% | 2.0% | 60.7% |
+
+### Edge-branch attribution in A (which part of today's edge filter carries the cost)
+
+Today's catalog (A), with one branch of the `graph_edge` authorization moved to a plain keyed
+shape per account (`audience_key` plus that branch's edge kinds), or with the harness's synthetic
+date window dropped from edge requests. Every other shape is as in A. Two jobs, each A then its
+variants on one runner; `--workloads import large-delete`.
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × A (same runner) | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| A | Xeon 8370C | import | 512.2 | 1.00 | 99 | 15,420 | 0% (0/513); p95 — | 70% (360/513); p95 1.76 | 0% (0/513); p95 — | no |
+| A | Xeon 8370C | large-delete | 146.1 | 1.00 | 95 | 17,717 | 0% (0/191); p95 — | 83% (158/191); p95 0.94 | 0% (0/191); p95 — | no |
+| A-edge-key-attendee | Xeon 8370C | import | 424.3 | 0.83 | 99 | 13,320 | 0% (0/425); p95 — | 78% (331/425); p95 1.29 | 0% (0/425); p95 — | no |
+| A-edge-key-attendee | Xeon 8370C | large-delete | 138.5 | 0.95 | 96 | 16,217 | 2% (3/145); p95 0.32 | 81% (117/145); p95 0.92 | 2% (3/145); p95 0.32 | no |
+| A-edge-key-generated | Xeon 8370C | import | 369.5 | 0.72 | 99 | 11,100 | 0% (0/370); p95 — | 79% (291/370); p95 1.16 | 0% (0/370); p95 — | no |
+| A-edge-key-generated | Xeon 8370C | large-delete | 122.9 | 0.84 | 95 | 14,517 | 3% (4/129); p95 0.33 | 82% (106/129); p95 0.65 | 3% (4/129); p95 0.34 | no |
+| A | EPYC 7763 | import | 527.7 | 1.00 | 98 | 15,420 | 0% (0/528); p95 — | 68% (357/528); p95 1.78 | 0% (0/528); p95 — | no |
+| A | EPYC 7763 | large-delete | 154.3 | 1.00 | 95 | 17,717 | 0% (0/205); p95 — | 83% (171/205); p95 1.00 | 0% (0/205); p95 — | no |
+| A-edge-key-resource | EPYC 7763 | import | 417.0 | 0.79 | 98 | 14,940 | 0% (0/417); p95 — | 71% (297/417); p95 0.86 | 0% (0/417); p95 — | no |
+| A-edge-key-resource | EPYC 7763 | large-delete | 149.1 | 0.97 | 96 | 17,117 | 3% (4/158); p95 0.97 | 80% (127/158); p95 0.95 | 3% (4/158); p95 0.98 | no |
+| A-edge-no-window | EPYC 7763 | import | 488.8 | 0.93 | 98 | 15,420 | 0% (0/489); p95 — | 70% (344/489); p95 1.68 | 0% (0/489); p95 — | no |
+| A-edge-no-window | EPYC 7763 | large-delete | 143.9 | 0.93 | 95 | 17,269 | 3% (4/153); p95 1.27 | 80% (123/153); p95 0.84 | 3% (4/153); p95 1.07 | no |
+
+| Keyed branch | Import × A | `graph_edge` import backfills (A: 6,900) |
+| --- | ---: | ---: |
+| `generated`/`updated` edges, Record → Record or Resource through `record` subqueries | **0.72** | 2,580 |
+| `resource` ↔ `resource` relationship edges, through `resource` subqueries | 0.79 | 6,420 |
+| `has_attendee`/`has_subject`, through `record` subqueries | 0.83 | 4,800 |
+| Synthetic date window removed (all branches kept) | 0.93 | 6,900 |
+| All edges keyed (E-only, other runner) | 0.51 | 0 |
+
+Today's five edge branches:
+
+- **Generated/updated edges** (branch 0, through `record` subqueries): the largest single share.
+- **Resource ↔ resource edges** (branch 1, through `resource` subqueries).
+- **Cross-Space disclosure** (branch 2): already plain equality on `from_space_id`/`to_space_id`.
+- **`relates_to`** (branch 3): already plain equality.
+- **Attendee/subject edges** (branch 4, through `record` subqueries).
+
+The cost is spread across the three subquery branches, and no one branch removes the stall or
+serves the other account. Effects don't add (0.72 × 0.79 × 0.83 ≈ 0.47, close to E-only's 0.51),
+because the branches share the same `record` membership nodes. The synthetic window costs about
+7%, so the edge cost is not a harness-window artifact. The synthetic writer only writes
+`has_attendee` edges, yet keying the `generated` branch saves the most. The cost is the
+subquery nodes each branch registers, which Record writes flip, not which edges are written.
+
+## Served-or-not summary, all rounds
+
+| Change | Import × same-runner control | Other account served? |
+| --- | ---: | --- |
+| Today's prod `b42f70d` at 2 vCPU vs `5b2cf3e` at 1 vCPU | 1.03 | No (subsets only) |
+| PR 70 removed (`1be10fb` vs `e10c4bd`) | 0.78 (import), 0.27 (deletion) | No |
+| Engine bridges (lock yield/slices, sampler, per-commit membership, marker bypass, PR 68) | 0.85–1.13 | No |
+| A with one edge branch keyed | 0.72–0.83 | No |
+| E-only (all edges keyed, today's model) | 0.51 | No |
+| E+R (edges + Record family keyed) | 0.02 (9.8 s) | No: 20–60% in 4–14 s bursts |
+| B-retained (proposal's first exceptions) | 0.40 | No |
+| B-retained, edges keyed | 0.03 (3.9 s) | Nearly (3/4, 4/9 in 4–6 s bursts) |
+| B-cold, amended | 4.0x B (10.1 s) | No: fails its pass line |
+| B-cold, all edges keyed | 0.23x B-cold (2.0 s) | Yes on import and both deletions; share deletion 2/3 in 3.4 s |
+| B all-plain | ~0.006 | Yes |
+
+## M4, revised after rounds 2 and 3
+
+**1. Where the time goes today.** Unchanged from M4 above. Two things are now measured. Today's
+engine `b42f70d` at 2 vCPU stalls as long as yesterday's `5b2cf3e` at 1 vCPU (1.03x import,
+0.96x large deletion). PR 70's `Prior::was_member` proof is the largest single engine regression
+since `1be10fb`: 63% of the large deletion's CPU on `e10c4bd`, 3.5–3.8x that deletion's time and
+1.29x the import's.
+
+**2. Does the proposed model remove the stall?** Only if every `graph_edge` branch is keyed, along
+with the Record family:
+
+- **B-cold as amended fails.** The edge branches kept on today's filter cost the import 10.1 s,
+  with drains at 20%.
+- **B-cold with all edges keyed passes** the three original workloads (2.0, 1.2 and 0.5 s, every
+  probe served). The share-and-membership worst case finishes in 3.4 s but loses one of three
+  drains.
+- **On today's model, keying edges alone is not enough.** E-only takes 273 s (0.51x). Adding the
+  Record family (E+R) brings it to 9.8 s, but drains and live changes still fail during the burst.
+
+**3. Which bridge to build first.** Key every `graph_edge` branch together with the Record family:
+B-cold with all edges keyed is the only proposal-shaped variant that passes. Within edges the cost
+is spread across the `generated`/`updated`, `resource`↔`resource` and attendee/subject branches, so
+no single branch is enough.
+
+PR 70's proof is the cheapest engine-side win (about 1.3x on imports, 3.5x on deletions), but it
+does not serve the other account. Whether to bound, cache or drop it is a correctness question for
+its owners, not settled here.
+
+**What prod is exposed to now.** The estimate above already treated 2 vCPU as 1 for this path, and
+the same-runner measurement confirms it (1.03x). The table stands: safe tonight, then at risk from
+Nov 26 at high regrowth and nightly from about Nov 29 at low. An estimate.

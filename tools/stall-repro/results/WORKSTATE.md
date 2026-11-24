@@ -1,4 +1,4 @@
-# OTTO-13916 continuation checkpoint — 2026-11-24 11:50 UTC (takeover)
+# OTTO-13916 continuation checkpoint — 2026-11-24 13:30 UTC (takeover, rounds 2–3 done)
 
 M1–M4 are pushed in RESULTS.md. No Actions run on this branch is still running. No PR exists.
 Nothing here is merged, deployed or reviewed. Linear has the takeover claim and the final comment.
@@ -16,6 +16,8 @@ Nothing here is merged, deployed or reviewed. Linear has the takeover claim and 
 | 45363678502 | 0bdc7a2 | Per-commit build + tests (passed) | not needed further |
 | 45372211215 | caf9e2d | Bridge build + 13 cross-runner variants | `variants/*-caf9e2d` |
 | 45377863650 | b4ab93e | 11 same-runner pairs (28 runs) | `paired/` |
+| 45388936382 | 5169054 | Today-vs-yesterday, CPU split, PR 70–72 bisect, B-cold, E-only, E+R | `paired2/` |
+| 45395594116 | ffc01e8 | B-cold attribution and profile, PR 70 profile, A edge-branch attribution | `paired3/` |
 
 ## If more is asked
 
