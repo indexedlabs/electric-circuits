@@ -1232,6 +1232,7 @@ async fn wait_for_source_effects(
     shutdown: &crate::shutdown::ShutdownToken,
     marker_lsn: u64,
 ) -> bool {
+    let _measurement = crate::stall_profile::Timer::start(crate::stall_profile::MARKER_WAIT);
     loop {
         if shutdown.is_shutting_down() {
             return false;
@@ -2160,13 +2161,19 @@ pub(crate) async fn process_envelope(
     {
         let mut group_paths = HashSet::new();
         let work = {
-            let mut reg = subq.registry.lock().await;
+            let mut reg = crate::stall_profile::lock(
+                &subq.registry,
+                crate::stall_profile::SEQUENCER_WAIT,
+                crate::stall_profile::SEQUENCER_HOLD,
+            ).await;
             if reg.touches(&ts.table) {
                 if let Some(commit_ts) = commit_ts {
                     reg.note_commit_time(lsn_u64, commit_ts);
                 }
                 let mut sq_hops: Option<Vec<crate::trace::TraceHop>> = tr.as_ref().map(|_| Vec::new());
+                let measurement = crate::stall_profile::Timer::start(crate::stall_profile::MEMBERSHIP);
                 let result = reg.on_table_delta(ts, &delta, lsn_u64, xid, txid.clone(), sq_hops.as_mut()).await;
+                drop(measurement);
                 if let Ok(result_work) = result.as_ref() {
                     group_paths = reg.group_paths_for_work(result_work);
                     for path in &group_paths {

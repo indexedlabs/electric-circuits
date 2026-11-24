@@ -1116,6 +1116,7 @@ fn spawn_flip_propagator(
             let trace_tx = trace_tx.clone();
             let group_lanes = group_lanes.clone();
             shutdown.spawn_background(async move {
+                let _measurement = crate::stall_profile::Timer::start(crate::stall_profile::FLIP_BATCH);
                 let commit_lsn = fw.commit_lsn();
                 let group_paths = fw.group_paths().to_vec();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch

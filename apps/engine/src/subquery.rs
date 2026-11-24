@@ -2821,12 +2821,13 @@ async fn propagate_one(
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     work: &mut VecDeque<(SubquerySig, Flip)>,
 ) -> Result<()> {
+    let _measurement = crate::stall_profile::Timer::start(crate::stall_profile::FLIP_ONE);
     let commit_lsn = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     // The flipped inner-set node's dependents, plus the table its change entered through: the
     // head of the propagation path each dependent's trace lights (`table:<t>` → `node:<sig>` →
     // dependent). Fetched under one lock so a concurrent drop can't split them.
     let (edges, source_table) = {
-        let reg = registry.lock().await;
+        let reg = crate::stall_profile::flip_lock(registry).await;
         (reg.edges_of(sig), reg.nodes.get(sig).map(|n| n.inner_table.clone()))
     };
     // A NULL-value flip only matters to NULL-sensitive dependents — a `NOT IN` leaf, or an `IN`
@@ -2976,7 +2977,7 @@ async fn requery_and_move_shapes(
 ) -> Result<Vec<(String, TableRef, i64)>> {
     // Brief lock: snapshot what the query-backs need, grouped by outer table.
     let (groups, reader) = {
-        let mut reg = registry.lock().await;
+        let mut reg = crate::stall_profile::flip_lock(registry).await;
         let mut groups: Vec<(TableSchema, Vec<String>)> = Vec::new();
         for shape_id in shape_ids {
             // A shape whose create is still in flight has edges (phase A) but no installed shape to
@@ -3023,7 +3024,7 @@ async fn requery_and_move_shapes(
         match reader.read(ts, filter).await {
             Ok(read) => reads.push(read),
             Err(e) => {
-                end_all(&mut *registry.lock().await);
+                end_all(&mut *crate::stall_profile::flip_lock(registry).await);
                 return Err(e);
             }
         }
@@ -3042,7 +3043,7 @@ async fn requery_and_move_shapes(
         // The emission tail only ever touches the candidates it is given, so an empty read moves
         // nothing for any shape (a full re-derive included): release the whole group in one hold.
         if rows.is_empty() {
-            let mut reg = registry.lock().await;
+            let mut reg = crate::stall_profile::flip_lock(registry).await;
             for shape_id in ids {
                 reg.end_queryback(shape_id);
             }
@@ -3050,7 +3051,7 @@ async fn requery_and_move_shapes(
         }
         let candidates: Vec<(Row, bool)> = rows.into_iter().map(|r| (r, true)).collect();
         for (k, shape_id) in ids.iter().enumerate() {
-            let mut reg = registry.lock().await;
+            let mut reg = crate::stall_profile::flip_lock(registry).await;
             // The proof a changes-only feed needs: the flip itself. The emission tail adds whatever
             // else the flip's commit did to the inner sets, while that commit is still the one
             // being ingested, so a row whose membership rested on two of them is still seen to
@@ -3123,7 +3124,7 @@ async fn requery_and_reconcile_parents(
     commit_lsn: u64,
 ) -> Result<Vec<(SubquerySig, TableRef, Vec<Flip>)>> {
     let (groups, reader) = {
-        let mut reg = registry.lock().await;
+        let mut reg = crate::stall_profile::flip_lock(registry).await;
         let mut groups: Vec<(TableSchema, Vec<SubquerySig>)> = Vec::new();
         for parent_sig in parent_sigs {
             // Same as `requery_and_move_shapes`'s pending-shape check, one tier down: a parent node
@@ -3166,7 +3167,7 @@ async fn requery_and_reconcile_parents(
         match reader.read(ts, filter).await {
             Ok(read) => reads.push(read),
             Err(e) => {
-                let mut reg = registry.lock().await;
+                let mut reg = crate::stall_profile::flip_lock(registry).await;
                 for (_, sigs) in &groups {
                     for parent_sig in sigs {
                         reg.end_node_queryback(parent_sig);
@@ -3185,7 +3186,7 @@ async fn requery_and_reconcile_parents(
         // An empty read asserts nothing for any parent: reconcile (to no flips) and release the
         // whole group in one hold.
         if rows.is_empty() {
-            let mut reg = registry.lock().await;
+            let mut reg = crate::stall_profile::flip_lock(registry).await;
             for parent_sig in sigs {
                 if reg.nodes.contains_key(parent_sig) {
                     reconciled.push((parent_sig.clone(), ts.table.clone(), Vec::new()));
@@ -3195,7 +3196,7 @@ async fn requery_and_reconcile_parents(
             continue;
         }
         for parent_sig in sigs {
-            let mut reg = registry.lock().await;
+            let mut reg = crate::stall_profile::flip_lock(registry).await;
             if let Some(evals) = reg.node_queryback_evals(parent_sig, ts, &rows, &gate) {
                 let flips = reg.apply_node_evals(parent_sig, evals).await;
                 // A parent's set moves here, not in `on_table_delta`: the commit changed a row of a

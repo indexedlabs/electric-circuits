@@ -224,6 +224,7 @@ async def run(args):
                 probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl")
                 probe_task = asyncio.create_task(probe.run())
                 await asyncio.sleep(3)
+                profile_before = (await client.get(f"{ENGINE_URL}/memory")).json().get("stall_profile")
                 fence_id = uuid4()
                 transactions = []
                 def mark(connection, transaction):
@@ -277,6 +278,9 @@ async def run(args):
                 result["changes_per_s"] = result.get("row_changes", 0) / result["elapsed_s"] if result["completed"] else None
                 result["probe"] = summarize([sample for sample in probe.samples if began - probe.started <= sample["at_s"] <= began + result["elapsed_s"] - probe.started])
                 result["idle_probe"] = summarize([sample for sample in probe.samples if sample["at_s"] < began - probe.started])
+                if profile_before is not None:
+                    profile_after = (await client.get(f"{ENGINE_URL}/memory")).json()["stall_profile"]
+                    result["wall_profile"] = {"before": profile_before, "after": profile_after, "delta": {category: {metric: values[metric] - profile_before["categories"][category][metric] for metric in values} for category, values in profile_after["categories"].items()}}
                 events = read_events(engine_log, began_wall, result["ended_wall"])
                 by_table = Counter()
                 empty = Counter()

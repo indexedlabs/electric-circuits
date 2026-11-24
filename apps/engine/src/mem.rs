@@ -506,6 +506,7 @@ pub(crate) fn snapshot_json(g: &Gauges, card: &Cardinalities) -> serde_json::Val
             "bytes_electric_adapter": card.bytes_electric_adapter,
         },
         "samples": g.samples.load(Ordering::Relaxed),
+        "stall_profile": crate::stall_profile::snapshot(),
     })
 }
 
