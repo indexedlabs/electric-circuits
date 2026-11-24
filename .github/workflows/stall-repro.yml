@@ -10,6 +10,18 @@ permissions:
   contents: read
 
 jobs:
+  stream-store:
+    if: contains(github.event.head_commit.message, '[store]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - run: cargo install durable-streams --version 0.1.5 --locked --root "$RUNNER_TEMP/stall-store"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stall-stream-store
+          path: ${{ runner.temp }}/stall-store/bin/durable-streams-server
   fixture:
     runs-on: ubuntu-latest
     timeout-minutes: 15
