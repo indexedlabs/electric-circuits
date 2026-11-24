@@ -50,7 +50,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: stall-repro-release-frame-pointers
+      - uses: actions/cache@v4
+        id: engine-binary
+        with:
+          path: target/release/electric-circuits-engine
+          key: stall-prod-5b2cf3e-release-debug1-frame-pointers-v1
       - name: Build unmodified production engine with symbols
+        if: steps.engine-binary.outputs.cache-hit != 'true'
         run: |
           export CARGO_TARGET_DIR="$PWD/target"
           cargo build --release --locked -p electric-circuits-engine
