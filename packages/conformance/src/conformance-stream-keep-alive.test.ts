@@ -12,7 +12,7 @@
 //      the time since) grows past its healthy bound, and the next sweep touches the stream once
 //      storage answers again (`#v-touch-retry`, `#c-sweep-inside-ttl`).
 //
-// Second-scale knobs: the floor is 2 × max(1 + 2, 1, 4) = 8 s, and the sweep (1 s) runs well inside a
+// Second-scale knobs: the floor is 2 × max(1 + 2, 2) = 6 s, and the sweep (1 s) runs well inside a
 // quarter of each TTL. Production runs a 21-day TTL with a 60 s sweep.
 
 import { createServer, request } from 'node:http'
@@ -36,9 +36,9 @@ const knobs = (ttl: number) => ({
   ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
   ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '2',
   ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS: '2',
-  ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '1',
-  // The lease is short enough for second-scale TTLs; group tests renew their claim while waiting.
-  ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '4',
+  // A held subscription keeps the shape active (not dormant, not evicted) for the whole test, so
+  // only the keep-alive can stop its stream expiring.
+  ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '3600',
 })
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -191,11 +191,10 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
         ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS: '1',
       },
     })
-    const groupLoad = {
+    const group = await engineRequest('POST', '/v1/subsets/load', {
       subscription: 'held-group',
       members: [{ key: 'plain', table: 'public.items', columns: ['id', 'n'] }],
-    }
-    const group = await engineRequest('POST', '/v1/subsets/load', groupLoad)
+    })
     const groupPath = group.streamPath!
     await engineRequest('PUT', '/consumers/held', { segment: 0, offset: '-1' })
     let id = 1
@@ -212,11 +211,7 @@ describe('conformance: the engine keeps its tracked streams inside their sliding
     // After the restart nothing reads or appends to either: the group's table sees no writes, the
     // sequencer resumes in a later segment, and the consumer only pins. Only the keep-alive can.
     await h.restartEngine()
-    const keepAliveUntil = Date.now() + 3 * ttl * 1000
-    while (Date.now() < keepAliveUntil) {
-      await engineRequest('POST', '/v1/subsets/load', groupLoad)
-      await sleep(1000)
-    }
+    await sleep(3 * ttl * 1000)
     for (const path of [groupPath, 'changes/0']) {
       expect(await head(path), `${path} is still there after three TTLs`).toEqual({ status: 200, ttl: String(ttl) })
     }

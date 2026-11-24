@@ -23,9 +23,9 @@
 //! from active once nothing holds them:
 //! 1. **Dormancy TTL** (hygiene): dormant longer than [`RetentionConfig::dormant_ttl`] → evict.
 //!    Reaps dead shapes even with no resource pressure. A live-only shape with no subscription is
-//!    retired after [`RetentionConfig::live_only_evict_after`] without a touch — the larger of
-//!    the live-only idle period (`ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS`, 24 hours by default) and
-//!    the subscription lease. If both are `0`, the live-only layer never retires a shape.
+//!    retired after [`RetentionConfig::live_only_evict_after`] without a touch. The configured
+//!    live-only period can shorten the ordinary idle-plus-dormancy window, but never lengthen it,
+//!    and the subscription lease is the floor. A value of `0` uses the ordinary window unchanged.
 //! 2. **`max_shapes` count cap** (engine cost bound): when the total shape count exceeds
 //!    [`RetentionConfig::max_shapes`], evict least-recently-read dormant shapes until under. A
 //!    subscribed shape is never evicted, and neither is a parkable shape that is still active.
@@ -47,8 +47,9 @@
 //! engine retires it **straight from active** (full teardown) once it has gone the live-only idle
 //! period with no subscription and no touch. A **touch** is a lease create, join or renewal, or an
 //! engine-visible read; a lease lapse is not one, so the period runs from the last renewal. The
-//! period is also how long a client that went away can still catch up from the feed's stream, so
-//! it is never shorter than the lease. Like any evicted shape, a returning client recreates it.
+//! effective period is the smaller of the configured live-only period and idle-plus-dormancy,
+//! floored by the subscription lease; a configured `0` uses the ordinary window. Like any evicted
+//! shape, a returning client recreates it.
 //!
 //! This module holds the configuration, the lifecycle state machine types, and the **pure** sweep
 //! planner ([`plan_sweep`]); `crate::engine` owns the state and executes plans. Persistence of the
@@ -71,7 +72,7 @@ use crate::pg::SnapshotGate;
 /// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
 /// | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Time since the last renewal before a native subscription lease lapses. `0` disables lease expiry. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
-/// | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Time a live-only shape (subquery, aggregate, changes-only feed) may go without a subscription or a touch before it is retired. The effective period is never shorter than the subscription lease. `0` leaves the lease as the floor; with a `0` lease too, the live-only layer never retires it. |
+/// | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Maximum idle period for an unsubscribed live-only shape (subquery, aggregate or changes-only feed). The effective period is the smaller of this value and the ordinary idle-plus-dormancy window, floored by the subscription lease. `0` uses the ordinary window unchanged. |
 /// | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum change-log span budget for dormant replay. |
 /// | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Replay budget multiplier applied to the shape's recorded backfill bytes. |
 /// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Cap on registered shapes (active, dormant and live-only; each group member is one). Over it, least-recently-read dormant shapes are evicted; active live-only shapes remain protected. `0` = unlimited. |
@@ -88,8 +89,7 @@ pub struct RetentionConfig {
     pub dormant_ttl: Duration,
     /// The live-only idle period as configured (`ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS`, default
     /// 24 hours; 0 = no period of its own). Read it through [`Self::live_only_evict_after`], which
-    /// applies the subscription-lease floor. When both this value and the lease are 0, the
-    /// live-only layer never retires a shape.
+    /// caps it at the ordinary idle-plus-dormancy window and applies the subscription-lease floor.
     pub live_only_idle: Duration,
     /// Minimum dormant replay span in bytes (`ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES`).
     pub replay_min_bytes: u64,
@@ -140,11 +140,13 @@ impl RetentionConfig {
     }
 
     /// How long a live-only shape may go with no subscription and no touch before it is retired
-    /// from active, and the reason that retirement is counted under. `None` = never. The period
-    /// is the larger of `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` and the subscription lease so a
-    /// lease lapse cannot retire a feed before the lease window itself has elapsed.
+    /// from active, and the reason that retirement is counted under. `None` = no finite window.
+    /// The configured period can only shorten the ordinary idle-plus-dormancy window, and the
+    /// subscription lease is the floor. A configured `0` means the ordinary window is unchanged.
     pub fn live_only_evict_after(&self) -> Option<(Duration, EvictReason)> {
-        let after = self.live_only_idle.max(self.subscription_lease_timeout);
+        let ordinary = self.idle_timeout.saturating_add(self.dormant_ttl);
+        let configured = if self.live_only_idle.is_zero() { ordinary } else { ordinary.min(self.live_only_idle) };
+        let after = configured.max(self.subscription_lease_timeout);
         (!after.is_zero()).then_some((after, EvictReason::LiveOnlyIdle))
     }
 
@@ -192,12 +194,11 @@ impl RetentionConfig {
 }
 
 /// The shortest non-zero `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` the engine starts with: twice the
-/// larger of a shape's idle-plus-dormancy window, the effective live-only period and the change
-/// log's retain window, 14.5 days at the defaults. The live-only period is the catch-up window for
-/// a feed that has gone away, so its stream must not expire during that period (including across a
-/// restart). `None` when idle or dormancy is `0` (disabled): an ordinary shape may then stay
-/// forever, and no TTL is safe. A retain window of `0` adds nothing to the floor, since dormancy
-/// eviction still unpins the segment a dormant shape holds.
+/// larger of a shape's idle-plus-dormancy window and the change log's retain window, 14.5 days at
+/// the defaults. Those windows bound how long the engine's own lifecycle holds a stream before it
+/// deletes it, so the TTL stays well clear of them. `None` when idle or dormancy is `0`
+/// (disabled): a shape may then stay forever, and no TTL is safe. A retain window of `0` adds
+/// nothing to the floor, since dormancy eviction still unpins the segment a dormant shape holds.
 ///
 /// The floor alone does not keep a tracked stream alive: a stream the engine neither appends to nor
 /// reads, such as a restored dormant shape whose dormancy clock restarted at boot, would still
@@ -208,9 +209,7 @@ pub fn stream_ttl_floor(retention: &RetentionConfig, changes: &crate::changelog:
     if retention.idle_timeout.is_zero() || retention.dormant_ttl.is_zero() {
         return None;
     }
-    let ordinary = retention.idle_timeout.saturating_add(retention.dormant_ttl);
-    let live_only = retention.live_only_evict_after().map_or(Duration::ZERO, |(after, _)| after);
-    Some(ordinary.max(live_only).max(changes.retain).saturating_mul(2))
+    Some(retention.idle_timeout.saturating_add(retention.dormant_ttl).max(changes.retain).saturating_mul(2))
 }
 
 /// Where a shape is in the lifecycle. Held per shape id by the engine (`Engine::lives`).
@@ -284,8 +283,8 @@ pub struct SweepShape {
     /// Eligible for dormancy at all (plain row shapes). A shape that is not is **live-only**: a
     /// subquery, an aggregate or a changes-only feed.
     pub dormancy_eligible: bool,
-    /// The id of the group this shape is a member of, if any. A group shares one stream and one
-    /// lease, so it is retired as a unit and only when no member is subscribed.
+    /// The id of the group this shape belongs to, if any. Retention excludes marked members;
+    /// group teardown owns retirement of the shared stream and re-join stays with that lifecycle.
     pub group: Option<String>,
     /// Tracked bytes appended to the shape's stream (engine-side accounting).
     pub stream_bytes: u64,
@@ -411,8 +410,8 @@ pub struct SweepPlan {
     pub over_budget: bool,
 }
 
-/// One unheld live-only shape. Group-owned shapes are filtered before this helper, so every unit
-/// here is a standalone stream with `idle` measured from that shape's most recent touch.
+/// One unheld live-only shape. Group-owned shapes are filtered before this helper, so each
+/// candidate is an independently retained stream with `idle` measured from its most recent touch.
 struct Unheld<'a> {
     idle: Duration,
     shape: &'a SweepShape,
@@ -460,7 +459,8 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // Tier 0 — dormancy: idle, unsubscribed, eligible, settled shapes go dormant.
     if !cfg.idle_timeout.is_zero() {
         for s in shapes {
-            if s.dormancy_eligible
+            if s.group.is_none()
+                && s.dormancy_eligible
                 && !s.in_transition
                 && s.dormant_for.is_none()
                 && s.refcount == 0
@@ -477,7 +477,7 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // the shape's bounded replay budget, is no longer safely reactivatable. Retire it now so the
     // next subscriber recreates from a fresh snapshot.
     for s in shapes {
-        if s.dormant_for.is_some() {
+        if s.group.is_none() && s.dormant_for.is_some() {
             if s.replay_span_deferred {
                 continue;
             } else if s.replay_span_bytes.is_none() {
@@ -493,7 +493,7 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
     // Tier 1 — dormancy TTL (hygiene, independent of pressure).
     if !cfg.dormant_ttl.is_zero() {
         for s in shapes {
-            if s.dormant_for.is_some_and(|d| d >= cfg.dormant_ttl) {
+            if s.group.is_none() && s.dormant_for.is_some_and(|d| d >= cfg.dormant_ttl) {
                 plan.evict.push((s.id.clone(), EvictReason::DormantTtl));
                 evicted.insert(&s.id);
             }
@@ -603,7 +603,7 @@ mod tests {
             SweepShape { idle: Duration::from_secs(3600), ..shape("s1") }, // idle past the timeout
             SweepShape { idle: Duration::from_secs(60), ..shape("s2") },   // recently read
             SweepShape { idle: Duration::from_secs(3600), refcount: 2, ..shape("s3") }, // subscribed
-            // Keep the live-only fixture below the lease floor: this test covers dormancy only.
+            // Keep the live-only fixture below its effective period: this test covers dormancy only.
             SweepShape { idle: Duration::from_secs(60), dormancy_eligible: false, ..shape("s4") }, // aggregate/subquery
             SweepShape { idle: Duration::from_secs(3600), in_transition: true, ..shape("s5") },    // mid-transition
         ];
@@ -632,7 +632,8 @@ mod tests {
 
     #[test]
     fn non_parkable_shapes_are_evicted_from_active_after_the_live_only_period() {
-        let grace = 1800; // the subscription lease is the floor when the idle period is disabled
+        let grace = 1800; // the configured period is shorter than the ordinary window
+        let c = RetentionConfig { live_only_idle: Duration::from_secs(grace), ..cfg() };
         let shapes = vec![
             // An aggregate/subquery shape (not dormancy-eligible), unsubscribed and idle past the
             // effective live-only period → evicted straight from active.
@@ -642,7 +643,7 @@ mod tests {
             // Same but within the grace window → kept.
             SweepShape { idle: Duration::from_secs(grace - 1), dormancy_eligible: false, ..shape("agg-young") },
         ];
-        let plan = plan_sweep(&cfg(), &shapes);
+        let plan = plan_sweep(&c, &shapes);
         assert_eq!(plan.evict, vec![("agg-old".to_string(), EvictReason::LiveOnlyIdle)]);
         assert!(plan.deactivate.is_empty(), "non-parkable shapes never deactivate");
     }
@@ -651,6 +652,7 @@ mod tests {
     fn non_parkable_retirement_still_runs_when_dormancy_is_disabled() {
         let c = RetentionConfig {
             idle_timeout: Duration::ZERO,
+            live_only_idle: Duration::from_secs(1800),
             subscription_lease_timeout: Duration::from_secs(1800),
             ..cfg()
         };
@@ -739,15 +741,24 @@ mod tests {
     }
 
     #[test]
-    fn zero_live_only_period_and_zero_lease_never_retire_a_live_only_shape() {
-        let c = RetentionConfig { live_only_idle: Duration::ZERO, subscription_lease_timeout: Duration::ZERO, ..cfg() };
-        assert_eq!(c.live_only_evict_after(), None);
-        let ancient = live_only("released", 0, u64::MAX);
-        assert!(plan_sweep(&c, &[ancient]).evict.is_empty());
+    fn zero_live_only_period_uses_the_ordinary_window() {
+        let c = RetentionConfig {
+            live_only_idle: Duration::ZERO,
+            subscription_lease_timeout: Duration::ZERO,
+            idle_timeout: Duration::from_secs(1),
+            dormant_ttl: Duration::from_secs(2),
+            ..cfg()
+        };
+        assert_eq!(c.live_only_evict_after(), Some((Duration::from_secs(3), EvictReason::LiveOnlyIdle)));
+        assert!(plan_sweep(&c, &[live_only("released", 0, 2)]).evict.is_empty());
+        assert_eq!(
+            plan_sweep(&c, &[live_only("released", 0, 3)]).evict,
+            vec![("released".to_string(), EvictReason::LiveOnlyIdle)]
+        );
     }
 
-    /// Group members are marked as belonging to a shared stream and are never retired by the
-    /// live-only sweep. Group release and re-join own their later lifecycle.
+    /// Group members are marked in the snapshot and excluded from the live-only sweep. Group
+    /// release and re-join own their later lifecycle and shared-stream retirement.
     #[test]
     fn the_live_only_period_never_retires_a_group_member() {
         let c = RetentionConfig { live_only_idle: Duration::from_secs(3600), ..cfg() };

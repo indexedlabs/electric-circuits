@@ -2156,8 +2156,8 @@ impl Engine {
         if plan.over_capacity {
             self.metrics.retention_pressure.fetch_add(1, Ordering::Relaxed);
             tracing::error!(
-                "retention: {} shapes exceed max_shapes={} but no eligible dormant shape is left to evict — \
-                 grouped members and live-only shapes remain protected; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
+                "retention: {} shapes exceed max_shapes={} but nothing dormant is left to evict — \
+                 every shape is actively subscribed or recently read; raise ELECTRIC_CIRCUITS_MAX_SHAPES or lower the idle timeout",
                 snapshot.len(),
                 cfg.max_shapes
             );
@@ -4816,14 +4816,20 @@ mod subscription_tests {
             "renewal advances the live-only clock"
         );
 
-        // Simulate the lease expiring after the renewal. The shape is now unheld, but its renewed
-        // live-only clock is fresh, so this sweep must leave the aggregate in place.
+        // Age the renewed claim past its lease, then let the ordinary sweep release it. The shape
+        // is now unheld, but its renewed live-only clock is fresh, so this sweep must leave it in place.
         {
             let mut st = engine.state.lock().await;
-            st.subscribe("aggregate-renewal", "renewed".into(), now - 2);
+            let lease = st
+                .feed_shares
+                .get_mut("aggregate-renewal")
+                .and_then(|share| share.subs.get_mut("renewed"))
+                .expect("the renewal claim is registered");
+            *lease = crate::changelog::now_secs().saturating_sub(2);
         }
         engine.retention_sweep().await;
         assert!(engine.get_shape("aggregate-renewal").await.is_some(), "the post-renewal idle period still applies");
+        assert_eq!(refcount(&engine, "aggregate-renewal").await, 0, "the lease lapse released the claim");
 
         // Move the clock beyond the configured period and run the ordinary sweep again: now the
         // same feed is retired as live-only idle.
