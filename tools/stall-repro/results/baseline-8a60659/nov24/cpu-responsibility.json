@@ -1,0 +1,170 @@
+{
+  "method": "exclusive owning operation, with recognized PG/append frames assigned first; inclusive inner functions overlap; async ancestry may be absent; no off-CPU claims",
+  "samples": 51471,
+  "categories": {
+    "other_or_unresolved": {
+      "samples": 1400,
+      "percent": 2.7199782401740786
+    },
+    "other_lock_cpu_not_registry_wait_wall": {
+      "samples": 16,
+      "percent": 0.03108546560198947
+    },
+    "row_membership_on_table_delta": {
+      "samples": 35379,
+      "percent": 68.7357929707991
+    },
+    "postgres_client": {
+      "samples": 423,
+      "percent": 0.8218219968525966
+    },
+    "flip_walk_including_requery_evaluation": {
+      "samples": 9916,
+      "percent": 19.265217306832973
+    },
+    "stream_append": {
+      "samples": 157,
+      "percent": 0.30502613121952166
+    },
+    "memory_sampler": {
+      "samples": 4180,
+      "percent": 8.121077888519748
+    }
+  },
+  "inclusive_overlapping": {
+    "futex": {
+      "samples": 38,
+      "percent": 0.073827980804725
+    },
+    "parking_lot": {
+      "samples": 1503,
+      "percent": 2.920090924986886
+    },
+    "on_table_delta": {
+      "samples": 35379,
+      "percent": 68.7357929707991
+    },
+    "MembershipCircuit::contains": {
+      "samples": 39559,
+      "percent": 76.85687085931885
+    },
+    "subq_circuit::seek": {
+      "samples": 37434,
+      "percent": 72.72833245905461
+    },
+    "propagate_one": {
+      "samples": 10055,
+      "percent": 19.53527228925026
+    },
+    "tokio::sync::mutex": {
+      "samples": 4176,
+      "percent": 8.113306522119252
+    },
+    "mem_totals": {
+      "samples": 4145,
+      "percent": 8.053078432515397
+    }
+  },
+  "top_leaf_frames": [
+    [
+      "dbsp::storage::file::reader::VarintReader::get",
+      9732
+    ],
+    [
+      "[unknown]",
+      4551
+    ],
+    [
+      "core::intrinsics::rotate_left",
+      1192
+    ],
+    [
+      "<core::result::Result<T,E> as core::ops::try_trait::Try>::branch",
+      1182
+    ],
+    [
+      "<core::hash::sip::Hasher<S> as core::hash::Hasher>::write",
+      1156
+    ],
+    [
+      "dbsp::storage::file::reader::Path<K,A>::for_row_from_ancestor",
+      1131
+    ],
+    [
+      "quick_cache::linked_slab::LinkedSlab<T>::get",
+      934
+    ],
+    [
+      "core::sync::atomic::atomic_add",
+      824
+    ],
+    [
+      "parking_lot::raw_rwlock::RawRwLock::try_lock_shared_fast",
+      816
+    ],
+    [
+      "<electric_circuits_engine::value::ArchivedValue as dbsp::dynamic::ord_repr::OrdRepr<electric_circuits_engine::value::Value>>::ord_cmp",
+      813
+    ],
+    [
+      "free_fastpath",
+      769
+    ],
+    [
+      "core::core_arch::x86::sse2::_mm_movemask_epi8",
+      674
+    ],
+    [
+      "dbsp::storage::file::reader::TreeBlock<K,A>::lookup_row",
+      661
+    ],
+    [
+      "<alloc::sync::Arc<T,A> as core::ops::drop::Drop>::drop",
+      621
+    ],
+    [
+      "core::num::nonzero::NonZero<T>::get",
+      575
+    ],
+    [
+      "core::ptr::const_ptr::<impl *const T>::offset",
+      552
+    ],
+    [
+      "feldera_storage::fbuf::FBuf::as_slice",
+      528
+    ],
+    [
+      "<u64>::wrapping_add",
+      521
+    ],
+    [
+      "cache_bin_alloc_impl",
+      503
+    ],
+    [
+      "<alloc::sync::Arc<T,A> as core::clone::Clone>::clone",
+      494
+    ],
+    [
+      "<electric_circuits_engine::value::Value as core::cmp::Ord>::cmp",
+      434
+    ],
+    [
+      "electric_circuits_engine::predicate::CompiledPredicate::eval_ctx",
+      383
+    ],
+    [
+      "<parking_lot::raw_rwlock::RawRwLock as lock_api::rwlock::RawRwLock>::unlock_shared",
+      365
+    ],
+    [
+      "__rustc::__rust_alloc",
+      364
+    ],
+    [
+      "<alloc::sync::Arc<T,A> as core::ops::deref::Deref>::deref",
+      356
+    ]
+  ]
+}

@@ -1,8 +1,9 @@
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
+M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
 
 # OTTO-13916 — scratch measurements, never merge
 
-M2, M3 and M4 are not yet complete. The corrected production-binary baseline
+M3 and M4 are not yet complete. The corrected production-binary baseline
 below supersedes the provisional timing runs. All data are synthetic; no prod or
 dev service was accessed. Nov23 also starves drain/live in this fixture, and clears
 in 2.75 minutes, not the observed 15 minutes. Nov24 clears in 8.81 minutes, not
@@ -63,7 +64,7 @@ that the production replay pin is irrelevant. Family/tailer and feed-entry
 counts remain unmatched. The fixture is sufficiently close to expose the
 membership cost, not a faithful reproduction of every production scheduling detail.
 
-## CPU profile evidence — M2 wall-time supplement pending
+## CPU and wall profile — M2
 
 The unchanged Nov24 engine was sampled for 529.15 seconds with
 `sudo perf record -e cpu-clock -F 99 -g --call-graph fp -p PID`, producing 51,471
@@ -72,13 +73,67 @@ flamegraph and all folded stacks; Nov23 equivalents are alongside its results.
 Raw `perf.data` and `perf.script` remain in Actions artifacts. Folded compression
 command: `gzip -n -c import.folded > import.folded.gz`.
 
-Preliminary deepest-recognized-frame attribution is 91.630% row/membership,
-5.257% lock-related CPU, 0.861% flip propagation, 0.820% PostgreSQL client,
-0.041% stream append and 1.391% other/unresolved. No sample was attributed to
-marker waiting. These CPU categories are not off-CPU wall time and are not a
-claim that every sampled mutex is the registry mutex. Async ancestry can be
-missing. The separate observational build supplies registry/marker/worker wall
-times before M2 is claimed.
+The initial deepest-frame classifier in `import-result.json` reported 91.630%
+membership and 5.257% lock CPU. **Do not use that as a responsibility split**:
+flip walks evaluate membership too, and compiler inline symbols place a mutex
+guard above memory sampling. Inspection of the full stacks gives this exclusive
+owning-operation table (`profile_report.py`), assigning recognized PG/append
+frames first. Async ancestry can be missing; unknown samples are not invented.
+
+| CPU responsibility | Samples | CPU % | Production function / file |
+| --- | ---: | ---: | --- |
+| Per-row shape/membership evaluation | 35,379 | 68.736 | `SubqueryRegistry::on_table_delta`, `emit_for_shapes_with`, `apps/engine/src/subquery.rs` |
+| Flip walks, including their requery predicate/membership evaluation | 9,916 | 19.265 | `propagate_one`, `requery_and_move_shapes`, `apps/engine/src/subquery.rs` |
+| PostgreSQL client | 423 | 0.822 | `pg` / `tokio_postgres` frames |
+| Stream append client | 157 | 0.305 | `append_reliable`, `append_retrying`, `append_batch`, `append_commit` |
+| Marker wait CPU | 0 | 0.000 | `wait_for_source_effects`, `apps/engine/src/engine/sequencer.rs` |
+| Memory sampler | 4,180 | 8.121 | `mem::spawn_sampler`, `Engine::mem_cardinalities`, `SubqueryRegistry::mem_totals` |
+| Other lock-related CPU outside those owners | 16 | 0.031 | Mutex/rwlock/futex frames; not all registry locks |
+| Everything else / unresolved | 1,400 | 2.720 | Retained stacks |
+
+Command: `python tools/stall-repro/profile_report.py tools/stall-repro/results/baseline-8a60659/nov24/import.folded.gz`.
+The resulting `cpu-responsibility.json` also preserves overlapping inner-frame
+counts: `MembershipCircuit::contains` occurs in **76.857%** of all samples and
+`subq_circuit::seek` in **72.728%**, across both sequencer and flip paths.
+`VarintReader::get` alone is the leaf of 9,732 samples (18.91%). This is repeated
+DBSP membership-snapshot lookup cost, not time spent executing SQL on Postgres.
+`mem_totals` traverses the same circuit snapshots for every node and contributes
+8.05% inclusively, despite its "cheap" source comment. `parking_lot` frames occur
+in 2.92% of samples inclusively; those also include DBSP/cache locks. Off-CPU
+registry waiting cannot honestly be assigned a CPU percentage.
+
+For wall time, Actions run `45360019209`, harness
+`346e9f970cc38beb50ff5c2ec26107b9ee90ec8a`, uses the separately verified observer
+engine `894b2cca2ec9c1ba547e130e275159c61e178e59`, SHA256
+`71fc1df3f0294ce0580d639e9001f239076bdbb92b64abf5b33faabbd8737311`.
+Command: `python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-A-observed-nov24-1cpu --catalog nov24 --variant A-observed --cpus 1 --workloads import --engine-source 894b2cca2ec9c1ba547e130e275159c61e178e59`.
+This is **not the same run as the CPU sample**: no perf, 372.996 s SQL-to-empty,
+372.650 s first-delivery-to-empty, 98.829% CPU, 15,420 backfills; drain/live both
+0/373, subset 289/373. Different sampling overhead, code layout and runner
+variation are not distinguished. An unprofiled unchanged-engine control is
+included with B so improvement ratios need not use the profiled baseline.
+
+| Observer interval, import | Completed calls | Aggregate wall s | Interpretation |
+| --- | ---: | ---: | --- |
+| Sequencer membership | 11,941 | 276.529 | Inside `on_table_delta` |
+| Sequencer registry hold | 11,941 | 276.606 | Includes membership; not additive |
+| Sequencer registry acquisition wait | 11,941 | 16.905 | Off-CPU and scheduling included |
+| `wait_for_source_effects` | 66 | 82.265 | Sequencer waits, with 10 ms polls; not 82 s of CPU |
+| Flip registry hold | 103,620 | 69.690 | Across all flip tasks |
+| Flip registry acquisition wait | 103,620 | 570.797 | Concurrent waits overlap |
+| Flip batches | 2,220 | 2,916.898 | Peak 8 active, zero at endpoints |
+| Individual walks | 6,780 | 2,916.889 | Includes IO, appends, scheduling and lock waits |
+
+The eight workers are semaphore-bounded async tasks, not eight dedicated
+threads. Their aggregate occupied time is 7.82 worker-seconds per elapsed
+second; they spend 570.80 worker-seconds waiting for the registry and 69.69
+holding it. The remainder is not instrumented finely enough to split network
+wait from runtime scheduling or other work. CPU samples show their executed
+work includes substantial membership evaluation. The sequencer dominates a
+single CPU and frequently holds the shared registry; raising worker count is
+not evidence of eight-way CPU capacity. Wall categories overlap and must never
+be summed into a CPU pie chart. Evidence is in `observer-346e9f9/`; the RAII guard
+test passed in build run `45358360702`, with `cargo fmt --check` clean.
 
 ## Provenance
 
