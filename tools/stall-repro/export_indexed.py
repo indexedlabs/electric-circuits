@@ -16,6 +16,28 @@ class StripDocumentation(ast.NodeTransformer):
         return self.generic_visit(node)
 
 
+class StorageOnlyTypes(ast.NodeTransformer):
+    def visit_AnnAssign(self, node):
+        calls = [child for child in ast.walk(node.value) if isinstance(child, ast.Call)] if node.value else []
+        storage = None
+        for call in calls:
+            name = ast.unparse(call.func)
+            if name in {"PydanticType", "PydanticUnionType"}:
+                call.func = ast.Name(id="__schema_jsonb__", ctx=ast.Load())
+                call.args = []
+                call.keywords = [ast.keyword(arg="none_as_null", value=ast.Constant(True))]
+                storage = "dict"
+            elif name == "EncryptedText":
+                call.func = ast.Name(id="__schema_binary__", ctx=ast.Load())
+                call.args = []
+                call.keywords = []
+                storage = "bytes"
+        if storage:
+            optional = " | None" if any(isinstance(child, ast.Constant) and child.value is None for child in ast.walk(node.annotation)) else ""
+            node.annotation = ast.parse(f"Mapped[{storage}{optional}]", mode="eval").body
+        return node
+
+
 def export(root: Path, destination: Path) -> None:
     source_root = root / "api/src"
     paths = sorted((source_root / "api/models").rglob("*.py"))
@@ -57,6 +79,9 @@ def export(root: Path, destination: Path) -> None:
                     if table:
                         table_classes[table] = [module, statement.name]
                         statement.body = [member for member in statement.body if isinstance(member, (ast.Assign, ast.AnnAssign)) and not (isinstance(member.value, ast.Call) and ast.unparse(member.value.func) == "relationship")]
+                        statement = StorageOnlyTypes().visit(statement)
+                        imports["__schema_jsonb__"] = ["sqlalchemy.dialects.postgresql", "JSONB"]
+                        imports["__schema_binary__"] = ["sqlalchemy", "LargeBinary"]
                 statement = StripDocumentation().visit(statement)
                 if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     statement.decorator_list = [decorator for decorator in statement.decorator_list if not ast.unparse(decorator).startswith("logfire.")]
@@ -84,6 +109,7 @@ def export(root: Path, destination: Path) -> None:
         "publication_source": str(infra_path.relative_to(root)),
         "publication_source_sha256": hashlib.sha256(infra_path.read_bytes()).hexdigest(),
         "table_classes": table_classes,
+        "schema_only_transforms": ["ORM relationships and methods omitted; neither creates SQL columns", "PydanticType and PydanticUnionType use their declared JSONB storage without application serializers", "EncryptedText uses its declared LargeBinary storage without loading credentials", "ASSISTANT_USER_ID is replaced with a synthetic UUID by the loader"],
         "modules": bundle,
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
