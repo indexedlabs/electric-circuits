@@ -1,6 +1,6 @@
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
-M3: The all-plain audience-key prototype processes the 13,081-change import in 3.18 s and 29,793-change deletion in 1.79 s after first delivery, with zero backfills; its deletion still misses one of nine two-second drain/live probes.
+M3: The all-plain audience-key prototype processes import/deletion in 3.18/1.79 s with zero backfills, but retaining the proposal's exceptional scopes still starves drain/live for the 148.42-second import.
 
 # OTTO-13916 — scratch measurements, never merge
 
@@ -170,11 +170,22 @@ completed delivery; the low CPU average includes that source time. The new
 log transaction is 121,912,564 bytes including its marker and new key columns.
 
 `B-retained`, which keeps the proposal's explicit chat/edge/Resource/File/User
-exceptions, and an unprofiled unchanged-engine A comparison are pending.
+exceptions, is now measured in the same run/commit: import **148.42 s** from first
+delivery, **98.94% CPU**, **7,020 backfills**, drain/live **0/148**, subset
+**107/148**. Large deletion takes **34.67 s**, small deletion **58.98 s**.
+It improves work volume but does **not** remove cross-account starvation.
+The unprofiled unchanged-engine A comparison is pending.
 Do not treat B's ideal result as the full proposal's gain. This prototype has
 no gateway token/relay revocation enforcement, direct-share equivalence,
 parent-move cascades, hidden/deleted cases or migration measurement. See
 `../MEASUREMENT_PATCHES.md` for the exact cuts; it is not safe to deploy.
+
+Early bridge result: unmodified A at **2 CPU** (run `45362388808`, harness
+`33929b5`, exact command in `variants/A-nov24-2.0cpu-33929b5/manifest.json`)
+takes **323.59 s** for import, consumes **102.64% of one core**, and still has
+drain/live **0/324**, but subset **324/324** (p95 **0.011 s**). More CPU provides
+serving capacity; it does not make the serial membership path twice as fast or
+remove the global drain dependency. Final comparison awaits all bridge rows.
 
 | Input | Identity |
 | --- | --- |
