@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gzip
 import json
 from pathlib import Path
@@ -12,6 +13,19 @@ def trim(bundle_path, provenance_paths):
     for path in provenance_paths:
         provenance = json.loads(path.read_text())
         selected.update((entry["module"], entry["name"]) for entry in (provenance if isinstance(provenance, list) else provenance["loaded"]))
+    pending = [("api.services.circuits_sync", "_uses_record_authority")]
+    while pending:
+        module, name = pending.pop()
+        descriptor = bundle["modules"].get(module)
+        if not descriptor or (module, name) in selected:
+            continue
+        if name in descriptor["imports"]:
+            imported, symbol = descriptor["imports"][name]
+            if symbol:
+                pending.append((imported, symbol))
+        elif name in descriptor["definitions"]:
+            selected.add((module, name))
+            pending.extend((module, node.id) for node in ast.walk(ast.parse(descriptor["definitions"][name])) if isinstance(node, ast.Name))
     original = len(bundle["modules"])
     modules = {}
     for module, descriptor in bundle["modules"].items():

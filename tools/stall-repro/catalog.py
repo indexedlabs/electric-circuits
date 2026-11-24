@@ -67,6 +67,7 @@ class GatewayShapes:
     async def body(self, table, account, scope=None, identity="fixture", chat=False, generation=0, plain=False):
         collection = self.gateway.registered_collection(table, allow_chat_projection_dependency=True)
         authority = self.authority(account, generation)
+        authority = replace(authority, record_scoped=self.gateway._uses_record_authority(collection, scope) or (chat and table != "composer_submission"))
         if plain:
             authority = replace(authority, direct_content_policy_enabled=False, direct_calendar_grantor_user_ids=(), fingerprint=f"{authority.fingerprint}-owner-only")
         authorization = None
