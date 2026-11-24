@@ -1540,13 +1540,13 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") && msg.contains("1252800"), "{msg}");
 
-        // The live-only knob may shorten the ordinary window. A lease longer than that window
-        // extends the effective live-only period and therefore the stream-TTL floor.
+        // The live-only knob can only shorten the ordinary window. Even a longer lease leaves
+        // the stream-TTL floor unchanged.
         // Keep the sweep explicit so this case reaches the floor check rather than the quarter-TTL check.
         let live_only = [
             ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "50"),
             ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "50"),
-            ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "3600"),
             ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "200"),
             ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
             ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
@@ -1557,23 +1557,6 @@ mod tests {
         live_only_under[6] = ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "199");
         let err = try_cfg(&live_only_under).expect_err("a TTL under the ordinary floor refuses");
         assert!(format!("{err:#}").contains("200"), "{err:#}");
-
-        // A lease longer than the ordinary window becomes the live-only floor, so the stream
-        // TTL must still cover twice that effective period.
-        let lease_floor = [
-            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "10"),
-            ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "10"),
-            ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "200"),
-            ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "0"),
-            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
-            ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
-            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "400"),
-        ];
-        assert!(try_cfg(&lease_floor).is_ok(), "the TTL at twice the lease floor boots");
-        let mut lease_floor_under = lease_floor;
-        lease_floor_under[6] = ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "399");
-        let err = try_cfg(&lease_floor_under).expect_err("a TTL under the lease floor refuses");
-        assert!(format!("{err:#}").contains("400"), "{err:#}");
 
         // The retain window wins when it is the larger.
         let retain =

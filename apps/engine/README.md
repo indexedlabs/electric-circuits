@@ -69,14 +69,14 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). `0` disables dormancy |
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Subscription lease window: a native claim not renewed within it is released. `0` disables lease expiry |
 | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
-| `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Retention: maximum idle period for an unsubscribed **live-only** shape (subquery, aggregate, changes-only feed: the kinds that cannot go dormant) before it is retired from active. The effective period is the smaller of this value and the ordinary idle-plus-dormancy window when both ordinary windows are enabled, floored by the subscription lease. If either ordinary window is disabled, a non-zero value stands on its own; `0` keeps main's live-only rule disabled |
+| `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Retention: maximum idle period for an unsubscribed **live-only** shape (subquery, aggregate, changes-only feed: the kinds that cannot go dormant) before it is retired from active. The effective period is the smaller of this value and the ordinary idle-plus-dormancy window (W). Dormant TTL `0` makes W infinite; idle timeout `0` still leaves W equal to the dormant TTL. A live-only value of `0` preserves W. The lease sets no minimum period |
 | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
 | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
 | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval (also drives change-log segment deletion) |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log) |
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever |
-| `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` | `0` (no TTL) | Durable Streams: sliding `Stream-TTL` sent on the `PUT` that creates a shape stream, a group's shared stream, a `changes/<n>` segment or `meta/catalog`. A stream created before it was set keeps its own configuration and is still opened. A non-zero value under twice the larger of idle-plus-dormancy, the effective live-only period (including the subscription-lease floor), and `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` (14.5 days at the defaults) refuses the boot (exit 78), and so does any non-zero value while idle or dormancy is `0` (disabled). A retain window of `0` adds nothing to the floor, since dormancy eviction still unpins the segment. A keep-alive sweep, on its own timer at the `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` interval, keeps every tracked stream (`meta/catalog`, shape and group streams, retained segments) alive with a non-live tail `GET` once it has gone a quarter of the TTL without an append or read; after a boot the first sweep reads every stream nothing has read since. `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` must be under a quarter of the TTL, or the boot exits 78. `/metrics/prometheus` reports `engine_stream_ttl_touches_total`, `engine_stream_ttl_touch_failures_total` and the gauge `engine_stream_ttl_oldest_untouched_seconds`: the oldest untouched age at the latest finished sweep plus the time since, so it keeps rising if sweeps stop. |
+| `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` | `0` (no TTL) | Durable Streams: sliding `Stream-TTL` sent on the `PUT` that creates a shape stream, a group's shared stream, a `changes/<n>` segment or `meta/catalog`. A stream created before it was set keeps its own configuration and is still opened. A non-zero value under twice the larger of idle-plus-dormancy, the effective live-only period, and `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` (14.5 days at the defaults) refuses the boot (exit 78), and so does any non-zero value while idle or dormancy is `0` (disabled). A retain window of `0` adds nothing to the floor, since dormancy eviction still unpins the segment. A keep-alive sweep, on its own timer at the `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` interval, keeps every tracked stream (`meta/catalog`, shape and group streams, retained segments) alive with a non-live tail `GET` once it has gone a quarter of the TTL without an append or read; after a boot the first sweep reads every stream nothing has read since. `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` must be under a quarter of the TTL, or the boot exits 78. `/metrics/prometheus` reports `engine_stream_ttl_touches_total`, `engine_stream_ttl_touch_failures_total` and the gauge `engine_stream_ttl_oldest_untouched_seconds`: the oldest untouched age at the latest finished sweep plus the time since, so it keeps rising if sweeps stop. |
 | `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | `16777216` (16 MiB) against a store that advertises a page, `67108864` (64 MiB) against one that does not — either lifted to `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB) when that is larger | Durable Streams: client-side hard cap for any response body; exceeding it fails the read with the stream path and observed size. A derived cap is never below the append budget: a JSON page cuts only on a value boundary, so the store frames one of this engine's own appends whole on read, and a smaller cap would refuse the engine's own change log. Setting it explicitly always wins, but a value below the append budget is refused at boot. An uncapped store answers a read with the whole remainder of the stream, so too small a cap there stalls the live loop permanently rather than bounding it |
 | `ELECTRIC_CIRCUITS_DS_CONNECT_TIMEOUT_SECS` | `10` | Durable Streams: TCP+TLS connect deadline |
 | `ELECTRIC_CIRCUITS_DS_READ_TIMEOUT_SECS` | `30` | Durable Streams: deadline for an ORDINARY (bounded) request — a replay page, a HEAD, an append. Also the engine-side deadline the replay path wraps `read_for_table` in, so no single page read outlives it whichever layer notices first |
@@ -508,12 +508,11 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
 - **A subscription is a lease.** Native reads go straight to durable-streams, so the engine never
   sees them: a claim counts as live only while it is created or renewed within
   `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` (`leaseSeconds` in the response — renew at a fraction of it).
-  The retention sweeper releases an unrenewed one exactly as an explicit `DELETE` would, and the
-  and a plain shape then follows the ordinary lifecycle (idle → dormant → evicted); a live-only shape
-  is retired from active after its effective live-only period. That period is the smaller of the
-  configured value and idle-plus-dormancy when both ordinary windows are enabled, floored by the
-  subscription lease. If either ordinary window is disabled, a non-zero value stands on its own;
-  `0` keeps main's live-only rule disabled. A client that renews late
+  The retention sweeper releases an unrenewed one exactly as an explicit `DELETE` would. A plain
+  shape then follows the ordinary lifecycle (idle → dormant → evicted); a live-only shape is retired
+  from active after its effective live-only period, measured from its last renewal or read. The
+  configured period can only shorten the ordinary idle-plus-dormancy window; `0` preserves that
+  window, which is infinite only when the dormant TTL is `0`. A client that renews late
   simply re-subscribes and may find a fresh shape. `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS=0`
   disables lease expiry; `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` independently disables dormancy. Watch `subscriptions_live` (gauge) and
   `subscriptions_lapsed_total` (counter); `GET /shapes/{id}` reports the per-shape count.
@@ -959,8 +958,8 @@ maintained:
 - **Active** — maintained live. Unsubscribing (`DELETE /shapes/{id}?subscription=…`, a lapsed lease,
   `/v1/shape` handle expiry) does not deactivate; brief reconnects rejoin the same warm stream.
 - **Dormant** — after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` with no reads and no **live** subscriptions
-  (a subscription is live only while renewed within that same window — see "Subscriptions"): engine
-  routing state is dropped, the durable stream and shape record are retained at zero engine cost.
+  (a subscription is live while renewed within `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS`,
+  independently of dormancy — see "Subscriptions"): engine routing state is dropped, the durable stream and shape record are retained at zero engine cost.
   Any touch (rejoin, `/v1/shape` re-snapshot, rows/log read) reactivates by replaying the change
   log from the captured resume position (`(segment, offset)`, following rotation pointers across
   segments) — no Postgres backfill. A dormant shape **pins** its resume segment against deletion;
@@ -975,9 +974,9 @@ maintained:
 Eviction is layered, least-recently-read first: ordinary shapes retire from dormant (dormancy TTL,
 count cap, and disk budget), while active **live-only** shapes (subqueries, aggregates and
 changes-only feeds) retire after their effective live-only period with no subscription or touch.
-The period is the smaller of the configured value and idle-plus-dormancy when both ordinary windows
-are enabled, floored by the subscription lease. If either ordinary window is disabled, a non-zero
-value stands on its own; `0` keeps main's live-only rule disabled. A lease lapse is not a touch, so
+A non-zero configured period can only shorten the ordinary idle-plus-dormancy window; `0` preserves
+that window. Dormant TTL `0` makes the ordinary window infinite, while idle timeout `0` leaves it equal
+to the dormant TTL. The lease sets no minimum period. A lease lapse is not a touch, so
 the period runs from the last renewal. Active ordinary shapes are never evicted, and no subscribed
 shape is evicted.
 

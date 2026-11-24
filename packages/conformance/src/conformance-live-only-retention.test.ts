@@ -134,7 +134,7 @@ describe('an unsubscribed live-only feed is retired after the live-only idle per
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
       ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '8',
-      // The explicit 8-second period, rather than the one-second lease floor, keeps this feed
+      // The explicit 8-second period, longer than the one-second lease, keeps this feed
       // around long enough to observe its live behavior before retirement.
       ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
       ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '3600',
@@ -268,5 +268,52 @@ describe('aggregate live-only retention', () => {
     expect(await shapeStatus(feed.shapeId), 'the live-only period starts at the renewal').toBe(200)
     await waitFor(async () => (await shapeStatus(feed.shapeId)) === 404, 'the renewed aggregate to be retired', 10000)
     expect(await counter('shapes_evicted_live_only_idle_total')).toBe(1)
+  }, 90000)
+})
+
+describe('Electric live-only retention', () => {
+  it('a handle poll renews the live-only clock past the original idle period', async () => {
+    const h = await boot({
+      ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
+      ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '4',
+      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '16',
+    })
+    const params = new URLSearchParams({
+      table: 'items',
+      where: "list_id IN (SELECT id FROM lists WHERE owner = 'u1')",
+      offset: '-1',
+    })
+    const snapshot = await fetch(`${h.engineUrl}/v1/shape?${params}`)
+    expect(snapshot.status, await snapshot.text()).toBe(200)
+    const handle = snapshot.headers.get('electric-handle')!
+    const id = handle.split('h')[0]!
+    params.set('handle', handle)
+    params.set('offset', snapshot.headers.get('electric-offset')!)
+
+    // This later-created feed is never renewed. Its retirement proves a sweep has passed the
+    // Electric shape's original idle deadline without another Electric poll moving that clock.
+    const control = await feed(inList(2), 'unrenewed-control')
+    expect(control.status).toBe(200)
+    const controlId = (control.body as unknown as Feed).shapeId
+    const unheld = async () => (await engine('GET', `/shapes/${id}`)).body.subscriptions === 0
+    await waitFor(unheld, 'the original Electric lease to lapse', 10000)
+
+    const poll = await fetch(`${h.engineUrl}/v1/shape?${params}`)
+    expect(poll.status, await poll.text()).toBe(200)
+    expect(poll.headers.get('electric-handle')).toBe(handle)
+    expect((await engine('GET', `/shapes/${id}`)).body.subscriptions).toBe(1)
+    await waitFor(unheld, 'the renewed Electric lease to lapse', 10000)
+    await waitFor(async () => (await shapeStatus(controlId)) === 404, 'the original idle period to end', 20000)
+    expect(await shapeStatus(id), 'the poll extended retention beyond the original deadline').toBe(200)
+
+    await waitFor(async () => (await shapeStatus(id)) === 404, 'the post-poll idle period to end', 10000)
+    await waitFor(async () => {
+      const expired = await fetch(`${h.engineUrl}/v1/shape?${params}`)
+      const body = await expired.json()
+      if (expired.status !== 409) return false
+      expect(body).toEqual([{ headers: { control: 'must-refetch' } }])
+      return true
+    }, 'stream retirement to make the expired handle answer must-refetch')
   }, 90000)
 })
