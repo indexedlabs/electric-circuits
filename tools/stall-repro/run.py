@@ -108,6 +108,20 @@ async def run(args):
     save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL))
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen([str(Path(args.store).resolve()), "--host", "127.0.0.1", "--port", "8791", "--data-dir", str(output / "store-data"), "--durability", "wal"], stdout=store_log, stderr=subprocess.STDOUT)
+    async with httpx.AsyncClient(timeout=1) as store_client:
+        for attempt in range(100):
+            try:
+                response = await store_client.head("http://127.0.0.1:8791/stall-readiness-nonexistent")
+                if response.status_code == 404:
+                    break
+            except httpx.HTTPError:
+                pass
+            if store.poll() is not None:
+                raise RuntimeError("Stream store exited before readiness")
+            await asyncio.sleep(0.1)
+        else:
+            store.terminate()
+            raise TimeoutError("Stream store did not accept requests")
     proxy_log = (output / "store-proxy.log").open("w")
     proxy_ready = output / "store-proxy.json"
     proxy = subprocess.Popen(["node", str(folder / "store-proxy.ts"), str(proxy_ready)], stdout=proxy_log, stderr=subprocess.STDOUT)
@@ -134,6 +148,7 @@ async def run(args):
         "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "0",
         "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "0",
         "ELECTRIC_CIRCUITS_LOG_JSON": "1",
+        "ELECTRIC_CIRCUITS_TRACE": "0",
         "ELECTRIC_SECRET": SECRET,
         "ELECTRIC_STORAGE_DIR": str(output / "engine-data"),
     }
