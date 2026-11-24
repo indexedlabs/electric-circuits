@@ -166,8 +166,11 @@ construction ([`http.rs`](/Users/bozilabs/labs/electric-circuits/apps/engine/src
 `limit` has no application maximum and snapshot shapes/`/v1/shape` can materialize unbounded results.
 Backfill statement timeout defaults to off ([`deployment-postgres.md`](/Users/bozilabs/labs/electric-circuits/docs/deployment-postgres.md)).
 
-Retention's `MAX_SHAPES` and disk budget only evict **dormant** shapes. Active subscriptions, and
-subquery/aggregate shapes that are not dormant, can exceed the cap while the engine logs pressure
+Retention's `MAX_SHAPES` and disk budget evict **dormant** shapes only. Active subscriptions and
+subquery/aggregate shapes remain protected; an unsubscribed live-only shape is retired after the
+smaller of a non-zero `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` and idle-plus-dormancy (W).
+Dormant TTL `0` makes W infinite; idle timeout `0` leaves W equal to the dormant TTL. A live-only
+value of `0` preserves W, independently of the lease. The engine logs pressure
 rather than shedding active work ([`retention.rs`](/Users/bozilabs/labs/electric-circuits/apps/engine/src/retention.rs),
 [`engine/lifecycle.rs`](/Users/bozilabs/labs/electric-circuits/apps/engine/src/engine/lifecycle.rs)).
 Fallback predicates such as `OR`, `NOT` and `LIKE` retain a per-change scan path
