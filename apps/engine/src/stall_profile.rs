@@ -73,15 +73,24 @@ pub(crate) async fn flip_lock<Value>(mutex: &Mutex<Value>) -> MeasuredGuard<'_, 
 
 pub(crate) fn snapshot() -> serde_json::Value {
     let labels = [
-        "marker_wait", "membership", "sequencer_registry_wait", "sequencer_registry_hold",
-        "flip_registry_wait", "flip_registry_hold", "flip_batch", "flip_one",
+        "marker_wait",
+        "membership",
+        "sequencer_registry_wait",
+        "sequencer_registry_hold",
+        "flip_registry_wait",
+        "flip_registry_hold",
+        "flip_batch",
+        "flip_one",
     ];
     let mut values = serde_json::Map::new();
     for (category, label) in labels.into_iter().enumerate() {
-        values.insert(label.to_owned(), serde_json::json!({
-            "calls": CALLS[category].load(Ordering::Relaxed),
-            "wall_seconds": NANOS[category].load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
-        }));
+        values.insert(
+            label.to_owned(),
+            serde_json::json!({
+                "calls": CALLS[category].load(Ordering::Relaxed),
+                "wall_seconds": NANOS[category].load(Ordering::Relaxed) as f64 / 1_000_000_000.0,
+            }),
+        );
     }
     serde_json::json!({
         "categories": values,

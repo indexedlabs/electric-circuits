@@ -2165,7 +2165,8 @@ pub(crate) async fn process_envelope(
                 &subq.registry,
                 crate::stall_profile::SEQUENCER_WAIT,
                 crate::stall_profile::SEQUENCER_HOLD,
-            ).await;
+            )
+            .await;
             if reg.touches(&ts.table) {
                 if let Some(commit_ts) = commit_ts {
                     reg.note_commit_time(lsn_u64, commit_ts);

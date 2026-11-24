@@ -35,14 +35,15 @@ jobs:
           git diff 5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363 HEAD -- apps/engine > tools/stall-repro/results/observer-build/source.diff
           cargo fmt --check > tools/stall-repro/results/observer-build/format.txt 2>&1 || true
           cargo build --release --locked -p electric-circuits-engine
-          cargo test --release --locked -p electric-circuits-engine --lib stall_profile::tests
           sha256sum target/release/electric-circuits-engine > tools/stall-repro/results/observer-build/binary.sha256
+          cargo test --release --locked -p electric-circuits-engine --features test-support --lib stall_profile::tests
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: stall-observer-build-${{ github.sha }}
           path: tools/stall-repro/results/observer-build/
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: stall-observed-engine-${{ github.sha }}
           path: target/release/electric-circuits-engine
