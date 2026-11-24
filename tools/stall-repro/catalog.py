@@ -64,7 +64,7 @@ class GatewayShapes:
         records = {"col": "id", "in": {"table": "record_date_index", "project": "record_id", "where": date_range}}
         if table == "record":
             return records
-        if table in {"assignment", "record_recurrence", "record_date_index", "record_assignee_index", "record_completed_index", "workflow_run"}:
+        if table in {"assignment", "record_recurrence", "record_date_index", "record_assignee_index", "record_completed_index"}:
             return {"col": "record_id", "in": {"table": "record", "project": "id", "where": records}}
         if table == "graph_edge":
             return {"col": "from_id", "in": {"table": "record", "project": "id", "where": records}}
@@ -108,6 +108,7 @@ async def main():
         requests = await gateway.generate(day)
         (output / f"{day}-requests.json").write_text(json.dumps(requests, separators=(",", ":")))
         print(day, len(requests), dict(Counter(request["body"]["table"] for request in requests)))
+    (output / "catalog-provenance.json").write_text(json.dumps(gateway.loader.loaded, indent=2))
 
 
 if __name__ == "__main__":
