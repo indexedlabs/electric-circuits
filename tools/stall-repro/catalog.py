@@ -72,6 +72,55 @@ def without_attendee_subject(where):
     return copy
 
 
+EDGE_BRANCHES = {
+    # Branches of today's graph_edge authorization, by the edge kinds each admits.
+    "attendee": lambda types, kinds: types == {"has_attendee", "has_subject"},
+    "generated": lambda types, kinds: types == {"generated", "updated"},
+    "resource": lambda types, kinds: kinds == {("from_type", "resource"), ("to_type", "resource")} or {("from_type", "resource"), ("to_type", "resource")} <= kinds and "relates_to" not in types,
+}
+
+
+def _plain_conditions(branch, column):
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("col") == column and node.get("op") == "eq":
+                found.add(node["value"])
+            for key, value in node.items():
+                if key != "in":
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(branch)
+    return found
+
+
+def _edge_branch_list(where):
+    """The OR list of today's five graph_edge authorization branches inside a gateway body."""
+    if isinstance(where, dict):
+        members = where.get("or")
+        if isinstance(members, list) and len(members) == 5 and any("has_attendee" in json.dumps(member) for member in members):
+            return members
+        for key, value in where.items():
+            found = _edge_branch_list(value) if key != "in" else None
+            if found is not None:
+                return found
+    elif isinstance(where, list):
+        for value in where:
+            found = _edge_branch_list(value)
+            if found is not None:
+                return found
+    return None
+
+
+def edge_branch(branches, name):
+    matches = [index for index, branch in enumerate(branches) if EDGE_BRANCHES[name](_plain_conditions(branch, "edge_type"), {(column, value) for column in ("from_type", "to_type") for value in _plain_conditions(branch, column)})]
+    if len(matches) != 1:
+        raise ValueError(f"expected one {name} branch in today's graph_edge filter, found {matches}")
+    return matches[0]
+
+
 def plain_control_body(body, account, identity):
     table = body["table"].removeprefix("public.")
     columns = body["columns"]
@@ -133,7 +182,7 @@ class GatewayShapes:
         columns = set(collection.columns) | ({"audience_key", "reader_class"} if keyed else set())
         return {"table": f"public.{table}", "columns": sorted(columns), "where": where, "changesOnly": True, "subscription": self._subscription(table, account, identity)}
 
-    async def cold_bodies(self, table, account):
+    async def cold_bodies(self, table, account, key_all_edges=False):
         """Variant B-cold, amended (`variant-b-cold.md`): the shapes one account holds on `table`."""
         user = str(synthetic_id(f"user/{account}"))
         space = str(synthetic_id(f"space/{account}"))
@@ -148,6 +197,8 @@ class GatewayShapes:
         if table == "suggestion":
             deck = {"and": [*live, {"col": "deleted_at", "isNull": True}, {"col": "status", "op": "eq", "value": "pending"}, {"col": "removed_at", "isNull": True}]}
             return [self._plain_body(table, account, deck, "cold-deck")]
+        if table == "graph_edge" and key_all_edges:
+            return [self.keyed_body(table, account, identity="cold-all-edges")]
         if table == "graph_edge":
             keyed = {"and": [*live, {"col": "from_type", "op": "eq", "value": "record"}, {"col": "to_type", "op": "eq", "value": "resource"}, {"or": [{"col": "edge_type", "op": "eq", "value": "has_attendee"}, {"col": "edge_type", "op": "eq", "value": "has_subject"}]}]}
             today = await self.body("graph_edge", account, None, identity="cold-other-edges")
@@ -162,13 +213,43 @@ class GatewayShapes:
             return [self.keyed_body(table, account, calendar=calendar, identity="cold") for calendar in range(15)]
         return [self.keyed_body(table, account, identity="cold")]
 
-    async def cold_catalog(self, requests):
+    async def cold_catalog(self, requests, key_all_edges=False):
         result = {}
         for request in requests:
             table = request["body"]["table"].removeprefix("public.")
-            for body in await self.cold_bodies(table, request["account"]):
+            for body in await self.cold_bodies(table, request["account"], key_all_edges):
                 signature = json.dumps({key: value for key, value in body.items() if key != "subscription"}, sort_keys=True)
                 result[signature] = {"kind": "cold-retained" if contains_subquery(body["where"]) else "cold-plain", "account": request["account"], "body": body, "has_subquery": contains_subquery(body["where"])}
+        return list(result.values())
+
+    def edge_attribution(self, body, account, mode):
+        """A graph_edge body for an A-edge-* attribution variant, plus the keyed shape it adds (if any)."""
+        copy = json.loads(json.dumps(body))
+        if mode == "no-window":
+            # where = AND[AND[authorization, AND[window, identity]], ...]: drop only the synthetic window.
+            outer = copy["where"]["and"][0]
+            scope = outer.get("and", [None, None])[1] if isinstance(outer, dict) and len(outer.get("and", [])) == 2 else None
+            if isinstance(scope, dict) and isinstance(scope.get("and"), list) and _edge_branch_list(scope) is None:
+                outer["and"][1] = {"and": [clause for clause in scope["and"] if "in" not in json.dumps(clause)]}
+            return [copy]
+        branches = _edge_branch_list(copy["where"])
+        removed = branches.pop(edge_branch(branches, mode))
+        space = str(synthetic_id(f"space/{account}"))
+        conditions = [{"col": "audience_key", "op": "eq", "value": space}, {"col": "reader_class", "op": "eq", "value": "live"}]
+        for column in ("from_type", "to_type"):
+            values = _plain_conditions(removed, column)
+            if len(values) == 1:
+                conditions.append({"col": column, "op": "eq", "value": values.pop()})
+        conditions.append({"or": [{"col": "edge_type", "op": "eq", "value": value} for value in sorted(_plain_conditions(removed, "edge_type"))]})
+        return [copy, self._plain_body("graph_edge", account, {"and": conditions}, f"edge-key-{mode}")]
+
+    async def edge_attribution_catalog(self, requests, mode):
+        result = {}
+        for request in requests:
+            bodies = self.edge_attribution(request["body"], request["account"], mode) if request["body"]["table"] == "public.graph_edge" else [request["body"]]
+            for body in bodies:
+                signature = json.dumps(body, sort_keys=True) if body is request["body"] else json.dumps({key: value for key, value in body.items() if key != "subscription"}, sort_keys=True)
+                result[signature] = {**request, "body": body, "has_subquery": contains_subquery(body["where"])}
         return list(result.values())
 
     async def keyed_catalog(self, requests, preserved=frozenset()):

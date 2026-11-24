@@ -106,7 +106,13 @@ RETAINED_CLASSES = {"chat": {"message", "workflow_run"}, "edge": {"graph_edge"},
 KEYED_VARIANTS = {"B", "B-retained", *(f"B-retained-key-{name}" for name in RETAINED_CLASSES)}
 # E-only / E-plus-R: today's catalog (A) with only these tables keyed as B keys them.
 PARTLY_KEYED = {"E-only": {"graph_edge"}, "E-plus-R": {"graph_edge", *RECORD_FAMILY}}
-AUDIENCE_VARIANTS = KEYED_VARIANTS | {"B-cold"} | set(PARTLY_KEYED)
+# A-edge-*: today's catalog with one graph_edge authorization branch keyed (or the synthetic date window dropped).
+EDGE_ATTRIBUTION = {"A-edge-key-attendee": "attendee", "A-edge-key-generated": "generated", "A-edge-key-resource": "resource", "A-edge-no-window": "no-window"}
+PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTION.items() if mode != "no-window"})
+# B-cold-key-edges: B-cold with every graph_edge branch keyed, to attribute B-cold's remaining cost.
+COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
+AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
+ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION)
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -120,6 +126,8 @@ BRIDGE_ENVIRONMENT = {
 
 def keyed(variant, table):
     """Whether this variant reads `table` through B's audience-key equality shapes."""
+    if variant in EDGE_ATTRIBUTION:
+        return False
     if variant in PARTLY_KEYED:
         return table in PARTLY_KEYED[variant]
     return variant in KEYED_VARIANTS and table not in preserved_tables(variant)
@@ -154,7 +162,7 @@ async def run(args):
         store_arguments.extend(["--max-chunk-bytes", "4194304"])
     save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
-    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant == "B-cold"))
+    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS))
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen(store_arguments, stdout=store_log, stderr=subprocess.STDOUT)
     async with httpx.AsyncClient(timeout=1) as store_client:
@@ -218,10 +226,12 @@ async def run(args):
             catalog = await gateway.generate(args.catalog, args.scale)
             if args.variant in KEYED_VARIANTS:
                 catalog = await gateway.keyed_catalog(catalog, preserved=preserved_tables(args.variant))
-            if args.variant in PARTLY_KEYED:
+            if args.variant in EDGE_ATTRIBUTION:
+                catalog = await gateway.edge_attribution_catalog(catalog, EDGE_ATTRIBUTION[args.variant])
+            elif args.variant in PARTLY_KEYED:
                 catalog = await gateway.keyed_catalog(catalog, preserved={request["body"]["table"].removeprefix("public.") for request in catalog} - PARTLY_KEYED[args.variant])
-            if args.variant == "B-cold":
-                catalog = await gateway.cold_catalog(catalog)
+            if args.variant in COLD_VARIANTS:
+                catalog = await gateway.cold_catalog(catalog, key_all_edges=args.variant == "B-cold-key-edges")
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -242,8 +252,12 @@ async def run(args):
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
             for table in ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource"):
-                if args.variant == "B-cold":
-                    for body in await gateway.cold_bodies(table, IMPORT_ACCOUNT):
+                if args.variant in COLD_VARIANTS:
+                    for body in await gateway.cold_bodies(table, IMPORT_ACCOUNT, args.variant == "B-cold-key-edges"):
+                        await create({"body": body})
+                    continue
+                if args.variant in EDGE_ATTRIBUTION and table == "graph_edge":
+                    for body in gateway.edge_attribution(await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}"), IMPORT_ACCOUNT, EDGE_ATTRIBUTION[args.variant]):
                         await create({"body": body})
                     continue
                 table_keyed = keyed(args.variant, table)
@@ -252,7 +266,7 @@ async def run(args):
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant == "B-cold" or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
+            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in COLD_VARIANTS or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
             if args.variant == "plain-only":
                 probe_body = plain_control_body(probe_body, 0, "other-account-probe")
             probe_feed = await create({"body": probe_body})
@@ -308,9 +322,9 @@ async def run(args):
                 began = time.monotonic()
                 profiler = None
                 perf = os.environ.get("STALL_REPRO_PERF")
-                if perf and workload == "import":
+                if perf:
                     perf_log = (output / "perf.log").open("w")
-                    profiler = subprocess.Popen(["sudo", perf, "record", "-e", "cpu-clock", "-F", "99", "-g", "--call-graph", "fp", "-p", str(pid), "-o", str(output / "import.perf.data"), "--", "sleep", str(args.timeout + 120)], stdout=perf_log, stderr=subprocess.STDOUT, start_new_session=True)
+                    profiler = subprocess.Popen(["sudo", perf, "record", "-e", "cpu-clock", "-F", "99", "-g", "--call-graph", "fp", "-p", str(pid), "-o", str(output / f"{workload}.perf.data"), "--", "sleep", str(args.timeout + 120)], stdout=perf_log, stderr=subprocess.STDOUT, start_new_session=True)
                 cpu_before = sum(process.cpu_times()[:2])
                 cpu_stopped = asyncio.Event()
                 cpu_task = asyncio.create_task(sample_cpu(process, quota.parent, output / f"{workload}-cpu.jsonl", cpu_stopped))
@@ -346,18 +360,18 @@ async def run(args):
                 if profiler:
                     subprocess.run(["sudo", "kill", "-INT", "--", f"-{profiler.pid}"], check=False)
                     profiler.wait(timeout=30)
-                    subprocess.run(["sudo", "chmod", "a+r", str(output / "import.perf.data")], check=True)
+                    subprocess.run(["sudo", "chmod", "a+r", str(output / f"{workload}.perf.data")], check=True)
                     perf_log.close()
                 await cpu_task
                 await probe_task
                 if profiler:
-                    with (output / "import.perf.script").open("w") as handle:
-                        extracted = subprocess.run(["sudo", perf, "script", "-i", str(output / "import.perf.data")], stdout=handle, stderr=subprocess.PIPE, text=True)
-                    stacks = fold((output / "import.perf.script").read_text())
+                    with (output / f"{workload}.perf.script").open("w") as handle:
+                        extracted = subprocess.run(["sudo", perf, "script", "-i", str(output / f"{workload}.perf.data")], stdout=handle, stderr=subprocess.PIPE, text=True)
+                    stacks = fold((output / f"{workload}.perf.script").read_text())
                     result["profile"] = {"elapsed_s": result["elapsed_s"], "samples": sum(stacks.values()), "script_exit": extracted.returncode, "script_stderr": extracted.stderr, "at_least_three_minutes": result["elapsed_s"] >= 180, "attribution": attribute(stacks) if stacks else {}}
                     if stacks:
-                        (output / "import.folded").write_text("\n".join(f"{stack} {count}" for stack, count in sorted(stacks.items())) + "\n")
-                        (output / "import.svg").write_text(render(stacks, f"{args.name} import CPU"))
+                        (output / f"{workload}.folded").write_text("\n".join(f"{stack} {count}" for stack, count in sorted(stacks.items())) + "\n")
+                        (output / f"{workload}.svg").write_text(render(stacks, f"{args.name} {workload} CPU"))
                 result["engine_cpu_percent"] = (cpu_after - cpu_before) / result["elapsed_s"] * 100
                 result["changes_per_s"] = result.get("row_changes", 0) / result["elapsed_s"] if result["completed"] else None
                 result["probe"] = summarize([sample for sample in probe.samples if began - probe.started <= sample["at_s"] <= began + result["elapsed_s"] - probe.started])
@@ -432,7 +446,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
-    parser.add_argument("--variant", choices=("A", "A-observed", *sorted(AUDIENCE_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
+    parser.add_argument("--variant", choices=("A", "A-observed", *sorted(ALL_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
     parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete"), default=["import", "large-delete", "small-delete"])

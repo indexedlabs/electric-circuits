@@ -11,7 +11,7 @@ import json
 import re
 from pathlib import Path
 
-WORKLOADS = ("import", "large-delete", "small-delete")
+WORKLOADS = ("import", "large-delete", "small-delete", "share-delete")
 SERVED_RATE = 0.9
 
 
