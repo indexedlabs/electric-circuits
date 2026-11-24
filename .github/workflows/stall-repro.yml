@@ -28,6 +28,15 @@ jobs:
         with:
           python-version: '3.13'
       - run: pip install 'sqlalchemy==2.0.44' sqlalchemy-utils passlib 'pydantic>=2.11,<3' whenever fastapi logfire uuid-utils pgvector httpx 'psycopg[binary]' psutil
+      - name: Prepare CPU sampler
+        if: contains(github.event.head_commit.message, '[profile]')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-common linux-tools-generic
+          PERF=$(find /usr/lib/linux-tools -type f -name perf | sort -V | tail -1)
+          test -x "$PERF"
+          echo "STALL_REPRO_PERF=$PERF" >> "$GITHUB_ENV"
+          sudo "$PERF" stat -e cycles -- true
       - uses: actions/download-artifact@v4
         with:
           name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937

@@ -18,6 +18,7 @@ import psycopg
 
 from catalog import GatewayShapes, TARGETS
 from data import IMPORT_ACCOUNT, LARGE_ACCOUNT, load_data, row_id
+from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
 
 
@@ -226,6 +227,11 @@ async def run(args):
                     transactions.append({"transaction": transaction, "txid": connection.execute("SELECT pg_current_xact_id()::text").fetchone()[0], "before_commit": time.time(), "marker": str(current)})
                 began_wall = time.time()
                 began = time.monotonic()
+                profiler = None
+                perf = os.environ.get("STALL_REPRO_PERF")
+                if perf and workload == "import":
+                    perf_log = (output / "perf.log").open("w")
+                    profiler = subprocess.Popen(["sudo", perf, "record", "-F", "99", "-g", "--call-graph", "fp", "-p", str(pid), "-o", str(output / "import.perf.data"), "--", "sleep", str(args.timeout + 120)], stdout=perf_log, stderr=subprocess.STDOUT, start_new_session=True)
                 cpu_before = sum(process.cpu_times()[:2])
                 cpu_stopped = asyncio.Event()
                 cpu_task = asyncio.create_task(sample_cpu(process, quota.parent, output / f"{workload}-cpu.jsonl", cpu_stopped))
@@ -245,6 +251,17 @@ async def run(args):
                 result["ended_wall"] = time.time()
                 result["began_wall"] = began_wall
                 result["transactions"] = transactions
+                if profiler:
+                    subprocess.run(["sudo", "kill", "-INT", "--", f"-{profiler.pid}"], check=False)
+                    profiler.wait(timeout=30)
+                    perf_log.close()
+                    with (output / "import.perf.script").open("w") as handle:
+                        extracted = subprocess.run(["sudo", perf, "script", "-i", str(output / "import.perf.data")], stdout=handle, stderr=subprocess.PIPE, text=True)
+                    stacks = fold((output / "import.perf.script").read_text())
+                    result["profile"] = {"elapsed_s": result["elapsed_s"], "samples": sum(stacks.values()), "script_exit": extracted.returncode, "script_stderr": extracted.stderr, "at_least_three_minutes": result["elapsed_s"] >= 180, "attribution": attribute(stacks) if stacks else {}}
+                    if stacks:
+                        (output / "import.folded").write_text("\n".join(f"{stack} {count}" for stack, count in sorted(stacks.items())) + "\n")
+                        (output / "import.svg").write_text(render(stacks, f"{args.name} import CPU"))
                 cpu_stopped.set()
                 await cpu_task
                 result["engine_cpu_percent"] = (sum(process.cpu_times()[:2]) - cpu_before) / result["elapsed_s"] * 100
