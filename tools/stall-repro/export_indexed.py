@@ -84,6 +84,10 @@ def export(root: Path, destination: Path) -> None:
                         statement = StorageOnlyTypes().visit(statement)
                         imports["__schema_jsonb__"] = ["sqlalchemy.dialects.postgresql", "JSONB"]
                         imports["__schema_binary__"] = ["sqlalchemy", "LargeBinary"]
+                    elif statement.name == "FormattedSuggestionShape":
+                        field_names = [member.target.id for member in statement.body if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name)]
+                        statement = ast.parse(f"FormattedSuggestionShape = __fields_only__(model_fields={dict.fromkeys(field_names)!r})").body[0]
+                        imports["__fields_only__"] = ["types", "SimpleNamespace"]
                 statement = StripDocumentation().visit(statement)
                 if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     statement.decorator_list = [decorator for decorator in statement.decorator_list if not ast.unparse(decorator).startswith("logfire.")]
@@ -111,7 +115,7 @@ def export(root: Path, destination: Path) -> None:
         "publication_source": str(infra_path.relative_to(root)),
         "publication_source_sha256": hashlib.sha256(infra_path.read_bytes()).hexdigest(),
         "table_classes": table_classes,
-        "schema_only_transforms": ["ORM relationships and methods omitted; neither creates SQL columns", "PydanticType and PydanticUnionType use their declared JSONB storage without application serializers", "EncryptedText uses its declared LargeBinary storage without loading credentials", "ASSISTANT_USER_ID is replaced with a synthetic UUID by the loader"],
+        "schema_only_transforms": ["ORM relationships and methods omitted; neither creates SQL columns", "PydanticType and PydanticUnionType use their declared JSONB storage without application serializers", "EncryptedText uses its declared LargeBinary storage without loading credentials", "FormattedSuggestionShape exports its annotated field names only, which is all the gateway registry reads", "ASSISTANT_USER_ID is replaced with a synthetic UUID by the loader"],
         "modules": bundle,
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
