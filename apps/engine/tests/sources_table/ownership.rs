@@ -68,7 +68,8 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupConflict => group_claim_overlap_is_atomic(&fixture).await,
             Case::GroupFence => group_uses_one_snapshot_fence(&fixture).await,
             Case::GroupRetirement => group_retirement_recreates_after_close(&fixture).await,
-            Case::GroupRestart => group_restart_restores_plain_and_drops_mixed(&fixture).await,
+            Case::GroupRestartSaved => group_restart(&fixture, true).await,
+            Case::GroupRestartUntrusted => group_restart(&fixture, false).await,
             Case::GroupRestoreExpired => group_restore_drops_expired_group_before_first_sweep(&fixture).await,
             Case::GroupClosedReload => group_closed_reload_waits_for_release(&fixture).await,
             Case::GroupRelease => group_release_reloads_same_subscription(&fixture).await,
@@ -114,7 +115,8 @@ enum Case {
     GroupConflict,
     GroupFence,
     GroupRetirement,
-    GroupRestart,
+    GroupRestartSaved,
+    GroupRestartUntrusted,
     GroupRestoreExpired,
     GroupClosedReload,
     GroupRelease,
@@ -222,8 +224,17 @@ fn group_retirement_reloads_and_closed_stream_is_recreated() -> Result<()> {
 
 #[test]
 #[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
-fn group_restart_restores_plain_and_drops_mixed_groups() -> Result<()> {
-    isolated("ownership::group_restart_restores_plain_and_drops_mixed_groups", Case::GroupRestart)
+fn group_graceful_restart_restores_plain_and_mixed_groups() -> Result<()> {
+    isolated("ownership::group_graceful_restart_restores_plain_and_mixed_groups", Case::GroupRestartSaved)
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_restart_without_usable_state_drops_mixed_without_reusing_paths() -> Result<()> {
+    isolated(
+        "ownership::group_restart_without_usable_state_drops_mixed_without_reusing_paths",
+        Case::GroupRestartUntrusted,
+    )
 }
 
 #[test]
@@ -2913,39 +2924,129 @@ async fn group_admission_gate(f: &Fixture) -> Result<()> {
     result
 }
 
-async fn group_restart_restores_plain_and_drops_mixed(f: &Fixture) -> Result<()> {
+// OTTO-13833: close is graceful, so a complete saved registry preserves mixed groups. An
+// untrusted state still drops them. Establish which happened BEFORE issuing another load: a
+// renewal of a restored group is not a new group reusing a dropped group's path.
+async fn group_restart(f: &Fixture, usable_state: bool) -> Result<()> {
+    install_source_fence(f).await?;
     let (engine, app) = group_engine(f).await?;
+    let mut replacement = None;
     let result = async {
         let (status, plain) = post_group(&app, group_body(f, "group-plain-restart", true)).await?;
         ensure!(status == StatusCode::OK, "plain group create failed: {status} {plain}");
         let (status, mixed) = post_group(&app, group_body(f, "group-mixed-restart", false)).await?;
         ensure!(status == StatusCode::OK, "mixed group create failed: {status} {mixed}");
-        engine.close(Duration::from_secs(10)).await;
-        let (restarted, restarted_app) = group_engine(f).await?;
-        let (status, duplicate_plain) = post_group(&restarted_app, group_body(f, "group-plain-restart", true)).await?;
-        ensure!(status == StatusCode::OK, "plain group did not renew after restart: {status} {duplicate_plain}");
-        ensure!(duplicate_plain["streamPath"] == plain["streamPath"], "restored plain group changed stream path");
-        f.client.batch_execute(&format!("INSERT INTO public.{} (id, body) VALUES (5, 'restart')", f.outer)).await?;
-        let restart_events =
-            wait_group_events(f, duplicate_plain["streamPath"].as_str().context("restored plain stream path")?, 1)
-                .await?;
-        ensure!(
-            restart_events.iter().any(|event| event_key(event).as_deref() == Some("5")),
-            "restored group missed live output: {restart_events:?}"
-        );
+        let plain_path = plain["streamPath"].as_str().context("plain group stream path")?;
         let old_mixed_path = mixed["streamPath"].as_str().context("mixed group stream path")?;
-        let (status, recreated_mixed) = post_group(&restarted_app, group_body(f, "group-mixed-restart", false)).await?;
         ensure!(
-            status == StatusCode::OK,
-            "mixed group was not dropped as a unit on restart: {status} {recreated_mixed}"
+            engine.close(Duration::from_secs(10)).await
+                == electric_circuits_engine::shutdown::ShutdownOutcome::Complete,
+            "the initial stop must complete gracefully"
         );
-        ensure!(recreated_mixed["streamPath"].as_str() != Some(old_mixed_path), "new group reused dropped stream path");
-        restarted.close(Duration::from_secs(10)).await;
+        let catalog = stream_events(f, "meta/catalog").await;
+        let state_path = catalog
+            .iter()
+            .rev()
+            .find(|event| event["t"] == "offset")
+            .and_then(|event| event["subq_state"]["stream"].as_str())
+            .context("the graceful stop must name its saved subquery state")?;
+        if !usable_state {
+            // Fault cut after the pointer is durable but before the state is complete. Keep the
+            // catalog and group streams intact; only remove the saved state's final record.
+            let mut streams = f.ds.store.streams.lock().await;
+            let (_, saved) = streams
+                .iter_mut()
+                .find(|(path, _)| path.ends_with(state_path))
+                .context("the named saved state must exist before the fault")?;
+            ensure!(saved.pop().is_some(), "the named saved state must have a final record to lose");
+        }
+        let (restarted, restarted_app) = group_engine(f).await?;
+        replacement = Some(restarted);
+        let restarted = replacement.as_ref().unwrap();
+        ensure!(restarted.has_group_record("group-plain-restart").await, "plain group was not restored");
+        ensure!(
+            restarted.has_group_record("group-mixed-restart").await == usable_state,
+            "mixed group restore did not follow the saved-state trust boundary"
+        );
+        let current_mixed = if usable_state {
+            // No snapshot/renewal request before live output proves that boot itself restored it.
+            mixed.clone()
+        } else {
+            let retired = f.ds.retired.lock().await;
+            let close =
+                retired.iter().position(|(method, path)| *method == Method::POST && path.ends_with(old_mixed_path));
+            let delete =
+                retired.iter().position(|(method, path)| *method == Method::DELETE && path.ends_with(old_mixed_path));
+            ensure!(
+                matches!((close, delete), (Some(close), Some(delete)) if close < delete),
+                "unrestorable mixed group must be closed then deleted before recreation: {retired:?}"
+            );
+            drop(retired);
+            let (status, fresh) = post_group(&restarted_app, group_body(f, "group-mixed-restart", false)).await?;
+            ensure!(status == StatusCode::OK, "dropped mixed group could not be recreated: {status} {fresh}");
+            ensure!(
+                fresh["streamPath"].as_str().is_some_and(|path| path != old_mixed_path),
+                "new group reused dropped stream path: {fresh}"
+            );
+            ensure!(fresh["groupId"] != mixed["groupId"], "new group reused dropped group identity");
+            fresh
+        };
+        let mixed_path = current_mixed["streamPath"].as_str().context("current mixed stream path")?;
+        let commit = uuid::Uuid::new_v4();
+        f.client
+            .batch_execute(&format!(
+                "BEGIN; INSERT INTO public.{} (id, body) VALUES (5, 'restart'); \
+             INSERT INTO public.{} (id) VALUES (5); \
+             INSERT INTO public.circuits_source_fence VALUES ('{}'); COMMIT",
+                f.outer, f.inner, commit
+            ))
+            .await?;
+        wait_source_receipt(restarted, f, commit).await?;
+        for path in [plain_path, mixed_path] {
+            wait_group_receipt(restarted, f, commit, path).await?;
+            let events = stream_events(f, path).await;
+            let delivered: BTreeSet<_> = events
+                .iter()
+                .filter(|event| event_key(event).as_deref() == Some("5") && event_operation(event) == Some("upsert"))
+                .filter_map(|event| event["type"].as_str())
+                .collect();
+            let expected = BTreeSet::from([format!("public.{}", f.outer), format!("public.{}", f.inner)]);
+            ensure!(
+                delivered == expected.iter().map(String::as_str).collect(),
+                "group {path} missed a plain or subquery member's live output: {events:?}"
+            );
+        }
+        if usable_state {
+            ensure!(
+                !f.ds.retired.lock().await.iter().any(|(_, path)| path.ends_with(old_mixed_path)),
+                "a restored mixed stream was retired"
+            );
+        } else {
+            ensure!(
+                !f.ds.store.streams.lock().await.keys().any(|path| path.ends_with(old_mixed_path)),
+                "recreated group wrote into the dropped group's stream"
+            );
+        }
+        for (subscription, plain_only, previous) in
+            [("group-plain-restart", true, &plain), ("group-mixed-restart", false, &current_mixed)]
+        {
+            let (status, renewed) = post_group(&restarted_app, group_body(f, subscription, plain_only)).await?;
+            ensure!(status == StatusCode::OK, "group renewal failed: {status} {renewed}");
+            ensure!(
+                renewed["streamPath"] == previous["streamPath"]
+                    && renewed["groupId"] == previous["groupId"]
+                    && renewed["results"] == previous["results"],
+                "renewal changed the group's stream or members"
+            );
+        }
         Ok::<_, anyhow::Error>(())
     }
     .await;
-    // The restart case closes both engines inside the body; this is idempotent cleanup for the
-    // failure path before the explicit restart.
+    if let Some(restarted) = replacement {
+        restarted.close(Duration::from_secs(10)).await;
+    }
+    engine.close(Duration::from_secs(10)).await;
+    remove_source_fence(f).await;
     result
 }
 
