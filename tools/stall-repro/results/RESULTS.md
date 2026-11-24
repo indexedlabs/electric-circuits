@@ -1,8 +1,10 @@
 # OTTO-13916 — measurements pending
 
 No M1, M2, M3, or M4 milestone has been reached. No stall, CPU attribution,
-throughput, or improvement has been measured. In particular, a build or an
-environment check is not a reproduction.
+throughput, or improvement is yet claimed as the final prod-matched experiment.
+Preliminary runs now demonstrate minute-scale drain/live starvation, but their
+startup quota and profiling-artifact limitations below require corrected runs.
+No model B or bridge verdict has been measured.
 
 ## Provenance
 
@@ -79,6 +81,60 @@ decoded engine change counts, WAL/log bytes, processing time or a stall.
   not evidence about production store identity, layout or latency.
 
 No flamegraphs, CPU attribution, model B results or bridge verdict exist yet.
+
+## Preliminary full catalogs — not the final M1 control
+
+These runs used 1 CPU during workloads but started/warmed the engine at 4 CPUs.
+That can change runtime thread selection, so they are not interchangeable with
+the corrected run that enforces its quota from process start. All use the same
+immutable production-source binary. No pinned-position warnings were observed.
+
+| Catalog / workload | First delivery → empty s | SQL → empty s | SQL-clock changes/s | Mean CPU % | Backfills | Backfills/min | Drain successes | Subset successes | Live successes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| Preliminary Nov 23 / import | 365.29 | 366.19 | 35.72 | 99.83 | 15,420 | 2,526.53 | 1/367 | 367/367 | 1/367 |
+| Preliminary Nov 23 / large delete | 129.40 | 153.52 | 194.07 | 93.24 | 21,461 | 8,387.74 | 0/154 | 154/154 | 0/154 |
+| Preliminary Nov 23 / small delete | 182.69 | 190.76 | 37.29 | 99.35 | 15,422 | 4,850.76 | 0/191 | 191/191 | 0/191 |
+| Preliminary Nov 24 / import | 669.83 | 670.50 | 19.51 | 99.94 | 15,420 | 1,379.86 | 1/671 | 671/671 | 1/671 |
+| Preliminary Nov 24 / large delete | 307.81 | 320.25 | 93.03 | 95.93 | 24,525 | 4,594.90 | 0/320 | 320/320 | 0/320 |
+| Preliminary Nov 24 / small delete | 350.85 | 394.30 | 18.04 | 99.40 | 15,422 | 2,346.77 | 0/395 | 395/395 | 0/395 |
+
+Every row: harness `672b8f03f1deb63c44fe6aaead15722715a70b61`, Actions
+`45351634450`; command `python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-DAY --catalog DAY`, replacing DAY with `nov23`/`nov24`.
+Full p50/p95/max probe latencies, writes, CPU series, exact commands and engine
+logs are retained in `precalibration-672b8f0/nov23/` and `nov24/`.
+
+The preliminary membership state was too large: Nov 23 had 1,091 nodes and
+364,381 contributors; Nov 24 had 1,708 nodes and 571,489 contributors. Synthetic
+row density and date-window diversity were reduced before the next run.
+
+## Near-target profiling attempt — artifacts incomplete
+
+Harness `0923ed79f35dc745352e6f99b6e37b37c42ab08a`, Actions `45355440591`.
+Same command pattern as above, with `STALL_REPRO_PERF` pointing to installed perf.
+The warmup still used 4 CPUs. A root-owned `perf.data` file prevented artifact
+upload; summaries were recovered from immutable job logs in `provisional-0923ed7/`.
+Folded stacks/SVGs from this attempt are unavailable, so this is not M2.
+
+| Metric | Nov 23 target | Nov 23 actual | Nov 24 target | Nov 24 actual |
+| --- | ---: | ---: | ---: | ---: |
+| Shapes | 8,376 | 8,376 | 10,571 | 10,571 |
+| Subquery shapes | 2,354 | 2,354 | 4,287 | 4,287 |
+| Nodes | 808 | 856 | 1,382 | 1,406 |
+| Edges | 14,339 | 14,340 | 25,219 | 26,367 |
+| Contributors | 141,628 | 144,765 | 235,310 | 237,341 |
+| Distinct values | 141,614 | 144,765 | 235,292 | 237,341 |
+
+Nov 24 import took 331.558 s from first delivery (331.981 s SQL clock), at 99.83%
+mean CPU. Drain and live probes each passed 1/332; subsets passed 332/332.
+The 32653 CPU samples attributed 89.06% to row/membership evaluation by deepest
+recognized frame, 5.97% to lock CPU, 1.10% to flip frames, 1.11% to PostgreSQL
+client frames, 0.037% to append frames, 0.003% to marker-wait frames and 2.71% to
+other/unresolved frames. These categories are approximate async-stack attribution,
+not lock hold/wait wall time, and cannot replace retained stacks or the wall timers.
+
+Nov 23 import took 87.808 s from first delivery (88.189 s SQL clock), not the
+incident's roughly fifteen minutes. This is a severity/timing mismatch, even
+though the other account's drain and live changes were starved in both runs.
 
 ## End-to-end smoke — not M1
 

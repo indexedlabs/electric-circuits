@@ -14,6 +14,7 @@ def probe_summary(probe):
 
 
 def summarize(roots):
+    commands = []
     print("| Run / workload | SQL start → empty s | First delivery → empty s | Changes/s (SQL clock) | CPU % (one core) | Backfills / min | Pinned | Drain ok/attempts; p50/p95/max s | Subset ok/attempts; p50/p95/max s | Live ok/attempts; p50/p95/max s | Harness commit |")
     print("| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |")
     for root in roots:
@@ -29,7 +30,8 @@ def summarize(roots):
                 result = json.loads(result_path.read_text())
                 values = [f"{folder.name} / {workload}", number(result["elapsed_s"]), number(result.get("first_read_to_empty_s")), number(result.get("changes_per_s")), number(result.get("engine_cpu_percent")), f"{result['backfills']:,} / {number(result['backfills_per_minute'])}", str(result["pinned_warnings"]), *[probe_summary(result["probe"][kind]) for kind in ("drain", "subset", "live")], f"`{manifest['harness_commit']}`"]
                 print("| " + " | ".join(values) + " |")
-            print(f"\nCommand for `{folder.name}`: `{manifest['command']}`. Engine SHA256 `{manifest['engine_sha256']}`.\n")
+            commands.append(f"Command for `{folder.name}`: `{manifest['command']}`. Engine SHA256 `{manifest['engine_sha256']}`.")
+    print("\n" + "\n\n".join(commands))
 
 
 if __name__ == "__main__":
