@@ -55,8 +55,9 @@ requires `GITHUB_ACTIONS=true` or an explicitly authorized remote machine settin
 `STALL_REPRO_REMOTE_MACHINE=1`. Do not set either to run in a Mighty Run sandbox.
 Python dependencies and artifact download steps are specified in the workflow.
 Node 22 runs `store-proxy.ts` using native type stripping; no pnpm install is needed.
-Systemd/sudo is required for the engine cgroup. Setup warms at 4 CPUs, measured
-work runs at the requested verified quota. Each run requires a fresh database.
+Systemd/sudo is required for the engine cgroup. The requested verified quota is
+in force from process start, including catalog warmup, so runtime thread selection
+does not accidentally observe a larger startup quota. Each run requires a fresh database.
 
 ## Files
 
