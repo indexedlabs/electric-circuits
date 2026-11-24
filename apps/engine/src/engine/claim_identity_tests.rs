@@ -165,3 +165,96 @@ async fn a_release_that_names_no_claim_releases_whatever_claim_the_subscription_
     assert_eq!(held(&engine, &shape).await, Some(2), "a claim's identity belongs to its own subscription");
     engine.close(Duration::from_secs(1)).await;
 }
+
+/// A group under `scope` the way a completed load leaves it: two member shapes on one stream, one
+/// claim per member, and the group's claim given an identity by its public member's create.
+async fn engine_with_group() -> (Engine, GroupRecord, String) {
+    const STREAM: &str = "shape/group-claim";
+    let store = Arc::new(crate::ds::ScriptedStore {
+        read_appended: true,
+        streams: Some(Default::default()),
+        ..Default::default()
+    });
+    let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://group-claim".into(), store));
+    engine.ds.ensure_stream(STREAM).await.unwrap();
+    let members = [("member-0", "scope", "items"), ("member-1", "scope:member:1", "notes")];
+    let now = crate::changelog::now_secs();
+    let mut st = engine.state.lock().await;
+    for (id, subscription, table) in members {
+        st.shapes.insert(
+            id.to_string(),
+            ShapeRecord {
+                id: id.to_string(),
+                table: TableRef::parse(table).unwrap(),
+                stream_path: STREAM.to_string(),
+                changes_only: true,
+                where_json: None,
+                columns: None,
+                family_key: None,
+                is_subquery: false,
+                aggregate: None,
+                fingerprint: None,
+                backfill_rows: None,
+                backfill_bytes: None,
+            },
+        );
+        let (ready_tx, ready) = tokio::sync::watch::channel(ShareOutcome::Ready);
+        drop(ready_tx);
+        st.feed_shares
+            .insert(id.to_string(), FeedShare { sig: format!("group-{id}"), subs: Default::default(), ready });
+        st.subscribe(id, subscription.to_string(), now);
+    }
+    let created = st.grant_claim("scope", &ClaimAsk::Keep, true).id;
+    let group = GroupRecord {
+        id: STREAM.into(),
+        stream_path: STREAM.into(),
+        subscription: "scope".into(),
+        members: members
+            .iter()
+            .map(|(id, subscription, table)| GroupMember {
+                key: table.to_string(),
+                shape_id: id.to_string(),
+                table: table.to_string(),
+                where_: None,
+                columns: None,
+                subscription: subscription.to_string(),
+                is_subquery: false,
+            })
+            .collect(),
+        lsn: "0/0".into(),
+        snapshot: String::new(),
+        horizon: "0/0".into(),
+        replay_fence: "0".into(),
+    };
+    st.group_claims.reserve("scope", STREAM).unwrap();
+    st.group_claims.reserve_private_members("scope", ["scope:member:1".to_string()]);
+    st.group_claims.complete(group.clone());
+    drop(st);
+    (engine, group, created)
+}
+
+/// A group's claim is one claim with one identity, held on its public subscription, and a load
+/// renews it as a create renews a feed's: naming the identity keeps it, naming none (a later
+/// session's load) is answered a new one. A release a member's id carries for the group then
+/// counts only against the identity it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_release_of_an_earlier_group_claim_leaves_the_group_a_later_load_took() {
+    let (engine, group, claim_a) = engine_with_group().await;
+    let kept = engine.renew_group_claim_as(&group, &ClaimAsk::Native(Some(claim_a.clone()))).await.unwrap();
+    assert_eq!(kept.as_deref(), Some(claim_a.as_str()), "a load by the claim's holder keeps its identity");
+    // Session B loads the same group under the same subscription, naming no claim.
+    let claim_b = engine.renew_group_claim_as(&group, &ClaimAsk::Native(None)).await.unwrap().expect("renewed");
+    assert_ne!(claim_a, claim_b, "a load that names no claim is a new session's");
+
+    let stale = format!("/v1/shapes/member-0?subscription=scope&claim={claim_a}");
+    assert_eq!(send(&engine, Request::delete(stale).body(Body::empty()).unwrap()).await.status, StatusCode::OK);
+
+    assert!(engine.group_record("scope").await.is_some(), "B's group is still held");
+    assert_eq!(held(&engine, "member-0").await, Some(1));
+    assert_eq!(held(&engine, "member-1").await, Some(1));
+
+    let own = format!("/v1/shapes/member-0?subscription=scope&claim={claim_b}");
+    assert_eq!(send(&engine, Request::delete(own).body(Body::empty()).unwrap()).await.status, StatusCode::OK);
+    assert!(engine.group_record("scope").await.is_none(), "B's release names B's claim, and drops the group");
+    engine.close(Duration::from_secs(1)).await;
+}

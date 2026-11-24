@@ -46,11 +46,17 @@ pub(crate) enum CatalogEvent {
     /// A shape was created, with the **subscription** that created it (ADR-0008) and the wall-clock
     /// second it was taken at — the lease's start, restored by the fold so a restart does not hand
     /// every subscription a fresh window.
+    ///
+    /// `claim` is the identity of the claim that create took (ADR-0008, "A claim has an
+    /// identity"). Absent in records written before claims had one, and for a shape that tracks no
+    /// subscription.
     Created {
         rec: ShapeRecord,
         sig: Option<String>,
         subscription: String,
         at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim: Option<String>,
     },
     /// A grouped feed's public claim and its private member list.  Members remain ordinary
     /// shape records; this event is the durable binding that lets a plain-only group restore
@@ -69,10 +75,16 @@ pub(crate) enum CatalogEvent {
     /// A subscription joined a shared feed, or RENEWED its lease (ADR-0008): the same subscription
     /// id twice is one claim, and the second one only moves `at`. The fold keeps a SET, so a
     /// duplicate is a no-op rather than a second count.
+    ///
+    /// `claim` is the claim's identity when this record gave it one: the claim is new, or a later
+    /// session took it over from an earlier one under the same subscription. A renewal that kept
+    /// the identity records none, and the fold keeps the one it has.
     Joined {
         id: String,
         subscription: String,
         at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claim: Option<String>,
     },
     /// A subscription left a shared feed. `Left` for an id the shape does not hold is a no-op (the
     /// release is idempotent — that is the point). With retention, an empty live set keeps the
@@ -997,6 +1009,11 @@ type Restored = (
 /// in.
 pub(crate) struct CatalogFold {
     recs: HashMap<String, Restored>,
+    /// The identity of each live claim that has one: `(shape id, subscription id) -> claim id`.
+    /// Beside `recs` rather than in it: set by the record that gave the claim its identity, and
+    /// removed with the claim (`Left`) or its shape (`Dropped`), so it only ever names a
+    /// subscription that `recs` holds.
+    claims: HashMap<(String, String), String>,
     groups: HashMap<String, GroupRecord>,
     ingest_columns: std::collections::BTreeMap<TableRef, Vec<String>>,
     // Historical names distinguish a dropped configured column from a typo even after a
@@ -1054,6 +1071,7 @@ impl Default for CatalogFold {
     fn default() -> Self {
         CatalogFold {
             recs: HashMap::new(),
+            claims: HashMap::new(),
             groups: HashMap::new(),
             ingest_columns: std::collections::BTreeMap::new(),
             ingest_columns_seen: std::collections::BTreeMap::new(),
@@ -1101,7 +1119,7 @@ impl CatalogFold {
                     self.groups.remove(&subscription);
                 }
             }
-            CatalogEvent::Created { rec, sig, subscription, at } => {
+            CatalogEvent::Created { rec, sig, subscription, at, claim } => {
                 // Every create moves the id high-water mark, and nothing ever moves it back (see
                 // `max_shape_id`). `max`, not "the last one wins": the engine mints ids
                 // monotonically from one counter, so the log is monotonic anyway, and taking the
@@ -1109,22 +1127,30 @@ impl CatalogFold {
                 if let Some(num) = shape_id_num(&rec.id) {
                     self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
                 }
+                if let Some(claim) = claim {
+                    self.claims.insert((rec.id.clone(), subscription.clone()), claim);
+                }
                 self.recs.insert(rec.id.clone(), (rec, sig, [(subscription, at)].into_iter().collect(), None));
             }
             // A join and a lease RENEWAL are the same record: insert wins for a new id, and only
             // moves the lease for one already held (ADR-0008). The restored `at` is what stops a
-            // restart from handing every subscription a fresh idle window.
-            CatalogEvent::Joined { id, subscription, at } => {
+            // restart from handing every subscription a fresh idle window. The claim's identity
+            // moves only when the record names one: a renewal by its holder names none.
+            CatalogEvent::Joined { id, subscription, at, claim } => {
                 if let Some(e) = self.recs.get_mut(&id) {
+                    if let Some(claim) = claim {
+                        self.claims.insert((id, subscription.clone()), claim);
+                    }
                     let lease = e.2.entry(subscription).or_insert(at);
                     *lease = (*lease).max(at);
                 }
             }
             // Idempotent by construction: releasing an id the set does not hold is a no-op, which
-            // is what makes a client's retried DELETE safe.
+            // is what makes a client's retried DELETE safe. The claim's identity goes with it.
             CatalogEvent::Left { id, subscription, lapsed: _ } => {
                 if let Some(e) = self.recs.get_mut(&id) {
                     e.2.remove(&subscription);
+                    self.claims.remove(&(id, subscription));
                 }
             }
             CatalogEvent::Dormant { id, resume, gate } => {
@@ -1149,6 +1175,7 @@ impl CatalogFold {
             // nothing left to retire.
             CatalogEvent::Dropped { id } => {
                 if let Some((rec, ..)) = self.recs.remove(&id) {
+                    self.claims.retain(|(shape, _), _| *shape != id);
                     self.pending_retire.insert(id, rec.stream_path);
                 }
             }
@@ -1619,7 +1646,7 @@ impl Engine {
             self.release_restore_reads().await?;
             return Ok(());
         }
-        let CatalogFold { recs, groups, start_pos, start_highwater, group_resume, .. } = fold;
+        let CatalogFold { recs, mut claims, groups, start_pos, start_highwater, group_resume, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The durable floor was adopted before any restore work, including the empty fast path.
@@ -1736,8 +1763,13 @@ impl Engine {
                     // The live set is restored WITH its lease ages (ADR-0008): a subscription that
                     // was already past the idle window when the process died is past it here too,
                     // so a restart neither forgets a subscription nor grants every one of them a
-                    // fresh window to pin the shape with.
+                    // fresh window to pin the shape with...
+                    // ...and with its claims' identities, so a release that names an earlier
+                    // claim than the one held is still told from the held claim's own.
                     for (sub, at) in subs {
+                        if let Some(claim) = claims.remove(&(id.clone(), sub.clone())) {
+                            st.claim_ids.insert(sub.clone(), claim);
+                        }
                         st.subscribe(&id, sub, at);
                     }
                 }
@@ -2842,8 +2874,10 @@ mod tests {
     fn paged_catalog_fixture() -> Vec<serde_json::Value> {
         let mut created = created_event("public.users");
         created["eid"] = serde_json::json!("created");
-        let joined =
-            catalog_event("joined", CatalogEvent::Joined { id: "s1".into(), subscription: "sub-b".into(), at: 101 });
+        let joined = catalog_event(
+            "joined",
+            CatalogEvent::Joined { id: "s1".into(), subscription: "sub-b".into(), at: 101, claim: None },
+        );
         vec![
             catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound())),
             created,
@@ -3656,7 +3690,7 @@ mod tests {
             backfill_bytes: None,
         };
         let fold = fold_of(vec![
-            CatalogEvent::Created { rec: rec.clone(), sig: None, subscription: "sub".into(), at: 1 },
+            CatalogEvent::Created { rec: rec.clone(), sig: None, subscription: "sub".into(), at: 1, claim: None },
             CatalogEvent::BackfillSized { id: "s1".into(), rows: 12, bytes: 3456 },
         ]);
         let restored = &fold.recs.get("s1").unwrap().0;
@@ -3669,7 +3703,7 @@ mod tests {
     /// The three shape-lifecycle events, with the subscription and lease timestamp ADR-0008 gives
     /// them — spelled out here so the fold tests read as "who is subscribed", not as bookkeeping.
     fn joined(id: &str, sub: &str, at: u64) -> CatalogEvent {
-        CatalogEvent::Joined { id: id.to_string(), subscription: sub.to_string(), at }
+        CatalogEvent::Joined { id: id.to_string(), subscription: sub.to_string(), at, claim: None }
     }
 
     fn left(id: &str, sub: &str) -> CatalogEvent {
@@ -4433,6 +4467,63 @@ mod tests {
         assert_eq!(st.subscription_owner("sub-b"), Some(&"s1".to_string()), "the id index is restored too");
     }
 
+    /// A claim's identity is in the record that took the claim, or that replaced its identity, and
+    /// a restart reads it back: the restored engine still tells a stale release from the held
+    /// claim's own. A renewal that kept the identity recorded none, and changes none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_claim_keeps_its_identity() {
+        let mut created = created_event("public.users");
+        created["sig"] = serde_json::json!("sig-1");
+        created["at"] = serde_json::json!(1000);
+        created["claim"] = serde_json::json!("claim-of-the-create");
+        let event = |value: serde_json::Value| serde_json::from_value::<CatalogEvent>(value).unwrap();
+        let fold = fold_of(vec![
+            event(created),
+            // sub-b: taken, renewed by its holder, then taken over by a later session.
+            event(serde_json::json!({"t": "joined", "id": "s1", "subscription": "sub-b", "at": 2000, "claim": "b-1"})),
+            event(serde_json::json!({"t": "joined", "id": "s1", "subscription": "sub-b", "at": 2100})),
+            event(serde_json::json!({"t": "joined", "id": "s1", "subscription": "sub-b", "at": 2200, "claim": "b-2"})),
+            event(serde_json::json!({"t": "joined", "id": "s1", "subscription": "sub-b", "at": 2300})),
+            // sub-c: released and taken again, so its first identity is gone with its first claim.
+            event(serde_json::json!({"t": "joined", "id": "s1", "subscription": "sub-c", "at": 2000, "claim": "c-1"})),
+            left("s1", "sub-c"),
+            event(serde_json::json!({"t": "joined", "id": "s1", "subscription": "sub-c", "at": 2400, "claim": "c-2"})),
+            CatalogEvent::Dormant {
+                id: "s1".to_string(),
+                resume: pos(0, "5"),
+                gate: crate::pg::SnapshotGate::passthrough(),
+            },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
+        ]);
+        let server = FakeDs::start().await;
+        let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
+        engine.apply_catalog(fold, &HashMap::new(), RestoreMode::Resume).await.unwrap();
+        let release = |subscription: &'static str, claim: &'static str| {
+            let engine = engine.clone();
+            async move {
+                use tower::ServiceExt;
+                let request =
+                    axum::http::Request::delete(format!("/v1/shapes/s1?subscription={subscription}&claim={claim}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap();
+                let status = crate::http::router(engine.clone()).oneshot(request).await.unwrap().status();
+                assert_eq!(status, axum::http::StatusCode::OK);
+                engine.subscription_count("s1").await
+            }
+        };
+
+        assert_eq!(
+            release("sub-b", "b-1").await,
+            3,
+            "a claim a later session took over is not released by its first identity"
+        );
+        assert_eq!(release("sub-c", "c-1").await, 3, "nor is a claim that was released and taken again");
+        assert_eq!(release("sub-a", "b-2").await, 3, "nor by another subscription's identity");
+        assert_eq!(release("sub-b", "b-2").await, 2, "the identity the last grant recorded releases it");
+        assert_eq!(release("sub-c", "c-2").await, 1);
+        assert_eq!(release("sub-a", "claim-of-the-create").await, 0, "a create's record names its claim");
+    }
+
     /// A shape that cannot be re-registered is a restore failure, not an empty-catalog success.
     /// The Postgres boot boundary must see this error before it starts serving, so it can apply
     /// the ordinary retry/fatal boot classification instead of resuming from missing state.
@@ -4463,7 +4554,7 @@ mod tests {
             let gate = crate::pg::SnapshotGate::passthrough();
             vec![
                 created,
-                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200 },
+                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200, claim: None },
                 CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate },
             ]
         }
@@ -4514,7 +4605,7 @@ mod tests {
             let gate = crate::pg::SnapshotGate::passthrough();
             vec![
                 created,
-                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200 },
+                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200, claim: None },
                 CatalogEvent::Dormant { id: id.to_string(), resume: pos(0, "5"), gate },
             ]
         }
@@ -4566,7 +4657,7 @@ mod tests {
             let created = serde_json::from_value::<CatalogEvent>(created).unwrap();
             vec![
                 created,
-                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200 },
+                CatalogEvent::Joined { id: id.to_string(), subscription: format!("sub-{id}"), at: 200, claim: None },
                 CatalogEvent::Dormant {
                     id: id.to_string(),
                     resume: pos(0, "5"),
