@@ -31,6 +31,8 @@ mod boot_identity_tests;
 mod boot_projection_tests;
 mod catalog;
 mod circuit_serving;
+#[cfg(test)]
+mod claim_identity_tests;
 mod drift;
 pub(crate) mod emission;
 pub use emission::GroupDrain;
