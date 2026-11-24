@@ -1233,6 +1233,9 @@ async fn wait_for_source_effects(
     marker_lsn: u64,
 ) -> bool {
     let _measurement = crate::stall_profile::Timer::start(crate::stall_profile::MARKER_WAIT);
+    if crate::stall_profile::unsafe_skip_marker_wait() {
+        return true;
+    }
     loop {
         if shutdown.is_shutting_down() {
             return false;

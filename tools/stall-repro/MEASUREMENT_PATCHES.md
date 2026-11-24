@@ -52,3 +52,13 @@ Both use the same source accounts, row counts, transaction boundaries, synthetic
 payloads, disabled FK/cascade triggers, and other-account probe as A. The extra
 columns add real stored/replicated bytes. The prototype is not an authorization
 qualification and must never be deployed.
+
+## Unsafe marker bypass
+
+`STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT=1` makes `wait_for_source_effects` return true
+immediately in the observational binary. This deliberately gives up the receipt's
+guarantee that earlier flip walks and their stream appends have completed, along
+with the wait function's shutdown/degradation checks. Other guards are unchanged.
+It is a measurement switch explicitly requested for this task, not a bridge safe
+to ship. The harness still requires zero pending flips and failing appends after
+the workload marker; an early receipt alone is never its completion oracle.

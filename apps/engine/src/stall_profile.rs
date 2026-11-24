@@ -1,5 +1,6 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::{Mutex, MutexGuard};
 
@@ -15,6 +16,11 @@ static NANOS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static CALLS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static ACTIVE_FLIPS: AtomicU64 = AtomicU64::new(0);
 static PEAK_FLIPS: AtomicU64 = AtomicU64::new(0);
+static SKIP_MARKER_WAIT: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn unsafe_skip_marker_wait() -> bool {
+    *SKIP_MARKER_WAIT.get_or_init(|| std::env::var("STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT").is_ok_and(|value| value == "1"))
+}
 
 pub(crate) struct Timer {
     category: usize,
