@@ -328,8 +328,14 @@ struct DsRateLimited {
 }
 
 /// Return the provider's requested delay when an error came from a 429 response.
-pub(crate) fn retry_after(e: &anyhow::Error) -> Option<std::time::Duration> {
+fn retry_after(e: &anyhow::Error) -> Option<std::time::Duration> {
     e.chain().find_map(|cause| cause.downcast_ref::<DsRateLimited>().and_then(|rate| rate.retry_after))
+}
+
+/// A bounded wait for a typed 429, including responses without Retry-After.
+/// Other failures retain their caller's existing retry policy.
+pub(crate) fn rate_limit_retry_delay(e: &anyhow::Error, attempt: u32) -> Option<std::time::Duration> {
+    e.downcast_ref::<DsRateLimited>().map(|rate| rate_limit_delay(attempt, rate.retry_after))
 }
 
 /// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
@@ -1347,7 +1353,7 @@ impl DsClient {
     /// [`StreamGone`].
     pub(crate) async fn touch(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
-        let res = self.retry_rate_limited(path, || self.store.read(&physical_path, "now", false)).await?;
+        let res = self.retry_rate_limited("GET", path, || self.store.read(&physical_path, "now", false)).await?;
         if res.status == 404 || res.status == 410 {
             return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
         }
@@ -1486,7 +1492,7 @@ impl DsClient {
     /// The first and only allowed preflight network operation. Any failure leaves ordinary stream
     /// operations untouched and is therefore safe to run before engine or Postgres construction.
     pub async fn preflight_readiness(&self, expected: &StoreIdentityV1) -> Result<StoreReadinessV1> {
-        let response = self.store.ready().await?;
+        let response = self.retry_rate_limited("GET", "_admin/ready", || self.store.ready()).await?;
         if response.status != 200 {
             return Err(anyhow::Error::new(StoreReadinessError::Response { status: response.status }));
         }
@@ -1550,7 +1556,7 @@ impl DsClient {
         attempt: u32,
         retry_after: Option<std::time::Duration>,
     ) -> bool {
-        let delay = retry_after.unwrap_or_else(|| rate_limit_backoff(attempt));
+        let delay = rate_limit_delay(attempt, retry_after);
         tracing::warn!(op, path, attempt, ?delay, "durable-streams rate limited request; retrying");
         if let Some(shutdown) = &self.shutdown {
             tokio::select! {
@@ -1565,7 +1571,7 @@ impl DsClient {
 
     /// Keep the port single-attempt. Release response buffers/permits before waiting and leave
     /// the caller's offset unchanged until a complete successful page arrives.
-    async fn retry_rate_limited<F, Fut>(&self, path: &str, mut request: F) -> Result<StoreResponse>
+    async fn retry_rate_limited<F, Fut>(&self, op: &'static str, path: &str, mut request: F) -> Result<StoreResponse>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<StoreResponse>>,
@@ -1579,8 +1585,8 @@ impl DsClient {
             let retry_after = res.retry_after;
             drop(res);
             attempt = attempt.saturating_add(1);
-            if !self.wait_rate_limit("GET", path, attempt, retry_after).await {
-                bail!("GET {path} rate-limit retry interrupted by engine shutdown");
+            if !self.wait_rate_limit(op, path, attempt, retry_after).await {
+                bail!("{op} {path} rate-limit retry interrupted by engine shutdown");
             }
         }
     }
@@ -1601,7 +1607,9 @@ impl DsClient {
         // other answer, an error or a cancelled PUT: an existing stream opened through a
         // config-mismatch 409 stays as due as it was.
         let pending = self.begin_access(path);
-        let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
+        let res = self
+            .retry_rate_limited("PUT", path, || self.store.ensure(&physical_path, "application/json", self.stream_ttl))
+            .await?;
         if (200..300).contains(&res.status) {
             // A create (or a matching re-create, which the store treats as an access) starts the
             // stream's TTL clock.
@@ -1611,7 +1619,7 @@ impl DsClient {
         }
         drop(pending);
         if res.status == 409 && !res.closed {
-            let head = self.store.head(&physical_path).await?;
+            let head = self.retry_rate_limited("HEAD", path, || self.store.head(&physical_path)).await?;
             if head.status == 200 && !head.closed {
                 return Ok(());
             }
@@ -1698,12 +1706,12 @@ impl DsClient {
     ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if first_only {
-            self.retry_rate_limited(path, || {
+            self.retry_rate_limited("GET", path, || {
                 self.store.read_first(&physical_path, offset, &self.memory_budget, self.read_max_bytes())
             })
             .await?
         } else {
-            self.retry_rate_limited(path, || {
+            self.retry_rate_limited("GET", path, || {
                 self.store.read_budgeted(
                     &physical_path,
                     offset,
@@ -1788,9 +1796,11 @@ impl DsClient {
                     if !is_unavailable(&e) {
                         return Err(e);
                     }
-                    // Storage answering "no such stream" to a HEAD is the one transient-looking case
-                    // that is really terminal: stop waiting and let the caller retire the record.
-                    if let Ok(None) = self.head(path).await {
+                    // A 429 asks us to wait, not reconcile. HEAD would add load and could
+                    // block before the restore budget/shutdown check, even without Retry-After.
+                    if e.downcast_ref::<DsRateLimited>().is_none()
+                        && let Ok(None) = self.head(path).await
+                    {
                         return Err(e.context(format!("stream '{path}' is gone")));
                     }
                     e
@@ -1800,7 +1810,7 @@ impl DsClient {
             if tokio::time::Instant::now() >= deadline {
                 return Err(e.context(format!("appending to {path} kept failing for {budget:?} ({attempt} attempts)")));
             }
-            let backoff = retry_after(&e).unwrap_or_else(|| {
+            let backoff = rate_limit_retry_delay(&e, attempt).unwrap_or_else(|| {
                 std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000))
             });
             tracing::warn!("append to {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
@@ -1951,7 +1961,7 @@ impl DsClient {
                 Err(AppendError::Other(e)) => {
                     failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     attempt += 1;
-                    let backoff = retry_after(&e).unwrap_or_else(|| {
+                    let backoff = rate_limit_retry_delay(&e, attempt).unwrap_or_else(|| {
                         std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000))
                     });
                     if attempt.is_multiple_of(10) {
@@ -2087,12 +2097,12 @@ impl DsClient {
     ) -> Result<(RawPage, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if budgeted {
-            self.retry_rate_limited(path, || {
+            self.retry_rate_limited("GET", path, || {
                 self.store.read_budgeted(&physical_path, offset, live, Some(&self.memory_budget), self.read_max_bytes())
             })
             .await?
         } else {
-            self.retry_rate_limited(path, || self.store.read(&physical_path, offset, live)).await?
+            self.retry_rate_limited("GET", path, || self.store.read(&physical_path, offset, live)).await?
         };
         self.note_access(path, res.status);
         let permit = std::mem::take(&mut res.permit);
@@ -2137,7 +2147,7 @@ impl DsClient {
         // A replay page is a bounded request, so it gets a deadline of its own; a long-poll is not
         // and keeps the store's own idle semantics.
         let res = self
-            .retry_rate_limited(path, || async {
+            .retry_rate_limited("GET", path, || async {
                 if live {
                     return self.store.read(&physical_path, offset, live).await;
                 }
@@ -2198,6 +2208,12 @@ fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
     }
     let at = httpdate::parse_http_date(value).ok()?;
     Some(at.duration_since(std::time::SystemTime::now()).unwrap_or_default())
+}
+
+/// Keep both stale/zero and excessively large provider delays within the existing
+/// backoff bounds. Repeated 429s still grow the delay when the header is too small.
+fn rate_limit_delay(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+    rate_limit_backoff(attempt).max(retry_after.unwrap_or_default()).min(std::time::Duration::from_secs(5))
 }
 
 fn rate_limit_backoff(attempt: u32) -> std::time::Duration {
@@ -3661,7 +3677,10 @@ mod tests {
                         client.touch("changes/0").await.unwrap();
                     }
                 }
-                assert_eq!(started.elapsed(), delay.unwrap_or(std::time::Duration::from_millis(100)).min(std::time::Duration::from_secs(5)));
+                assert_eq!(
+                    started.elapsed(),
+                    delay.unwrap_or(std::time::Duration::from_millis(100)).min(std::time::Duration::from_secs(5))
+                );
                 let offset = if mode == 5 { "now" } else { "prior" };
                 assert_eq!(*store.read_offsets.lock().unwrap(), vec![offset, offset]);
             }
@@ -3675,39 +3694,41 @@ mod tests {
         ]))
         .unwrap();
         for (delay, expected_wait) in [(0, 100), (2, 2000), (3600, 5000)] {
-        for mode in 0..5 {
-            let store = Arc::new(ScriptedStore {
-                append_fault: std::sync::Mutex::new(Some((
-                    "shape/s1".into(),
-                    0,
-                    AppendFault::RateLimited(Some(std::time::Duration::from_secs(delay))),
-                ))),
-                ..Default::default()
-            });
-            let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
-            let started = tokio::time::Instant::now();
-            match mode {
-                0 => client.append("shape/s1", &envelopes).await.unwrap(),
-                1 => assert!(client.append_reliable("shape/s1", &envelopes).await.unwrap()),
-                4 => { client.append_checked("shape/s1", &envelopes).await.unwrap(); }
-                _ => {
-                    let budget = std::time::Duration::from_millis(if mode == 2 { expected_wait + 100 } else { 50 });
-                    let result = client
-                        .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
-                        .await;
-                    if mode == 3 {
-                        assert!(result.is_err(), "Retry-After must not extend the restore budget");
-                        assert_eq!(started.elapsed(), budget);
-                        assert!(store.appended.lock().unwrap().is_empty());
-                        continue;
+            for mode in 0..5 {
+                let store = Arc::new(ScriptedStore {
+                    append_fault: std::sync::Mutex::new(Some((
+                        "shape/s1".into(),
+                        0,
+                        AppendFault::RateLimited(Some(std::time::Duration::from_secs(delay))),
+                    ))),
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+                let started = tokio::time::Instant::now();
+                match mode {
+                    0 => client.append("shape/s1", &envelopes).await.unwrap(),
+                    1 => assert!(client.append_reliable("shape/s1", &envelopes).await.unwrap()),
+                    4 => {
+                        client.append_checked("shape/s1", &envelopes).await.unwrap();
                     }
-                    result.unwrap();
+                    _ => {
+                        let budget = std::time::Duration::from_millis(if mode == 2 { expected_wait + 100 } else { 50 });
+                        let result = client
+                            .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
+                            .await;
+                        if mode == 3 {
+                            assert!(result.is_err(), "Retry-After must not extend the restore budget");
+                            assert_eq!(started.elapsed(), budget);
+                            assert!(store.appended.lock().unwrap().is_empty());
+                            continue;
+                        }
+                        result.unwrap();
+                    }
                 }
+                assert_eq!(started.elapsed(), std::time::Duration::from_millis(expected_wait));
+                assert_eq!(store.appended.lock().unwrap().len(), 1);
+                assert_eq!(client.appended_bytes("shape/s1"), serde_json::to_vec(&envelopes).unwrap().len() as u64);
             }
-            assert_eq!(started.elapsed(), std::time::Duration::from_millis(expected_wait));
-            assert_eq!(store.appended.lock().unwrap().len(), 1);
-            assert_eq!(client.appended_bytes("shape/s1"), serde_json::to_vec(&envelopes).unwrap().len() as u64);
-        }
         }
     }
 
@@ -3779,12 +3800,15 @@ mod tests {
         let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
         let started = tokio::time::Instant::now();
         let mut sent_at = Vec::new();
-        client.retry_rate_limited("changes/0", || {
-            sent_at.push(started.elapsed().as_millis());
-            let mut res = response(if sent_at.len() <= 3 { 429 } else { 200 });
-            res.retry_after = parse_retry_after(header);
-            async { Ok(res) }
-        }).await.unwrap();
+        client
+            .retry_rate_limited("GET", "changes/0", || {
+                sent_at.push(started.elapsed().as_millis());
+                let mut res = response(if sent_at.len() <= 3 { 429 } else { 200 });
+                res.retry_after = parse_retry_after(header);
+                async { Ok(res) }
+            })
+            .await
+            .unwrap();
         assert_eq!(sent_at, [0, 100, 300, 700], "{header}: repeated 429s must use growing backoff");
     }
 
@@ -3819,7 +3843,8 @@ mod tests {
                 let shutdown = crate::shutdown::ShutdownToken::new();
                 let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
                     {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
-                ])).unwrap();
+                ]))
+                .unwrap();
                 let budget = std::time::Duration::from_millis(50);
                 let started = tokio::time::Instant::now();
                 let op = client.append_retrying("shape/s1", &envelopes, budget, &shutdown);
@@ -3827,10 +3852,16 @@ mod tests {
                 std::future::poll_fn(|cx| {
                     assert!(op.as_mut().poll(cx).is_pending());
                     std::task::Poll::Ready(())
-                }).await;
-                assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 0,
-                    "a 429 must wait without HEAD reconciliation, even without Retry-After");
-                if cancel { shutdown.begin(); }
+                })
+                .await;
+                assert_eq!(
+                    store.head_count.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "a 429 must wait without HEAD reconciliation, even without Retry-After"
+                );
+                if cancel {
+                    shutdown.begin();
+                }
                 let error = op.await.expect_err("restore must remain bounded");
                 assert!(error.to_string().contains(if cancel { "shutting down" } else { "kept failing" }));
                 assert_eq!(started.elapsed(), if cancel { std::time::Duration::ZERO } else { budget });
@@ -3848,11 +3879,14 @@ mod tests {
         let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
         let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
             {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let budget = std::time::Duration::from_millis(350);
         let started = tokio::time::Instant::now();
-        let error = client.append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
-            .await.expect_err("persistent 429 must exhaust the restore budget");
+        let error = client
+            .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
+            .await
+            .expect_err("persistent 429 must exhaust the restore budget");
         assert!(error.to_string().contains("kept failing"));
         assert_eq!(started.elapsed(), budget);
         assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 0);
