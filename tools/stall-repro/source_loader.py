@@ -140,7 +140,7 @@ class SourceLoader:
                         node.args.kwarg.annotation = None
                 source = ast.unparse(syntax)
                 syntax = ResolveGlobals(source, descriptor).visit(ast.parse(source))
-                exec(compile(ast.fix_missing_locations(syntax), descriptor["path"], "exec"), namespace)
+                exec(compile(ast.fix_missing_locations(syntax), descriptor["path"], "exec", dont_inherit=True), namespace)
                 vars(self.module(module)).update(namespace)
                 self.loaded.append({"module": module, "name": name, "source_sha256": descriptor["sha256"]})
             else:
