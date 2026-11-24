@@ -37,7 +37,7 @@ def marker(connection, user_id, generation, source_commit_id):
     connection.execute("INSERT INTO public.native_sync_authority_fence (user_id, generation, source_commit_id) VALUES (%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET generation=EXCLUDED.generation, source_commit_id=EXCLUDED.source_commit_id", (user_id, generation, source_commit_id))
 
 
-async def until_ready(client, timeout=300):
+async def until_ready(client, unit, timeout=300):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -46,6 +46,9 @@ async def until_ready(client, timeout=300):
                 return
         except httpx.HTTPError:
             pass
+        active = subprocess.check_output(["systemctl", "show", unit, "--property=ActiveState", "--value"], text=True).strip()
+        if active not in {"active", "activating"}:
+            raise RuntimeError(f"Engine service exited ({active}); inspect engine.log")
         await asyncio.sleep(1)
     raise TimeoutError("Engine did not become ready; inspect engine.log")
 
@@ -93,12 +96,23 @@ async def run(args):
     save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL))
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen([str(Path(args.store).resolve()), "--host", "127.0.0.1", "--port", "8791", "--data-dir", str(output / "store-data"), "--durability", "wal"], stdout=store_log, stderr=subprocess.STDOUT)
+    proxy_log = (output / "store-proxy.log").open("w")
+    proxy_ready = output / "store-proxy.json"
+    proxy = subprocess.Popen(["node", str(folder / "store-proxy.ts"), str(proxy_ready)], stdout=proxy_log, stderr=subprocess.STDOUT)
+    for attempt in range(100):
+        if proxy_ready.exists():
+            break
+        if proxy.poll() is not None:
+            store.terminate()
+            raise RuntimeError("Store proxy exited; inspect store-proxy.log")
+        await asyncio.sleep(0.1)
+    access = json.loads(proxy_ready.read_text())
     unit = f"stall-repro-{uuid4().hex[:10]}"
     engine_log = output / "engine.log"
     engine_log.touch()
     env = {
-        "ELECTRIC_CIRCUITS_DS_URL": "http://127.0.0.1:8791",
-        "ELECTRIC_CIRCUITS_DS_IN_PROCESS_TEST": "1",
+        **access["env"],
+        "ELECTRIC_CIRCUITS_DS_URL": access["url"],
         "ELECTRIC_CIRCUITS_PG_URL": PG_URL,
         "ELECTRIC_CIRCUITS_PG_TABLES": ",".join(gateway.loader.bundle["publication"]),
         "ELECTRIC_CIRCUITS_PG_SLOT": "stall_repro",
@@ -116,7 +130,7 @@ async def run(args):
     save(output / "manifest.json", manifest)
     try:
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {SECRET}"}, timeout=120) as client:
-            await until_ready(client)
+            await until_ready(client, unit)
             pid = int(subprocess.check_output(["systemctl", "show", unit, "--property=MainPID", "--value"], text=True).strip())
             process = psutil.Process(pid)
             catalog = await gateway.generate(args.catalog, args.scale)
@@ -204,6 +218,13 @@ async def run(args):
                     raise RuntimeError(f"{workload} did not complete; later workloads not contaminated with its backlog")
     finally:
         subprocess.run(["sudo", "systemctl", "stop", unit], timeout=120, check=False)
+        proxy.terminate()
+        try:
+            proxy.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proxy.kill()
+            proxy.wait()
+        proxy_log.close()
         store.terminate()
         try:
             store.wait(timeout=30)
