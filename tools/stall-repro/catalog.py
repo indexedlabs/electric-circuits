@@ -37,6 +37,24 @@ def contains_subquery(predicate):
     return isinstance(predicate, list) and any(contains_subquery(value) for value in predicate)
 
 
+def validate_predicate(predicate, table, columns):
+    if isinstance(predicate, list):
+        for member in predicate:
+            validate_predicate(member, table, columns)
+    elif isinstance(predicate, dict):
+        column = predicate.get("col")
+        if column and column not in columns[table]:
+            raise ValueError(f"Unknown predicate column {table}.{column}")
+        for key, member in predicate.items():
+            if key == "in" and isinstance(member, dict):
+                inner = member["table"].removeprefix("public.")
+                if member["project"] not in columns[inner]:
+                    raise ValueError(f"Unknown subquery projection {inner}.{member['project']}")
+                validate_predicate(member.get("where"), inner, columns)
+            elif key in {"and", "or", "not"}:
+                validate_predicate(member, table, columns)
+
+
 class GatewayShapes:
     def __init__(self, bundle: Path):
         self.loader = SourceLoader(bundle)
@@ -104,8 +122,11 @@ async def main():
     output = folder / "results/fixture"
     output.mkdir(parents=True, exist_ok=True)
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
+    columns = {table: {column["name"] for column in declarations} for table, declarations in json.loads((output / "columns.json").read_text()).items()}
     for day in TARGETS:
         requests = await gateway.generate(day)
+        for request in requests:
+            validate_predicate(request["body"]["where"], request["body"]["table"].removeprefix("public."), columns)
         (output / f"{day}-requests.json").write_text(json.dumps(requests, separators=(",", ":")))
         print(day, len(requests), dict(Counter(request["body"]["table"] for request in requests)))
     (output / "catalog-provenance.json").write_text(json.dumps(gateway.loader.loaded, indent=2))
