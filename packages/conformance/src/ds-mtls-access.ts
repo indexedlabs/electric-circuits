@@ -100,6 +100,13 @@ export async function mtlsAccess(rawUrl: string, transport: DsTransport = 'mtls'
       { key: readFileSync(join(pki, 'server.key')), cert: readFileSync(join(pki, 'server.pem')), ca: readFileSync(join(pki, 'ca.pem')), requestCert: transport === 'mtls', rejectUnauthorized: false },
       handler,
     )
+  // Node closes an idle keep-alive connection after 5 s (6 s with its buffer). The engine's
+  // storage client keeps idle connections far longer, so a request sent as the facade closed one
+  // was answered with a reset, and the engine with a 500: the reconnect-storm test's last burst
+  // of reads lands about six seconds after the connections its restart opened went idle. The
+  // store this facade stands in front of does not hang up on idle clients; neither may the
+  // facade. The engine's own idle limit (90 s) now closes them first.
+  server.keepAliveTimeout = 120_000
   server.on('connection', (socket) => {
     inboundSockets.add(socket)
     socket.once('close', () => inboundSockets.delete(socket))
