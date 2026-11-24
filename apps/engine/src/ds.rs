@@ -2229,11 +2229,11 @@ fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
     Some(at.duration_since(std::time::SystemTime::now()).unwrap_or_default())
 }
 
-/// Keep both stale/zero and excessively large provider delays within the existing
-/// backoff bounds. Repeated 429s still grow the delay when the header is too small.
 /// The longest a 429 is waited out before the next attempt, whatever `Retry-After` asked for.
 const RATE_LIMIT_DELAY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Keep both stale/zero and excessively large provider delays within the existing
+/// backoff bounds. Repeated 429s still grow the delay when the header is too small.
 fn rate_limit_delay(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
     rate_limit_backoff(attempt).max(retry_after.unwrap_or_default()).min(RATE_LIMIT_DELAY_MAX)
 }

@@ -883,33 +883,11 @@ impl Engine {
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
         let stream_path = format!("shape/{id}");
-        // The PUT runs without the state lock, as the row-shape and subquery paths' do: a
-        // rate-limited store keeps `ensure_stream` retrying for as long as it answers 429, and every
-        // other create, join, drop and sweep takes this lock. Unlike theirs, this stream must exist
-        // before anything is registered (the circuit path's sequencer appends the seed as soon as
-        // it is asked), so the lock is re-taken after the PUT and what the first hold checked is
-        // checked again. The id needs no re-check: `next_shape_id` only grows.
-        drop(st);
-        self.ds.ensure_stream(&stream_path).await?;
-        st = self.state.lock().await;
-        let recheck = self.ensure_schema_resolved(&st, std::slice::from_ref(table)).and_then(|()| {
-            if st.feed_by_sig.contains_key(&agg_sig) {
-                // Redone, the attempt joins the aggregate that registered while this one waited.
-                return Err(anyhow::Error::new(CreateRaced(format!(
-                    "an identical aggregate registered while '{stream_path}' was being made"
-                ))));
-            }
-            ensure_group_subscription_available(&st, sub, false)?;
-            ensure_subscription_free(&st, sub, "")
-        });
-        if let Err(e) = recheck {
-            drop(st);
-            // Nothing refers to the stream yet: leave no orphan behind.
-            if let Err(delete) = self.ds.delete_stream(&stream_path).await {
-                tracing::warn!("aggregate {id}: could not delete its unused stream '{stream_path}': {delete:#}");
-            }
-            return Err(e);
-        }
+        // NOTE: as on the row-shape and subquery paths, the stream is PUT only after this create
+        // has registered and released the state lock (per path below), inside its `CreateGuard`.
+        // A rate-limited store keeps `ensure_stream` retrying for as long as it answers 429; held
+        // here, that wait would stall every other create, join, drop and sweep, and identical
+        // aggregates arriving meanwhile join the pending share instead of making streams of their own.
 
         // Circuit-served path: a bare COUNT whose predicate decomposes over the table's counts
         // pipeline is seeded by summing groups and updated from group deltas — no Postgres.
@@ -919,16 +897,6 @@ impl Engine {
                 if let Some(gcols) = arr.counts_group_cols(table).map(|g| g.to_vec()) {
                     if let Some(constraints) = plan_circuit_agg(where_.as_ref(), &ts, &gcols) {
                         let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
-                        let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
-                        cmd_tx
-                            .send(SequencerCmd::CreateCircuitAgg {
-                                table: table.clone(),
-                                shape_id: id.clone(),
-                                stream_path: stream_path.clone(),
-                                constraints,
-                                ready: ready_tx2,
-                            })
-                            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
                         let rec = ShapeRecord {
                             id: id.clone(),
                             table: table.clone(),
@@ -967,10 +935,27 @@ impl Engine {
                         drop(st);
                         let mut creating =
                             CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
-                        return match ready_rx2
-                            .await
-                            .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
-                        {
+                        // The seed is appended as soon as the sequencer takes the command, so the
+                        // stream must exist first.
+                        let seeded = async {
+                            self.ds.ensure_stream(&stream_path).await.context("creating aggregate stream")?;
+                            let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
+                            cmd_tx
+                                .send(SequencerCmd::CreateCircuitAgg {
+                                    table: table.clone(),
+                                    shape_id: id.clone(),
+                                    stream_path: stream_path.clone(),
+                                    constraints,
+                                    ready: ready_tx2,
+                                })
+                                .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                            ready_rx2
+                                .await
+                                .unwrap_or_else(|_| Err("sequencer dropped the ready channel".to_string()))
+                                .map_err(|e| anyhow::anyhow!(e))
+                        }
+                        .await;
+                        return match seeded {
                             Ok(()) => {
                                 // The create's work is done, but it may have overlapped a degradation — its stream is
                                 // then already reaped and the handle would be dead on arrival. Refuse instead of
@@ -1016,9 +1001,9 @@ impl Engine {
                                     creating.rollback().await;
                                     return Err(raced);
                                 }
-                                let _ = share_tx.send(ShareOutcome::Failed);
+                                let _ = share_tx.send(ShareOutcome::failed_by(&e));
                                 creating.rollback().await;
-                                bail!("aggregate '{id}' creation failed: {e}")
+                                Err(e.context(format!("aggregate '{id}' creation failed")))
                             }
                         };
                     }
@@ -1076,22 +1061,27 @@ impl Engine {
         st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
-        let outcome = backfill_and_activate(
-            &self.ds,
-            &self.pg_pool,
-            &cmd_tx,
-            &ts,
-            table,
-            &id,
-            &stream_path_c,
-            &pred,
-            None,
-            false,
-            Some((func, col_idx)),
-            &self.shutdown_token(),
-            ack_rx,
-        )
-        .await;
+        let outcome = match self.ds.ensure_stream(&stream_path_c).await {
+            Err(e) => Err(e.context("creating aggregate stream")),
+            Ok(()) => {
+                backfill_and_activate(
+                    &self.ds,
+                    &self.pg_pool,
+                    &cmd_tx,
+                    &ts,
+                    table,
+                    &id,
+                    &stream_path_c,
+                    &pred,
+                    None,
+                    false,
+                    Some((func, col_idx)),
+                    &self.shutdown_token(),
+                    ack_rx,
+                )
+                .await
+            }
+        };
         match outcome {
             Ok(_backfill_stats) => {
                 // The create's work is done, but it may have overlapped a degradation — its stream is
