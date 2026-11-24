@@ -1568,6 +1568,8 @@ mod tests {
         let short = [
             ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
             ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
+            ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1"),
             ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
             ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
             ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "8"),
@@ -1589,6 +1591,8 @@ mod tests {
                 ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
                 ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "100"),
                 ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "200"),
+                ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1"),
                 ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", ttl),
             ])
         };
@@ -1606,6 +1610,8 @@ mod tests {
             try_cfg(&[
                 ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
                 ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3"),
+                ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1"),
                 ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "4"),
                 ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "40"),
                 ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", secs),
@@ -1620,6 +1626,8 @@ mod tests {
             try_cfg(&[
                 ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1"),
                 ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "2"),
+                ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "1"),
+                ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "1"),
                 ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "2"),
                 ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "10"),
                 ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", secs),

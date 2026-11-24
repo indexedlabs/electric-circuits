@@ -11,9 +11,9 @@
 //   3. A TTL under the floor, or any TTL while dormancy is disabled, refuses the boot with exit 78;
 //      a disabled retain window adds nothing to the floor (`#v-ttl-floor`).
 //
-// Second-scale retention knobs keep the floor (twice the larger of idle-plus-dormancy and the
-// change log's retain window) small enough for a test to clear; production's defaults make it
-// 14.5 days.
+// Second-scale retention knobs keep the floor (twice the larger of idle-plus-dormancy, live-only
+// idle and the change log's retain window) small enough for a test to clear; production's defaults
+// make it 14.5 days.
 
 import pgpkg from 'pg'
 import type { Row, Schema } from '@electric-circuits/protocol'
@@ -27,13 +27,15 @@ const schema: Schema = {
 
 const TTL = '86400'
 
-/** Floor = 2 × max(1 + 3600, 4) = 7202 s. */
+/** Floor = 2 × max(1 + 3600, 1, 1, 4) = 7202 s. */
 const knobs = {
   ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES: '0',
   ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS: '1',
   ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS: '4',
   ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
   ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '3600',
+  ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '1',
+  ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
