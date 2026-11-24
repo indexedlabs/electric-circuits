@@ -1,0 +1,59 @@
+{
+  "target": {
+    "shapes": 10571,
+    "standalone": 6251,
+    "family_shapes": 33,
+    "families": 1,
+    "subquery_shapes": 4287,
+    "subquery_nodes": 1382,
+    "subquery_edges": 25219,
+    "subquery_contributors": 235310,
+    "subquery_distinct_values": 235292,
+    "subquery_feed_entries": 16388,
+    "tailers": 37,
+    "tables": 44
+  },
+  "actual": {
+    "cardinalities": {
+      "bytes_circuit_integral": 1895940,
+      "bytes_circuit_snapshots": 1750000,
+      "bytes_electric_adapter": 0,
+      "bytes_executors": 455456,
+      "bytes_feed_sets": 2080,
+      "bytes_membership_circuit": 3645940,
+      "bytes_pk_dict": 1684088,
+      "bytes_retention": 169950,
+      "bytes_shape_records": 2036624,
+      "bytes_subquery_registry": 23741159,
+      "families": 16,
+      "family_shapes": 580,
+      "shapes": 873,
+      "shapes_dormant": 0,
+      "standalone": 90,
+      "subquery_contributors": 37067,
+      "subquery_distinct_values": 37067,
+      "subquery_edges": 715,
+      "subquery_feed_entries": 380,
+      "subquery_nodes": 290,
+      "subquery_shapes": 203,
+      "tables": 44,
+      "tailers": 20
+    },
+    "process": {
+      "allocator_allocated_bytes": 119488040,
+      "allocator_config": {
+        "background_thread": true,
+        "dirty_decay_ms": 1000,
+        "muzzy_decay_ms": 1000
+      },
+      "allocator_resident_bytes": 145534976,
+      "allocator_retained_bytes": 45830144,
+      "rss_bytes": 162455552,
+      "rss_mib": 154,
+      "virtual_bytes": 748552192
+    },
+    "samples": 126
+  },
+  "source_shape_requests": 847,
+  "smoke_only": false
+}

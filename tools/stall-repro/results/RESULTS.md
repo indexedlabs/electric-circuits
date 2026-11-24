@@ -784,8 +784,7 @@ identity, the commit-membership flag and its check. What differed was the engine
 runner (6975P-C for the 286 s run, 8573C for the 531 s run). On one runner the import gap is
 1.29x, and the deletion gap is 3.8x.
 
-PR 70 is "Remove rows a changes-only feed's client holds only from its snapshot". A profile of the
-large deletion on `1be10fb` and `e10c4bd` is running (`[paired-3]`, `pr70-profile`) to name the
+PR 70 is "Remove rows a changes-only feed's client holds only from its snapshot". The profile below names the
 function that got more expensive.
 
 ### B-cold, amended: fails the pass line
@@ -823,9 +822,7 @@ contributors and 380 feed entries.
 `resource` edges through `resource` subqueries). Record and Resource writes flip those nodes, and
 each flip walks `graph_edge`. The share deletion adds walks on every Record-family table, `file`
 and `user` from the kept share and membership scopes (2,003 `record`, 1,000 each on three Record
-tables, 843 `file`, 845 `user`). Variant (a), B-cold with every edge keyed, and a profiled B-cold
-for the per-row membership share are running (`[paired-3]`: `b-cold-edges`, `b-cold-profile`).
-Variant (b) is not run unless that shows a class cannot be keyed.
+tables, 843 `file`, 845 `user`). Variant (a) and the profile follow below.
 
 ### E-only and E+R (proposal orchestrator's spec)
 
@@ -857,3 +854,90 @@ and the small deletion 3.7 s. The other account is still not served: drains 20%,
 during those seconds. With `calendar_event`, chats, Files, Resources and Users still on today's
 filters, 1,121 subquery shapes remain. The comparable B-retained-key-edge row (Record family and
 `calendar_event` keyed) took 3.9 s.
+
+## Round 3 (Actions run `45395594116`, harness `ffc01e8`, `[paired-3]`)
+
+### Which function PR 70 made more expensive
+
+Job `pr70-profile`: the large deletion on `1be10fb`, then on `e10c4bd`, on one Xeon 8573C, each
+under `sudo perf record -e cpu-clock -F 99 -g --call-graph fp -p PID`.
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × `1be10fb` | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| A | Xeon 8573C | large-delete | 36.8 | 1.00 | 80 | 17,717 | 10% (4/42); p95 0.05 | 100% (42/42); p95 0.12 | 10% (4/42); p95 0.16 | no |
+| A | Xeon 8573C | large-delete | 130.7 | 3.55 | 94 | 17,717 | 2% (3/136); p95 0.04 | 79% (108/136); p95 0.84 | 2% (3/136); p95 0.14 | no |
+
+The first row is `1be10fb`, the second `e10c4bd`. Folded stacks and SVGs are in
+`paired3/paired-pr70-profile-*/large-delete.folded.gz` and `.svg`. `profile_report.py` shows:
+
+| CPU owner | `1be10fb` samples (%) | `e10c4bd` samples (%) |
+| --- | ---: | ---: |
+| Per-row membership, `SubqueryRegistry::on_table_delta` | 984 (29.7%) | **9,083 (72.2%)** |
+| Flip walks | 931 (28.1%) | 1,212 (9.6%) |
+| Memory sampler | 525 (15.8%) | 1,140 (9.1%) |
+| Postgres client | 238 (7.2%) | 263 (2.1%) |
+| Total samples | 3,318 | 12,586 |
+
+Inclusive samples of the functions that grew:
+
+| Function (`apps/engine/src/`) | `1be10fb` | `e10c4bd` |
+| --- | ---: | ---: |
+| `subquery::Prior::was_member` | 0 | **7,943** |
+| `<subquery::Before as SubqueryEval>::contains` | 0 | 7,814 |
+| `predicate::CompiledPredicate::eval_ctx` | 969 | 8,858 |
+| `subq_circuit::MembershipCircuit::contains` | 951 | 8,408 |
+| `subq_circuit::seek` | 118 | 6,832 |
+| `dbsp::storage::file::reader::VarintReader::get` (leaf) | 55 | 1,443 |
+
+**What PR 70 added.** In `SubqueryRegistry::emit_for_shapes_with` (`subquery.rs`, the
+non-member branch around line 2470), when a changed row is not a member of a changes-only shape
+and the feed never delivered its pk, the engine now calls `prior.was_member(...)`. That
+re-evaluates the shape's whole predicate against the row's old image with `Before`, which reads
+every subquery set through `MembershipCircuit::contains` and `seek`.
+
+**Why it costs this much here.** Every subquery shape in this catalog is changes-only, and the
+synthetic feeds deliver nothing before the workloads. So every deleted or moved row pays a full
+predicate re-evaluation against every candidate shape that rejects it.
+
+The same path costs the import 1.29x and the large deletion 3.5–3.8x on one runner. Prod's feeds
+have delivered rows, which may shortcut some of these proofs: an estimate in prod's favour, not
+measured. Whether to keep, bound or cache this proof is a product and correctness question (it
+exists so that rows a client holds only from its snapshot are removed when they leave scope), and
+it is not settled here.
+
+### B-cold variant (a): every edge keyed
+
+Job `b-cold-edges`: B-cold, then B-cold-key-edges (B-cold with `graph_edge` entirely on B's keyed
+body, every other scope unchanged), on one Xeon 6975P-C.
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × B-cold | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| B-cold | Xeon 6975P-C | import | 8.8 | 1.00 | 92 | 4,800 | 22% (2/9); p95 0.11 | 100% (9/9); p95 0.05 | 22% (2/9); p95 0.09 | no |
+| B-cold | Xeon 6975P-C | large-delete | 4.3 | 1.00 | 51 | 3,954 | 57% (4/7); p95 0.74 | 100% (7/7); p95 0.03 | 57% (4/7); p95 0.72 | no |
+| B-cold | Xeon 6975P-C | small-delete | 4.5 | 1.00 | 82 | 4,802 | 40% (2/5); p95 0.35 | 100% (5/5); p95 0.02 | 40% (2/5); p95 0.31 | no |
+| B-cold | Xeon 6975P-C | share-delete | 7.1 | 1.00 | 79 | 15,075 | 29% (2/7); p95 0.55 | 100% (7/7); p95 0.01 | 29% (2/7); p95 0.41 | no |
+| B-cold-key-edges | Xeon 6975P-C | import | 2.0 | 0.23 | 49 | 0 | 100% (2/2); p95 0.34 | 100% (2/2); p95 0.01 | 100% (2/2); p95 0.27 | **yes** |
+| B-cold-key-edges | Xeon 6975P-C | large-delete | 1.2 | 0.27 | 33 | 0 | 100% (4/4); p95 0.36 | 100% (4/4); p95 0.01 | 100% (4/4); p95 0.22 | **yes** |
+| B-cold-key-edges | Xeon 6975P-C | small-delete | 0.5 | 0.11 | 37 | 0 | 100% (1/1); p95 0.39 | 100% (1/1); p95 0.01 | 100% (1/1); p95 0.39 | **yes** |
+| B-cold-key-edges | Xeon 6975P-C | share-delete | 3.4 | 0.48 | 74 | 7,574 | 67% (2/3); p95 0.96 | 100% (3/3); p95 0.01 | 67% (2/3); p95 0.80 | no |
+
+**The kept edge branches carry all of B-cold's import and deletion cost.** With them keyed, the
+three original workloads take 2.0, 1.2 and 0.5 s with zero backfills, and every probe succeeds:
+that passes B-cold's line. The share deletion (3.4 s, under 10 s) still lost one drain and one
+live change of three. Its 7,574 backfills come from the kept share and membership scopes
+(Record-family direct shares, `file`, `user`), which is the remaining cost of the kept
+subqueries in this worst case. Variant (b) is not needed: the class that carries the cost
+(`graph_edge`'s other branches) can be keyed.
+
+### B-cold's CPU and per-row membership share
+
+Job `b-cold-profile`: B-cold alone, perf on every workload, one Xeon 6975P-C. Folded stacks and
+SVGs are in `paired3/paired-b-cold-profile-1-B-cold-prod-1cpu/`. These are short runs with few
+samples, so the unresolved share is large.
+
+| Workload | s | CPU % | Samples | Per-row membership | Flip walks | Postgres client | Appends | Sampler | Other / unresolved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Import | 8.8 | 92 | 795 | 32.3% | 8.2% | 7.9% | 2.4% | 1.6% | 47.2% |
+| Large deletion | 4.2 | 53 | 377 | 14.1% | 2.4% | 8.8% | 7.2% | 2.7% | 63.7% |
+| Small deletion | 4.6 | 83 | 433 | 22.4% | 2.3% | 9.2% | 1.8% | 2.3% | 60.7% |
+| Share deletion | 7.2 | 81 | 588 | 8.0% | 4.6% | 20.4% | 2.6% | 2.0% | 60.7% |
