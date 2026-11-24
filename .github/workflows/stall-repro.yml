@@ -33,7 +33,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y linux-tools-common linux-tools-generic
-          PERF=$(find /usr/lib/linux-tools -type f -name perf | sort -V | tail -1)
+          PERF=$(command -v perf)
+          if ! "$PERF" --version; then
+            PERF=$(find /usr/lib/linux-tools -type f -name perf | sort -V | tail -1)
+          fi
           test -x "$PERF"
           echo "STALL_REPRO_PERF=$PERF" >> "$GITHUB_ENV"
           sudo "$PERF" stat -e cpu-clock -- true
