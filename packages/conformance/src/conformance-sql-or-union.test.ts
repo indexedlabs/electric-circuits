@@ -2,10 +2,10 @@
 // (`apps/engine/src/sql.rs`, `JsonSql::or`):
 //
 //   1. `c IN (s1) OR c IN (s2)` becomes `c IN (s1 UNION ALL s2)` when both subqueries project one
-//      SQL type;
-//   2. an `OR` with `k IN (…)` on the table's single-column primary key gathers every other branch
-//      B into that union as `SELECT k FROM <table> WHERE B` — only where the `OR` is a filter, not
-//      under a `NOT`.
+//      known non-collatable SQL type (column collations are not available to the printer);
+//   2. an `OR` with `k IN (…)` on the table's single-column primary key gathers another branch B
+//      only if it is a positive IN or an AND containing one. A broad branch leaves the whole key
+//      OR unchanged. Gathering is only for filters, never under NOT.
 //
 // Both exist so Postgres can drive the table from a set of keys instead of scanning it; neither may
 // change a row. This suite runs generated predicates — nested `OR`s, subqueries on other tables
@@ -18,7 +18,7 @@
 import { type Predicate, predicateToSql, type Row, type Schema } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
-import { createShape, foldStream, pgQuery } from './engine-native.js'
+import { createShape, foldStream, lockTable, pgQuery, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -182,27 +182,6 @@ class Gen {
   }
 }
 
-/** The `OR`s in `p` that a rewrite can apply to, by the predicate's shape alone (types aside). */
-function rewritable(p: Predicate, table: string, filter = true, counts = { union: 0, key: 0 }): typeof counts {
-  const node = p as unknown as Record<string, unknown>
-  if (Array.isArray(node.or)) {
-    const ins = (node.or as Record<string, unknown>[]).filter((b) => b.in && !b.negated)
-    const cols = ins.map((b) => b.col as string)
-    if (cols.some((c, i) => cols.indexOf(c) !== i)) counts.union++
-    if (filter && cols.includes('id') && (node.or as unknown[]).length > 1) counts.key++
-    for (const b of node.or as Predicate[]) rewritable(b, table, filter, counts)
-  } else if (Array.isArray(node.and)) {
-    for (const b of node.and as Predicate[]) rewritable(b, table, filter, counts)
-  } else if (node.not) {
-    rewritable(node.not as Predicate, table, false, counts)
-  }
-  if (node.in) {
-    const sq = node.in as { table: string; where?: Predicate }
-    if (sq.where) rewritable(sq.where, sq.table, true, counts)
-  }
-  return counts
-}
-
 let h: Harness
 
 beforeAll(async () => {
@@ -244,38 +223,77 @@ async function oldSqlIds(table: string, where: Predicate): Promise<number[]> {
   return rows.map((row) => Number(row.id)).sort((a, b) => a - b)
 }
 
-/** The ids the engine's subset query selects for `where`, through the engine's (rewritten) SQL. */
-async function engineIds(table: string, where: Predicate): Promise<number[]> {
-  const res = await fetch(`${h.engineUrl}/v1/subsets/query`, {
+/** Query the production subset endpoint; text keys are kept as text for the collation case. */
+async function subsetRows(harness: Harness, table: string, where: Predicate, limit = 10000): Promise<Row[]> {
+  const res = await fetch(`${harness.engineUrl}/v1/subsets/query`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ table, where, orderBy: { col: 'id' }, limit: 10000 }),
+    body: JSON.stringify({ table, where, orderBy: { col: 'id' }, limit }),
+    signal: AbortSignal.timeout(20000),
   })
   const text = await res.text()
   if (!res.ok) throw new Error(`subset query on ${table} answered ${res.status}: ${text}\n${JSON.stringify(where)}`)
-  return ((JSON.parse(text) as { rows: Row[] }).rows ?? []).map((row) => Number(row.id)).sort((a, b) => a - b)
+  return (JSON.parse(text) as { rows: Row[] }).rows ?? []
+}
+
+async function engineIds(table: string, where: Predicate): Promise<number[]> {
+  return (await subsetRows(h, table, where)).map((row) => Number(row.id)).sort((a, b) => a - b)
+}
+
+/**
+ * Park the real subset SELECT at a PostgreSQL relation lock, inspect the statement PostgreSQL
+ * received, then release it and collect its rows. The lock is the causal gate: no log timing,
+ * extension, engine instrumentation, or copy of the SQL printer is needed.
+ */
+async function subsetWithSql(harness: Harness, table: string, where: Predicate, limit = 10000): Promise<{ sql: string; rows: Row[] }> {
+  const lock = await lockTable(harness, `"public"."${table}"`)
+  // Observe rejection immediately even while waiting for the relation-lock gate.
+  let failure: unknown
+  const pending = subsetRows(harness, table, where, limit).catch((error: unknown) => {
+    failure = error
+    return []
+  })
+  let sql = ''
+  try {
+    await waitFor(async () => {
+      if (failure) throw failure
+      const blocked = await pgQuery(harness, `
+        SELECT DISTINCT a.query
+        FROM pg_stat_activity a
+        JOIN pg_locks l ON l.pid = a.pid AND NOT l.granted
+        WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+          AND a.wait_event_type = 'Lock' AND l.relation = $1::regclass
+          AND a.query LIKE $2
+      `, [`public.${table}`, `% from "public"."${table}" t where %`])
+      if (blocked.length !== 1) return false
+      sql = String(blocked[0]!.query)
+      return true
+    }, 'the subset SELECT waiting on its table lock', 15000)
+  } finally {
+    await lock.release()
+    // Always settle the request before leaving this test's gate, including assertion/setup failure.
+    await pending
+  }
+  if (failure) throw failure
+  return { sql, rows: await pending }
 }
 
 describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they replace', () => {
   it(`generated predicates (seed ${SEED}) select the same rows through the engine as through the old SQL`, async () => {
     const gen = new Gen(rng(SEED + 1))
     const tables: Table[] = ['items', 'items', 'items', 'parents', 'others']
-    const counts = { union: 0, key: 0 }
     let nonEmpty = 0
     for (let i = 0; i < PREDICATES; i++) {
       const table = gen.pick(tables)
       const where = gen.pred(table, 0)
-      rewritable(where, table, true, counts)
       const expected = await oldSqlIds(table, where)
       if (expected.length > 0) nonEmpty++
       expect(await engineIds(table, where), `predicate #${i} on ${table} (seed ${SEED}): ${JSON.stringify(where)}`).toEqual(
         expected,
       )
     }
-    // The generator has to have reached both rewrites often, and selected rows, or the equality
-    // above proves nothing about them.
-    expect(counts.union, 'ORs with same-column IN siblings').toBeGreaterThan(PREDICATES / 4)
-    expect(counts.key, 'ORs with an IN on the key and another branch, outside a NOT').toBeGreaterThan(PREDICATES / 4)
+    // Actual execution of both rewrites is checked against pg_stat_activity below, independently
+    // of these row comparisons; counting predicate shapes would not prove SQL was rewritten.
     expect(nonEmpty, 'predicates that select at least one row').toBeGreaterThan(PREDICATES / 3)
   }, 300000)
 
@@ -305,13 +323,15 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
       },
     },
     {
-      name: 'rule 2: the key IN, a nullable comparison and an IN on another column',
+      name: 'rule 2: the key IN and a conjunction containing an IN on another column',
       table: 'items',
       where: {
         or: [
           { col: 'id', in: { table: 'others', project: 'n', where: { col: 'n', op: 'lt', value: 40 } } },
-          { col: 'n', op: 'gt', value: 5 },
-          { col: 'other_id', in: { table: 'others', project: 'id', where: { col: 'parent_id', isNull: true } } },
+          { and: [
+            { col: 'n', op: 'gt', value: 5 },
+            { col: 'other_id', in: { table: 'others', project: 'id', where: { col: 'parent_id', isNull: true } } },
+          ] },
         ],
       },
     },
@@ -319,7 +339,9 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
       name: 'rule 2 is not made under NOT, where UNKNOWN and FALSE differ',
       table: 'items',
       where: {
-        not: { or: [{ col: 'id', in: { table: 'parents', project: 'id' } }, { col: 'n', op: 'gt', value: 3 }] },
+        not: { or: [{ col: 'id', in: { table: 'parents', project: 'id' } }, { and: [
+          { col: 'parent_id', in: { table: 'others', project: 'parent_id' } }, { col: 'n', op: 'gt', value: 3 },
+        ] }] },
       },
     },
     {
@@ -360,7 +382,10 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
                   where: {
                     or: [
                       { col: 'id', in: { table: 'others', project: 'parent_id', where: { col: 'n', op: 'gt', value: 20 } } },
-                      { col: 'tag', op: 'eq', value: 'b' },
+                      { and: [
+                        { col: 'id', in: { table: 'items', project: 'parent_id' } },
+                        { col: 'tag', op: 'eq', value: 'b' },
+                      ] },
                     ],
                   },
                 },
@@ -377,6 +402,92 @@ describe('SQL writer: OR-of-IN rewrites select exactly the rows of the SQL they 
       expect(await engineIds(c.table, c.where), JSON.stringify(c.where)).toEqual(await oldSqlIds(c.table, c.where))
     })
   }
+
+  it('PostgreSQL receives both UNION ALL rewrites and the same rows as the old SQL', async () => {
+    // Rule 1 is on a non-key; rule 2 must wrap the second branch in SELECT id FROM items.
+    const probes: { where: Predicate; fragment: string }[] = [
+      {
+        where: { or: [
+          { col: 'parent_id', in: { table: 'parents', project: 'id' } },
+          { col: 'parent_id', in: { table: 'others', project: 'parent_id' } },
+        ] },
+        fragment: '"parent_id" IN (SELECT "id" FROM "public"."parents" UNION ALL SELECT "parent_id" FROM "public"."others")',
+      },
+      {
+        where: { or: [
+          { col: 'id', in: { table: 'parents', project: 'id' } },
+          { and: [
+            { col: 'parent_id', in: { table: 'others', project: 'parent_id' } },
+            { col: 'n', op: 'gt', value: 3 },
+          ] },
+        ] },
+        fragment: '"id" IN (SELECT "id" FROM "public"."parents" UNION ALL SELECT "id" FROM "public"."items" WHERE ("parent_id" IN (SELECT "parent_id" FROM "public"."others") AND "n" > 3))',
+      },
+    ]
+    for (const { where, fragment } of probes) {
+      const expected = await oldSqlIds('items', where)
+      expect(expected.length).toBeGreaterThan(0)
+      const { sql, rows } = await subsetWithSql(h, 'items', where)
+      expect(sql).toContain(fragment)
+      expect(rows.map((r) => Number(r.id)).sort((a, b) => a - b)).toEqual(expected)
+    }
+  })
+
+  it('a paged key OR with a broad branch reaches PostgreSQL unchanged', async () => {
+    const where: Predicate = { or: [
+      { col: 'id', in: { table: 'parents', project: 'id' } },
+      { col: 'id', in: { table: 'others', project: 'id' } },
+      { col: 'label', isNull: true },
+    ] }
+    const { sql, rows } = await subsetWithSql(h, 'items', where, 1)
+    expect(sql).toContain('where ("id" IN (SELECT "id" FROM "public"."parents") OR "id" IN (SELECT "id" FROM "public"."others") OR "label" IS NULL)')
+    expect(sql).not.toContain('UNION ALL')
+    expect(sql).toContain('limit 1')
+    expect(rows.map((r) => Number(r.id))).toEqual((await oldSqlIds('items', where)).slice(0, 1))
+  })
+
+  it('different projection collations keep the original SQL and rows for text keys and columns', async () => {
+    const textSchema: Schema = { tables: {
+      words: { columns: { id: { type: 'text' }, tag: { type: 'text' } }, primaryKey: 'id' },
+      exact: { columns: { id: { type: 'text' } }, primaryKey: 'id' },
+      folded: { columns: { id: { type: 'text' } }, primaryKey: 'id' },
+    } }
+    const textHarness = await bootHarness(textSchema, { ddl: `
+      CREATE COLLATION case_insensitive (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+      CREATE TABLE words (id text PRIMARY KEY, tag text);
+      CREATE TABLE exact (id text COLLATE "C" PRIMARY KEY);
+      CREATE TABLE folded (id text COLLATE case_insensitive PRIMARY KEY);
+      ALTER TABLE words REPLICA IDENTITY FULL;
+      ALTER TABLE exact REPLICA IDENTITY FULL;
+      ALTER TABLE folded REPLICA IDENTITY FULL;
+    ` })
+    try {
+      await pgQuery(textHarness, `INSERT INTO words VALUES ('X', 'X'), ('x', 'x'), ('Y', 'Y'), ('y', 'y')`)
+      await pgQuery(textHarness, `INSERT INTO exact VALUES ('X')`)
+      await pgQuery(textHarness, `INSERT INTO folded VALUES ('Y')`)
+      await drainEngine(textHarness)
+      const collations = await pgQuery(textHarness, `
+        SELECT attcollation::text AS collation FROM pg_attribute
+        WHERE attrelid IN ('exact'::regclass, 'folded'::regclass) AND attname = 'id'
+      `)
+      expect(new Set(collations.map((r) => r.collation)).size).toBe(2)
+      for (const col of ['id', 'tag']) {
+        const where: Predicate = { or: [
+          { col, in: { table: 'exact', project: 'id' } },
+          { col, in: { table: 'folded', project: 'id' } },
+        ] }
+        const old = predicateToSql(where)
+        const expected = await pgQuery(textHarness, `SELECT id FROM words WHERE ${old.text}`, old.params)
+        expect(expected.map((r) => String(r.id)).sort()).toEqual(['X', 'Y', 'y'])
+        const { sql, rows } = await subsetWithSql(textHarness, 'words', where)
+        expect(sql).not.toContain('UNION ALL')
+        expect(sql).toContain(`where ("${col}" IN (SELECT "id" FROM "public"."exact") OR "${col}" IN (SELECT "id" FROM "public"."folded"))`)
+        expect(rows.map((r) => String(r.id)).sort()).toEqual(expected.map((r) => String(r.id)).sort())
+      }
+    } finally {
+      await textHarness.shutdown()
+    }
+  }, 120000)
 
   // A shape's backfill prints its predicate with the same writer, so a few of the cases above are
   // also created as subquery shapes and their streams compared with the old SQL's rows.

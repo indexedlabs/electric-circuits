@@ -545,11 +545,14 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 That writer prints two kinds of `OR` so Postgres can drive the table from a set of keys rather
 than scan it to test every branch on every row: same-column `IN (subquery)` siblings become one
-`IN` over a `UNION ALL` (when every subquery projects the same type), and an `OR` that tests the
-table's single-column key with `IN` gathers every other branch `B` into that union as
-`SELECT key FROM <table> WHERE B` (only where the `OR` is a filter, not under a `NOT`, since it
-turns an UNKNOWN branch into FALSE). The rows are the same; the predicate and the shape identity
-are untouched (`sql.rs`, `JsonSql::or`; `conformance-sql-or-union.test.ts`). Shape backfills and
+`IN` over a `UNION ALL` (when every subquery projects the same known non-collatable type), and an
+`OR` that tests the table's single-column key with `IN` gathers another branch `B` as
+`SELECT key FROM <table> WHERE B` only when every branch is a positive `IN` over a subquery or
+literal list, or a conjunction containing one. Any broad branch keeps the entire key `OR` in its
+original form. Gathering applies only where the `OR` is a filter, not under a `NOT`, since it
+turns an UNKNOWN branch into FALSE. Column collations are not introspected, so collatable and
+unclassified projection types retain the original SQL. The rows, predicate and shape identity
+are unchanged (`sql.rs`, `JsonSql::or`; `conformance-sql-or-union.test.ts`). Shape backfills and
 group loads print their predicates with the same writer.
 
 ---
