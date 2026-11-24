@@ -543,20 +543,14 @@ top-N operator). Subquery predicates in subset queries are evaluated natively by
 `predicate_json_to_sql`. This is the basis for windowed / infinite-scroll sync: each page is a
 bounded keyset range query folded into the `WHERE`, so the engine never holds a stateful top-N.
 
-That writer prints two kinds of `OR` so Postgres can drive the table from a set of keys rather
-than scan it to test every branch on every row: same-column `IN (subquery)` siblings become one
-`IN` over a `UNION ALL` (when every subquery projects the same known non-collatable type), and an
-`OR` that tests the table's single-column key with `IN` gathers another branch `B` as
-`SELECT key FROM <table> WHERE B` only when every branch is a positive `IN` over a subquery or
-literal list, or a conjunction containing one. Any broad branch keeps the entire key `OR` in its
-original form. Gathering applies only where the `OR` is a filter, not under a `NOT`, since it
-turns an UNKNOWN branch into FALSE, and only in a subset query without a page limit: under a
-`LIMIT` the gathered member must be computed in full before the limit can stop the scan, so a
-paged query keeps its key `OR` as written (the same-column union still applies; shape backfills
-and unpaged subset queries gather). Column collations are not introspected, so collatable and
-unclassified projection types retain the original SQL. The rows, predicate and shape identity
-are unchanged (`sql.rs`, `JsonSql::or`; `conformance-sql-or-union.test.ts`). Shape backfills and
-group loads print their predicates with the same writer.
+That writer prints one kind of `OR` differently from the predicate: same-column `IN (subquery)`
+siblings become one `IN` over a `UNION ALL` (when every subquery projects the same known
+non-collatable type), so Postgres tests one set instead of one subquery per branch. An `OR` across
+columns, the table's key included, is printed as the client wrote it. Column collations are not
+introspected, so collatable and unclassified projection types retain the original SQL. The rows,
+predicate and shape identity are unchanged (`sql.rs`, `JsonSql::or`;
+`conformance-sql-or-union.test.ts`). Shape backfills and group loads print their predicates with
+the same writer.
 
 ---
 

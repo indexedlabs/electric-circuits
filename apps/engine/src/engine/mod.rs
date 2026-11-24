@@ -3712,13 +3712,7 @@ impl Engine {
                     }
                 }
                 CompiledPredicate::compile_with(p, &ts, &mut Validate(&schemas))?;
-                // A page limit must be able to stop the scan, so a paged query is printed without
-                // the key union (see `paged_predicate_json_to_sql`).
-                Some(if limit.is_some() {
-                    crate::sql::paged_predicate_json_to_sql(p, 1, &schemas, table)
-                } else {
-                    crate::sql::predicate_json_to_sql(p, 1, &schemas, table)
-                })
+                Some(crate::sql::predicate_json_to_sql(p, 1, &schemas, table))
             }
             Some(p) => {
                 let cp = CompiledPredicate::compile_opt(Some(p), &ts)?;

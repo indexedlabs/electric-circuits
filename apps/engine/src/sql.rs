@@ -9,11 +9,11 @@
 //! cleanly. The caller still applies `matches()` as the final authority, so the SQL only needs to be a
 //! sound *superset* filter; mirroring the proven compiler keeps it exact.
 //!
-//! The JSON emitter ([`predicate_json_to_sql`]) prints two kinds of `OR` differently from the
-//! TypeScript mirror — sibling `IN (subquery)` tests as one `IN` over a `UNION ALL`, and an `OR`
-//! that tests the table's key with `IN` as one key union — so Postgres can drive the table from a
-//! set of keys instead of scanning it. The rows are the same (see `JsonSql::or`, and
-//! `conformance-sql-or-union.test.ts`, which runs both forms over generated predicates).
+//! The JSON emitter ([`predicate_json_to_sql`]) prints one kind of `OR` differently from the
+//! TypeScript mirror — sibling `IN (subquery)` tests on one column as one `IN` over a `UNION ALL`,
+//! so Postgres tests one set instead of one subquery per branch. The rows are the same (see
+//! `JsonSql::or`, and `conformance-sql-or-union.test.ts`, which runs both forms over generated
+//! predicates).
 
 use std::collections::HashMap;
 
@@ -130,10 +130,9 @@ fn build(p: &CompiledPredicate, ts: &TableSchema, params: &mut Vec<String>) -> S
 /// inlined, text bound as `$n`). `start_param` is the next placeholder index (1-based). Returns
 /// `None` for an empty/match-all predicate is *not* applicable here — pass a real predicate.
 ///
-/// Two rewrites of an `OR` change the SQL text and never the rows it selects (see
+/// One rewrite of an `OR` changes the SQL text and never the rows it selects (see
 /// [`JsonSql::or`]): sibling `IN (subquery)` tests on one column become one `IN` over a
-/// `UNION ALL`, and an `OR` that tests the table's key with `IN` gathers its other IN-constrained
-/// branches into that union. Collatable projections are left alone because schemas carry no collation.
+/// `UNION ALL`. Collatable projections are left alone because schemas carry no collation.
 /// The predicate itself — and with it the shape's identity — is untouched.
 pub fn predicate_json_to_sql(
     pred: &PredicateJson,
@@ -141,32 +140,8 @@ pub fn predicate_json_to_sql(
     schemas: &HashMap<TableRef, TableSchema>,
     table: &TableRef,
 ) -> (String, Vec<String>) {
-    json_sql(pred, start_param, schemas, table, true)
-}
-
-/// [`predicate_json_to_sql`] for a query with a page limit: the key union (rule 2 of
-/// [`JsonSql::or`]) is never made, and the same-column union still is. Gathering a broad branch
-/// into the key's set makes Postgres compute that whole set before `LIMIT` can stop the outer
-/// scan, so a page that main's SQL answers from a few index rows would scan the table each time.
-pub fn paged_predicate_json_to_sql(
-    pred: &PredicateJson,
-    start_param: usize,
-    schemas: &HashMap<TableRef, TableSchema>,
-    table: &TableRef,
-) -> (String, Vec<String>) {
-    json_sql(pred, start_param, schemas, table, false)
-}
-
-fn json_sql(
-    pred: &PredicateJson,
-    start_param: usize,
-    schemas: &HashMap<TableRef, TableSchema>,
-    table: &TableRef,
-    gather_keys: bool,
-) -> (String, Vec<String>) {
     let mut params: Vec<String> = Vec::new();
-    let text =
-        JsonSql { start: start_param, params: &mut params, schemas, gather_keys }.build(pred, table, Use::Filter);
+    let text = JsonSql { start: start_param, params: &mut params, schemas }.build(pred, table);
     (text, params)
 }
 
@@ -175,21 +150,6 @@ fn plain_in(branch: &PredicateJson) -> Option<(&str, &SubqueryJson)> {
     match branch {
         PredicateJson::In { col, subquery, negated: false } => Some((col.as_str(), subquery)),
         _ => None,
-    }
-}
-
-/// A positive membership constraint. `where_sql` lowers a literal IN list to an OR of equality
-/// leaves on one column; recognize that existing representation without extending the predicate.
-/// An AND is constrained when any conjunct is constrained (including through nested ANDs).
-fn has_positive_in(branch: &PredicateJson) -> bool {
-    match branch {
-        PredicateJson::In { negated: false, .. } => true,
-        PredicateJson::And { and } => and.iter().any(has_positive_in),
-        PredicateJson::Or { or } => {
-            let Some(PredicateJson::Leaf { col, op: LeafOp::Eq, .. }) = or.first() else { return false };
-            or.iter().all(|p| matches!(p, PredicateJson::Leaf { col: c, op: LeafOp::Eq, .. } if c == col))
-        }
-        _ => false,
     }
 }
 
@@ -219,36 +179,18 @@ fn union_type<'a>(schema: &'a TableSchema, column: &str) -> Option<&'a str> {
     })
 }
 
-/// How the value of the expression being written is used.
-///
-/// The key-union rewrite ([`JsonSql::or`], rule 2) turns a branch that is UNKNOWN for a row into
-/// FALSE for that row. That is invisible wherever a row is kept only when the expression is TRUE —
-/// a `WHERE`, and every `AND`/`OR` operand of one — and visible under a `NOT`, where NOT UNKNOWN
-/// drops the row and NOT FALSE keeps it. So that rewrite is made only in a [`Use::Filter`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Use {
-    /// The expression keeps a row only when TRUE: FALSE and UNKNOWN are the same outcome.
-    Filter,
-    /// The expression is under a `NOT`, which tells FALSE from UNKNOWN.
-    Negated,
-    /// A key OR with a broad branch must retain main's SQL, including all its descendants.
-    Verbatim,
-}
-
-/// The JSON emitter's state: where placeholders start, the text params bound so far, every
-/// table's compiled schema (for native types and keys), and whether the key union may be made.
+/// The JSON emitter's state: where placeholders start, the text params bound so far, and every
+/// table's compiled schema (for native types).
 struct JsonSql<'a> {
     start: usize,
     params: &'a mut Vec<String>,
     schemas: &'a HashMap<TableRef, TableSchema>,
-    /// `false` for a query with a page limit (see [`paged_predicate_json_to_sql`]).
-    gather_keys: bool,
 }
 
 impl JsonSql<'_> {
     /// `table` is the table the current predicate's columns belong to; it switches to the inner table
     /// when descending into a subquery, so each leaf's param is cast to the right column's native type.
-    fn build(&mut self, p: &PredicateJson, table: &TableRef, used: Use) -> String {
+    fn build(&mut self, p: &PredicateJson, table: &TableRef) -> String {
         let schemas = self.schemas;
         let pg_type = |col: &str| schemas.get(table).and_then(|ts| ts.pg_type_of(col)).map(str::to_string);
         // Same rule as the compiled emitter: an ORDERING comparison on a collatable text column is
@@ -288,7 +230,7 @@ impl JsonSql<'_> {
                 if and.is_empty() {
                     "TRUE".to_string()
                 } else {
-                    let parts: Vec<String> = and.iter().map(|p| self.build(p, table, used)).collect();
+                    let parts: Vec<String> = and.iter().map(|p| self.build(p, table)).collect();
                     format!("({})", parts.join(" AND "))
                 }
             }
@@ -296,108 +238,54 @@ impl JsonSql<'_> {
                 if or.is_empty() {
                     "FALSE".to_string()
                 } else {
-                    self.or(or, table, used)
+                    self.or(or, table)
                 }
             }
-            PredicateJson::Not { not } => {
-                let inner_use = if used == Use::Verbatim { Use::Verbatim } else { Use::Negated };
-                format!("(NOT {})", self.build(not, table, inner_use))
-            }
+            PredicateJson::Not { not } => format!("(NOT {})", self.build(not, table)),
             PredicateJson::In { col, subquery, negated } => {
                 let op = if *negated { "NOT IN" } else { "IN" };
-                format!("{} {op} ({})", quote_ident(col), self.select(subquery, used))
+                format!("{} {op} ({})", quote_ident(col), self.select(subquery))
             }
         }
     }
 
     /// `SELECT <project> FROM <table>[ WHERE <where>]` for one subquery. The inner where's columns
     /// belong to the subquery's table, so the context switches and their params are cast to the
-    /// inner table's native types. A subquery's `WHERE` is a filter however the `IN` is used: the
-    /// set it selects is the projection of the rows it is TRUE for.
-    fn select(&mut self, subquery: &SubqueryJson, used: Use) -> String {
-        let inner_use = if used == Use::Verbatim { Use::Verbatim } else { Use::Filter };
+    /// inner table's native types.
+    fn select(&mut self, subquery: &SubqueryJson) -> String {
         let inner = match &subquery.where_ {
-            Some(w) => format!(" WHERE {}", self.build(w, &subquery.table, inner_use)),
+            Some(w) => format!(" WHERE {}", self.build(w, &subquery.table)),
             None => String::new(),
         };
         // The inner table is schema-qualified like every other FROM (`"schema"."name"`).
         format!("SELECT {} FROM {}{inner}", quote_ident(&subquery.project), subquery.table.quote_qualified())
     }
 
-    /// An `OR`, with two rewrites that let Postgres drive the table from a set of keys instead of
-    /// scanning it to test every branch on every row. Both keep the rows exactly:
+    /// An `OR`, with same-column `IN` siblings printed as one `IN`: `c IN (s1) OR c IN (s2)` becomes
+    /// `c IN (s1 UNION ALL s2)` when every subquery projects the same known non-collatable SQL type
+    /// (so the union is that type, and each comparison is the one the separate tests made). The rows
+    /// are the same, under a `NOT` too, because three-valued logic agrees: both forms are TRUE iff `c`
+    /// equals a value of some subquery, FALSE iff neither subquery holds `c` or a NULL (with `c`
+    /// itself not NULL, or both subqueries empty), and UNKNOWN otherwise.
     ///
-    /// 1. **Same-column `IN` siblings** — `c IN (s1) OR c IN (s2)` becomes `c IN (s1 UNION ALL s2)`,
-    ///    when every subquery projects the same known non-collatable SQL type (so the union is that
-    ///    type, and each comparison is the one the separate tests made). Three-valued logic agrees:
-    ///    both forms are
-    ///    TRUE iff `c` equals a value of some subquery, FALSE iff neither subquery holds `c` or a
-    ///    NULL (with `c` itself not NULL, or both subqueries empty), and UNKNOWN otherwise.
-    /// 2. **The key in an `IN`** — when a branch is `k IN (…)` on the table's single-column primary
-    ///    key, each other branch `B` must be a positive IN (subquery or literal list), or an AND
-    ///    containing one. Only then does it join as `SELECT k FROM <table> WHERE B`. A broad branch
-    ///    vetoes rewriting the whole key OR, including descendants, retaining main's SQL. The
-    ///    key is unique and never NULL, so a row is in `SELECT k … WHERE B` exactly when `B` is TRUE
-    ///    for it. `B` UNKNOWN becomes FALSE, which is why this is done only in a [`Use::Filter`].
-    ///    Every key subquery must project the key's known non-collatable type. Not made in a query
-    ///    with a page limit ([`paged_predicate_json_to_sql`]), at any depth; the broad-branch veto
-    ///    still holds there.
-    ///
-    /// Left alone: `NOT IN` (its NULL semantics are not a union's), `IN` on different non-key
-    /// columns, a key that is composite or of unknown type, and any projection whose type is unknown
-    /// or differs from its siblings', and projections whose collation compatibility is unknown.
-    /// A union of ONE member is not a rewrite either, and an `OR` neither rule applies to is written
-    /// exactly as before.
-    fn or(&mut self, branches: &[PredicateJson], table: &TableRef, used: Use) -> String {
-        if used == Use::Verbatim {
-            let parts: Vec<String> = branches.iter().map(|p| self.build(p, table, used)).collect();
-            return format!("({})", parts.join(" OR "));
-        }
+    /// Left alone: `NOT IN` (its NULL semantics are not a union's), `IN` tests on different columns
+    /// (the table's key included: an `OR` across columns is printed as the client wrote it), and any
+    /// projection whose type is unknown, collatable, or differs from its siblings'. A union of ONE
+    /// member is not a rewrite either, and an `OR` the rule does not apply to is written exactly as
+    /// before.
+    fn or(&mut self, branches: &[PredicateJson], table: &TableRef) -> String {
         let schemas = self.schemas;
         // The SQL type a subquery projects: its column's native type, known only from introspection
-        // (`None` in library mode, so neither rewrite applies there).
+        // (`None` in library mode, so the rewrite does not apply there).
         let projects =
             |subquery: &SubqueryJson| schemas.get(&subquery.table).and_then(|ts| union_type(ts, &subquery.project));
 
-        // Rule 2: the table's single-column key, tested with `IN` by at least one branch.
-        if used == Use::Filter
-            && let Some(ts) = schemas.get(table)
-            && let [key] = ts.pk_cols.as_slice()
-        {
-            let key_name = ts.columns[*key].0.as_str();
-            let keyed: Vec<&SubqueryJson> =
-                branches.iter().filter_map(plain_in).filter(|(col, _)| *col == key_name).map(|(_, s)| s).collect();
-            if !keyed.is_empty() && branches.len() > 1 && !branches.iter().all(has_positive_in) {
-                return self.or(branches, table, Use::Verbatim);
-            }
-            if self.gather_keys
-                && !keyed.is_empty()
-                && branches.len() > 1
-                && let Some(key_type) = union_type(ts, key_name)
-                && keyed.iter().all(|s| projects(s) == Some(key_type))
-            {
-                let members: Vec<String> = branches
-                    .iter()
-                    .map(|branch| match plain_in(branch) {
-                        Some((col, subquery)) if col == key_name => self.select(subquery, used),
-                        _ => format!(
-                            "SELECT {} FROM {} WHERE {}",
-                            quote_ident(key_name),
-                            table.quote_qualified(),
-                            self.build(branch, table, Use::Filter)
-                        ),
-                    })
-                    .collect();
-                return format!("({} IN ({}))", quote_ident(key_name), members.join(" UNION ALL "));
-            }
-        }
-
-        // Rule 1: same-column `IN` siblings, each column's union where its first sibling stood.
+        // Each column's union stands where its first sibling stood.
         let mut merged: Vec<&str> = Vec::new();
         let mut parts: Vec<String> = Vec::with_capacity(branches.len());
         for branch in branches {
             let Some((col, _)) = plain_in(branch) else {
-                parts.push(self.build(branch, table, used));
+                parts.push(self.build(branch, table));
                 continue;
             };
             if merged.contains(&col) {
@@ -408,10 +296,10 @@ impl JsonSql<'_> {
             let projected = projects(siblings[0]);
             if siblings.len() > 1 && projected.is_some() && siblings.iter().all(|s| projects(s) == projected) {
                 merged.push(col);
-                let members: Vec<String> = siblings.into_iter().map(|s| self.select(s, used)).collect();
+                let members: Vec<String> = siblings.into_iter().map(|s| self.select(s)).collect();
                 parts.push(format!("{} IN ({})", quote_ident(col), members.join(" UNION ALL ")));
             } else {
-                parts.push(self.build(branch, table, used));
+                parts.push(self.build(branch, table));
             }
         }
         format!("({})", parts.join(" OR "))
@@ -617,11 +505,11 @@ mod tests {
         assert_eq!(p, vec!["x'); DROP TABLE users;--".to_string()]);
     }
 
-    // --- the OR rewrites (`JsonSql::or`) ------------------------------------------------------------
+    // --- the OR rewrite (`JsonSql::or`) -------------------------------------------------------------
     //
     // An app scope in miniature, introspected (every column's Postgres type known): `events` and
-    // `records` keyed by a uuid `id`, `grants` linking users to both, `legacy` keyed by an int4 with
-    // an int8 column, and `pairs` with a composite key.
+    // `records` keyed by a uuid `id`, `grants` linking users to both, and `legacy` keyed by an int4
+    // with an int8 column.
 
     fn app_schemas() -> HashMap<TableRef, TableSchema> {
         use ColumnType::{Int, Text};
@@ -660,13 +548,6 @@ mod tests {
         ] {
             schemas.insert(ts.table.clone(), ts);
         }
-        let mut columns = BTreeMap::new();
-        for (c, ty, pg) in [("a", Text, "uuid"), ("b", Text, "uuid"), ("c", Int, "int4")] {
-            columns.insert(c.to_string(), ColumnDef { ty, pg_type: Some(pg.to_string()), has_default: false });
-        }
-        let def = TableDef { columns, primary_key: vec!["a".to_string(), "b".to_string()], fingerprint: None };
-        let pairs = TableSchema::from_def(&TableRef::parse("pairs").unwrap(), &def).unwrap();
-        schemas.insert(pairs.table.clone(), pairs);
         schemas
     }
 
@@ -756,7 +637,7 @@ mod tests {
         );
     }
 
-    /// `IN` tests on two different non-key columns are not one set.
+    /// `IN` tests on two different columns are not one set.
     #[test]
     fn in_tests_on_different_columns_are_left_alone() {
         let (w, _) = app_sql(
@@ -793,10 +674,11 @@ mod tests {
         );
     }
 
-    /// The week-query shape: key subqueries plus a parent IN and an original-start range.
-    /// Literal IN lists already reach the printer as same-column equality ORs.
+    /// The week-query shape: a key subquery, or a parent IN with an original-start range. An `OR`
+    /// across columns is printed as the client wrote it, the table's key included. Literal IN lists
+    /// already reach the printer as same-column equality ORs.
     #[test]
-    fn the_week_query_gathers_a_parent_in_and_time_range() {
+    fn the_week_query_is_printed_as_written() {
         for (parent, expected_parent, expected_params) in [
             (
                 "recurring_parent_id IN (SELECT id FROM records WHERE visible = true)",
@@ -807,11 +689,6 @@ mod tests {
                 "recurring_parent_id IN ('p1', 'p2')",
                 r#"("recurring_parent_id" = $2::text::"uuid" OR "recurring_parent_id" = $3::text::"uuid")"#.to_string(),
                 vec!["u1", "p1", "p2", "2026-11-16", "2026-11-23"],
-            ),
-            (
-                "recurring_parent_id IN ('p1')",
-                r#"("recurring_parent_id" = $2::text::"uuid")"#.to_string(),
-                vec!["u1", "p1", "2026-11-16", "2026-11-23"],
             ),
         ] {
             let pj = crate::where_sql::parse_where(&format!(
@@ -825,7 +702,7 @@ mod tests {
             assert_eq!(
                 w,
                 format!(
-                    r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."records" WHERE ({expected_parent} AND "original_start_time" >= ${}::text::"timestamptz" AND "original_start_time" < ${end}::text::"timestamptz")))"#,
+                    r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR ({expected_parent} AND "original_start_time" >= ${}::text::"timestamptz" AND "original_start_time" < ${end}::text::"timestamptz"))"#,
                     end - 1,
                 )
             );
@@ -833,8 +710,10 @@ mod tests {
         }
     }
 
+    /// A key `IN` beside INs on other columns, conjunctions and broad branches keeps every branch
+    /// where the client wrote it; only same-column key INs share a union.
     #[test]
-    fn the_key_in_gathers_only_in_branches_and_conjunctions() {
+    fn a_key_or_is_printed_as_written() {
         let (w, p) = app_sql(
             "events",
             serde_json::json!({"or": [
@@ -849,56 +728,27 @@ mod tests {
         assert_eq!(
             w,
             format!(
-                r#"("id" IN (SELECT "id" FROM "public"."events" WHERE "record_id" IN ({VISIBLE}) UNION ALL SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."events" WHERE ("deleted_at" IS NULL AND ("owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid") AND "name" = $3::text::"text"))))"#
+                r#"("record_id" IN ({VISIBLE}) OR "id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR ("deleted_at" IS NULL AND ("owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid") AND "name" = $3::text::"text")))"#
             )
         );
         assert_eq!(p, vec!["u1", "u2", "a"]);
-    }
 
-    /// A broad branch vetoes the entire key OR, including sibling/nested unions. A mere nested
-    /// OR containing an IN, a NOT IN, and equalities on different columns are not positive IN lists.
-    #[test]
-    fn a_key_or_with_any_broad_branch_is_unchanged() {
-        for (broad, printed) in [
-            (serde_json::json!({"col": "deleted_at", "isNull": true}), r#""deleted_at" IS NULL"#.to_string()),
-            (
-                serde_json::json!({"col": "owner_id", "op": "eq", "value": "u2"}),
-                r#""owner_id" = $2::text::"uuid""#.to_string(),
-            ),
-            (
-                serde_json::json!({"col": "id", "negated": true, "in": {"table": "records", "project": "id"}}),
-                r#""id" NOT IN (SELECT "id" FROM "public"."records")"#.to_string(),
-            ),
-            (
-                serde_json::json!({"or": [on_visible_record("record_id"), on_visible_record("record_id")]}),
-                format!(r#"("record_id" IN ({VISIBLE}) OR "record_id" IN ({VISIBLE}))"#),
-            ),
-            (
-                serde_json::json!({"or": [{"col": "owner_id", "op": "eq", "value": "u2"}, {"col": "record_id", "op": "eq", "value": "r"}]}),
-                r#"("owner_id" = $2::text::"uuid" OR "record_id" = $3::text::"uuid")"#.to_string(),
-            ),
-            (
-                serde_json::json!({"and": [{"not": on_visible_record("record_id")}, {"col": "deleted_at", "isNull": true}]}),
-                format!(r#"((NOT "record_id" IN ({VISIBLE})) AND "deleted_at" IS NULL)"#),
-            ),
-        ] {
-            let (w, _) = app_sql(
-                "events",
-                serde_json::json!({"or": [
-                    granted("id", "event_id", "u1"), on_visible_record("id"), broad,
-                ]}),
-            );
-            assert_eq!(
-                w,
-                format!(
-                    r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "id" IN ({VISIBLE}) OR {printed})"#
-                )
-            );
-        }
+        let (w, _) = app_sql(
+            "events",
+            serde_json::json!({"or": [
+                granted("id", "event_id", "u1"), on_visible_record("id"), {"col": "deleted_at", "isNull": true},
+            ]}),
+        );
+        assert_eq!(
+            w,
+            format!(
+                r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL {VISIBLE}) OR "deleted_at" IS NULL)"#
+            )
+        );
     }
 
     /// Introspection carries no column collation. Do not assume matching type names mean matching
-    /// collations: leave text (and unclassified/domain types) alone, even for the key rule.
+    /// collations: leave text (and unclassified/domain types) alone, on the key and off it.
     #[test]
     fn projections_without_known_collation_compatibility_are_left_alone() {
         for ty in ["text", "varchar", "bpchar", "name", "citext", "custom_domain"] {
@@ -924,10 +774,10 @@ mod tests {
         }
     }
 
-    /// Gathering makes an UNKNOWN branch FALSE, which a `NOT` would tell apart: under a `NOT` the
-    /// `OR` keeps its branches. The exact same-column union still applies there.
+    /// The same-column union keeps UNKNOWN as UNKNOWN, so it is made under a `NOT` too; an `OR`
+    /// across columns under a `NOT` is printed as written.
     #[test]
-    fn the_key_union_is_not_made_under_not() {
+    fn the_same_column_union_is_made_under_not() {
         let (w, _) = app_sql(
             "events",
             serde_json::json!({"not": {"or": [granted("id", "event_id", "u1"), on_visible_record("record_id")]}}),
@@ -949,155 +799,49 @@ mod tests {
                 r#"(NOT (("record_id" IN ({VISIBLE} UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))))"#
             )
         );
-
-        // A subquery's WHERE is a filter again, even under a NOT: the set it selects is the same.
-        let (w, _) = app_sql(
-            "events",
-            serde_json::json!({"not": {"col": "record_id", "in": {"table": "records", "project": "id",
-                "where": {"or": [granted("id", "record_id", "u1"), on_visible_record("owner_id")]}}}}),
-        );
-        assert_eq!(
-            w,
-            format!(
-                r#"(NOT "record_id" IN (SELECT "id" FROM "public"."records" WHERE ("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."records" WHERE "owner_id" IN ({VISIBLE})))))"#
-            )
-        );
     }
 
-    /// Only the table's key gathers: an `IN` on another column, a composite key, and a key
-    /// subquery that projects another type all leave the `OR` as it was.
+    /// Same-column key INs whose subqueries project int4 and int8 would make a union of another
+    /// type: they stay separate branches.
     #[test]
-    fn only_a_single_column_key_of_the_projected_type_gathers() {
-        let (w, _) = app_sql(
-            "events",
-            serde_json::json!({"or": [on_visible_record("record_id"), {"col": "name", "op": "eq", "value": "a"}]}),
-        );
-        assert_eq!(w, format!(r#"("record_id" IN ({VISIBLE}) OR "name" = $1::text::"text")"#));
-
-        let (w, _) =
-            app_sql("pairs", serde_json::json!({"or": [on_visible_record("a"), {"col": "c", "op": "eq", "value": 1}]}));
-        assert_eq!(w, format!(r#"("a" IN ({VISIBLE}) OR "c" = 1)"#));
-
-        let (w, _) = app_sql(
-            "legacy",
-            serde_json::json!({"or": [{"col": "id", "in": {"table": "legacy", "project": "big"}}, {"col": "record_id", "op": "eq", "value": "r"}]}),
-        );
-        assert_eq!(w, r#"("id" IN (SELECT "big" FROM "public"."legacy") OR "record_id" = $1::text::"text")"#);
-
-        // One key `IN` alone has nothing to gather.
-        let (w, _) = app_sql("events", serde_json::json!({"or": [granted("id", "event_id", "u1")]}));
-        assert_eq!(w, r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid"))"#);
-    }
-
-    /// Both arms are positive INs, so the broad-branch veto cannot hide a missing key-type guard.
-    /// The key is int4, while its subquery projects int8; these must remain separate branches.
-    #[test]
-    fn a_positive_key_or_requires_the_key_projection_type() {
+    fn key_siblings_of_different_projection_types_are_left_alone() {
         let (w, params) = app_sql(
             "legacy",
             serde_json::json!({"or": [
                 {"col": "id", "in": {"table": "legacy", "project": "big"}},
-                {"col": "big", "in": {"table": "legacy", "project": "big"}},
+                {"col": "id", "in": {"table": "legacy", "project": "id"}},
             ]}),
         );
         assert_eq!(
             w,
-            r#"("id" IN (SELECT "big" FROM "public"."legacy") OR "big" IN (SELECT "big" FROM "public"."legacy"))"#
+            r#"("id" IN (SELECT "big" FROM "public"."legacy") OR "id" IN (SELECT "id" FROM "public"."legacy"))"#
         );
         assert!(params.is_empty());
     }
 
-    /// Both rules apply to every `OR` at every depth: under an `AND`, inside a subquery's `WHERE`
-    /// (on the inner table's own key), and in a subquery nested in that one. Placeholders start
-    /// where the caller says.
+    /// The rule applies to every `OR` at every depth: under an `AND` and inside a subquery's
+    /// `WHERE` (on the inner table's columns). Placeholders start where the caller says.
     #[test]
-    fn the_rewrites_apply_at_every_depth() {
+    fn the_rewrite_applies_at_every_depth() {
         let pj: PredicateJson = serde_json::from_value(serde_json::json!({"and": [
             {"col": "deleted_at", "isNull": true},
             {"col": "record_id", "in": {"table": "records", "project": "id", "where": {"or": [
                 granted("owner_id", "user_id", "u1"),
-                granted("id", "record_id", "u1"),
+                granted("owner_id", "user_id", "u2"),
             ]}}},
         ]}))
         .unwrap();
         let (w, p) = predicate_json_to_sql(&pj, 3, &app_schemas(), &"events".into());
         assert_eq!(
             w,
-            r#"("deleted_at" IS NULL AND "record_id" IN (SELECT "id" FROM "public"."records" WHERE ("id" IN (SELECT "id" FROM "public"."records" WHERE "owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $3::text::"uuid") UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $4::text::"uuid"))))"#
+            r#"("deleted_at" IS NULL AND "record_id" IN (SELECT "id" FROM "public"."records" WHERE ("owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $3::text::"uuid" UNION ALL SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $4::text::"uuid"))))"#
         );
-        assert_eq!(p, vec!["u1".to_string(), "u1".to_string()]);
+        assert_eq!(p, vec!["u1".to_string(), "u2".to_string()]);
     }
 
-    /// Under a page limit the key union is never made: the week query keeps its key `OR` as the
-    /// client wrote it, while the same predicate without a limit is still gathered.
+    /// An `OR` the rule does not apply to is printed exactly as before the rewrite existed.
     #[test]
-    fn a_paged_query_keeps_its_key_or() {
-        let pj = crate::where_sql::parse_where(
-            "id IN (SELECT record_id FROM grants WHERE user_id = 'u1') OR \
-             (recurring_parent_id IN (SELECT id FROM records WHERE visible = true) \
-              AND original_start_time >= '2026-11-16' AND original_start_time < '2026-11-23')",
-        )
-        .unwrap()
-        .unwrap();
-        let range =
-            r#""original_start_time" >= $2::text::"timestamptz" AND "original_start_time" < $3::text::"timestamptz""#;
-        let (w, params) = paged_predicate_json_to_sql(&pj, 1, &app_schemas(), &"records".into());
-        assert_eq!(
-            w,
-            format!(
-                r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR ("recurring_parent_id" IN ({VISIBLE}) AND {range}))"#
-            )
-        );
-        assert_eq!(params, vec!["u1", "2026-11-16", "2026-11-23"]);
-
-        let (w, _) = predicate_json_to_sql(&pj, 1, &app_schemas(), &"records".into());
-        assert_eq!(
-            w,
-            format!(
-                r#"("id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL SELECT "id" FROM "public"."records" WHERE ("recurring_parent_id" IN ({VISIBLE}) AND {range})))"#
-            )
-        );
-    }
-
-    /// The same-column union is still made under a page limit, on the key and off it, at the top
-    /// and inside a subquery; the key union is made at no depth.
-    #[test]
-    fn a_paged_query_keeps_the_same_column_union() {
-        let paged = |table: &str, json: serde_json::Value| {
-            let pj: PredicateJson = serde_json::from_value(json).unwrap();
-            paged_predicate_json_to_sql(&pj, 1, &app_schemas(), &TableRef::parse(table).unwrap()).0
-        };
-        assert_eq!(
-            paged(
-                "events",
-                serde_json::json!({"or": [
-                    granted("id", "event_id", "u1"), on_visible_record("record_id"), granted("record_id", "record_id", "u2"),
-                ]}),
-            ),
-            format!(
-                r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "record_id" IN ({VISIBLE} UNION ALL SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid"))"#
-            )
-        );
-        assert_eq!(
-            paged("events", serde_json::json!({"or": [granted("id", "event_id", "u1"), on_visible_record("id")]})),
-            format!(
-                r#"("id" IN (SELECT "event_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid" UNION ALL {VISIBLE}))"#
-            )
-        );
-        assert_eq!(
-            paged(
-                "events",
-                serde_json::json!({"col": "record_id", "in": {"table": "records", "project": "id", "where": {"or": [
-                    granted("owner_id", "user_id", "u1"), granted("id", "record_id", "u1"),
-                ]}}}),
-            ),
-            r#""record_id" IN (SELECT "id" FROM "public"."records" WHERE ("owner_id" IN (SELECT "user_id" FROM "public"."grants" WHERE "user_id" = $1::text::"uuid") OR "id" IN (SELECT "record_id" FROM "public"."grants" WHERE "user_id" = $2::text::"uuid")))"#
-        );
-    }
-
-    /// An `OR` that neither rule applies to is printed exactly as before the rewrites existed.
-    #[test]
-    fn an_or_neither_rule_applies_to_is_unchanged() {
+    fn an_or_without_same_column_siblings_is_unchanged() {
         let (w, _) = app_sql(
             "events",
             serde_json::json!({"or": [{"col": "name", "op": "eq", "value": "a"}, {"col": "deleted_at", "isNull": true}]}),
