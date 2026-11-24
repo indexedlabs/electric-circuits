@@ -3783,8 +3783,12 @@ mod tests {
         });
         let client = DsClient::with_test_store("scripted://provider".into(), store);
         let shutdown = crate::shutdown::ShutdownToken::new();
+        let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+            {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
+        ]))
+        .unwrap();
         let op = tokio::spawn(async move {
-            client.append_retrying("shape/s1", &[], std::time::Duration::from_secs(1), &shutdown).await
+            client.append_retrying("shape/s1", &envelopes, std::time::Duration::from_secs(1), &shutdown).await
         });
         let _ = tokio::time::timeout(std::time::Duration::from_millis(1), gate.entered.notified()).await;
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
