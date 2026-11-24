@@ -62,3 +62,26 @@ with the wait function's shutdown/degradation checks. Other guards are unchanged
 It is a measurement switch explicitly requested for this task, not a bridge safe
 to ship. The harness still requires zero pending flips and failing appends after
 the workload marker; an early receipt alone is never its completion oracle.
+
+## Per-commit batching experiment contract, before implementation
+
+The proposal's explicit reading is first-old/last-new folding per primary key,
+one registry acquisition and membership evaluation per touched table per commit.
+The frozen observer run at engine 894b2cc actually calls production membership
+11,941 times for the six-transaction import. `check_membership_batch.py` asserts
+an upper bound of 44 tables times six commits, plus every possible probe write
+and 16 boundary/sampler allowance calls. This is a cost/structure contract using
+the real engine's captured counters, not a customer-facing correctness oracle.
+Its red artifact must be recorded before the prototype is implemented.
+
+The proposed scratch implementation will buffer only this transaction, bound
+charged retained images to 512 MiB and 100,000 primary keys, and fail closed at
+the existing replay boundary on overflow. That deliberate scratch rejection is
+NOT the production arbitrary-transaction-size contract. No new durable record,
+task, network client, retry policy, snapshot gate or dedup rule is introduced.
+The transaction's existing last-envelope boundary owns and drops the buffer.
+Membership flush precedes ordinary appends and receipt publication. Errors reset
+the highwater through the existing sequencer error path. The prototype will not
+claim time slicing, scratch spill, fair round scheduling, crash-safe deferred
+walk recovery, or comprehensive intermediate authorization equivalence. Full
+production invariants require those missing parts; this experiment is unmergeable.

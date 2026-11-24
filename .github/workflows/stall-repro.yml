@@ -11,6 +11,25 @@ permissions:
   actions: read
 
 jobs:
+  batch-red:
+    if: contains(github.event.head_commit.message, '[batch-red]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert batching contract against immutable pre-prototype engine evidence
+        run: |
+          mkdir -p tools/stall-repro/results/batch-red
+          set +e
+          python3 tools/stall-repro/check_membership_batch.py tools/stall-repro/results/observer-346e9f9/import-result.json > tools/stall-repro/results/batch-red/assertion.txt 2>&1
+          status=$?
+          set -e
+          cat tools/stall-repro/results/batch-red/assertion.txt
+          test "$status" = 1
+          grep -q 'membership called 11941 times' tools/stall-repro/results/batch-red/assertion.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stall-batch-red-${{ github.sha }}
+          path: tools/stall-repro/results/batch-red/
   historical-build:
     if: contains(github.event.head_commit.message, '[coalesced-build]')
     runs-on: ubuntu-latest
