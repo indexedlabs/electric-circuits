@@ -543,6 +543,15 @@ top-N operator). Subquery predicates in subset queries are evaluated natively by
 `predicate_json_to_sql`. This is the basis for windowed / infinite-scroll sync: each page is a
 bounded keyset range query folded into the `WHERE`, so the engine never holds a stateful top-N.
 
+That writer prints one kind of `OR` differently from the predicate: same-column `IN (subquery)`
+siblings become one `IN` over a `UNION ALL` (when every subquery projects the same known
+non-collatable type), so Postgres tests one set instead of one subquery per branch. An `OR` across
+columns, the table's key included, is printed as the client wrote it. Column collations are not
+introspected, so collatable and unclassified projection types retain the original SQL. The rows,
+predicate and shape identity are unchanged (`sql.rs`, `JsonSql::or`;
+`conformance-sql-or-union.test.ts`). Shape backfills and group loads print their predicates with
+the same writer.
+
 ---
 
 ## 6b. Design decision: no interpreted operator graph in the dynamic tier

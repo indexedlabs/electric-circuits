@@ -29,7 +29,8 @@ export default function setup() {
 
   const dir = mkdtempSync(join(tmpdir(), 'el-pg-'))
   const data = join(dir, 'data')
-  execFileSync(postgres.initdb, ['-D', data, '-U', 'postgres', '--auth=trust', '--no-sync'], { stdio: 'ignore' })
+  // ICU collation fixtures require UTF8 even when the host locale is C/POSIX.
+  execFileSync(postgres.initdb, ['-D', data, '-U', 'postgres', '--auth=trust', '--no-sync', '--encoding=UTF8'], { stdio: 'ignore' })
 
   // Try a few ports; initdb is done, only the chosen port differs per attempt.
   let port = 0
