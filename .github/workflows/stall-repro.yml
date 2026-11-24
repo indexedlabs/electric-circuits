@@ -15,6 +15,10 @@ jobs:
     if: contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[measure]')
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        catalog: ${{ fromJSON(contains(github.event.head_commit.message, '[smoke]') && '["nov24"]' || '["nov23","nov24"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,14 +57,14 @@ jobs:
         run: |
           ARGS=()
           if [ "$SMOKE" = 1 ]; then ARGS=(--smoke --timeout 120); fi
-          python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-nov24 --catalog nov24 "${ARGS[@]}"
+          python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.catalog }} --catalog ${{ matrix.catalog }} "${ARGS[@]}"
       - name: Stop disposable database
         if: always()
         run: docker rm -f stall-experiment-pg || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: stall-experiment-${{ github.sha }}
+          name: stall-experiment-${{ matrix.catalog }}-${{ github.sha }}
           path: |
             tools/stall-repro/results/run-*/
             tools/stall-repro/results/fixture/

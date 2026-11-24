@@ -93,6 +93,7 @@ async def run(args):
     fixture = folder / "results/fixture"
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
     data = load_data(fixture / "columns.json")
+    print("Seeding synthetic database", flush=True)
     save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL))
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen([str(Path(args.store).resolve()), "--host", "127.0.0.1", "--port", "8791", "--data-dir", str(output / "store-data"), "--durability", "wal"], stdout=store_log, stderr=subprocess.STDOUT)
@@ -131,17 +132,23 @@ async def run(args):
     try:
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {SECRET}"}, timeout=120) as client:
             await until_ready(client, unit)
+            print("Engine ready; generating gateway requests", flush=True)
             pid = int(subprocess.check_output(["systemctl", "show", unit, "--property=MainPID", "--value"], text=True).strip())
             process = psutil.Process(pid)
             catalog = await gateway.generate(args.catalog, args.scale)
             if args.smoke:
                 catalog = catalog[:20] + catalog[-20:]
             semaphore = asyncio.Semaphore(8)
+            created = 0
             async def create(request):
+                nonlocal created
                 async with semaphore:
                     response = await client.post(f"{ENGINE_URL}/v1/subset-feeds", json=request["body"])
                     if response.status_code != 200:
                         raise RuntimeError(f"Shape creation failed: {response.status_code} {response.text[:2000]} table={request['body']['table']}")
+                    created += 1
+                    if created % 500 == 0:
+                        print(f"Created {created}/{len(catalog)} shapes", flush=True)
                     return response.json()
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
@@ -155,6 +162,7 @@ async def run(args):
             memory = await client.get(f"{ENGINE_URL}/memory")
             memory.raise_for_status()
             save(output / "catalog-before-warmup.json", memory.json())
+            print(json.dumps({"before_warmup": memory.json()["cardinalities"]}), flush=True)
             validator = gateway.gateway._is_drained_receipt
             fence_user = row_id("user", 1)
             fence_generation = gateway.authority(1).generation
@@ -169,6 +177,7 @@ async def run(args):
             memory = await client.get(f"{ENGINE_URL}/memory")
             memory.raise_for_status()
             save(output / "catalog-calibration.json", {"target": TARGETS[args.catalog], "actual": memory.json(), "source_shape_requests": len(catalog), "smoke_only": args.smoke})
+            print(json.dumps({"calibration": memory.json()["cardinalities"]}), flush=True)
             command("sudo", "systemctl", "set-property", unit, f"CPUQuota={int(args.cpus * 100)}%")
             cgroup = subprocess.check_output(["systemctl", "show", unit, "--property=ControlGroup", "--value"], text=True).strip()
             quota = Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "cpu.max"
