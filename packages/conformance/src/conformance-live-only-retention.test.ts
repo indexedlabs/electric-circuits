@@ -253,8 +253,9 @@ describe('aggregate live-only retention', () => {
     expect(first.status, JSON.stringify(first.body)).toBe(200)
     const feed = first.body as unknown as Feed
 
-    // Let the original live-only period pass, then renew the native claim. The renewal is a
-    // touch, so a later lease lapse does not immediately retire the aggregate.
+    // Let the original lease lapse while the shape is still inside its live-only period, then
+    // renew the native claim. The renewal is a touch, so a later lease lapse does not immediately
+    // retire the aggregate.
     await sleep(2200)
     const renewed = await aggregate('aggregate-renewed')
     expect(renewed.status, JSON.stringify(renewed.body)).toBe(200)

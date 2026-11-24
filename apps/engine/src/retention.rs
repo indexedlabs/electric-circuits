@@ -25,7 +25,8 @@
 //!    Reaps dead shapes even with no resource pressure. A live-only shape with no subscription is
 //!    retired after [`RetentionConfig::live_only_evict_after`] without a touch. The configured
 //!    live-only period can shorten the ordinary idle-plus-dormancy window, but never lengthen it,
-//!    and the subscription lease is the floor. A value of `0` uses the ordinary window unchanged.
+//!    and the subscription lease is the floor. A value of `0` uses the ordinary window unchanged;
+//!    when the ordinary dormant TTL is disabled, main's live-only layer remains disabled too.
 //! 2. **`max_shapes` count cap** (engine cost bound): when the total shape count exceeds
 //!    [`RetentionConfig::max_shapes`], evict least-recently-read dormant shapes until under. A
 //!    subscribed shape is never evicted, and neither is a parkable shape that is still active.
@@ -72,7 +73,7 @@ use crate::pg::SnapshotGate;
 /// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `21600` (6 hours) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
 /// | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | `1800` (30 min) | Time since the last renewal before a native subscription lease lapses. `0` disables lease expiry. |
 /// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
-/// | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Maximum idle period for an unsubscribed live-only shape (subquery, aggregate or changes-only feed). The effective period is the smaller of this value and the ordinary idle-plus-dormancy window, floored by the subscription lease. `0` uses the ordinary window unchanged. |
+/// | `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | `86400` (24 hours) | Maximum idle period for an unsubscribed live-only shape (subquery, aggregate or changes-only feed). The effective period is the smaller of this value and the ordinary idle-plus-dormancy window, floored by the subscription lease. `0` uses the ordinary window unchanged; a disabled dormant TTL keeps main's live-only layer disabled. |
 /// | `ELECTRIC_CIRCUITS_REPLAY_MIN_BYTES` | `16777216` (16 MiB) | Minimum change-log span budget for dormant replay. |
 /// | `ELECTRIC_CIRCUITS_REPLAY_MULTIPLIER` | `4` | Replay budget multiplier applied to the shape's recorded backfill bytes. |
 /// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Cap on registered shapes (active, dormant and live-only; each group member is one). Over it, least-recently-read dormant shapes are evicted; active live-only shapes remain protected. `0` = unlimited. |
@@ -143,7 +144,12 @@ impl RetentionConfig {
     /// from active, and the reason that retirement is counted under. `None` = no finite window.
     /// The configured period can only shorten the ordinary idle-plus-dormancy window, and the
     /// subscription lease is the floor. A configured `0` means the ordinary window is unchanged.
+    /// If the ordinary dormant TTL is disabled, main's live-only layer has no finite window and
+    /// remains disabled.
     pub fn live_only_evict_after(&self) -> Option<(Duration, EvictReason)> {
+        if self.dormant_ttl.is_zero() {
+            return None;
+        }
         let ordinary = self.idle_timeout.saturating_add(self.dormant_ttl);
         let configured = if self.live_only_idle.is_zero() { ordinary } else { ordinary.min(self.live_only_idle) };
         let after = configured.max(self.subscription_lease_timeout);
@@ -755,6 +761,18 @@ mod tests {
             plan_sweep(&c, &[live_only("released", 0, 3)]).evict,
             vec![("released".to_string(), EvictReason::LiveOnlyIdle)]
         );
+    }
+
+    #[test]
+    fn disabled_dormant_ttl_keeps_live_only_shapes_forever() {
+        let c = RetentionConfig {
+            live_only_idle: Duration::from_secs(1),
+            subscription_lease_timeout: Duration::ZERO,
+            dormant_ttl: Duration::ZERO,
+            ..cfg()
+        };
+        assert_eq!(c.live_only_evict_after(), None);
+        assert!(plan_sweep(&c, &[live_only("released", 0, 365 * 24 * 3600)]).evict.is_empty());
     }
 
     /// Group members are marked in the snapshot and excluded from the live-only sweep. Group
