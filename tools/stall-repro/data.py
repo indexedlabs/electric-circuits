@@ -81,7 +81,7 @@ class SyntheticData:
             "calendar": {"user_id": row_id("user", account), "external_account_id": row_id("external_account", account), "provider": "google", "should_sync": True},
             "calendar_event": {"user_id": row_id("user", account), "calendar_id": row_id("calendar", account, ordinal % 15), "provider": "google", "status": "confirmed", "is_busy_block": False},
             "resource": {"resource_type": "person", "space_id": row_id("space", account), "user_id": row_id("user", account) if ordinal == 0 else None},
-            "resource_fact": {"resource_id": row_id("resource", account, ordinal % 100)},
+            "resource_fact": {"resource_id": row_id("resource", account, ordinal % 100), "fact_type": "note" if ordinal < 100 else "full_name"},
             "graph_edge": {"from_type": "record", "from_id": row_id("record", account, ordinal), "to_type": "resource", "to_id": row_id("resource", account, ordinal % 100), "edge_type": "has_attendee"},
             "message": {"target_type": "record", "target_id": row_id("record", account, ordinal % 1000), "source_type": "user", "source_id": row_id("user", account)},
             "activity": {"target_type": "user", "target_id": row_id("user", account), "is_hidden": False},
