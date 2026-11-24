@@ -1647,10 +1647,12 @@ impl<'a> BackfillReader<'a> {
         let Some(stream) = self.stream.as_mut() else { return Ok(None) };
         let shutdown = &self.client.inner.shutdown;
         let memory = &shutdown.metrics().memory_budget;
-        // Disabled admission must not add a row-level shutdown cut to an in-flight cursor.
+        // Disabled admission must not add a row-level shutdown cut to an in-flight cursor. The cut
+        // is the end of the shutdown's drain window, not its start: a flip's query-back that is
+        // being finished inside the window reads its candidate rows through here.
         let mut permit = if memory.enabled() {
             tokio::select! {
-                _ = shutdown.wait() => anyhow::bail!("backfill frame interrupted by shutdown"),
+                _ = shutdown.wait_drain_end() => anyhow::bail!("backfill frame interrupted by shutdown"),
                 permit = memory.acquire(self.budget) => permit,
             }
         } else {
@@ -1669,7 +1671,7 @@ impl<'a> BackfillReader<'a> {
             // before admitting its actual size for decoding; never wait with another permit.
             drop(permit);
             permit = tokio::select! {
-                _ = shutdown.wait() => anyhow::bail!("backfill frame interrupted by shutdown"),
+                _ = shutdown.wait_drain_end() => anyhow::bail!("backfill frame interrupted by shutdown"),
                 permit = memory.acquire(raw.0) => permit,
             };
         }

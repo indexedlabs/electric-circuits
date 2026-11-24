@@ -11,14 +11,21 @@ mod ingest_projection_tests;
 #[path = "crash_consistency_tests.rs"]
 mod crash_consistency_tests;
 
+#[cfg(test)]
+#[path = "subq_restore_tests.rs"]
+mod subq_restore_tests;
+
 /// The engine's durable **shape catalog**: an append-only event stream replayed at boot so a
 /// restart re-registers every shape itself instead of requiring a client re-registration storm.
 /// Plain/routed shapes resume with passthrough gates (the change log replays everything after the
 /// persisted offset; re-emission across the crash window is idempotent absolute upserts);
 /// aggregates re-seed their fold from a fresh Postgres snapshot (their fresh gate then skips the
-/// replayed history). Subquery shapes are NOT restorable without persisted inner-node state (a
-/// fresh-seeded node cannot detect downtime flips, which would leave stale move-outs forever) —
-/// they are dropped loudly at restore for clients to recreate. A restorable shape whose stream
+/// replayed history). Subquery shapes are restored from the registry state the last graceful stop
+/// wrote (`crate::subq_state`): their inner sets and key sets as they stood at the checkpoint, then
+/// the same change-log replay. Without that state — a crash, a degraded engine, a stop with
+/// subquery effects still in flight — they are NOT restorable (a fresh-seeded node cannot detect
+/// downtime flips, which would leave stale move-outs forever) and are dropped loudly at restore for
+/// clients to recreate. A restorable shape whose stream
 /// storage is definitively missing or closed is likewise dropped and retired at boot; a transport
 /// error while checking the stream still aborts the restore, and the boot backs off and retries it
 /// (`pg::boot_disposition`) rather than exiting.
@@ -54,8 +61,8 @@ pub(crate) enum CatalogEvent {
     },
     /// A grouped feed's public claim and its private member list.  Members remain ordinary
     /// shape records; this event is the durable binding that lets a plain-only group restore
-    /// as one lease after a restart.  Groups containing subquery members are deliberately
-    /// skipped during restore because their inner-node state is not persisted.
+    /// as one lease after a restart. A group with subquery members is restored only when the
+    /// saved registry can restore every member.
     GroupCreated {
         group: GroupRecord,
     },
@@ -143,6 +150,14 @@ pub(crate) enum CatalogEvent {
         /// ignore the field; an older checkpoint without it restores every group attached.
         #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         groups: std::collections::BTreeMap<String, u64>,
+        /// The subquery registry as it stood at exactly this checkpoint, written to a stream of its
+        /// own at a graceful stop (`crate::subq_state`). Only the LAST `Offset` in the log counts:
+        /// the registry moves with every change the sequencer processes, so any later `Offset` —
+        /// which carries none — means the state no longer describes where a restart resumes, and
+        /// subquery shapes are dropped at restore as they were before this field existed. Older
+        /// engines ignore the field and drop them too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subq_state: Option<crate::subq_state::StatePointer>,
     },
     /// The change log rotated (ADR-0006): `segment` became the CURRENT segment at `at` (unix
     /// seconds). Written on the first creation of segment 0 too, so every segment's start time is
@@ -394,6 +409,11 @@ impl CatalogWriter {
     /// The last change-log position whose `Offset` checkpoint is durable (see [`Self::durable`]).
     pub(crate) fn durable_offset(&self) -> Option<LogPosition> {
         self.durable.lock().unwrap().as_ref().map(|(pos, _)| pos.clone())
+    }
+
+    /// The last checkpoint — position AND highwater — whose `Offset` is durable.
+    pub(crate) fn durable_checkpoint(&self) -> Option<CatalogCheckpoint> {
+        self.durable.lock().unwrap().clone()
     }
 
     /// Adopt the checkpoint the boot restored from the catalog: it is by definition already durable,
@@ -1011,6 +1031,14 @@ pub(crate) struct CatalogFold {
     start_highwater: Option<(u64, u64)>,
     /// The per-group resume points recorded with that checkpoint (OTTO-11131).
     group_resume: std::collections::BTreeMap<String, u64>,
+    /// The subquery registry state that checkpoint names, if it names one — taken from the LAST
+    /// `Offset` only (see [`CatalogEvent::Offset`]).
+    subq_state: Option<crate::subq_state::StatePointer>,
+    /// The most recent state an earlier `Offset` named and a later one superseded. Its stream is
+    /// of no use to anyone; it is still here only if the boot that superseded it died before
+    /// deleting it, so every boot deletes it again (a delete of an absent stream is a no-op).
+    /// One entry, not a history: each boot clears what the one before it left.
+    superseded_subq_state: Option<crate::subq_state::StatePointer>,
     /// The change log's current segment: the last `ChangesRotated`, else 0 (ADR-0006). A lower
     /// bound — a process can die between closing a segment and recording the rotation — so the
     /// boot walks forward from here (`changelog::resolve_current`).
@@ -1047,6 +1075,8 @@ impl Default for CatalogFold {
             start_pos: LogPosition::start(),
             start_highwater: None,
             group_resume: std::collections::BTreeMap::new(),
+            subq_state: None,
+            superseded_subq_state: None,
             binding: None,
             source_receipts: HashMap::new(),
             last_source_receipt: None,
@@ -1140,7 +1170,14 @@ impl CatalogFold {
             CatalogEvent::Retired { id } => {
                 self.pending_retire.remove(&id);
             }
-            CatalogEvent::Offset { pos, highwater, groups } => {
+            CatalogEvent::Offset { pos, highwater, groups, subq_state } => {
+                // The registry state travels with ONE checkpoint: whatever an earlier `Offset`
+                // named is superseded by this one, whether or not this one names a state itself.
+                if let Some(previous) = std::mem::replace(&mut self.subq_state, subq_state)
+                    && self.subq_state.as_ref().is_none_or(|current| current.stream != previous.stream)
+                {
+                    self.superseded_subq_state = Some(previous);
+                }
                 if (&pos, highwater) < (&self.start_pos, self.start_highwater) {
                     tracing::error!(
                         previous = %self.start_pos, checkpoint = %pos,
@@ -1292,16 +1329,20 @@ impl Engine {
     /// Vouch for every stream that Resume would install before changing the registry, routing or
     /// sequencer. Definitive missing/closed answers are returned for retirement; a transport error
     /// still aborts the restore (the boot boundary classifies it as retryable and backs off).
-    /// Schema-drift and subquery records are intentionally dropped by the existing
-    /// restore path, so their streams are retired below rather than treated as resumable state.
+    /// Schema-drift records, and subquery records the saved registry state does not hold
+    /// (`restorable_subqueries`), are dropped by the restore itself, so their streams are retired
+    /// below rather than treated as resumable state.
     async fn preflight_catalog_streams(
         &self,
         recs: &HashMap<String, Restored>,
         compiled: &HashMap<TableRef, TableSchema>,
+        restorable_subqueries: &HashSet<String>,
     ) -> Result<Vec<(String, &'static str)>> {
         let mut retire = Vec::new();
         for (id, (rec, _, _, _)) in recs {
-            if rec.is_subquery || schema_moved_while_down(rec, compiled).is_some() {
+            if (rec.is_subquery && !restorable_subqueries.contains(id))
+                || schema_moved_while_down(rec, compiled).is_some()
+            {
                 continue;
             }
             let head = self
@@ -1553,8 +1594,62 @@ impl Engine {
         // Resume must prove every retained stream is still appendable before any record, share or
         // sequencer state is installed. Park intentionally skips this: it records old-epoch shapes
         // for the reset's close-then-delete path and must preserve that existing semantics.
+        // The subquery registry as the last graceful stop wrote it, if the LAST checkpoint names
+        // one and it verifies (`crate::subq_state`). A storage failure here is a restore error like
+        // any other (the boot retries); a state that does not verify is not used at all, and its
+        // shapes are dropped below exactly as they were before there was such a state.
+        let subq_pointer = fold.subq_state.clone();
+        let mut subq_reason = "the last stop wrote no registry state (a crash, or subquery effects still in flight)";
+        let mut subq_state: Option<crate::subq_state::IndexedState> = None;
+        if mode == RestoreMode::Resume
+            && let Some(pointer) = &subq_pointer
+        {
+            match crate::subq_state::read(&self.ds, pointer, &fold.start_pos, fold.start_highwater)
+                .await
+                .context("catalog restore: reading the subquery registry state")?
+            {
+                crate::subq_state::Loaded::State(state) => {
+                    tracing::info!(
+                        event = "subquery_state_read",
+                        stream = %pointer.stream,
+                        nodes = state.nodes.len(),
+                        shapes = state.shapes.len(),
+                        bytes = pointer.bytes,
+                        "catalog restore: the last checkpoint names a subquery registry state"
+                    );
+                    self.metrics.subquery_state_bytes.store(pointer.bytes, Ordering::Relaxed);
+                    subq_reason = "the saved registry state cannot bring it back";
+                    subq_state = Some(state.indexed());
+                }
+                crate::subq_state::Loaded::Rejected(why) => {
+                    tracing::error!(
+                        event = "subquery_state_rejected",
+                        stream = %pointer.stream,
+                        "catalog restore: the subquery registry state {} cannot be used ({why}); every subquery \
+                         shape is dropped",
+                        pointer.stream
+                    );
+                    subq_reason = "the saved registry state did not verify";
+                }
+            }
+        }
+        // The subquery shapes that state can bring back: on a table whose schema has not moved, and
+        // held by the state. (Their inner sets are vouched for one by one when each is restored.)
+        let mut restorable_subqueries: HashSet<String> = match &subq_state {
+            Some(state) => fold
+                .recs
+                .iter()
+                .filter(|(id, (rec, ..))| {
+                    rec.is_subquery
+                        && state.shapes.contains_key(*id)
+                        && schema_moved_while_down(rec, compiled).is_none()
+                })
+                .map(|(id, _)| id.clone())
+                .collect(),
+            None => HashSet::new(),
+        };
         let boot_retire = if mode == RestoreMode::Resume {
-            self.preflight_catalog_streams(&fold.recs, compiled).await?
+            self.preflight_catalog_streams(&fold.recs, compiled, &restorable_subqueries).await?
         } else {
             Vec::new()
         };
@@ -1594,6 +1689,7 @@ impl Engine {
                 self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
                 self.metrics.catalog_restore_retired.fetch_add(1, Ordering::Relaxed);
                 self.metrics.emitter().catalog_restore_retired(reason);
+                restorable_subqueries.remove(&id);
                 dead_streams.push((id, rec.stream_path));
             }
         }
@@ -1601,10 +1697,20 @@ impl Engine {
             for (id, path) in dead_streams {
                 self.retire_shape_stream(&id, &path).await;
             }
+            if mode == RestoreMode::Resume {
+                self.retire_subq_state(
+                    subq_pointer.as_ref(),
+                    fold.superseded_subq_state.as_ref(),
+                    &fold.start_pos,
+                    fold.start_highwater,
+                    &fold.group_resume,
+                )
+                .await?;
+            }
             self.release_restore_reads().await?;
             return Ok(());
         }
-        let CatalogFold { recs, groups, start_pos, start_highwater, group_resume, .. } = fold;
+        let CatalogFold { recs, groups, start_pos, start_highwater, group_resume, superseded_subq_state, .. } = fold;
         let restored_ids: Vec<String> = recs.keys().cloned().collect();
         tracing::info!("catalog restore: {} shape(s), change-log replay from {start_pos}", recs.len());
         // The durable floor was adopted before any restore work, including the empty fast path.
@@ -1626,7 +1732,7 @@ impl Engine {
                     "catalog restore: sequencer already started at {start}; restored checkpoint is {start_pos}"
                 )));
             }
-            *start = start_pos;
+            *start = start_pos.clone();
             // Restore de-duplication with the position, including a completed chunk prefix.
             *highwater = start_highwater;
         }
@@ -1665,8 +1771,65 @@ impl Engine {
             }
         }
 
-        // 2. Restore records + shares; subquery shapes are dropped (see CATALOG_STREAM docs).
+        // 1b. Rebuild the subquery registry from the saved state, one shape at a time, through the
+        // installation path a create uses — with reads paused, so no change can reach a
+        // half-restored registry, and before any record is installed, so a shape that cannot be
+        // restored is simply dropped below like every subquery shape used to be.
+        let mut subq_restored: HashSet<String> = HashSet::new();
+        if let Some(state) = &subq_state {
+            let started = std::time::Instant::now();
+            let mut ids: Vec<&String> = restorable_subqueries.iter().collect();
+            ids.sort();
+            let mut registry = self.subqueries.lock().await;
+            for id in ids {
+                let Some((rec, ..)) = recs.get(id) else { continue };
+                let outcome = async {
+                    let ts =
+                        compiled.get(&rec.table).with_context(|| format!("table '{}' no longer exists", rec.table))?;
+                    let out_cols = match &rec.columns {
+                        Some(names) => {
+                            Some(Arc::new(names.iter().map(|n| ts.column_index(n)).collect::<Result<Vec<usize>>>()?))
+                        }
+                        None => None,
+                    };
+                    let where_json = rec.where_json.as_ref().context("a subquery shape has no predicate")?;
+                    registry
+                        .restore_shape(
+                            &rec.id,
+                            &rec.table,
+                            &rec.stream_path,
+                            where_json,
+                            out_cols,
+                            rec.changes_only,
+                            &state.shapes[id],
+                            &state.nodes,
+                        )
+                        .await
+                }
+                .await;
+                match outcome {
+                    Ok(()) => {
+                        subq_restored.insert(id.clone());
+                    }
+                    Err(e) => tracing::warn!(
+                        "restore: subquery shape {id} cannot be restored from the saved registry state ({e:#})"
+                    ),
+                }
+            }
+            tracing::info!(
+                event = "subquery_state_restored",
+                shapes = subq_restored.len(),
+                nodes = registry.node_count(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "catalog restore: subquery registry rebuilt from the saved state"
+            );
+        }
+
+        // 2. Restore records + shares. A subquery shape is restored only if the registry state
+        // brought it back above; otherwise it is dropped (see CATALOG_STREAM docs).
         let mut resume: Vec<ShapeRecord> = Vec::new();
+        // Restored subquery shapes whose group was dropped below: out of the registry again.
+        let mut subq_unrestored: Vec<String> = Vec::new();
         {
             let mut st = self.state.lock().await;
             for (id, (rec, sig, subs, dormant)) in recs {
@@ -1685,14 +1848,14 @@ impl Engine {
                     dead_streams.push((id.clone(), rec.stream_path.clone()));
                     continue;
                 }
-                if rec.is_subquery {
-                    // Subquery shapes are registry-served and their inner-node contributor
-                    // state is not persisted: a fresh-seeded node cannot detect flips that
-                    // happened during downtime (stale move-outs would persist forever), so
-                    // they are dropped loudly and clients recreate them.
+                if rec.is_subquery && !subq_restored.contains(&id) {
+                    // Subquery shapes need their saved inner sets: seeding from today's rows
+                    // cannot recover the membership moves that happened during downtime.
                     tracing::warn!(
-                        "restore: dropping subquery shape {id} (inner-node state is not persisted); subscribers observe the deleted stream and recreate"
+                        "restore: dropping subquery shape {id} ({subq_reason}); subscribers observe the deleted \
+                         stream and recreate"
                     );
+                    self.metrics.subquery_shapes_dropped_at_restore.fetch_add(1, Ordering::Relaxed);
                     self.catalog_tx.send(CatalogEvent::Dropped { id: id.clone() });
                     dead_streams.push((id.clone(), rec.stream_path.clone()));
                     continue;
@@ -1727,23 +1890,25 @@ impl Engine {
                     }
                     None => {
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
-                        resume.push(rec);
+                        // A subquery shape is served by the registry, which is already rebuilt:
+                        // there is nothing to register with the sequencer.
+                        if !rec.is_subquery {
+                            resume.push(rec);
+                        }
                     }
                 }
             }
             // Restore the public group claim only when every private member survived.  A
-            // subquery member deliberately cannot survive a restart because its inner-node
-            // contributor state is not persisted; its group is dropped as one unit and the
-            // client recreates the scope.
+            // subquery member survives only when the saved registry state brought it back; a
+            // group missing any member is dropped as one unit and the client recreates the
+            // scope. Keep the existing live-lease requirement; re-joining an unheld group is
+            // separate work (OTTO-13834).
             let now = crate::changelog::now_secs();
             if let Some((lsn, _)) = start_highwater {
                 self.group_lanes.note_restored_highwater(lsn);
             }
             for (subscription, group) in groups {
-                let restorable = group
-                    .members
-                    .iter()
-                    .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
+                let restorable = group.members.iter().all(|member| st.shapes.contains_key(&member.shape_id));
                 let lease_live = self.retention.subscription_lease_timeout.is_zero()
                     || group.members.iter().all(|member| {
                         st.feed_shares
@@ -1771,6 +1936,13 @@ impl Engine {
                     if let Some((lsn, _)) = start_highwater {
                         self.group_lanes.restore_position(&group.stream_path, lsn);
                     }
+                    // The position the group's stream had reached when the engine stopped, so the
+                    // lane never places an envelope below one already on it.
+                    if let Some(position) =
+                        subq_state.as_ref().and_then(|state| state.group_positions.get(&group.stream_path))
+                    {
+                        self.group_lanes.restore_position(&group.stream_path, *position);
+                    }
                     st.group_claims.complete(group);
                 } else {
                     tracing::info!(
@@ -1787,6 +1959,10 @@ impl Engine {
                             }
                             st.circuit_placement.remove(&member.shape_id);
                             self.lives.lock().unwrap().remove(&member.shape_id);
+                            if subq_restored.remove(&member.shape_id) {
+                                self.metrics.subquery_shapes_dropped_at_restore.fetch_add(1, Ordering::Relaxed);
+                                subq_unrestored.push(member.shape_id.clone());
+                            }
                             self.catalog_tx.send(CatalogEvent::Dropped { id: member.shape_id.clone() });
                             dead_streams.push((member.shape_id.clone(), rec.stream_path));
                         }
@@ -1797,6 +1973,13 @@ impl Engine {
             resume.retain(|rec| st.shapes.contains_key(&rec.id));
             self.ensure_sequencer(&mut st);
         }
+        if !subq_unrestored.is_empty() {
+            let mut registry = self.subqueries.lock().await;
+            for id in &subq_unrestored {
+                registry.drop_subquery_shape(id).await;
+            }
+        }
+        self.metrics.subquery_shapes_restored.fetch_add(subq_restored.len() as u64, Ordering::Relaxed);
         // Restored dormant shapes still need the TTL/eviction layers running.
         self.ensure_retention_sweeper();
         // Retirement: clients may still be tailing these streams from before the restart, so close
@@ -1824,6 +2007,24 @@ impl Engine {
                 return Err(e.context(format!("catalog restore failed for shape {}", rec.id)));
             }
         }
+        // The registry state has now been used (or could not be), and it describes the registry at
+        // the checkpoint ONLY: the moment the sequencer reads on, the streams move past it. So the
+        // checkpoint is written again naming nothing, durably, BEFORE reads are released — a crash
+        // from here on finds no state and drops the shapes, never this state replayed a second
+        // time over streams that have since moved.
+        if let Err(e) = self
+            .retire_subq_state(
+                subq_pointer.as_ref(),
+                superseded_subq_state.as_ref(),
+                &start_pos,
+                start_highwater,
+                &group_resume,
+            )
+            .await
+        {
+            self.rollback_catalog_restore(&restored_ids, &cmd_tx).await;
+            return Err(e.context("catalog restore: invalidating the used subquery registry state"));
+        }
         if let Err(e) = self.release_restore_reads().await {
             self.rollback_catalog_restore(&restored_ids, &cmd_tx).await;
             return Err(e.context("catalog restore: sequencer resume handshake failed"));
@@ -1831,10 +2032,45 @@ impl Engine {
         Ok(())
     }
 
+    /// The registry state the last checkpoint named has served its purpose — it was restored, or it
+    /// cannot be used — so make that durable and remove its stream.
+    ///
+    /// The `Offset` written here repeats the checkpoint the boot resumes from, naming no state: the
+    /// fold trusts only the last `Offset`, so this is what invalidates the pointer. It is awaited
+    /// (`send_durable`) because the caller releases the sequencer right after, and a state must
+    /// never outlive the first change read past it. The stream is deleted only after that, and
+    /// best-effort: a stream left behind is the fold's `superseded_subq_state` at the next boot,
+    /// which is deleted here too.
+    async fn retire_subq_state(
+        &self,
+        pointer: Option<&crate::subq_state::StatePointer>,
+        superseded: Option<&crate::subq_state::StatePointer>,
+        pos: &LogPosition,
+        highwater: Option<(u64, u64)>,
+        groups: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<()> {
+        if pointer.is_some() {
+            self.catalog_tx
+                .send_durable(CatalogEvent::Offset {
+                    pos: pos.clone(),
+                    highwater,
+                    groups: groups.clone(),
+                    subq_state: None,
+                })
+                .await?;
+        }
+        for state in pointer.into_iter().chain(superseded) {
+            if let Err(e) = self.ds.delete_stream(&state.stream).await {
+                tracing::warn!("restore: deleting the used subquery state {} failed ({e:#})", state.stream);
+            }
+        }
+        Ok(())
+    }
+
     /// Release the replay gate only after the sequencer acknowledges the command. A dropped
     /// receiver/ack must remain a setup error; clearing the shared gate would otherwise let a
     /// replacement task race ahead of an incomplete catalog restore.
-    async fn release_restore_reads(&self) -> Result<()> {
+    pub(super) async fn release_restore_reads(&self) -> Result<()> {
         let existing_seq = self.state.lock().await.sequencer.as_ref().map(|s| s.cmd_tx.clone());
         if let Some(cmd_tx) = existing_seq {
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -1862,16 +2098,24 @@ impl Engine {
         if cmd_tx.send(SequencerCmd::Barrier { done: done_tx }).is_ok() {
             let _ = done_rx.await;
         }
-        let mut st = self.state.lock().await;
-        let mut lives = self.lives.lock().unwrap();
-        for id in ids {
-            lives.remove(id);
-            st.forget_subscriptions(id);
-            if let Some(share) = st.feed_shares.remove(id) {
-                st.feed_by_sig.remove(&share.sig);
+        {
+            let mut st = self.state.lock().await;
+            let mut lives = self.lives.lock().unwrap();
+            for id in ids {
+                lives.remove(id);
+                st.forget_subscriptions(id);
+                if let Some(share) = st.feed_shares.remove(id) {
+                    st.feed_by_sig.remove(&share.sig);
+                }
+                st.circuit_placement.remove(id);
+                st.shapes.remove(id);
             }
-            st.circuit_placement.remove(id);
-            st.shapes.remove(id);
+        }
+        // Subquery shapes rebuilt from the saved registry state leave the registry too, so the
+        // retried restore starts from an empty one (a no-op for every other id).
+        let mut registry = self.subqueries.lock().await;
+        for id in ids {
+            registry.drop_subquery_shape(id).await;
         }
     }
 
@@ -2360,7 +2604,12 @@ mod tests {
                 gate: crate::pg::SnapshotGate::passthrough(),
             },
             CatalogEvent::ChangesRotated { segment: 270, at: crate::changelog::now_secs() },
-            CatalogEvent::Offset { pos: saved.clone(), highwater: Some((0x10, 2)), groups: Default::default() },
+            CatalogEvent::Offset {
+                pos: saved.clone(),
+                highwater: Some((0x10, 2)),
+                groups: Default::default(),
+                subq_state: None,
+            },
         ]
         .into_iter()
         .enumerate()
@@ -2473,7 +2722,12 @@ mod tests {
             (pos(1081, "-1"), None),
             (floor.clone(), highwater),
         ] {
-            engine.catalog_tx.send(CatalogEvent::Offset { pos, highwater, groups: Default::default() });
+            engine.catalog_tx.send(CatalogEvent::Offset {
+                pos,
+                highwater,
+                groups: Default::default(),
+                subq_state: None,
+            });
         }
         tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap().unwrap();
         let offsets: Vec<CatalogCheckpoint> = boot_race_events(&store)
@@ -2520,19 +2774,26 @@ mod tests {
                     pos: floor.clone(),
                     highwater: Some((8241725836464, 3)),
                     groups: Default::default(),
+                    subq_state: None,
                 },
                 // Equal positions can legitimately advance the paired highwater.
                 CatalogEvent::Offset {
                     pos: floor.clone(),
                     highwater: Some((8241725836464, 4)),
                     groups: Default::default(),
+                    subq_state: None,
                 },
             ]);
             assert!(output.0.lock().unwrap().is_empty(), "advancing/equal checkpoints are valid");
             for _ in 0..2 {
                 fold.apply_once(
                     "stale-shutdown",
-                    CatalogEvent::Offset { pos: regressed.clone(), highwater: None, groups: Default::default() },
+                    CatalogEvent::Offset {
+                        pos: regressed.clone(),
+                        highwater: None,
+                        groups: Default::default(),
+                        subq_state: None,
+                    },
                 );
             }
             assert_eq!(fold.start_pos(), regressed, "diagnosis must not guess a repaired replay frontier");
@@ -2560,7 +2821,7 @@ mod tests {
             CATALOG_STREAM,
             &[catalog_event(
                 "previous-process",
-                CatalogEvent::Offset { pos: floor.clone(), highwater, groups: Default::default() },
+                CatalogEvent::Offset { pos: floor.clone(), highwater, groups: Default::default(), subq_state: None },
             )],
         )
         .await
@@ -2569,7 +2830,12 @@ mod tests {
         *store.catalog_event_gate.lock().unwrap() = Some(("offset".into(), gate.clone()));
         let shutdown = crate::shutdown::ShutdownToken::with_supervisor(Some(Arc::new(tokio::sync::Notify::new())));
         let writer = spawn_catalog_writer(ds.clone(), shutdown.clone(), true);
-        writer.send(CatalogEvent::Offset { pos: LogPosition::start(), highwater: None, groups: Default::default() });
+        writer.send(CatalogEvent::Offset {
+            pos: LogPosition::start(),
+            highwater: None,
+            groups: Default::default(),
+            subq_state: None,
+        });
         tokio::time::timeout(OTTO_5492_DEADLINE, async {
             tokio::select! {
                 // Broken writer: the stale append is already in storage's hands.
@@ -2606,7 +2872,15 @@ mod tests {
             let old = if malformed {
                 serde_json::json!({"t":"offset", "eid":"old", "pos":null})
             } else {
-                catalog_event("old", CatalogEvent::Offset { pos: floor.clone(), highwater, groups: Default::default() })
+                catalog_event(
+                    "old",
+                    CatalogEvent::Offset {
+                        pos: floor.clone(),
+                        highwater,
+                        groups: Default::default(),
+                        subq_state: None,
+                    },
+                )
             };
             ds.append_json(CATALOG_STREAM, &[old]).await.unwrap();
             let engine = if configured {
@@ -2627,7 +2901,12 @@ mod tests {
             engine.sweep_change_log().await;
             let unread_retained = engine.changes.state().segments().contains_key(&0);
             for (pos, highwater) in [(LogPosition::start(), None), (floor.clone(), highwater), (floor, None)] {
-                engine.catalog_tx.send(CatalogEvent::Offset { pos, highwater, groups: Default::default() });
+                engine.catalog_tx.send(CatalogEvent::Offset {
+                    pos,
+                    highwater,
+                    groups: Default::default(),
+                    subq_state: None,
+                });
             }
             let written = tokio::time::timeout(OTTO_5492_DEADLINE, engine.catalog_tx.wait_durable()).await.unwrap();
             let offsets: Vec<_> = boot_race_events(&store).into_iter().filter(|event| event["t"] == "offset").collect();
@@ -2827,7 +3106,12 @@ mod tests {
             catalog_event("pin", CatalogEvent::ConsumerPinned { id: "reader".into(), position: pos(2, "pin") }),
             catalog_event(
                 "offset",
-                CatalogEvent::Offset { pos: pos(3, "tail"), highwater: Some((42, 7)), groups: Default::default() },
+                CatalogEvent::Offset {
+                    pos: pos(3, "tail"),
+                    highwater: Some((42, 7)),
+                    groups: Default::default(),
+                    subq_state: None,
+                },
             ),
         ]
     }
@@ -3286,7 +3570,7 @@ mod tests {
         let bound = catalog_event("bound", CatalogEvent::StoreBound(expected_store_bound()));
         let offset = catalog_event(
             "offset",
-            CatalogEvent::Offset { pos: pos(0, "tail"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(0, "tail"), highwater: None, groups: Default::default(), subq_state: None },
         );
         let mut mismatch = expected_store_bound();
         mismatch.query_generation = "other-query".into();
@@ -3578,7 +3862,12 @@ mod tests {
                 .chain([
                     CatalogEvent::GroupCreated { group: group(1, "s1", "member-1") },
                     CatalogEvent::GroupCreated { group: group(2, "s2", "member-2") },
-                    CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x20, 1)), groups: behind },
+                    CatalogEvent::Offset {
+                        pos: pos(0, "10"),
+                        highwater: Some((0x20, 1)),
+                        groups: behind,
+                        subq_state: None,
+                    },
                 ])
                 .collect(),
         );
@@ -3659,8 +3948,12 @@ mod tests {
     /// engine to create a slot from nothing (ADR-0004).
     #[test]
     fn a_catalog_without_a_binding_folds_to_no_epoch() {
-        let fold =
-            fold_of(vec![CatalogEvent::Offset { pos: pos(0, "42"), highwater: None, groups: Default::default() }]);
+        let fold = fold_of(vec![CatalogEvent::Offset {
+            pos: pos(0, "42"),
+            highwater: None,
+            groups: Default::default(),
+            subq_state: None,
+        }]);
         assert!(fold.binding.is_none());
         assert_eq!(fold.start_pos, pos(0, "42"));
         // Nothing at all folds to the empty catalog, which the restore skips outright.
@@ -3780,8 +4073,18 @@ mod tests {
     #[test]
     fn the_dedup_highwater_is_restored_with_the_checkpoint_it_was_taken_at() {
         let fold = fold_of(vec![
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x10, 3)), groups: Default::default() },
-            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)), groups: Default::default() },
+            CatalogEvent::Offset {
+                pos: pos(0, "10"),
+                highwater: Some((0x10, 3)),
+                groups: Default::default(),
+                subq_state: None,
+            },
+            CatalogEvent::Offset {
+                pos: pos(0, "20"),
+                highwater: Some((0x20, 7)),
+                groups: Default::default(),
+                subq_state: None,
+            },
         ]);
         assert_eq!(fold.start_pos, pos(0, "20"));
         assert_eq!(fold.start_highwater, Some((0x20, 7)), "the last checkpoint's highwater, not the first");
@@ -3789,8 +4092,13 @@ mod tests {
         // A checkpoint taken before anything was applied carries none, and CLEARS an older one:
         // last-writer-wins for the pair, never a mix of a new position and a stale highwater.
         let fold = fold_of(vec![
-            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x20, 7)), groups: Default::default() },
-            CatalogEvent::Offset { pos: pos(1, "0"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset {
+                pos: pos(0, "20"),
+                highwater: Some((0x20, 7)),
+                groups: Default::default(),
+                subq_state: None,
+            },
+            CatalogEvent::Offset { pos: pos(1, "0"), highwater: None, groups: Default::default(), subq_state: None },
         ]);
         assert_eq!(fold.start_pos, pos(1, "0"));
         assert_eq!(fold.start_highwater, None);
@@ -3810,11 +4118,22 @@ mod tests {
             pos: pos(0, "10"),
             highwater: Some((0x20, 1)),
             groups: behind.clone(),
+            subq_state: None,
         }]);
         assert_eq!(fold.group_resume, behind);
         let fold = fold_of(vec![
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: Some((0x20, 1)), groups: behind.clone() },
-            CatalogEvent::Offset { pos: pos(0, "20"), highwater: Some((0x30, 1)), groups: Default::default() },
+            CatalogEvent::Offset {
+                pos: pos(0, "10"),
+                highwater: Some((0x20, 1)),
+                groups: behind.clone(),
+                subq_state: None,
+            },
+            CatalogEvent::Offset {
+                pos: pos(0, "20"),
+                highwater: Some((0x30, 1)),
+                groups: Default::default(),
+                subq_state: None,
+            },
         ]);
         assert!(fold.group_resume.is_empty(), "a later checkpoint that passed no behind group clears it");
 
@@ -3822,6 +4141,7 @@ mod tests {
             pos: pos(0, "10"),
             highwater: Some((0x20, 1)),
             groups: behind.clone(),
+            subq_state: None,
         })
         .unwrap();
         assert_eq!(json["groups"], serde_json::json!({ "shape/group-3": 0x18 }));
@@ -3829,6 +4149,7 @@ mod tests {
             pos: pos(0, "10"),
             highwater: None,
             groups: Default::default(),
+            subq_state: None,
         })
         .unwrap();
         assert!(bare.get("groups").is_none(), "an empty set must keep the old wire form");
@@ -3846,6 +4167,7 @@ mod tests {
             pos: pos(2, "9"),
             highwater: None,
             groups: Default::default(),
+            subq_state: None,
         })
         .unwrap();
         assert_eq!(bare.get("highwater"), None, "{bare}");
@@ -3853,6 +4175,7 @@ mod tests {
             pos: pos(2, "9"),
             highwater: Some((5, 6)),
             groups: Default::default(),
+            subq_state: None,
         })
         .unwrap();
         assert_eq!(with["highwater"], serde_json::json!([5, 6]));
@@ -3872,7 +4195,7 @@ mod tests {
     fn rotations_fold_to_the_current_segment_and_every_segments_start() {
         let fold = fold_of(vec![
             CatalogEvent::ChangesRotated { segment: 0, at: 100 },
-            CatalogEvent::Offset { pos: pos(0, "9"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(0, "9"), highwater: None, groups: Default::default(), subq_state: None },
             CatalogEvent::ChangesRotated { segment: 1, at: 200 },
             CatalogEvent::ChangesRotated { segment: 2, at: 300 },
         ]);
@@ -3945,7 +4268,7 @@ mod tests {
         let fold = fold_of(vec![
             created,
             CatalogEvent::Dormant { id: "s1".to_string(), resume: pos(3, "77"), gate },
-            CatalogEvent::Offset { pos: pos(4, "12"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(4, "12"), highwater: None, groups: Default::default(), subq_state: None },
         ]);
         assert_eq!(fold.start_pos, pos(4, "12"));
         assert_eq!(fold.recs.get("s1").and_then(|r| r.3.as_ref()).map(|(p, _)| p.clone()), Some(pos(3, "77")));
@@ -3955,6 +4278,7 @@ mod tests {
             pos: pos(4, "12"),
             highwater: None,
             groups: Default::default(),
+            subq_state: None,
         })
         .unwrap();
         assert_eq!(json["t"], "offset");
@@ -3991,6 +4315,7 @@ mod tests {
             pos: pos(2, "9"),
             highwater: None,
             groups: Default::default(),
+            subq_state: None,
         })
         .unwrap();
         assert!(predates_segmentation(&now).is_none());
@@ -4228,7 +4553,7 @@ mod tests {
         let created = serde_json::from_value::<CatalogEvent>(created_event("public.users")).unwrap();
         let fold = fold_of(vec![
             created,
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default(), subq_state: None },
         ]);
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
         engine.restore_reads_paused.store(true, std::sync::atomic::Ordering::Release);
@@ -4391,7 +4716,7 @@ mod tests {
                 resume: pos(0, "5"),
                 gate: crate::pg::SnapshotGate::passthrough(),
             },
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default(), subq_state: None },
         ]);
         let server = FakeDs::start().await;
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(server.url()));
@@ -4446,7 +4771,12 @@ mod tests {
                 .into_iter()
                 .chain(dormant("s2", "shape/s2", "public.accounts"))
                 .chain(dormant("s3", "shape/s3", "public.events"))
-                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() }])
+                .chain([CatalogEvent::Offset {
+                    pos: pos(0, "10"),
+                    highwater: None,
+                    groups: Default::default(),
+                    subq_state: None,
+                }])
                 .collect(),
         );
         let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(missing_server.url()));
@@ -4497,7 +4827,12 @@ mod tests {
                 .into_iter()
                 .chain(dormant("s2", "public.accounts"))
                 .chain(dormant("s3", "public.events"))
-                .chain([CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() }])
+                .chain([CatalogEvent::Offset {
+                    pos: pos(0, "10"),
+                    highwater: None,
+                    groups: Default::default(),
+                    subq_state: None,
+                }])
                 .collect(),
         );
         let closed_engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test(closed_server.url()));
@@ -4628,7 +4963,7 @@ mod tests {
                 resume: pos(0, "5"),
                 gate: crate::pg::SnapshotGate::passthrough(),
             },
-            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default() },
+            CatalogEvent::Offset { pos: pos(0, "10"), highwater: None, groups: Default::default(), subq_state: None },
         ]);
         let (store, _reads) = boot_race_store();
         let engine = Engine::new_for_in_process_test(DsClient::with_test_store("scripted://dead-reader".into(), store));

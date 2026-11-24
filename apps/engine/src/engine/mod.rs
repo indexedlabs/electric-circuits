@@ -1106,7 +1106,10 @@ fn spawn_flip_propagator(
 ) {
     let workers: usize =
         std::env::var("ELECTRIC_CIRCUITS_FLIP_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
-    shutdown.clone().spawn_background(async move {
+    // Draining, not background (dispatcher and workers alike): a flip already handed over when a
+    // shutdown begins is walked to the end of the drain window. Its effects are otherwise lost for
+    // good — the inner set has moved — and the registry could not be written for the next boot.
+    shutdown.clone().spawn_draining(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(workers));
         while let Some(fw) = rx.recv().await {
             let permit = sem.clone().acquire_owned().await.expect("flip semaphore");
@@ -1115,7 +1118,7 @@ fn spawn_flip_propagator(
             let degrade = degrade.clone();
             let trace_tx = trace_tx.clone();
             let group_lanes = group_lanes.clone();
-            shutdown.spawn_background(async move {
+            shutdown.spawn_draining(async move {
                 let commit_lsn = fw.commit_lsn();
                 let group_paths = fw.group_paths().to_vec();
                 // Both arms report `(error, items the batch never got through)`; a deferred batch
@@ -1788,6 +1791,11 @@ impl Engine {
         let source_id = restart_notify.as_ref().map(|_| metrics.stack_id.clone());
         let telemetry = crate::mem::init_otel(metrics.clone(), memory_gauges.clone(), source_id.as_deref());
         let shutdown = crate::shutdown::ShutdownToken::with_metrics(restart_notify, metrics.clone());
+        // A configured engine lets deferred subquery work finish after a signal (see
+        // `shutdown`'s drain window); without a config everything stops at the signal, as before.
+        if let Some(config) = config {
+            shutdown.set_drain_budget(config.shutdown_subquery_drain);
+        }
         let ds = ds.with_shutdown(shutdown.clone());
         let pg_pool = pg_url.as_ref().map(|url| {
             crate::pg::Pool::owned(
@@ -2011,6 +2019,13 @@ impl Engine {
             tracing::warn!(parties = ?self.shutdown.outstanding(), "Engine close exceeded graceful drain");
             ShutdownOutcome::Forced
         };
+        // The sequencer has written its last checkpoint (or the grace ran out): nothing a flip
+        // worker or an emission lane still holds can change what the next boot restores. Close the
+        // drain window and let them stop before the membership circuit is shut down under them.
+        self.shutdown.end_drain();
+        if !self.shutdown.wait_for_drained(std::time::Duration::from_secs(1).min(remaining())).await {
+            tracing::warn!("Engine close: deferred subquery work was still running when its drain window closed");
+        }
         // Handles are volatile; durable subscriptions lapse by lease after restart.
         crate::electric::close_handles(self);
         if !self.drain_catalog(remaining().min(crate::shutdown::CATALOG_DRAIN)).await
@@ -2586,10 +2601,10 @@ impl Engine {
     /// Delete every registered subquery shape's durable stream. Clients read durable-streams
     /// directly, past the HTTP surface that now answers 503, so a deleted stream is the only way
     /// they learn their shape is no longer maintained. The shape RECORDS stay registered (the
-    /// engine answers 503, not 404). This destroys nothing a restart would have kept: a restart
-    /// re-seeds every node from Postgres but DROPS every subquery shape — their inner-node state
-    /// is not persisted, so the catalog restore deliberately does not restore them (see
-    /// `Engine::apply_catalog`) — and clients recreate them with `POST /shapes`.
+    /// engine answers 503, not 404). This destroys nothing a restart would have kept: a degraded
+    /// engine never writes its subquery registry on the way out (`sequencer_loop`'s final
+    /// checkpoint), so the catalog restore DROPS every subquery shape (see `Engine::apply_catalog`)
+    /// — and clients recreate them with `POST /shapes`.
     async fn reap_subquery_streams(&self) {
         let paths: Vec<String> = {
             let st = self.state.lock().await;
@@ -2975,6 +2990,12 @@ impl Engine {
             let mut st = self.state.lock().await;
             self.ensure_sequencer(&mut st);
         }
+        // The sequencer now runs from the cursor the restore installed, whether the restore spawned
+        // it or the line above did (an empty catalog, an epoch reset). Tell it so: a cursor the
+        // restore vouches for is a valid checkpoint before the first read completes, which is what
+        // lets an engine that stops while idle still write its subquery registry for the next
+        // boot (`sequencer_loop`'s final checkpoint).
+        self.release_restore_reads().await.context("vouching for the sequencer's start position")?;
         // Spawn the ingestor at most once, even if setup_postgres is called again.
         if self.replicator_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
             tracing::warn!("setup_postgres called again; ingestor already running, not spawning another");

@@ -762,6 +762,24 @@ pub(crate) fn init_otel(
         catalog_restore_retired,
         ""
     );
+    engine_counter!(
+        "engine_subquery_shapes_restored",
+        "Subquery shapes restored at boot from the registry state the last graceful stop wrote",
+        subquery_shapes_restored,
+        ""
+    );
+    engine_counter!(
+        "engine_subquery_shapes_dropped_at_restore",
+        "Subquery shapes dropped at boot because no usable registry state vouched for them",
+        subquery_shapes_dropped_at_restore,
+        ""
+    );
+    engine_gauge!(
+        "engine_subquery_state",
+        "Size of the subquery registry state this boot restored from (zero when it restored none)",
+        subquery_state_bytes,
+        "By"
+    );
     engine_gauge!(
         "engine_catalog",
         "Response-body bytes read by the latest successful catalog fold, excluding admission reads",

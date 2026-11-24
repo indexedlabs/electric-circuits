@@ -752,6 +752,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
     child.control_secret = base.control_secret.clone();
     child.shutdown_grace = base.shutdown_grace;
     child.shutdown_ready_drain = base.shutdown_ready_drain;
+    child.shutdown_subquery_drain = base.shutdown_subquery_drain;
     child.storage_dir = Some(source_root.to_string_lossy().into_owned());
     child.stack_id = row.source_id.clone();
     Ok(child)

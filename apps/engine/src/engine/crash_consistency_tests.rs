@@ -510,6 +510,7 @@ async fn crashsim_catalog_503_at_every_append_retries_without_reordering() {
                     pos: pos.clone(),
                     highwater: *highwater,
                     groups: Default::default(),
+                    subq_state: None,
                 });
             }
             bounded("catalog retry drain", run.engine.catalog_tx.wait_durable()).await.unwrap();
@@ -950,7 +951,12 @@ async fn closed_tail_snapshot() -> (Arc<ScriptedStore>, Arc<std::sync::Mutex<Ora
     assert_ne!(tail.offset, "-1", "checkpoint must be beyond the rotation pointer");
     seed.engine
         .catalog_tx
-        .send_durable(CatalogEvent::Offset { pos: tail.clone(), highwater: None, groups: Default::default() })
+        .send_durable(CatalogEvent::Offset {
+            pos: tail.clone(),
+            highwater: None,
+            groups: Default::default(),
+            subq_state: None,
+        })
         .await
         .unwrap();
     assert!(seed.engine.ds.head("changes/2").await.unwrap().is_some());

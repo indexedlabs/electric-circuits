@@ -126,6 +126,7 @@ transaction holding the table, or to set `REPLICA IDENTITY FULL` in the migratio
 | `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
 | `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
+| `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` | no | `5` | How long deferred subquery work may keep running after `SIGTERM`, so the subquery registry can be written and subquery shapes survive the restart. Comes out of the grace, must be less than it (unset: 5 s or a fifth of the grace, whichever is shorter); `0` = abandon it at the signal. |
 | `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` | no | `2` | How long the port stays open after `SIGTERM` answering `/ready` with 503, so a load balancer drains first. Comes out of the grace, must be less than it; `0` = stop accepting at once. |
 
 ¹ Omit `ELECTRIC_CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
@@ -359,7 +360,12 @@ perform the idempotent exact-generation promotion.
   re-delivered on the next boot and de-duplicated there. New `live=true` requests arriving during
   the drain are answered `503` + `Retry-After: 1` so clients back off to the successor instead of
   spinning. Shape streams are **never** closed or deleted on
-  shutdown — the restored shape continues its stream, so a restart costs clients nothing. The whole
+  shutdown — the restored shape continues its stream, so a restart costs clients nothing. That
+  includes subquery shapes: flip query-backs and lane appends already in flight get
+  `ELECTRIC_CIRCUITS_SHUTDOWN_SUBQUERY_DRAIN_SECS` (5 s) to land, and the engine then writes its
+  subquery registry to `meta/subq-state/*` and names it from the final checkpoint, which the next
+  boot restores. A crash writes nothing: subquery shapes are then dropped at boot and their clients
+  reload (`subquery_shapes_dropped_at_restore_total`). The whole
   sequence is bounded by `ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS` (25 s); a second signal, or the
   grace running out, exits `70` immediately (nothing is corrupted: an unacknowledged commit is
   re-delivered and the previous checkpoint stands). Keep `terminationGracePeriodSeconds` above the
