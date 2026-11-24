@@ -34,6 +34,7 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 | `conformance-subquery-positions.test.ts` | every live envelope of a subquery shape, a changes-only feed and a group stream carries `headers.lsn` + `txid`, positions never fall along a stream, and a flip's verdict that follows a newer live change still reaches the real client |
 | `conformance-group-evaluation-order.test.ts` | a group stream (`/v1/subsets/load`) carries each key's envelopes in evaluation order: a nested flip's verdict that follows a newer live change to the same key is the stream's last word, and a verdict about other keys still lands in commit order |
 | `conformance-subset-feed-removals.test.ts` | a subset feed removes rows the client holds only from the snapshot: soft-deleted, moved out of the window, deleted, or hidden through the inner table |
+| `conformance-sql-or-union.test.ts` | the SQL writer's `OR` rewrites (same-column `IN` siblings as one `UNION ALL`; an `OR` on the key gathered into the key's union) select exactly the rows of the rewrite-free SQL: generated predicates with nested `OR`s, subqueries on other tables, `NOT IN`, `NOT`, NULL cells and projections, through the subset query and a subquery shape's backfill |
 | `conformance-expressiveness`, `-transitions` | full predicate grammar, rows entering/leaving shapes |
 | `conformance-fuzz`, `-fuzz-wide`, `-counterexample` | random-predicate fuzz vs the oracle + pinned counterexample replays |
 | `harness-mechanics.test.ts` | the harness itself (boot, teardown, engine discovery) |
