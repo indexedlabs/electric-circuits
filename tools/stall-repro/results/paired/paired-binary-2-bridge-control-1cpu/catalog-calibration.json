@@ -1,0 +1,175 @@
+{
+  "target": {
+    "shapes": 10571,
+    "standalone": 6251,
+    "family_shapes": 33,
+    "families": 1,
+    "subquery_shapes": 4287,
+    "subquery_nodes": 1382,
+    "subquery_edges": 25219,
+    "subquery_contributors": 235310,
+    "subquery_distinct_values": 235292,
+    "subquery_feed_entries": 16388,
+    "tailers": 37,
+    "tables": 44
+  },
+  "actual": {
+    "cardinalities": {
+      "bytes_circuit_integral": 12296320,
+      "bytes_circuit_snapshots": 11029728,
+      "bytes_electric_adapter": 0,
+      "bytes_executors": 2840775,
+      "bytes_feed_sets": 71308,
+      "bytes_membership_circuit": 23326048,
+      "bytes_pk_dict": 2037832,
+      "bytes_retention": 2717382,
+      "bytes_shape_records": 101385374,
+      "bytes_subquery_registry": 425825691,
+      "families": 0,
+      "family_shapes": 0,
+      "shapes": 10571,
+      "shapes_dormant": 0,
+      "standalone": 6284,
+      "subquery_contributors": 237341,
+      "subquery_distinct_values": 237341,
+      "subquery_edges": 26367,
+      "subquery_feed_entries": 13656,
+      "subquery_nodes": 1406,
+      "subquery_shapes": 4287,
+      "tables": 44,
+      "tailers": 12
+    },
+    "process": {
+      "allocator_allocated_bytes": 888664712,
+      "allocator_config": {
+        "background_thread": true,
+        "dirty_decay_ms": 1000,
+        "muzzy_decay_ms": 1000
+      },
+      "allocator_resident_bytes": 964268032,
+      "allocator_retained_bytes": 163930112,
+      "rss_bytes": 1003532288,
+      "rss_mib": 957,
+      "virtual_bytes": 1708007424
+    },
+    "samples": 188,
+    "stall_profile": {
+      "active_flip_batches": 0,
+      "categories": {
+        "flip_batch": {
+          "calls": 0,
+          "gt_5s": 0,
+          "le_100ms": 0,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.0,
+          "wall_seconds": 0.0
+        },
+        "flip_one": {
+          "calls": 0,
+          "gt_5s": 0,
+          "le_100ms": 0,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.0,
+          "wall_seconds": 0.0
+        },
+        "flip_registry_hold": {
+          "calls": 0,
+          "gt_5s": 0,
+          "le_100ms": 0,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.0,
+          "wall_seconds": 0.0
+        },
+        "flip_registry_wait": {
+          "calls": 0,
+          "gt_5s": 0,
+          "le_100ms": 0,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.0,
+          "wall_seconds": 0.0
+        },
+        "marker_wait": {
+          "calls": 1,
+          "gt_5s": 0,
+          "le_100ms": 0,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 1,
+          "max_seconds_since_boot": 2.069449396,
+          "wall_seconds": 2.069449396
+        },
+        "membership": {
+          "calls": 361,
+          "gt_5s": 0,
+          "le_100ms": 361,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.064445604,
+          "wall_seconds": 21.09508115
+        },
+        "sampler_registry_hold": {
+          "calls": 207,
+          "gt_5s": 0,
+          "le_100ms": 101,
+          "le_10ms": 4,
+          "le_1ms": 102,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.061549335,
+          "wall_seconds": 4.422046585
+        },
+        "sampler_registry_wait": {
+          "calls": 207,
+          "gt_5s": 0,
+          "le_100ms": 40,
+          "le_10ms": 3,
+          "le_1ms": 164,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.094568084,
+          "wall_seconds": 2.025317641
+        },
+        "sequencer_registry_hold": {
+          "calls": 361,
+          "gt_5s": 0,
+          "le_100ms": 361,
+          "le_10ms": 0,
+          "le_1ms": 0,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.064450611,
+          "wall_seconds": 21.096484827
+        },
+        "sequencer_registry_wait": {
+          "calls": 361,
+          "gt_5s": 0,
+          "le_100ms": 38,
+          "le_10ms": 0,
+          "le_1ms": 323,
+          "le_1s": 0,
+          "le_5s": 0,
+          "max_seconds_since_boot": 0.092476358,
+          "wall_seconds": 1.881552316
+        }
+      },
+      "peak_flip_batches": 0
+    }
+  },
+  "source_shape_requests": 10563,
+  "smoke_only": false
+}

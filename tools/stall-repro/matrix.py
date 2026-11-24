@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 WORKLOADS = ("import", "large-delete", "small-delete")
@@ -24,6 +25,18 @@ def cell(probe):
     return "—" if value is None else f"{value * 100:.0f}% ({probe['successes']}/{probe['attempts']}); p95 {'—' if p95 is None else f'{p95:.2f}'}"
 
 
+def runner_cpu(folder):
+    machine = folder / "machine.txt"
+    if not machine.exists():
+        return "?"
+    for line in machine.read_text().splitlines():
+        if line.startswith("Model name:"):
+            model = line.split(":", 1)[1].strip()
+            match = re.search(r"(EPYC \w+)|Xeon\(R\) (?:Platinum )?(\w+(?:-\w+)?)", model, re.IGNORECASE)
+            return ("" if not match else match.group(1) or f"Xeon {match.group(2)}") or model
+    return "?"
+
+
 def load(folder):
     rows = {}
     for workload in WORKLOADS:
@@ -35,21 +48,22 @@ def load(folder):
 
 def render(folders, control):
     baseline = load(control)
-    print("| Variant | Workload | First delivery → empty s | × A control | CPU % | Backfills | Drain | Subset | Live change | Served? |")
-    print("| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |")
+    print("| Variant | Runner CPU | Workload | First delivery → empty s | × A control | CPU % | Backfills | Drain | Subset | Live change | Served? |")
+    print("| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |")
     for folder in folders:
         manifest = json.loads((folder / "manifest.json").read_text())
+        cpu = runner_cpu(folder)
         label = manifest["variant"] + ("" if manifest["cpu_quota"] == 1 else f", {manifest['cpu_quota']:g} CPU")
         for workload, result in load(folder).items():
             if not result.get("completed"):
-                print(f"| {label} | {workload} | did not complete: {result.get('error', '?')[:80]} | | | | | | | |")
+                print(f"| {label} | {cpu} | {workload} | did not complete: {result.get('error', '?')[:80]} | | | | | | | |")
                 continue
             elapsed = result.get("first_read_to_empty_s") or result["elapsed_s"]
             control_elapsed = baseline.get(workload, {}).get("first_read_to_empty_s")
             ratio = f"{elapsed / control_elapsed:.2f}" if control_elapsed else "—"
             probes = result["probe"]
             served = all((rate(probes[kind]) or 0) >= SERVED_RATE for kind in ("drain", "subset", "live"))
-            print(f"| {label} | {workload} | {elapsed:,.1f} | {ratio} | {result['engine_cpu_percent']:.0f} | {result['backfills']:,} | {cell(probes['drain'])} | {cell(probes['subset'])} | {cell(probes['live'])} | {'**yes**' if served else 'no'} |")
+            print(f"| {label} | {cpu} | {workload} | {elapsed:,.1f} | {ratio} | {result['engine_cpu_percent']:.0f} | {result['backfills']:,} | {cell(probes['drain'])} | {cell(probes['subset'])} | {cell(probes['live'])} | {'**yes**' if served else 'no'} |")
 
 
 def holds(folders):

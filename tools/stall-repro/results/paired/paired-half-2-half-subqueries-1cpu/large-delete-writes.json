@@ -1,0 +1,97 @@
+[
+  {
+    "table": "message",
+    "operation": "delete",
+    "rows": 22300
+  },
+  {
+    "table": "activity",
+    "operation": "delete",
+    "rows": 3000
+  },
+  {
+    "table": "graph_edge",
+    "operation": "delete",
+    "rows": 250
+  },
+  {
+    "table": "assignment",
+    "operation": "delete",
+    "rows": 500
+  },
+  {
+    "table": "record_recurrence",
+    "operation": "delete",
+    "rows": 500
+  },
+  {
+    "table": "record_date_index",
+    "operation": "delete",
+    "rows": 800
+  },
+  {
+    "table": "record_completed_index",
+    "operation": "delete",
+    "rows": 10
+  },
+  {
+    "table": "record_assignee_index",
+    "operation": "delete",
+    "rows": 13
+  },
+  {
+    "table": "resource_fact",
+    "operation": "delete",
+    "rows": 150
+  },
+  {
+    "table": "workflow",
+    "operation": "delete",
+    "rows": 50
+  },
+  {
+    "table": "calendar_event",
+    "operation": "delete",
+    "rows": 1100
+  },
+  {
+    "table": "record",
+    "operation": "delete",
+    "rows": 1000
+  },
+  {
+    "table": "calendar",
+    "operation": "delete",
+    "rows": 15
+  },
+  {
+    "table": "resource",
+    "operation": "delete",
+    "rows": 100
+  },
+  {
+    "table": "space_member",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "standing_grant",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "space",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "external_account",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "user",
+    "operation": "delete",
+    "rows": 1
+  }
+]
