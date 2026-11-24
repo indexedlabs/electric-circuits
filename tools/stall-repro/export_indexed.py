@@ -41,9 +41,11 @@ def export(root: Path, destination: Path) -> None:
             elif isinstance(statement, ast.Import):
                 for alias in statement.names:
                     imports[alias.asname or alias.name.split(".")[0]] = [alias.name if alias.asname else alias.name.split(".")[0], None]
-            elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Assign, ast.AnnAssign)):
+            elif isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Assign, ast.AnnAssign, ast.TypeAlias)):
                 if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                     names = [statement.name]
+                elif isinstance(statement, ast.TypeAlias):
+                    names = [statement.name.id]
                 else:
                     targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
                     names = [target.id for target in targets if isinstance(target, ast.Name)]
@@ -54,7 +56,7 @@ def export(root: Path, destination: Path) -> None:
                             table = ast.literal_eval(member.value)
                     if table:
                         table_classes[table] = [module, statement.name]
-                        statement.body = [member for member in statement.body if isinstance(member, (ast.Assign, ast.AnnAssign))]
+                        statement.body = [member for member in statement.body if isinstance(member, (ast.Assign, ast.AnnAssign)) and not (isinstance(member.value, ast.Call) and ast.unparse(member.value.func) == "relationship")]
                 statement = StripDocumentation().visit(statement)
                 if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     statement.decorator_list = [decorator for decorator in statement.decorator_list if not ast.unparse(decorator).startswith("logfire.")]

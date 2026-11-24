@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from uuid import UUID, uuid5
 
-from sqlalchemy.schema import CreateIndex, CreateTable
+from sqlalchemy.schema import AddConstraint, CreateIndex, CreateTable
 from sqlalchemy.dialects import postgresql
 
 from source_loader import SourceLoader
@@ -39,9 +39,11 @@ async def export() -> None:
     ddl = []
     columns = {}
     for name, table in sorted(schemas.items()):
-        ddl.append(str(CreateTable(table).compile(dialect=dialect)))
+        ddl.append(str(CreateTable(table, include_foreign_key_constraints=[]).compile(dialect=dialect)))
         ddl.extend(str(CreateIndex(index).compile(dialect=dialect)) for index in table.indexes)
         columns[name] = [{"name": column.name, "type": str(column.type.compile(dialect=dialect)), "nullable": column.nullable, "primary_key": column.primary_key, "server_default": str(column.server_default.arg) if column.server_default else None} for column in table.columns]
+    for table in schemas.values():
+        ddl.extend(str(AddConstraint(constraint).compile(dialect=dialect)) for constraint in table.foreign_key_constraints)
     (output / "schema.sql").write_text(";\n".join(ddl) + ";\n")
     (output / "columns.json").write_text(json.dumps(columns, indent=2))
     samples = []

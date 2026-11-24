@@ -26,6 +26,7 @@ jobs:
           name: stall-fixture-${{ github.sha }}
           path: tools/stall-repro/results/fixture/
   build:
+    if: contains(github.event.head_commit.message, '[engine]') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
