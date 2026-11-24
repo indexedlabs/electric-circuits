@@ -22,7 +22,9 @@ jobs:
     concurrency:
       group: dbsp-benchmark-${{ github.event.pull_request.number || inputs.head }}
       cancel-in-progress: false
-    runs-on: ubuntu-latest
+    # A fork pull request keeps a GitHub-hosted runner: its code never runs on
+    # a Mighty runner.
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-latest' || fromJSON('["self-hosted","mighty-ci-8x32"]') }}
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
@@ -75,4 +77,4 @@ jobs:
           # upload-artifact v4 skips dot-paths unless asked, and the results live under .bench-artifacts.
           include-hidden-files: true
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
