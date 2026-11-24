@@ -51,7 +51,7 @@ async def export() -> None:
     for name, table in sorted(schemas.items()):
         ddl.append(str(CreateTable(table, include_foreign_key_constraints=[]).compile(dialect=dialect)))
         ddl.extend(str(CreateIndex(index).compile(dialect=dialect)) for index in table.indexes)
-        columns[name] = [{"name": column.name, "type": str(column.type.compile(dialect=dialect)), "nullable": column.nullable, "primary_key": column.primary_key, "server_default": str(column.server_default.arg) if column.server_default else None} for column in table.columns]
+        columns[name] = [{"name": column.name, "type": str(column.type.compile(dialect=dialect)), "nullable": column.nullable, "primary_key": column.primary_key, "server_default": str(getattr(column.server_default, "arg", column.server_default)) if column.server_default else None, "enum": [member.value for member in column.type.enum_class] if hasattr(column.type, "enum_class") else None, "foreign_keys": [foreign_key.target_fullname for foreign_key in column.foreign_keys]} for column in table.columns]
     for table in schemas.values():
         ddl.extend(str(AddConstraint(constraint).compile(dialect=dialect)) for constraint in table.foreign_key_constraints)
     (output / "schema.sql").write_text(";\n".join(ddl) + ";\n")
