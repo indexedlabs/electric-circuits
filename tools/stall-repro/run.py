@@ -190,6 +190,10 @@ async def run(args):
             memory.raise_for_status()
             save(output / "catalog-before-warmup.json", memory.json())
             print(json.dumps({"before_warmup": memory.json()["cardinalities"]}), flush=True)
+            for endpoint in ("graph", "state"):
+                response = await client.get(f"{ENGINE_URL}/{endpoint}")
+                response.raise_for_status()
+                save(output / f"catalog-{endpoint}.json", response.json())
             validator = gateway.gateway._is_drained_receipt
             fence_user = row_id("user", 1)
             fence_generation = gateway.authority(1).generation
@@ -197,7 +201,7 @@ async def run(args):
             def warm():
                 with psycopg.connect(PG_URL) as connection:
                     for account in range(19):
-                        data.update(connection, "record", account, 1 if args.smoke else 5 if args.catalog == "nov23" else 12)
+                        data.update(connection, "record", account, 1 if args.smoke else 9 if args.catalog == "nov23" else 19)
                     marker(connection, fence_user, fence_generation, warm_marker)
             await asyncio.to_thread(warm)
             await wait_for_marker(client, validator, warm_marker, fence_user, fence_generation, 900)

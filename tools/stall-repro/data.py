@@ -17,7 +17,7 @@ LARGE_ACCOUNT = 18
 IMPORT_ACCOUNT = 19
 IMPORT_TRANSACTIONS = [2086, 2134, 2160, 2101, 2139, 2461]
 LARGE_ROWS = {"message": 22300, "activity": 3000, "calendar_event": 1100, "record": 1000, "record_date_index": 800, "record_recurrence": 500, "assignment": 500, "graph_edge": 250, "resource": 100, "resource_fact": 150, "workflow": 50, "calendar": 15, "space": 1, "user": 1, "external_account": 1, "space_member": 1, "standing_grant": 1, "record_completed_index": 10, "record_assignee_index": 13}
-BACKGROUND_ROWS = {"user": 1, "space": 1, "space_member": 1, "external_account": 1, "calendar": 15, "standing_grant": 1, "record": 1000, "record_date_index": 1000, "record_recurrence": 300, "assignment": 300, "graph_edge": 250, "resource": 200, "resource_fact": 100, "calendar_event": 200}
+BACKGROUND_ROWS = {"user": 1, "space": 1, "space_member": 1, "external_account": 1, "calendar": 15, "standing_grant": 1, "record": 500, "record_date_index": 500, "record_recurrence": 150, "assignment": 150, "graph_edge": 125, "resource": 100, "resource_fact": 50, "calendar_event": 100}
 DELETE_ORDER = ["message", "activity", "graph_edge", "assignment", "record_recurrence", "record_date_index", "record_completed_index", "record_assignee_index", "resource_fact", "workflow", "calendar_event", "record", "calendar", "resource", "space_member", "standing_grant", "space", "external_account", "user"]
 
 

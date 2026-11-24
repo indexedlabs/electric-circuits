@@ -93,9 +93,9 @@ class GatewayShapes:
 
     async def generate(self, day="nov24", scale=1, windows=None):
         target = TARGETS[day]
-        windows = windows or (28 if day == "nov23" else 56)
+        windows = windows or (14 if day == "nov23" else 36)
         requests = []
-        table_counts = apportion(round(target["subquery_shapes"] * scale), SUBQUERY_TABLE_WEIGHTS)
+        table_counts = apportion(max(0, round(target["subquery_shapes"] * scale) - 8), SUBQUERY_TABLE_WEIGHTS)
         account_weights = dict(enumerate(ACCOUNT_WEIGHTS))
         for table, count in table_counts.items():
             for account, account_count in apportion(count, account_weights).items():
@@ -109,11 +109,16 @@ class GatewayShapes:
             body = await self.body(table, 0, plain=True, chat=table == "suggestion")
             if not contains_subquery(body["where"]):
                 plain_weights[table] = weight
-        for table, count in apportion(target["standalone"] + target["family_shapes"], plain_weights).items():
+        for table, count in apportion(target["standalone"], plain_weights).items():
             for ordinal in range(count):
                 account = ordinal % len(ACCOUNT_WEIGHTS)
                 body = await self.body(table, account, {"col": "id", "op": "neq", "value": str(synthetic_id(f"plain-shape/{table}/{ordinal}"))}, identity=f"plain-{table}-{ordinal}", plain=True, chat=table == "suggestion")
                 requests.append({"kind": "plain-target", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])})
+        for ordinal in range(target["family_shapes"]):
+            account = ordinal % len(ACCOUNT_WEIGHTS)
+            scope = {"col": "id", "op": "eq", "value": str(synthetic_id(f"calendar/{account}/{ordinal // len(ACCOUNT_WEIGHTS)}"))}
+            body = await self.body("calendar", account, scope, identity=f"family-{ordinal}", plain=True)
+            requests.append({"kind": "family-target", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])})
         return requests
 
 
