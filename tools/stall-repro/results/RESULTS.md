@@ -1,3 +1,4 @@
+B-cold (amended, `variant-b-cold.md`) FAILS its pass line. Import 10.1 s, drains 20% and live changes 0% during it. Large and small deletions take 5.2 and 5.3 s with drains and live changes at 50-60%. The share deletion takes 10.1 s with drains at 20%. B on the same runner passes (2.5, 1.2 and 0.2 s, all probes 100%). Every import backfill is `graph_edge`, from the edge branches kept on today's filter. E-only (edges keyed on today's model) still stalls: 273 s, 0.51x. E+R takes 9.8 s on the import (0.02x) but is not served (drains 20%).
 Today vs yesterday (Nov 24, same runner): prod's engine today (`b42f70d`, 2 vCPU) stalls as long as yesterday's (`5b2cf3e`, 1 vCPU). Import 547 s against 532 s (1.03x), large deletion 153 s against 159 s (0.96x), small deletion 265 s against 253 s (1.04x). The other account's drains and live changes are 0% on both; only subsets improve (100% against 58-84%). Bisect: PR 70 (`e10c4bd`) carries the slowdown since `1be10fb`, 1.29x on the import and 3.8x on the large deletion; PRs 71, 72 and 69 change nothing.
 M4: Today the time goes to per-row membership evaluation (about 19 to 23 ms per changed row, 69% of CPU), serialized on one registry mutex. The other account starves because its drain and live change wait behind the workload in the single change log. No engine-side bridge keeps that account served (drain and live success at most 22% in every A variant, including 2 CPUs). The audience-key model removes the stall only if graph edges are keyed as well: B-retained takes 132 s with drains at 0 to 1%, against 3.9 s with graph edges keyed. Build that first. Prod's second vCPU does not help this path (0.96x), and the estimate is that prod is safe tonight but exposed to hour-scale outages from Nov 26 to 28, depending on regrowth.
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
@@ -786,3 +787,73 @@ runner (6975P-C for the 286 s run, 8573C for the 531 s run). On one runner the i
 PR 70 is "Remove rows a changes-only feed's client holds only from its snapshot". A profile of the
 large deletion on `1be10fb` and `e10c4bd` is running (`[paired-3]`, `pr70-profile`) to name the
 function that got more expensive.
+
+### B-cold, amended: fails the pass line
+
+Spec and harness reading: `tools/stall-repro/variant-b-cold.md`. B-cold had not started when the
+amendment arrived, so only the amended version ran. Job `b-cold`: B, then B-cold, on one EPYC
+9V74, production binary `5b2cf3e`, 1 CPU. B-cold seeds the share rows and adds the fourth
+workload, `share-delete`: one transaction of 4,895 changes deleting account 17 with its 1,000
+`record_share`, 1,000 `file_share`, 100 `resource_share`, 100 `file` and 1,001 `space_member` rows.
+B-cold's catalog: 873 shapes, 203 of them subquery shapes, with 290 nodes, 715 edges, 37,067
+contributors and 380 feed entries.
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × B (same runner) | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| B | EPYC 9V74 | import | 2.5 | 1.00 | 27 | 0 | 100% (3/3); p95 0.16 | 100% (3/3); p95 0.01 | 100% (3/3); p95 0.13 | **yes** |
+| B | EPYC 9V74 | large-delete | 1.2 | 1.00 | 21 | 0 | 100% (6/6); p95 0.74 | 100% (6/6); p95 0.01 | 100% (6/6); p95 0.58 | **yes** |
+| B | EPYC 9V74 | small-delete | 0.2 | 1.00 | 19 | 0 | 100% (1/1); p95 0.84 | 100% (1/1); p95 0.02 | 100% (1/1); p95 0.79 | **yes** |
+| B-cold | EPYC 9V74 | import | 10.1 | 4.01 | 88 | 4,800 | 20% (2/10); p95 0.83 | 100% (10/10); p95 0.08 | 0% (0/10); p95 — | no |
+| B-cold | EPYC 9V74 | large-delete | 5.2 | 4.33 | 44 | 3,954 | 60% (6/10); p95 0.74 | 100% (10/10); p95 0.02 | 60% (6/10); p95 0.74 | no |
+| B-cold | EPYC 9V74 | small-delete | 5.3 | 22.92 | 73 | 4,802 | 50% (3/6); p95 0.81 | 100% (6/6); p95 0.04 | 50% (3/6); p95 0.76 | no |
+| B-cold | EPYC 9V74 | share-delete | 10.1 | — | 68 | 15,075 | 20% (2/10); p95 0.97 | 100% (10/10); p95 0.18 | 20% (2/10); p95 0.87 | no |
+
+**Against the pass line:**
+
+| Workload | Under 10 s? | Probes all served? |
+| --- | --- | --- |
+| Import (10.1 s) | No | No: drain 2/10, live 0/10 |
+| Large deletion (5.2 s) | Yes | No: 6/10 each |
+| Small deletion (5.3 s) | Yes | No: 3/6 each |
+| Share deletion (10.1 s) | No | No: 2/10 each |
+
+**Where it goes.** Every one of the import's 4,800 backfills, and 6,194 of the share deletion's
+15,075, are on `graph_edge`: the edge branches the amendment kept on today's filter (`generated`/
+`updated` edges whose `from_id` and `to_id` run through `record` subqueries, and `resource`→
+`resource` edges through `resource` subqueries). Record and Resource writes flip those nodes, and
+each flip walks `graph_edge`. The share deletion adds walks on every Record-family table, `file`
+and `user` from the kept share and membership scopes (2,003 `record`, 1,000 each on three Record
+tables, 843 `file`, 845 `user`). Variant (a), B-cold with every edge keyed, and a profiled B-cold
+for the per-row membership share are running (`[paired-3]`: `b-cold-edges`, `b-cold-profile`).
+Variant (b) is not run unless that shows a class cannot be keyed.
+
+### E-only and E+R (proposal orchestrator's spec)
+
+E-only is today's catalog with only the `graph_edge` shapes replaced by B's keyed body
+(`audience_key` plus `reader_class = 'live'`). Windowed historical edge requests collapse to one
+feed per account (686 edge requests become 19). E+R also keys the six Record-family tables. Each
+ran after its own A control on one EPYC 7763. Only the keyed tables get audience columns.
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × A (same runner) | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| A | EPYC 7763 | import | 532.8 | 1.00 | 99 | 15,420 | 0% (0/533); p95 — | 67% (359/533); p95 1.68 | 0% (0/533); p95 — | no |
+| A | EPYC 7763 | large-delete | 161.6 | 1.00 | 95 | 17,717 | 0% (0/212); p95 — | 84% (178/212); p95 1.03 | 0% (0/212); p95 — | no |
+| A | EPYC 7763 | small-delete | 247.2 | 1.00 | 99 | 15,422 | 0% (1/250); p95 1.69 | 57% (142/250); p95 0.50 | 0% (1/250); p95 1.74 | no |
+| E-only | EPYC 7763 | import | 273.3 | 0.51 | 98 | 8,520 | 0% (0/274); p95 — | 80% (218/274); p95 0.71 | 0% (0/274); p95 — | no |
+| E-only | EPYC 7763 | large-delete | 108.1 | 0.67 | 93 | 11,969 | 5% (6/116); p95 0.40 | 87% (101/116); p95 0.82 | 5% (6/116); p95 0.40 | no |
+| E-only | EPYC 7763 | small-delete | 153.0 | 0.62 | 99 | 8,522 | 1% (1/155); p95 0.71 | 74% (114/155); p95 0.43 | 1% (1/155); p95 0.68 | no |
+| A | EPYC 7763 | import | 529.1 | 1.00 | 98 | 15,420 | 0% (0/529); p95 — | 69% (363/529); p95 1.76 | 0% (0/529); p95 — | no |
+| A | EPYC 7763 | large-delete | 157.0 | 1.00 | 95 | 17,717 | 0% (0/206); p95 — | 84% (173/206); p95 0.97 | 0% (0/206); p95 — | no |
+| A | EPYC 7763 | small-delete | 252.1 | 1.00 | 99 | 15,422 | 0% (0/255); p95 — | 58% (147/255); p95 0.47 | 0% (0/255); p95 — | no |
+| E-plus-R | EPYC 7763 | import | 9.8 | 0.02 | 83 | 120 | 20% (2/10); p95 0.68 | 100% (10/10); p95 0.72 | 20% (2/10); p95 0.51 | no |
+| E-plus-R | EPYC 7763 | large-delete | 14.3 | 0.09 | 66 | 504 | 33% (7/21); p95 0.04 | 100% (21/21); p95 1.51 | 29% (6/21); p95 0.04 | no |
+| E-plus-R | EPYC 7763 | small-delete | 3.7 | 0.01 | 64 | 122 | 60% (3/5); p95 0.65 | 100% (5/5); p95 0.43 | 60% (3/5); p95 0.60 | no |
+
+**E-only still stalls.** It halves the import (273 s), but the Record-family scopes still drive
+8,400 backfills, and drains and live changes stay at 0–5%.
+
+**E+R nearly removes it.** The import takes 9.8 s with 120 backfills, the large deletion 14.3 s,
+and the small deletion 3.7 s. The other account is still not served: drains 20%, 33% and 60%
+during those seconds. With `calendar_event`, chats, Files, Resources and Users still on today's
+filters, 1,121 subquery shapes remain. The comparable B-retained-key-edge row (Record family and
+`calendar_event` keyed) took 3.9 s.
