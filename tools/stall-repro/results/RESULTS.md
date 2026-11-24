@@ -50,9 +50,11 @@ decoded engine change counts, WAL/log bytes, processing time or a stall.
   gateway predicate builders and registry projections from the pinned source.
   Historical date windows and unique-ID filters are synthetic, not a captured
   Swift request sequence. Shape-request totals are not engine catalog calibration.
-- The pinned app configuration lists **45** tracked tables versus the incident's
-  **44**. No table is silently guessed away. The engine's default publication is
-  `FOR ALL TABLES`; filtering is separate. This mismatch remains unresolved.
+- The pinned app configuration lists **45** entries, including internal fences;
+  the engine's own smoke snapshot reports **44 tables**, matching the incident's
+  metric. No configured table was silently removed. The engine's default
+  publication is `FOR ALL TABLES`; configured filtering and memory table counts
+  are separate quantities.
 - The SQLAlchemy export preserves storage columns, checks, indexes and FKs;
   application ORM relationships/serializers are not executed. Encrypted values
   are synthetic bytes. FKs/cascades are suppressed with
@@ -66,14 +68,52 @@ decoded engine change counts, WAL/log bytes, processing time or a stall.
 - There are 19 weighted synthetic background accounts and one new import account;
   the probe account is distinct from both import and deletion accounts. Actual
   subquery nodes, edges, contributors and feed entries are not yet measured.
-- Timing currently starts at SQL submission, not the first engine change-read.
-  Successful probe latencies exclude censored timeouts; success denominators
-  include them. Neither timing limitation may be hidden in eventual tables.
+- Both SQL submission and first change-log delivery are timed. First delivery
+  means the first completed HTTP response at the external loopback proxy that
+  contains a workload xid, not an instrumented sequencer function entry. The
+  proxy records xids/counts, never row payloads, but parsing the extra copy costs
+  uncapped-host CPU. Successful probe latencies exclude censored timeouts;
+  success denominators include them. These limits remain visible in tables.
 - Fixture readiness metadata comes from the existing conformance proxy. Stream
   data goes to the real file-backed Rust store outside the engine quota. This is
   not evidence about production store identity, layout or latency.
 
 No flamegraphs, CPU attribution, model B results or bridge verdict exist yet.
+
+## End-to-end smoke — not M1
+
+Actions run `45351487929`, harness `c84f2fdcd1be61f11f6a8394ec5968b5626052bb`,
+unchanged release engine hash above. This deliberately uses only **48 shapes**
+(28 subquery, 20 standalone), not a historical catalog. The engine reports 48
+nodes, 204 edges, 13,442 contributors and 4 feed entries before workloads.
+`cpu.max` is `100000 100000`. All three independent-account probes pass 3/3 idle
+attempts before each workload. Raw evidence is in `smoke-c84f2fd/`.
+
+Command: `python tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-nov24 --catalog nov24 --smoke --timeout 120`.
+
+| Workload | Changes | SQL start → empty s | First delivery → empty s | Changes/s (SQL clock) | Mean CPU % (one core) | Backfills / minute | Pinned warnings |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Import | 13,081 | 21.604 | 20.938 | 605.50 | 74.80 | 15,420 / 42,825.84 | 0 |
+| Large deletion | 29,793 | 9.860 | 1.866 | 3,021.63 | 27.89 | 202 / 1,229.22 | 0 |
+| Small deletion | 7,114 | 14.143 | 12.045 | 503.00 | 80.18 | 15,422 / 65,425.81 | 0 |
+
+Each probe cell is successes/attempts, then successful p50/p95/max in seconds.
+Timeouts are censored at 2 s. Short drain/live failures are observable even here;
+they do **not** reproduce the requested many-minute stall.
+
+| Workload | Drain | Subset | Live change |
+| --- | --- | --- | --- |
+| Import | 3/22; 0.748/0.748/1.826 | 22/22; 0.039/0.053/0.089 | 1/22; 0.101/0.101/0.101 |
+| Large deletion | 9/10; 0.031/0.952/1.768 | 10/10; 0.012/0.014/0.014 | 9/10; 0.029/0.783/1.765 |
+| Small deletion | 4/15; 0.034/0.180/1.165 | 15/15; 0.021/0.033/0.034 | 2/15; 0.029/0.029/0.030 |
+
+An earlier full-catalog attempt (`8f333ac11d9e20b3470d81fc337fffb5461abfc4`,
+run `45351083884`) did not measure either workload: Nov 23 boot raced the stream
+store (catalog GET 502); Nov 24 rejected a synthetic `workflow_run.record_id`
+window (that column does not exist). Fixed by real-store readiness and a
+created-at window. A later fixture-only run `45353004075` caught PostgreSQL's
+temporary bootstrap server shutting down after Unix-socket readiness; the
+workflow now waits for TCP readiness. None of these failures is stall evidence.
 
 ## Important interpretation limit
 

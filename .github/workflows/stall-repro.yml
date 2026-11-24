@@ -55,7 +55,7 @@ jobs:
           python tools/stall-repro/export_fixture.py
           docker run -d --name stall-experiment-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=synthetic -e POSTGRES_DB=stall_repro postgres:18 -c wal_level=logical -c max_replication_slots=10 -c max_wal_senders=10
           for attempt in $(seq 1 60); do
-            if docker exec stall-experiment-pg pg_isready -U postgres -d stall_repro; then break; fi
+            if docker exec stall-experiment-pg pg_isready -h 127.0.0.1 -U postgres -d stall_repro; then break; fi
             sleep 1
           done
           docker exec -i stall-experiment-pg psql -v ON_ERROR_STOP=1 -U postgres -d stall_repro < tools/stall-repro/results/fixture/schema.sql
@@ -128,7 +128,7 @@ jobs:
         run: |
           docker run -d --name stall-schema-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=synthetic -e POSTGRES_DB=stall_repro postgres:18 -c wal_level=logical
           for attempt in $(seq 1 60); do
-            if docker exec stall-schema-pg pg_isready -U postgres -d stall_repro; then break; fi
+            if docker exec stall-schema-pg pg_isready -h 127.0.0.1 -U postgres -d stall_repro; then break; fi
             sleep 1
           done
           docker exec -i stall-schema-pg psql -v ON_ERROR_STOP=1 -U postgres -d stall_repro < tools/stall-repro/results/fixture/schema.sql
