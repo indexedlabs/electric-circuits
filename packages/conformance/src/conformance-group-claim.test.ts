@@ -75,7 +75,12 @@ describe('a group load answers and accepts its claim', () => {
     const a = await load()
     expect(typeof a.claim).toBe('string')
     expect(a.claim.length).toBeGreaterThan(0)
-    expect(a.rows.map((row) => `${row.table}:${row.value.id}`).sort()).toEqual(['items:1', 'items:2', 'notes:1'])
+    // A group load names each row's table as it resolved it, schema included.
+    expect(a.rows.map((row) => `${row.table}:${row.value.id}`).sort()).toEqual([
+      'public.items:1',
+      'public.items:2',
+      'public.notes:1',
+    ])
     const publicMember = a.results[0]!.shapeId
 
     const renewed = await load(a.claim)
