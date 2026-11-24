@@ -1,0 +1,51 @@
+name: stall-repro-scratch
+
+on:
+  push:
+    branches: ['profile/stall-repro-2026-11-24']
+    paths-ignore: ['tools/stall-repro/results/**', 'tools/stall-repro/README.md']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: '1'
+      RUSTFLAGS: '-C force-frame-pointers=yes'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolated runner preflight
+        run: |
+          mkdir -p tools/stall-repro/results/preflight
+          {
+            date -u
+            git rev-parse HEAD
+            uname -a
+            lscpu
+            docker version
+            sudo -n true
+            cat /proc/sys/kernel/perf_event_paranoid
+            docker run --rm --cpus=1 postgres:18 bash -c 'nproc; cat /sys/fs/cgroup/cpu.max; postgres --version'
+          } 2>&1 | tee tools/stall-repro/results/preflight/machine.txt
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stall-repro-release-frame-pointers
+      - name: Build unmodified production engine with symbols
+        run: |
+          export CARGO_TARGET_DIR="$PWD/target"
+          cargo build --release --locked -p electric-circuits-engine
+          sha256sum target/release/electric-circuits-engine | tee tools/stall-repro/results/preflight/binary.sha256
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stall-preflight-${{ github.sha }}
+          path: tools/stall-repro/results/preflight/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stall-engine-${{ github.sha }}
+          path: target/release/electric-circuits-engine
