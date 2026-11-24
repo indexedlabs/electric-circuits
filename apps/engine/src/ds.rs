@@ -3674,12 +3674,13 @@ mod tests {
             {"type":"public.items", "key":"1", "value":{"id":1}, "headers":{"operation":"upsert"}}
         ]))
         .unwrap();
-        for mode in 0..4 {
+        for (delay, expected_wait) in [(0, 100), (2, 2000), (3600, 5000)] {
+        for mode in 0..5 {
             let store = Arc::new(ScriptedStore {
                 append_fault: std::sync::Mutex::new(Some((
                     "shape/s1".into(),
                     0,
-                    AppendFault::RateLimited(Some(std::time::Duration::from_secs(2))),
+                    AppendFault::RateLimited(Some(std::time::Duration::from_secs(delay))),
                 ))),
                 ..Default::default()
             });
@@ -3688,8 +3689,9 @@ mod tests {
             match mode {
                 0 => client.append("shape/s1", &envelopes).await.unwrap(),
                 1 => assert!(client.append_reliable("shape/s1", &envelopes).await.unwrap()),
+                4 => { client.append_checked("shape/s1", &envelopes).await.unwrap(); }
                 _ => {
-                    let budget = std::time::Duration::from_secs(if mode == 2 { 3 } else { 1 });
+                    let budget = std::time::Duration::from_millis(if mode == 2 { expected_wait + 100 } else { 50 });
                     let result = client
                         .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
                         .await;
@@ -3702,9 +3704,10 @@ mod tests {
                     result.unwrap();
                 }
             }
-            assert!(started.elapsed() >= std::time::Duration::from_secs(2));
+            assert_eq!(started.elapsed(), std::time::Duration::from_millis(expected_wait));
             assert_eq!(store.appended.lock().unwrap().len(), 1);
             assert_eq!(client.appended_bytes("shape/s1"), serde_json::to_vec(&envelopes).unwrap().len() as u64);
+        }
         }
     }
 
@@ -3774,11 +3777,15 @@ mod tests {
 
     async fn assert_rate_limited_floor(header: &str) {
         let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
-        for (attempt, millis) in [(1, 100), (2, 200), (3, 400)] {
-            let started = tokio::time::Instant::now();
-            assert!(client.wait_rate_limit("GET", "changes/0", attempt, parse_retry_after(header)).await);
-            assert_eq!(started.elapsed(), std::time::Duration::from_millis(millis), "{header}: growing backoff floor");
-        }
+        let started = tokio::time::Instant::now();
+        let mut sent_at = Vec::new();
+        client.retry_rate_limited("changes/0", || {
+            sent_at.push(started.elapsed().as_millis());
+            let mut res = response(if sent_at.len() <= 3 { 429 } else { 200 });
+            res.retry_after = parse_retry_after(header);
+            async { Ok(res) }
+        }).await.unwrap();
+        assert_eq!(sent_at, [0, 100, 300, 700], "{header}: repeated 429s must use growing backoff");
     }
 
     #[tokio::test(start_paused = true)]
