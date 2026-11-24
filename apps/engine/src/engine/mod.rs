@@ -1950,7 +1950,10 @@ impl Engine {
         }
         engine.ensure_degrade_reaper();
         crate::electric::ensure_evictor(&engine);
-        crate::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
+        let sampler_period = crate::stall_profile::sampler_period_ms();
+        if sampler_period > 0 {
+            crate::mem::spawn_sampler(engine.clone(), Duration::from_millis(sampler_period));
+        }
         engine
     }
 
@@ -3952,7 +3955,12 @@ impl Engine {
             (st.shapes.len(), tables_with_execs, st.tables.len(), families, family_shapes, standalone)
         };
         let sq = {
-            let reg = self.subqueries.lock().await;
+            let reg = crate::stall_profile::lock(
+                &self.subqueries,
+                crate::stall_profile::SAMPLER_WAIT,
+                crate::stall_profile::SAMPLER_HOLD,
+            )
+            .await;
             reg.mem_totals()
         };
         let shapes_dormant =

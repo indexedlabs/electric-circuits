@@ -102,6 +102,27 @@ async def sample_cpu(process, cgroup, output, stopped):
                 pass
 
 
+RETAINED_CLASSES = {"chat": {"message", "workflow_run"}, "edge": {"graph_edge"}, "resource": {"resource", "resource_fact"}, "file": {"file"}, "user": {"user"}}
+KEYED_VARIANTS = {"B", "B-retained", *(f"B-retained-key-{name}" for name in RETAINED_CLASSES)}
+BRIDGE_ENVIRONMENT = {
+    "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
+    "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
+    "commit-membership-slices": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1", "STALL_REPRO_LOCK_SLICE_ROWS": "256"},
+    "yield-rows": {"STALL_REPRO_SEQUENCER_YIELD": "1"},
+    "sampler-off": {"STALL_REPRO_MEM_SAMPLER_MS": "0"},
+    "sampler-10x": {"STALL_REPRO_MEM_SAMPLER_MS": "5000"},
+    "bridge-control": {},
+}
+
+
+def preserved_tables(variant):
+    """Tables B-retained keeps on their original gateway predicates; a key-<class> variant keys that one class."""
+    if variant == "B":
+        return set()
+    keyed = variant.removeprefix("B-retained-key-") if variant.startswith("B-retained-key-") else None
+    return set().union(*(tables for name, tables in RETAINED_CLASSES.items() if name != keyed))
+
+
 async def run(args):
     if os.environ.get("GITHUB_ACTIONS") != "true" and os.environ.get("STALL_REPRO_REMOTE_MACHINE") != "1":
         raise RuntimeError("Run only on the authorized isolated remote machine or GitHub Actions, never in a Mighty Run sandbox")
@@ -111,7 +132,7 @@ async def run(args):
     fixture = folder / "results/fixture"
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
     data = load_data(fixture / "columns.json")
-    if args.variant in {"B", "B-retained"}:
+    if args.variant in KEYED_VARIANTS:
         statements = await asyncio.to_thread(data.add_audience_columns, PG_URL, [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]])
         (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
     help_probe = subprocess.run([str(Path(args.store).resolve()), "--help"], capture_output=True, text=True)
@@ -169,10 +190,7 @@ async def run(args):
         "ELECTRIC_SECRET": SECRET,
         "ELECTRIC_STORAGE_DIR": str(output / "engine-data"),
     }
-    if args.variant == "marker-bypass":
-        env["STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT"] = "1"
-    if args.variant == "commit-membership":
-        env["STALL_REPRO_COMMIT_MEMBERSHIP"] = "1"
+    env.update(BRIDGE_ENVIRONMENT.get(args.variant, {}))
     command("sudo", "systemd-run", "--unit", unit, "--collect", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
     manifest["variant"] = args.variant
@@ -186,8 +204,8 @@ async def run(args):
             process = psutil.Process(pid)
             save(output / "engine-threads-at-ready.json", {thread.id: Path(f"/proc/{pid}/task/{thread.id}/comm").read_text().strip() for thread in process.threads()})
             catalog = await gateway.generate(args.catalog, args.scale)
-            if args.variant in {"B", "B-retained"}:
-                catalog = await gateway.keyed_catalog(catalog, retained=args.variant == "B-retained")
+            if args.variant in KEYED_VARIANTS:
+                catalog = await gateway.keyed_catalog(catalog, preserved=preserved_tables(args.variant))
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -208,13 +226,13 @@ async def run(args):
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
             for table in ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource"):
-                keyed = args.variant == "B" or args.variant == "B-retained" and table not in {"graph_edge", "resource"}
+                keyed = args.variant in KEYED_VARIANTS and table not in preserved_tables(args.variant)
                 for calendar in (range(15) if keyed and table == "calendar_event" else [0]):
                     body = gateway.keyed_body(table, IMPORT_ACCOUNT, calendar=calendar, identity=f"import-{table}") if keyed else await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}")
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in {"B", "B-retained"} else await gateway.body("record", 0, identity="other-account-probe")
+            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in KEYED_VARIANTS else await gateway.body("record", 0, identity="other-account-probe")
             if args.variant == "plain-only":
                 probe_body = plain_control_body(probe_body, 0, "other-account-probe")
             probe_feed = await create({"body": probe_body})
@@ -389,7 +407,7 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
-    parser.add_argument("--variant", choices=("A", "A-observed", "B", "B-retained", "marker-bypass", "commit-membership", "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
+    parser.add_argument("--variant", choices=("A", "A-observed", *sorted(KEYED_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
     parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

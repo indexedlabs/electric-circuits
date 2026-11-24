@@ -1961,48 +1961,54 @@ async fn flush_commit_membership(
 ) -> Result<()> {
     let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     let xid = txid.as_deref().and_then(|value| value.parse::<u64>().ok());
-    for (schema, delta) in batch.finish() {
-        if delta.is_empty() {
-            continue;
-        }
-        let (work, group_paths) = {
-            let mut registry = crate::stall_profile::lock(
-                &subq.registry,
-                crate::stall_profile::SEQUENCER_WAIT,
-                crate::stall_profile::SEQUENCER_HOLD,
-            )
-            .await;
-            if !registry.touches(&schema.table) {
+    let slice_rows = crate::stall_profile::slice_rows();
+    for (schema, table_delta) in batch.finish() {
+        for delta in crate::stall_batch::slices(table_delta, slice_rows) {
+            if delta.is_empty() {
                 continue;
             }
-            if let Some(commit_ts) = commit_ts {
-                registry.note_commit_time(lsn_u64, commit_ts);
-            }
-            let measurement = crate::stall_profile::Timer::start(crate::stall_profile::MEMBERSHIP);
-            let work = registry.on_table_delta(&schema, &delta, lsn_u64, xid, txid.clone(), None).await?;
-            drop(measurement);
-            let group_paths = registry.group_paths_for_work(&work);
-            for path in &group_paths {
-                subq.group_lanes.begin_origin(path, lsn_u64);
-            }
-            (work, group_paths)
-        };
-        if !work.is_empty() {
-            subq.pending_flips.add(lsn_u64);
-            if subq
-                .flip_tx
-                .send(FlipWork::Walk {
-                    work,
-                    txid: txid.clone(),
-                    lsn: lsn.clone(),
-                    group_paths: group_paths.iter().cloned().collect(),
-                })
-                .is_err()
-            {
-                subq.pending_flips.complete(lsn_u64);
-                for path in &group_paths {
-                    subq.group_lanes.complete_origin(path, lsn_u64);
+            let (work, group_paths) = {
+                let mut registry = crate::stall_profile::lock(
+                    &subq.registry,
+                    crate::stall_profile::SEQUENCER_WAIT,
+                    crate::stall_profile::SEQUENCER_HOLD,
+                )
+                .await;
+                if !registry.touches(&schema.table) {
+                    continue;
                 }
+                if let Some(commit_ts) = commit_ts {
+                    registry.note_commit_time(lsn_u64, commit_ts);
+                }
+                let measurement = crate::stall_profile::Timer::start(crate::stall_profile::MEMBERSHIP);
+                let work = registry.on_table_delta(&schema, &delta, lsn_u64, xid, txid.clone(), None).await?;
+                drop(measurement);
+                let group_paths = registry.group_paths_for_work(&work);
+                for path in &group_paths {
+                    subq.group_lanes.begin_origin(path, lsn_u64);
+                }
+                (work, group_paths)
+            };
+            if !work.is_empty() {
+                subq.pending_flips.add(lsn_u64);
+                if subq
+                    .flip_tx
+                    .send(FlipWork::Walk {
+                        work,
+                        txid: txid.clone(),
+                        lsn: lsn.clone(),
+                        group_paths: group_paths.iter().cloned().collect(),
+                    })
+                    .is_err()
+                {
+                    subq.pending_flips.complete(lsn_u64);
+                    for path in &group_paths {
+                        subq.group_lanes.complete_origin(path, lsn_u64);
+                    }
+                }
+            }
+            if crate::stall_profile::sequencer_yield() {
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -2302,6 +2308,9 @@ async fn process_envelope_deferred(
                 Ok(std::collections::VecDeque::new())
             }
         }?;
+        if crate::stall_profile::sequencer_yield() {
+            tokio::task::yield_now().await;
+        }
         if !work.is_empty() {
             subq.pending_flips.add(lsn_u64);
             if subq

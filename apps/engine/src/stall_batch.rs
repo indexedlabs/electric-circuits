@@ -88,6 +88,26 @@ impl Commit {
     }
 }
 
+/// Split a folded table delta into slices of at least `rows` entries (`0` = one slice). A cut
+/// never separates an update's old image from the new image `Rows::finish` places right after
+/// it, so a slice boundary never makes a row look deleted between its two images.
+pub(crate) fn slices(delta: Vec<Tup2<Row, ZWeight>>, rows: usize) -> Vec<Vec<Tup2<Row, ZWeight>>> {
+    if rows == 0 {
+        return vec![delta];
+    }
+    let mut out = Vec::new();
+    let mut current: Vec<Tup2<Row, ZWeight>> = Vec::new();
+    for entry in delta {
+        let pairs_with_previous = entry.1 > 0 && current.last().is_some_and(|previous| previous.1 < 0);
+        if current.len() >= rows && !pairs_with_previous {
+            out.push(std::mem::take(&mut current));
+        }
+        current.push(entry);
+    }
+    out.push(current);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +124,21 @@ mod tests {
             rows.push("key".into(), &row(value), weight);
         }
         assert_eq!(rows.finish(), vec![Tup2(row(1), -1), Tup2(row(3), 1)]);
+    }
+
+    #[test]
+    fn slices_keep_old_and_new_images_together() {
+        let delta = vec![Tup2(row(1), -1), Tup2(row(2), 1), Tup2(row(3), -1), Tup2(row(4), 1), Tup2(row(5), 1)];
+        let cut = slices(delta.clone(), 1);
+        assert_eq!(
+            cut,
+            vec![
+                vec![Tup2(row(1), -1), Tup2(row(2), 1)],
+                vec![Tup2(row(3), -1), Tup2(row(4), 1)],
+                vec![Tup2(row(5), 1)]
+            ]
+        );
+        assert_eq!(slices(delta.clone(), 0), vec![delta]);
     }
 
     #[test]

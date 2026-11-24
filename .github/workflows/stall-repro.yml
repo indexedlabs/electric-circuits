@@ -68,7 +68,7 @@ jobs:
           name: stall-historical-build-${{ matrix.source }}
           path: tools/stall-repro/results/historical-build/
   observer-build:
-    if: contains(github.event.head_commit.message, '[observe-build]')
+    if: contains(github.event.head_commit.message, '[observe-build]') || contains(github.event.head_commit.message, '[bridges]')
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -104,15 +104,19 @@ jobs:
           name: stall-observed-engine-${{ github.sha }}
           path: target/release/electric-circuits-engine
   experiment:
-    if: contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[measure]')
+    # A [bridges] push builds the scratch binary first and measures it in the same run.
+    needs: observer-build
+    if: ${{ !cancelled() && needs.observer-build.result != 'failure' && (contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[measure]')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    env:
+      BRIDGE_BINARY: ${{ contains(github.event.head_commit.message, '[bridges]') && contains(fromJSON('["bridge-control","sampler-off","sampler-10x","yield-rows","commit-membership","commit-membership-slices"]'), matrix.variant) && '1' || '0' }}
     strategy:
       fail-fast: false
-      max-parallel: ${{ contains(github.event.head_commit.message, '[final-variants]') && 1 || 8 }}
+      max-parallel: ${{ contains(github.event.head_commit.message, '[bridges]') && 13 || contains(github.event.head_commit.message, '[final-variants]') && 1 || 8 }}
       matrix:
-        catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]') || contains(github.event.head_commit.message, '[cheap-variants]') || contains(github.event.head_commit.message, '[coalesced]') || contains(github.event.head_commit.message, '[final-variants]') || contains(github.event.head_commit.message, '[observe]')) && '["nov24"]' || '["nov23","nov24"]') }}
-        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained"]' || contains(github.event.head_commit.message, '[cheap-variants]') && '["marker-bypass","A-observed"]' || contains(github.event.head_commit.message, '[coalesced]') && '["coalesced-base","coalesced-head"]' || contains(github.event.head_commit.message, '[final-variants]') && '["commit-membership","half-subqueries","plain-only"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
+        catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]') || contains(github.event.head_commit.message, '[cheap-variants]') || contains(github.event.head_commit.message, '[coalesced]') || contains(github.event.head_commit.message, '[final-variants]') || contains(github.event.head_commit.message, '[bridges]') || contains(github.event.head_commit.message, '[observe]')) && '["nov24"]' || '["nov23","nov24"]') }}
+        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[bridges]') && '["B-retained-key-chat","B-retained-key-edge","B-retained-key-resource","B-retained-key-file","B-retained-key-user","half-subqueries","plain-only","bridge-control","sampler-off","sampler-10x","yield-rows","commit-membership","commit-membership-slices"]' || contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained"]' || contains(github.event.head_commit.message, '[cheap-variants]') && '["marker-bypass","A-observed"]' || contains(github.event.head_commit.message, '[coalesced]') && '["coalesced-base","coalesced-head"]' || contains(github.event.head_commit.message, '[final-variants]') && '["commit-membership","half-subqueries","plain-only"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
         cpus: ${{ fromJSON(contains(github.event.head_commit.message, '[cpu-variants]') && '[2,4]' || '[1]') }}
         include: ${{ fromJSON(contains(github.event.head_commit.message, '[cheap-variants]') && '[{"catalog":"nov24","variant":"A","cpus":2},{"catalog":"nov24","variant":"A","cpus":4}]' || '[]') }}
     steps:
@@ -137,14 +141,19 @@ jobs:
           echo "STALL_REPRO_PERF=$PERF" >> "$GITHUB_ENV"
           sudo "$PERF" stat -e cpu-clock -- true
       - uses: actions/download-artifact@v4
-        if: matrix.variant != 'A-observed' && matrix.variant != 'marker-bypass' && matrix.variant != 'coalesced-base' && matrix.variant != 'coalesced-head' && matrix.variant != 'commit-membership'
+        if: env.BRIDGE_BINARY != '1' && matrix.variant != 'A-observed' && matrix.variant != 'marker-bypass' && matrix.variant != 'coalesced-base' && matrix.variant != 'coalesced-head' && matrix.variant != 'commit-membership'
         with:
           name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937
           run-id: 45342910224
           github-token: ${{ github.token }}
           path: tools/stall-repro/bin
       - uses: actions/download-artifact@v4
-        if: matrix.variant == 'commit-membership'
+        if: env.BRIDGE_BINARY == '1'
+        with:
+          name: stall-observed-engine-${{ github.sha }}
+          path: tools/stall-repro/bin
+      - uses: actions/download-artifact@v4
+        if: env.BRIDGE_BINARY != '1' && matrix.variant == 'commit-membership'
         with:
           name: stall-observed-engine-0bdc7a2f6e5614f87246b66534a786c5aea792b6
           run-id: 45363678502
@@ -194,7 +203,7 @@ jobs:
           if [ "$OBSERVE" != 1 ] && { [ '${{ matrix.variant }}' = A-observed ] || [ '${{ matrix.variant }}' = marker-bypass ]; }; then ARGS+=(--engine-source cbb6156a1c20de49e9175e895acb2cec75286a57); fi
           if [ '${{ matrix.variant }}' = coalesced-base ]; then ARGS+=(--engine-source 1be10fb8313af3247c5dbc8b3190d355419c4c79); fi
           if [ '${{ matrix.variant }}' = coalesced-head ]; then ARGS+=(--engine-source 3a0ce4047e1f5a2ad3ea2712f64ff9c06bcee606); fi
-          if [ '${{ matrix.variant }}' = commit-membership ]; then ARGS+=(--engine-source 0bdc7a2f6e5614f87246b66534a786c5aea792b6); fi
+          if [ "$BRIDGE_BINARY" = 1 ]; then ARGS+=(--engine-source ${{ github.sha }}); elif [ '${{ matrix.variant }}' = commit-membership ]; then ARGS+=(--engine-source 0bdc7a2f6e5614f87246b66534a786c5aea792b6); fi
           nohup bash -c 'set +e; python "$@"; echo "$?" > "$RUNNER_TEMP/stall-driver-exit"' _ tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.variant }}-${{ matrix.catalog }}-${{ matrix.cpus }}cpu --catalog ${{ matrix.catalog }} --variant ${{ matrix.variant }} --cpus ${{ matrix.cpus }} "${ARGS[@]}" > "$RUNNER_TEMP/stall-driver.log" 2>&1 &
           while ! test -f tools/stall-repro/results/run-${{ matrix.variant }}-${{ matrix.catalog }}-${{ matrix.cpus }}cpu/catalog-before-warmup.json; do
             if test -f "$RUNNER_TEMP/stall-driver-exit"; then cat "$RUNNER_TEMP/stall-driver.log"; exit "$(cat "$RUNNER_TEMP/stall-driver-exit")"; fi
@@ -217,7 +226,7 @@ jobs:
           status=$(cat "$RUNNER_TEMP/stall-driver-exit")
           if [ "$status" != 0 ]; then exit "$status"; fi
           if [ '${{ matrix.variant }}' = commit-membership ]; then
-            for result in tools/stall-repro/results/run-commit-membership-*/*-result.json; do
+            for result in tools/stall-repro/results/run-commit-membership-nov24-*/*-result.json; do
               python tools/stall-repro/check_membership_batch.py "$result" | tee "${result%-result.json}-batch-check.txt"
             done
           fi

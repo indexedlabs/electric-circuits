@@ -116,3 +116,42 @@ selects one synthetic parent/key. Nullable owner columns can match fewer rows.
 These are shape-cost ablations, NOT authorization-equivalent app models; they
 must not be mistaken for B's maintained keys or a safe gateway change. The
 original plain shapes and the underlying synthetic data/writes are unchanged.
+
+## Bridge knobs (takeover, `[bridges]` build)
+
+One scratch binary built from this branch carries every knob below; each is off by default,
+and `bridge-control` runs the same binary with all of them off.
+
+- Lock-hold histograms: every `stall_profile` category also records its longest interval
+  since boot and counts in six buckets (≤1 ms, ≤10 ms, ≤100 ms, ≤1 s, ≤5 s, >5 s). The memory
+  sampler's registry acquisition is now measured too (`sampler_registry_wait`/`_hold`). Pure
+  observation.
+- `STALL_REPRO_SEQUENCER_YIELD=1` (`yield-rows`): after each release of the registry lock the
+  sequencer calls `tokio::task::yield_now()`. Prod already releases the lock after every row
+  (`process_envelope_deferred`); this only lets other ready tasks run before the sequencer
+  queues for the lock again. It gives up nothing.
+- `STALL_REPRO_LOCK_SLICE_ROWS=N` (`commit-membership-slices`, N=256): only on the per-commit
+  membership path, which otherwise holds the lock for a whole table's folded delta. The flush
+  releases and re-takes the lock every N delta rows and never cuts between an update's old
+  and new images. It gives up a commit being applied to membership in one step: between slices
+  a flip walk, a subset or the sampler can see membership sets that hold part of a commit, and
+  outer-shape emissions from an earlier slice can be appended before a later slice's
+  retractions. For example, if one commit moves a Record from Space X to Space Y, readers of Y
+  can get it before readers of X lose it. Stream order within one shape is unchanged. No
+  answer from snapshots is prototyped: `GET /_runtime/drained-through` already reads the
+  receipt map without the registry lock, and what a drain waits for is the sequencer reaching
+  the fence's commit in log order plus `wait_for_source_effects`. `marker-bypass` measures
+  removing the second half.
+- `STALL_REPRO_MEM_SAMPLER_MS` (`sampler-off` = 0, `sampler-10x` = 5000): period of the
+  hard-coded 500 ms OTel sampler (`mem::spawn_sampler`), which takes the registry lock and
+  walks every node's values in `SubqueryRegistry::mem_totals`. The 30 s structured memory log
+  and `GET /memory` still compute cardinalities. Off loses only the OTel memory gauges' freshness.
+
+## Retained-scope ablation (`B-retained-key-<class>`)
+
+Same as `B-retained`, except that one exception class is keyed like the rest: its historical
+requests become `audience_key`/`reader_class` equality feeds, and the import account's feed on
+that table is keyed. Classes: `chat` = message, workflow_run; `edge` = graph_edge; `resource` =
+resource, resource_fact; `file` = file; `user` = user. The writer maintains audience keys on
+every table in all keyed variants, as for B. These runs show how much each retained class costs.
+They do not claim that keying the class is authorization-equivalent.

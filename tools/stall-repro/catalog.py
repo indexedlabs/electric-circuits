@@ -108,13 +108,12 @@ class GatewayShapes:
         predicate = {"and": [{"col": "audience_key", "op": "eq", "value": str(key)}, {"col": "reader_class", "op": "eq", "value": "live"}]}
         return {"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key", "reader_class"}), "where": predicate, "changesOnly": True, "subscription": self.gateway._internal_subscription(synthetic_id(f"user/{account}"), f"{identity}:{table}:{key}:live", self.authority(account))}
 
-    async def keyed_catalog(self, requests, retained=False):
-        preserved = {"message", "workflow_run", "graph_edge", "resource", "resource_fact", "file", "user"}
+    async def keyed_catalog(self, requests, preserved=frozenset()):
         result = {}
         for request in requests:
             table = request["body"]["table"].removeprefix("public.")
             account = request["account"]
-            if retained and table in preserved:
+            if table in preserved:
                 bodies = [request["body"]]
             else:
                 owners = [account]
