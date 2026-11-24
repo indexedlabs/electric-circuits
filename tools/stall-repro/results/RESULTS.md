@@ -1,3 +1,4 @@
+Today vs yesterday (Nov 24, same runner): prod's engine today (`b42f70d`, 2 vCPU) stalls as long as yesterday's (`5b2cf3e`, 1 vCPU). Import 547 s against 532 s (1.03x), large deletion 153 s against 159 s (0.96x), small deletion 265 s against 253 s (1.04x). The other account's drains and live changes are 0% on both; only subsets improve (100% against 58-84%). Bisect: PR 70 (`e10c4bd`) carries the slowdown since `1be10fb`, 1.29x on the import and 3.8x on the large deletion; PRs 71, 72 and 69 change nothing.
 M4: Today the time goes to per-row membership evaluation (about 19 to 23 ms per changed row, 69% of CPU), serialized on one registry mutex. The other account starves because its drain and live change wait behind the workload in the single change log. No engine-side bridge keeps that account served (drain and live success at most 22% in every A variant, including 2 CPUs). The audience-key model removes the stall only if graph edges are keyed as well: B-retained takes 132 s with drains at 0 to 1%, against 3.9 s with graph edges keyed. Build that first. Prod's second vCPU does not help this path (0.96x), and the estimate is that prod is safe tonight but exposed to hour-scale outages from Nov 26 to 28, depending on regrowth.
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
@@ -720,3 +721,68 @@ that empties the catalog resets this clock; nothing else measured here does.
 These are estimates with wide error. The synthetic engine is 2.5–12x cheaper per change than prod
 was, and the gap grows with catalog size. Prod's write pacing, its real row densities and its
 second deletion are not modelled. The total-shape cap (20,000) is not modelled either.
+
+
+## Takeover round 2: today's prod engine, the PR 70–72 bisect, B-cold, E-only and E+R
+
+Actions run `45388936382`, harness `5169054`, workflow job `paired` with `[paired-2]`. Every group
+ran back to back on one runner, each run with a fresh PostgreSQL 18, the Nov 24 catalog, 8 flip
+workers and `ELECTRIC_CIRCUITS_MAX_SHAPES=20000`. Binaries:
+
+| Binary | Commit | Built by Actions run |
+| --- | --- | --- |
+| `prod` | `5b2cf3e` | `45342910224` |
+| `base` | `1be10fb` | `45362388808` |
+| `pr70` | `e10c4bd` | `45388936382` |
+| `pr71` | `a248886` | `45388936382` |
+| `pr69` | `b42f70d` (prod since 08:33 UTC Nov 24) | `45388936382` |
+
+Each new build is a `git archive` of its commit with no source change, release profile with
+debug level 1 and frame pointers. Per-run commands are in `paired2/LABEL/manifest.json`.
+
+### Is today's prod engine's stall longer or shorter than yesterday's?
+
+About the same. Same runner (EPYC 7763), same catalog and workloads:
+
+| Engine, vCPU | Workload | First delivery → empty s | × yesterday | CPU % | Drain | Subset | Live | Served? |
+| --- | --- | ---: | ---: | ---: | --- | --- | --- | --- |
+| `5b2cf3e`, 1 (yesterday) | import | 532.3 | 1.00 | 98 | 0% (0/533) | 68% (365/533) | 0% (0/533) | no |
+| `5b2cf3e`, 1 | large-delete | 159.1 | 1.00 | 95 | 0% (0/210) | 84% (176/210) | 0% (0/210) | no |
+| `5b2cf3e`, 1 | small-delete | 253.4 | 1.00 | 99 | 0% (0/257) | 58% (148/257) | 0% (0/257) | no |
+| `b42f70d`, 2 (today) | import | 547.1 | 1.03 | 103 | 0% (0/548) | 100% (548/548) | 0% (0/548) | no |
+| `b42f70d`, 2 | large-delete | 153.3 | 0.96 | 100 | 0% (0/202) | 100% (202/202) | 0% (0/202) | no |
+| `b42f70d`, 2 | small-delete | 264.8 | 1.04 | 104 | 0% (0/285) | 100% (285/285) | 0% (0/285) | no |
+
+The difference is within the 5% same-runner noise. PR 69 (timestamp-bound comparison) neither
+helps nor hurts this workload, and the second vCPU still goes unused by the serialized path
+(the engine uses 1.00–1.04 cores). The `cpu-split` job (`5b2cf3e` at 2 CPU, `b42f70d` at 1 CPU)
+separates the two changes and is added below when it lands.
+
+### Bisect: PR 70 carries the slowdown since `1be10fb`
+
+Commands: `run.py … --variant A --workloads import` on Xeon 8573C, and `--workloads large-delete`
+on Xeon 6975P-C, one runner each, in commit order.
+
+| Engine | Import s (8573C) | × `1be10fb` | Large deletion s (6975P-C) | × `1be10fb` |
+| --- | ---: | ---: | ---: | ---: |
+| `1be10fb` (PR 68's base) | 294.8 | 1.00 | 26.6 | 1.00 |
+| `e10c4bd` (after PR 70, exact removals) | 379.7 | **1.29** | 99.9 | **3.76** |
+| `a248886` (after PR 71, commit positions) | 383.8 | 1.30 | 94.9 | 3.57 |
+| `5b2cf3e` (after PR 72, boot lock) | 381.9 | 1.30 | 91.9 | 3.45 |
+| `b42f70d` (after PR 69, today's prod) | 385.2 | 1.31 | 93.4 | 3.51 |
+
+Backfills are identical on every row (15,420 import; 17,717 deletion), so the added cost is
+inside the engine, not more Postgres reads. No row keeps the other account served: drains and
+live changes are 0% on the imports and 2–10% on the deletions.
+
+The orchestrator's "roughly doubled" compared runs on two CPU models; the inputs were otherwise
+identical. Both runs used Indexed source `da746b7`, the same 10,563 requests, the same engine
+cardinalities (4,287 subquery shapes, 1,406 nodes, 26,367 edges, 237,341 contributors) and the
+same 13,081 import changes. The harness diff `b187502..9f5ad6d` touches only B's subscription
+identity, the commit-membership flag and its check. What differed was the engine binary and the
+runner (6975P-C for the 286 s run, 8573C for the 531 s run). On one runner the import gap is
+1.29x, and the deletion gap is 3.8x.
+
+PR 70 is "Remove rows a changes-only feed's client holds only from its snapshot". A profile of the
+large deletion on `1be10fb` and `e10c4bd` is running (`[paired-3]`, `pr70-profile`) to name the
+function that got more expensive.
