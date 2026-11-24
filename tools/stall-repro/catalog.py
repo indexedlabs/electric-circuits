@@ -117,8 +117,8 @@ class GatewayShapes:
                 requests.append({"kind": "plain-target", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])})
         for ordinal in range(target["family_shapes"]):
             account = ordinal % len(ACCOUNT_WEIGHTS)
-            scope = {"col": "id", "op": "eq", "value": str(synthetic_id(f"calendar/{account}/{ordinal // len(ACCOUNT_WEIGHTS)}"))}
-            body = await self.body("calendar", account, scope, identity=f"family-{ordinal}", plain=True)
+            scope = {"col": "id", "op": "eq", "value": str(synthetic_id(f"external_account/{account}/{ordinal // len(ACCOUNT_WEIGHTS)}"))}
+            body = await self.body("external_account", account, scope, identity=f"family-{ordinal}", plain=True)
             requests.append({"kind": "family-target", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])})
         return requests
 

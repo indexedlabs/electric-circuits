@@ -192,8 +192,7 @@ async def run(args):
             print(json.dumps({"before_warmup": memory.json()["cardinalities"]}), flush=True)
             for endpoint in ("graph", "state"):
                 response = await client.get(f"{ENGINE_URL}/{endpoint}")
-                response.raise_for_status()
-                save(output / f"catalog-{endpoint}.json", response.json())
+                save(output / f"catalog-{endpoint}.json", {"status": response.status_code, "body": response.json() if response.status_code == 200 else response.text})
             validator = gateway.gateway._is_drained_receipt
             fence_user = row_id("user", 1)
             fence_generation = gateway.authority(1).generation
