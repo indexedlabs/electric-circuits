@@ -11,6 +11,43 @@ permissions:
   actions: read
 
 jobs:
+  historical-build:
+    if: contains(github.event.head_commit.message, '[coalesced-build]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        source: ['1be10fb8313af3247c5dbc8b3190d355419c4c79', '3a0ce4047e1f5a2ad3ea2712f64ff9c06bcee606']
+    env:
+      CARGO_PROFILE_RELEASE_DEBUG: '1'
+      RUSTFLAGS: '-C force-frame-pointers=yes'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stall-repro-release-frame-pointers
+      - name: Build exact historical source without porting it
+        run: |
+          git fetch origin refs/pull/68/head
+          mkdir -p "$RUNNER_TEMP/historical-source" tools/stall-repro/results/historical-build
+          git archive ${{ matrix.source }} | tar -x -C "$RUNNER_TEMP/historical-source"
+          export CARGO_TARGET_DIR="$PWD/target"
+          cargo build --release --locked --manifest-path "$RUNNER_TEMP/historical-source/Cargo.toml" -p electric-circuits-engine
+          printf '%s\n' '${{ matrix.source }}' > tools/stall-repro/results/historical-build/source.txt
+          sha256sum target/release/electric-circuits-engine > tools/stall-repro/results/historical-build/binary.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stall-historical-engine-${{ matrix.source }}
+          path: target/release/electric-circuits-engine
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stall-historical-build-${{ matrix.source }}
+          path: tools/stall-repro/results/historical-build/
   observer-build:
     if: contains(github.event.head_commit.message, '[observe-build]')
     runs-on: ubuntu-latest
@@ -54,9 +91,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]') || contains(github.event.head_commit.message, '[observe]')) && '["nov24"]' || '["nov23","nov24"]') }}
-        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained","A"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
+        catalog: ${{ fromJSON((contains(github.event.head_commit.message, '[smoke]') || contains(github.event.head_commit.message, '[model-B]') || contains(github.event.head_commit.message, '[cpu-variants]') || contains(github.event.head_commit.message, '[cheap-variants]') || contains(github.event.head_commit.message, '[observe]')) && '["nov24"]' || '["nov23","nov24"]') }}
+        variant: ${{ fromJSON(contains(github.event.head_commit.message, '[model-B]') && '["B","B-retained","A"]' || contains(github.event.head_commit.message, '[cheap-variants]') && '["marker-bypass","A-observed"]' || contains(github.event.head_commit.message, '[observe]') && '["A-observed"]' || '["A"]') }}
         cpus: ${{ fromJSON(contains(github.event.head_commit.message, '[cpu-variants]') && '[2,4]' || '[1]') }}
+        include: ${{ fromJSON(contains(github.event.head_commit.message, '[cheap-variants]') && '[{"catalog":"nov24","variant":"A","cpus":2},{"catalog":"nov24","variant":"A","cpus":4}]' || '[]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -79,17 +117,17 @@ jobs:
           echo "STALL_REPRO_PERF=$PERF" >> "$GITHUB_ENV"
           sudo "$PERF" stat -e cpu-clock -- true
       - uses: actions/download-artifact@v4
-        if: ${{ !contains(github.event.head_commit.message, '[observe]') }}
+        if: matrix.variant != 'A-observed' && matrix.variant != 'marker-bypass'
         with:
           name: stall-engine-d6f1b0a9fc1f437a357ac259eb13f436256bc937
           run-id: 45342910224
           github-token: ${{ github.token }}
           path: tools/stall-repro/bin
       - uses: actions/download-artifact@v4
-        if: contains(github.event.head_commit.message, '[observe]')
+        if: matrix.variant == 'A-observed' || matrix.variant == 'marker-bypass'
         with:
-          name: stall-observed-engine-894b2cca2ec9c1ba547e130e275159c61e178e59
-          run-id: 45358360702
+          name: ${{ contains(github.event.head_commit.message, '[observe]') && 'stall-observed-engine-894b2cca2ec9c1ba547e130e275159c61e178e59' || 'stall-observed-engine-cbb6156a1c20de49e9175e895acb2cec75286a57' }}
+          run-id: ${{ contains(github.event.head_commit.message, '[observe]') && '45358360702' || '45359671720' }}
           github-token: ${{ github.token }}
           path: tools/stall-repro/bin
       - uses: actions/download-artifact@v4
@@ -119,6 +157,7 @@ jobs:
           if [ "$SMOKE" = 1 ]; then ARGS=(--smoke --timeout 120); fi
           if [ "$CALIBRATE" = 1 ]; then ARGS+=(--calibrate-only); fi
           if [ "$OBSERVE" = 1 ]; then ARGS+=(--workloads import --engine-source 894b2cca2ec9c1ba547e130e275159c61e178e59); fi
+          if [ "$OBSERVE" != 1 ] && { [ '${{ matrix.variant }}' = A-observed ] || [ '${{ matrix.variant }}' = marker-bypass ]; }; then ARGS+=(--engine-source cbb6156a1c20de49e9175e895acb2cec75286a57); fi
           nohup bash -c 'set +e; python "$@"; echo "$?" > "$RUNNER_TEMP/stall-driver-exit"' _ tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.variant }}-${{ matrix.catalog }}-${{ matrix.cpus }}cpu --catalog ${{ matrix.catalog }} --variant ${{ matrix.variant }} --cpus ${{ matrix.cpus }} "${ARGS[@]}" > "$RUNNER_TEMP/stall-driver.log" 2>&1 &
           while ! test -f tools/stall-repro/results/run-${{ matrix.variant }}-${{ matrix.catalog }}-${{ matrix.cpus }}cpu/catalog-before-warmup.json; do
             if test -f "$RUNNER_TEMP/stall-driver-exit"; then cat "$RUNNER_TEMP/stall-driver.log"; exit "$(cat "$RUNNER_TEMP/stall-driver-exit")"; fi
