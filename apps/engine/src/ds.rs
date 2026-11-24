@@ -3703,7 +3703,7 @@ mod tests {
         tokio::select! {
             biased;
             _ = &mut read => panic!("must wait for Retry-After"),
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => shutdown.begin(),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => { shutdown.begin(); },
         }
         assert!(read.await.is_err());
         assert_eq!(*store.read_offsets.lock().unwrap(), vec!["prior"]);
