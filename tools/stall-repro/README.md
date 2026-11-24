@@ -4,9 +4,11 @@ This branch starts at engine commit `5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363`.
 No changes here are intended for merge, deployment, or review. Never point this
 harness at production or development; all rows and identities must be synthetic.
 
-The harness is under construction. SQL-only workload validation passes, but no
-engine workload measurements have been made. See `results/RESULTS.md` for the
-evidence status, including environment failures and fidelity limitations.
+The calibrated production-source baseline reproduces minutes of cross-account
+starvation, and CPU stacks, observer wall times and audience-key measurements are
+retained in `results/RESULTS.md`. It does not reproduce every incident detail or
+absolute duration. Every prototype is unqualified and unmergeable; read
+`MEASUREMENT_PATCHES.md` before interpreting a variant.
 
 ## Execution route
 
@@ -31,9 +33,25 @@ synthetic. This does not qualify the production storage implementation.
 The workflow is the complete executable recipe. It pins the production-source
 engine and store artifacts by their originating run IDs, so a Python harness fix
 does not require rebuilding Rust. Push a commit containing `[smoke]` for a reduced
-40-request smoke, `[measure]` for the full Nov 24 catalog, `[engine]` to rebuild
+40-request smoke, `[measure]` for both full catalogs, `[engine]` to rebuild
 the engine, or `[store]` to rebuild the store. Ordinary pushes validate fixtures.
 Documentation-only commits do not launch another experiment.
+
+| Commit-message tags | Actions experiment |
+| --- | --- |
+| `[measure] [profile]` | Production binary, Nov23 and Nov24, 1 CPU, import perf stacks |
+| `[measure] [model-B]` | B and B-retained, Nov24, 1 CPU |
+| `[measure] [cheap-variants]` | A at 2/4 CPUs; observer control and unsafe marker bypass at 1 CPU |
+| `[coalesced-build]` | Exact PR68 base/head builds, no source port |
+| `[measure] [coalesced]` | PR68 base/head, Nov24, 1 CPU |
+| `[observe-build]` | Current scratch Rust binary plus focused observer/fold tests |
+| `[measure] [observe]` | Verified original observer binary, import only |
+| `[measure] [final-variants]` | Verified per-commit binary, then half/plain controls, 1 CPU |
+
+Artifact run IDs and exact binary source commits are pinned in the workflow.
+Do not use a newly built scratch binary as the unchanged-production baseline.
+The production build archives `5b2cf3e` even when the harness branch contains
+measurement Rust changes. All variants use release debug level 1/frame pointers.
 
 ```sh
 python -m unittest discover -s tools/stall-repro -p 'test_*.py'
@@ -58,6 +76,29 @@ Node 22 runs `store-proxy.ts` using native type stripping; no pnpm install is ne
 Systemd/sudo is required for the engine cgroup. The requested verified quota is
 in force from process start, including catalog warmup, so runtime thread selection
 does not accidentally observe a larger startup quota. Each run requires a fresh database.
+
+To select a variant manually, add `--variant B`, `B-retained`, `marker-bypass`,
+`commit-membership`, `coalesced-base`, `coalesced-head`, `half-subqueries` or
+`plain-only`. Supply the matching binary and `--engine-source FULL_SHA` for
+nonproduction builds. Use `--cpus 2` or `4` for CPU controls. `--workloads import`
+limits an observer run, but the comparison defaults to all three workloads.
+For perf, install the runner's `linux-tools` and set `STALL_REPRO_PERF` to the
+working binary path. The driver invokes
+`sudo perf record -e cpu-clock -F 99 -g --call-graph fp -p PID` during import.
+
+Download and summarize evidence without running the experiment locally:
+
+```sh
+bash tools/stall-repro/collect.sh ACTIONS_RUN_ID /tmp/stall-artifacts
+python3 tools/stall-repro/retain_results.py /tmp/stall-artifacts tools/stall-repro/results/variants
+python3 tools/stall-repro/summarize_results.py tools/stall-repro/results/variants
+python3 tools/stall-repro/profile_report.py tools/stall-repro/results/baseline-8a60659/nov24/import.folded.gz
+```
+
+The collector uses the attached repository's Mighty GitHub App, not personal
+credentials. Do not repeatedly poll Actions: collect after a durable Mighty
+one-shot trigger, and honor any API rate refusal. Folded stacks are gzip-compressed
+without timestamps; full raw perf files remain in the named Actions artifacts.
 
 ## Files
 
