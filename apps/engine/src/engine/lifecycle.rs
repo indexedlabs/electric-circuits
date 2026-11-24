@@ -883,7 +883,33 @@ impl Engine {
         let id = format!("s{num_id}");
         st.next_shape_id += 1;
         let stream_path = format!("shape/{id}");
+        // The PUT runs without the state lock, as the row-shape and subquery paths' do: a
+        // rate-limited store keeps `ensure_stream` retrying for as long as it answers 429, and every
+        // other create, join, drop and sweep takes this lock. Unlike theirs, this stream must exist
+        // before anything is registered (the circuit path's sequencer appends the seed as soon as
+        // it is asked), so the lock is re-taken after the PUT and what the first hold checked is
+        // checked again. The id needs no re-check: `next_shape_id` only grows.
+        drop(st);
         self.ds.ensure_stream(&stream_path).await?;
+        st = self.state.lock().await;
+        let recheck = self.ensure_schema_resolved(&st, std::slice::from_ref(table)).and_then(|()| {
+            if st.feed_by_sig.contains_key(&agg_sig) {
+                // Redone, the attempt joins the aggregate that registered while this one waited.
+                return Err(anyhow::Error::new(CreateRaced(format!(
+                    "an identical aggregate registered while '{stream_path}' was being made"
+                ))));
+            }
+            ensure_group_subscription_available(&st, sub, false)?;
+            ensure_subscription_free(&st, sub, "")
+        });
+        if let Err(e) = recheck {
+            drop(st);
+            // Nothing refers to the stream yet: leave no orphan behind.
+            if let Err(delete) = self.ds.delete_stream(&stream_path).await {
+                tracing::warn!("aggregate {id}: could not delete its unused stream '{stream_path}': {delete:#}");
+            }
+            return Err(e);
+        }
 
         // Circuit-served path: a bare COUNT whose predicate decomposes over the table's counts
         // pipeline is seeded by summing groups and updated from group deltas — no Postgres.

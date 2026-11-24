@@ -552,9 +552,11 @@ pub(crate) fn spawn_catalog_writer(
                                      with it. No event is dropped."
                                 );
                             }
-                            let wait = crate::ds::rate_limit_retry_delay(&e, attempt).unwrap_or_else(|| {
-                                crate::replication::jitter(catalog_backoff(attempt), crate::replication::clock_nanos())
-                            });
+                            // Jittered either way: engines refused by one store at the same moment
+                            // must not re-send at the same moment.
+                            let nanos = crate::replication::clock_nanos();
+                            let wait = crate::ds::jittered_rate_limit_retry_delay(&e, attempt, nanos)
+                                .unwrap_or_else(|| crate::replication::jitter(catalog_backoff(attempt), nanos));
                             tokio::time::sleep(wait).await;
                         }
                     },

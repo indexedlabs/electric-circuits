@@ -475,7 +475,8 @@ perform the idempotent exact-generation promotion.
   acknowledged only once its `Created` record has reached the catalog (the same for a join), and a
   catalog append that fails transiently — a refused connection, a timeout, a 429 or 5xx — is retried in
   place, forever, at 100 ms → 5 s. For 429, Retry-After (seconds or an HTTP date) is honored
-  within the growing backoff floor and 5 s ceiling. So `POST /shapes` hangs for the duration of the outage
+  within the growing backoff floor and 5 s ceiling, with jitter so engines sharing one store do not
+  retry in lockstep (never below Retry-After). So `POST /shapes` hangs for the duration of the outage
   instead of returning a handle a restart would forget; use your client's own timeout, and expect
   `catalog_append_retries_total` to climb with `shape_appends` flat. If the client gives up and the
   record lands anyway, the shape simply has no subscriber and the retention sweeper evicts it.

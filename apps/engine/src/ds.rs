@@ -338,6 +338,25 @@ pub(crate) fn rate_limit_retry_delay(e: &anyhow::Error, attempt: u32) -> Option<
     e.downcast_ref::<DsRateLimited>().map(|rate| rate_limit_delay(attempt, rate.retry_after))
 }
 
+/// [`rate_limit_retry_delay`] spread by `nanos` (clock noise, see `replication::jitter`) for a
+/// retrier that others may have been refused alongside: writers given the same `Retry-After` must
+/// not all come back at once. The spread is the quarter above the bounded delay, as far as the
+/// ceiling allows; at the ceiling the window slides down instead of vanishing. It never starts
+/// below the `Retry-After` (itself bounded by the ceiling).
+pub(crate) fn jittered_rate_limit_retry_delay(
+    e: &anyhow::Error,
+    attempt: u32,
+    nanos: u32,
+) -> Option<std::time::Duration> {
+    let rate = e.downcast_ref::<DsRateLimited>()?;
+    let delay = rate_limit_delay(attempt, rate.retry_after);
+    let width = delay / 4;
+    let top = (delay + width).min(RATE_LIMIT_DELAY_MAX);
+    let floor = top.saturating_sub(width).max(rate.retry_after.unwrap_or_default().min(top));
+    let span = u64::try_from((top - floor).as_millis()).unwrap_or(0);
+    Some(floor + std::time::Duration::from_millis(u64::from(nanos) % (span + 1)))
+}
+
 /// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
 /// connection, a timeout, a connection dropped mid-response, a 429, or a 5xx?
 ///
@@ -2212,13 +2231,16 @@ fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
 
 /// Keep both stale/zero and excessively large provider delays within the existing
 /// backoff bounds. Repeated 429s still grow the delay when the header is too small.
+/// The longest a 429 is waited out before the next attempt, whatever `Retry-After` asked for.
+const RATE_LIMIT_DELAY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn rate_limit_delay(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
-    rate_limit_backoff(attempt).max(retry_after.unwrap_or_default()).min(std::time::Duration::from_secs(5))
+    rate_limit_backoff(attempt).max(retry_after.unwrap_or_default()).min(RATE_LIMIT_DELAY_MAX)
 }
 
 fn rate_limit_backoff(attempt: u32) -> std::time::Duration {
     let step = attempt.saturating_sub(1).min(6);
-    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << step)).min(std::time::Duration::from_secs(5))
+    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << step)).min(RATE_LIMIT_DELAY_MAX)
 }
 
 #[derive(Deserialize)]
@@ -3816,6 +3838,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sent_at, [0, 100, 300, 700], "{header}: repeated 429s must use growing backoff");
+    }
+
+    /// The catalog writer's 429 wait is spread across writers and attempts, never shorter than the
+    /// store's `Retry-After` (bounded by the 5 s ceiling) and never longer than that ceiling.
+    #[test]
+    fn rate_limited_catalog_jitter_spreads_retries_and_never_undercuts_retry_after() {
+        let ceiling = std::time::Duration::from_secs(5);
+        for retry_after in
+            [None, Some(0), Some(2), Some(4), Some(5), Some(3600)].map(|s| s.map(std::time::Duration::from_secs))
+        {
+            let e = status_error_with_retry_after("POST", "meta/catalog", 429, "", retry_after);
+            let floor = retry_after.unwrap_or_default().min(ceiling);
+            let mut every_attempt = std::collections::BTreeSet::new();
+            for attempt in 1..=10 {
+                // Writers refused together differ only in their clock noise.
+                let writers: std::collections::BTreeSet<_> = (0..64u32)
+                    .map(|writer| {
+                        jittered_rate_limit_retry_delay(&e, attempt, writer.wrapping_mul(2_654_435_761)).unwrap()
+                    })
+                    .collect();
+                for &delay in &writers {
+                    assert!(delay >= floor, "{retry_after:?} attempt {attempt}: {delay:?} undercuts Retry-After");
+                    assert!(delay <= ceiling, "{retry_after:?} attempt {attempt}: {delay:?} exceeds the ceiling");
+                }
+                if floor < ceiling {
+                    assert!(writers.len() > 1, "{retry_after:?} attempt {attempt}: writers retry in lockstep");
+                    let bounded = rate_limit_delay(attempt, retry_after);
+                    if bounded + bounded / 4 <= ceiling {
+                        assert!(writers.iter().all(|&d| d >= bounded), "below the ceiling the spread is upward only");
+                    }
+                }
+                every_attempt.extend(writers);
+            }
+            if floor < ceiling {
+                assert!(every_attempt.len() > 10, "{retry_after:?}: the delay must vary across attempts and writers");
+            }
+        }
+        let unavailable = status_error("POST", "meta/catalog", 503, "");
+        assert_eq!(jittered_rate_limit_retry_delay(&unavailable, 1, 0), None, "other errors keep their own policy");
     }
 
     #[tokio::test(start_paused = true)]
