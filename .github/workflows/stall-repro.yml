@@ -63,9 +63,11 @@ jobs:
       - name: Start isolated driver and retain catalog checkpoint
         env:
           SMOKE: ${{ contains(github.event.head_commit.message, '[smoke]') && '1' || '0' }}
+          CALIBRATE: ${{ contains(github.event.head_commit.message, '[calibrate]') && '1' || '0' }}
         run: |
           ARGS=()
           if [ "$SMOKE" = 1 ]; then ARGS=(--smoke --timeout 120); fi
+          if [ "$CALIBRATE" = 1 ]; then ARGS+=(--calibrate-only); fi
           nohup bash -c 'set +e; python "$@"; echo "$?" > "$RUNNER_TEMP/stall-driver-exit"' _ tools/stall-repro/run.py --engine tools/stall-repro/bin/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-${{ matrix.catalog }} --catalog ${{ matrix.catalog }} "${ARGS[@]}" > "$RUNNER_TEMP/stall-driver.log" 2>&1 &
           while ! test -f tools/stall-repro/results/run-${{ matrix.catalog }}/catalog-before-warmup.json; do
             if test -f "$RUNNER_TEMP/stall-driver-exit"; then cat "$RUNNER_TEMP/stall-driver.log"; exit "$(cat "$RUNNER_TEMP/stall-driver-exit")"; fi

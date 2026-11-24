@@ -205,6 +205,8 @@ async def run(args):
             memory.raise_for_status()
             save(output / "catalog-calibration.json", {"target": TARGETS[args.catalog], "actual": memory.json(), "source_shape_requests": len(catalog), "smoke_only": args.smoke})
             print(json.dumps({"calibration": memory.json()["cardinalities"]}), flush=True)
+            if args.calibrate_only:
+                return
             command("sudo", "systemctl", "set-property", unit, f"CPUQuota={int(args.cpus * 100)}%")
             cgroup = subprocess.check_output(["systemctl", "show", unit, "--property=ControlGroup", "--value"], text=True).strip()
             quota = Path("/sys/fs/cgroup") / cgroup.lstrip("/") / "cpu.max"
@@ -338,4 +340,5 @@ if __name__ == "__main__":
     parser.add_argument("--cpus", type=float, default=1)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--calibrate-only", action="store_true")
     asyncio.run(run(parser.parse_args()))
