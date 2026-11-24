@@ -55,6 +55,23 @@ def validate_predicate(predicate, table, columns):
                 validate_predicate(member, table, columns)
 
 
+RECORD_FAMILY = ("record", "record_date_index", "record_recurrence", "record_assignee_index", "record_completed_index", "assignment")
+
+
+def without_attendee_subject(where):
+    """Today's graph_edge filter with its has_attendee/has_subject branch removed (B-cold keys that branch)."""
+    def is_attendee_subject(branch):
+        types = {member.get("value") for clause in branch.get("and", []) for member in clause.get("or", []) if isinstance(member, dict) and member.get("col") == "edge_type"}
+        return types == {"has_attendee", "has_subject"}
+    copy = json.loads(json.dumps(where))
+    branches = copy["and"][0]["and"][1]["or"]
+    kept = [branch for branch in branches if not is_attendee_subject(branch)]
+    if len(kept) != len(branches) - 1:
+        raise ValueError("expected exactly one has_attendee/has_subject branch in today's graph_edge filter")
+    copy["and"][0]["and"][1]["or"] = kept
+    return copy
+
+
 def plain_control_body(body, account, identity):
     table = body["table"].removeprefix("public.")
     columns = body["columns"]
@@ -107,6 +124,52 @@ class GatewayShapes:
         key = synthetic_id(f"calendar/{owner}/{calendar}") if table == "calendar_event" else synthetic_id(f"space/{owner}")
         predicate = {"and": [{"col": "audience_key", "op": "eq", "value": str(key)}, {"col": "reader_class", "op": "eq", "value": "live"}]}
         return {"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key", "reader_class"}), "where": predicate, "changesOnly": True, "subscription": self.gateway._internal_subscription(synthetic_id(f"user/{account}"), f"{identity}:{table}:{key}:live", self.authority(account))}
+
+    def _subscription(self, table, account, identity):
+        return self.gateway._internal_subscription(synthetic_id(f"user/{account}"), f"{identity}:{table}", self.authority(account))
+
+    def _plain_body(self, table, account, where, identity, keyed=True):
+        collection = self.gateway.registered_collection(table, allow_chat_projection_dependency=True)
+        columns = set(collection.columns) | ({"audience_key", "reader_class"} if keyed else set())
+        return {"table": f"public.{table}", "columns": sorted(columns), "where": where, "changesOnly": True, "subscription": self._subscription(table, account, identity)}
+
+    async def cold_bodies(self, table, account):
+        """Variant B-cold, amended (`variant-b-cold.md`): the shapes one account holds on `table`."""
+        user = str(synthetic_id(f"user/{account}"))
+        space = str(synthetic_id(f"space/{account}"))
+        live = [{"col": "audience_key", "op": "eq", "value": space}, {"col": "reader_class", "op": "eq", "value": "live"}]
+        if table in RECORD_FAMILY:
+            shared = {"col": "id" if table == "record" else "record_id", "in": {"table": "public.record_share", "project": "record_id", "where": {"and": [{"col": "target_type", "op": "eq", "value": "user"}, {"col": "target_id", "op": "eq", "value": user}, {"col": "deleted_at", "isNull": True}]}}}
+            return [self.keyed_body(table, account, identity="cold"), self._plain_body(table, account, shared, "cold-direct-share", keyed=False)]
+        if table == "message":
+            record_chat = {"and": [*live, {"col": "deleted_at", "isNull": True}, {"col": "target_type", "op": "eq", "value": "record"}]}
+            composer = {"and": [{"col": "user_id", "op": "eq", "value": user}, {"col": "deleted_at", "isNull": True}, {"col": "target_type", "op": "eq", "value": "composer_submission"}]}
+            return [self._plain_body(table, account, record_chat, "cold-record-chat"), self._plain_body(table, account, composer, "cold-pending-composer")]
+        if table == "suggestion":
+            deck = {"and": [*live, {"col": "deleted_at", "isNull": True}, {"col": "status", "op": "eq", "value": "pending"}, {"col": "removed_at", "isNull": True}]}
+            return [self._plain_body(table, account, deck, "cold-deck")]
+        if table == "graph_edge":
+            keyed = {"and": [*live, {"col": "from_type", "op": "eq", "value": "record"}, {"col": "to_type", "op": "eq", "value": "resource"}, {"or": [{"col": "edge_type", "op": "eq", "value": "has_attendee"}, {"col": "edge_type", "op": "eq", "value": "has_subject"}]}]}
+            today = await self.body("graph_edge", account, None, identity="cold-other-edges")
+            return [self._plain_body(table, account, keyed, "cold-attendee-subject"), {**today, "where": without_attendee_subject(today["where"])}]
+        if table in {"file", "user", "standing_grant", "standing_grant_backfill_status", "monitored_url_subscription", "monitored_url_source"}:
+            return [await self.body(table, account, None, identity=f"cold-today-{table}")]
+        if table in {"resource", "resource_fact"}:
+            shared = {"table": "public.resource_share", "project": "resource_id", "where": {"and": [{"col": "target_id", "op": "eq", "value": user}, {"col": "deleted_at", "isNull": True}]}}
+            where = {"and": [{"col": "deleted_at", "isNull": True}, {"or": [{"col": "space_id", "op": "eq", "value": space}, {"col": "id" if table == "resource" else "resource_id", "in": shared}]}]}
+            return [self._plain_body(table, account, where, "cold-space-or-share", keyed=False)]
+        if table == "calendar_event":
+            return [self.keyed_body(table, account, calendar=calendar, identity="cold") for calendar in range(15)]
+        return [self.keyed_body(table, account, identity="cold")]
+
+    async def cold_catalog(self, requests):
+        result = {}
+        for request in requests:
+            table = request["body"]["table"].removeprefix("public.")
+            for body in await self.cold_bodies(table, request["account"]):
+                signature = json.dumps({key: value for key, value in body.items() if key != "subscription"}, sort_keys=True)
+                result[signature] = {"kind": "cold-retained" if contains_subquery(body["where"]) else "cold-plain", "account": request["account"], "body": body, "has_subquery": contains_subquery(body["where"])}
+        return list(result.values())
 
     async def keyed_catalog(self, requests, preserved=frozenset()):
         result = {}

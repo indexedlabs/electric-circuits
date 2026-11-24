@@ -155,3 +155,9 @@ that table is keyed. Classes: `chat` = message, workflow_run; `edge` = graph_edg
 resource, resource_fact; `file` = file; `user` = user. The writer maintains audience keys on
 every table in all keyed variants, as for B. These runs show how much each retained class costs.
 They do not claim that keying the class is authorization-equivalent.
+
+## Engine bisect, B-cold and E variants (`[paired] [paired-2] [bisect-build]`)
+
+- **Engine bisect.** Release builds (debug level 1, frame pointers) of PR 70 (`e10c4bd`), PR 71 (`a248886`) and PR 69 (`b42f70d`, prod since 08:33 UTC Nov 24), built from `git archive` with no source change. They run beside the existing `1be10fb` and `5b2cf3e` binaries on one runner.
+- **B-cold.** See `variant-b-cold.md`.
+- **E-only and E-plus-R.** Today's catalog (A). Only `graph_edge` (E-only), or `graph_edge` plus the six Record-family tables (E-plus-R), get B's audience-key columns and keyed bodies, collapsed to one feed per account as in B. Every other table and the probe's feed stay as today, except that the probe's Record feed is keyed in E-plus-R.

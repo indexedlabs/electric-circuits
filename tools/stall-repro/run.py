@@ -16,8 +16,8 @@ import httpx
 import psutil
 import psycopg
 
-from catalog import GatewayShapes, TARGETS, control_catalog, plain_control_body
-from data import IMPORT_ACCOUNT, LARGE_ACCOUNT, load_data, row_id
+from catalog import RECORD_FAMILY, GatewayShapes, TARGETS, control_catalog, plain_control_body
+from data import IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
 
@@ -104,6 +104,9 @@ async def sample_cpu(process, cgroup, output, stopped):
 
 RETAINED_CLASSES = {"chat": {"message", "workflow_run"}, "edge": {"graph_edge"}, "resource": {"resource", "resource_fact"}, "file": {"file"}, "user": {"user"}}
 KEYED_VARIANTS = {"B", "B-retained", *(f"B-retained-key-{name}" for name in RETAINED_CLASSES)}
+# E-only / E-plus-R: today's catalog (A) with only these tables keyed as B keys them.
+PARTLY_KEYED = {"E-only": {"graph_edge"}, "E-plus-R": {"graph_edge", *RECORD_FAMILY}}
+AUDIENCE_VARIANTS = KEYED_VARIANTS | {"B-cold"} | set(PARTLY_KEYED)
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -113,6 +116,13 @@ BRIDGE_ENVIRONMENT = {
     "sampler-10x": {"STALL_REPRO_MEM_SAMPLER_MS": "5000"},
     "bridge-control": {},
 }
+
+
+def keyed(variant, table):
+    """Whether this variant reads `table` through B's audience-key equality shapes."""
+    if variant in PARTLY_KEYED:
+        return table in PARTLY_KEYED[variant]
+    return variant in KEYED_VARIANTS and table not in preserved_tables(variant)
 
 
 def preserved_tables(variant):
@@ -132,8 +142,9 @@ async def run(args):
     fixture = folder / "results/fixture"
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
     data = load_data(fixture / "columns.json")
-    if args.variant in KEYED_VARIANTS:
-        statements = await asyncio.to_thread(data.add_audience_columns, PG_URL, [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]])
+    if args.variant in AUDIENCE_VARIANTS:
+        published = [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]]
+        statements = await asyncio.to_thread(data.add_audience_columns, PG_URL, [table for table in published if args.variant not in PARTLY_KEYED or table in PARTLY_KEYED[args.variant]])
         (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
     help_probe = subprocess.run([str(Path(args.store).resolve()), "--help"], capture_output=True, text=True)
     (output / "store-help.txt").write_text(help_probe.stdout + help_probe.stderr)
@@ -143,7 +154,7 @@ async def run(args):
         store_arguments.extend(["--max-chunk-bytes", "4194304"])
     save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
-    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL))
+    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant == "B-cold"))
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen(store_arguments, stdout=store_log, stderr=subprocess.STDOUT)
     async with httpx.AsyncClient(timeout=1) as store_client:
@@ -207,6 +218,10 @@ async def run(args):
             catalog = await gateway.generate(args.catalog, args.scale)
             if args.variant in KEYED_VARIANTS:
                 catalog = await gateway.keyed_catalog(catalog, preserved=preserved_tables(args.variant))
+            if args.variant in PARTLY_KEYED:
+                catalog = await gateway.keyed_catalog(catalog, preserved={request["body"]["table"].removeprefix("public.") for request in catalog} - PARTLY_KEYED[args.variant])
+            if args.variant == "B-cold":
+                catalog = await gateway.cold_catalog(catalog)
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -227,13 +242,17 @@ async def run(args):
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
             for table in ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource"):
-                keyed = args.variant in KEYED_VARIANTS and table not in preserved_tables(args.variant)
-                for calendar in (range(15) if keyed and table == "calendar_event" else [0]):
-                    body = gateway.keyed_body(table, IMPORT_ACCOUNT, calendar=calendar, identity=f"import-{table}") if keyed else await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}")
+                if args.variant == "B-cold":
+                    for body in await gateway.cold_bodies(table, IMPORT_ACCOUNT):
+                        await create({"body": body})
+                    continue
+                table_keyed = keyed(args.variant, table)
+                for calendar in (range(15) if table_keyed and table == "calendar_event" else [0]):
+                    body = gateway.keyed_body(table, IMPORT_ACCOUNT, calendar=calendar, identity=f"import-{table}") if table_keyed else await gateway.body(table, IMPORT_ACCOUNT, identity=f"import-{table}")
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in KEYED_VARIANTS else await gateway.body("record", 0, identity="other-account-probe")
+            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant == "B-cold" or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
             if args.variant == "plain-only":
                 probe_body = plain_control_body(probe_body, 0, "other-account-probe")
             probe_feed = await create({"body": probe_body})
@@ -297,7 +316,12 @@ async def run(args):
                 cpu_task = asyncio.create_task(sample_cpu(process, quota.parent, output / f"{workload}-cpu.jsonl", cpu_stopped))
                 result = {"workload": workload, "measurement": "source SQL start to workload receipt and zero pending flips/appends", "first_change_read_time": None, "timeout_s": args.timeout}
                 try:
-                    operation = data.calendar_import if workload == "import" else lambda url, callback: data.delete_account(url, LARGE_ACCOUNT if workload == "large-delete" else IMPORT_ACCOUNT, callback)
+                    if workload == "import":
+                        operation = data.calendar_import
+                    elif workload == "share-delete":
+                        operation = lambda url, callback: data.delete_account(url, SHARE_ACCOUNT, callback, extra_tables=SHARE_TABLES)
+                    else:
+                        operation = lambda url, callback: data.delete_account(url, LARGE_ACCOUNT if workload == "large-delete" else IMPORT_ACCOUNT, callback)
                     journal = await asyncio.to_thread(operation, PG_URL, mark)
                     save(output / f"{workload}-writes.json", journal)
                     result["row_changes"] = sum(entry["rows"] for entry in journal)
@@ -408,8 +432,8 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
-    parser.add_argument("--variant", choices=("A", "A-observed", *sorted(KEYED_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
+    parser.add_argument("--variant", choices=("A", "A-observed", *sorted(AUDIENCE_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete"), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

@@ -1,0 +1,1381 @@
+{
+  "indexed_commit": "da746b7dce4e4b7aa89215eb5e5cdad2d2d947ce",
+  "publication": [
+    "public.conversation",
+    "public.calendar_event",
+    "public.calendar",
+    "public.record_date_index",
+    "public.record",
+    "public.record_recurrence",
+    "public.graph_edge",
+    "public.circuits_source_fence",
+    "public.native_sync_authority_fence",
+    "public.space",
+    "public.record_share",
+    "public.monitored_url_source",
+    "public.monitored_url_subscription",
+    "public.resource",
+    "public.resource_share",
+    "public.assignment",
+    "public.standing_grant",
+    "public.partner_calendar_event_mirror",
+    "public.message",
+    "public.composer_submission",
+    "public.workflow",
+    "public.record_completed_index",
+    "public.workflow_run",
+    "public.suggestion",
+    "public.user",
+    "public.space_member",
+    "public.external_account",
+    "public.invite",
+    "public.assistant_state",
+    "public.feedback",
+    "public.upcoming_summary",
+    "public.calendar_highlight",
+    "public.suggestion_seen",
+    "public.activity",
+    "public.email_inbox",
+    "public.generated_image",
+    "public.assistant_stream_event",
+    "public.resource_fact",
+    "public.record_assignee_index",
+    "public.tag",
+    "public.tagged_item",
+    "public.file",
+    "public.file_share",
+    "public.standing_grant_backfill_status",
+    "public.external_link"
+  ],
+  "tables_with_fk_dependencies": [
+    "activity",
+    "agent_run",
+    "assignment",
+    "assistant_run",
+    "assistant_state",
+    "assistant_stream_event",
+    "calendar",
+    "calendar_event",
+    "calendar_highlight",
+    "channel_conversation",
+    "channel_event",
+    "circuits_source_fence",
+    "composer_submission",
+    "contact_address",
+    "conversation",
+    "email_inbox",
+    "event_log",
+    "external_account",
+    "external_link",
+    "external_link_group",
+    "external_link_item",
+    "feedback",
+    "file",
+    "file_share",
+    "generated_image",
+    "graph_edge",
+    "invite",
+    "message",
+    "monitored_url_run",
+    "monitored_url_source",
+    "monitored_url_subscription",
+    "monty_runtime_checkpoint",
+    "native_sync_authority_fence",
+    "partner_calendar_event_mirror",
+    "record",
+    "record_assignee_index",
+    "record_completed_index",
+    "record_date_index",
+    "record_recurrence",
+    "record_share",
+    "resource",
+    "resource_fact",
+    "resource_share",
+    "routine",
+    "routine_installation",
+    "routine_revision",
+    "signal",
+    "space",
+    "space_member",
+    "standing_grant",
+    "standing_grant_backfill_status",
+    "suggestion",
+    "suggestion_seen",
+    "tag",
+    "tagged_item",
+    "upcoming_summary",
+    "user",
+    "workflow",
+    "workflow_run",
+    "workflow_runtime_event",
+    "workflow_runtime_state"
+  ],
+  "loaded": [
+    {
+      "module": "api.models.base",
+      "name": "Base",
+      "source_sha256": "e75d744b5d2cae4f970dd6529255b4b02e4730aa0ede2e5fa471927000d11827"
+    },
+    {
+      "module": "api.models.uuid",
+      "name": "uuidv7_pk",
+      "source_sha256": "dc6c258d8438ab7ba15584fa180855749504eb712ab2c8a6d72687fd34e2a9ad"
+    },
+    {
+      "module": "api.models.uuid",
+      "name": "uuidv7",
+      "source_sha256": "dc6c258d8438ab7ba15584fa180855749504eb712ab2c8a6d72687fd34e2a9ad"
+    },
+    {
+      "module": "api.models.types",
+      "name": "WheneverInstant",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.external_link",
+      "name": "PROVIDER_COLUMNS_CHECK",
+      "source_sha256": "cbee1d1e3f4c1fd01ee32d5414cb68ec8b6053d1151eb778d712499345a4407a"
+    },
+    {
+      "module": "api.models.external_link",
+      "name": "APP_COLUMNS_CHECK",
+      "source_sha256": "cbee1d1e3f4c1fd01ee32d5414cb68ec8b6053d1151eb778d712499345a4407a"
+    },
+    {
+      "module": "api.models.external_link",
+      "name": "ExternalLink",
+      "source_sha256": "cbee1d1e3f4c1fd01ee32d5414cb68ec8b6053d1151eb778d712499345a4407a"
+    },
+    {
+      "module": "api.models.types",
+      "name": "StrEnumType",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.workflow",
+      "name": "WorkflowType",
+      "source_sha256": "21eab405ae1d77c7aeef410dec9c208cc415d0c7f8982bd65e79f282abaee169"
+    },
+    {
+      "module": "api.models.workflow",
+      "name": "WorkflowStatus",
+      "source_sha256": "21eab405ae1d77c7aeef410dec9c208cc415d0c7f8982bd65e79f282abaee169"
+    },
+    {
+      "module": "api.models.workflow",
+      "name": "Workflow",
+      "source_sha256": "21eab405ae1d77c7aeef410dec9c208cc415d0c7f8982bd65e79f282abaee169"
+    },
+    {
+      "module": "api.models.types",
+      "name": "USER_STRING_MAX_LENGTH",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.types",
+      "name": "UserString",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.user",
+      "name": "AvatarColor",
+      "source_sha256": "8644539dda017cc368e7361d2945d5c59dc0b1ddfd3644ce599078637f709b9b"
+    },
+    {
+      "module": "api.models.user",
+      "name": "UserReferralSource",
+      "source_sha256": "8644539dda017cc368e7361d2945d5c59dc0b1ddfd3644ce599078637f709b9b"
+    },
+    {
+      "module": "api.models.user",
+      "name": "REFERRAL_SOURCE_MAX_LENGTH",
+      "source_sha256": "8644539dda017cc368e7361d2945d5c59dc0b1ddfd3644ce599078637f709b9b"
+    },
+    {
+      "module": "api.lib.trace_capture",
+      "name": "TraceCaptureMode",
+      "source_sha256": "7153cfd081ccb91326a66efa5fa1609d1c9cdfcf56c8b55a4fb647db0a980ffa"
+    },
+    {
+      "module": "api.models.user",
+      "name": "User",
+      "source_sha256": "8644539dda017cc368e7361d2945d5c59dc0b1ddfd3644ce599078637f709b9b"
+    },
+    {
+      "module": "api.models.activity",
+      "name": "ActivityTargetType",
+      "source_sha256": "ef5c97f252c77b54751db7d270315d7de86b761d22636ef998c9c937a709fabc"
+    },
+    {
+      "module": "api.models.activity",
+      "name": "ActivitySourceType",
+      "source_sha256": "ef5c97f252c77b54751db7d270315d7de86b761d22636ef998c9c937a709fabc"
+    },
+    {
+      "module": "api.models.activity",
+      "name": "ActivityType",
+      "source_sha256": "ef5c97f252c77b54751db7d270315d7de86b761d22636ef998c9c937a709fabc"
+    },
+    {
+      "module": "api.models.activity",
+      "name": "Activity",
+      "source_sha256": "ef5c97f252c77b54751db7d270315d7de86b761d22636ef998c9c937a709fabc"
+    },
+    {
+      "module": "api.models.event_log",
+      "name": "EventLogType",
+      "source_sha256": "0a9a2cd16e590db4627ba2245946a5db344e132abc0b693301a7f4f2751c7feb"
+    },
+    {
+      "module": "api.models.types",
+      "name": "JSONB",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.event_log",
+      "name": "EventLogStatus",
+      "source_sha256": "0a9a2cd16e590db4627ba2245946a5db344e132abc0b693301a7f4f2751c7feb"
+    },
+    {
+      "module": "api.models.event_log",
+      "name": "EventLogFailureReason",
+      "source_sha256": "0a9a2cd16e590db4627ba2245946a5db344e132abc0b693301a7f4f2751c7feb"
+    },
+    {
+      "module": "api.models.event_log",
+      "name": "EventLog",
+      "source_sha256": "0a9a2cd16e590db4627ba2245946a5db344e132abc0b693301a7f4f2751c7feb"
+    },
+    {
+      "module": "api.models.uuid",
+      "name": "uuidv7_column",
+      "source_sha256": "dc6c258d8438ab7ba15584fa180855749504eb712ab2c8a6d72687fd34e2a9ad"
+    },
+    {
+      "module": "api.models.record",
+      "name": "RecordType",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.record",
+      "name": "RecordStatus",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.record",
+      "name": "WorkflowOrigin",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.record",
+      "name": "INSTANCE_SPELLED_DATE_SQL",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.record",
+      "name": "Record",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.types.suggestion_payload",
+      "name": "SuggestionSourceType",
+      "source_sha256": "fbf1e75460918b03d4479b5835178aa0ad2b6e91f34f7be8dd2ac9b4f60b24e7"
+    },
+    {
+      "module": "api.models.suggestion",
+      "name": "SuggestionStatus",
+      "source_sha256": "6870ccebd88e163bd3622e5185a0fd0739d96462db0ca87c04f631962f23fefc"
+    },
+    {
+      "module": "api.types.suggestion_context",
+      "name": "SuggestionSourceContextType",
+      "source_sha256": "c623d370322a1efa604aec3fc793bf57a3144c848e7d0e36729a1a5b48728f45"
+    },
+    {
+      "module": "api.models.types",
+      "name": "WheneverDate",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.suggestion",
+      "name": "Suggestion",
+      "source_sha256": "6870ccebd88e163bd3622e5185a0fd0739d96462db0ca87c04f631962f23fefc"
+    },
+    {
+      "module": "api.models.workflow_run",
+      "name": "WorkflowRunArrivalProvenance",
+      "source_sha256": "70882729d1dcc78c67db7d804667ea1fb9c835ca5b2e38c12965cbed564799a6"
+    },
+    {
+      "module": "api.models.workflow_run",
+      "name": "WorkflowRunStatus",
+      "source_sha256": "70882729d1dcc78c67db7d804667ea1fb9c835ca5b2e38c12965cbed564799a6"
+    },
+    {
+      "module": "api.types.workflow_runtime_event",
+      "name": "WorkflowRuntimeEventInteractionProfile",
+      "source_sha256": "152d8d7f155da39b0cfcf9ea235e51915e1676c23034d42713d7663b349ed256"
+    },
+    {
+      "module": "api.types.signal_rlm",
+      "name": "RlmModelProfile",
+      "source_sha256": "f5940dddadeb244dc297e08e5e8373d3fc6a994fd4f936e381761e426953ac83"
+    },
+    {
+      "module": "api.models.workflow_run",
+      "name": "RoutineWorkflowRunStatus",
+      "source_sha256": "70882729d1dcc78c67db7d804667ea1fb9c835ca5b2e38c12965cbed564799a6"
+    },
+    {
+      "module": "api.models.workflow_run",
+      "name": "ROUTINE_WORKFLOW_RUN_PIN_SHAPE_CHECK",
+      "source_sha256": "70882729d1dcc78c67db7d804667ea1fb9c835ca5b2e38c12965cbed564799a6"
+    },
+    {
+      "module": "api.models.workflow_run",
+      "name": "WorkflowRun",
+      "source_sha256": "70882729d1dcc78c67db7d804667ea1fb9c835ca5b2e38c12965cbed564799a6"
+    },
+    {
+      "module": "api.models.workflow_runtime_state",
+      "name": "WORKFLOW_RUNTIME_SCHEMA_VERSION",
+      "source_sha256": "ae9f29c16530042bc21dbd6b44bc1da815dcbed4da8d13ddb81238c685030fb3"
+    },
+    {
+      "module": "api.models.workflow_runtime_state",
+      "name": "WorkflowRuntimeLifecycleState",
+      "source_sha256": "ae9f29c16530042bc21dbd6b44bc1da815dcbed4da8d13ddb81238c685030fb3"
+    },
+    {
+      "module": "api.models.workflow_runtime_state",
+      "name": "WorkflowRuntimeLifecycleReason",
+      "source_sha256": "ae9f29c16530042bc21dbd6b44bc1da815dcbed4da8d13ddb81238c685030fb3"
+    },
+    {
+      "module": "api.models.workflow_runtime_state",
+      "name": "WorkflowRuntimeState",
+      "source_sha256": "ae9f29c16530042bc21dbd6b44bc1da815dcbed4da8d13ddb81238c685030fb3"
+    },
+    {
+      "module": "api.types.workflow_runtime_event",
+      "name": "WorkflowRuntimeEventKind",
+      "source_sha256": "152d8d7f155da39b0cfcf9ea235e51915e1676c23034d42713d7663b349ed256"
+    },
+    {
+      "module": "api.types.workflow_runtime_event",
+      "name": "WorkflowRuntimeEventSourceType",
+      "source_sha256": "152d8d7f155da39b0cfcf9ea235e51915e1676c23034d42713d7663b349ed256"
+    },
+    {
+      "module": "api.types.workflow_runtime_event",
+      "name": "WorkflowRuntimeEventPayloadKind",
+      "source_sha256": "152d8d7f155da39b0cfcf9ea235e51915e1676c23034d42713d7663b349ed256"
+    },
+    {
+      "module": "api.types.workflow_question_limits",
+      "name": "WORKFLOW_QUESTION_CUSTOM_ANSWER_MAX_CHARS",
+      "source_sha256": "599dd69cd1f3ce0a101d682ae2fd42d62528a6d3fe2f93d2bdd3064d1f23e52c"
+    },
+    {
+      "module": "api.types.workflow_question_limits",
+      "name": "WORKFLOW_QUESTION_ANSWER_INLINE_MAX_BYTES",
+      "source_sha256": "599dd69cd1f3ce0a101d682ae2fd42d62528a6d3fe2f93d2bdd3064d1f23e52c"
+    },
+    {
+      "module": "api.types.workflow_runtime_event",
+      "name": "WORKFLOW_RUNTIME_EVENT_INLINE_PAYLOAD_MAX_BYTES",
+      "source_sha256": "152d8d7f155da39b0cfcf9ea235e51915e1676c23034d42713d7663b349ed256"
+    },
+    {
+      "module": "api.models.workflow_runtime_event",
+      "name": "WorkflowRuntimeEvent",
+      "source_sha256": "6a847a9423b7c0321c54373e215afac1f8c96f9cf4f5a03b423d640e1cf5a4f0"
+    },
+    {
+      "module": "api.models.monty_runtime_checkpoint",
+      "name": "MontyRuntimeCheckpointStatus",
+      "source_sha256": "bc1d8a9289bd8b96760b0a46a2099f04d484e4ce04e209c48b2110860bfc76ee"
+    },
+    {
+      "module": "api.models.monty_runtime_checkpoint",
+      "name": "MontyRuntimeCheckpoint",
+      "source_sha256": "bc1d8a9289bd8b96760b0a46a2099f04d484e4ce04e209c48b2110860bfc76ee"
+    },
+    {
+      "module": "api.models.agent_run",
+      "name": "AgentRunRole",
+      "source_sha256": "1249082fc48992ad746505621df74420a6190f2714069ba5446fc004ef2e065e"
+    },
+    {
+      "module": "api.models.agent_run",
+      "name": "AgentRunStatus",
+      "source_sha256": "1249082fc48992ad746505621df74420a6190f2714069ba5446fc004ef2e065e"
+    },
+    {
+      "module": "api.models.agent_run",
+      "name": "AgentRun",
+      "source_sha256": "1249082fc48992ad746505621df74420a6190f2714069ba5446fc004ef2e065e"
+    },
+    {
+      "module": "api.models.space",
+      "name": "SpaceType",
+      "source_sha256": "ae2a7ce25e719e1de833158a18e145b9fcef3c28523e258e5e1324a5b1985a87"
+    },
+    {
+      "module": "api.models.space",
+      "name": "TASK_LIFECYCLE_WRITER_VERSION_V1",
+      "source_sha256": "ae2a7ce25e719e1de833158a18e145b9fcef3c28523e258e5e1324a5b1985a87"
+    },
+    {
+      "module": "api.models.space",
+      "name": "Space",
+      "source_sha256": "ae2a7ce25e719e1de833158a18e145b9fcef3c28523e258e5e1324a5b1985a87"
+    },
+    {
+      "module": "api.models.routine_installation",
+      "name": "RoutineInstallationStatus",
+      "source_sha256": "575bd0618a527ef3e5753c70ec8e6f5b60da8819a1467b8a50c3eaf2c381fb14"
+    },
+    {
+      "module": "api.models.routine_installation",
+      "name": "RoutineInstallation",
+      "source_sha256": "575bd0618a527ef3e5753c70ec8e6f5b60da8819a1467b8a50c3eaf2c381fb14"
+    },
+    {
+      "module": "api.models.routine",
+      "name": "RoutineStatus",
+      "source_sha256": "ebc73e22c0c9c0c5cbbb7aaed2954d99c16e4664840799325db0deef88529472"
+    },
+    {
+      "module": "api.models.routine",
+      "name": "Routine",
+      "source_sha256": "ebc73e22c0c9c0c5cbbb7aaed2954d99c16e4664840799325db0deef88529472"
+    },
+    {
+      "module": "api.models.routine_revision",
+      "name": "RoutineRuntimeKind",
+      "source_sha256": "b907113662733c56e30f467ed35869297568e285a9cbf3f1c3eb83c6ac0f4246"
+    },
+    {
+      "module": "api.models.routine_revision",
+      "name": "RoutineRevision",
+      "source_sha256": "b907113662733c56e30f467ed35869297568e285a9cbf3f1c3eb83c6ac0f4246"
+    },
+    {
+      "module": "api.models.signal",
+      "name": "SignalSubjectType",
+      "source_sha256": "c4951d96e7536a3aa0d1888b11ec9bef53ee8b911aa30f1f201f88fe6af0a2ce"
+    },
+    {
+      "module": "api.models.signal",
+      "name": "SignalRawSourceType",
+      "source_sha256": "c4951d96e7536a3aa0d1888b11ec9bef53ee8b911aa30f1f201f88fe6af0a2ce"
+    },
+    {
+      "module": "api.models.signal",
+      "name": "SignalOrigin",
+      "source_sha256": "c4951d96e7536a3aa0d1888b11ec9bef53ee8b911aa30f1f201f88fe6af0a2ce"
+    },
+    {
+      "module": "api.models.signal",
+      "name": "Signal",
+      "source_sha256": "c4951d96e7536a3aa0d1888b11ec9bef53ee8b911aa30f1f201f88fe6af0a2ce"
+    },
+    {
+      "module": "api.models.types",
+      "name": "CalendarProvider",
+      "source_sha256": "2b1a831f2f75ebbb98e1377b03955a199f4495f94cdc63a50c06f1a776f02a5b"
+    },
+    {
+      "module": "api.models.calendar_event",
+      "name": "CalendarEventRole",
+      "source_sha256": "6d92a67b0d980b187e119d09483c22c8ca9472bdef3938c211f78ebbe43e6ee6"
+    },
+    {
+      "module": "api.lib.calendar_event_snapshot_compat",
+      "name": "empty_legacy_fields_loro_snapshot",
+      "source_sha256": "ceaac767be1003fbfe0dd1479d2c4c64f037334d45dc39f290c22d98571da890"
+    },
+    {
+      "module": "api.lib.calendar_event_snapshot_compat",
+      "name": "LEGACY_EMPTY_FIELDS_LORO_SNAPSHOT_HEX",
+      "source_sha256": "ceaac767be1003fbfe0dd1479d2c4c64f037334d45dc39f290c22d98571da890"
+    },
+    {
+      "module": "api.models.calendar_event.status",
+      "name": "CalendarEventStatus",
+      "source_sha256": "cf93c9d9d13d6a26c65a4b00eb99249c09cda28d68b735d8ace39c47208c3537"
+    },
+    {
+      "module": "api.models.calendar_event",
+      "name": "ORGANIZER_INDEXED_RECORD_ID_UNIQUE_INDEX",
+      "source_sha256": "6d92a67b0d980b187e119d09483c22c8ca9472bdef3938c211f78ebbe43e6ee6"
+    },
+    {
+      "module": "api.models.calendar_event",
+      "name": "CalendarEvent",
+      "source_sha256": "6d92a67b0d980b187e119d09483c22c8ca9472bdef3938c211f78ebbe43e6ee6"
+    },
+    {
+      "module": "api.models.calendar",
+      "name": "Calendar",
+      "source_sha256": "8c8eff90c14a035b009d0f8e5a40544ac478332aba50c509b3fd84192fc22f3d"
+    },
+    {
+      "module": "api.types.resource_identity",
+      "name": "ResourceType",
+      "source_sha256": "6f6f8dde958bc05b4c20a13657cf3c074be4633d6602a910dc94867ce9d28983"
+    },
+    {
+      "module": "api.types.resource_identity",
+      "name": "ResourceCategory",
+      "source_sha256": "6f6f8dde958bc05b4c20a13657cf3c074be4633d6602a910dc94867ce9d28983"
+    },
+    {
+      "module": "api.models.resource",
+      "name": "OWNER_PERSON_RESOURCE_ACTIVE_UNIQUE_INDEX",
+      "source_sha256": "9c0ce5967301ee3ef4914593b9ef1f01247e92ffd59d09eda97ea143a831be90"
+    },
+    {
+      "module": "api.models.resource",
+      "name": "Resource",
+      "source_sha256": "9c0ce5967301ee3ef4914593b9ef1f01247e92ffd59d09eda97ea143a831be90"
+    },
+    {
+      "module": "api.models.external_account",
+      "name": "ExternalAccountProvider",
+      "source_sha256": "56347d135b30ee345299cc6ae974b2e0315a1daaa60d61b036911afd84a4d25f"
+    },
+    {
+      "module": "api.lib.google.oauth_app",
+      "name": "GoogleOAuthAppLabel",
+      "source_sha256": "41399182e6b11a08520235aa1ec56af71e9030309e037d203b62250f53ff59a0"
+    },
+    {
+      "module": "api.models.external_account",
+      "name": "ExternalAccountDisconnectState",
+      "source_sha256": "56347d135b30ee345299cc6ae974b2e0315a1daaa60d61b036911afd84a4d25f"
+    },
+    {
+      "module": "api.types.data_lifecycle",
+      "name": "DisconnectEvents",
+      "source_sha256": "859ab972ada010869fd6f61407be1678776146057d82cc66e1c0d50d6746ae3e"
+    },
+    {
+      "module": "api.models.external_account",
+      "name": "EXTERNAL_ACCOUNT_IDENTITY_CONSTRAINT",
+      "source_sha256": "56347d135b30ee345299cc6ae974b2e0315a1daaa60d61b036911afd84a4d25f"
+    },
+    {
+      "module": "api.models.external_account",
+      "name": "ExternalAccount",
+      "source_sha256": "56347d135b30ee345299cc6ae974b2e0315a1daaa60d61b036911afd84a4d25f"
+    },
+    {
+      "module": "api.models.message",
+      "name": "MessageTargetType",
+      "source_sha256": "11a6f871d4f3d97a03dc96b582f8a87cc2cb9e52e613e636c788dcc74dcb5f96"
+    },
+    {
+      "module": "api.models.message",
+      "name": "MessageType",
+      "source_sha256": "11a6f871d4f3d97a03dc96b582f8a87cc2cb9e52e613e636c788dcc74dcb5f96"
+    },
+    {
+      "module": "api.models.message",
+      "name": "MessageStatus",
+      "source_sha256": "11a6f871d4f3d97a03dc96b582f8a87cc2cb9e52e613e636c788dcc74dcb5f96"
+    },
+    {
+      "module": "api.models.message",
+      "name": "APP_CONNECT_INTRO_CARD",
+      "source_sha256": "11a6f871d4f3d97a03dc96b582f8a87cc2cb9e52e613e636c788dcc74dcb5f96"
+    },
+    {
+      "module": "api.models.message",
+      "name": "ACCOUNT_PASSWORD_CARD",
+      "source_sha256": "11a6f871d4f3d97a03dc96b582f8a87cc2cb9e52e613e636c788dcc74dcb5f96"
+    },
+    {
+      "module": "api.models.message",
+      "name": "Message",
+      "source_sha256": "11a6f871d4f3d97a03dc96b582f8a87cc2cb9e52e613e636c788dcc74dcb5f96"
+    },
+    {
+      "module": "api.types.channel",
+      "name": "ChannelEventType",
+      "source_sha256": "054fd725edc7f3d50d11f9f22f995f358056638a782dce6fecddad410e5cb890"
+    },
+    {
+      "module": "api.types.channel",
+      "name": "ChannelDirection",
+      "source_sha256": "054fd725edc7f3d50d11f9f22f995f358056638a782dce6fecddad410e5cb890"
+    },
+    {
+      "module": "api.models.channel_event",
+      "name": "ChannelEvent",
+      "source_sha256": "f0765e95de6f4f0d87d2a144136481f25023647d50f57e5e0013ccdacce1bf93"
+    },
+    {
+      "module": "api.types.channel",
+      "name": "ChannelType",
+      "source_sha256": "054fd725edc7f3d50d11f9f22f995f358056638a782dce6fecddad410e5cb890"
+    },
+    {
+      "module": "api.models.channel_conversation",
+      "name": "ChannelConversation",
+      "source_sha256": "423e702768c5b4038c88ac962f3d4d549e52bd820c4f7105ef01d79288ae4035"
+    },
+    {
+      "module": "api.models.composer_submission",
+      "name": "ComposerSubmissionState",
+      "source_sha256": "d88deefb9c0d0eb23a15f83f90efddd1fe40c8f329ab4b252fa5824b0dad9fa1"
+    },
+    {
+      "module": "api.models.composer_submission",
+      "name": "ComposerSubmission",
+      "source_sha256": "d88deefb9c0d0eb23a15f83f90efddd1fe40c8f329ab4b252fa5824b0dad9fa1"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "StandingGrantBackfillState",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.types.standing_grant",
+      "name": "StandingGrantBackfillPhase",
+      "source_sha256": "6f249e14eb87d967854e6077ad5a970345b91733001440b05bb7af2a200998e3"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "StandingGrantBackfillStatus",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "StandingGrantTier",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "StandingGrantScope",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "StandingGrantState",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "StandingGrant",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.models.invite",
+      "name": "InviteType",
+      "source_sha256": "4f8fcf12aaf8f1236f0dfaadc48b7f27cf1e6cc4194e0911281930ee20acb3f6"
+    },
+    {
+      "module": "api.models.invite",
+      "name": "InviteResourceType",
+      "source_sha256": "4f8fcf12aaf8f1236f0dfaadc48b7f27cf1e6cc4194e0911281930ee20acb3f6"
+    },
+    {
+      "module": "api.models.invite",
+      "name": "InvitePermission",
+      "source_sha256": "4f8fcf12aaf8f1236f0dfaadc48b7f27cf1e6cc4194e0911281930ee20acb3f6"
+    },
+    {
+      "module": "api.models.invite",
+      "name": "Invite",
+      "source_sha256": "4f8fcf12aaf8f1236f0dfaadc48b7f27cf1e6cc4194e0911281930ee20acb3f6"
+    },
+    {
+      "module": "api.types.contact_address",
+      "name": "ContactAddressKind",
+      "source_sha256": "6f5940d9b940c1296c3a55e4b84d5b1723bf2ead774508dc476899e0cd0312c3"
+    },
+    {
+      "module": "api.models.contact_address",
+      "name": "ContactAddress",
+      "source_sha256": "e4f4710835b521ce2ca7e88b1096d2f6698e3d71d6c73eb7fee219578c83267a"
+    },
+    {
+      "module": "api.models.file_share",
+      "name": "FileShareTargetType",
+      "source_sha256": "462e4cb628be9a3849efca2c208813c658be188fc54bc9b28edd39bbf1c49245"
+    },
+    {
+      "module": "api.models.file_share",
+      "name": "FileShare",
+      "source_sha256": "462e4cb628be9a3849efca2c208813c658be188fc54bc9b28edd39bbf1c49245"
+    },
+    {
+      "module": "api.models.file",
+      "name": "FileScopeType",
+      "source_sha256": "76789101529a046dd5e8c85b3e516e5ff6888d1863efd428ec178d45ee891ea9"
+    },
+    {
+      "module": "api.models.file",
+      "name": "FileType",
+      "source_sha256": "76789101529a046dd5e8c85b3e516e5ff6888d1863efd428ec178d45ee891ea9"
+    },
+    {
+      "module": "api.models.file",
+      "name": "FileParentType",
+      "source_sha256": "76789101529a046dd5e8c85b3e516e5ff6888d1863efd428ec178d45ee891ea9"
+    },
+    {
+      "module": "api.models.file",
+      "name": "FileStatus",
+      "source_sha256": "76789101529a046dd5e8c85b3e516e5ff6888d1863efd428ec178d45ee891ea9"
+    },
+    {
+      "module": "api.models.file",
+      "name": "FileScanVerdict",
+      "source_sha256": "76789101529a046dd5e8c85b3e516e5ff6888d1863efd428ec178d45ee891ea9"
+    },
+    {
+      "module": "api.models.file",
+      "name": "File",
+      "source_sha256": "76789101529a046dd5e8c85b3e516e5ff6888d1863efd428ec178d45ee891ea9"
+    },
+    {
+      "module": "api.models.external_link_item",
+      "name": "ExternalLinkItemMediaKind",
+      "source_sha256": "296b6d071dbf3fd0e929b0c2aaf6f62388fd167408a6ae28081955500163ecef"
+    },
+    {
+      "module": "api.models.external_link_item",
+      "name": "ExternalLinkItemMediaStatus",
+      "source_sha256": "296b6d071dbf3fd0e929b0c2aaf6f62388fd167408a6ae28081955500163ecef"
+    },
+    {
+      "module": "api.models.external_link_item",
+      "name": "ExternalLinkItem",
+      "source_sha256": "296b6d071dbf3fd0e929b0c2aaf6f62388fd167408a6ae28081955500163ecef"
+    },
+    {
+      "module": "api.models.external_link_group",
+      "name": "ExternalLinkGroup",
+      "source_sha256": "9cc7c141716f62d36c7efb9b05b01fba17113b1dabbd90522498fdf9bba17ab4"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLFetchScopeType",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLProcessorKind",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLSourceStatus",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.services.monitored_url.config",
+      "name": "MONITORED_URL_DEFAULT_POLL_INTERVAL_SECONDS",
+      "source_sha256": "a3f8a07617eb1f9cb60e11e6f312a9b43ff07f75992b84f2d39513d218380851"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLSource",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLRunStatus",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLRunResult",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLRun",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.event_log",
+      "name": "TagTargetType",
+      "source_sha256": "0a9a2cd16e590db4627ba2245946a5db344e132abc0b693301a7f4f2751c7feb"
+    },
+    {
+      "module": "api.models.tag_item",
+      "name": "TaggedItem",
+      "source_sha256": "92d24476bd85fcd60f4962ee1878c27376e88390fa2773ca7b0508ab47657a7b"
+    },
+    {
+      "module": "api.lib.crdt.record_fields.field",
+      "name": "TagType",
+      "source_sha256": "8b621f66911f5840ab2c315db2656e288777f234085fd4d285056bb9f6a03d0b"
+    },
+    {
+      "module": "api.models.tag",
+      "name": "Tag",
+      "source_sha256": "ecba941c9543e1a7c3bce443384324b701735942a2b01b12c96dfc9534a4f013"
+    },
+    {
+      "module": "api.models.record_assignee_index",
+      "name": "RecordAssigneeIndex",
+      "source_sha256": "8e3386b4b45f28c94f8be3a531e595c17f5192667d70c1aa15e837ba487e6488"
+    },
+    {
+      "module": "api.types.resource_fact_contract",
+      "name": "FactType",
+      "source_sha256": "d0dc5a5ff571e02a22b5b4a61f7ea6f34e02868c21461888a96dae449de31924"
+    },
+    {
+      "module": "api.models.resource_fact",
+      "name": "FactSource",
+      "source_sha256": "aa4e58e2baea63ad8634b7efcb07d13005a40dd4750cfc52afe5dbb870f618fc"
+    },
+    {
+      "module": "api.models.resource_fact",
+      "name": "ResourceFact",
+      "source_sha256": "aa4e58e2baea63ad8634b7efcb07d13005a40dd4750cfc52afe5dbb870f618fc"
+    },
+    {
+      "module": "api.models.assistant_stream_event",
+      "name": "AssistantStreamEvent",
+      "source_sha256": "28205bd20b74870272ceb597161efddf1be8851d5cdcdc8caa1f363c9b4a4bb2"
+    },
+    {
+      "module": "api.models.assistant_run",
+      "name": "AssistantRun",
+      "source_sha256": "0ba25ef521830fd7a382e0a48fb2284aac233e36db40510d876fadab34a80eb5"
+    },
+    {
+      "module": "api.models.assistant_state",
+      "name": "AssistantStateType",
+      "source_sha256": "fee55e7a8fe7cfdc99d6c5f61207a6351af4648700c39dcf6fe1b1cd614b9c62"
+    },
+    {
+      "module": "api.models.assistant_state",
+      "name": "AssistantStateSourceType",
+      "source_sha256": "fee55e7a8fe7cfdc99d6c5f61207a6351af4648700c39dcf6fe1b1cd614b9c62"
+    },
+    {
+      "module": "api.lib.assistant.types",
+      "name": "AssistantStatus",
+      "source_sha256": "85cb78a16ac7b60f76566a5d450c9390e80c4604607e2dcc683f0d0642cc680a"
+    },
+    {
+      "module": "api.models.assistant_state",
+      "name": "AssistantState",
+      "source_sha256": "fee55e7a8fe7cfdc99d6c5f61207a6351af4648700c39dcf6fe1b1cd614b9c62"
+    },
+    {
+      "module": "api.models.generated_image",
+      "name": "GeneratedImageType",
+      "source_sha256": "c19b29b5c2922c6a563367db15fad16b897373195a8c2a1e517925ffd1159cd8"
+    },
+    {
+      "module": "api.models.generated_image",
+      "name": "GeneratedImageStatus",
+      "source_sha256": "c19b29b5c2922c6a563367db15fad16b897373195a8c2a1e517925ffd1159cd8"
+    },
+    {
+      "module": "api.models.generated_image",
+      "name": "GeneratedImage",
+      "source_sha256": "c19b29b5c2922c6a563367db15fad16b897373195a8c2a1e517925ffd1159cd8"
+    },
+    {
+      "module": "api.models.email_inbox",
+      "name": "EmailInbox",
+      "source_sha256": "99daedf0ce288175e7094373ba792cce3a597d515d134fed06a3fdbb1dc37e47"
+    },
+    {
+      "module": "api.models.suggestion_seen",
+      "name": "SuggestionSeen",
+      "source_sha256": "e7d50be587ec324b07f412207b9175a2dffb2563545a7de48e2f5e059cebe185"
+    },
+    {
+      "module": "api.models.calendar_highlight",
+      "name": "CalendarHighlightType",
+      "source_sha256": "484a98dfcfa9fc2672094d88cbb731e1e789f6d11816600f1dd9331937ef1767"
+    },
+    {
+      "module": "api.models.calendar_highlight",
+      "name": "CalendarHighlightBucket",
+      "source_sha256": "484a98dfcfa9fc2672094d88cbb731e1e789f6d11816600f1dd9331937ef1767"
+    },
+    {
+      "module": "api.models.calendar_highlight",
+      "name": "CalendarHighlight",
+      "source_sha256": "484a98dfcfa9fc2672094d88cbb731e1e789f6d11816600f1dd9331937ef1767"
+    },
+    {
+      "module": "api.models.upcoming_summary",
+      "name": "UpcomingSummaryGranularity",
+      "source_sha256": "d6fcee90a40f0b50cc2a41b17abc476ba267af2876f1ab77501ea1275f25f5a3"
+    },
+    {
+      "module": "api.models.upcoming_summary",
+      "name": "UpcomingSummaryStatus",
+      "source_sha256": "d6fcee90a40f0b50cc2a41b17abc476ba267af2876f1ab77501ea1275f25f5a3"
+    },
+    {
+      "module": "api.models.upcoming_summary",
+      "name": "UpcomingSummary",
+      "source_sha256": "d6fcee90a40f0b50cc2a41b17abc476ba267af2876f1ab77501ea1275f25f5a3"
+    },
+    {
+      "module": "api.models.feedback",
+      "name": "FeedbackTargetType",
+      "source_sha256": "71cc4c933dafc1351152d8d8f856a6c5840cb19d11de7561643800f8802eb9a7"
+    },
+    {
+      "module": "api.models.feedback",
+      "name": "Feedback",
+      "source_sha256": "71cc4c933dafc1351152d8d8f856a6c5840cb19d11de7561643800f8802eb9a7"
+    },
+    {
+      "module": "api.models.space_member",
+      "name": "SpaceMember",
+      "source_sha256": "5527c4ec8eb576520203fc7d2f98fa3ea1056aca36e0964455b2a6125c44561c"
+    },
+    {
+      "module": "api.models.record_completed_index",
+      "name": "RecordCompletedIndex",
+      "source_sha256": "39d005b723c6c064cec5d15bac381e9746e0d5d2cde6b9c15daa29c18b12611f"
+    },
+    {
+      "module": "api.models.partner_calendar_event",
+      "name": "PartnerCalendarEventMirror",
+      "source_sha256": "c67bf53bdc49c055c61a8212c9f68b7122abcf3233fc6e74c215fce3a0a209be"
+    },
+    {
+      "module": "api.models.assignment",
+      "name": "AssignmentScope",
+      "source_sha256": "38ebe3fe8944bb070a681e887e494dfeb6286063f0457b94ef1aeddcac43d6e5"
+    },
+    {
+      "module": "api.models.assignment",
+      "name": "AssignmentStatus",
+      "source_sha256": "38ebe3fe8944bb070a681e887e494dfeb6286063f0457b94ef1aeddcac43d6e5"
+    },
+    {
+      "module": "api.models.assignment",
+      "name": "AssignmentTargetType",
+      "source_sha256": "38ebe3fe8944bb070a681e887e494dfeb6286063f0457b94ef1aeddcac43d6e5"
+    },
+    {
+      "module": "api.models.assignment",
+      "name": "Assignment",
+      "source_sha256": "38ebe3fe8944bb070a681e887e494dfeb6286063f0457b94ef1aeddcac43d6e5"
+    },
+    {
+      "module": "api.models.resource_share",
+      "name": "ResourceShareTargetType",
+      "source_sha256": "2bab38e47621031a0d2bd0f18f641a5c088db288756e12b256d217be55e19533"
+    },
+    {
+      "module": "api.models.resource_share",
+      "name": "ResourceShareSource",
+      "source_sha256": "2bab38e47621031a0d2bd0f18f641a5c088db288756e12b256d217be55e19533"
+    },
+    {
+      "module": "api.models.resource_share",
+      "name": "ResourceShareAccessLevel",
+      "source_sha256": "2bab38e47621031a0d2bd0f18f641a5c088db288756e12b256d217be55e19533"
+    },
+    {
+      "module": "api.models.resource_share",
+      "name": "ResourceShare",
+      "source_sha256": "2bab38e47621031a0d2bd0f18f641a5c088db288756e12b256d217be55e19533"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLSubscriptionSubjectType",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLConsumerAdapter",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLSubscriptionStatus",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLSubscriptionDisabledVia",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.monitored_url",
+      "name": "MonitoredURLSubscription",
+      "source_sha256": "4da4a09b0fb66ec2bcd1038eb1b2fe1f646d0679f66ac5d5cafee1e8e849a80e"
+    },
+    {
+      "module": "api.models.record_share",
+      "name": "RecordShareTargetType",
+      "source_sha256": "9290b37dec8058618359eff70f703170f39a45b8e78ce4dd69bde47b55cd19ef"
+    },
+    {
+      "module": "api.models.record_share",
+      "name": "RecordShareAccessLevel",
+      "source_sha256": "9290b37dec8058618359eff70f703170f39a45b8e78ce4dd69bde47b55cd19ef"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "EntityType",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.models.record_share",
+      "name": "RecordShare",
+      "source_sha256": "9290b37dec8058618359eff70f703170f39a45b8e78ce4dd69bde47b55cd19ef"
+    },
+    {
+      "module": "api.models.sync_authority",
+      "name": "NativeSyncAuthorityFence",
+      "source_sha256": "6827311b8339535918e3f655c666e4e9d6b74acc383324e35e4a087ab8325e62"
+    },
+    {
+      "module": "api.models.circuits_source_fence",
+      "name": "CircuitsSourceFence",
+      "source_sha256": "799ecc254a5d9c7903a242ecd7ed1c526209563d4fb2d2667577f0d0a29f2071"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "VALIDITY_CHECK",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "EdgeType",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "EDGE_TYPE_VALUES",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "ACTIVE_EDGE_TYPE_CHECK",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "UNSCOPED_EDGE_KEY_COLUMNS",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "UNSCOPED_ACTIVE_INDEX_PREDICATE",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "SCOPED_EDGE_KEY_COLUMNS",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "SCOPED_ACTIVE_INDEX_PREDICATE",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.graph_edge",
+      "name": "GraphEdge",
+      "source_sha256": "e607c18ce415061e284bad37e6b5706051b0d0e69c40800d5cd6176bda88525b"
+    },
+    {
+      "module": "api.models.record_recurrence",
+      "name": "RecordRecurrence",
+      "source_sha256": "3bdb02c1c3e4474d852f986a586d7f605544f5df40ecd8a0c4bbae72327f3b8d"
+    },
+    {
+      "module": "api.lib.crdt.record_fields.field",
+      "name": "RecordFieldType",
+      "source_sha256": "8b621f66911f5840ab2c315db2656e288777f234085fd4d285056bb9f6a03d0b"
+    },
+    {
+      "module": "api.models.record_date_index",
+      "name": "RecordDateIndex",
+      "source_sha256": "c6aafb0d9fdf55cc42f5bbd53e5cbb04fd7cafa36d7c8752164f23603ae97d9d"
+    },
+    {
+      "module": "api.models.conversation",
+      "name": "ConversationType",
+      "source_sha256": "00c8f42524def7256987f8fc91136a328e6e070b2fc09b56fc7846013c027110"
+    },
+    {
+      "module": "api.models.conversation",
+      "name": "Conversation",
+      "source_sha256": "00c8f42524def7256987f8fc91136a328e6e070b2fc09b56fc7846013c027110"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "NativeSyncAuthority",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "registered_collection",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "GRANT_RELATION_TABLES",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "RegisteredCollection",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.models.suggestion",
+      "name": "FormattedSuggestionShape",
+      "source_sha256": "6870ccebd88e163bd3622e5185a0fd0739d96462db0ca87c04f631962f23fefc"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "REGISTERED_COLLECTIONS",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "_CHAT_PROJECTION_DEPENDENCIES",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "PRIVATE_AUTHORIZATION_TABLES",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "authorize_predicate",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "_and",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "authorization_predicate",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "MONITORED_SOURCE_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "GRAPH_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_account",
+      "name": "ACCOUNT_SPACE_COLLECTIONS",
+      "source_sha256": "10a8efbe20d06fbd065b6dd9e6afa95036d1928d57f12f4a5703cd40b096bd04"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "STANDING_GRANT_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "RESOURCE_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "CALENDAR_SOURCE_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "SPACE_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "FILE_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "SPACE_MEMBERSHIP_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "record_authorization_predicate",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "RECORD_COLLECTION_KEYS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "RECORD_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "_lower_expression",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "_record_audience",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.models.record_sync_authority",
+      "name": "authorized_record_id_paths",
+      "source_sha256": "1e838157b10a9cd75bf93efcb6b6af9ac5530b91794ef801ad8d99f851b270cd"
+    },
+    {
+      "module": "api.models.record_sync_authority",
+      "name": "_direct_record_share_ids",
+      "source_sha256": "1e838157b10a9cd75bf93efcb6b6af9ac5530b91794ef801ad8d99f851b270cd"
+    },
+    {
+      "module": "api.models.record",
+      "name": "direct_partner_home_space_ids_query",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.standing_grant",
+      "name": "active_all_editor_standing_grant_grantor_query",
+      "source_sha256": "aba0c928c0e949e7e29ac28986014513214d28855a6077aa420b454abb554bdb"
+    },
+    {
+      "module": "api.models.record",
+      "name": "client_visible_record_type_clause",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.record",
+      "name": "SERVER_ONLY_RECORD_TYPES",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.models.record",
+      "name": "CLIENT_HIDDEN_RECORD_TYPES",
+      "source_sha256": "b270968fc1a22d4cb77b682f63af76532cf72a3d51e3647c695fe7c17cf69284"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "_lower_select",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "_AUTHORIZATION_SUBQUERY_TABLES",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "_literal",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "_internal_subscription",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "_subscription_for_fingerprint",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync",
+      "name": "_SUBSCRIPTION_RE",
+      "source_sha256": "c2087784cc4771f4f473c1662a9c817a3403988ede5e5f78cf230f64d098f4d7"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "SERVER_AUDIENCE_PRIVATE_COLLECTIONS",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "graph_edge_authorization_predicate",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "authorized_resource_ids_query",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.models.resource_share",
+      "name": "direct_partner_resource_ids_query",
+      "source_sha256": "2bab38e47621031a0d2bd0f18f641a5c088db288756e12b256d217be55e19533"
+    },
+    {
+      "module": "api.models.resource",
+      "name": "partner_visible_resource_clause",
+      "source_sha256": "9c0ce5967301ee3ef4914593b9ef1f01247e92ffd59d09eda97ea143a831be90"
+    },
+    {
+      "module": "api.models.resource",
+      "name": "PARTNER_VISIBLE_RESOURCE_TYPES",
+      "source_sha256": "9c0ce5967301ee3ef4914593b9ef1f01247e92ffd59d09eda97ea143a831be90"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "CROSS_HOME_BIDIRECTIONAL_RESOURCE_EDGE_TYPES",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "CROSS_HOME_FORWARD_RESOURCE_EDGE_TYPES",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "GENERIC_SYNC_EDGE_TYPES",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "RECORD_ROLE_EDGE_TYPES",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.types.graph_edge",
+      "name": "RECORD_ROLE_EDGE_TYPE_VALUES",
+      "source_sha256": "5e75fb9b734023f07300d1393d1e0ce7be443f50009cfabc3a4f9b661dfe8d9d"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "calendar_event_authorization_predicate",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "_calendar_event_row_state_predicate",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    },
+    {
+      "module": "api.services.circuits_sync_authority",
+      "name": "resource_authorization_predicate",
+      "source_sha256": "aeeddd71843de5315d65d75c1a1265b341dee8a01f9cc73425e4b6f30173a9c0"
+    }
+  ],
+  "bundle_sha256": "76d78f0b0bb6dbfc8068a39b9ffa2313722a53fb6a943aa17f3bb8b90e659e90"
+}
