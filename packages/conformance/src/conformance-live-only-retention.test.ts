@@ -247,7 +247,7 @@ describe('aggregate live-only retention', () => {
     const h = await boot({
       ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
       ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS: '1',
-      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '3',
+      ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS: '8',
     })
     const first = await aggregate('aggregate-renewed')
     expect(first.status, JSON.stringify(first.body)).toBe(200)
