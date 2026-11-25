@@ -1,4 +1,4 @@
-B-per-account (OTTO-14032, q-keyed-stream-sharing): per-account plain filters with literal lists cost the same as B's per-Space keyed streams. On one runner they take 1.00-1.02x B on the import (3.52 vs 3.46 s and 2.00 vs 2.00 s), 1.02-1.19x on the large deletion and 0.95-1.00x on the small deletion, all under 10 s with zero backfills. Every bystander probe succeeds, except one drain and one live change of 9 on one runner's large deletion, which B lost the same way. The catalog is 445 shapes against B's 725; no synthetic accounts share a Space, so the no-dedupe cost is not exercised.
+B-per-account built on S (OTTO-14032, q-keyed-stream-sharing): one stream per account, S's row-column filters with literal lists, costs the same as S's per-Space streams within noise on one runner. Import is 1.00-1.05x (2.79 vs 2.66 s, 3.45 vs 3.45 s), large deletion 0.90-1.41x (2.56 vs 1.82 s, 1.59 vs 1.76 s), small deletion 1.00x, all under 10 s with zero backfills. Both variants lose the same large-deletion drains (5/7 each, 8/9 each), so neither passes the strict line there. The engine catalog has 461 shapes against S's 860.
 M4 (revised after rounds 2 and 3): Per-row membership evaluation under one registry lock is where the time goes, and the other account starves behind the workload in the single change log. Today's prod engine (`b42f70d`, 2 vCPU) stalls as long as yesterday's (1.03x). PR 70's snapshot-removal proof (`Prior::was_member`) makes the import 1.29x and the large deletion 3.5-3.8x slower. No engine-side change keeps the other account served. Among model variants only those that key every `graph_edge` branch and the Record family do. B-cold with all edges keyed passes (2.0, 1.2 and 0.5 s, every probe served). B-cold as amended fails (10.1 s import, drains 20%). E-only still takes 273 s, and E+R takes 9.8 s but is not served.
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
@@ -1053,7 +1053,9 @@ its owners, not settled here.
 the same-runner measurement confirms it (1.03x). The table stands: safe tonight, then at risk from
 Nov 26 at high regrowth and nightly from about Nov 29 at low. An estimate.
 
-## B-per-account: per-account plain filters vs per-Space keyed streams (OTTO-14032, `q-keyed-stream-sharing`)
+## B-per-account built on B (superseded: the control is S, not B)
+
+Kept for provenance. The proposal's control is variant S (`simple_keys.py`); see the next section.
 
 Actions run `45537460409`, harness `bada4e3`, workflow job `paired` with `[paired-4]`. Two jobs ran
 on two runners: job `per-account-1` ran B then B-per-account on EPYC 7763, and job
@@ -1122,3 +1124,72 @@ runner pair gave B 2.0–3.5 s and 1.1–1.35 s. They are reported as measured, 
   has no literal-list operator.
 - **Direct shares.** About 72 Record ids per account (20 for account 17, 122 for account 18), taken
   from B-cold's share mapping without seeding `record_share`.
+
+## B-per-account built on S, paired with S (OTTO-14032, `q-keyed-stream-sharing`)
+
+**Inputs.** Branch `profile/simple-keys-2026-11-24` (S's code and results, through `db32729`) was
+merged into this branch, and B-per-account was rebuilt on S's code in `simple_keys.py`
+(`per_account_feed`; reading in `MEASUREMENT_PATCHES.md`). The only difference from S is one stream
+per account and keyed table, holding the account's Spaces, partner Spaces and direct-share ids as
+literal lists, with no cross-account dedupe. Data, other tables, the probe and the import feeds
+are identical to S's.
+
+**Runs.** Actions run `45538971803`, harness `0375e92`, `[paired-5]`. Engine `b42f70d` (the `pr69`
+binary, the one S's runs used; `9bc1563` was not built), Nov 24 catalog, 1 CPU, the three original
+workloads. Job `s-per-account-1` ran S then B-per-account on EPYC 9V74, and job
+`s-per-account-2` ran B-per-account then S on EPYC 7763. Manifests:
+`paired/paired-s-per-account-*/manifest.json`.
+
+The "×" column compares with the first run in each job (S in job 1, B-per-account in job 2).
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × first run in job | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| S | EPYC 9V74 | import | 2.7 | 1.00 | 30 | 0 | 100% (3/3); p95 0.27 | 100% (3/3); p95 0.02 | 100% (3/3); p95 0.19 | **yes** |
+| S | EPYC 9V74 | large-delete | 1.8 | 1.00 | 22 | 0 | 71% (5/7); p95 0.26 | 100% (7/7); p95 0.03 | 71% (5/7); p95 0.24 | no |
+| S | EPYC 9V74 | small-delete | 0.3 | 1.00 | 22 | 0 | 100% (1/1); p95 0.83 | 100% (1/1); p95 0.03 | 100% (1/1); p95 0.77 | **yes** |
+| B-per-account | EPYC 9V74 | import | 2.8 | 1.05 | 29 | 0 | 100% (3/3); p95 0.31 | 100% (3/3); p95 0.03 | 100% (3/3); p95 0.22 | **yes** |
+| B-per-account | EPYC 9V74 | large-delete | 2.6 | 1.41 | 20 | 0 | 71% (5/7); p95 0.95 | 100% (7/7); p95 0.04 | 71% (5/7); p95 0.87 | no |
+| B-per-account | EPYC 9V74 | small-delete | 0.3 | 1.02 | 22 | 0 | 100% (1/1); p95 0.84 | 100% (1/1); p95 0.05 | 100% (1/1); p95 0.82 | **yes** |
+| B-per-account | EPYC 7763 | import | 3.4 | 1.00 | 29 | 0 | 100% (4/4); p95 0.21 | 100% (4/4); p95 0.06 | 100% (4/4); p95 0.18 | **yes** |
+| B-per-account | EPYC 7763 | large-delete | 1.6 | 1.00 | 21 | 0 | 89% (8/9); p95 0.55 | 100% (9/9); p95 0.02 | 89% (8/9); p95 0.43 | no |
+| B-per-account | EPYC 7763 | small-delete | 0.6 | 1.00 | 21 | 0 | 100% (2/2); p95 0.03 | 100% (2/2); p95 0.01 | 100% (2/2); p95 0.03 | **yes** |
+| S | EPYC 7763 | import | 3.5 | 1.00 | 29 | 0 | 100% (4/4); p95 0.13 | 100% (4/4); p95 0.06 | 100% (4/4); p95 0.17 | **yes** |
+| S | EPYC 7763 | large-delete | 1.8 | 1.11 | 20 | 0 | 89% (8/9); p95 0.35 | 100% (9/9); p95 0.02 | 89% (8/9); p95 0.20 | no |
+| S | EPYC 7763 | small-delete | 0.6 | 0.99 | 19 | 0 | 100% (2/2); p95 0.03 | 100% (2/2); p95 0.01 | 50% (1/2); p95 0.03 | no |
+
+| Runner | Workload | S s | B-per-account s | Per-account × S |
+| --- | --- | ---: | ---: | ---: |
+| EPYC 9V74 | import | 2.66 | 2.79 | 1.05 |
+| EPYC 9V74 | large deletion | 1.82 | 2.56 | 1.41 |
+| EPYC 9V74 | small deletion | 0.33 | 0.33 | 1.00 |
+| EPYC 7763 | import | 3.45 | 3.45 | 1.00 |
+| EPYC 7763 | large deletion | 1.76 | 1.59 | 0.90 |
+| EPYC 7763 | small deletion | 0.56 | 0.56 | 1.00 |
+
+**Catalog** (engine `shapes` after warmup, import and probe feeds included):
+
+| Variant | Requests | Engine shapes | Subquery shapes |
+| --- | ---: | ---: | ---: |
+| S | 974 | 860 | 71 (`file`, `user`, `resource`, `resource_fact`, as in S) |
+| B-per-account | 454 | 461 | 71 |
+
+S sends one feed per Space, per partner calendar and per share list. Its partner feeds repeat
+the owner's own Space feed with an identical filter, so the engine collapses 974 requests into
+fewer shapes. Per-account folds an account's feeds into one filter per table, so it has fewer
+shapes. Each synthetic Space has two readers (its owner and the owner's grantee), and no two
+member accounts share a home Space.
+
+An estimate, not measured: in prod, shapes per keyed table are about the number of accounts for
+per-account, against about Spaces plus partner calendars for S. Per-account has more only where
+several member accounts share one Space.
+
+**Pass line** (under 10 s, every bystander probe succeeding):
+
+- **Import:** both variants pass on both runners.
+- **Large deletion:** both fail strictly on both runners, losing the same attempts. On 9V74 each
+  lost 2 of 7 drains and live changes; on 7763 each lost 1 of 9. S's own SUMMARY reports this
+  loss for every S run.
+- **Small deletion:** B-per-account passes both. S lost one live change of two on 7763.
+
+**Fix-plan figures.** These S numbers (2.66–3.45 s import, 1.76–1.82 s large deletion) sit inside
+the fix plan's 2.6–3.6 s and 1.2–1.9 s.
