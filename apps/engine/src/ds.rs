@@ -348,13 +348,28 @@ pub(crate) fn jittered_rate_limit_retry_delay(
     attempt: u32,
     nanos: u32,
 ) -> Option<std::time::Duration> {
-    let rate = e.downcast_ref::<DsRateLimited>()?;
-    let delay = rate_limit_delay(attempt, rate.retry_after);
+    e.downcast_ref::<DsRateLimited>().map(|rate| jittered_rate_limit_delay(attempt, rate.retry_after, nanos))
+}
+
+fn jittered_rate_limit_delay(
+    attempt: u32,
+    retry_after: Option<std::time::Duration>,
+    nanos: u32,
+) -> std::time::Duration {
+    let delay = rate_limit_delay(attempt, retry_after);
     let width = delay / 4;
     let top = (delay + width).min(RATE_LIMIT_DELAY_MAX);
-    let floor = top.saturating_sub(width).max(rate.retry_after.unwrap_or_default().min(top));
+    let floor = top.saturating_sub(width).max(retry_after.unwrap_or_default().min(top));
     let span = u64::try_from((top - floor).as_millis()).unwrap_or(0);
-    Some(floor + std::time::Duration::from_millis(u64::from(nanos) % (span + 1)))
+    floor + std::time::Duration::from_millis(u64::from(nanos) % (span + 1))
+}
+
+/// How a request's 429 waits are spaced: on the growing schedule every caller shares, or jittered
+/// ([`jittered_rate_limit_delay`]) where many engines make the same request at the same moment.
+#[derive(Clone, Copy)]
+enum RatePacing {
+    Shared,
+    Jittered,
 }
 
 /// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
@@ -1370,14 +1385,17 @@ impl DsClient {
     /// The keep-alive: a non-live `GET` at the tail (`offset=now`), which slides the stream's TTL
     /// without reading any of it. `HEAD` would not slide it. A stream that is not there is a typed
     /// [`StreamGone`].
+    ///
+    /// One attempt, a 429 included (a typed [`DsRateLimited`]): the keep-alive sweep is the retry
+    /// loop, and it waits for every touch before it counts failures and starts the next one.
     pub(crate) async fn touch(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
-        let res = self.retry_rate_limited("GET", path, || self.store.read(&physical_path, "now", false)).await?;
+        let res = self.store.read(&physical_path, "now", false).await?;
         if res.status == 404 || res.status == 410 {
             return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
         }
         if !(200..300).contains(&res.status) {
-            return Err(status_error("GET", path, res.status, ""));
+            return Err(status_error_with_retry_after("GET", path, res.status, "", res.retry_after));
         }
         self.note_access(path, res.status);
         Ok(())
@@ -1575,7 +1593,21 @@ impl DsClient {
         attempt: u32,
         retry_after: Option<std::time::Duration>,
     ) -> bool {
-        let delay = rate_limit_delay(attempt, retry_after);
+        self.wait_rate_limit_paced(op, path, attempt, retry_after, RatePacing::Shared).await
+    }
+
+    async fn wait_rate_limit_paced(
+        &self,
+        op: &'static str,
+        path: &str,
+        attempt: u32,
+        retry_after: Option<std::time::Duration>,
+        pacing: RatePacing,
+    ) -> bool {
+        let delay = match pacing {
+            RatePacing::Shared => rate_limit_delay(attempt, retry_after),
+            RatePacing::Jittered => jittered_rate_limit_delay(attempt, retry_after, crate::replication::clock_nanos()),
+        };
         tracing::warn!(op, path, attempt, ?delay, "durable-streams rate limited request; retrying");
         if let Some(shutdown) = &self.shutdown {
             tokio::select! {
@@ -1590,7 +1622,21 @@ impl DsClient {
 
     /// Keep the port single-attempt. Release response buffers/permits before waiting and leave
     /// the caller's offset unchanged until a complete successful page arrives.
-    async fn retry_rate_limited<F, Fut>(&self, op: &'static str, path: &str, mut request: F) -> Result<StoreResponse>
+    async fn retry_rate_limited<F, Fut>(&self, op: &'static str, path: &str, request: F) -> Result<StoreResponse>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<StoreResponse>>,
+    {
+        self.retry_rate_limited_paced(op, path, RatePacing::Shared, request).await
+    }
+
+    async fn retry_rate_limited_paced<F, Fut>(
+        &self,
+        op: &'static str,
+        path: &str,
+        pacing: RatePacing,
+        mut request: F,
+    ) -> Result<StoreResponse>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<StoreResponse>>,
@@ -1604,7 +1650,7 @@ impl DsClient {
             let retry_after = res.retry_after;
             drop(res);
             attempt = attempt.saturating_add(1);
-            if !self.wait_rate_limit(op, path, attempt, retry_after).await {
+            if !self.wait_rate_limit_paced(op, path, attempt, retry_after, pacing).await {
                 bail!("{op} {path} rate-limit retry interrupted by engine shutdown");
             }
         }
@@ -1619,6 +1665,16 @@ impl DsClient {
     /// apart: only a live stream that is not closed counts as existing, a `5xx` on the `HEAD` stays
     /// retryable, and every other `409` keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
+        self.ensure_stream_paced(path, RatePacing::Shared).await
+    }
+
+    /// [`Self::ensure_stream`] with its 429 waits jittered: for a PUT that every engine on a store
+    /// makes at the same moment (the catalog's, at boot), so they do not retry in lockstep.
+    pub(crate) async fn ensure_stream_jittered(&self, path: &str) -> Result<()> {
+        self.ensure_stream_paced(path, RatePacing::Jittered).await
+    }
+
+    async fn ensure_stream_paced(&self, path: &str, pacing: RatePacing) -> Result<()> {
         let physical_path = self.physical_path(path)?;
         // While the PUT is in flight the stream counts as accessed, so a keep-alive sweep that runs
         // meanwhile neither touches a stream that does not exist yet (a 404) nor ages it from boot.
@@ -1627,7 +1683,9 @@ impl DsClient {
         // config-mismatch 409 stays as due as it was.
         let pending = self.begin_access(path);
         let res = self
-            .retry_rate_limited("PUT", path, || self.store.ensure(&physical_path, "application/json", self.stream_ttl))
+            .retry_rate_limited_paced("PUT", path, pacing, || {
+                self.store.ensure(&physical_path, "application/json", self.stream_ttl)
+            })
             .await?;
         if (200..300).contains(&res.status) {
             // A create (or a matching re-create, which the store treats as an access) starts the
@@ -1638,7 +1696,7 @@ impl DsClient {
         }
         drop(pending);
         if res.status == 409 && !res.closed {
-            let head = self.retry_rate_limited("HEAD", path, || self.store.head(&physical_path)).await?;
+            let head = self.retry_rate_limited_paced("HEAD", path, pacing, || self.store.head(&physical_path)).await?;
             if head.status == 200 && !head.closed {
                 return Ok(());
             }
@@ -2055,7 +2113,7 @@ impl DsClient {
             return Ok(None);
         }
         if !(200..300).contains(&res.status) {
-            return Err(status_error("HEAD", path, res.status, ""));
+            return Err(status_error_with_retry_after("HEAD", path, res.status, "", res.retry_after));
         }
         Ok(Some(StreamHead { next_offset: res.next_offset, closed: res.closed }))
     }
@@ -3717,7 +3775,13 @@ mod tests {
                         client.read_for_table("changes/0", "prior", false, "public.items").await.unwrap();
                     }
                     _ => {
-                        client.touch("changes/0").await.unwrap();
+                        // The keep-alive is single-attempt: its sweep is the retry loop.
+                        let error = client.touch("changes/0").await.expect_err("a touch does not wait out a 429");
+                        assert!(is_unavailable(&error), "a refused touch stays transient: {error:#}");
+                        assert!(rate_limit_retry_delay(&error, 1).is_some(), "a refused touch is a typed 429");
+                        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+                        assert_eq!(*store.read_offsets.lock().unwrap(), vec!["now"]);
+                        continue;
                     }
                 }
                 assert_eq!(

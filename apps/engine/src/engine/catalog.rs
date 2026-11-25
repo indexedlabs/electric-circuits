@@ -963,7 +963,7 @@ fn unreadable_literal(
 /// and one error line per attempt for as long as storage is down is a flood, not information.
 /// `logged` is the caller's per-outage latch; it is cleared again on success.
 async fn ensure_catalog(ds: &DsClient, logged: &mut bool) -> bool {
-    match ds.ensure_stream(CATALOG_STREAM).await {
+    match ds.ensure_stream_jittered(CATALOG_STREAM).await {
         Ok(()) => {
             *logged = false;
             true
@@ -1261,7 +1261,8 @@ impl Engine {
             if !initialize_namespace {
                 return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
             }
-            ds.ensure_stream(CATALOG_STREAM).await?;
+            // Jittered: every engine booting against this empty namespace makes this PUT at once.
+            ds.ensure_stream_jittered(CATALOG_STREAM).await?;
             let mut event = serde_json::to_value(CatalogEvent::StoreBound(expected.clone()))?;
             event
                 .as_object_mut()

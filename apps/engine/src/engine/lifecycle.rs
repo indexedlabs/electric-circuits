@@ -3458,11 +3458,25 @@ impl Engine {
         };
         let Some((id, path)) = candidate else { return Ok(()) };
         let mut attempt = 0u32;
+        let mut rate_limited = 0u32;
         let lost = loop {
             match self.ds.head(&path).await {
                 Ok(Some(head)) => break head.closed,
                 Ok(None) => break true,
                 Err(e) => {
+                    // A 429 is the store asking for time, not doubt about the stream: wait out its
+                    // bounded delay as every other rate-limited request does, without spending one
+                    // of the three probes.
+                    if let Some(delay) = crate::ds::rate_limit_retry_delay(&e, rate_limited + 1) {
+                        rate_limited += 1;
+                        let shutdown = self.shutdown_token();
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => continue,
+                            _ = shutdown.wait() => {
+                                return Err(e.context(format!("joining retained shape {id}: interrupted by shutdown")));
+                            }
+                        }
+                    }
                     attempt += 1;
                     if attempt >= 3 || !crate::ds::is_unavailable(&e) {
                         return Err(e.context(format!(
