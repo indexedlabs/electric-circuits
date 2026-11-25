@@ -513,13 +513,13 @@ CREATE TABLE external_link (
 
 ;
 CREATE UNIQUE INDEX external_link_user_owner_person_provider_app_unique_idx ON external_link (user_id, owner_person_id, provider) WHERE package IS NOT NULL AND state IN ('pending', 'linked', 'lost');
+CREATE INDEX external_link_resource_id_idx ON external_link (resource_id) WHERE resource_id IS NOT NULL;
+CREATE INDEX external_link_connect_workflow_id_idx ON external_link (connect_workflow_id) WHERE connect_workflow_id IS NOT NULL;
 CREATE INDEX external_link_owner_person_id_provider_app_idx ON external_link (owner_person_id, provider) WHERE package IS NOT NULL;
 CREATE UNIQUE INDEX external_link_user_id_provider_chat_unique_idx ON external_link (user_id, provider) WHERE package IS NULL AND state <> 'unlinked';
 CREATE INDEX external_link_provider_account_hint_active_idx ON external_link (provider, account_hint) WHERE state <> 'unlinked';
 CREATE INDEX external_link_user_id_idx ON external_link (user_id);
 CREATE UNIQUE INDEX external_link_resource_id_linked_unique_idx ON external_link (resource_id) WHERE state = 'linked';
-CREATE INDEX external_link_resource_id_idx ON external_link (resource_id) WHERE resource_id IS NOT NULL;
-CREATE INDEX external_link_connect_workflow_id_idx ON external_link (connect_workflow_id) WHERE connect_workflow_id IS NOT NULL;
 CREATE INDEX external_link_connect_card_message_id_idx ON external_link (connect_card_message_id) WHERE connect_card_message_id IS NOT NULL;
 CREATE INDEX external_link_provider_account_id_active_idx ON external_link (provider, account_id) WHERE state <> 'unlinked';
 CREATE INDEX external_link_user_provider_label_app_idx ON external_link (user_id, provider, account_label, id) WHERE package IS NOT NULL;
@@ -1464,9 +1464,9 @@ CREATE TABLE standing_grant (
 )
 
 ;
-CREATE UNIQUE INDEX standing_grant_live_user_resource_pair_idx ON standing_grant (grantor_user_id, grantee_resource_id, scope) WHERE state <> 'revoked' AND grantor_user_id IS NOT NULL AND grantee_resource_id IS NOT NULL;
 CREATE UNIQUE INDEX standing_grant_live_pair_idx ON standing_grant (grantor_user_id, grantee_user_id, scope) WHERE state <> 'revoked';
 CREATE INDEX standing_grant_grantee_active_all_editor_idx ON standing_grant (grantee_user_id, grantor_user_id) WHERE state = 'active' AND scope = 'all' AND tier = 'editor';
+CREATE UNIQUE INDEX standing_grant_live_user_resource_pair_idx ON standing_grant (grantor_user_id, grantee_resource_id, scope) WHERE state <> 'revoked' AND grantor_user_id IS NOT NULL AND grantee_resource_id IS NOT NULL;
 CREATE UNIQUE INDEX standing_grant_live_resource_user_pair_idx ON standing_grant (grantor_resource_id, grantee_user_id, scope) WHERE state <> 'revoked' AND grantor_resource_id IS NOT NULL AND grantee_user_id IS NOT NULL;
 
 CREATE TABLE standing_grant_backfill_status (
@@ -1998,8 +1998,8 @@ ALTER TABLE standing_grant_backfill_status ADD CONSTRAINT standing_grant_backfil
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantee_user_id_fk FOREIGN KEY(grantee_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantee_resource_id_fk FOREIGN KEY(grantee_resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantor_resource_id_fk FOREIGN KEY(grantor_resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
-ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_origin_invite_id_fk FOREIGN KEY(origin_invite_id) REFERENCES invite (id) ON DELETE RESTRICT;
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantor_user_id_fk FOREIGN KEY(grantor_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
+ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_origin_invite_id_fk FOREIGN KEY(origin_invite_id) REFERENCES invite (id) ON DELETE RESTRICT;
 ALTER TABLE invite ADD CONSTRAINT invite_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE invite ADD CONSTRAINT invite_exchanged_by_user_id_fk FOREIGN KEY(exchanged_by_user_id) REFERENCES "user" (id);
 ALTER TABLE invite ADD CONSTRAINT invite_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);

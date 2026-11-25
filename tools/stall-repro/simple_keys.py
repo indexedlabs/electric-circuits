@@ -23,7 +23,15 @@ SIMPLE_KEYED = (*RECORD_FAMILY, "calendar_event", "graph_edge")
 # S-rest-today: S, with every other table (chat included) on today's real gateway predicate.
 # B-per-account: S with one stream per account and keyed table (OTTO-14032, q-keyed-stream-sharing):
 # S's own row conditions, the account's Space list and direct-share ids as literal lists.
-SIMPLE_VARIANTS = {"S", "S-edge-shares", "S-rest-today", "B-per-account"}
+# S-assign-today: S, with `assignment` on today's gateway filter instead of S's keyed feed.
+# S-chat-narrow: S, with chat keyed only where indexed main keys it (`_keyed_chat_demand` over
+# `KEYED_CHAT_COLLECTIONS`, api/src/api/services/circuits_sync.py at 90893c5): `suggestion` for any
+# demand without a subquery, `message` only for a thread's target pair or one message id, and
+# `workflow_run` only for one thread's runs. Every `message` and `workflow_run` demand in the
+# synthetic catalog is a created_at-windowed history read naming no thread, so all of them keep
+# today's filter; `suggestion` stays keyed as in S.
+SIMPLE_VARIANTS = {"S", "S-edge-shares", "S-rest-today", "B-per-account", "S-assign-today", "S-chat-narrow"}
+NARROW_CHAT_TODAY = {"message", "workflow_run"}
 CHAT_TABLES = {"message", "workflow_run", "suggestion"}
 IMPORT_REST_TABLES = ("message", "workflow_run", "suggestion", "resource", "resource_fact", "file", "user")
 HIDDEN_RECORD_TYPES = ("busy_block", "legacy_preference", "family_context_report")
@@ -177,6 +185,9 @@ def per_account_feed(gateway, table, lists):
 
 
 async def simple_bodies(gateway, variant, table, account, lists):
+    # Today's filter, one shape per account and table, as `S-rest-today` builds it.
+    if (variant == "S-assign-today" and table == "assignment") or (variant == "S-chat-narrow" and table in NARROW_CHAT_TODAY):
+        return [await gateway.body(table, account, None, identity=f"today-{table}", chat=table in CHAT_TABLES)]
     if table in SIMPLE_KEYED and variant == "B-per-account":
         return [gateway._plain_body(table, account, per_account_feed(gateway, table, lists), "per-account", keyed=False)]
     if table in SIMPLE_KEYED:
