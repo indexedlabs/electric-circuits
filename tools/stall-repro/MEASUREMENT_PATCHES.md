@@ -162,18 +162,18 @@ They do not claim that keying the class is authorization-equivalent.
 - **B-cold.** See `variant-b-cold.md`.
 - **E-only and E-plus-R.** Today's catalog (A). Only `graph_edge` (E-only), or `graph_edge` plus the six Record-family tables (E-plus-R), get B's audience-key columns and keyed bodies, collapsed to one feed per account as in B. Every other table and the probe's feed stay as today, except that the probe's Record feed is keyed in E-plus-R.
 
-## B-per-account (`[paired-4]`, OTTO-14032 question `q-keyed-stream-sharing`)
+## B-per-account
 
-Per-account keyed streams in place of B's per-Space shared ones. Each account gets one plain filter per keyed table, built in `catalog.py` `per_account_bodies`, with no subquery and no dedupe across accounts.
+### As built on B (`[paired-4]`, superseded)
 
-- **Record family:**
-  - `record`: `space_id = own`, OR `space_id IN (partner)` with the record's `deleted_at IS NULL AND removed_at IS NULL`, OR `id IN (direct shares)`.
-  - The other five tables: `space_id IN (own, partner)` OR `record_id IN (direct shares)`; `assignment` has no `space_id`, so it uses B's `audience_key` column.
-- **`calendar_event`:** `user_id = U OR calendar_id IN (partner's 15 calendars)`.
-- **Every other keyed table, `graph_edge` included:** `audience_key IN (own, partner) AND reader_class = 'live'`, which is B-cold-key-edges' key per account.
-- **Lists:** literal values resolved at build time. The engine has no literal-list operator (`in` is always a subquery), so a list is an OR of equality leaves.
-- **Partner:** the grantor of the account's seeded standing grant.
-- **Partner calendars:** the authority's direct calendar grantor's 15.
-- **Direct shares:** the B-cold share mapping, computed rather than seeded, about 72 Record ids per account.
-- **Not modelled from B:** B has no partner case, so the partner branch follows today's gateway `record` predicate.
-- **Data:** the same as B's: audience columns on every table, no share rows seeded.
+Harness `bada4e3` built B-per-account on B's `audience_key` columns and paired it with B (results in `paired/paired-per-account-*`). The proposal's control is variant S, not B, so it was rebuilt below. The earlier rows stay for provenance only.
+
+### As built on S (`[paired-5]`, OTTO-14032 question `q-keyed-stream-sharing`)
+
+Built from S (`simple_keys.py`, merged from `profile/simple-keys-2026-11-24`), so that the only difference from S is one stream per account instead of one per Space. For every account and keyed table (`SIMPLE_KEYED`: the Record family, `calendar_event`, `graph_edge`), `per_account_feed` ORs S's feeds for that account into one plain filter:
+
+- **Record family:** `space_id IN (the account's Spaces, partner Spaces included)` with S's row conditions (hidden record types; assignment variables), `OR id/record_id IN (direct shares)`.
+- **`calendar_event`:** `(user_id = U OR calendar_id IN (partner calendars))` with S's event row state.
+- **`graph_edge`:** S's six edge branches with each `= space` written as `IN (spaces)`. S as written has no edge share list, so neither does this.
+
+Lists are S's own, from `account_lists`, read from the database when the shape is built. The engine has no literal-list operator, so an `IN` list is an OR of equality leaves. There is no cross-account dedupe. Every other table, the data (share seed, `assignment.space_id`, audience columns on the tables S doesn't key), the probe and the import feeds are exactly S's.

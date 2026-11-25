@@ -1,0 +1,92 @@
+[
+  {
+    "table": "record_share",
+    "operation": "delete",
+    "rows": 1000
+  },
+  {
+    "table": "file_share",
+    "operation": "delete",
+    "rows": 1000
+  },
+  {
+    "table": "resource_share",
+    "operation": "delete",
+    "rows": 100
+  },
+  {
+    "table": "file",
+    "operation": "delete",
+    "rows": 100
+  },
+  {
+    "table": "graph_edge",
+    "operation": "delete",
+    "rows": 125
+  },
+  {
+    "table": "assignment",
+    "operation": "delete",
+    "rows": 150
+  },
+  {
+    "table": "record_recurrence",
+    "operation": "delete",
+    "rows": 150
+  },
+  {
+    "table": "record_date_index",
+    "operation": "delete",
+    "rows": 500
+  },
+  {
+    "table": "resource_fact",
+    "operation": "delete",
+    "rows": 50
+  },
+  {
+    "table": "calendar_event",
+    "operation": "delete",
+    "rows": 100
+  },
+  {
+    "table": "record",
+    "operation": "delete",
+    "rows": 500
+  },
+  {
+    "table": "calendar",
+    "operation": "delete",
+    "rows": 15
+  },
+  {
+    "table": "resource",
+    "operation": "delete",
+    "rows": 100
+  },
+  {
+    "table": "space_member",
+    "operation": "delete",
+    "rows": 1001
+  },
+  {
+    "table": "standing_grant",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "space",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "external_account",
+    "operation": "delete",
+    "rows": 1
+  },
+  {
+    "table": "user",
+    "operation": "delete",
+    "rows": 1
+  }
+]

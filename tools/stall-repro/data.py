@@ -95,7 +95,7 @@ class SyntheticData:
             "record_recurrence": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account), "rrule": "FREQ=DAILY;COUNT=10"},
             "record_completed_index": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account)},
             "record_assignee_index": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account)},
-            "assignment": {"record_id": row_id("record", account, ordinal), "target_type": "resource", "target_id": row_id("resource", account, ordinal % 100), "source": "user", "scope": None, "instance_date": None},
+            "assignment": {"record_id": row_id("record", account, ordinal), "space_id": row_id("space", account), "variable": ("calendar", "origin", "driver")[ordinal % 3], "target_type": "resource", "target_id": row_id("resource", account, ordinal % 100), "source": "user", "scope": None, "instance_date": None},
             "calendar": {"user_id": row_id("user", account), "external_account_id": row_id("external_account", account), "provider": "google", "should_sync": True},
             "calendar_event": {"user_id": row_id("user", account), "calendar_id": row_id("calendar", account, ordinal % 15), "provider": "google", "status": "confirmed", "is_busy_block": False},
             "resource": {"resource_type": "person", "space_id": row_id("space", account), "user_id": row_id("user", account) if ordinal == 0 else None},
@@ -132,6 +132,14 @@ class SyntheticData:
                 statements.append(statement.as_string(connection))
                 self.columns[table].extend([{"name": name, "type": kind, "nullable": True, "primary_key": False, "server_default": None, "enum": None, "foreign_keys": []} for name, kind in (("audience_key", "UUID"), ("reader_class", "TEXT"))])
         return statements
+
+    def add_assignment_space(self, postgres_url):
+        """Variant S: `assignment.space_id`, which the synthetic writer fills from the row's Record."""
+        statement = "ALTER TABLE public.assignment ADD COLUMN space_id uuid"
+        with psycopg.connect(postgres_url) as connection:
+            connection.execute(statement)
+        self.columns["assignment"].append({"name": "space_id", "type": "UUID", "nullable": True, "primary_key": False, "server_default": None, "enum": None, "foreign_keys": []})
+        return [statement]
 
     def insert(self, connection, table, account, count, start=None):
         rows = self.rows.setdefault((table, account), [])

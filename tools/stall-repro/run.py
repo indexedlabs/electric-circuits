@@ -20,6 +20,7 @@ from catalog import RECORD_FAMILY, GatewayShapes, TARGETS, control_catalog, plai
 from data import IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
+from simple_keys import IMPORT_REST_TABLES, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, simple_bodies, simple_catalog
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -111,8 +112,8 @@ EDGE_ATTRIBUTION = {"A-edge-key-attendee": "attendee", "A-edge-key-generated": "
 PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTION.items() if mode != "no-window"})
 # B-cold-key-edges: B-cold with every graph_edge branch keyed, to attribute B-cold's remaining cost.
 COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
-AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED) | {"B-per-account"}
-ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION)
+AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
+ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -154,6 +155,13 @@ async def run(args):
         published = [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]]
         statements = await asyncio.to_thread(data.add_audience_columns, PG_URL, [table for table in published if args.variant not in PARTLY_KEYED or table in PARTLY_KEYED[args.variant]])
         (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
+    if args.variant in SIMPLE_VARIANTS:
+        statements = await asyncio.to_thread(data.add_assignment_space, PG_URL)
+        if args.variant != "S-rest-today":
+            # The tables S does not change keep B-cold's shapes, which read B-cold's columns.
+            published = [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]]
+            statements += await asyncio.to_thread(data.add_audience_columns, PG_URL, [table for table in published if table not in SIMPLE_KEYED])
+        (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
     help_probe = subprocess.run([str(Path(args.store).resolve()), "--help"], capture_output=True, text=True)
     (output / "store-help.txt").write_text(help_probe.stdout + help_probe.stderr)
     supports_page_cap = b"--max-chunk-bytes" in Path(args.store).read_bytes()
@@ -162,7 +170,12 @@ async def run(args):
         store_arguments.extend(["--max-chunk-bytes", "4194304"])
     save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
-    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS))
+    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS | SIMPLE_VARIANTS or "share-delete" in args.workloads))
+    lists = {}
+    if args.variant in SIMPLE_VARIANTS:
+        with psycopg.connect(PG_URL) as connection:
+            lists = {account: account_lists(connection, gateway, account) for account in range(IMPORT_ACCOUNT + 1)}
+        save(output / "account-lists.json", {account: vars(entry) for account, entry in lists.items()})
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen(store_arguments, stdout=store_log, stderr=subprocess.STDOUT)
     async with httpx.AsyncClient(timeout=1) as store_client:
@@ -230,10 +243,10 @@ async def run(args):
                 catalog = await gateway.edge_attribution_catalog(catalog, EDGE_ATTRIBUTION[args.variant])
             elif args.variant in PARTLY_KEYED:
                 catalog = await gateway.keyed_catalog(catalog, preserved={request["body"]["table"].removeprefix("public.") for request in catalog} - PARTLY_KEYED[args.variant])
-            if args.variant == "B-per-account":
-                catalog = await gateway.per_account_catalog(catalog)
             if args.variant in COLD_VARIANTS:
                 catalog = await gateway.cold_catalog(catalog, key_all_edges=args.variant == "B-cold-key-edges")
+            if args.variant in SIMPLE_VARIANTS:
+                catalog = await simple_catalog(gateway, args.variant, catalog, lists)
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -253,9 +266,13 @@ async def run(args):
                     return response.json()
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
-            for table in ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource"):
-                if args.variant == "B-per-account":
-                    for body in gateway.per_account_bodies(table, IMPORT_ACCOUNT):
+            import_tables = ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource")
+            if args.variant == "S-rest-today":
+                # This variant asks what today's remaining filters cost, so the importing account holds them too.
+                import_tables = tuple(dict.fromkeys((*import_tables, *IMPORT_REST_TABLES)))
+            for table in import_tables:
+                if args.variant in SIMPLE_VARIANTS:
+                    for body in await simple_bodies(gateway, args.variant, table, IMPORT_ACCOUNT, lists[IMPORT_ACCOUNT]):
                         await create({"body": body})
                     continue
                 if args.variant in COLD_VARIANTS:
@@ -272,7 +289,10 @@ async def run(args):
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            probe_body = {**gateway.per_account_bodies("record", 0)[0], "subscription": gateway._subscription("record", 0, "other-account-probe")} if args.variant == "B-per-account" else gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in COLD_VARIANTS or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
+            if args.variant in SIMPLE_VARIANTS:
+                probe_body = (await simple_bodies(gateway, args.variant, "record", 0, lists[0]))[0]
+            else:
+                probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in COLD_VARIANTS or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
             if args.variant == "plain-only":
                 probe_body = plain_control_body(probe_body, 0, "other-account-probe")
             probe_feed = await create({"body": probe_body})
