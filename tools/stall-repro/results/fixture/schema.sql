@@ -22,16 +22,16 @@ CREATE TABLE activity (
 )
 
 ;
-CREATE INDEX activity_related_record_id_idx ON activity (target_type, target_id, related_record_id);
+CREATE INDEX activity_event_log_id_idx ON activity (event_log_id) WHERE event_log_id IS NOT NULL;
 CREATE INDEX activity_target_idx ON activity (target_type, target_id, deleted_at, read_at, type);
-CREATE UNIQUE INDEX ix_activity_client_id ON activity (client_id);
 CREATE INDEX activity_payload_idx ON activity USING gin (payload jsonb_path_ops);
+CREATE INDEX activity_related_record_id_idx ON activity (target_type, target_id, related_record_id);
 CREATE INDEX activity_live_user_related_record_id_idx ON activity (related_record_id) WHERE target_type = 'user' AND deleted_at IS NULL;
 CREATE INDEX activity_space_id_idx ON activity (space_id);
-CREATE INDEX activity_event_log_id_idx ON activity (event_log_id) WHERE event_log_id IS NOT NULL;
-CREATE INDEX activity_related_suggestion_id_idx ON activity (target_type, target_id, related_suggestion_id);
 CREATE INDEX activity_related_message_id_idx ON activity (target_type, target_id, related_message_id);
+CREATE INDEX activity_related_suggestion_id_idx ON activity (target_type, target_id, related_suggestion_id);
 CREATE UNIQUE INDEX activity_signal_processed_source_target_unique_idx ON activity (source_id, target_id) WHERE type = 'signal_processed';
+CREATE UNIQUE INDEX ix_activity_client_id ON activity (client_id);
 
 CREATE TABLE agent_run (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -55,10 +55,10 @@ CREATE TABLE agent_run (
 )
 
 ;
-CREATE INDEX agent_run_space_id_idx ON agent_run (space_id);
-CREATE INDEX agent_run_processor_signal_idx ON agent_run ((payload ->> 'signal_id')) WHERE role = 'processor' AND workflow_run_id IS NULL;
 CREATE INDEX agent_run_router_signal_idx ON agent_run ((payload ->> 'signal_id')) WHERE role = 'router';
+CREATE INDEX agent_run_processor_signal_idx ON agent_run ((payload ->> 'signal_id')) WHERE role = 'processor' AND workflow_run_id IS NULL;
 CREATE INDEX agent_run_parent_agent_run_id_idx ON agent_run (parent_agent_run_id);
+CREATE INDEX agent_run_space_id_idx ON agent_run (space_id);
 
 CREATE TABLE assignment (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -86,11 +86,11 @@ CREATE TABLE assignment (
 )
 
 ;
-CREATE INDEX assignment_record_id_idx ON assignment (record_id);
 CREATE INDEX assignment_record_active_idx ON assignment (record_id, variable, target_type, target_id) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX assignment_active_semantic_idx ON assignment (record_id, variable, target_type, target_id, coalesce(scope, 'series'), coalesce(instance_date, DATE '0001-01-01')) WHERE deleted_at IS NULL;
 CREATE INDEX assignment_target_active_idx ON assignment (target_type, target_id, variable, record_id) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX assignment_record_calendar_unique_idx ON assignment (record_id) WHERE target_type = 'calendar' AND deleted_at IS NULL;
+CREATE INDEX assignment_record_id_idx ON assignment (record_id);
 
 CREATE TABLE assistant_run (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -183,12 +183,12 @@ CREATE TABLE calendar (
 )
 
 ;
-CREATE INDEX calendar_google_subscribed_live_idx ON calendar (id) WHERE deleted_at IS NULL AND provider_calendar_id LIKE '%%@import.calendar.google.com';
-CREATE INDEX calendar_resource_id_idx ON calendar (resource_id) WHERE resource_id IS NOT NULL;
 CREATE INDEX calendar_user_id_provider_calendar_id_idx ON calendar (user_id, provider_calendar_id);
 CREATE INDEX calendar_selected_last_checked_idx ON calendar (coalesce(last_checked_at, created_at), id) WHERE should_sync AND deleted_at IS NULL;
 CREATE INDEX calendar_user_id_primary_idx ON calendar (user_id, deleted_at, is_primary);
 CREATE INDEX calendar_external_account_id_idx ON calendar (external_account_id);
+CREATE INDEX calendar_resource_id_idx ON calendar (resource_id) WHERE resource_id IS NOT NULL;
+CREATE INDEX calendar_google_subscribed_live_idx ON calendar (id) WHERE deleted_at IS NULL AND provider_calendar_id LIKE '%%@import.calendar.google.com';
 
 CREATE TABLE calendar_event (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -234,12 +234,8 @@ CREATE TABLE calendar_event (
 )
 
 ;
-CREATE INDEX calendar_event_user_id_start_datetime_end_datetime_idx ON calendar_event (user_id, start_datetime, end_datetime) WHERE deleted_at IS NULL AND start_datetime IS NOT NULL;
-CREATE INDEX calendar_event_partner_consolidation_candidate_idx ON calendar_event (user_id, provider, ical_uid, id) WHERE deleted_at IS NULL AND status <> 'cancelled' AND linked_record_id IS NOT NULL AND ical_uid IS NOT NULL;
-CREATE INDEX calendar_event_cancelled_recurrence_exception_idx ON calendar_event (user_id, calendar_id, original_start_time) WHERE status = 'cancelled' AND original_start_time IS NOT NULL;
-CREATE INDEX calendar_event_dirty_by_user_id_idx ON calendar_event (dirty_by_user_id) WHERE dirty_by_user_id IS NOT NULL;
-CREATE INDEX calendar_event_dirty_organizer_idx ON calendar_event (dirty_at) WHERE dirty_at IS NOT NULL AND role = 'organizer';
 CREATE INDEX calendar_event_is_recurring_until_idx ON calendar_event (is_recurring, recurring_until);
+CREATE INDEX calendar_event_dirty_organizer_idx ON calendar_event (dirty_at) WHERE dirty_at IS NOT NULL AND role = 'organizer';
 CREATE INDEX calendar_event_calendar_id_id_idx ON calendar_event (calendar_id, id);
 CREATE INDEX calendar_event_calendar_id_user_id_linked_record_id_idx ON calendar_event (calendar_id, user_id, linked_record_id);
 CREATE UNIQUE INDEX calendar_event_organizer_indexed_record_id_unique_idx ON calendar_event (indexed_record_id) WHERE deleted_at IS NULL AND role = 'organizer' AND indexed_record_id IS NOT NULL;
@@ -248,6 +244,10 @@ CREATE INDEX calendar_event_user_id_start_date_end_date_idx ON calendar_event (u
 CREATE INDEX calendar_event_ical_uid_idx ON calendar_event (ical_uid);
 CREATE INDEX calendar_event_retired_linked_idx ON calendar_event (linked_record_id) WHERE linked_record_id IS NOT NULL AND (deleted_at IS NOT NULL OR status = 'cancelled');
 CREATE INDEX calendar_event_indexed_record_id_idx ON calendar_event (indexed_record_id);
+CREATE INDEX calendar_event_user_id_start_datetime_end_datetime_idx ON calendar_event (user_id, start_datetime, end_datetime) WHERE deleted_at IS NULL AND start_datetime IS NOT NULL;
+CREATE INDEX calendar_event_partner_consolidation_candidate_idx ON calendar_event (user_id, provider, ical_uid, id) WHERE deleted_at IS NULL AND status <> 'cancelled' AND linked_record_id IS NOT NULL AND ical_uid IS NOT NULL;
+CREATE INDEX calendar_event_cancelled_recurrence_exception_idx ON calendar_event (user_id, calendar_id, original_start_time) WHERE status = 'cancelled' AND original_start_time IS NOT NULL;
+CREATE INDEX calendar_event_dirty_by_user_id_idx ON calendar_event (dirty_by_user_id) WHERE dirty_by_user_id IS NOT NULL;
 
 CREATE TABLE calendar_highlight (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -305,10 +305,10 @@ CREATE TABLE channel_event (
 )
 
 ;
-CREATE INDEX channel_event_external_conversation_id_idx ON channel_event (external_conversation_id) WHERE external_conversation_id IS NOT NULL;
 CREATE INDEX channel_event_type_idx ON channel_event (type);
-CREATE UNIQUE INDEX channel_event_external_message_id_unique_idx ON channel_event (external_message_id) WHERE external_message_id IS NOT NULL;
 CREATE INDEX channel_event_space_id_created_at_idx ON channel_event (space_id, created_at);
+CREATE UNIQUE INDEX channel_event_external_message_id_unique_idx ON channel_event (external_message_id) WHERE external_message_id IS NOT NULL;
+CREATE INDEX channel_event_external_conversation_id_idx ON channel_event (external_conversation_id) WHERE external_conversation_id IS NOT NULL;
 
 CREATE TABLE circuits_source_fence (
 	source_commit_id UUID NOT NULL, 
@@ -366,11 +366,11 @@ CREATE TABLE conversation (
 )
 
 ;
-CREATE INDEX conversation_calendar_completed_created_at_idx ON conversation (created_at, id) WHERE jsonb_path_exists(metadata, '$.calendar ? (@.completed == true)'::jsonpath);
-CREATE UNIQUE INDEX conversation_record_id_active_unique_idx ON conversation (record_id) WHERE record_id IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX conversation_calendar_unsettled_created_at_idx ON conversation (created_at DESC) WHERE deleted_at IS NULL AND jsonb_extract_path(metadata, 'calendar') IS NOT NULL AND coalesce(jsonb_extract_path_text(metadata, 'calendar', 'completed'), 'false') != 'true' AND coalesce(jsonb_extract_path_text(metadata, 'calendar', 'failed'), 'false') != 'true';
 CREATE INDEX conversation_event_log_id_idx ON conversation (event_log_id) WHERE event_log_id IS NOT NULL;
 CREATE UNIQUE INDEX conversation_onboarding_singleton_idx ON conversation (space_id) WHERE type = 'onboarding' AND deleted_at IS NULL;
+CREATE INDEX conversation_calendar_completed_created_at_idx ON conversation (created_at, id) WHERE jsonb_path_exists(metadata, '$.calendar ? (@.completed == true)'::jsonpath);
+CREATE UNIQUE INDEX conversation_record_id_active_unique_idx ON conversation (record_id) WHERE record_id IS NOT NULL AND deleted_at IS NULL;
 
 CREATE TABLE email_inbox (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -417,15 +417,15 @@ CREATE TABLE event_log (
 )
 
 ;
-CREATE INDEX event_log_tag_created_payload_id_idx ON event_log (space_id, ((content -> 'payload'::text) ->> 'id'::text)) WHERE (type::text = 'tag_created'::text AND status::text = 'committed'::text);
-CREATE INDEX event_log_source_user_id_idx ON event_log (source_user_id);
-CREATE INDEX event_log_resource_share_create_client_id_idx ON event_log (space_id, ((content -> 'payload'::text) ->> 'client_id'::text), created_at, id) WHERE status = 'committed' AND type = 'resource_share_created';
-CREATE UNIQUE INDEX event_log_client_id_non_failed_unique_idx ON event_log (client_id) WHERE status != 'failed';
 CREATE INDEX event_log_record_id_idx ON event_log (record_id);
-CREATE INDEX event_log_client_id_failed_created_at_idx ON event_log (client_id, created_at, id) WHERE status = 'failed';
-CREATE INDEX event_log_legacy_workflow_suggestion_recovery_idx ON event_log (((content -> 'payload'::text) ->> 'request_id'::text), space_id, created_at, id) WHERE status = 'pending' AND workflow_suggestion_address IS NULL AND type IN ('suggestion_created', 'suggestions_created') AND ((content -> 'payload'::text) ->> 'request_id'::text) IS NOT NULL;
-CREATE INDEX event_log_record_unsynced_attendee_idx ON event_log (record_id, timestamp) WHERE status = 'committed' AND deleted_at IS NULL AND type IN ('assignment_created', 'assignment_deleted', 'resource_assigned_to_record', 'resource_unassigned_from_record');
+CREATE INDEX event_log_tag_created_payload_id_idx ON event_log (space_id, ((content -> 'payload'::text) ->> 'id'::text)) WHERE (type::text = 'tag_created'::text AND status::text = 'committed'::text);
 CREATE INDEX event_log_space_id_type_status_idx ON event_log (space_id, type, status);
+CREATE INDEX event_log_record_unsynced_attendee_idx ON event_log (record_id, timestamp) WHERE status = 'committed' AND deleted_at IS NULL AND type IN ('assignment_created', 'assignment_deleted', 'resource_assigned_to_record', 'resource_unassigned_from_record');
+CREATE UNIQUE INDEX event_log_client_id_non_failed_unique_idx ON event_log (client_id) WHERE status != 'failed';
+CREATE INDEX event_log_source_user_id_idx ON event_log (source_user_id);
+CREATE INDEX event_log_legacy_workflow_suggestion_recovery_idx ON event_log (((content -> 'payload'::text) ->> 'request_id'::text), space_id, created_at, id) WHERE status = 'pending' AND workflow_suggestion_address IS NULL AND type IN ('suggestion_created', 'suggestions_created') AND ((content -> 'payload'::text) ->> 'request_id'::text) IS NOT NULL;
+CREATE INDEX event_log_resource_share_create_client_id_idx ON event_log (space_id, ((content -> 'payload'::text) ->> 'client_id'::text), created_at, id) WHERE status = 'committed' AND type = 'resource_share_created';
+CREATE INDEX event_log_client_id_failed_created_at_idx ON event_log (client_id, created_at, id) WHERE status = 'failed';
 
 CREATE TABLE external_account (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -459,13 +459,13 @@ CREATE TABLE external_account (
 )
 
 ;
-CREATE UNIQUE INDEX external_account_resource_id_unique_idx ON external_account (resource_id) WHERE resource_id IS NOT NULL;
-CREATE INDEX external_account_email_recovery_created_at_idx ON external_account (created_at) WHERE has_email_scope OR has_email_readonly_scope;
 CREATE UNIQUE INDEX external_account_auth_enabled_idx ON external_account (provider, provider_account_id, oauth_app) WHERE authentication_enabled = true;
 CREATE INDEX external_account_email_recovery_updated_at_idx ON external_account (updated_at) WHERE has_email_scope OR has_email_readonly_scope;
 CREATE INDEX external_account_email_recovery_email_granted_at_idx ON external_account (email_granted_at) WHERE has_email_scope OR has_email_readonly_scope;
 CREATE INDEX external_account_login_provider_account_id_idx ON external_account (lower(provider_account_id));
 CREATE INDEX external_account_login_email_idx ON external_account (lower(email));
+CREATE UNIQUE INDEX external_account_resource_id_unique_idx ON external_account (resource_id) WHERE resource_id IS NOT NULL;
+CREATE INDEX external_account_email_recovery_created_at_idx ON external_account (created_at) WHERE has_email_scope OR has_email_readonly_scope;
 
 CREATE TABLE external_link (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -512,17 +512,17 @@ CREATE TABLE external_link (
 )
 
 ;
-CREATE INDEX external_link_connect_card_message_id_idx ON external_link (connect_card_message_id) WHERE connect_card_message_id IS NOT NULL;
-CREATE INDEX external_link_owner_person_id_provider_app_idx ON external_link (owner_person_id, provider) WHERE package IS NOT NULL;
-CREATE INDEX external_link_resource_id_idx ON external_link (resource_id) WHERE resource_id IS NOT NULL;
 CREATE UNIQUE INDEX external_link_user_owner_person_provider_app_unique_idx ON external_link (user_id, owner_person_id, provider) WHERE package IS NOT NULL AND state IN ('pending', 'linked', 'lost');
-CREATE INDEX external_link_connect_workflow_id_idx ON external_link (connect_workflow_id) WHERE connect_workflow_id IS NOT NULL;
-CREATE INDEX external_link_provider_account_id_active_idx ON external_link (provider, account_id) WHERE state <> 'unlinked';
-CREATE UNIQUE INDEX external_link_resource_id_linked_unique_idx ON external_link (resource_id) WHERE state = 'linked';
-CREATE INDEX external_link_user_id_idx ON external_link (user_id);
+CREATE INDEX external_link_owner_person_id_provider_app_idx ON external_link (owner_person_id, provider) WHERE package IS NOT NULL;
 CREATE UNIQUE INDEX external_link_user_id_provider_chat_unique_idx ON external_link (user_id, provider) WHERE package IS NULL AND state <> 'unlinked';
-CREATE INDEX external_link_user_provider_label_app_idx ON external_link (user_id, provider, account_label, id) WHERE package IS NOT NULL;
 CREATE INDEX external_link_provider_account_hint_active_idx ON external_link (provider, account_hint) WHERE state <> 'unlinked';
+CREATE INDEX external_link_user_id_idx ON external_link (user_id);
+CREATE UNIQUE INDEX external_link_resource_id_linked_unique_idx ON external_link (resource_id) WHERE state = 'linked';
+CREATE INDEX external_link_resource_id_idx ON external_link (resource_id) WHERE resource_id IS NOT NULL;
+CREATE INDEX external_link_connect_workflow_id_idx ON external_link (connect_workflow_id) WHERE connect_workflow_id IS NOT NULL;
+CREATE INDEX external_link_connect_card_message_id_idx ON external_link (connect_card_message_id) WHERE connect_card_message_id IS NOT NULL;
+CREATE INDEX external_link_provider_account_id_active_idx ON external_link (provider, account_id) WHERE state <> 'unlinked';
+CREATE INDEX external_link_user_provider_label_app_idx ON external_link (user_id, provider, account_label, id) WHERE package IS NOT NULL;
 
 CREATE TABLE external_link_group (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -558,11 +558,11 @@ CREATE TABLE external_link_group (
 )
 
 ;
-CREATE INDEX external_link_group_schedule_source_id_idx ON external_link_group (schedule_source_id) WHERE schedule_source_id IS NOT NULL;
 CREATE INDEX external_link_group_resource_id_idx ON external_link_group (resource_id) WHERE resource_id IS NOT NULL;
 CREATE INDEX external_link_group_external_link_id_name_id_idx ON external_link_group (external_link_id, name, id);
 CREATE INDEX external_link_group_chat_card_message_id_idx ON external_link_group (chat_card_message_id) WHERE chat_card_message_id IS NOT NULL;
 CREATE INDEX external_link_group_activity_order_idx ON external_link_group (external_link_id, last_activity_at DESC NULLS LAST, name, id);
+CREATE INDEX external_link_group_schedule_source_id_idx ON external_link_group (schedule_source_id) WHERE schedule_source_id IS NOT NULL;
 
 CREATE TABLE external_link_item (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -592,14 +592,14 @@ CREATE TABLE external_link_item (
 )
 
 ;
-CREATE INDEX external_link_item_kept_external_link_id_sender_id_idx ON external_link_item (external_link_id, sender_id) WHERE kept_at IS NOT NULL;
-CREATE INDEX external_link_item_group_stamp_sent_at_id_idx ON external_link_item (external_link_group_id, signaled_at, sent_at, id);
-CREATE INDEX external_link_item_file_id_idx ON external_link_item (file_id) WHERE file_id IS NOT NULL;
 CREATE UNIQUE INDEX external_link_item_external_link_id_external_id_idx ON external_link_item (external_link_id, external_id) WHERE external_link_group_id IS NULL;
 CREATE INDEX external_link_item_unsignaled_group_arrival_idx ON external_link_item (external_link_group_id, created_at, id) WHERE signaled_at IS NULL;
 CREATE INDEX external_link_item_external_link_id_idx ON external_link_item (external_link_id);
 CREATE INDEX external_link_item_external_link_group_id_sent_at_id_idx ON external_link_item (external_link_group_id, sent_at, id);
 CREATE INDEX external_link_item_unkept_created_at_idx ON external_link_item (created_at) WHERE kept_at IS NULL;
+CREATE INDEX external_link_item_kept_external_link_id_sender_id_idx ON external_link_item (external_link_id, sender_id) WHERE kept_at IS NOT NULL;
+CREATE INDEX external_link_item_group_stamp_sent_at_id_idx ON external_link_item (external_link_group_id, signaled_at, sent_at, id);
+CREATE INDEX external_link_item_file_id_idx ON external_link_item (file_id) WHERE file_id IS NOT NULL;
 
 CREATE TABLE feedback (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -623,11 +623,11 @@ CREATE TABLE feedback (
 )
 
 ;
-CREATE INDEX feedback_otto_user_feedback_pending_idx ON feedback (created_at) WHERE eval_processed_at IS NULL AND is_positive = false AND target_type = 'message' AND subject_key = 'otto_user_feedback';
 CREATE UNIQUE INDEX feedback_email_feedback_target_unique_idx ON feedback (target_id) WHERE target_type = 'email_message' AND subject_key = 'email_feedback';
 CREATE INDEX feedback_user_id_idx ON feedback (user_id);
 CREATE INDEX feedback_target_type_target_id_idx ON feedback (target_type, target_id);
 CREATE INDEX feedback_eval_pending_idx ON feedback (created_at) WHERE eval_processed_at IS NULL AND is_positive = false AND (target_type = 'suggestion' OR (target_type = 'email_message' AND subject_key = 'email_feedback'));
+CREATE INDEX feedback_otto_user_feedback_pending_idx ON feedback (created_at) WHERE eval_processed_at IS NULL AND is_positive = false AND target_type = 'message' AND subject_key = 'otto_user_feedback';
 
 CREATE TABLE file (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -657,7 +657,6 @@ CREATE TABLE file (
 )
 
 ;
-CREATE INDEX file_status_idx ON file (status);
 CREATE INDEX file_channel_event_id_idx ON file (channel_event_id) WHERE channel_event_id IS NOT NULL;
 CREATE INDEX file_parent_type_parent_id_idx ON file (parent_type, parent_id);
 CREATE UNIQUE INDEX file_external_link_item_id_content_hash_idx ON file (external_link_item_id, content_hash) WHERE deleted_at IS NULL AND scope_type = 'chat_message';
@@ -665,6 +664,7 @@ CREATE UNIQUE INDEX ux_file_channel_dedup ON file (channel_event_id, content_has
 CREATE INDEX file_unattached_upload_sweep_idx ON file (updated_at, id) WHERE scope_type = 'user' AND status = 'uploading' AND deleted_at IS NULL AND parent_id IS NULL;
 CREATE INDEX file_external_link_item_id_idx ON file (external_link_item_id) WHERE external_link_item_id IS NOT NULL;
 CREATE UNIQUE INDEX ux_file_user_dedup ON file (user_id, content_hash) WHERE deleted_at IS NULL AND scope_type = 'user';
+CREATE INDEX file_status_idx ON file (status);
 
 CREATE TABLE file_share (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -727,15 +727,15 @@ CREATE TABLE graph_edge (
 )
 
 ;
-CREATE UNIQUE INDEX graph_edge_unscoped_tuple_active_idx ON graph_edge (from_type, from_id, edge_type, to_type, to_id) WHERE deleted_at IS NULL AND scope_type IS NULL;
-CREATE INDEX graph_edge_to_space_idx ON graph_edge (to_space_id, deleted_at);
-CREATE INDEX graph_edge_type_created_idx ON graph_edge (edge_type, created_at);
 CREATE INDEX graph_edge_scope_from_active_idx ON graph_edge (scope_type, scope_id, from_type, from_id, edge_type) WHERE deleted_at IS NULL AND scope_type IS NOT NULL;
 CREATE INDEX graph_edge_from_space_idx ON graph_edge (from_space_id, deleted_at);
 CREATE INDEX graph_edge_from_idx ON graph_edge (from_type, from_id, edge_type);
 CREATE INDEX graph_edge_scope_to_active_idx ON graph_edge (scope_type, scope_id, to_type, to_id, edge_type) WHERE deleted_at IS NULL AND scope_type IS NOT NULL;
 CREATE INDEX graph_edge_to_idx ON graph_edge (to_type, to_id, edge_type);
 CREATE UNIQUE INDEX graph_edge_scoped_tuple_active_idx ON graph_edge (scope_type, scope_id, from_type, from_id, edge_type, to_type, to_id) WHERE deleted_at IS NULL AND scope_type IS NOT NULL;
+CREATE UNIQUE INDEX graph_edge_unscoped_tuple_active_idx ON graph_edge (from_type, from_id, edge_type, to_type, to_id) WHERE deleted_at IS NULL AND scope_type IS NULL;
+CREATE INDEX graph_edge_to_space_idx ON graph_edge (to_space_id, deleted_at);
+CREATE INDEX graph_edge_type_created_idx ON graph_edge (edge_type, created_at);
 
 CREATE TABLE invite (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -794,13 +794,13 @@ CREATE TABLE message (
 )
 
 ;
-CREATE INDEX message_agent_run_id_idx ON message (agent_run_id);
 CREATE INDEX message_reply_to_message_id_idx ON message (reply_to_message_id) WHERE reply_to_message_id IS NOT NULL;
 CREATE INDEX message_event_log_id_idx ON message (event_log_id) WHERE event_log_id IS NOT NULL;
 CREATE INDEX message_status_space_id_idx ON message (status, space_id);
 CREATE INDEX message_target_skip_card_created_at_id_idx ON message (target_id, created_at, id) WHERE deleted_at IS NULL AND ((content -> 'attachments') @> '[{"type": "app_link_connect", "kind": "intro"}]'::jsonb OR (content -> 'attachments') @> '[{"type": "account_connect", "kind": "password"}]'::jsonb);
 CREATE INDEX message_target_live_created_at_id_idx ON message (target_type, target_id, created_at, id) WHERE deleted_at IS NULL;
 CREATE INDEX message_target_parent_id_type_idx ON message (target_type, target_id, type, deleted_at, parent_id);
+CREATE INDEX message_agent_run_id_idx ON message (agent_run_id);
 
 CREATE TABLE monitored_url_run (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -852,8 +852,8 @@ CREATE TABLE monitored_url_run (
 )
 
 ;
-CREATE INDEX monitored_url_run_source_history_idx ON monitored_url_run (source_id, scheduled_for DESC);
 CREATE INDEX monitored_url_run_stale_running_idx ON monitored_url_run (started_at, id) WHERE status = 'running';
+CREATE INDEX monitored_url_run_source_history_idx ON monitored_url_run (source_id, scheduled_for DESC);
 
 CREATE TABLE monitored_url_source (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -925,8 +925,8 @@ CREATE TABLE monitored_url_subscription (
 )
 
 ;
-CREATE INDEX monitored_url_subscription_active_source_idx ON monitored_url_subscription (source_id, id) WHERE status = 'active';
 CREATE INDEX monitored_url_subscription_space_subject_active_idx ON monitored_url_subscription (space_id, subject_id) WHERE status = 'active';
+CREATE INDEX monitored_url_subscription_active_source_idx ON monitored_url_subscription (source_id, id) WHERE status = 'active';
 
 CREATE TABLE monty_runtime_checkpoint (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -975,10 +975,10 @@ CREATE TABLE monty_runtime_checkpoint (
 )
 
 ;
-CREATE INDEX monty_runtime_checkpoint_workflow_run_idx ON monty_runtime_checkpoint (workflow_id, created_by_workflow_run_id);
-CREATE INDEX monty_runtime_checkpoint_restore_idx ON monty_runtime_checkpoint (runtime_state_id, generation DESC) WHERE status = 'ready';
 CREATE INDEX monty_runtime_checkpoint_parent_checkpoint_id_idx ON monty_runtime_checkpoint (parent_checkpoint_id) WHERE parent_checkpoint_id IS NOT NULL;
 CREATE INDEX monty_runtime_checkpoint_created_by_agent_run_id_idx ON monty_runtime_checkpoint (created_by_agent_run_id) WHERE created_by_agent_run_id IS NOT NULL;
+CREATE INDEX monty_runtime_checkpoint_workflow_run_idx ON monty_runtime_checkpoint (workflow_id, created_by_workflow_run_id);
+CREATE INDEX monty_runtime_checkpoint_restore_idx ON monty_runtime_checkpoint (runtime_state_id, generation DESC) WHERE status = 'ready';
 
 CREATE TABLE native_sync_authority_fence (
 	user_id UUID NOT NULL, 
@@ -1004,8 +1004,8 @@ CREATE TABLE partner_calendar_event_mirror (
 
 ;
 CREATE INDEX partner_calendar_event_mirror_recipient_active_idx ON partner_calendar_event_mirror (recipient_user_id) WHERE deleted_at IS NULL;
-CREATE UNIQUE INDEX partner_calendar_event_mirror_grant_origin_uidx ON partner_calendar_event_mirror (origin_standing_grant_id, origin_calendar_event_id);
 CREATE INDEX partner_calendar_event_mirror_origin_idx ON partner_calendar_event_mirror (origin_calendar_event_id);
+CREATE UNIQUE INDEX partner_calendar_event_mirror_grant_origin_uidx ON partner_calendar_event_mirror (origin_standing_grant_id, origin_calendar_event_id);
 
 CREATE TABLE record (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1045,21 +1045,21 @@ CREATE TABLE record (
 )
 
 ;
-CREATE UNIQUE INDEX record_space_id_ical_uid_original_start_time_unique ON record (space_id, ical_uid, original_start_time) WHERE original_start_time IS NOT NULL AND superseded_by_record_id IS NULL;
-CREATE INDEX record_superseded_by_record_id_idx ON record (superseded_by_record_id) WHERE superseded_by_record_id IS NOT NULL;
-CREATE INDEX record_user_workflow_created_active_idx ON record (created_by_user_id, workflow_created_at DESC, id DESC) WHERE deleted_at IS NULL AND removed_at IS NULL AND archived_at IS NULL AND workflow_created_at IS NOT NULL;
-CREATE INDEX record_source_calendar_event_id_idx ON record (source_calendar_event_id);
-CREATE INDEX record_space_id_parent_id_idx ON record (space_id, parent_id);
-CREATE INDEX record_user_last_composer_activity_active_idx ON record (created_by_user_id, last_composer_activity_at DESC, id DESC) WHERE deleted_at IS NULL AND removed_at IS NULL AND archived_at IS NULL AND last_composer_activity_at IS NOT NULL;
-CREATE INDEX record_recurring_parent_id_spelled_date_idx ON record (recurring_parent_id, (left(replace(original_start_time, '-', ''), 8) COLLATE "C")) WHERE recurring_parent_id IS NOT NULL AND superseded_by_record_id IS NULL;
 CREATE UNIQUE INDEX record_space_id_app_event_ref_unique ON record (space_id, app_event_ref) WHERE app_event_ref IS NOT NULL AND superseded_by_record_id IS NULL AND deleted_at IS NULL;
+CREATE INDEX record_space_id_parent_id_idx ON record (space_id, parent_id);
 CREATE INDEX record_recurring_parent_id_idx ON record (recurring_parent_id) WHERE recurring_parent_id IS NOT NULL;
 CREATE INDEX record_pending_provider_reindex_idx ON record (id) WHERE provider_projection_reindex_pending_version IS NOT NULL;
 CREATE UNIQUE INDEX record_recurring_parent_id_original_start_time_idx ON record (recurring_parent_id, original_start_time) WHERE deleted_at IS NULL;
+CREATE INDEX record_user_workflow_created_active_idx ON record (created_by_user_id, workflow_created_at DESC, id DESC) WHERE deleted_at IS NULL AND removed_at IS NULL AND archived_at IS NULL AND workflow_created_at IS NOT NULL;
 CREATE UNIQUE INDEX record_space_id_ical_uid_parent_unique ON record (space_id, ical_uid) WHERE original_start_time IS NULL AND superseded_by_record_id IS NULL;
 CREATE INDEX record_event_log_id_idx ON record (event_log_id) WHERE event_log_id IS NOT NULL;
+CREATE INDEX record_recurring_parent_id_spelled_date_idx ON record (recurring_parent_id, (left(replace(original_start_time, '-', ''), 8) COLLATE "C")) WHERE recurring_parent_id IS NOT NULL AND superseded_by_record_id IS NULL;
 CREATE INDEX record_source_suggestion_id_idx ON record (source_suggestion_id);
 CREATE INDEX record_space_id_filter_idx ON record (space_id, deleted_at, removed_at, archived_at);
+CREATE UNIQUE INDEX record_space_id_ical_uid_original_start_time_unique ON record (space_id, ical_uid, original_start_time) WHERE original_start_time IS NOT NULL AND superseded_by_record_id IS NULL;
+CREATE INDEX record_superseded_by_record_id_idx ON record (superseded_by_record_id) WHERE superseded_by_record_id IS NOT NULL;
+CREATE INDEX record_source_calendar_event_id_idx ON record (source_calendar_event_id);
+CREATE INDEX record_user_last_composer_activity_active_idx ON record (created_by_user_id, last_composer_activity_at DESC, id DESC) WHERE deleted_at IS NULL AND removed_at IS NULL AND archived_at IS NULL AND last_composer_activity_at IS NOT NULL;
 
 CREATE TABLE record_assignee_index (
 	record_id UUID NOT NULL, 
@@ -1096,11 +1096,11 @@ CREATE TABLE record_date_index (
 )
 
 ;
-CREATE INDEX record_date_index_datetime_range_partial_idx ON record_date_index (datetime_value, end_datetime_value, field_id, space_id) WHERE datetime_value IS NOT NULL;
-CREATE INDEX record_date_index_datetime_value_partial_idx ON record_date_index (datetime_value, field_id, space_id) WHERE datetime_value IS NOT NULL;
 CREATE INDEX record_date_index_date_value_partial_idx ON record_date_index (date_value, field_id, space_id) WHERE date_value IS NOT NULL;
 CREATE INDEX record_date_index_date_range_partial_idx ON record_date_index (date_value, end_date_value, field_id, space_id) WHERE date_value IS NOT NULL;
 CREATE INDEX record_date_index_field_type_space_id_idx ON record_date_index (field_type, space_id);
+CREATE INDEX record_date_index_datetime_range_partial_idx ON record_date_index (datetime_value, end_datetime_value, field_id, space_id) WHERE datetime_value IS NOT NULL;
+CREATE INDEX record_date_index_datetime_value_partial_idx ON record_date_index (datetime_value, field_id, space_id) WHERE datetime_value IS NOT NULL;
 
 CREATE TABLE record_recurrence (
 	record_id UUID NOT NULL, 
@@ -1139,9 +1139,9 @@ CREATE TABLE record_share (
 )
 
 ;
+CREATE INDEX record_share_record_id_idx ON record_share (record_id) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX record_share_unique_idx ON record_share (space_id, record_id, target_type, target_id, invite_id) WHERE deleted_at IS NULL;
 CREATE INDEX record_share_target_type_target_id_idx ON record_share (target_type, target_id);
-CREATE INDEX record_share_record_id_idx ON record_share (record_id) WHERE deleted_at IS NULL;
 CREATE INDEX record_share_origin_standing_grant_filter_idx ON record_share (origin_standing_grant_id) WHERE deleted_at IS NULL;
 
 CREATE TABLE resource (
@@ -1175,12 +1175,12 @@ CREATE TABLE resource (
 )
 
 ;
+CREATE UNIQUE INDEX resource_feed_token_unique_idx ON resource (feed_token) WHERE feed_token IS NOT NULL;
 CREATE INDEX resource_superseded_by_resource_id_idx ON resource (superseded_by_resource_id) WHERE superseded_by_resource_id IS NOT NULL;
 CREATE INDEX resource_parent_id_idx ON resource (parent_id) WHERE parent_id IS NOT NULL;
 CREATE UNIQUE INDEX resource_active_owner_person_unique_idx ON resource (space_id, user_id) WHERE user_id IS NOT NULL AND resource_type = 'person' AND deleted_at IS NULL AND superseded_by_resource_id IS NULL;
 CREATE INDEX resource_normalized_name_lookup_idx ON resource (normalized_name) WHERE deleted_at IS NULL;
 CREATE INDEX resource_space_id_idx ON resource (space_id) WHERE deleted_at IS NULL;
-CREATE UNIQUE INDEX resource_feed_token_unique_idx ON resource (feed_token) WHERE feed_token IS NOT NULL;
 
 CREATE TABLE resource_fact (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1232,11 +1232,11 @@ CREATE TABLE resource_share (
 )
 
 ;
-CREATE UNIQUE INDEX resource_share_origin_live_uidx ON resource_share (origin_standing_grant_id, resource_id) WHERE origin_standing_grant_id IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX resource_share_target_lookup_idx ON resource_share (target_type, target_id, resource_id) WHERE deleted_at IS NULL;
 CREATE UNIQUE INDEX resource_share_active_provenance_idx ON resource_share (resource_id, target_type, target_id, source, origin_standing_grant_id) NULLS NOT DISTINCT WHERE deleted_at IS NULL;
 CREATE INDEX resource_share_resource_lookup_idx ON resource_share (resource_id, access_level, target_id) WHERE deleted_at IS NULL;
 CREATE INDEX resource_share_origin_idx ON resource_share (origin_standing_grant_id) WHERE origin_standing_grant_id IS NOT NULL;
+CREATE UNIQUE INDEX resource_share_origin_live_uidx ON resource_share (origin_standing_grant_id, resource_id) WHERE origin_standing_grant_id IS NOT NULL AND deleted_at IS NULL;
 
 CREATE TABLE routine (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1301,10 +1301,10 @@ CREATE TABLE routine_installation (
 )
 
 ;
-CREATE INDEX routine_installation_repair_task_record_id_idx ON routine_installation (repair_task_record_id);
-CREATE INDEX routine_installation_created_by_user_id_idx ON routine_installation (created_by_user_id) WHERE created_by_user_id IS NOT NULL;
 CREATE INDEX routine_installation_space_id_idx ON routine_installation (space_id);
 CREATE INDEX routine_installation_routine_id_idx ON routine_installation (routine_id);
+CREATE INDEX routine_installation_created_by_user_id_idx ON routine_installation (created_by_user_id) WHERE created_by_user_id IS NOT NULL;
+CREATE INDEX routine_installation_repair_task_record_id_idx ON routine_installation (repair_task_record_id);
 
 CREATE TABLE routine_revision (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1339,8 +1339,8 @@ CREATE TABLE routine_revision (
 )
 
 ;
-CREATE INDEX routine_revision_created_by_user_id_idx ON routine_revision (created_by_user_id) WHERE created_by_user_id IS NOT NULL;
 CREATE INDEX routine_revision_created_by_agent_run_id_idx ON routine_revision (created_by_agent_run_id) WHERE created_by_agent_run_id IS NOT NULL;
+CREATE INDEX routine_revision_created_by_user_id_idx ON routine_revision (created_by_user_id) WHERE created_by_user_id IS NOT NULL;
 
 CREATE TABLE signal (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1373,6 +1373,7 @@ CREATE TABLE signal (
 ;
 CREATE INDEX signal_dispatch_frontier_idx ON signal (seq) WHERE dispatched_at IS NULL;
 CREATE INDEX signal_email_received_source_id_idx ON signal (source_id) WHERE type = 'email.received' AND source_type = 'email_message';
+CREATE INDEX signal_pending_lane_seq_idx ON signal (space_id, dispatch_lane_key, seq) WHERE dispatched_at IS NULL AND dispatch_lane_key IS NOT NULL;
 CREATE INDEX signal_root_signal_id_idx ON signal (root_signal_id) WHERE root_signal_id IS NOT NULL;
 CREATE INDEX signal_terminal_catalog_unavailable_created_idx ON signal (created_at, id) WHERE dispatched_at IS NOT NULL AND dispatch_disposition->>'kind' = 'terminal_quarantined' AND dispatch_disposition->>'reason_code' = 'workflow_catalog_unavailable';
 CREATE INDEX signal_dispatch_unstarted_frontier_idx ON signal (seq) WHERE dispatched_at IS NULL AND dispatch_started_at IS NULL;
@@ -1385,7 +1386,6 @@ CREATE INDEX signal_external_link_received_pending_dispatch_idx ON signal (dispa
 CREATE INDEX signal_calendar_active_source_seq_idx ON signal (source_id, seq DESC, id DESC) WHERE type IN ('calendar.invite_received', 'calendar.event_created', 'calendar.event_updated') AND source_type = 'calendar_event' AND source_id IS NOT NULL;
 CREATE INDEX signal_calendar_delete_source_seq_idx ON signal (source_id, seq, id) WHERE type = 'calendar.event_deleted' AND source_type = 'calendar_event' AND source_id IS NOT NULL;
 CREATE INDEX signal_subject_type_id_idx ON signal (subject_type, subject_id);
-CREATE INDEX signal_pending_lane_seq_idx ON signal (space_id, dispatch_lane_key, seq) WHERE dispatched_at IS NULL AND dispatch_lane_key IS NOT NULL;
 CREATE INDEX signal_space_id_idx ON signal (space_id);
 CREATE INDEX signal_calendar_subscription_found_pending_dispatch_idx ON signal (dispatch_started_at, seq) WHERE type = 'calendar.subscription_found' AND dispatched_at IS NULL;
 
@@ -1414,10 +1414,10 @@ CREATE TABLE space (
 )
 
 ;
+CREATE INDEX space_filter_idx ON space (deleted_at, removed_at, archived_at);
+CREATE INDEX space_parent_id_idx ON space (parent_id);
 CREATE INDEX space_created_by_user_id_idx ON space (created_by_user_id);
 CREATE INDEX space_event_log_id_idx ON space (event_log_id) WHERE event_log_id IS NOT NULL;
-CREATE INDEX space_parent_id_idx ON space (parent_id);
-CREATE INDEX space_filter_idx ON space (deleted_at, removed_at, archived_at);
 
 CREATE TABLE space_member (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1430,8 +1430,8 @@ CREATE TABLE space_member (
 )
 
 ;
-CREATE INDEX space_member_user_id_idx ON space_member (user_id);
 CREATE INDEX space_member_space_id_idx ON space_member (space_id);
+CREATE INDEX space_member_user_id_idx ON space_member (user_id);
 
 CREATE TABLE standing_grant (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1464,10 +1464,10 @@ CREATE TABLE standing_grant (
 )
 
 ;
-CREATE UNIQUE INDEX standing_grant_live_pair_idx ON standing_grant (grantor_user_id, grantee_user_id, scope) WHERE state <> 'revoked';
 CREATE UNIQUE INDEX standing_grant_live_user_resource_pair_idx ON standing_grant (grantor_user_id, grantee_resource_id, scope) WHERE state <> 'revoked' AND grantor_user_id IS NOT NULL AND grantee_resource_id IS NOT NULL;
-CREATE UNIQUE INDEX standing_grant_live_resource_user_pair_idx ON standing_grant (grantor_resource_id, grantee_user_id, scope) WHERE state <> 'revoked' AND grantor_resource_id IS NOT NULL AND grantee_user_id IS NOT NULL;
+CREATE UNIQUE INDEX standing_grant_live_pair_idx ON standing_grant (grantor_user_id, grantee_user_id, scope) WHERE state <> 'revoked';
 CREATE INDEX standing_grant_grantee_active_all_editor_idx ON standing_grant (grantee_user_id, grantor_user_id) WHERE state = 'active' AND scope = 'all' AND tier = 'editor';
+CREATE UNIQUE INDEX standing_grant_live_resource_user_pair_idx ON standing_grant (grantor_resource_id, grantee_user_id, scope) WHERE state <> 'revoked' AND grantor_resource_id IS NOT NULL AND grantee_user_id IS NOT NULL;
 
 CREATE TABLE standing_grant_backfill_status (
 	standing_grant_id UUID NOT NULL, 
@@ -1538,8 +1538,6 @@ CREATE TABLE suggestion (
 )
 
 ;
-CREATE INDEX suggestion_source_type_id_idx ON suggestion (source_type, source_id);
-CREATE INDEX suggestion_rejected_space_updated_idx ON suggestion (space_id, updated_at DESC) WHERE status = 'rejected' AND removed_at IS NULL AND deleted_at IS NULL;
 CREATE INDEX suggestion_space_id_status_idx ON suggestion (space_id, status);
 CREATE INDEX suggestion_handled_notification_expires_at_idx ON suggestion (expires_at) WHERE status = 'handled_notification' AND expires_at IS NOT NULL;
 CREATE INDEX suggestion_space_id_key_created_at_idx ON suggestion (space_id, key, created_at);
@@ -1549,8 +1547,8 @@ CREATE INDEX suggestion_pending_unbound_request_id_idx ON suggestion (request_id
 CREATE INDEX suggestion_request_id_idx ON suggestion (request_id);
 CREATE UNIQUE INDEX suggestion_family_setup_space_key_unique_idx ON suggestion (space_id, key) WHERE status = 'pending' AND removed_at IS NULL AND deleted_at IS NULL AND source_type = 'family_setup' AND key IS NOT NULL;
 CREATE UNIQUE INDEX suggestion_pending_workflow_id_key_unique_idx ON suggestion (workflow_id, key) WHERE status = 'pending' AND removed_at IS NULL AND deleted_at IS NULL AND workflow_id IS NOT NULL AND key IS NOT NULL;
-CREATE INDEX suggestion_workflow_id_idx ON suggestion (workflow_id) WHERE workflow_id IS NOT NULL;
 CREATE INDEX suggestion_pending_workflow_space_created_idx ON suggestion (space_id, created_at, id) WHERE status = 'pending' AND removed_at IS NULL AND deleted_at IS NULL AND workflow_id IS NOT NULL AND key IS NOT NULL AND space_id IS NOT NULL;
+CREATE INDEX suggestion_workflow_id_idx ON suggestion (workflow_id) WHERE workflow_id IS NOT NULL;
 CREATE INDEX suggestion_legacy_workflow_recovery_idx ON suggestion (request_id, space_id, created_at, id) WHERE status = 'pending' AND removed_at IS NULL AND deleted_at IS NULL AND workflow_id IS NULL AND key IS NULL;
 CREATE INDEX suggestion_workflow_created_by_run_idx ON suggestion (workflow_id, created_by_run_id) WHERE created_by_run_id IS NOT NULL;
 CREATE INDEX suggestion_workflow_run_cards_created_idx ON suggestion (workflow_id, created_at, id) WHERE created_by_run_id IS NOT NULL AND deleted_at IS NULL;
@@ -1559,6 +1557,8 @@ CREATE INDEX suggestion_workflow_last_revised_by_run_idx ON suggestion (workflow
 CREATE INDEX suggestion_acceptance_claim_idx ON suggestion (acceptance_claimed_at) WHERE acceptance_claim_event_log_id IS NOT NULL;
 CREATE INDEX suggestion_source_context_type_id_idx ON suggestion (source_context_type, source_context_id) WHERE deleted_at IS NULL;
 CREATE INDEX suggestion_acceptance_claim_event_log_id_idx ON suggestion (acceptance_claim_event_log_id) WHERE acceptance_claim_event_log_id IS NOT NULL;
+CREATE INDEX suggestion_source_type_id_idx ON suggestion (source_type, source_id);
+CREATE INDEX suggestion_rejected_space_updated_idx ON suggestion (space_id, updated_at DESC) WHERE status = 'rejected' AND removed_at IS NULL AND deleted_at IS NULL;
 
 CREATE TABLE suggestion_seen (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1686,9 +1686,9 @@ CREATE TABLE "user" (
 )
 
 ;
-CREATE INDEX user_family_setup_record_id_idx ON "user" (family_setup_record_id);
-CREATE INDEX user_default_calendar_id_idx ON "user" (default_calendar_id) WHERE default_calendar_id IS NOT NULL;
 CREATE INDEX user_is_internal_idx ON "user" (id) WHERE is_internal;
+CREATE INDEX user_default_calendar_id_idx ON "user" (default_calendar_id) WHERE default_calendar_id IS NOT NULL;
+CREATE INDEX user_family_setup_record_id_idx ON "user" (family_setup_record_id);
 
 CREATE TABLE workflow (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1723,12 +1723,12 @@ CREATE TABLE workflow (
 )
 
 ;
-CREATE INDEX workflow_record_id_idx ON workflow (record_id) WHERE record_id IS NOT NULL;
-CREATE UNIQUE INDEX workflow_record_id_unique_idx ON workflow (record_id) WHERE record_id IS NOT NULL AND archived_at IS NULL;
-CREATE INDEX workflow_parent_id_idx ON workflow (parent_id) WHERE parent_id IS NOT NULL;
-CREATE INDEX workflow_source_signal_id_idx ON workflow (source_signal_id) WHERE source_signal_id IS NOT NULL;
-CREATE INDEX workflow_recent_open_idx ON workflow (space_id, updated_at) WHERE status = 'open';
 CREATE INDEX workflow_repair_suspended_idx ON workflow (repair_suspended_at) WHERE repair_suspended_at IS NOT NULL;
+CREATE UNIQUE INDEX workflow_record_id_unique_idx ON workflow (record_id) WHERE record_id IS NOT NULL AND archived_at IS NULL;
+CREATE INDEX workflow_record_id_idx ON workflow (record_id) WHERE record_id IS NOT NULL;
+CREATE INDEX workflow_recent_open_idx ON workflow (space_id, updated_at) WHERE status = 'open';
+CREATE INDEX workflow_source_signal_id_idx ON workflow (source_signal_id) WHERE source_signal_id IS NOT NULL;
+CREATE INDEX workflow_parent_id_idx ON workflow (parent_id) WHERE parent_id IS NOT NULL;
 
 CREATE TABLE workflow_run (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1781,14 +1781,14 @@ CREATE TABLE workflow_run (
 )
 
 ;
+CREATE INDEX workflow_run_workflow_id_created_at_idx ON workflow_run (workflow_id, created_at);
+CREATE INDEX workflow_run_agent_run_id_idx ON workflow_run (agent_run_id) WHERE agent_run_id IS NOT NULL;
 CREATE INDEX workflow_run_monty_checkpoint_before_id_idx ON workflow_run (monty_checkpoint_before_id) WHERE monty_checkpoint_before_id IS NOT NULL;
 CREATE INDEX workflow_run_otto_email_stalled_due_idx ON workflow_run (created_at, id) WHERE status = 'pending' AND stalled_alert_emitted_at IS NULL AND stalled_alert_attempt_count < 2;
 CREATE INDEX workflow_run_signal_id_idx ON workflow_run (signal_id);
 CREATE UNIQUE INDEX workflow_run_workflow_id_id_unique_idx ON workflow_run (workflow_id, id);
 CREATE INDEX workflow_run_monty_checkpoint_after_id_idx ON workflow_run (monty_checkpoint_after_id) WHERE monty_checkpoint_after_id IS NOT NULL;
 CREATE UNIQUE INDEX workflow_run_routine_chain_ordinal_idx ON workflow_run (workflow_id, routine_chain_root_workflow_run_id, routine_reentry_ordinal) WHERE routine_chain_root_workflow_run_id IS NOT NULL;
-CREATE INDEX workflow_run_workflow_id_created_at_idx ON workflow_run (workflow_id, created_at);
-CREATE INDEX workflow_run_agent_run_id_idx ON workflow_run (agent_run_id) WHERE agent_run_id IS NOT NULL;
 
 CREATE TABLE workflow_runtime_event (
 	id UUID DEFAULT uuidv7() NOT NULL, 
@@ -1880,106 +1880,105 @@ CREATE TABLE workflow_runtime_state (
 ;
 CREATE INDEX workflow_runtime_state_pending_continuation_event_id_idx ON workflow_runtime_state (pending_continuation_event_id) WHERE pending_continuation_event_id IS NOT NULL;
 CREATE INDEX workflow_runtime_state_context_compaction_due_idx ON workflow_runtime_state (COALESCE(context_last_compacted_at, created_at), last_active_at, id);
-ALTER TABLE external_link ADD CONSTRAINT external_link_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id) ON DELETE CASCADE;
-ALTER TABLE external_link ADD CONSTRAINT external_link_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE SET NULL;
 ALTER TABLE external_link ADD CONSTRAINT external_link_connect_card_message_id_fk FOREIGN KEY(connect_card_message_id) REFERENCES message (id) ON DELETE SET NULL;
+ALTER TABLE external_link ADD CONSTRAINT external_link_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id) ON DELETE CASCADE;
 ALTER TABLE external_link ADD CONSTRAINT external_link_connect_workflow_id_fk FOREIGN KEY(connect_workflow_id) REFERENCES workflow (id) ON DELETE SET NULL;
-ALTER TABLE workflow ADD CONSTRAINT workflow_parent_id_fk FOREIGN KEY(parent_id) REFERENCES workflow (id) ON DELETE RESTRICT;
-ALTER TABLE workflow ADD CONSTRAINT workflow_source_signal_id_fk FOREIGN KEY(source_signal_id) REFERENCES signal (id);
-ALTER TABLE workflow ADD CONSTRAINT workflow_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
-ALTER TABLE workflow ADD CONSTRAINT workflow_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE SET NULL;
-ALTER TABLE workflow ADD CONSTRAINT workflow_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE "user" ADD CONSTRAINT user_default_calendar_id_fk FOREIGN KEY(default_calendar_id) REFERENCES calendar (id) ON DELETE SET NULL;
-ALTER TABLE "user" ADD CONSTRAINT user_family_setup_record_id_fk FOREIGN KEY(family_setup_record_id) REFERENCES record (id) ON DELETE SET NULL;
+ALTER TABLE external_link ADD CONSTRAINT external_link_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE SET NULL;
 ALTER TABLE "user" ADD CONSTRAINT user_onboarding_workflow_id_fk FOREIGN KEY(onboarding_workflow_id) REFERENCES workflow (id) ON DELETE SET NULL;
+ALTER TABLE "user" ADD CONSTRAINT user_family_setup_record_id_fk FOREIGN KEY(family_setup_record_id) REFERENCES record (id) ON DELETE SET NULL;
+ALTER TABLE "user" ADD CONSTRAINT user_default_calendar_id_fk FOREIGN KEY(default_calendar_id) REFERENCES calendar (id) ON DELETE SET NULL;
 ALTER TABLE "user" ADD CONSTRAINT user_last_read_activity_id_fk FOREIGN KEY(last_read_activity_id) REFERENCES activity (id);
 ALTER TABLE "user" ADD CONSTRAINT user_private_space_id_fk FOREIGN KEY(private_space_id) REFERENCES space (id) ON DELETE SET NULL;
-ALTER TABLE activity ADD CONSTRAINT activity_related_suggestion_id_fk FOREIGN KEY(related_suggestion_id) REFERENCES suggestion (id) ON DELETE CASCADE;
-ALTER TABLE activity ADD CONSTRAINT activity_related_message_id_fk FOREIGN KEY(related_message_id) REFERENCES message (id) ON DELETE CASCADE;
 ALTER TABLE activity ADD CONSTRAINT activity_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE activity ADD CONSTRAINT activity_related_record_id_fk FOREIGN KEY(related_record_id) REFERENCES record (id) ON DELETE CASCADE;
 ALTER TABLE activity ADD CONSTRAINT activity_event_log_id_fk FOREIGN KEY(event_log_id) REFERENCES event_log (id);
-ALTER TABLE event_log ADD CONSTRAINT event_log_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) DEFERRABLE;
+ALTER TABLE activity ADD CONSTRAINT activity_related_suggestion_id_fk FOREIGN KEY(related_suggestion_id) REFERENCES suggestion (id) ON DELETE CASCADE;
+ALTER TABLE activity ADD CONSTRAINT activity_related_message_id_fk FOREIGN KEY(related_message_id) REFERENCES message (id) ON DELETE CASCADE;
+ALTER TABLE space ADD CONSTRAINT space_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
+ALTER TABLE space ADD CONSTRAINT space_event_log_id_fk FOREIGN KEY(event_log_id) REFERENCES event_log (id) DEFERRABLE;
+ALTER TABLE space ADD CONSTRAINT space_parent_id_fk FOREIGN KEY(parent_id) REFERENCES space (id);
 ALTER TABLE event_log ADD CONSTRAINT event_log_source_user_id_fk FOREIGN KEY(source_user_id) REFERENCES "user" (id);
 ALTER TABLE event_log ADD CONSTRAINT event_log_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) DEFERRABLE;
-ALTER TABLE record ADD CONSTRAINT record_recurring_parent_id_fk FOREIGN KEY(recurring_parent_id) REFERENCES record (id) ON DELETE CASCADE;
-ALTER TABLE record ADD CONSTRAINT record_source_suggestion_id_fk FOREIGN KEY(source_suggestion_id) REFERENCES suggestion (id) DEFERRABLE;
-ALTER TABLE record ADD CONSTRAINT record_superseded_by_record_id_fk FOREIGN KEY(superseded_by_record_id) REFERENCES record (id) ON DELETE RESTRICT;
+ALTER TABLE event_log ADD CONSTRAINT event_log_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) DEFERRABLE;
 ALTER TABLE record ADD CONSTRAINT record_parent_id_fk FOREIGN KEY(parent_id) REFERENCES record (id);
 ALTER TABLE record ADD CONSTRAINT record_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE record ADD CONSTRAINT record_event_log_id_fk FOREIGN KEY(event_log_id) REFERENCES event_log (id) DEFERRABLE;
 ALTER TABLE record ADD CONSTRAINT record_source_calendar_event_id_fk FOREIGN KEY(source_calendar_event_id) REFERENCES calendar_event (id) ON DELETE SET NULL DEFERRABLE;
 ALTER TABLE record ADD CONSTRAINT record_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE suggestion ADD CONSTRAINT suggestion_handled_by_user_id_fk FOREIGN KEY(handled_by_user_id) REFERENCES "user" (id);
-ALTER TABLE suggestion ADD CONSTRAINT suggestion_last_revised_by_run_id_fk FOREIGN KEY(last_revised_by_run_id) REFERENCES workflow_run (id);
-ALTER TABLE suggestion ADD CONSTRAINT suggestion_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id);
+ALTER TABLE record ADD CONSTRAINT record_recurring_parent_id_fk FOREIGN KEY(recurring_parent_id) REFERENCES record (id) ON DELETE CASCADE;
+ALTER TABLE record ADD CONSTRAINT record_source_suggestion_id_fk FOREIGN KEY(source_suggestion_id) REFERENCES suggestion (id) DEFERRABLE;
+ALTER TABLE record ADD CONSTRAINT record_superseded_by_record_id_fk FOREIGN KEY(superseded_by_record_id) REFERENCES record (id) ON DELETE RESTRICT;
 ALTER TABLE suggestion ADD CONSTRAINT suggestion_handled_outcome_record_id_fk FOREIGN KEY(handled_outcome_record_id) REFERENCES record (id);
 ALTER TABLE suggestion ADD CONSTRAINT suggestion_acceptance_claim_event_log_id_fk FOREIGN KEY(acceptance_claim_event_log_id) REFERENCES event_log (id);
 ALTER TABLE suggestion ADD CONSTRAINT suggestion_created_by_run_id_fk FOREIGN KEY(created_by_run_id) REFERENCES workflow_run (id);
 ALTER TABLE suggestion ADD CONSTRAINT suggestion_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_routine_installation_workflow_id_fk FOREIGN KEY(workflow_id, routine_installation_id, routine_id) REFERENCES routine_installation (workflow_id, id, routine_id) ON DELETE RESTRICT;
-ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_agent_run_id_fk FOREIGN KEY(agent_run_id) REFERENCES agent_run (id);
-ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_routine_revision_routine_id_fk FOREIGN KEY(routine_id, routine_revision_id) REFERENCES routine_revision (routine_id, id) ON DELETE RESTRICT;
-ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_signal_id_fk FOREIGN KEY(signal_id) REFERENCES signal (id);
-ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_monty_checkpoint_before_same_runtime_fk FOREIGN KEY(workflow_runtime_state_id, monty_checkpoint_before_id) REFERENCES monty_runtime_checkpoint (runtime_state_id, id) ON DELETE RESTRICT;
+ALTER TABLE suggestion ADD CONSTRAINT suggestion_handled_by_user_id_fk FOREIGN KEY(handled_by_user_id) REFERENCES "user" (id);
+ALTER TABLE suggestion ADD CONSTRAINT suggestion_last_revised_by_run_id_fk FOREIGN KEY(last_revised_by_run_id) REFERENCES workflow_run (id);
+ALTER TABLE suggestion ADD CONSTRAINT suggestion_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id);
 ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_routine_chain_root_owner_fk FOREIGN KEY(workflow_id, routine_chain_root_workflow_run_id, routine_installation_id, routine_id, routine_revision_id) REFERENCES workflow_run (workflow_id, id, routine_installation_id, routine_id, routine_revision_id) ON DELETE CASCADE;
 ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id);
 ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_monty_checkpoint_after_same_runtime_fk FOREIGN KEY(workflow_runtime_state_id, monty_checkpoint_after_id) REFERENCES monty_runtime_checkpoint (runtime_state_id, id) ON DELETE RESTRICT;
 ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_workflow_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id, workflow_runtime_state_id) REFERENCES workflow_runtime_state (workflow_id, id) ON DELETE RESTRICT;
-ALTER TABLE workflow_runtime_state ADD CONSTRAINT workflow_runtime_state_current_monty_checkpoint_same_runtime_fk FOREIGN KEY(id, current_monty_checkpoint_id) REFERENCES monty_runtime_checkpoint (runtime_state_id, id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
-ALTER TABLE workflow_runtime_state ADD CONSTRAINT workflow_runtime_state_pending_continuation_event_fk FOREIGN KEY(pending_continuation_event_id) REFERENCES workflow_runtime_event (id) ON DELETE SET NULL;
-ALTER TABLE workflow_runtime_state ADD CONSTRAINT workflow_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id) ON DELETE RESTRICT;
-ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_target_same_runtime_fk FOREIGN KEY(runtime_state_id, target_event_id) REFERENCES workflow_runtime_event (runtime_state_id, id) ON DELETE RESTRICT;
-ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id, runtime_state_id) REFERENCES workflow_runtime_state (workflow_id, id) ON DELETE RESTRICT;
-ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id) ON DELETE RESTRICT;
-ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_causation_same_runtime_fk FOREIGN KEY(runtime_state_id, causation_event_id) REFERENCES workflow_runtime_event (runtime_state_id, id) ON DELETE RESTRICT;
-ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_workflow_run_workflow_id_fk FOREIGN KEY(workflow_id, workflow_run_id) REFERENCES workflow_run (workflow_id, id) ON DELETE RESTRICT;
+ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_routine_revision_routine_id_fk FOREIGN KEY(routine_id, routine_revision_id) REFERENCES routine_revision (routine_id, id) ON DELETE RESTRICT;
+ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_routine_installation_workflow_id_fk FOREIGN KEY(workflow_id, routine_installation_id, routine_id) REFERENCES routine_installation (workflow_id, id, routine_id) ON DELETE RESTRICT;
+ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_agent_run_id_fk FOREIGN KEY(agent_run_id) REFERENCES agent_run (id);
+ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_signal_id_fk FOREIGN KEY(signal_id) REFERENCES signal (id);
+ALTER TABLE workflow_run ADD CONSTRAINT workflow_run_monty_checkpoint_before_same_runtime_fk FOREIGN KEY(workflow_runtime_state_id, monty_checkpoint_before_id) REFERENCES monty_runtime_checkpoint (runtime_state_id, id) ON DELETE RESTRICT;
+ALTER TABLE monty_runtime_checkpoint ADD CONSTRAINT monty_runtime_checkpoint_created_by_workflow_run_workflow_id_fk FOREIGN KEY(workflow_id, created_by_workflow_run_id) REFERENCES workflow_run (workflow_id, id) ON DELETE RESTRICT;
+ALTER TABLE monty_runtime_checkpoint ADD CONSTRAINT monty_runtime_checkpoint_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id, runtime_state_id) REFERENCES workflow_runtime_state (workflow_id, id) ON DELETE RESTRICT;
 ALTER TABLE monty_runtime_checkpoint ADD CONSTRAINT monty_runtime_checkpoint_parent_same_runtime_fk FOREIGN KEY(runtime_state_id, parent_checkpoint_id) REFERENCES monty_runtime_checkpoint (runtime_state_id, id) ON DELETE RESTRICT;
 ALTER TABLE monty_runtime_checkpoint ADD CONSTRAINT monty_runtime_checkpoint_created_by_agent_run_id_fk FOREIGN KEY(created_by_agent_run_id) REFERENCES agent_run (id) ON DELETE RESTRICT;
-ALTER TABLE monty_runtime_checkpoint ADD CONSTRAINT monty_runtime_checkpoint_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id, runtime_state_id) REFERENCES workflow_runtime_state (workflow_id, id) ON DELETE RESTRICT;
-ALTER TABLE monty_runtime_checkpoint ADD CONSTRAINT monty_runtime_checkpoint_created_by_workflow_run_workflow_id_fk FOREIGN KEY(workflow_id, created_by_workflow_run_id) REFERENCES workflow_run (workflow_id, id) ON DELETE RESTRICT;
 ALTER TABLE agent_run ADD CONSTRAINT agent_run_parent_space_fk FOREIGN KEY(space_id, parent_agent_run_id) REFERENCES agent_run (space_id, id) ON DELETE RESTRICT;
 ALTER TABLE agent_run ADD CONSTRAINT agent_run_workflow_run_id_fk FOREIGN KEY(workflow_run_id) REFERENCES workflow_run (id) ON DELETE RESTRICT;
 ALTER TABLE agent_run ADD CONSTRAINT agent_run_parent_agent_run_id_fk FOREIGN KEY(parent_agent_run_id) REFERENCES agent_run (id);
 ALTER TABLE agent_run ADD CONSTRAINT agent_run_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE space ADD CONSTRAINT space_parent_id_fk FOREIGN KEY(parent_id) REFERENCES space (id);
-ALTER TABLE space ADD CONSTRAINT space_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
-ALTER TABLE space ADD CONSTRAINT space_event_log_id_fk FOREIGN KEY(event_log_id) REFERENCES event_log (id) DEFERRABLE;
-ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id) ON DELETE CASCADE;
-ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_last_failed_workflow_run_fk FOREIGN KEY(workflow_id, id, last_failed_workflow_run_id) REFERENCES workflow_run (workflow_id, routine_installation_id, id) ON DELETE SET NULL (last_failed_workflow_run_id);
-ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_last_successful_workflow_run_fk FOREIGN KEY(workflow_id, id, last_successful_workflow_run_id) REFERENCES workflow_run (workflow_id, routine_installation_id, id) ON DELETE SET NULL (last_successful_workflow_run_id);
+ALTER TABLE workflow_runtime_state ADD CONSTRAINT workflow_runtime_state_current_monty_checkpoint_same_runtime_fk FOREIGN KEY(id, current_monty_checkpoint_id) REFERENCES monty_runtime_checkpoint (runtime_state_id, id) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED;
+ALTER TABLE workflow_runtime_state ADD CONSTRAINT workflow_runtime_state_pending_continuation_event_fk FOREIGN KEY(pending_continuation_event_id) REFERENCES workflow_runtime_event (id) ON DELETE SET NULL;
+ALTER TABLE workflow_runtime_state ADD CONSTRAINT workflow_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id) ON DELETE RESTRICT;
+ALTER TABLE workflow ADD CONSTRAINT workflow_parent_id_fk FOREIGN KEY(parent_id) REFERENCES workflow (id) ON DELETE RESTRICT;
+ALTER TABLE workflow ADD CONSTRAINT workflow_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
+ALTER TABLE workflow ADD CONSTRAINT workflow_source_signal_id_fk FOREIGN KEY(source_signal_id) REFERENCES signal (id);
+ALTER TABLE workflow ADD CONSTRAINT workflow_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE SET NULL;
+ALTER TABLE workflow ADD CONSTRAINT workflow_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
+ALTER TABLE signal ADD CONSTRAINT signal_source_workflow_id_fk FOREIGN KEY(source_workflow_id) REFERENCES workflow (id);
+ALTER TABLE signal ADD CONSTRAINT signal_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
+ALTER TABLE signal ADD CONSTRAINT signal_parent_signal_id_fk FOREIGN KEY(parent_signal_id) REFERENCES signal (id) ON DELETE SET NULL;
+ALTER TABLE signal ADD CONSTRAINT signal_root_signal_id_fk FOREIGN KEY(root_signal_id) REFERENCES signal (id);
+ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_target_same_runtime_fk FOREIGN KEY(runtime_state_id, target_event_id) REFERENCES workflow_runtime_event (runtime_state_id, id) ON DELETE RESTRICT;
+ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_runtime_state_workflow_id_fk FOREIGN KEY(workflow_id, runtime_state_id) REFERENCES workflow_runtime_state (workflow_id, id) ON DELETE RESTRICT;
+ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_causation_same_runtime_fk FOREIGN KEY(runtime_state_id, causation_event_id) REFERENCES workflow_runtime_event (runtime_state_id, id) ON DELETE RESTRICT;
+ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id) ON DELETE RESTRICT;
+ALTER TABLE workflow_runtime_event ADD CONSTRAINT workflow_runtime_event_workflow_run_workflow_id_fk FOREIGN KEY(workflow_id, workflow_run_id) REFERENCES workflow_run (workflow_id, id) ON DELETE RESTRICT;
+ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_routine_id_fk FOREIGN KEY(routine_id) REFERENCES routine (id) ON DELETE RESTRICT;
 ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_repair_task_record_id_fk FOREIGN KEY(repair_task_record_id) REFERENCES record (id) ON DELETE SET NULL;
 ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_active_revision_routine_id_fk FOREIGN KEY(routine_id, active_revision_id) REFERENCES routine_revision (routine_id, id) ON DELETE RESTRICT;
-ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_routine_id_fk FOREIGN KEY(routine_id) REFERENCES routine (id) ON DELETE RESTRICT;
 ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_repair_expected_revision_fk FOREIGN KEY(routine_id, repair_expected_active_revision_id) REFERENCES routine_revision (routine_id, id) ON DELETE RESTRICT;
 ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id) ON DELETE SET NULL;
 ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
-ALTER TABLE routine ADD CONSTRAINT routine_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id) ON DELETE SET NULL;
-ALTER TABLE routine ADD CONSTRAINT routine_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
-ALTER TABLE routine_revision ADD CONSTRAINT routine_revision_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id) ON DELETE SET NULL;
-ALTER TABLE routine_revision ADD CONSTRAINT routine_revision_created_by_agent_run_id_fk FOREIGN KEY(created_by_agent_run_id) REFERENCES agent_run (id) ON DELETE SET NULL;
+ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id) ON DELETE CASCADE;
+ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_last_failed_workflow_run_fk FOREIGN KEY(workflow_id, id, last_failed_workflow_run_id) REFERENCES workflow_run (workflow_id, routine_installation_id, id) ON DELETE SET NULL (last_failed_workflow_run_id);
+ALTER TABLE routine_installation ADD CONSTRAINT routine_installation_last_successful_workflow_run_fk FOREIGN KEY(workflow_id, id, last_successful_workflow_run_id) REFERENCES workflow_run (workflow_id, routine_installation_id, id) ON DELETE SET NULL (last_successful_workflow_run_id);
 ALTER TABLE routine_revision ADD CONSTRAINT routine_revision_routine_id_fk FOREIGN KEY(routine_id) REFERENCES routine (id) ON DELETE RESTRICT;
 ALTER TABLE routine_revision ADD CONSTRAINT routine_revision_parent_routine_id_fk FOREIGN KEY(routine_id, parent_revision_id) REFERENCES routine_revision (routine_id, id) ON DELETE RESTRICT;
-ALTER TABLE signal ADD CONSTRAINT signal_parent_signal_id_fk FOREIGN KEY(parent_signal_id) REFERENCES signal (id) ON DELETE SET NULL;
-ALTER TABLE signal ADD CONSTRAINT signal_root_signal_id_fk FOREIGN KEY(root_signal_id) REFERENCES signal (id);
-ALTER TABLE signal ADD CONSTRAINT signal_source_workflow_id_fk FOREIGN KEY(source_workflow_id) REFERENCES workflow (id);
-ALTER TABLE signal ADD CONSTRAINT signal_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE calendar_event ADD CONSTRAINT calendar_event_calendar_id_fk FOREIGN KEY(calendar_id) REFERENCES calendar (id);
-ALTER TABLE calendar_event ADD CONSTRAINT calendar_event_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
+ALTER TABLE routine_revision ADD CONSTRAINT routine_revision_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id) ON DELETE SET NULL;
+ALTER TABLE routine_revision ADD CONSTRAINT routine_revision_created_by_agent_run_id_fk FOREIGN KEY(created_by_agent_run_id) REFERENCES agent_run (id) ON DELETE SET NULL;
+ALTER TABLE routine ADD CONSTRAINT routine_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id) ON DELETE SET NULL;
+ALTER TABLE routine ADD CONSTRAINT routine_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
 ALTER TABLE calendar_event ADD CONSTRAINT calendar_event_linked_record_id_fk FOREIGN KEY(linked_record_id) REFERENCES record (id) DEFERRABLE;
 ALTER TABLE calendar_event ADD CONSTRAINT calendar_event_dirty_by_user_id_fk FOREIGN KEY(dirty_by_user_id) REFERENCES "user" (id);
+ALTER TABLE calendar_event ADD CONSTRAINT calendar_event_calendar_id_fk FOREIGN KEY(calendar_id) REFERENCES calendar (id);
+ALTER TABLE calendar_event ADD CONSTRAINT calendar_event_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
+ALTER TABLE calendar ADD CONSTRAINT calendar_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
 ALTER TABLE calendar ADD CONSTRAINT calendar_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE SET NULL;
 ALTER TABLE calendar ADD CONSTRAINT calendar_external_account_id_fk FOREIGN KEY(external_account_id) REFERENCES external_account (id);
-ALTER TABLE calendar ADD CONSTRAINT calendar_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
-ALTER TABLE resource ADD CONSTRAINT resource_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
+ALTER TABLE external_account ADD CONSTRAINT external_account_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE SET NULL;
+ALTER TABLE external_account ADD CONSTRAINT external_account_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
 ALTER TABLE resource ADD CONSTRAINT resource_superseded_by_resource_id_fk FOREIGN KEY(superseded_by_resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
 ALTER TABLE resource ADD CONSTRAINT resource_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE RESTRICT;
 ALTER TABLE resource ADD CONSTRAINT resource_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE SET NULL;
 ALTER TABLE resource ADD CONSTRAINT resource_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
 ALTER TABLE resource ADD CONSTRAINT resource_parent_id_space_id_fk FOREIGN KEY(parent_id, space_id) REFERENCES resource (id, space_id);
-ALTER TABLE external_account ADD CONSTRAINT external_account_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE SET NULL;
-ALTER TABLE external_account ADD CONSTRAINT external_account_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
-ALTER TABLE message ADD CONSTRAINT message_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
+ALTER TABLE resource ADD CONSTRAINT resource_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE message ADD CONSTRAINT message_composer_submission_id_fk FOREIGN KEY(composer_submission_id) REFERENCES composer_submission (id) ON DELETE RESTRICT;
 ALTER TABLE message ADD CONSTRAINT message_event_log_id_fk FOREIGN KEY(event_log_id) REFERENCES event_log (id);
 ALTER TABLE message ADD CONSTRAINT message_reply_to_message_id_fk FOREIGN KEY(reply_to_message_id) REFERENCES message (id) ON DELETE SET NULL;
@@ -1987,56 +1986,57 @@ ALTER TABLE message ADD CONSTRAINT message_user_id_fk FOREIGN KEY(user_id) REFER
 ALTER TABLE message ADD CONSTRAINT message_source_channel_event_id_fk FOREIGN KEY(source_channel_event_id) REFERENCES channel_event (id) ON DELETE SET NULL;
 ALTER TABLE message ADD CONSTRAINT message_agent_run_id_fk FOREIGN KEY(agent_run_id) REFERENCES agent_run (id) ON DELETE SET NULL;
 ALTER TABLE message ADD FOREIGN KEY(parent_id) REFERENCES message (id);
-ALTER TABLE channel_event ADD CONSTRAINT channel_event_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
-ALTER TABLE channel_event ADD CONSTRAINT channel_event_source_user_id_fk FOREIGN KEY(source_user_id) REFERENCES "user" (id);
-ALTER TABLE channel_event ADD CONSTRAINT channel_event_external_conversation_id_fk FOREIGN KEY(external_conversation_id) REFERENCES channel_conversation (id) ON DELETE SET NULL;
-ALTER TABLE channel_conversation ADD CONSTRAINT channel_conversation_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
-ALTER TABLE channel_conversation ADD CONSTRAINT channel_conversation_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id);
+ALTER TABLE message ADD CONSTRAINT message_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE composer_submission ADD CONSTRAINT composer_submission_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id) ON DELETE CASCADE;
 ALTER TABLE composer_submission ADD CONSTRAINT composer_submission_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
+ALTER TABLE channel_event ADD CONSTRAINT channel_event_source_user_id_fk FOREIGN KEY(source_user_id) REFERENCES "user" (id);
+ALTER TABLE channel_event ADD CONSTRAINT channel_event_external_conversation_id_fk FOREIGN KEY(external_conversation_id) REFERENCES channel_conversation (id) ON DELETE SET NULL;
+ALTER TABLE channel_event ADD CONSTRAINT channel_event_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
+ALTER TABLE channel_conversation ADD CONSTRAINT channel_conversation_workflow_id_fk FOREIGN KEY(workflow_id) REFERENCES workflow (id);
+ALTER TABLE channel_conversation ADD CONSTRAINT channel_conversation_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
 ALTER TABLE standing_grant_backfill_status ADD CONSTRAINT standing_grant_backfill_status_standing_grant_id_fk FOREIGN KEY(standing_grant_id) REFERENCES standing_grant (id) ON DELETE CASCADE;
-ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantee_resource_id_fk FOREIGN KEY(grantee_resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantee_user_id_fk FOREIGN KEY(grantee_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
-ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_origin_invite_id_fk FOREIGN KEY(origin_invite_id) REFERENCES invite (id) ON DELETE RESTRICT;
+ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantee_resource_id_fk FOREIGN KEY(grantee_resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantor_resource_id_fk FOREIGN KEY(grantor_resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
+ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_origin_invite_id_fk FOREIGN KEY(origin_invite_id) REFERENCES invite (id) ON DELETE RESTRICT;
 ALTER TABLE standing_grant ADD CONSTRAINT standing_grant_grantor_user_id_fk FOREIGN KEY(grantor_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
+ALTER TABLE invite ADD CONSTRAINT invite_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE invite ADD CONSTRAINT invite_exchanged_by_user_id_fk FOREIGN KEY(exchanged_by_user_id) REFERENCES "user" (id);
 ALTER TABLE invite ADD CONSTRAINT invite_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE invite ADD CONSTRAINT invite_contact_address_id_fk FOREIGN KEY(contact_address_id) REFERENCES contact_address (id) ON DELETE RESTRICT;
-ALTER TABLE invite ADD CONSTRAINT invite_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
+ALTER TABLE file_share ADD CONSTRAINT file_share_message_id_fk FOREIGN KEY(message_id) REFERENCES message (id);
 ALTER TABLE file_share ADD CONSTRAINT file_share_target_space_id_fk FOREIGN KEY(target_space_id) REFERENCES space (id);
 ALTER TABLE file_share ADD CONSTRAINT file_share_file_id_fk FOREIGN KEY(file_id) REFERENCES file (id);
 ALTER TABLE file_share ADD CONSTRAINT file_share_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
-ALTER TABLE file_share ADD CONSTRAINT file_share_message_id_fk FOREIGN KEY(message_id) REFERENCES message (id);
-ALTER TABLE file ADD CONSTRAINT file_external_link_item_id_fk FOREIGN KEY(external_link_item_id) REFERENCES external_link_item (id) ON DELETE CASCADE;
 ALTER TABLE file ADD CONSTRAINT file_channel_event_id_fk FOREIGN KEY(channel_event_id) REFERENCES channel_event (id) ON DELETE CASCADE;
 ALTER TABLE file ADD CONSTRAINT file_user_id_fk FOREIGN KEY(user_id) REFERENCES "user" (id);
-ALTER TABLE external_link_item ADD CONSTRAINT external_link_item_external_link_id_fk FOREIGN KEY(external_link_id) REFERENCES external_link (id) ON DELETE CASCADE;
+ALTER TABLE file ADD CONSTRAINT file_external_link_item_id_fk FOREIGN KEY(external_link_item_id) REFERENCES external_link_item (id) ON DELETE CASCADE;
 ALTER TABLE external_link_item ADD CONSTRAINT external_link_item_file_id_fk FOREIGN KEY(file_id) REFERENCES file (id);
 ALTER TABLE external_link_item ADD CONSTRAINT external_link_item_external_link_group_id_fk FOREIGN KEY(external_link_group_id) REFERENCES external_link_group (id) ON DELETE CASCADE;
+ALTER TABLE external_link_item ADD CONSTRAINT external_link_item_external_link_id_fk FOREIGN KEY(external_link_id) REFERENCES external_link (id) ON DELETE CASCADE;
 ALTER TABLE external_link_group ADD CONSTRAINT external_link_group_schedule_source_id_fk FOREIGN KEY(schedule_source_id) REFERENCES monitored_url_source (id) ON DELETE SET NULL;
 ALTER TABLE external_link_group ADD CONSTRAINT external_link_group_chat_card_message_id_fk FOREIGN KEY(chat_card_message_id) REFERENCES message (id) ON DELETE SET NULL;
 ALTER TABLE external_link_group ADD CONSTRAINT external_link_group_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE SET NULL;
 ALTER TABLE external_link_group ADD CONSTRAINT external_link_group_external_link_id_fk FOREIGN KEY(external_link_id) REFERENCES external_link (id) ON DELETE CASCADE;
 ALTER TABLE monitored_url_source ADD CONSTRAINT monitored_url_source_successful_run_same_source_fk FOREIGN KEY(id, last_successful_run_id) REFERENCES monitored_url_run (source_id, id) ON DELETE RESTRICT;
-ALTER TABLE monitored_url_run ADD CONSTRAINT monitored_url_run_source_id_fk FOREIGN KEY(source_id) REFERENCES monitored_url_source (id) ON DELETE RESTRICT;
 ALTER TABLE monitored_url_run ADD CONSTRAINT monitored_url_run_previous_same_source_fk FOREIGN KEY(source_id, previous_successful_run_id) REFERENCES monitored_url_run (source_id, id) ON DELETE RESTRICT;
+ALTER TABLE monitored_url_run ADD CONSTRAINT monitored_url_run_source_id_fk FOREIGN KEY(source_id) REFERENCES monitored_url_source (id) ON DELETE RESTRICT;
 ALTER TABLE tagged_item ADD FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE tagged_item ADD FOREIGN KEY(confirmed_by_user_id) REFERENCES "user" (id);
 ALTER TABLE tagged_item ADD FOREIGN KEY(tag_id) REFERENCES tag (id);
-ALTER TABLE tag ADD FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE tag ADD FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE tag ADD FOREIGN KEY(confirmed_by_user_id) REFERENCES "user" (id);
 ALTER TABLE tag ADD FOREIGN KEY(shadows_tag_id) REFERENCES tag (id) ON DELETE SET NULL;
+ALTER TABLE tag ADD FOREIGN KEY(space_id) REFERENCES space (id);
+ALTER TABLE record_assignee_index ADD CONSTRAINT record_assignee_index_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
 ALTER TABLE record_assignee_index ADD CONSTRAINT record_assignee_index_assignee_id_fk FOREIGN KEY(assignee_id) REFERENCES "user" (id);
 ALTER TABLE record_assignee_index ADD CONSTRAINT record_assignee_index_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE record_assignee_index ADD CONSTRAINT record_assignee_index_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
+ALTER TABLE resource_fact ADD CONSTRAINT resource_fact_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
 ALTER TABLE resource_fact ADD CONSTRAINT resource_fact_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE resource_fact ADD CONSTRAINT resource_fact_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
-ALTER TABLE resource_fact ADD CONSTRAINT resource_fact_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
-ALTER TABLE assistant_stream_event ADD FOREIGN KEY(assistant_run_id) REFERENCES assistant_run (id) ON DELETE CASCADE;
 ALTER TABLE assistant_stream_event ADD FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE assistant_stream_event ADD FOREIGN KEY(assistant_state_id) REFERENCES assistant_state (id) ON DELETE CASCADE;
+ALTER TABLE assistant_stream_event ADD FOREIGN KEY(assistant_run_id) REFERENCES assistant_run (id) ON DELETE CASCADE;
 ALTER TABLE assistant_run ADD CONSTRAINT assistant_run_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE assistant_run ADD CONSTRAINT assistant_run_assistant_state_fk FOREIGN KEY(assistant_state_id) REFERENCES assistant_state (id);
 ALTER TABLE assistant_state ADD CONSTRAINT assistant_state_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
@@ -2053,35 +2053,35 @@ ALTER TABLE space_member ADD CONSTRAINT space_member_user_id_fk FOREIGN KEY(user
 ALTER TABLE space_member ADD CONSTRAINT space_member_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE CASCADE;
 ALTER TABLE record_completed_index ADD CONSTRAINT record_completed_index_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE record_completed_index ADD CONSTRAINT record_completed_index_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
+ALTER TABLE partner_calendar_event_mirror ADD CONSTRAINT partner_calendar_event_mirror_standing_grant_id_fk FOREIGN KEY(origin_standing_grant_id) REFERENCES standing_grant (id) ON DELETE RESTRICT;
 ALTER TABLE partner_calendar_event_mirror ADD CONSTRAINT partner_calendar_event_mirror_recipient_user_id_fk FOREIGN KEY(recipient_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
 ALTER TABLE partner_calendar_event_mirror ADD CONSTRAINT partner_calendar_event_mirror_calendar_event_id_fk FOREIGN KEY(calendar_event_id) REFERENCES calendar_event (id) ON DELETE RESTRICT;
 ALTER TABLE partner_calendar_event_mirror ADD CONSTRAINT partner_calendar_event_mirror_origin_calendar_event_id_fk FOREIGN KEY(origin_calendar_event_id) REFERENCES calendar_event (id) ON DELETE RESTRICT;
-ALTER TABLE partner_calendar_event_mirror ADD CONSTRAINT partner_calendar_event_mirror_standing_grant_id_fk FOREIGN KEY(origin_standing_grant_id) REFERENCES standing_grant (id) ON DELETE RESTRICT;
-ALTER TABLE assignment ADD CONSTRAINT assignment_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE assignment ADD CONSTRAINT assignment_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
-ALTER TABLE resource_share ADD CONSTRAINT resource_share_target_id_fk FOREIGN KEY(target_id) REFERENCES "user" (id) ON DELETE RESTRICT;
+ALTER TABLE assignment ADD CONSTRAINT assignment_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE resource_share ADD CONSTRAINT resource_share_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
 ALTER TABLE resource_share ADD CONSTRAINT resource_share_invite_id_fk FOREIGN KEY(invite_id) REFERENCES invite (id) ON DELETE RESTRICT;
 ALTER TABLE resource_share ADD CONSTRAINT resource_share_resource_id_fk FOREIGN KEY(resource_id) REFERENCES resource (id) ON DELETE RESTRICT;
 ALTER TABLE resource_share ADD CONSTRAINT resource_share_origin_standing_grant_id_fk FOREIGN KEY(origin_standing_grant_id) REFERENCES standing_grant (id) ON DELETE RESTRICT;
-ALTER TABLE monitored_url_subscription ADD CONSTRAINT monitored_url_subscription_resource_same_space_fk FOREIGN KEY(subject_id, space_id) REFERENCES resource (id, space_id) ON DELETE RESTRICT;
+ALTER TABLE resource_share ADD CONSTRAINT resource_share_target_id_fk FOREIGN KEY(target_id) REFERENCES "user" (id) ON DELETE RESTRICT;
 ALTER TABLE monitored_url_subscription ADD CONSTRAINT monitored_url_subscription_execution_user_id_fk FOREIGN KEY(execution_user_id) REFERENCES "user" (id) ON DELETE RESTRICT;
 ALTER TABLE monitored_url_subscription ADD CONSTRAINT monitored_url_subscription_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id) ON DELETE RESTRICT;
 ALTER TABLE monitored_url_subscription ADD CONSTRAINT monitored_url_subscription_source_id_fk FOREIGN KEY(source_id) REFERENCES monitored_url_source (id) ON DELETE RESTRICT;
-ALTER TABLE record_share ADD CONSTRAINT record_share_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id);
+ALTER TABLE monitored_url_subscription ADD CONSTRAINT monitored_url_subscription_resource_same_space_fk FOREIGN KEY(subject_id, space_id) REFERENCES resource (id, space_id) ON DELETE RESTRICT;
 ALTER TABLE record_share ADD CONSTRAINT record_share_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE record_share ADD CONSTRAINT record_share_target_id_fk FOREIGN KEY(target_id) REFERENCES "user" (id);
 ALTER TABLE record_share ADD CONSTRAINT record_share_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE record_share ADD CONSTRAINT record_share_origin_standing_grant_id_fk FOREIGN KEY(origin_standing_grant_id) REFERENCES standing_grant (id);
 ALTER TABLE record_share ADD CONSTRAINT record_share_invite_id_fk FOREIGN KEY(invite_id) REFERENCES invite (id);
+ALTER TABLE record_share ADD CONSTRAINT record_share_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id);
 ALTER TABLE native_sync_authority_fence ADD FOREIGN KEY(user_id) REFERENCES "user" (id) ON DELETE CASCADE;
-ALTER TABLE graph_edge ADD CONSTRAINT graph_edge_from_space_id_fk FOREIGN KEY(from_space_id) REFERENCES space (id);
 ALTER TABLE graph_edge ADD CONSTRAINT graph_edge_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE graph_edge ADD CONSTRAINT graph_edge_to_space_id_fk FOREIGN KEY(to_space_id) REFERENCES space (id);
+ALTER TABLE graph_edge ADD CONSTRAINT graph_edge_from_space_id_fk FOREIGN KEY(from_space_id) REFERENCES space (id);
 ALTER TABLE record_recurrence ADD CONSTRAINT record_recurrence_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
 ALTER TABLE record_recurrence ADD CONSTRAINT record_recurrence_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
-ALTER TABLE record_date_index ADD CONSTRAINT record_date_index_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
 ALTER TABLE record_date_index ADD CONSTRAINT record_date_index_space_id_fk FOREIGN KEY(space_id) REFERENCES space (id);
+ALTER TABLE record_date_index ADD CONSTRAINT record_date_index_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id) ON DELETE CASCADE;
 ALTER TABLE conversation ADD CONSTRAINT conversation_record_id_fk FOREIGN KEY(record_id) REFERENCES record (id);
 ALTER TABLE conversation ADD CONSTRAINT conversation_created_by_user_id_fk FOREIGN KEY(created_by_user_id) REFERENCES "user" (id);
 ALTER TABLE conversation ADD CONSTRAINT conversation_event_log_id_fk FOREIGN KEY(event_log_id) REFERENCES event_log (id);

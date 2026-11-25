@@ -252,6 +252,50 @@ class GatewayShapes:
                 result[signature] = {**request, "body": body, "has_subquery": contains_subquery(body["where"])}
         return list(result.values())
 
+    def per_account_bodies(self, table, account):
+        """Variant B-per-account: one plain filter per account and table, literal IN lists, no subquery.
+
+        Lists are what the gateway would resolve when it builds the shape: the account's own Space,
+        its partner's Space (the grantor of its active standing grant, as `data.py` seeds it), its
+        partner's calendars (the authority's direct calendar grantors) and the Records shared with
+        it directly (the share mapping `data.py` seeds for B-cold, computed, not read).
+        """
+        from data import BACKGROUND_ROWS, LARGE_ACCOUNT, LARGE_ROWS, SHARE_ACCOUNT, SHARE_ACCOUNT_ROWS, SHARE_ROWS, other_account, row_id
+        own = str(synthetic_id(f"space/{account}"))
+        partner_user = (account + 1) % 18 if account < 18 else 17 if account == 18 else None
+        partner = [str(synthetic_id(f"space/{partner_user}"))] if partner_user is not None else []
+        shared = sorted({str(row_id("record", owner, ordinal % (LARGE_ROWS if owner == LARGE_ACCOUNT else BACKGROUND_ROWS)["record"]))
+                         for owner in range(19) for ordinal in range((SHARE_ACCOUNT_ROWS if owner == SHARE_ACCOUNT else SHARE_ROWS)["record_share"])
+                         if owner != account and other_account(owner, ordinal) == account})
+        def any_of(column, values):
+            return {"or": [{"col": column, "op": "eq", "value": value} for value in values]} if len(values) > 1 else {"col": column, "op": "eq", "value": values[0]}
+        def ids(column):
+            # The engine has no literal-list operator (`in` is always a subquery), so a literal
+            # IN list is an OR of equality leaves, as the gateway would have to send it.
+            return [any_of(column, shared)] if shared else []
+        if table == "record":
+            where = {"or": [any_of("space_id", [own]), *([{"and": [any_of("space_id", partner), {"col": "deleted_at", "isNull": True}, {"col": "removed_at", "isNull": True}]}] if partner else []), *ids("id")]}
+        elif table in RECORD_FAMILY:
+            space_column = "space_id" if table != "assignment" else "audience_key"
+            where = {"or": [any_of(space_column, [own, *partner]), *ids("record_id")]}
+        elif table == "calendar_event":
+            calendars = [str(value) for value in self.authority(account).direct_calendar_grantor_user_ids]
+            calendars = [str(synthetic_id(f"calendar/{partner_user}/{index}")) for index in range(15)] if calendars else []
+            where = {"or": [{"col": "user_id", "op": "eq", "value": str(synthetic_id(f"user/{account}"))}, *([any_of("calendar_id", calendars)] if calendars else [])]}
+        else:
+            where = {"and": [any_of("audience_key", [own, *partner]), {"col": "reader_class", "op": "eq", "value": "live"}]}
+        return [self._plain_body(table, account, where, "per-account")]
+
+    async def per_account_catalog(self, requests):
+        result = {}
+        for request in requests:
+            table = request["body"]["table"].removeprefix("public.")
+            for body in self.per_account_bodies(table, request["account"]):
+                # No dedupe across accounts: the account is part of the key.
+                signature = json.dumps([request["account"], {key: value for key, value in body.items() if key != "subscription"}], sort_keys=True)
+                result[signature] = {"kind": "per-account-plain", "account": request["account"], "body": body, "has_subquery": contains_subquery(body["where"])}
+        return list(result.values())
+
     async def keyed_catalog(self, requests, preserved=frozenset()):
         result = {}
         for request in requests:

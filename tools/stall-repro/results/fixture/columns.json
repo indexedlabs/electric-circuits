@@ -232,8 +232,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "space.id",
-        "agent_run.space_id"
+        "agent_run.space_id",
+        "space.id"
       ]
     },
     {
@@ -4659,8 +4659,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "monitored_url_run.source_id",
-        "monitored_url_source.id"
+        "monitored_url_source.id",
+        "monitored_url_run.source_id"
       ]
     },
     {
@@ -5172,8 +5172,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "space.id",
-        "resource.space_id"
+        "resource.space_id",
+        "space.id"
       ]
     },
     {
@@ -5291,8 +5291,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "workflow_run.workflow_id",
-        "workflow_runtime_state.workflow_id"
+        "workflow_runtime_state.workflow_id",
+        "workflow_run.workflow_id"
       ]
     },
     {
@@ -5303,8 +5303,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "monty_runtime_checkpoint.runtime_state_id",
-        "workflow_runtime_state.id"
+        "workflow_runtime_state.id",
+        "monty_runtime_checkpoint.runtime_state_id"
       ]
     },
     {
@@ -6339,8 +6339,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "space.id",
-        "resource.space_id"
+        "resource.space_id",
+        "space.id"
       ]
     },
     {
@@ -7005,8 +7005,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "workflow.id",
         "workflow_run.workflow_id",
+        "workflow.id",
         "workflow_run.workflow_id"
       ]
     },
@@ -7019,8 +7019,8 @@
       "enum": null,
       "foreign_keys": [
         "routine_revision.routine_id",
-        "routine_revision.routine_id",
-        "routine.id"
+        "routine.id",
+        "routine_revision.routine_id"
       ]
     },
     {
@@ -7221,8 +7221,8 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "routine.id",
-        "routine_revision.routine_id"
+        "routine_revision.routine_id",
+        "routine.id"
       ]
     },
     {
@@ -9558,10 +9558,10 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "routine_installation.workflow_id",
-        "workflow_runtime_state.workflow_id",
         "workflow.id",
-        "workflow_run.workflow_id"
+        "workflow_run.workflow_id",
+        "routine_installation.workflow_id",
+        "workflow_runtime_state.workflow_id"
       ]
     },
     {
@@ -9664,8 +9664,8 @@
       "enum": null,
       "foreign_keys": [
         "monty_runtime_checkpoint.runtime_state_id",
-        "workflow_runtime_state.id",
-        "monty_runtime_checkpoint.runtime_state_id"
+        "monty_runtime_checkpoint.runtime_state_id",
+        "workflow_runtime_state.id"
       ]
     },
     {
@@ -9780,9 +9780,9 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "workflow_run.routine_id",
+        "routine_installation.routine_id",
         "routine_revision.routine_id",
-        "routine_installation.routine_id"
+        "workflow_run.routine_id"
       ]
     },
     {
@@ -9922,9 +9922,9 @@
       "server_default": null,
       "enum": null,
       "foreign_keys": [
-        "workflow_run.workflow_id",
         "workflow_runtime_state.workflow_id",
-        "workflow.id"
+        "workflow.id",
+        "workflow_run.workflow_id"
       ]
     },
     {
@@ -9936,8 +9936,8 @@
       "enum": null,
       "foreign_keys": [
         "workflow_runtime_event.runtime_state_id",
-        "workflow_runtime_state.id",
-        "workflow_runtime_event.runtime_state_id"
+        "workflow_runtime_event.runtime_state_id",
+        "workflow_runtime_state.id"
       ]
     },
     {

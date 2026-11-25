@@ -161,3 +161,19 @@ They do not claim that keying the class is authorization-equivalent.
 - **Engine bisect.** Release builds (debug level 1, frame pointers) of PR 70 (`e10c4bd`), PR 71 (`a248886`) and PR 69 (`b42f70d`, prod since 08:33 UTC Nov 24), built from `git archive` with no source change. They run beside the existing `1be10fb` and `5b2cf3e` binaries on one runner.
 - **B-cold.** See `variant-b-cold.md`.
 - **E-only and E-plus-R.** Today's catalog (A). Only `graph_edge` (E-only), or `graph_edge` plus the six Record-family tables (E-plus-R), get B's audience-key columns and keyed bodies, collapsed to one feed per account as in B. Every other table and the probe's feed stay as today, except that the probe's Record feed is keyed in E-plus-R.
+
+## B-per-account (`[paired-4]`, OTTO-14032 question `q-keyed-stream-sharing`)
+
+Per-account keyed streams in place of B's per-Space shared ones. Each account gets one plain filter per keyed table, built in `catalog.py` `per_account_bodies`, with no subquery and no dedupe across accounts.
+
+- **Record family:**
+  - `record`: `space_id = own`, OR `space_id IN (partner)` with the record's `deleted_at IS NULL AND removed_at IS NULL`, OR `id IN (direct shares)`.
+  - The other five tables: `space_id IN (own, partner)` OR `record_id IN (direct shares)`; `assignment` has no `space_id`, so it uses B's `audience_key` column.
+- **`calendar_event`:** `user_id = U OR calendar_id IN (partner's 15 calendars)`.
+- **Every other keyed table, `graph_edge` included:** `audience_key IN (own, partner) AND reader_class = 'live'`, which is B-cold-key-edges' key per account.
+- **Lists:** literal values resolved at build time. The engine has no literal-list operator (`in` is always a subquery), so a list is an OR of equality leaves.
+- **Partner:** the grantor of the account's seeded standing grant.
+- **Partner calendars:** the authority's direct calendar grantor's 15.
+- **Direct shares:** the B-cold share mapping, computed rather than seeded, about 72 Record ids per account.
+- **Not modelled from B:** B has no partner case, so the partner branch follows today's gateway `record` predicate.
+- **Data:** the same as B's: audience columns on every table, no share rows seeded.

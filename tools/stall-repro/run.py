@@ -111,7 +111,7 @@ EDGE_ATTRIBUTION = {"A-edge-key-attendee": "attendee", "A-edge-key-generated": "
 PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTION.items() if mode != "no-window"})
 # B-cold-key-edges: B-cold with every graph_edge branch keyed, to attribute B-cold's remaining cost.
 COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
-AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
+AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED) | {"B-per-account"}
 ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION)
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
@@ -230,6 +230,8 @@ async def run(args):
                 catalog = await gateway.edge_attribution_catalog(catalog, EDGE_ATTRIBUTION[args.variant])
             elif args.variant in PARTLY_KEYED:
                 catalog = await gateway.keyed_catalog(catalog, preserved={request["body"]["table"].removeprefix("public.") for request in catalog} - PARTLY_KEYED[args.variant])
+            if args.variant == "B-per-account":
+                catalog = await gateway.per_account_catalog(catalog)
             if args.variant in COLD_VARIANTS:
                 catalog = await gateway.cold_catalog(catalog, key_all_edges=args.variant == "B-cold-key-edges")
             if args.variant in {"half-subqueries", "plain-only"}:
@@ -252,6 +254,10 @@ async def run(args):
             handles = await asyncio.gather(*(create(request) for request in catalog))
             save(output / "shape-handles.json", handles)
             for table in ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource"):
+                if args.variant == "B-per-account":
+                    for body in gateway.per_account_bodies(table, IMPORT_ACCOUNT):
+                        await create({"body": body})
+                    continue
                 if args.variant in COLD_VARIANTS:
                     for body in await gateway.cold_bodies(table, IMPORT_ACCOUNT, args.variant == "B-cold-key-edges"):
                         await create({"body": body})
@@ -266,7 +272,7 @@ async def run(args):
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in COLD_VARIANTS or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
+            probe_body = {**gateway.per_account_bodies("record", 0)[0], "subscription": gateway._subscription("record", 0, "other-account-probe")} if args.variant == "B-per-account" else gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in COLD_VARIANTS or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
             if args.variant == "plain-only":
                 probe_body = plain_control_body(probe_body, 0, "other-account-probe")
             probe_feed = await create({"body": probe_body})
