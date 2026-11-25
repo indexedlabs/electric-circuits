@@ -1,3 +1,4 @@
+B-per-account (OTTO-14032, q-keyed-stream-sharing): per-account plain filters with literal lists cost the same as B's per-Space keyed streams. On one runner they take 1.00-1.02x B on the import (3.52 vs 3.46 s and 2.00 vs 2.00 s), 1.02-1.19x on the large deletion and 0.95-1.00x on the small deletion, all under 10 s with zero backfills. Every bystander probe succeeds, except one drain and one live change of 9 on one runner's large deletion, which B lost the same way. The catalog is 445 shapes against B's 725; no synthetic accounts share a Space, so the no-dedupe cost is not exercised.
 M4 (revised after rounds 2 and 3): Per-row membership evaluation under one registry lock is where the time goes, and the other account starves behind the workload in the single change log. Today's prod engine (`b42f70d`, 2 vCPU) stalls as long as yesterday's (1.03x). PR 70's snapshot-removal proof (`Prior::was_member`) makes the import 1.29x and the large deletion 3.5-3.8x slower. No engine-side change keeps the other account served. Among model variants only those that key every `graph_edge` branch and the Record family do. B-cold with all edges keyed passes (2.0, 1.2 and 0.5 s, every probe served). B-cold as amended fails (10.1 s import, drains 20%). E-only still takes 273 s, and E+R takes 9.8 s but is not served.
 M1: Synthetic cross-account starvation reproduced: Nov24 import took 528.49 s from first delivery at 98.50% CPU with 0/529 drain and live successes, versus Nov23 165.12 s; this reproduces the mechanism, not the incident's absolute duration.
 M2: A 529-second, 51,471-sample profile assigns 68.74% CPU to per-row membership, 19.27% to flip walks and 8.12% to memory sampling; a separate 373-second observer run spends 82.26 s in marker waits and 276.61 s holding the sequencer registry lock.
@@ -1051,3 +1052,73 @@ its owners, not settled here.
 **What prod is exposed to now.** The estimate above already treated 2 vCPU as 1 for this path, and
 the same-runner measurement confirms it (1.03x). The table stands: safe tonight, then at risk from
 Nov 26 at high regrowth and nightly from about Nov 29 at low. An estimate.
+
+## B-per-account: per-account plain filters vs per-Space keyed streams (OTTO-14032, `q-keyed-stream-sharing`)
+
+Actions run `45537460409`, harness `bada4e3`, workflow job `paired` with `[paired-4]`. Two jobs ran
+on two runners: job `per-account-1` ran B then B-per-account on EPYC 7763, and job
+`per-account-2` ran B-per-account then B on Xeon 6975P-C. Both used the production binary
+`5b2cf3e`, the same one every B run used (`b42f70d`/`9bc1563` were not used; `b42f70d` matched
+`5b2cf3e` within 3% in the CPU-split run), with the Nov 24 catalog, 1 CPU and the three original
+workloads. I skipped the share deletion: it needs B-cold's share seed, which neither B nor this
+variant loads. Manifests are in `paired/paired-per-account-*/manifest.json`; the variant is
+defined in `MEASUREMENT_PATCHES.md` ("B-per-account").
+
+The "× control" column compares each row with the first run of its job. That is B in job 1 and
+B-per-account in job 2 (the reversed order), so job 2's B rows read as B over B-per-account.
+
+| Variant | Runner CPU | Workload | First delivery → empty s | × first run in job | CPU % | Backfills | Drain | Subset | Live change | Served? |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| B | EPYC 7763 | import | 3.5 | 1.00 | 23 | 0 | 100% (4/4); p95 0.14 | 100% (4/4); p95 0.01 | 100% (4/4); p95 0.12 | **yes** |
+| B | EPYC 7763 | large-delete | 1.3 | 1.00 | 21 | 0 | 89% (8/9); p95 0.75 | 100% (9/9); p95 0.03 | 89% (8/9); p95 0.73 | no |
+| B | EPYC 7763 | small-delete | 0.4 | 1.00 | 18 | 0 | 100% (2/2); p95 0.04 | 100% (2/2); p95 0.01 | 100% (2/2); p95 0.03 | **yes** |
+| B-per-account | EPYC 7763 | import | 3.5 | 1.02 | 28 | 0 | 100% (4/4); p95 0.37 | 100% (4/4); p95 0.02 | 100% (4/4); p95 0.21 | **yes** |
+| B-per-account | EPYC 7763 | large-delete | 1.6 | 1.19 | 20 | 0 | 89% (8/9); p95 0.83 | 100% (9/9); p95 0.04 | 89% (8/9); p95 0.79 | no |
+| B-per-account | EPYC 7763 | small-delete | 0.4 | 0.97 | 19 | 0 | 100% (2/2); p95 0.03 | 100% (2/2); p95 0.01 | 100% (2/2); p95 0.03 | **yes** |
+| B-per-account | Xeon 6975P-C | import | 2.0 | 1.00 | 30 | 0 | 100% (2/2); p95 0.22 | 100% (2/2); p95 0.01 | 100% (2/2); p95 0.17 | **yes** |
+| B-per-account | Xeon 6975P-C | large-delete | 1.2 | 1.02 | 30 | 0 | 100% (4/4); p95 0.34 | 100% (4/4); p95 0.01 | 100% (4/4); p95 0.19 | **yes** |
+| B-per-account | Xeon 6975P-C | small-delete | 0.3 | 1.00 | 28 | 0 | 100% (1/1); p95 0.22 | 100% (1/1); p95 0.01 | 100% (1/1); p95 0.15 | **yes** |
+| B | Xeon 6975P-C | import | 2.0 | 1.00 | 28 | 0 | 100% (2/2); p95 0.03 | 100% (2/2); p95 0.01 | 100% (2/2); p95 0.03 | **yes** |
+| B | Xeon 6975P-C | large-delete | 1.1 | 1.00 | 28 | 0 | 100% (4/4); p95 0.33 | 100% (4/4); p95 0.01 | 100% (4/4); p95 0.25 | **yes** |
+| B | Xeon 6975P-C | small-delete | 0.3 | 1.00 | 23 | 0 | 100% (1/1); p95 0.09 | 100% (1/1); p95 0.05 | 100% (1/1); p95 0.09 | **yes** |
+
+| Runner | Workload | B s | B-per-account s | Per-account × B |
+| --- | --- | ---: | ---: | ---: |
+| EPYC 7763 | import | 3.46 | 3.52 | 1.02 |
+| EPYC 7763 | large deletion | 1.35 | 1.60 | 1.19 |
+| EPYC 7763 | small deletion | 0.37 | 0.35 | 0.95 |
+| Xeon 6975P-C | import | 2.00 | 2.00 | 1.00 |
+| Xeon 6975P-C | large deletion | 1.14 | 1.16 | 1.02 |
+| Xeon 6975P-C | small deletion | 0.27 | 0.27 | 1.00 |
+
+**Catalog.** B has 725 shapes (704 from the history, plus import and probe feeds), with 0
+subqueries. B-per-account has 445 shapes (438 plus feeds), also with 0 subqueries. Per-account is
+smaller here for two reasons:
+
+- B keys `calendar_event` once per calendar (15 shapes per account), where per-account uses one
+  `user_id`/`calendar_id` filter per account.
+- Every synthetic account has its own home Space, so no two accounts share a Space and B's
+  per-Space dedupe never merges anything.
+
+The no-dedupe shape cost is therefore not exercised by this fixture. An estimate, not measured:
+per-account needs about (accounts × keyed tables) shapes and per-Space about (Spaces × keyed
+tables), so the ratio is accounts per shared Space.
+
+**Pass line** (each workload under 10 s, every bystander probe succeeding):
+
+- **Xeon 6975P-C:** both variants pass every workload.
+- **EPYC 7763:** both pass import and small deletion. Both fail the large deletion strictly, each
+  losing one drain and one live change of 9 attempts (p95 0.83 vs 0.75 s for drains), while
+  finishing in 1.6 and 1.35 s.
+
+**Fix-plan numbers.** The fix plan quotes S at 2.6–3.6 s import and 1.2–1.9 s large deletion; this
+runner pair gave B 2.0–3.5 s and 1.1–1.35 s. They are reported as measured, not reconciled.
+
+**Readings used.**
+- **Partner case.** B has none (only the owner's Space is keyed), so the partner case follows
+  today's gateway `record` predicate: the grantor's Space, with the record's `deleted_at` and
+  `removed_at` null. It is resolved to literal values at build time.
+- **Lists.** A literal `IN` list is an OR of equality leaves, because the engine's predicate JSON
+  has no literal-list operator.
+- **Direct shares.** About 72 Record ids per account (20 for account 17, 122 for account 18), taken
+  from B-cold's share mapping without seeding `record_share`.
