@@ -3022,6 +3022,10 @@ mod tests {
         /// Answer 429 to every ensure whose path ends with this suffix while set: a store
         /// rate-limiting one stream's PUT until the test clears it.
         pub(crate) ensure_rate_limited: std::sync::Mutex<Option<String>>,
+        /// When each ensure arrived, by path: the gaps are the client's retry delays.
+        pub(crate) ensure_at: std::sync::Mutex<Vec<(String, tokio::time::Instant)>>,
+        /// Answer this many HEADs 429 before answering normally.
+        pub(crate) head_rate_limited: std::sync::atomic::AtomicUsize,
         pub(crate) ensure_closed: bool,
         /// The `Stream-TTL` each ensure carried, by path.
         pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
@@ -3189,13 +3193,16 @@ mod tests {
         fn ensure<'a>(&'a self, path: &'a str, _content_type: &'a str, ttl: Option<NonZeroU64>) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
+                self.ensure_at.lock().unwrap().push((path.to_string(), tokio::time::Instant::now()));
                 self.ensure_ttls.lock().unwrap().push((path.to_string(), ttl.map(NonZeroU64::get)));
                 let gate = self.ensure_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
                     gate.hold().await;
                 }
                 if self.ensure_rate_limited.lock().unwrap().as_deref().is_some_and(|suffix| path.ends_with(suffix)) {
-                    return Ok(response(429));
+                    let mut res = response(429);
+                    res.retry_after = self.retry_after;
+                    return Ok(res);
                 }
                 self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
                 let status = self.ensure_fault.lock().unwrap().take().unwrap_or(self.ensure_status);
@@ -3515,6 +3522,14 @@ mod tests {
                     return Err(anyhow::anyhow!("scripted HEAD transport failure"));
                 }
                 self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rate_limited = self.head_rate_limited.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |left| left.checked_sub(1),
+                );
+                if rate_limited.is_ok() {
+                    return Ok(response(429));
+                }
                 let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
                 if let Some(streams) = &self.streams {
                     match streams.lock().unwrap().get(path) {
@@ -3811,6 +3826,54 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn rate_limited_catalog_put_is_retried_before_empty_boot() {
         admit_rate_limited_empty_namespace(None).await;
+    }
+
+    /// Every engine booting against an empty namespace PUTs `meta/catalog` first, so that PUT's
+    /// 429 waits are jittered like the catalog writer's appends: never sooner than Retry-After,
+    /// never past the 5 s ceiling, and not on the deterministic schedule every engine shares.
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_initial_catalog_put_is_jittered_within_its_bounds() {
+        const ATTEMPTS: usize = 8;
+        let retry_after = std::time::Duration::from_secs(1);
+        let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+        let store = Arc::new(ScriptedStore {
+            readiness_body: std::sync::Mutex::new(Some(readiness_json(&identity))),
+            read_appended: true,
+            streams: Some(std::sync::Mutex::new(HashMap::new())),
+            retry_after: Some(retry_after),
+            ..Default::default()
+        });
+        *store.ensure_rate_limited.lock().unwrap() = Some("meta/catalog".into());
+        let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        client.refresh_readiness(&identity).await.unwrap();
+        let admission = tokio::spawn(crate::engine::Engine::admit_store(
+            client,
+            crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope()),
+            true,
+        ));
+        let puts = |store: &ScriptedStore| {
+            store
+                .ensure_at
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.ends_with("meta/catalog"))
+                .map(|(_, at)| *at)
+                .collect::<Vec<_>>()
+        };
+        while puts(&store).len() < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        *store.ensure_rate_limited.lock().unwrap() = None;
+        admission.await.unwrap().expect("admission completes once the store stops answering 429");
+        let gaps: Vec<_> = puts(&store).windows(2).take(ATTEMPTS - 1).map(|pair| pair[1] - pair[0]).collect();
+        for (attempt, gap) in gaps.iter().enumerate() {
+            assert!(*gap >= retry_after, "attempt {}: {gap:?} undercuts Retry-After", attempt + 1);
+            assert!(*gap <= RATE_LIMIT_DELAY_MAX, "attempt {}: {gap:?} exceeds the ceiling", attempt + 1);
+        }
+        let lockstep: Vec<_> =
+            (1..ATTEMPTS as u32).map(|attempt| rate_limit_delay(attempt, Some(retry_after))).collect();
+        assert_ne!(gaps, lockstep, "the initial catalog PUT retries on the schedule every engine shares");
     }
 
     #[tokio::test(start_paused = true)]

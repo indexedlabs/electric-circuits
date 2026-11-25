@@ -6094,6 +6094,30 @@ mod stream_ttl_tests {
         assert!(engine.ds.touched_ago("meta/catalog").is_some(), "tracked streams keep theirs");
     }
 
+    /// A store that keeps answering a keep-alive 429 does not hold the sweep: the refused touch is
+    /// counted, the stream stays due, the sweep finishes and records the untouched gauge, and the
+    /// next sweep touches the stream once the store answers.
+    #[tokio::test(start_paused = true)]
+    async fn a_touch_the_store_keeps_rate_limiting_fails_and_the_next_sweep_retries_it() {
+        let store = Arc::new(crate::ds::ScriptedStore::default());
+        store.nonlive_read_status.store(429, Ordering::Relaxed);
+        let engine = hour_old_engine(store.clone());
+        engine.park_dormant_shape_for_test("s1", "users", LogPosition { segment: 0, offset: "0".into() }).await;
+
+        tokio::time::timeout(Duration::from_secs(60), engine.sweep_stream_ttl())
+            .await
+            .expect("a sweep must finish while the store answers its touches 429");
+        assert!(engine.metrics.stream_ttl_touch_failures.load(Ordering::Relaxed) >= 1, "the refused touch is counted");
+        assert_eq!(engine.ds.touched_ago("shape/s1"), None, "a refused touch leaves the stream due");
+        assert!(engine.metrics.stream_ttl_oldest_untouched_secs() >= 3600, "the sweep recorded the untouched age");
+
+        store.nonlive_read_status.store(0, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(60), engine.sweep_stream_ttl())
+            .await
+            .expect("the next sweep must run");
+        assert!(engine.ds.touched_ago("shape/s1").is_some(), "the next sweep touches the stream");
+    }
+
     /// Without a TTL there is nothing to keep alive.
     #[tokio::test]
     async fn no_ttl_touches_nothing() {
@@ -6268,6 +6292,41 @@ mod rate_limited_create_tests {
             shape_puts.len() == 1 && shape_puts.iter().all(|path| path.ends_with("shape/s1")),
             "N identical creates must PUT one stream: {shape_puts:?}"
         );
+        engine.close(Duration::from_secs(5)).await;
+    }
+
+    /// A shared join first HEADs the retained shape's stream. A 429 on that HEAD is the store
+    /// asking for time, not doubt about the stream: the join waits it out and joins the existing
+    /// shape, and nothing new is PUT.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_liveness_head_still_joins_the_shared_shape() {
+        let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
+        let engine =
+            Engine::new_for_in_process_test(DsClient::with_test_store("scripted://join-429".into(), store.clone()));
+        let schema: Schema = serde_json::from_value(serde_json::json!({"tables": {
+            "a":{"columns":{"id":{"type":"int"}},"primaryKey":"id"}
+        }}))
+        .unwrap();
+        engine.define_schema(&schema).await.unwrap();
+        let first = engine.create_shape(&"a".into(), None, None, true, true).await.unwrap();
+
+        store.head_rate_limited.store(6, Ordering::Relaxed);
+        let joined =
+            tokio::time::timeout(Duration::from_secs(120), engine.create_shape(&"a".into(), None, None, true, true))
+                .await
+                .expect("the join must finish once the store answers its HEAD")
+                .expect("a 429 on the liveness HEAD must not fail the join");
+        assert_eq!(joined.id, first.id, "the join must reach the existing shape");
+        assert_eq!(store.head_rate_limited.load(Ordering::Relaxed), 0, "every scripted 429 was answered");
+        assert_eq!(puts_of(&store, "shape/s1"), 1, "the shared shape's stream was PUT once");
+        let shape_puts = store
+            .operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.starts_with("create:") && op.contains("shape/"))
+            .count();
+        assert_eq!(shape_puts, 1, "the join must not make a stream of its own");
         engine.close(Duration::from_secs(5)).await;
     }
 }
