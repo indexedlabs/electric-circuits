@@ -109,3 +109,6 @@ does not cover. The last line is what the brief expected.
   rows; a real gateway would also rebuild each affected account's feeds.
 - Parent moves (a Record changing Space), production data, and any client.
 - `monitored_url_*` and `standing_grant_backfill_status`, which the synthetic catalog does not hold.
+
+
+Follow-up variants S-assign-today and S-chat-narrow (Nov 25): `S-ASSIGN-CHAT.md` beside this file.

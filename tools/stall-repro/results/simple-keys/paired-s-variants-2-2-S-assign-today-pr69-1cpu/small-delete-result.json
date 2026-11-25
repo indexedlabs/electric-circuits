@@ -1,0 +1,174 @@
+{
+  "workload": "small-delete",
+  "measurement": "source SQL start to workload receipt and zero pending flips/appends",
+  "first_change_read_time": 1795631378.79,
+  "timeout_s": 3600,
+  "row_changes": 7114,
+  "source_write_s": 0.5594809599999735,
+  "completion": {
+    "receipt": {
+      "drained": true,
+      "receipt": {
+        "commitLsn": "0/6742B98",
+        "generation": "ed59de3117b14f47c3c415381dafe3ad5691890473bfd831e744acbc3ae6b889",
+        "sourceCommitId": "27251f3e-5cdb-488e-bcb8-1e471a34e60b",
+        "userId": "f67df0d4-d079-5aab-a250-53e9e684b718"
+      },
+      "sourceCommitId": "27251f3e-5cdb-488e-bcb8-1e471a34e60b"
+    },
+    "queue": {
+      "changes": {
+        "offset": "0000000000000000_0000000237932104",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "epoch": {
+        "boundAt": "2026-11-25T18:28:29.649Z",
+        "reason": null,
+        "slot": "stall_repro",
+        "state": "ok",
+        "systemIdentifier": "7712177690744496177",
+        "timelineId": 1
+      },
+      "failingAppends": 0,
+      "flipFailures": 0,
+      "lsn": "0/6744930",
+      "pendingFlips": 0,
+      "replayFailed": false,
+      "settle": {
+        "boundHits": 0,
+        "checks": 5940,
+        "fencedTables": 0,
+        "forgotten": 0,
+        "overflowRefusals": 0,
+        "pollerFailures": 0,
+        "pollerTicks": 32,
+        "recordBytes": 144,
+        "rejections": 0,
+        "retakes": 0,
+        "sequencedXids": 3,
+        "sequencedXidsPeak": 19,
+        "tables": 1,
+        "timeouts": 0,
+        "waitMs": {
+          "buckets": {
+            "le_10000ms": 0,
+            "le_1000ms": 0,
+            "le_100ms": 0,
+            "le_10ms": 0,
+            "le_1ms": 0,
+            "le_2500ms": 0,
+            "le_250ms": 0,
+            "le_25ms": 0,
+            "le_2ms": 0,
+            "le_30000ms": 0,
+            "le_5000ms": 0,
+            "le_500ms": 0,
+            "le_50ms": 0,
+            "le_5ms": 0,
+            "le_infms": 0
+          },
+          "count": 0,
+          "maxMs": 0,
+          "p50Ms": null,
+          "p90Ms": null,
+          "p99Ms": null,
+          "sumMs": 0
+        },
+        "waiting": 0,
+        "xidsDropped": 0
+      },
+      "sync": 0,
+      "visibilityWaits": 0
+    }
+  },
+  "completed": true,
+  "elapsed_s": 4.0997828259999665,
+  "ended_wall": 1795631382.0036457,
+  "began_wall": 1795631377.903862,
+  "transactions": [
+    {
+      "transaction": 0,
+      "txid": "1439",
+      "before_commit": 1795631378.4624646,
+      "marker": "27251f3e-5cdb-488e-bcb8-1e471a34e60b"
+    }
+  ],
+  "engine_cpu_percent": 80.7359838430629,
+  "changes_per_s": 1735.213864228246,
+  "probe": {
+    "drain": {
+      "attempts": 4,
+      "successes": 2,
+      "success_rate": 0.5,
+      "successful_p50_s": 0.13846009000002368,
+      "successful_p95_s": 0.13846009000002368,
+      "successful_max_s": 1.2723895229999584,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.013041160999989643,
+      "successful_p95_s": 0.06437451599998667,
+      "successful_max_s": 0.11815221800003428,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 4,
+      "successes": 2,
+      "success_rate": 0.5,
+      "successful_p50_s": 0.11658748899998272,
+      "successful_p95_s": 0.11658748899998272,
+      "successful_max_s": 1.1169311079999602,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "idle_probe": {
+    "drain": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.021714766000002328,
+      "successful_p95_s": 0.02254395699998213,
+      "successful_max_s": 0.02439435099995535,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.0075007909999840194,
+      "successful_p95_s": 0.008150660000012522,
+      "successful_max_s": 0.014246087999993051,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.02019442200003141,
+      "successful_p95_s": 0.02073040499999479,
+      "successful_max_s": 0.02442995600000586,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "pinned_warnings": 0,
+  "large_transactions": [],
+  "backfills": 2101,
+  "backfills_by_table": {
+    "public.assignment": 2100,
+    "public.record": 1
+  },
+  "empty_backfills_by_table": {
+    "public.assignment": 2100,
+    "public.record": 1
+  },
+  "backfills_per_minute": 30747.970160895795,
+  "first_read_to_empty_s": 3.2136456966400146,
+  "first_read_definition": "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy",
+  "engine_changes_per_s": 2213.6852259220577,
+  "cpu_sample_window_s": 3.0023727416992188,
+  "engine_cpu_after_first_read_percent": 101.25325072993716
+}
