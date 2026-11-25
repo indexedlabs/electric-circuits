@@ -222,7 +222,7 @@ pub(crate) const EXIT_CATALOG_REFUSED: i32 = 74;
 /// "exit the process" branch is unit-testable without exiting anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppendVerdict {
-    /// Transport, timeout or 5xx: storage is having a moment. Retry THIS event, in place, forever —
+    /// Transport, timeout, 429 or 5xx: storage is having a moment. Retry THIS event, in place, forever —
     /// the queue is ordered and single-consumer, so everything behind it waits, which is exactly
     /// right (a later event must never reach the log before an earlier one).
     Retry,
@@ -232,7 +232,7 @@ pub(crate) enum AppendVerdict {
 }
 
 /// Classify a failed catalog append. `is_unavailable` is deliberately the ONLY forgiving side (see
-/// [`crate::ds::is_unavailable`]): it forgives the transport and 5xx, and nothing else.
+/// [`crate::ds::is_unavailable`]): it forgives the transport, 429 and 5xx, and nothing else.
 pub(crate) fn classify_append(e: &anyhow::Error) -> AppendVerdict {
     if crate::ds::is_unavailable(e) { AppendVerdict::Retry } else { AppendVerdict::Refused }
 }
@@ -425,7 +425,7 @@ impl CatalogWriter {
 /// while holding the engine-state lock, so the log order matches the state-mutation order).
 ///
 /// **The writer never drops a lifecycle event.** In Postgres mode, a stale Offset is rejected when
-/// a newer durable floor already covers it. A transient failure (transport, timeout, 5xx) retries THAT
+/// a newer durable floor already covers it. A transient failure (transport, timeout, 429, 5xx) retries THAT
 /// event in place, forever, so the log keeps its order and a restart cannot under-restore; a
 /// definite refusal requests a source restart (standalone: [`EXIT_CATALOG_REFUSED`]), because memory and the durable
 /// record disagree has no honest way to continue. The retry loop is bounded in practice by the
@@ -531,7 +531,7 @@ pub(crate) fn spawn_catalog_writer(
                 if !ensured {
                     ensured = self::ensure_catalog(&ds, &mut ensure_logged).await;
                 }
-                match ds.append_json(CATALOG_STREAM, std::slice::from_ref(&json)).await {
+                match ds.append_json_once(CATALOG_STREAM, std::slice::from_ref(&json)).await {
                     Ok(()) => break,
                     Err(e) => match if ensured { classify_append(&e) } else { AppendVerdict::Retry } {
                         AppendVerdict::Refused => {
@@ -552,9 +552,12 @@ pub(crate) fn spawn_catalog_writer(
                                      with it. No event is dropped."
                                 );
                             }
-                            let base = catalog_backoff(attempt);
-                            tokio::time::sleep(crate::replication::jitter(base, crate::replication::clock_nanos()))
-                                .await;
+                            // Jittered either way: engines refused by one store at the same moment
+                            // must not re-send at the same moment.
+                            let nanos = crate::replication::clock_nanos();
+                            let wait = crate::ds::jittered_rate_limit_retry_delay(&e, attempt, nanos)
+                                .unwrap_or_else(|| crate::replication::jitter(catalog_backoff(attempt), nanos));
+                            tokio::time::sleep(wait).await;
                         }
                     },
                 }
@@ -960,7 +963,7 @@ fn unreadable_literal(
 /// and one error line per attempt for as long as storage is down is a flood, not information.
 /// `logged` is the caller's per-outage latch; it is cleared again on success.
 async fn ensure_catalog(ds: &DsClient, logged: &mut bool) -> bool {
-    match ds.ensure_stream(CATALOG_STREAM).await {
+    match ds.ensure_stream_jittered(CATALOG_STREAM).await {
         Ok(()) => {
             *logged = false;
             true
@@ -1258,7 +1261,8 @@ impl Engine {
             if !initialize_namespace {
                 return Err(anyhow::Error::new(CatalogStoreBindingError::EmptyWithoutInitialization));
             }
-            ds.ensure_stream(CATALOG_STREAM).await?;
+            // Jittered: every engine booting against this empty namespace makes this PUT at once.
+            ds.ensure_stream_jittered(CATALOG_STREAM).await?;
             let mut event = serde_json::to_value(CatalogEvent::StoreBound(expected.clone()))?;
             event
                 .as_object_mut()
@@ -2035,6 +2039,8 @@ pub(crate) mod testing {
     pub(crate) struct FakeDsState {
         /// Remaining `POST /meta/catalog` calls to answer 503 (transient).
         fail_appends: AtomicU32,
+        /// Remaining `POST /meta/catalog` calls to answer 429 with an immediate retry.
+        rate_limited_appends: AtomicU32,
         /// Remaining `POST /meta/catalog` calls to COMMIT and then answer 503 — a response lost
         /// after the write landed, which is what makes the writer's retry append a second copy.
         lose_responses: AtomicU32,
@@ -2121,14 +2127,25 @@ pub(crate) mod testing {
                              body: String| async move {
                                 if logical_path(&path) != "meta/catalog" {
                                     st.closes.fetch_add(1, Ordering::SeqCst);
-                                    return axum::http::StatusCode::NO_CONTENT;
+                                    return axum::http::StatusCode::NO_CONTENT.into_response();
                                 }
                                 if st
                                     .fail_appends
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
-                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                                }
+                                if st
+                                    .rate_limited_appends
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .is_ok()
+                                {
+                                    return (
+                                        [(axum::http::header::RETRY_AFTER, "0")],
+                                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    )
+                                        .into_response();
                                 }
                                 let is_retired = serde_json::from_str::<serde_json::Value>(&body)
                                     .ok()
@@ -2156,9 +2173,9 @@ pub(crate) mod testing {
                                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
-                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE;
+                                    return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
                                 }
-                                axum::http::StatusCode::NO_CONTENT
+                                axum::http::StatusCode::NO_CONTENT.into_response()
                             },
                         )
                         .delete(
@@ -2232,6 +2249,11 @@ pub(crate) mod testing {
         /// Answer the next `n` catalog appends with 503.
         pub(crate) fn fail_appends(&self, n: u32) {
             self.state.fail_appends.store(n, Ordering::SeqCst);
+        }
+
+        /// Answer the next `n` catalog appends with 429 and `Retry-After: 0`.
+        pub(crate) fn rate_limit_appends(&self, n: u32) {
+            self.state.rate_limited_appends.store(n, Ordering::SeqCst);
         }
 
         /// Commit the next `n` catalog appends and then answer 503 (a lost success response).
@@ -4121,6 +4143,30 @@ mod tests {
             vec!["joined".to_string(), "left".to_string()],
             "both events land, exactly once each, in send order"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limited_append_is_retried_in_place_and_lands() {
+        let server = FakeDs::start().await;
+        server.rate_limit_appends(1);
+        let shutdown = ShutdownToken::new();
+        let w = spawn_catalog_writer(DsClient::new_for_in_process_test(server.url()), shutdown.clone(), false);
+        tokio::select! {
+            biased;
+            code = shutdown.wait_for_restart() => panic!("429 must not request engine restart (exit {code})"),
+            result = w.send_durable(joined("s1", "sub-a", 100)) => result.expect("append must land"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(20)) => panic!("append did not finish"),
+        }
+        assert_eq!(server.catalog_kinds(), vec!["joined".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_initial_catalog_append_is_retried_before_admission() {
+        let server = FakeDs::start().await;
+        server.rate_limit_appends(1);
+        let admission =
+            Engine::admit_store(DsClient::new_for_in_process_test(server.url()), expected_store_bound(), true).await;
+        assert!(admission.is_ok(), "429 must not refuse boot: {:?}", admission.err());
     }
 
     /// `send_durable` is the durable-before-ack primitive: the future must not resolve while the

@@ -20,6 +20,7 @@ name = "electric-circuits-engine"
 path = "src/main.rs"
 
 [dependencies]
+httpdate = "1"
 # Query engine, reintroduced as the storage-backed table-state layer (src/arrangements.rs):
 # one shared circuit whose arrangements spill to disk when tables grow. Version reqs kept at
 # minor-level so cargo unifies our direct deps with dbsp's own tree (so the rkyv/size-of/

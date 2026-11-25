@@ -315,8 +315,65 @@ impl std::fmt::Display for DsUnavailable {
 
 impl std::error::Error for DsUnavailable {}
 
+/// The durable-streams server asked the caller to try again later because it is currently
+/// rate-limited. Unlike other 4xx answers this is transient; the optional delay is the provider's
+/// `Retry-After` instruction.
+#[derive(Debug, thiserror::Error)]
+#[error("{op} {path} -> 429 (durable-streams rate limited): {body}")]
+struct DsRateLimited {
+    op: &'static str,
+    path: String,
+    retry_after: Option<std::time::Duration>,
+    body: String,
+}
+
+/// Return the provider's requested delay when an error came from a 429 response.
+fn retry_after(e: &anyhow::Error) -> Option<std::time::Duration> {
+    e.chain().find_map(|cause| cause.downcast_ref::<DsRateLimited>().and_then(|rate| rate.retry_after))
+}
+
+/// A bounded wait for a typed 429, including responses without Retry-After.
+/// Other failures retain their caller's existing retry policy.
+pub(crate) fn rate_limit_retry_delay(e: &anyhow::Error, attempt: u32) -> Option<std::time::Duration> {
+    e.downcast_ref::<DsRateLimited>().map(|rate| rate_limit_delay(attempt, rate.retry_after))
+}
+
+/// [`rate_limit_retry_delay`] spread by `nanos` (clock noise, see `replication::jitter`) for a
+/// retrier that others may have been refused alongside: writers given the same `Retry-After` must
+/// not all come back at once. The spread is the quarter above the bounded delay, as far as the
+/// ceiling allows; at the ceiling the window slides down instead of vanishing. It never starts
+/// below the `Retry-After` (itself bounded by the ceiling).
+pub(crate) fn jittered_rate_limit_retry_delay(
+    e: &anyhow::Error,
+    attempt: u32,
+    nanos: u32,
+) -> Option<std::time::Duration> {
+    e.downcast_ref::<DsRateLimited>().map(|rate| jittered_rate_limit_delay(attempt, rate.retry_after, nanos))
+}
+
+fn jittered_rate_limit_delay(
+    attempt: u32,
+    retry_after: Option<std::time::Duration>,
+    nanos: u32,
+) -> std::time::Duration {
+    let delay = rate_limit_delay(attempt, retry_after);
+    let width = delay / 4;
+    let top = (delay + width).min(RATE_LIMIT_DELAY_MAX);
+    let floor = top.saturating_sub(width).max(retry_after.unwrap_or_default().min(top));
+    let span = u64::try_from((top - floor).as_millis()).unwrap_or(0);
+    floor + std::time::Duration::from_millis(u64::from(nanos) % (span + 1))
+}
+
+/// How a request's 429 waits are spaced: on the growing schedule every caller shares, or jittered
+/// ([`jittered_rate_limit_delay`]) where many engines make the same request at the same moment.
+#[derive(Clone, Copy)]
+enum RatePacing {
+    Shared,
+    Jittered,
+}
+
 /// Is this a durable-streams failure that may clear on its own — the server not up yet, a refused
-/// connection, a timeout, a connection dropped mid-response, or a 5xx?
+/// connection, a timeout, a connection dropped mid-response, a 429, or a 5xx?
 ///
 /// This is the read the **boot** takes: a storage server that comes up after its engine is the
 /// normal case in a compose/Kubernetes start, so it must back off rather than exit `EX_CONFIG`.
@@ -333,6 +390,9 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
     if e.chain().any(|c| c.downcast_ref::<StreamGone>().is_some()) {
         return false;
     }
+    if e.chain().any(|c| c.downcast_ref::<DsRateLimited>().is_some()) {
+        return true;
+    }
     if e.chain().any(|c| c.downcast_ref::<DsUnavailable>().is_some()) {
         return true;
     }
@@ -342,8 +402,21 @@ pub fn is_unavailable(e: &anyhow::Error) -> bool {
 }
 
 /// Build the error for a non-2xx durable-streams response: typed when the server said it is
-/// unavailable (5xx), an ordinary message otherwise.
+/// unavailable (429/5xx), an ordinary message otherwise.
 fn status_error(op: &'static str, path: &str, status: u16, body: &str) -> anyhow::Error {
+    status_error_with_retry_after(op, path, status, body, None)
+}
+
+fn status_error_with_retry_after(
+    op: &'static str,
+    path: &str,
+    status: u16,
+    body: &str,
+    retry_after: Option<std::time::Duration>,
+) -> anyhow::Error {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS.as_u16() {
+        return anyhow::Error::new(DsRateLimited { op, path: path.to_string(), retry_after, body: body.to_string() });
+    }
     if (500..600).contains(&status) {
         return anyhow::Error::new(DsUnavailable { op, path: path.to_string(), status });
     }
@@ -397,6 +470,7 @@ pub type GoneReconciler = std::sync::Arc<
 /// exact error/retry behavior while keeping HTTP mechanics below the port.
 pub(crate) struct StoreResponse {
     status: u16,
+    retry_after: Option<std::time::Duration>,
     /// The response body is deliberately retained as an outcome rather than normalized to text.
     /// Successful stream reads must fail if their body cannot be acquired: accepting the advertised
     /// next offset with an empty page could checkpoint past envelopes that never reached Circuits.
@@ -1015,6 +1089,7 @@ impl HttpDurableStreamsStore {
         limit: u64,
     ) -> StoreResponse {
         let status = res.status().as_u16();
+        let retry_after = header(&res, "retry-after").and_then(|value| parse_retry_after(&value));
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
         let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
@@ -1039,7 +1114,7 @@ impl HttpDurableStreamsStore {
         } else {
             None
         };
-        StoreResponse { status, permit, body, next_offset, up_to_date, closed }
+        StoreResponse { status, retry_after, permit, body, next_offset, up_to_date, closed }
     }
 }
 
@@ -1310,6 +1385,9 @@ impl DsClient {
     /// The keep-alive: a non-live `GET` at the tail (`offset=now`), which slides the stream's TTL
     /// without reading any of it. `HEAD` would not slide it. A stream that is not there is a typed
     /// [`StreamGone`].
+    ///
+    /// One attempt, a 429 included (a typed [`DsRateLimited`]): the keep-alive sweep is the retry
+    /// loop, and it waits for every touch before it counts failures and starts the next one.
     pub(crate) async fn touch(&self, path: &str) -> Result<()> {
         let physical_path = self.physical_path(path)?;
         let res = self.store.read(&physical_path, "now", false).await?;
@@ -1317,7 +1395,7 @@ impl DsClient {
             return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
         }
         if !(200..300).contains(&res.status) {
-            return Err(status_error("GET", path, res.status, ""));
+            return Err(status_error_with_retry_after("GET", path, res.status, "", res.retry_after));
         }
         self.note_access(path, res.status);
         Ok(())
@@ -1451,7 +1529,7 @@ impl DsClient {
     /// The first and only allowed preflight network operation. Any failure leaves ordinary stream
     /// operations untouched and is therefore safe to run before engine or Postgres construction.
     pub async fn preflight_readiness(&self, expected: &StoreIdentityV1) -> Result<StoreReadinessV1> {
-        let response = self.store.ready().await?;
+        let response = self.retry_rate_limited("GET", "_admin/ready", || self.store.ready()).await?;
         if response.status != 200 {
             return Err(anyhow::Error::new(StoreReadinessError::Response { status: response.status }));
         }
@@ -1508,6 +1586,76 @@ impl DsClient {
         self.scope.qualify(logical_path)
     }
 
+    async fn wait_rate_limit(
+        &self,
+        op: &'static str,
+        path: &str,
+        attempt: u32,
+        retry_after: Option<std::time::Duration>,
+    ) -> bool {
+        self.wait_rate_limit_paced(op, path, attempt, retry_after, RatePacing::Shared).await
+    }
+
+    async fn wait_rate_limit_paced(
+        &self,
+        op: &'static str,
+        path: &str,
+        attempt: u32,
+        retry_after: Option<std::time::Duration>,
+        pacing: RatePacing,
+    ) -> bool {
+        let delay = match pacing {
+            RatePacing::Shared => rate_limit_delay(attempt, retry_after),
+            RatePacing::Jittered => jittered_rate_limit_delay(attempt, retry_after, crate::replication::clock_nanos()),
+        };
+        tracing::warn!(op, path, attempt, ?delay, "durable-streams rate limited request; retrying");
+        if let Some(shutdown) = &self.shutdown {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => true,
+                _ = shutdown.wait() => false,
+            }
+        } else {
+            tokio::time::sleep(delay).await;
+            true
+        }
+    }
+
+    /// Keep the port single-attempt. Release response buffers/permits before waiting and leave
+    /// the caller's offset unchanged until a complete successful page arrives.
+    async fn retry_rate_limited<F, Fut>(&self, op: &'static str, path: &str, request: F) -> Result<StoreResponse>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<StoreResponse>>,
+    {
+        self.retry_rate_limited_paced(op, path, RatePacing::Shared, request).await
+    }
+
+    async fn retry_rate_limited_paced<F, Fut>(
+        &self,
+        op: &'static str,
+        path: &str,
+        pacing: RatePacing,
+        mut request: F,
+    ) -> Result<StoreResponse>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<StoreResponse>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            let res = request().await?;
+            if res.status != 429 {
+                return Ok(res);
+            }
+            let retry_after = res.retry_after;
+            drop(res);
+            attempt = attempt.saturating_add(1);
+            if !self.wait_rate_limit_paced(op, path, attempt, retry_after, pacing).await {
+                bail!("{op} {path} rate-limit retry interrupted by engine shutdown");
+            }
+        }
+    }
+
     /// Idempotently create a JSON stream (PUT), with the client's sliding `Stream-TTL` if it has
     /// one. Existing stream with same config -> 200.
     ///
@@ -1517,6 +1665,16 @@ impl DsClient {
     /// apart: only a live stream that is not closed counts as existing, a `5xx` on the `HEAD` stays
     /// retryable, and every other `409` keeps its meaning.
     pub async fn ensure_stream(&self, path: &str) -> Result<()> {
+        self.ensure_stream_paced(path, RatePacing::Shared).await
+    }
+
+    /// [`Self::ensure_stream`] with its 429 waits jittered: for a PUT that every engine on a store
+    /// makes at the same moment (the catalog's, at boot), so they do not retry in lockstep.
+    pub(crate) async fn ensure_stream_jittered(&self, path: &str) -> Result<()> {
+        self.ensure_stream_paced(path, RatePacing::Jittered).await
+    }
+
+    async fn ensure_stream_paced(&self, path: &str, pacing: RatePacing) -> Result<()> {
         let physical_path = self.physical_path(path)?;
         // While the PUT is in flight the stream counts as accessed, so a keep-alive sweep that runs
         // meanwhile neither touches a stream that does not exist yet (a 404) nor ages it from boot.
@@ -1524,7 +1682,11 @@ impl DsClient {
         // other answer, an error or a cancelled PUT: an existing stream opened through a
         // config-mismatch 409 stays as due as it was.
         let pending = self.begin_access(path);
-        let res = self.store.ensure(&physical_path, "application/json", self.stream_ttl).await?;
+        let res = self
+            .retry_rate_limited_paced("PUT", path, pacing, || {
+                self.store.ensure(&physical_path, "application/json", self.stream_ttl)
+            })
+            .await?;
         if (200..300).contains(&res.status) {
             // A create (or a matching re-create, which the store treats as an access) starts the
             // stream's TTL clock.
@@ -1534,7 +1696,7 @@ impl DsClient {
         }
         drop(pending);
         if res.status == 409 && !res.closed {
-            let head = self.store.head(&physical_path).await?;
+            let head = self.retry_rate_limited_paced("HEAD", path, pacing, || self.store.head(&physical_path)).await?;
             if head.status == 200 && !head.closed {
                 return Ok(());
             }
@@ -1550,6 +1712,22 @@ impl DsClient {
     /// Append envelopes as a JSON array (the server flattens one array level into N messages).
     /// Append raw JSON events (non-envelope streams, e.g. the shape catalog).
     pub async fn append_json(&self, path: &str, events: &[serde_json::Value]) -> Result<()> {
+        let mut attempt = 0u32;
+        loop {
+            match self.append_json_once(path, events).await {
+                Err(e) if e.downcast_ref::<DsRateLimited>().is_some() => {
+                    attempt = attempt.saturating_add(1);
+                    if !self.wait_rate_limit("POST", path, attempt, retry_after(&e)).await {
+                        return Err(e.context("append interrupted by engine shutdown"));
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// The ordered catalog writer owns retries and shutdown-party accounting for its queue.
+    pub(crate) async fn append_json_once(&self, path: &str, events: &[serde_json::Value]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -1559,7 +1737,8 @@ impl DsClient {
         self.note_access(path, res.status);
         if !(200..300).contains(&res.status) {
             let status = res.status;
-            return Err(status_error("POST", path, status, &res.body_or_default()));
+            let retry_after = res.retry_after;
+            return Err(status_error_with_retry_after("POST", path, status, &res.body_or_default(), retry_after));
         }
         Ok(())
     }
@@ -1604,11 +1783,21 @@ impl DsClient {
     ) -> Result<(String, Option<String>, bool, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if first_only {
-            self.store.read_first(&physical_path, offset, &self.memory_budget, self.read_max_bytes()).await?
+            self.retry_rate_limited("GET", path, || {
+                self.store.read_first(&physical_path, offset, &self.memory_budget, self.read_max_bytes())
+            })
+            .await?
         } else {
-            self.store
-                .read_budgeted(&physical_path, offset, false, Some(&self.memory_budget), self.read_max_bytes())
-                .await?
+            self.retry_rate_limited("GET", path, || {
+                self.store.read_budgeted(
+                    &physical_path,
+                    offset,
+                    false,
+                    Some(&self.memory_budget),
+                    self.read_max_bytes(),
+                )
+            })
+            .await?
         };
         self.note_access(path, res.status);
         if res.status == 204 || res.status == 404 {
@@ -1628,10 +1817,9 @@ impl DsClient {
     /// [`Self::append_reliable`], which discards instead, and the change log uses
     /// [`Self::append_checked`], which routes around it.
     pub async fn append(&self, path: &str, envelopes: &[Envelope]) -> Result<()> {
-        match self.append_once(path, envelopes).await {
-            Ok(_) => Ok(()),
-            Err(AppendError::Gone(status)) => bail!("POST {path} -> {status} (stream retired)"),
-            Err(AppendError::Other(e)) => Err(e),
+        match self.append_checked(path, envelopes).await? {
+            Appended::Ok { .. } => Ok(()),
+            Appended::Retired(status) => bail!("POST {path} -> {status} (stream retired)"),
         }
     }
 
@@ -1642,13 +1830,13 @@ impl DsClient {
 
     /// Append on a path where **failing costs the shape**: activation, the catalog restore's
     /// re-seed, a dormant shape's replay. Transient storage failures (`ds::is_unavailable`:
-    /// transport, timeout, 5xx) are retried with capped backoff until `budget` runs out or the
+    /// transport, timeout, 429, 5xx) are retried with capped backoff until `budget` runs out or the
     /// shutdown token fires.
     ///
-    /// The plain [`Self::append`] propagates the first error, and these callers turn an error into
+    /// The plain [`Self::append`] propagates errors other than 429, and these callers turn an error into
     /// a **retirement** — so one 503 during a boot used to permanently delete an acknowledged
     /// subscription and its stream. Permanent removal is for records that are genuinely
-    /// unrecoverable: a definite refusal (a 4xx, an unserialisable event), a stream storage confirms
+    /// unrecoverable: a definite refusal (a 4xx other than 429, an unserialisable event), a stream storage confirms
     /// is gone (`HEAD` → 404/410/closed), or an exhausted budget. A service that is merely
     /// unavailable is backpressure, not loss.
     ///
@@ -1665,12 +1853,12 @@ impl DsClient {
         budget: std::time::Duration,
         shutdown: &crate::shutdown::ShutdownToken,
     ) -> Result<()> {
-        let deadline = std::time::Instant::now() + budget;
+        let deadline = tokio::time::Instant::now() + budget;
         let mut attempt = 0u32;
         loop {
-            let e = match self.append_checked(path, envelopes).await {
-                Ok(Appended::Ok { .. }) => return Ok(()),
-                Ok(Appended::Retired(status)) => match self.head(path).await {
+            let e = match self.append_once(path, envelopes).await {
+                Ok(_) => return Ok(()),
+                Err(AppendError::Gone(status)) => match self.head(path).await {
                     // There and appendable: the terminal status did not come from storage.
                     Ok(Some(head)) if !head.closed => anyhow::anyhow!(
                         "POST {path} -> {status}, contradicted by HEAD (the stream is there): treating it as transient"
@@ -1681,25 +1869,33 @@ impl DsClient {
                     // an acknowledged subscription.
                     Err(he) => anyhow::anyhow!("POST {path} -> {status}; HEAD could not confirm it ({he:#})"),
                 },
-                Err(e) => {
+                Err(AppendError::Other(e)) => {
                     if !is_unavailable(&e) {
                         return Err(e);
                     }
-                    // Storage answering "no such stream" to a HEAD is the one transient-looking case
-                    // that is really terminal: stop waiting and let the caller retire the record.
-                    if let Ok(None) = self.head(path).await {
+                    // A 429 asks us to wait, not reconcile. HEAD would add load and could
+                    // block before the restore budget/shutdown check, even without Retry-After.
+                    if e.downcast_ref::<DsRateLimited>().is_none()
+                        && let Ok(None) = self.head(path).await
+                    {
                         return Err(e.context(format!("stream '{path}' is gone")));
                     }
                     e
                 }
             };
             attempt += 1;
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(e.context(format!("appending to {path} kept failing for {budget:?} ({attempt} attempts)")));
             }
-            let backoff = std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+            let backoff = rate_limit_retry_delay(&e, attempt).unwrap_or_else(|| {
+                std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000))
+            });
             tracing::warn!("append to {path} failed (attempt {attempt}), retrying in {backoff:?}: {e:#}");
             tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(e.context(format!("appending to {path} kept failing for {budget:?} ({attempt} attempts)")));
+                }
                 _ = tokio::time::sleep(backoff) => {}
                 _ = shutdown.wait() => {
                     return Err(e.context(format!("appending to {path} abandoned: shutting down")));
@@ -1713,13 +1909,22 @@ impl DsClient {
     ///
     /// The change log's writer needs both (ADR-0006): the tail offset IS the segment's size (the
     /// rotation decision), and a closed segment is a routing signal — walk forward to the successor
-    /// — not a loss. Transient failures still surface as `Err` so the ingestor can tear its
+    /// — not a loss. Transient failures other than 429 still surface as `Err` so the ingestor can tear its
     /// connection down unacknowledged rather than lose the commit.
     pub async fn append_checked(&self, path: &str, envelopes: &[Envelope]) -> Result<Appended> {
-        match self.append_once(path, envelopes).await {
-            Ok(next_offset) => Ok(Appended::Ok { next_offset }),
-            Err(AppendError::Gone(status)) => Ok(Appended::Retired(status)),
-            Err(AppendError::Other(e)) => Err(e),
+        let mut attempt = 0u32;
+        loop {
+            match self.append_once(path, envelopes).await {
+                Ok(next_offset) => return Ok(Appended::Ok { next_offset }),
+                Err(AppendError::Gone(status)) => return Ok(Appended::Retired(status)),
+                Err(AppendError::Other(e)) if e.downcast_ref::<DsRateLimited>().is_some() => {
+                    attempt = attempt.saturating_add(1);
+                    if !self.wait_rate_limit("POST", path, attempt, retry_after(&e)).await {
+                        return Err(e.context("append interrupted by engine shutdown"));
+                    }
+                }
+                Err(AppendError::Other(e)) => return Err(e),
+            }
         }
     }
 
@@ -1753,8 +1958,9 @@ impl DsClient {
             Err(AppendError::Gone(res.status))
         } else {
             let status = res.status;
+            let retry_after = res.retry_after;
             Err(AppendError::Other(
-                status_error("POST", path, status, &res.body_or_default())
+                status_error_with_retry_after("POST", path, status, &res.body_or_default(), retry_after)
                     .context(format!("append rejected: {} envelopes, {payload_len} request bytes", envelopes.len())),
             ))
         }
@@ -1832,8 +2038,9 @@ impl DsClient {
                 Err(AppendError::Other(e)) => {
                     failure.get_or_insert_with(|| FailedAppend::new(&self.failed_appends));
                     attempt += 1;
-                    let backoff =
-                        std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
+                    let backoff = rate_limit_retry_delay(&e, attempt).unwrap_or_else(|| {
+                        std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000))
+                    });
                     if attempt.is_multiple_of(10) {
                         tracing::error!("append to {path} still failing after {attempt} attempts: {e:#}");
                     } else {
@@ -1906,7 +2113,7 @@ impl DsClient {
             return Ok(None);
         }
         if !(200..300).contains(&res.status) {
-            return Err(status_error("HEAD", path, res.status, ""));
+            return Err(status_error_with_retry_after("HEAD", path, res.status, "", res.retry_after));
         }
         Ok(Some(StreamHead { next_offset: res.next_offset, closed: res.closed }))
     }
@@ -1967,11 +2174,12 @@ impl DsClient {
     ) -> Result<(RawPage, crate::memory_budget::Permit)> {
         let physical_path = self.physical_path(path)?;
         let mut res = if budgeted {
-            self.store
-                .read_budgeted(&physical_path, offset, live, Some(&self.memory_budget), self.read_max_bytes())
-                .await?
+            self.retry_rate_limited("GET", path, || {
+                self.store.read_budgeted(&physical_path, offset, live, Some(&self.memory_budget), self.read_max_bytes())
+            })
+            .await?
         } else {
-            self.store.read(&physical_path, offset, live).await?
+            self.retry_rate_limited("GET", path, || self.store.read(&physical_path, offset, live)).await?
         };
         self.note_access(path, res.status);
         let permit = std::mem::take(&mut res.permit);
@@ -2015,18 +2223,25 @@ impl DsClient {
         let physical_path = self.physical_path(path)?;
         // A replay page is a bounded request, so it gets a deadline of its own; a long-poll is not
         // and keeps the store's own idle semantics.
-        let res = if live {
-            self.store.read(&physical_path, offset, live).await?
-        } else {
-            let deadline = ds_read_deadline();
-            match tokio::time::timeout(deadline, self.store.read(&physical_path, offset, live)).await {
-                Ok(res) => res?,
-                Err(_) => {
-                    tracing::error!(path, deadline_secs = deadline.as_secs(), "durable-streams read never completed");
-                    return Err(anyhow::Error::new(DsReadTimeout { path: path.to_string(), after: deadline }));
+        let res = self
+            .retry_rate_limited("GET", path, || async {
+                if live {
+                    return self.store.read(&physical_path, offset, live).await;
                 }
-            }
-        };
+                let deadline = ds_read_deadline();
+                match tokio::time::timeout(deadline, self.store.read(&physical_path, offset, live)).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        tracing::error!(
+                            path,
+                            deadline_secs = deadline.as_secs(),
+                            "durable-streams read never completed"
+                        );
+                        Err(anyhow::Error::new(DsReadTimeout { path: path.to_string(), after: deadline }))
+                    }
+                }
+            })
+            .await?;
         self.note_access(path, res.status);
         if res.status == 204 {
             return Ok(ReadResult {
@@ -2062,6 +2277,28 @@ impl DsClient {
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
     res.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(std::time::Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(std::time::SystemTime::now()).unwrap_or_default())
+}
+
+/// The longest a 429 is waited out before the next attempt, whatever `Retry-After` asked for.
+const RATE_LIMIT_DELAY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Keep both stale/zero and excessively large provider delays within the existing
+/// backoff bounds. Repeated 429s still grow the delay when the header is too small.
+fn rate_limit_delay(attempt: u32, retry_after: Option<std::time::Duration>) -> std::time::Duration {
+    rate_limit_backoff(attempt).max(retry_after.unwrap_or_default()).min(RATE_LIMIT_DELAY_MAX)
+}
+
+fn rate_limit_backoff(attempt: u32) -> std::time::Duration {
+    let step = attempt.saturating_sub(1).min(6);
+    std::time::Duration::from_millis(100u64.saturating_mul(1u64 << step)).min(RATE_LIMIT_DELAY_MAX)
 }
 
 #[derive(Deserialize)]
@@ -2839,6 +3076,14 @@ mod tests {
         /// Answer every ensure with this status (and `stream-closed` when `ensure_closed`) without
         /// creating anything; zero creates the stream and answers 201.
         pub(crate) ensure_status: u16,
+        pub(crate) ensure_fault: std::sync::Mutex<Option<u16>>,
+        /// Answer 429 to every ensure whose path ends with this suffix while set: a store
+        /// rate-limiting one stream's PUT until the test clears it.
+        pub(crate) ensure_rate_limited: std::sync::Mutex<Option<String>>,
+        /// When each ensure arrived, by path: the gaps are the client's retry delays.
+        pub(crate) ensure_at: std::sync::Mutex<Vec<(String, tokio::time::Instant)>>,
+        /// Answer this many HEADs 429 before answering normally.
+        pub(crate) head_rate_limited: std::sync::atomic::AtomicUsize,
         pub(crate) ensure_closed: bool,
         /// The `Stream-TTL` each ensure carried, by path.
         pub(crate) ensure_ttls: std::sync::Mutex<Vec<(String, Option<u64>)>>,
@@ -2849,7 +3094,7 @@ mod tests {
         pub(crate) uncreated: std::sync::Mutex<Vec<String>>,
         /// Hold every ensure before it creates its stream, as a PUT still in flight.
         pub(crate) ensure_gate: std::sync::Mutex<Option<Arc<BodyGate>>>,
-        /// One live GET response for a matching path suffix, without deleting storage.
+        /// One live GET response (or 429 on any GET) for a matching path suffix, without deleting storage.
         pub(crate) read_fault: std::sync::Mutex<Option<(String, u16)>>,
         /// One transient HEAD response for a matching path suffix.
         pub(crate) head_fault: std::sync::Mutex<Option<(String, u16)>>,
@@ -2871,6 +3116,8 @@ mod tests {
         pub(crate) append_notifiers: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
         pub(crate) operations: std::sync::Mutex<Vec<String>>,
         pub(crate) fail_read_body: bool,
+        /// Retry-After attached to the one scripted 429 read response.
+        pub(crate) retry_after: Option<std::time::Duration>,
         pub(crate) read_pages: std::sync::Mutex<Vec<(String, bool, String)>>,
         /// Pages keyed by the offset the reader asked for. A single ordered log two readers share
         /// (the sequencer's live tail and a replay scan) cannot be modelled by one pop-front queue:
@@ -2910,6 +3157,7 @@ mod tests {
         pub(crate) page_delay: Option<std::time::Duration>,
         pub(crate) readiness_status: u16,
         pub(crate) readiness_body: std::sync::Mutex<Option<String>>,
+        pub(crate) readiness_fault: std::sync::Mutex<Option<u16>>,
         pub(crate) head_status: u16,
         /// Return a transport error from HEAD instead of a response (health outage cut).
         pub(crate) head_error: bool,
@@ -2925,6 +3173,7 @@ mod tests {
     pub(crate) enum AppendFault {
         Hold(Arc<BodyGate>),
         Unavailable,
+        RateLimited(Option<std::time::Duration>),
         /// The append is atomic, but its acknowledgement is lost (an ambiguous failure).
         CommitThenUnavailable,
     }
@@ -2951,6 +3200,7 @@ mod tests {
     fn response(status: u16) -> StoreResponse {
         StoreResponse {
             status,
+            retry_after: None,
             permit: crate::memory_budget::Permit::default(),
             body: Some(Ok(String::new())),
             next_offset: Some("opaque-provider-token".to_string()),
@@ -2991,7 +3241,8 @@ mod tests {
         fn ready<'a>(&'a self) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push("ready".to_string());
-                let mut response = response(if self.readiness_status == 0 { 200 } else { self.readiness_status });
+                let status = self.readiness_fault.lock().unwrap().take().unwrap_or(self.readiness_status);
+                let mut response = response(if status == 0 { 200 } else { status });
                 response.body = Some(Ok(self.readiness_body.lock().unwrap().clone().unwrap_or_default()));
                 Ok(response)
             })
@@ -3000,14 +3251,21 @@ mod tests {
         fn ensure<'a>(&'a self, path: &'a str, _content_type: &'a str, ttl: Option<NonZeroU64>) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.operations.lock().unwrap().push(format!("create:{path}"));
+                self.ensure_at.lock().unwrap().push((path.to_string(), tokio::time::Instant::now()));
                 self.ensure_ttls.lock().unwrap().push((path.to_string(), ttl.map(NonZeroU64::get)));
                 let gate = self.ensure_gate.lock().unwrap().clone();
                 if let Some(gate) = gate {
                     gate.hold().await;
                 }
+                if self.ensure_rate_limited.lock().unwrap().as_deref().is_some_and(|suffix| path.ends_with(suffix)) {
+                    let mut res = response(429);
+                    res.retry_after = self.retry_after;
+                    return Ok(res);
+                }
                 self.uncreated.lock().unwrap().retain(|suffix| !path.ends_with(suffix.as_str()));
-                if self.ensure_status != 0 {
-                    let mut res = response(self.ensure_status);
+                let status = self.ensure_fault.lock().unwrap().take().unwrap_or(self.ensure_status);
+                if status != 0 {
+                    let mut res = response(status);
                     res.closed = self.ensure_closed;
                     return Ok(res);
                 }
@@ -3063,6 +3321,11 @@ mod tests {
                 match &fault {
                     Some(AppendFault::Hold(gate)) => gate.hold().await,
                     Some(AppendFault::Unavailable) => return Ok(response(503)),
+                    Some(AppendFault::RateLimited(retry_after)) => {
+                        let mut res = response(429);
+                        res.retry_after = *retry_after;
+                        return Ok(res);
+                    }
                     _ => {}
                 }
                 if let Some(streams) = &self.streams {
@@ -3123,8 +3386,11 @@ mod tests {
                 }
                 {
                     let mut fault = self.read_fault.lock().unwrap();
-                    if live && fault.as_ref().is_some_and(|(suffix, _)| path.ends_with(suffix)) {
-                        return Ok(response(fault.take().unwrap().1));
+                    if fault.as_ref().is_some_and(|(suffix, status)| path.ends_with(suffix) && (live || *status == 429))
+                    {
+                        let mut res = response(fault.take().unwrap().1);
+                        res.retry_after = self.retry_after;
+                        return Ok(res);
                     }
                 }
                 let gate = self.read_gate.lock().unwrap().clone();
@@ -3314,6 +3580,14 @@ mod tests {
                     return Err(anyhow::anyhow!("scripted HEAD transport failure"));
                 }
                 self.head_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let rate_limited = self.head_rate_limited.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |left| left.checked_sub(1),
+                );
+                if rate_limited.is_ok() {
+                    return Ok(response(429));
+                }
                 let mut res = response(if self.head_status == 0 { 200 } else { self.head_status });
                 if let Some(streams) = &self.streams {
                     match streams.lock().unwrap().get(path) {
@@ -3442,6 +3716,374 @@ mod tests {
             format!("{json_err:#}").contains("scripted stream body failure"),
             "the source body failure must survive the facade boundary"
         );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_read_is_retried_until_the_store_recovers() {
+        let store = Arc::new(ScriptedStore {
+            read_fault: std::sync::Mutex::new(Some(("changes/0".to_string(), 429))),
+            retry_after: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".to_string(), store);
+
+        let page = client
+            .read("changes/0", "prior-offset", true)
+            .await
+            .expect("a 429 read must be retried until the store answers normally");
+        assert!(page.envelopes.is_empty());
+    }
+
+    #[test]
+    fn rate_limited_classification_and_retry_after_formats() {
+        for status in 400..500 {
+            assert_eq!(is_unavailable(&status_error("POST", "meta/catalog", status, "")), status == 429);
+        }
+        assert_eq!(parse_retry_after("7"), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("Sun, 06 Nov 1994 08:49:37 GMT"), Some(std::time::Duration::ZERO));
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + std::time::Duration::from_secs(60));
+        assert!((58..=60).contains(&parse_retry_after(&date).unwrap().as_secs()));
+        assert_eq!(parse_retry_after("nonsense"), None);
+        assert_eq!(parse_retry_after("-1"), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_read_modes_wait_and_preserve_the_cursor() {
+        for delay in [None, Some(std::time::Duration::from_secs(60))] {
+            for mode in 0..6 {
+                let store = Arc::new(ScriptedStore {
+                    read_fault: std::sync::Mutex::new(Some(("changes/0".into(), 429))),
+                    retry_after: delay,
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+                let started = tokio::time::Instant::now();
+                match mode {
+                    0 => {
+                        client.read("changes/0", "prior", true).await.unwrap();
+                    }
+                    1 => {
+                        client.read_json("changes/0", "prior").await.unwrap();
+                    }
+                    2 => {
+                        client.read_json_prefix("changes/0", "prior").await.unwrap();
+                    }
+                    3 => {
+                        client.read_budgeted("changes/0", "prior", false).await.unwrap();
+                    }
+                    4 => {
+                        client.read_for_table("changes/0", "prior", false, "public.items").await.unwrap();
+                    }
+                    _ => {
+                        // The keep-alive is single-attempt: its sweep is the retry loop.
+                        let error = client.touch("changes/0").await.expect_err("a touch does not wait out a 429");
+                        assert!(is_unavailable(&error), "a refused touch stays transient: {error:#}");
+                        assert!(rate_limit_retry_delay(&error, 1).is_some(), "a refused touch is a typed 429");
+                        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+                        assert_eq!(*store.read_offsets.lock().unwrap(), vec!["now"]);
+                        continue;
+                    }
+                }
+                assert_eq!(
+                    started.elapsed(),
+                    delay.unwrap_or(std::time::Duration::from_millis(100)).min(std::time::Duration::from_secs(5))
+                );
+                let offset = if mode == 5 { "now" } else { "prior" };
+                assert_eq!(*store.read_offsets.lock().unwrap(), vec![offset, offset]);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_envelope_appends_wait_without_double_accounting() {
+        let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+            {"type":"public.items", "key":"1", "value":{"id":1}, "headers":{"operation":"upsert"}}
+        ]))
+        .unwrap();
+        for (delay, expected_wait) in [(0, 100), (2, 2000), (3600, 5000)] {
+            for mode in 0..5 {
+                let store = Arc::new(ScriptedStore {
+                    append_fault: std::sync::Mutex::new(Some((
+                        "shape/s1".into(),
+                        0,
+                        AppendFault::RateLimited(Some(std::time::Duration::from_secs(delay))),
+                    ))),
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+                let started = tokio::time::Instant::now();
+                match mode {
+                    0 => client.append("shape/s1", &envelopes).await.unwrap(),
+                    1 => assert!(client.append_reliable("shape/s1", &envelopes).await.unwrap()),
+                    4 => {
+                        client.append_checked("shape/s1", &envelopes).await.unwrap();
+                    }
+                    _ => {
+                        let budget = std::time::Duration::from_millis(if mode == 2 { expected_wait + 100 } else { 50 });
+                        let result = client
+                            .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
+                            .await;
+                        if mode == 3 {
+                            assert!(result.is_err(), "Retry-After must not extend the restore budget");
+                            assert_eq!(started.elapsed(), budget);
+                            assert!(store.appended.lock().unwrap().is_empty());
+                            continue;
+                        }
+                        result.unwrap();
+                    }
+                }
+                assert_eq!(started.elapsed(), std::time::Duration::from_millis(expected_wait));
+                assert_eq!(store.appended.lock().unwrap().len(), 1);
+                assert_eq!(client.appended_bytes("shape/s1"), serde_json::to_vec(&envelopes).unwrap().len() as u64);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_read_wait_is_cancelled_on_shutdown() {
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let store = Arc::new(ScriptedStore {
+            read_fault: std::sync::Mutex::new(Some(("changes/0".into(), 429))),
+            retry_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        let client =
+            DsClient::with_test_store("scripted://provider".into(), store.clone()).with_shutdown(shutdown.clone());
+        let read = client.read("changes/0", "prior", true);
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("must wait for Retry-After"),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => { shutdown.begin(); },
+        }
+        assert!(read.await.is_err());
+        assert_eq!(*store.read_offsets.lock().unwrap(), vec!["prior"]);
+    }
+
+    async fn admit_rate_limited_empty_namespace(readiness_fault: Option<u16>) {
+        let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+        let store = Arc::new(ScriptedStore {
+            readiness_fault: std::sync::Mutex::new(readiness_fault),
+            readiness_body: std::sync::Mutex::new(Some(readiness_json(&identity))),
+            ensure_fault: std::sync::Mutex::new(Some(429)),
+            read_appended: true,
+            streams: Some(std::sync::Mutex::new(HashMap::new())),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        client.refresh_readiness(&identity).await.expect("a readiness 429 must retry");
+        crate::engine::Engine::admit_store(
+            client,
+            crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope()),
+            true,
+        )
+        .await
+        .expect("a catalog PUT 429 must retry before first boot");
+        assert_eq!(store.appended.lock().unwrap().len(), 1, "the binding must be durable");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_readiness_and_catalog_put_are_retried_before_empty_boot() {
+        admit_rate_limited_empty_namespace(Some(429)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_catalog_put_is_retried_before_empty_boot() {
+        admit_rate_limited_empty_namespace(None).await;
+    }
+
+    /// Every engine booting against an empty namespace PUTs `meta/catalog` first, so that PUT's
+    /// 429 waits are jittered like the catalog writer's appends: never sooner than Retry-After,
+    /// never past the 5 s ceiling, and not on the deterministic schedule every engine shares.
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_initial_catalog_put_is_jittered_within_its_bounds() {
+        const ATTEMPTS: usize = 8;
+        let retry_after = std::time::Duration::from_secs(1);
+        let identity = crate::store_identity::StoreIdentityV1::in_process_test_identity();
+        let store = Arc::new(ScriptedStore {
+            readiness_body: std::sync::Mutex::new(Some(readiness_json(&identity))),
+            read_appended: true,
+            streams: Some(std::sync::Mutex::new(HashMap::new())),
+            retry_after: Some(retry_after),
+            ..Default::default()
+        });
+        *store.ensure_rate_limited.lock().unwrap() = Some("meta/catalog".into());
+        let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        client.refresh_readiness(&identity).await.unwrap();
+        let admission = tokio::spawn(crate::engine::Engine::admit_store(
+            client,
+            crate::store_identity::StoreBound::coupled_v1(&crate::store_identity::StreamScope::in_process_test_scope()),
+            true,
+        ));
+        let puts = |store: &ScriptedStore| {
+            store
+                .ensure_at
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(path, _)| path.ends_with("meta/catalog"))
+                .map(|(_, at)| *at)
+                .collect::<Vec<_>>()
+        };
+        while puts(&store).len() < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        *store.ensure_rate_limited.lock().unwrap() = None;
+        admission.await.unwrap().expect("admission completes once the store stops answering 429");
+        let gaps: Vec<_> = puts(&store).windows(2).take(ATTEMPTS - 1).map(|pair| pair[1] - pair[0]).collect();
+        for (attempt, gap) in gaps.iter().enumerate() {
+            assert!(*gap >= retry_after, "attempt {}: {gap:?} undercuts Retry-After", attempt + 1);
+            assert!(*gap <= RATE_LIMIT_DELAY_MAX, "attempt {}: {gap:?} exceeds the ceiling", attempt + 1);
+        }
+        let lockstep: Vec<_> =
+            (1..ATTEMPTS as u32).map(|attempt| rate_limit_delay(attempt, Some(retry_after))).collect();
+        assert_ne!(gaps, lockstep, "the initial catalog PUT retries on the schedule every engine shares");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_ensure_head_fallback_is_retried() {
+        let store = Arc::new(ScriptedStore {
+            ensure_status: 409,
+            head_fault: std::sync::Mutex::new(Some(("meta/catalog".into(), 429))),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".into(), store);
+        client.ensure_stream("meta/catalog").await.expect("a HEAD 429 after PUT 409 must retry");
+    }
+
+    async fn assert_rate_limited_floor(header: &str) {
+        let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
+        let started = tokio::time::Instant::now();
+        let mut sent_at = Vec::new();
+        client
+            .retry_rate_limited("GET", "changes/0", || {
+                sent_at.push(started.elapsed().as_millis());
+                let mut res = response(if sent_at.len() <= 3 { 429 } else { 200 });
+                res.retry_after = parse_retry_after(header);
+                async { Ok(res) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(sent_at, [0, 100, 300, 700], "{header}: repeated 429s must use growing backoff");
+    }
+
+    /// The catalog writer's 429 wait is spread across writers and attempts, never shorter than the
+    /// store's `Retry-After` (bounded by the 5 s ceiling) and never longer than that ceiling.
+    #[test]
+    fn rate_limited_catalog_jitter_spreads_retries_and_never_undercuts_retry_after() {
+        let ceiling = std::time::Duration::from_secs(5);
+        for retry_after in
+            [None, Some(0), Some(2), Some(4), Some(5), Some(3600)].map(|s| s.map(std::time::Duration::from_secs))
+        {
+            let e = status_error_with_retry_after("POST", "meta/catalog", 429, "", retry_after);
+            let floor = retry_after.unwrap_or_default().min(ceiling);
+            let mut every_attempt = std::collections::BTreeSet::new();
+            for attempt in 1..=10 {
+                // Writers refused together differ only in their clock noise.
+                let writers: std::collections::BTreeSet<_> = (0..64u32)
+                    .map(|writer| {
+                        jittered_rate_limit_retry_delay(&e, attempt, writer.wrapping_mul(2_654_435_761)).unwrap()
+                    })
+                    .collect();
+                for &delay in &writers {
+                    assert!(delay >= floor, "{retry_after:?} attempt {attempt}: {delay:?} undercuts Retry-After");
+                    assert!(delay <= ceiling, "{retry_after:?} attempt {attempt}: {delay:?} exceeds the ceiling");
+                }
+                if floor < ceiling {
+                    assert!(writers.len() > 1, "{retry_after:?} attempt {attempt}: writers retry in lockstep");
+                    let bounded = rate_limit_delay(attempt, retry_after);
+                    if bounded + bounded / 4 <= ceiling {
+                        assert!(writers.iter().all(|&d| d >= bounded), "below the ceiling the spread is upward only");
+                    }
+                }
+                every_attempt.extend(writers);
+            }
+            if floor < ceiling {
+                assert!(every_attempt.len() > 10, "{retry_after:?}: the delay must vary across attempts and writers");
+            }
+        }
+        let unavailable = status_error("POST", "meta/catalog", 503, "");
+        assert_eq!(jittered_rate_limit_retry_delay(&unavailable, 1, 0), None, "other errors keep their own policy");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_zero_retry_after_has_a_backoff_floor() {
+        assert_rate_limited_floor("0").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_past_retry_after_has_a_backoff_floor() {
+        assert_rate_limited_floor("Sun, 06 Nov 1994 08:49:37 GMT").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_large_retry_after_has_a_ceiling() {
+        let client = DsClient::with_test_store("scripted://provider".into(), Arc::new(ScriptedStore::default()));
+        let started = tokio::time::Instant::now();
+        assert!(client.wait_rate_limit("GET", "changes/0", 1, parse_retry_after("3600")).await);
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(5), "provider delays must be bounded");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_restore_append_skips_head_and_respects_budget_and_shutdown() {
+        use std::future::Future;
+        for delay in [None, Some(std::time::Duration::from_secs(2))] {
+            for cancel in [false, true] {
+                let store = Arc::new(ScriptedStore {
+                    append_fault: std::sync::Mutex::new(Some(("shape/s1".into(), 0, AppendFault::RateLimited(delay)))),
+                    ..Default::default()
+                });
+                let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+                let shutdown = crate::shutdown::ShutdownToken::new();
+                let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+                    {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
+                ]))
+                .unwrap();
+                let budget = std::time::Duration::from_millis(50);
+                let started = tokio::time::Instant::now();
+                let op = client.append_retrying("shape/s1", &envelopes, budget, &shutdown);
+                tokio::pin!(op);
+                std::future::poll_fn(|cx| {
+                    assert!(op.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert_eq!(
+                    store.head_count.load(std::sync::atomic::Ordering::Relaxed),
+                    0,
+                    "a 429 must wait without HEAD reconciliation, even without Retry-After"
+                );
+                if cancel {
+                    shutdown.begin();
+                }
+                let error = op.await.expect_err("restore must remain bounded");
+                assert!(error.to_string().contains(if cancel { "shutting down" } else { "kept failing" }));
+                assert_eq!(started.elapsed(), if cancel { std::time::Duration::ZERO } else { budget });
+                assert!(store.appended.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_repeated_restore_appends_stop_at_the_deadline() {
+        let store = Arc::new(ScriptedStore {
+            terminal_append_status: std::sync::atomic::AtomicU16::new(429),
+            ..Default::default()
+        });
+        let client = DsClient::with_test_store("scripted://provider".into(), store.clone());
+        let envelopes: Vec<Envelope> = serde_json::from_value(serde_json::json!([
+            {"type":"public.items", "key":"1", "headers":{"operation":"upsert"}}
+        ]))
+        .unwrap();
+        let budget = std::time::Duration::from_millis(350);
+        let started = tokio::time::Instant::now();
+        let error = client
+            .append_retrying("shape/s1", &envelopes, budget, &crate::shutdown::ShutdownToken::new())
+            .await
+            .expect_err("persistent 429 must exhaust the restore budget");
+        assert!(error.to_string().contains("kept failing"));
+        assert_eq!(started.elapsed(), budget);
+        assert_eq!(store.head_count.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

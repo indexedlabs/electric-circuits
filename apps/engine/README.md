@@ -480,7 +480,7 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 | `0` | a graceful shutdown completed inside its grace period |
 | `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
 | `71` | shutdown **incomplete**: catalog drain or a source receipt missed the shutdown grace |
-| `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
+| `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx other than 429, an event that will not serialize). The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 429, 5xx — is NOT this: it is retried in place, forever |
 | `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it. Also requested for a terminal live-replay failure (GET 404/410, missing successor or terminal read-cap breach), if catalog restore finds a sequencer already started at a different checkpoint, or if the Postgres-mode catalog writer refuses an `Offset` before its durable floor is known |
 | `78` | **boot refused** (`EX_CONFIG`) — see below |
 
@@ -537,8 +537,9 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
 `POST /shapes` (and a join that takes a NEW claim — a lease *renewal* promises nothing that is not
 already in the log, so its record is queued like any other) is acknowledged only once its record has
 reached the durable catalog. The
-catalog writer never drops a lifecycle event: a transient failure — transport, timeout, 5xx — retries **that**
-event in place, forever, at 100 ms → 5 s, and everything queued behind it waits, which is what keeps
+catalog writer never drops a lifecycle event: a transient failure — transport, timeout, 429, 5xx — retries **that**
+event in place, forever, at 100 ms → 5 s (a 429 honors Retry-After within those bounds, jittered, never below
+the smaller of Retry-After and the 5 s ceiling), and everything queued behind it waits, which is what keeps
 the log's order equal to the engine's. So a create while durable-streams is down **waits** rather
 than handing back a shape a restart would forget; the client's own timeout is the bound, and a record
 that lands after the client gave up leaves a shape with no subscriber, which the retention sweeper
@@ -576,9 +577,9 @@ whose **restored lease age** is already past the idle window, so the sweeper rel
 sweep; a `Dropped` that never landed comes back as a shape whose subscriptions are equally stale, and
 a repeated purge is a no-op.
 
-A *definite* refusal of a record (a 4xx, an event that will not serialize) is the pathological case —
+A *definite* refusal of a record (a 4xx other than 429, an event that will not serialize) is the pathological case —
 memory and storage disagree — and exits `74`. Note what that means for a storage front that accepts
-the `PUT` creating `meta/catalog` but 4xx's the `POST` appending to it: the engine crash-loops on 74
+the `PUT` creating `meta/catalog` but 4xx's the `POST` appending to it (with anything but 429, which is retried): the engine crash-loops on 74
 rather than refusing the boot with 78. That is intentional. Until the stream has been created once,
 every append failure is retried (so a misrouted PUT never exits); after it, the state is "storage
 refused a record the engine has already acted on", which is an IO failure to be restarted through,

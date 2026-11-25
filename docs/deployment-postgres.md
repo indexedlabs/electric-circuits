@@ -473,15 +473,17 @@ perform the idempotent exact-generation promotion.
   every shape already in the log undropped and short of the gap. Restore durable-streams and restart.
 - **A durable-streams outage while running makes creates WAIT; it never makes them lie.** A shape is
   acknowledged only once its `Created` record has reached the catalog (the same for a join), and a
-  catalog append that fails transiently — a refused connection, a timeout, a 5xx — is retried in
-  place, forever, at 100 ms → 5 s. So `POST /shapes` hangs for the duration of the outage instead of
-  returning a handle a restart would forget; use your client's own timeout, and expect
+  catalog append that fails transiently — a refused connection, a timeout, a 429 or 5xx — is retried in
+  place, forever, at 100 ms → 5 s. For 429, Retry-After (seconds or an HTTP date) is honored
+  within the growing backoff floor and 5 s ceiling, with jitter so engines sharing one store do not
+  retry in lockstep (never below the smaller of Retry-After and the 5 s ceiling). So `POST /shapes` hangs for the duration of the outage
+  instead of returning a handle a restart would forget; use your client's own timeout, and expect
   `catalog_append_retries_total` to climb with `shape_appends` flat. If the client gives up and the
   record lands anyway, the shape simply has no subscriber and the retention sweeper evicts it.
   **Deletes are not affected**: `DELETE /shapes/{id}` (and `?purge=true`) answers as soon as the
   engine state is updated, and its record lands behind it — a delete that waited would time out and
   be retried, and a repeated delete decrements a shared refcount twice. Two outcomes are NOT this: a
-  definite refusal from storage (a 4xx, once the catalog stream exists) exits the process `74`,
+  definite refusal from storage (a 4xx other than 429, once the catalog stream exists) exits the process `74`,
   because the engine's memory and its durable record have diverged and only a re-fold at boot
   reconciles them; and a `SIGTERM` during an outage names the `catalog writer` party and exits `70`
   when the grace runs out.

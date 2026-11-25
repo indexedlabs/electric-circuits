@@ -598,9 +598,11 @@ canvas update, screenshot.
   had no subscriber (plain `delete_stream`).
 - **The catalog writer never drops a lifecycle event, and the records a client is *promised* are durable
   before it is answered** (`engine/catalog.rs`). A failed append is classified with
-  `ds::is_unavailable`: transport/timeout/5xx retries THAT event in place, forever, with backoff
-  (100 ms → 5 s) — the queue is ordered and single-consumer, so everything behind it waits, which is
-  the point. A definite refusal (a 4xx, an event that will not serialize) exits `74` (`EX_IOERR`),
+  `ds::is_unavailable`: transport/timeout/429/5xx retries THAT event in place, forever, with backoff
+  (100 ms → 5 s). For 429, Retry-After (seconds or an HTTP date) is honored within the growing
+  backoff floor and 5 s ceiling, and jittered so writers refused together do not retry together
+  (never below the smaller of Retry-After and the 5 s ceiling, never past the ceiling). The queue is ordered and single-consumer, so everything behind it waits.
+  A definite refusal (a 4xx other than 429, an event that will not serialize) exits `74` (`EX_IOERR`),
   because an engine whose memory and durable record disagree has no honest way to continue and only a
   re-fold at boot can reconcile them — but only **once the catalog stream exists in this process**:
   until the creating PUT has succeeded, an append failure can just as well be "the stream is not
