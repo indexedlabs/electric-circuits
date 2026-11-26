@@ -1,0 +1,93 @@
+{
+  "workload": "writer-merge",
+  "measurement": "source SQL start to workload receipt and zero pending flips/appends",
+  "first_change_read_time": null,
+  "timeout_s": 3600,
+  "completed": false,
+  "error": "UniqueViolation('duplicate key value violates unique constraint \"resource_fact_resource_type_unique_idx\"\\nDETAIL:  Key (resource_id, fact_type)=(aa144ffa-7515-5387-a7ce-468e532241b5, note) already exists.')",
+  "elapsed_s": 0.01665355299996918,
+  "ended_wall": 1795719501.4539,
+  "sequencer_held": {
+    "peak_held_bytes": 0,
+    "longest_held_run_s": 0.0,
+    "sampled_every_s": 1
+  },
+  "subquery_change": {
+    "shapes": 0,
+    "standalone": 0,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0
+  },
+  "began_wall": 1795719501.4372447,
+  "transactions": [],
+  "engine_cpu_percent": 300.23623187251604,
+  "changes_per_s": null,
+  "probe": {
+    "drain": {
+      "attempts": 0,
+      "successes": 0,
+      "success_rate": null,
+      "successful_p50_s": null,
+      "successful_p95_s": null,
+      "successful_max_s": null,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 0,
+      "successes": 0,
+      "success_rate": null,
+      "successful_p50_s": null,
+      "successful_p95_s": null,
+      "successful_max_s": null,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 0,
+      "successes": 0,
+      "success_rate": null,
+      "successful_p50_s": null,
+      "successful_p95_s": null,
+      "successful_max_s": null,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "idle_probe": {
+    "drain": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.024930276000020513,
+      "successful_p95_s": 0.04370177999999214,
+      "successful_max_s": 0.05065457200004175,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.007457915999964371,
+      "successful_p95_s": 0.008516709000048195,
+      "successful_max_s": 0.03387176400002545,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.03117830500002583,
+      "successful_p95_s": 0.04227484600005482,
+      "successful_max_s": 0.042283012999973835,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "pinned_warnings": 0,
+  "large_transactions": [],
+  "backfills": 0,
+  "backfills_by_table": {},
+  "empty_backfills_by_table": {},
+  "backfills_per_minute": 0.0
+}

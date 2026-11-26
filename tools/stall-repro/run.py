@@ -16,6 +16,7 @@ from uuid import UUID, uuid4
 import httpx
 import psutil
 import psycopg
+from psycopg import sql
 
 from catalog import RECORD_FAMILY, GatewayShapes, TARGETS, control_catalog, plain_control_body
 from export_fixture import synthetic_id
@@ -115,6 +116,18 @@ def audit_operation(data, workload):
     if workload == "h1-commit":
         # 1,000 Record updates, 20 in each of the 50 Spaces that hold Records.
         return lambda connection: [{"table": "record", "operation": "update", "rows": data.update(connection, "record", account, 20)} for account in H1_DATA_ACCOUNTS]
+    if workload == "cold-resource_share":
+        # One Resource per share: the table's active-provenance key (Resource, target, source, grant;
+        # NULLs not distinct) allows one live direct share per Resource and target.
+        def shares(connection):
+            columns = [column["name"] for column in data.columns["resource_share"]]
+            rows = [data.make("resource_share", COLD_ACCOUNT, 100 + ordinal) | {"resource_id": row_id("resource", COLD_ACCOUNT, 100 + ordinal)} for ordinal in range(1000)]
+            command = sql.SQL("COPY {} ({}) FROM STDIN").format(sql.Identifier("public", "resource_share"), sql.SQL(",").join(map(sql.Identifier, columns)))
+            with connection.cursor().copy(command) as copier:
+                for row in rows:
+                    copier.write_row([row[column] for column in columns])
+            return [{"table": "resource_share", "operation": "insert", "rows": len(rows)}]
+        return shares
     if workload.startswith("cold-"):
         table = workload.removeprefix("cold-")
         return lambda connection: [{"table": table, "operation": "insert", "rows": data.insert(connection, table, COLD_ACCOUNT, 1000)}]
@@ -140,7 +153,9 @@ def audit_operation(data, workload):
         def merge(connection):
             target = row_id("resource", 5, 0)
             superseded = connection.execute("UPDATE public.resource SET superseded_by_resource_id = %s, updated_at = now() WHERE id = ANY(%s)", (target, [row_id("resource", 5, ordinal) for ordinal in range(1, 100)])).rowcount
-            facts = connection.execute("UPDATE public.resource_fact SET resource_id = %s, updated_at = now() WHERE resource_id = ANY(%s)", (target, [row_id("resource", account, ordinal) for account in (5, 6) for ordinal in range(100)])).rowcount
+            # A live fact is unique per (Resource, fact type), so a merge absorbs the moved facts:
+            # each moves to the target and is soft-deleted in the same update.
+            facts = connection.execute("UPDATE public.resource_fact SET resource_id = %s, deleted_at = now(), updated_at = now() WHERE resource_id = ANY(%s)", (target, [row_id("resource", account, ordinal) for account in (5, 6) for ordinal in range(100) if (account, ordinal) != (5, 0)])).rowcount
             return [{"table": "resource", "operation": "update", "rows": superseded}, {"table": "resource_fact", "operation": "update", "rows": facts}]
         return merge
     if workload == "writer-files":
@@ -437,9 +452,9 @@ async def run(args):
                 catalog = await simple_catalog(gateway, args.variant, catalog, lists)
             if args.variant in MAIN3_VARIANTS:
                 catalog = await main3_catalog(gateway, catalog, keyed_lists, args.variant != "S-main3-off", history=args.variant not in {"S-main3-live", "S-main3-live-plus"}, keyed_all=args.variant == "S-main3-keyed-all", plus=args.variant == "S-main3-live-plus")
+                save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in H1_VARIANTS:
                 catalog = await h1_catalog(gateway, *H1_VARIANTS[args.variant])
-                save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
