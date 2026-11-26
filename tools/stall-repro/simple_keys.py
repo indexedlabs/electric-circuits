@@ -321,7 +321,11 @@ async def today_predicate(gateway, table, lists):
 # S-main3: the demands phones send, lowered by indexed main's own gateway code at 52e79b875b with
 # `circuits_keyed_scopes`, `circuits_keyed_index_tables` and `circuits_keyed_chat_rows` on. The run
 # loads main's bundle (indexed-source-52e79b8.json.gz) and schema, so `gateway` here is main's.
-MAIN3_VARIANTS = {"S-main3"}
+# S-main3-off: the same phone demands lowered by main with all three flags off (today's filters).
+# S-main3-live: S-main3 with only what phones hold now (session feeds, Home's today, tomorrow and
+# recurring groups, thread and rail groups): no day window from earlier days, as if engine 9bc1563's
+# idle-shape retirement had let every one of them go.
+MAIN3_VARIANTS = {"S-main3", "S-main3-off", "S-main3-live"}
 
 
 def main3_keyed_lists(connection, gateway, lists):
@@ -344,7 +348,7 @@ def main3_keyed_lists(connection, gateway, lists):
     )
 
 
-async def main3_lower(gateway, table, predicate, operation, account, keyed_lists):
+async def main3_lower(gateway, table, predicate, operation, account, keyed_lists, flags=True):
     """Lower one app demand the way main's `_authorize_collection_read` does with all three flags on.
 
     Returns (where, keyed). `operation` is "feed" (changes-only stream), "group" (a group member) or
@@ -363,7 +367,7 @@ async def main3_lower(gateway, table, predicate, operation, account, keyed_lists
         keyed_demand = sync._keyed_chat_demand(collection, predicate, scope, chat_rows=True)
     else:
         keyed_demand = table in authority_module.KEYED_COLLECTIONS and (operation == "subset" or not sync._looks_into_another_table(keyed_predicate))
-    keyed = record_scoped and keyed_demand
+    keyed = flags and record_scoped and keyed_demand
     base = replace(gateway.authority(account), record_scoped=record_scoped)
     authority = replace(base, keyed=authority_module.KeyedSyncAuthority(user_id=user, lists=keyed_lists, index_tables=True, chat_rows=True)) if keyed else base
     client = keyed_predicate if keyed else predicate
@@ -524,11 +528,11 @@ def main3_app_demands(account, keyed_lists, fixture_counts):
     return demands
 
 
-async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None):
+async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None, flags=True):
     """Every demand of one account's phone, lowered by main; duplicates (same table and filter) once."""
     result = {}
     for table, predicate, operation, origin in main3_app_demands(account, keyed_lists, fixture_counts or {}):
-        where, keyed = await main3_lower(gateway, table, predicate, operation, account, keyed_lists)
+        where, keyed = await main3_lower(gateway, table, predicate, operation, account, keyed_lists, flags)
         key = (table, json.dumps(where, sort_keys=True))
         if key in result:
             continue
@@ -537,12 +541,12 @@ async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None):
     return list(result.values())
 
 
-async def main3_catalog(gateway, requests, keyed_lists):
+async def main3_catalog(gateway, requests, keyed_lists, flags=True, history=True):
     counts = {}
     for request in requests:
         key = (request["account"], request["body"]["table"].removeprefix("public."))
         counts[key] = counts.get(key, 0) + 1
     catalog = []
     for account in sorted({account for account, _ in counts}):
-        catalog += await main3_bodies(gateway, account, keyed_lists[account], {table: count for (owner, table), count in counts.items() if owner == account})
+        catalog += await main3_bodies(gateway, account, keyed_lists[account], {table: count for (owner, table), count in counts.items() if owner == account and (history or table not in DAY_WINDOW_TABLES)}, flags)
     return catalog

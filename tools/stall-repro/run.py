@@ -78,6 +78,29 @@ def wait_for_receipt(http, validator, source_commit_id, user_id, generation, tim
     raise TimeoutError(f"no receipt for {source_commit_id} in {timeout}s")
 
 
+# One imported calendar event's tracked rows (about 6 per event, as indexed's import writes them);
+# its untracked rows (sync state and the like) are not published and cost the engine nothing.
+EVENT_TRACKED_ROWS = (("calendar_event", 1), ("record", 1), ("record_date_index", 1), ("assignment", 1), ("graph_edge", 2))
+PACED_IMPORT_EVENTS = 1000
+
+
+def paced_first_import(data, url, events_per_commit, fence_user, fence_generation, validator, transactions, receipts, events=PACED_IMPORT_EVENTS):
+    """A first import paced as #8955 would: commits of `events_per_commit` events, each followed by the engine's receipt."""
+    journal = []
+    with httpx.Client(headers={"Authorization": f"Bearer {SECRET}"}) as http:
+        for first in range(0, events, events_per_commit):
+            count = min(events_per_commit, events - first)
+            with psycopg.connect(url) as connection:
+                connection.execute("SET LOCAL session_replication_role = replica")
+                for table, per_event in EVENT_TRACKED_ROWS:
+                    journal.append({"table": table, "operation": "insert", "rows": data.insert(connection, table, IMPORT_ACCOUNT, count * per_event), "commit": len(receipts)})
+                current = uuid4()
+                marker(connection, fence_user, fence_generation, current)
+                transactions.append({"transaction": f"paced-import-{len(receipts)}", "txid": connection.execute("SELECT pg_current_xact_id()::text").fetchone()[0], "before_commit": time.time(), "marker": str(current)})
+            receipts.append(wait_for_receipt(http, validator, current, fence_user, fence_generation))
+    return journal
+
+
 def paced_delete_account(data, url, account, fence_user, fence_generation, validator, transactions, receipts):
     """Delete an account's rows as a paced bulk write: bounded commits, each followed by the engine's receipt."""
     pending = [(table, len(data.rows.get((table, account), [])) if table != "user" else min(1, len(data.rows.get((table, account), [])))) for table in DELETE_ORDER]
@@ -324,7 +347,7 @@ async def run(args):
             if args.variant in SIMPLE_VARIANTS:
                 catalog = await simple_catalog(gateway, args.variant, catalog, lists)
             if args.variant in MAIN3_VARIANTS:
-                catalog = await main3_catalog(gateway, catalog, keyed_lists)
+                catalog = await main3_catalog(gateway, catalog, keyed_lists, args.variant != "S-main3-off", history=args.variant != "S-main3-live")
                 save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
@@ -351,7 +374,7 @@ async def run(args):
                 import_tables = tuple(dict.fromkeys((*import_tables, *IMPORT_REST_TABLES)))
             if args.variant in MAIN3_VARIANTS:
                 # The importing account's phone holds the same demands as every other account.
-                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT]):
+                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off"):
                     await create({"body": request["body"]})
                 import_tables = ()
             for table in import_tables:
@@ -374,7 +397,8 @@ async def run(args):
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
             if args.variant in MAIN3_VARIANTS:
-                probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0]) if request["body"]["table"] == "public.record" and request["kind"] == "keyed")
+                # The bystander's session-long Record feed (workflow roots): keyed with the flags on.
+                probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0], flags=args.variant != "S-main3-off") if request["body"]["table"] == "public.record" and request["demand"]["origin"] == "session")
                 probe_body = {**probe_body, "subscription": gateway._subscription("record", 0, "other-account-probe")}
             elif args.variant in SIMPLE_VARIANTS:
                 probe_body = (await simple_bodies(gateway, args.variant, "record", 0, lists[0]))[0]
@@ -449,6 +473,12 @@ async def run(args):
                 try:
                     if workload == "import":
                         operation = data.calendar_import
+                    elif workload.startswith("paced-import-"):
+                        def operation(url, callback, size=int(workload.removeprefix("paced-import-"))):
+                            journal = paced_first_import(data, url, size, fence_user, fence_generation, validator, transactions, receipts)
+                            with psycopg.connect(url) as connection:
+                                callback(connection, "final")
+                            return journal
                     elif workload == "paced-delete":
                         def operation(url, callback):
                             journal = paced_delete_account(data, url, LARGE_ACCOUNT, fence_user, fence_generation, validator, transactions, receipts)
@@ -593,5 +623,5 @@ if __name__ == "__main__":
     parser.add_argument("--variant", choices=("A", "A-observed", *sorted(ALL_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete"), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))
