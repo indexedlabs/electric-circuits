@@ -347,7 +347,7 @@ async def run(args):
             if args.variant in SIMPLE_VARIANTS:
                 catalog = await simple_catalog(gateway, args.variant, catalog, lists)
             if args.variant in MAIN3_VARIANTS:
-                catalog = await main3_catalog(gateway, catalog, keyed_lists, args.variant != "S-main3-off", history=args.variant != "S-main3-live")
+                catalog = await main3_catalog(gateway, catalog, keyed_lists, args.variant != "S-main3-off", history=args.variant != "S-main3-live", keyed_all=args.variant == "S-main3-keyed-all")
                 save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
@@ -374,7 +374,7 @@ async def run(args):
                 import_tables = tuple(dict.fromkeys((*import_tables, *IMPORT_REST_TABLES)))
             if args.variant in MAIN3_VARIANTS:
                 # The importing account's phone holds the same demands as every other account.
-                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off"):
+                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all"):
                     await create({"body": request["body"]})
                 import_tables = ()
             for table in import_tables:
@@ -398,7 +398,7 @@ async def run(args):
                     await create({"body": body})
             if args.variant in MAIN3_VARIANTS:
                 # The bystander's session-long Record feed (workflow roots): keyed with the flags on.
-                probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0], flags=args.variant != "S-main3-off") if request["body"]["table"] == "public.record" and request["demand"]["origin"] == "session")
+                probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all") if request["body"]["table"] == "public.record" and request["demand"]["origin"] == "session")
                 probe_body = {**probe_body, "subscription": gateway._subscription("record", 0, "other-account-probe")}
             elif args.variant in SIMPLE_VARIANTS:
                 probe_body = (await simple_bodies(gateway, args.variant, "record", 0, lists[0]))[0]
