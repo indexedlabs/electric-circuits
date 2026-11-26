@@ -30,7 +30,11 @@ SIMPLE_KEYED = (*RECORD_FAMILY, "calendar_event", "graph_edge")
 # `workflow_run` only for one thread's runs. Every `message` and `workflow_run` demand in the
 # synthetic catalog is a created_at-windowed history read naming no thread, so all of them keep
 # today's filter; `suggestion` stays keyed as in S.
-SIMPLE_VARIANTS = {"S", "S-edge-shares", "S-rest-today", "B-per-account", "S-assign-today", "S-chat-narrow"}
+# S-chat-thread: S-chat-narrow with the fixture's chat demands replaced by the ones phones send
+# (indexed main 2cd606c5: NativeCircuitsRecordRailPredicates.swift, web/src/lib/chat/demands.ts):
+# a Record thread's Messages, a run thread's workflow_runs and one Message by id, each keyed as
+# main lowers it. Cards (`suggestion`) stay as S keys them.
+SIMPLE_VARIANTS = {"S", "S-edge-shares", "S-rest-today", "B-per-account", "S-assign-today", "S-chat-narrow", "S-chat-thread"}
 NARROW_CHAT_TODAY = {"message", "workflow_run"}
 CHAT_TABLES = {"message", "workflow_run", "suggestion"}
 IMPORT_REST_TABLES = ("message", "workflow_run", "suggestion", "resource", "resource_fact", "file", "user")
@@ -184,6 +188,49 @@ def per_account_feed(gateway, table, lists):
     return {"or": [own, direct]}
 
 
+def any_equal(column, values):
+    """Main's `_any_equal`: always an OR, and no values matches no row."""
+    values = list(values)
+    if not values:
+        return all_of(null(column), null(column, False))
+    return {"or": [eq(column, value) for value in values]}
+
+
+def keyed_message_authorization(lists, message_id=None):
+    """Main's keyed `message` authorization (`_chat_authorization_predicate` over
+    `keyed_message_target_predicates`, circuits_sync_authority.py at 2cd606c5), with the by-id
+    demand's Space-posted branch."""
+    records = [any_equal("space_id", lists.spaces)]
+    if lists.shared_records:
+        records.append(any_equal("target_id", lists.shared_records))
+    targets = [all_of(eq("target_type", "record"), {"or": records}), all_of(eq("target_type", "composer_submission"), eq("user_id", lists.user))]
+    if message_id is not None and lists.member_spaces:
+        targets.append(all_of(eq("id", message_id), eq("target_type", "space"), {"or": [eq("target_id", space) for space in sorted(lists.member_spaces)]}))
+    return all_of(null("deleted_at"), {"or": targets})
+
+
+async def chat_thread_bodies(gateway, table, account, ordinal, lists):
+    """One fixture `message` or `workflow_run` demand as the demand a phone sends, keyed as main does.
+
+    The ordinal-th `message` demand becomes the Record thread of the account's ordinal-th Record,
+    or every third one a single-Message-id demand; the ordinal-th `workflow_run` demand becomes that
+    Record's run thread. A run thread keeps its client subquery on `workflow`, with main's keyed
+    Workflow filter injected, and the run's Space on `audience_key` (the harness column S uses).
+    """
+    from data import row_id
+    record = str(row_id("record", account, ordinal))
+    if table == "message" and ordinal % 3 == 2:
+        message_id = str(row_id("message", account, ordinal))
+        where = all_of(eq("id", message_id), keyed_message_authorization(lists, message_id))
+        return [gateway._plain_body(table, account, where, f"phone-message-id:{ordinal}")]
+    if table == "message":
+        where = all_of(all_of(eq("target_type", "record"), eq("target_id", record)), keyed_message_authorization(lists))
+        return [gateway._plain_body(table, account, where, f"phone-record-thread:{ordinal}")]
+    workflows = all_of(eq("record_id", record), all_of(null("record_id", False), any_equal("space_id", lists.spaces)))
+    where = all_of({"col": "workflow_id", "in": {"table": "public.workflow", "project": "id", "where": workflows}}, any_equal("audience_key", lists.spaces))
+    return [gateway._plain_body(table, account, where, f"phone-run-thread:{ordinal}")]
+
+
 async def simple_bodies(gateway, variant, table, account, lists):
     # Today's filter, one shape per account and table, as `S-rest-today` builds it.
     if (variant == "S-assign-today" and table == "assignment") or (variant == "S-chat-narrow" and table in NARROW_CHAT_TODAY):
@@ -200,6 +247,19 @@ async def simple_bodies(gateway, variant, table, account, lists):
 async def simple_catalog(gateway, variant, requests, lists):
     """One request per account and feed, deduplicated like B and B-cold."""
     result = {}
+    if variant == "S-chat-thread":
+        # Phones send only thread-named chat demands: map each fixture message/workflow_run demand,
+        # in order per account, to one; the rest of the catalog follows S below.
+        ordinals = {}
+        for request in requests:
+            table = request["body"]["table"].removeprefix("public.")
+            if table not in NARROW_CHAT_TODAY:
+                continue
+            account = request["account"]
+            ordinal = ordinals[(table, account)] = ordinals.get((table, account), -1) + 1
+            for body in await chat_thread_bodies(gateway, table, account, ordinal, lists[account]):
+                result[(account, table, str(body["where"]))] = {"kind": "phone-chat", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])}
+        requests = [request for request in requests if request["body"]["table"].removeprefix("public.") not in NARROW_CHAT_TODAY]
     for table, account in dict.fromkeys((request["body"]["table"].removeprefix("public."), request["account"]) for request in requests):
         for body in await simple_bodies(gateway, variant, table, account, lists[account]):
             result[(account, table, str(body["where"]))] = {"kind": "simple-retained" if contains_subquery(body["where"]) else "simple-plain", "account": account, "body": body, "has_subquery": contains_subquery(body["where"])}
