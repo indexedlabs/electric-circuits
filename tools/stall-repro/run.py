@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import asyncio
 import datetime
 import hashlib
@@ -17,10 +18,10 @@ import psutil
 import psycopg
 
 from catalog import RECORD_FAMILY, GatewayShapes, TARGETS, control_catalog, plain_control_body
-from data import IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
+from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
-from simple_keys import IMPORT_REST_TABLES, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, simple_bodies, simple_catalog
+from simple_keys import IMPORT_REST_TABLES, MAIN3_VARIANTS, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -56,6 +57,51 @@ async def until_ready(client, unit, timeout=300):
     raise TimeoutError("Engine did not become ready; inspect engine.log")
 
 
+# indexed `BulkWriteSettings` at 52e79b875b: a paced commit holds at most this many tracked rows
+# and rows in all, and the writer waits for the engine's receipt before the next (`PacedCommits`).
+PACED_TRACKED_ROWS = 10
+PACED_TOTAL_ROWS = 500
+RECEIPT_POLL_S = 0.05
+
+
+def wait_for_receipt(http, validator, source_commit_id, user_id, generation, timeout=900):
+    """Poll the engine's own drained-through receipt every 50 ms; return seconds until it arrived."""
+    started = time.monotonic()
+    while time.monotonic() - started < timeout:
+        try:
+            response = http.get(f"{ENGINE_URL}/_runtime/drained-through/{source_commit_id}", params={"user_id": str(user_id), "generation": generation}, timeout=2)
+            if response.status_code == 200 and validator(response.json(), marker=source_commit_id, user_id=user_id, generation=generation):
+                return time.monotonic() - started
+        except httpx.HTTPError:
+            pass
+        time.sleep(RECEIPT_POLL_S)
+    raise TimeoutError(f"no receipt for {source_commit_id} in {timeout}s")
+
+
+def paced_delete_account(data, url, account, fence_user, fence_generation, validator, transactions, receipts):
+    """Delete an account's rows as a paced bulk write: bounded commits, each followed by the engine's receipt."""
+    pending = [(table, len(data.rows.get((table, account), [])) if table != "user" else min(1, len(data.rows.get((table, account), [])))) for table in DELETE_ORDER]
+    journal = []
+    with httpx.Client(headers={"Authorization": f"Bearer {SECRET}"}) as http:
+        while any(count for _, count in pending):
+            with psycopg.connect(url) as connection:
+                connection.execute("SET LOCAL session_replication_role = replica")
+                budget = min(PACED_TRACKED_ROWS, PACED_TOTAL_ROWS)
+                for index, (table, count) in enumerate(pending):
+                    take = min(count, budget)
+                    if take:
+                        journal.append({"table": table, "operation": "delete", "rows": data.delete(connection, table, account, take), "commit": len(receipts)})
+                        pending[index] = (table, count - take)
+                        budget -= take
+                    if not budget:
+                        break
+                current = uuid4()
+                marker(connection, fence_user, fence_generation, current)
+                transactions.append({"transaction": f"paced-{len(receipts)}", "txid": connection.execute("SELECT pg_current_xact_id()::text").fetchone()[0], "before_commit": time.time(), "marker": str(current)})
+            receipts.append(wait_for_receipt(http, validator, current, fence_user, fence_generation))
+    return journal
+
+
 async def wait_for_marker(client, validator, source_commit_id, user_id, generation, timeout, process=None):
     deadline = time.monotonic() + timeout
     last = None
@@ -88,6 +134,33 @@ def read_events(path, after, before=float("inf")):
                 continue
 
 
+async def sample_metrics(client, output, stopped):
+    """Sample the engine's sequencer-hold gauges once a second; return the peak bytes and the longest held run."""
+    peak, longest, run_started = 0, 0.0, None
+    with output.open("w") as handle:
+        while not stopped.is_set():
+            try:
+                body = (await client.get(f"{ENGINE_URL}/metrics", timeout=2)).json()
+                gauges = body.get("gauges", body)
+                held_run = gauges.get("sequencer_held_run", 0)
+                held_bytes = gauges.get("sequencer_held_bytes", gauges.get("sequencer_held", 0))
+                handle.write(json.dumps({"at": time.time(), "sequencer_held_run": held_run, "sequencer_held_bytes": held_bytes}) + "\n")
+                peak = max(peak, held_bytes or 0)
+                now = time.monotonic()
+                if held_run:
+                    run_started = run_started or now
+                    longest = max(longest, now - run_started)
+                else:
+                    run_started = None
+            except (httpx.HTTPError, ValueError):
+                pass
+            try:
+                await asyncio.wait_for(stopped.wait(), 1)
+            except TimeoutError:
+                pass
+    return {"peak_held_bytes": peak, "longest_held_run_s": longest, "sampled_every_s": 1}
+
+
 async def sample_cpu(process, cgroup, output, stopped):
     with output.open("w") as handle:
         while not stopped.is_set():
@@ -113,7 +186,7 @@ PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTI
 # B-cold-key-edges: B-cold with every graph_edge branch keyed, to attribute B-cold's remaining cost.
 COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
-ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS
+ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -170,11 +243,14 @@ async def run(args):
         store_arguments.extend(["--max-chunk-bytes", "4194304"])
     save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
-    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS | SIMPLE_VARIANTS or "share-delete" in args.workloads))
+    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS | SIMPLE_VARIANTS | MAIN3_VARIANTS or "share-delete" in args.workloads))
     lists = {}
-    if args.variant in SIMPLE_VARIANTS:
+    keyed_lists = {}
+    if args.variant in SIMPLE_VARIANTS | MAIN3_VARIANTS:
         with psycopg.connect(PG_URL) as connection:
             lists = {account: account_lists(connection, gateway, account) for account in range(IMPORT_ACCOUNT + 1)}
+            if args.variant in MAIN3_VARIANTS:
+                keyed_lists = {account: main3_keyed_lists(connection, gateway, entry) for account, entry in lists.items()}
         save(output / "account-lists.json", {account: vars(entry) for account, entry in lists.items()})
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen(store_arguments, stdout=store_log, stderr=subprocess.STDOUT)
@@ -247,6 +323,9 @@ async def run(args):
                 catalog = await gateway.cold_catalog(catalog, key_all_edges=args.variant == "B-cold-key-edges")
             if args.variant in SIMPLE_VARIANTS:
                 catalog = await simple_catalog(gateway, args.variant, catalog, lists)
+            if args.variant in MAIN3_VARIANTS:
+                catalog = await main3_catalog(gateway, catalog, keyed_lists)
+                save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -270,6 +349,11 @@ async def run(args):
             if args.variant == "S-rest-today":
                 # This variant asks what today's remaining filters cost, so the importing account holds them too.
                 import_tables = tuple(dict.fromkeys((*import_tables, *IMPORT_REST_TABLES)))
+            if args.variant in MAIN3_VARIANTS:
+                # The importing account's phone holds the same demands as every other account.
+                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT]):
+                    await create({"body": request["body"]})
+                import_tables = ()
             for table in import_tables:
                 if args.variant in SIMPLE_VARIANTS:
                     for body in await simple_bodies(gateway, args.variant, table, IMPORT_ACCOUNT, lists[IMPORT_ACCOUNT]):
@@ -289,7 +373,10 @@ async def run(args):
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            if args.variant in SIMPLE_VARIANTS:
+            if args.variant in MAIN3_VARIANTS:
+                probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0]) if request["body"]["table"] == "public.record" and request["kind"] == "keyed")
+                probe_body = {**probe_body, "subscription": gateway._subscription("record", 0, "other-account-probe")}
+            elif args.variant in SIMPLE_VARIANTS:
                 probe_body = (await simple_bodies(gateway, args.variant, "record", 0, lists[0]))[0]
             else:
                 probe_body = gateway.keyed_body("record", 0, identity="other-account-probe") if args.variant in COLD_VARIANTS or keyed(args.variant, "record") else await gateway.body("record", 0, identity="other-account-probe")
@@ -337,11 +424,15 @@ async def run(args):
                 probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl")
                 probe_task = asyncio.create_task(probe.run())
                 await asyncio.sleep(3)
-                profile_before = (await client.get(f"{ENGINE_URL}/memory")).json().get("stall_profile")
+                memory_before = (await client.get(f"{ENGINE_URL}/memory")).json()
+                profile_before = memory_before.get("stall_profile")
+                receipts = []
+                metrics_stopped = asyncio.Event()
+                metrics_task = asyncio.create_task(sample_metrics(client, output / f"{workload}-metrics.jsonl", metrics_stopped))
                 fence_id = uuid4()
                 transactions = []
                 def mark(connection, transaction):
-                    current = uuid4() if workload == "import" and transaction != 5 else fence_id
+                    current = fence_id if transaction in {5, "final"} and workload in {"import", "import+paced-delete"} or workload not in {"import", "import+paced-delete"} else uuid4()
                     marker(connection, fence_user, fence_generation, current)
                     transactions.append({"transaction": transaction, "txid": connection.execute("SELECT pg_current_xact_id()::text").fetchone()[0], "before_commit": time.time(), "marker": str(current)})
                 began_wall = time.time()
@@ -358,6 +449,23 @@ async def run(args):
                 try:
                     if workload == "import":
                         operation = data.calendar_import
+                    elif workload == "paced-delete":
+                        def operation(url, callback):
+                            journal = paced_delete_account(data, url, LARGE_ACCOUNT, fence_user, fence_generation, validator, transactions, receipts)
+                            with psycopg.connect(url) as connection:
+                                callback(connection, "final")
+                            return journal
+                    elif workload == "import+paced-delete":
+                        def operation(url, callback):
+                            # The first import (unpaced, as prod commits it) and the paced deletion at once;
+                            # a marker-only commit after both closes the workload.
+                            with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                                imported = pool.submit(data.calendar_import, url, lambda connection, transaction: mark(connection, f"import-{transaction}"))
+                                deleted = pool.submit(paced_delete_account, data, url, LARGE_ACCOUNT, fence_user, fence_generation, validator, transactions, receipts)
+                                journal = imported.result() + deleted.result()
+                            with psycopg.connect(url) as connection:
+                                callback(connection, "final")
+                            return journal
                     elif workload == "share-delete":
                         operation = lambda url, callback: data.delete_account(url, SHARE_ACCOUNT, callback, extra_tables=SHARE_TABLES)
                     else:
@@ -373,6 +481,16 @@ async def run(args):
                     result["error"] = repr(error)
                 result["elapsed_s"] = time.monotonic() - began
                 result["ended_wall"] = time.time()
+                metrics_stopped.set()
+                result["sequencer_held"] = await metrics_task
+                if receipts:
+                    ordered = sorted(receipts)
+                    result["receipts"] = {"commits": len(receipts), "p50_s": ordered[len(ordered) // 2], "p95_s": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))], "max_s": ordered[-1], "sum_s": sum(receipts)}
+                try:
+                    memory_after = (await client.get(f"{ENGINE_URL}/memory")).json()
+                    result["subquery_change"] = {key: memory_after["cardinalities"].get(key, 0) - memory_before["cardinalities"].get(key, 0) for key in memory_before["cardinalities"] if key.startswith("subquery_") or key in {"shapes", "standalone"}}
+                except (httpx.HTTPError, KeyError, ValueError):
+                    pass
                 try:
                     cpu_after = sum(process.cpu_times()[:2])
                 except psutil.NoSuchProcess:
@@ -475,5 +593,5 @@ if __name__ == "__main__":
     parser.add_argument("--variant", choices=("A", "A-observed", *sorted(ALL_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete"), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete"), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

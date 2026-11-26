@@ -8,6 +8,8 @@ way a gateway would when it builds a token. `predicate_sql` renders an engine pr
 
 from __future__ import annotations
 
+import datetime
+import json
 from dataclasses import dataclass, replace
 from uuid import UUID
 
@@ -314,3 +316,233 @@ async def today_predicate(gateway, table, lists):
     """What today's gateway admits for the account on `table`, with no client scope (no week filter)."""
     collection = gateway.gateway.registered_collection(table, allow_chat_projection_dependency=True)
     return await gateway.gateway.authorize_predicate(None, collection, UUID(lists.user), authority=today_authority(gateway, lists))
+
+
+# S-main3: the demands phones send, lowered by indexed main's own gateway code at 52e79b875b with
+# `circuits_keyed_scopes`, `circuits_keyed_index_tables` and `circuits_keyed_chat_rows` on. The run
+# loads main's bundle (indexed-source-52e79b8.json.gz) and schema, so `gateway` here is main's.
+MAIN3_VARIANTS = {"S-main3"}
+
+
+def main3_keyed_lists(connection, gateway, lists):
+    """Main's `_read_keyed_audience_lists` (api/models/record_sync_authority.py) as SQL over the fixture,
+    derived Resource access off: the caller's Spaces, partner homes, its own calendars, its partners'
+    syncing calendars, the Records shared with it in live Spaces and its direct Resource shares."""
+    record_sync = gateway.loader.module("api.models.record_sync_authority")
+    user = lists.user
+    def ids(statement, *parameters):
+        return tuple(sorted({row[0] for row in connection.execute(statement, parameters).fetchall()}))
+    member = tuple(sorted(UUID(space) for space in lists.member_spaces))
+    return record_sync.KeyedAudienceLists(
+        space_ids=member,
+        partner_space_ids=tuple(UUID(space) for space in lists.partner_spaces if UUID(space) not in member),
+        calendar_ids=ids("SELECT id FROM public.calendar WHERE user_id = %s AND deleted_at IS NULL", user),
+        partner_calendar_ids=tuple(UUID(calendar) for calendar in lists.partner_calendars),
+        shared_record_ids=ids("SELECT r.id FROM public.record r JOIN public.space s ON s.id = r.space_id AND s.deleted_at IS NULL WHERE r.id = ANY(%s::uuid[])", list(lists.shared_records)),
+        shared_resource_ids=ids("SELECT resource_id FROM public.resource_share WHERE target_id = %s AND deleted_at IS NULL AND source = 'direct'", user),
+        generation=f"stall-repro-{lists.account}",
+    )
+
+
+async def main3_lower(gateway, table, predicate, operation, account, keyed_lists):
+    """Lower one app demand the way main's `_authorize_collection_read` does with all three flags on.
+
+    Returns (where, keyed). `operation` is "feed" (changes-only stream), "group" (a group member) or
+    "subset" (one-shot query). A feed drops its date window before the keyed test; a group member keeps
+    it, so it keys only when its filter reads no other table; a chat demand keys by `_keyed_chat_demand`.
+    """
+    sync = gateway.gateway
+    authority_module = gateway.authority_module
+    collection = sync.registered_collection(table, allow_chat_projection_dependency=True)
+    user = UUID(str(synthetic_id(f"user/{account}")))
+    chat = collection.chat_only or table in sync._CHAT_TABLES
+    record_scoped = sync._uses_record_authority(collection, predicate) or (chat and table != "composer_submission")
+    keyed_predicate = sync.without_date_window(predicate, table) if operation == "feed" and not chat else predicate
+    scope = sync._chat_scope_from_predicate(predicate)
+    if chat:
+        keyed_demand = sync._keyed_chat_demand(collection, predicate, scope, chat_rows=True)
+    else:
+        keyed_demand = table in authority_module.KEYED_COLLECTIONS and (operation == "subset" or not sync._looks_into_another_table(keyed_predicate))
+    keyed = record_scoped and keyed_demand
+    base = replace(gateway.authority(account), record_scoped=record_scoped)
+    authority = replace(base, keyed=authority_module.KeyedSyncAuthority(user_id=user, lists=keyed_lists, index_tables=True, chat_rows=True)) if keyed else base
+    client = keyed_predicate if keyed else predicate
+    if chat and table == "suggestion" and scope is not None and scope.get("source_context_type") == "record":
+        # Main validates the thread against the database on admission (`_validate_exact_chat_scope`)
+        # and then authorizes exactly the thread's cards; the harness takes that filter directly.
+        authorization = sync._card_thread_predicate(scope["source_context_id"])
+        where = await sync.authorize_predicate(client, collection, user, chat=True, chat_authorization=authorization, authority=authority)
+    elif chat:
+        authorization = await sync._chat_authorization_predicate(collection, user, authority=authority, scope=scope)
+        where = await sync.authorize_predicate(client, collection, user, chat=True, chat_authorization=authorization, authority=authority)
+    else:
+        where = await sync.authorize_predicate(client, collection, user, authority=authority)
+    return where, keyed
+
+
+# The app's predicates (ios/Index at 52e79b875b), with the app time zone taken as UTC and Home's
+# "today" fixed at 2026-09-15 inside the fixture's date range.
+HOME_TODAY = datetime.date(2026, 9, 15)
+FIXTURE_DAYS = 84
+
+
+def _day(value):
+    return value.isoformat()
+
+
+def _instant(value):
+    return f"{value.isoformat()}T00:00:00Z"
+
+
+def _leaf(column, op, value):
+    return {"col": column, "op": op, "value": value}
+
+
+def _in(column, table, project, where=None):
+    # Phones name the inner table bare (PredicateSubquery(table: "workflow")); main's thread test
+    # (`_workflow_run_thread_record_id`) matches that spelling.
+    subquery = {"table": table, "project": project}
+    if where is not None:
+        subquery["where"] = where
+    return {"col": column, "in": subquery}
+
+
+def app_date(start, end):
+    """NativeCircuitsCalendarPredicates.recordDateIndicesForDayWindow."""
+    return {"or": [
+        all_of(_leaf("date_value", "lt", _day(end)), _leaf("end_date_value", "gte", _day(start))),
+        all_of(_leaf("date_value", "gte", _day(start)), _leaf("date_value", "lt", _day(end)), null("end_date_value")),
+        all_of(_leaf("datetime_value", "lt", _instant(end)), _leaf("end_datetime_value", "gte", _instant(start))),
+        all_of(_leaf("datetime_value", "gte", _instant(start)), _leaf("datetime_value", "lt", _instant(end)), null("end_datetime_value")),
+    ]}
+
+
+def app_recurrences(start, end):
+    """recurrencesForDayWindow."""
+    return all_of({"or": [null("recurring_until"), _leaf("recurring_until", "gte", _instant(start - datetime.timedelta(days=2)))]}, _leaf("dtstart", "lt", _instant(end + datetime.timedelta(days=2))))
+
+
+def app_override_records(start, end):
+    """recurrenceOverrideRecords."""
+    return all_of(_in("recurring_parent_id", "record_recurrence", "record_id", app_recurrences(start, end)), _leaf("original_start_time", "gte", _day(start - datetime.timedelta(days=2))), _leaf("original_start_time", "lt", _day(end + datetime.timedelta(days=2))))
+
+
+def app_calendar_events(start, end):
+    """calendarEventsForDayWindow."""
+    non_recurring = {"or": [_leaf("is_recurring", "eq", False), null("is_recurring")]}
+    return {"or": [
+        all_of(null("original_start_time", False), _leaf("original_start_time", "gte", _day(start - datetime.timedelta(days=2))), _leaf("original_start_time", "lt", _day(end + datetime.timedelta(days=2)))),
+        all_of(_leaf("is_recurring", "eq", True), {"or": [null("recurring_until"), _leaf("recurring_until", "gte", _day(start - datetime.timedelta(days=3)))]}),
+        all_of(non_recurring, null("start_datetime"), _leaf("start_date", "lt", _day(end)), _leaf("end_date", "gte", _day(start))),
+        all_of(non_recurring, null("start_datetime"), _leaf("start_date", "gte", _day(start)), _leaf("start_date", "lt", _day(end)), null("end_date")),
+        all_of(non_recurring, null("start_date"), _leaf("start_datetime", "lt", _instant(end)), _leaf("end_datetime", "gte", _instant(start))),
+        all_of(non_recurring, null("start_date"), _leaf("start_datetime", "gte", _instant(start)), _leaf("start_datetime", "lt", _instant(end)), null("end_datetime")),
+    ]}
+
+
+def app_day_window(start, end):
+    """RecordDateIndexWindowDemand.windowDemands plus calendar_event: one day window's six group members."""
+    return [
+        ("record_date_index", {"or": [app_date(start, end), _in("record_id", "record_recurrence", "record_id", app_recurrences(start, end))]}),
+        ("record", {"or": [_in("id", "record_date_index", "record_id", app_date(start, end)), _in("id", "record_recurrence", "record_id", app_recurrences(start, end)), app_override_records(start, end)]}),
+        ("record_recurrence", app_recurrences(start, end)),
+        ("assignment", _in("record_id", "record_date_index", "record_id", app_date(start, end))),
+        ("graph_edge", all_of(eq("from_type", "record"), _in("from_id", "record_date_index", "record_id", app_date(start, end)), eq("edge_type", "has_attendee"))),
+        ("calendar_event", app_calendar_events(start, end)),
+    ]
+
+
+def app_home_recurring(start, end):
+    """Home's recurring window: groups [record_recurrence, record, record_date_index] and [overrides]."""
+    return [
+        ("record_recurrence", app_recurrences(start, end)),
+        ("record", _in("id", "record_recurrence", "record_id", app_recurrences(start, end))),
+        ("record_date_index", _in("record_id", "record_recurrence", "record_id", app_recurrences(start, end))),
+        ("record", app_override_records(start, end)),
+    ]
+
+
+def app_session(account, spaces):
+    """What the shell holds for the session as per-table feeds (AuthenticatedContentView)."""
+    demands = [
+        ("record", all_of(null("deleted_at"), null("archived_at"), null("removed_at"), null("parent_id"), null("recurring_parent_id"))),
+        ("resource", None),
+        ("suggestion", eq("status", "pending")),
+        *((table, None) for table in ("calendar", "space", "user", "space_member", "assistant_state")),
+    ]
+    for space in spaces:
+        demands += [
+            ("resource", eq("space_id", space)),
+            ("resource_fact", eq("space_id", space)),
+            ("graph_edge", all_of({"or": [eq("from_space_id", space), eq("to_space_id", space)]}, eq("to_type", "resource"), {"or": [eq("from_type", "resource"), all_of(eq("from_type", "suggestion"), eq("edge_type", "accepted_as"))]})),
+        ]
+    return demands
+
+
+def app_thread_rail(record):
+    """recordRailCircuitsSubscription.projectionDemands: one group of four."""
+    one = {"or": [eq("record_id", record)]}
+    return [("assignment", one), ("graph_edge", all_of(eq("from_type", "record"), {"or": [eq("from_id", record)]}, eq("edge_type", "has_attendee"))), ("record_assignee_index", one), ("record_completed_index", one)]
+
+
+def app_thread(record):
+    """thread(id), grouped: record, message, suggestion and workflow_run."""
+    return [
+        ("record", {"or": [eq("id", record), eq("client_id", record)]}),
+        ("message", all_of(eq("target_type", "record"), eq("target_id", record))),
+        ("suggestion", all_of(eq("source_context_type", "record"), eq("source_context_id", record))),
+        ("workflow_run", _in("workflow_id", "workflow", "id", eq("record_id", record))),
+    ]
+
+
+DAY_WINDOW_TABLES = {"record", "record_date_index", "record_recurrence", "assignment", "graph_edge", "calendar_event"}
+
+
+def main3_app_demands(account, keyed_lists, fixture_counts):
+    """(table, predicate, operation, origin) one account's phones hold.
+
+    Fixture demands map in order onto the shapes phones send: the i-th demand on a day-window table
+    becomes that table's member of the day window i days into the fixture's range (day windows move
+    daily and nothing retires an idle one); index-table demands become thread-rail groups, chat
+    demands thread groups; everything else is the session's feeds, held once."""
+    from data import row_id
+    spaces = [str(space) for space in (*keyed_lists.space_ids, *keyed_lists.partner_space_ids)]
+    demands = [(table, predicate, "feed", "session") for table, predicate in app_session(account, spaces)]
+    for offset, origin in ((0, "home-today"), (1, "home-tomorrow")):
+        start = HOME_TODAY + datetime.timedelta(days=offset)
+        demands += [(table, predicate, "group", origin) for table, predicate in app_day_window(start, start + datetime.timedelta(days=1))]
+    demands += [(table, predicate, "group", "home-recurring") for table, predicate in app_home_recurring(HOME_TODAY, HOME_TODAY + datetime.timedelta(days=2))]
+    for table in DAY_WINDOW_TABLES:
+        for ordinal in range(fixture_counts.get(table, 0)):
+            start = datetime.date(2026, 9, 1) + datetime.timedelta(days=ordinal % FIXTURE_DAYS)
+            demands += [(member, predicate, "group", f"day-window:{start}") for member, predicate in app_day_window(start, start + datetime.timedelta(days=1)) if member == table]
+    rail = fixture_counts.get("record_assignee_index", 0) + fixture_counts.get("record_completed_index", 0)
+    for ordinal in range(rail):
+        demands += [(table, predicate, "group", "thread-rail") for table, predicate in app_thread_rail(str(row_id("record", account, ordinal)))]
+    for ordinal in range(max(fixture_counts.get("message", 0), fixture_counts.get("workflow_run", 0))):
+        demands += [(table, predicate, "group", "thread") for table, predicate in app_thread(str(row_id("record", account, ordinal)))]
+    return demands
+
+
+async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None):
+    """Every demand of one account's phone, lowered by main; duplicates (same table and filter) once."""
+    result = {}
+    for table, predicate, operation, origin in main3_app_demands(account, keyed_lists, fixture_counts or {}):
+        where, keyed = await main3_lower(gateway, table, predicate, operation, account, keyed_lists)
+        key = (table, json.dumps(where, sort_keys=True))
+        if key in result:
+            continue
+        identity = f"main3:{len(result)}:{origin}:{operation}"
+        result[key] = {"kind": "keyed" if keyed else "today", "account": account, "body": gateway._plain_body(table, account, where, identity, keyed=False), "has_subquery": contains_subquery(where), "demand": {"table": table, "operation": operation, "origin": origin, "keyed": keyed}}
+    return list(result.values())
+
+
+async def main3_catalog(gateway, requests, keyed_lists):
+    counts = {}
+    for request in requests:
+        key = (request["account"], request["body"]["table"].removeprefix("public."))
+        counts[key] = counts.get(key, 0) + 1
+    catalog = []
+    for account in sorted({account for account, _ in counts}):
+        catalog += await main3_bodies(gateway, account, keyed_lists[account], {table: count for (owner, table), count in counts.items() if owner == account})
+    return catalog

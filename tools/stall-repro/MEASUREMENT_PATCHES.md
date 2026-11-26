@@ -177,3 +177,40 @@ Built from S (`simple_keys.py`, merged from `profile/simple-keys-2026-11-24`), s
 - **`graph_edge`:** S's six edge branches with each `= space` written as `IN (spaces)`. S as written has no edge share list, so neither does this.
 
 Lists are S's own, from `account_lists`, read from the database when the shape is built. The engine has no literal-list operator, so an `IN` list is an OR of equality leaves. There is no cross-account dedupe. Every other table, the data (share seed, `assignment.space_id`, audience columns on the tables S doesn't key), the probe and the import feeds are exactly S's.
+
+## S-main3 (`[paired-8] [prod-build]`)
+
+The demands phones send, lowered by indexed main's own gateway code at `52e79b875b`
+(`indexed-source-52e79b8.json.gz`, whose schema the run also loads), with `circuits_keyed_scopes`,
+`circuits_keyed_index_tables` and `circuits_keyed_chat_rows` on. `simple_keys.main3_lower` mirrors
+`_authorize_collection_read`'s keyed decision and then calls main's `authorize_predicate` and
+`_chat_authorization_predicate` with a keyed or plain authority:
+
+- **Feeds** drop their date window before the test.
+- **Group members** keep it, so they key only with no `in`.
+- **Chat** keys by `_keyed_chat_demand(chat_rows=True)`.
+
+**Demand shapes** (`main3_app_demands`) are the app's own predicates, from `ios/Index` at the same
+commit:
+
+- **Home groups:** today, tomorrow and recurring.
+- **Day-window groups:** the six members each.
+- **Thread-rail groups.**
+- **Thread groups.**
+- **Session feeds:** the family graph by Space, account tables, the pending card deck, and the
+  workflow-root `record` feed.
+
+**Group members** are created as changes-only feeds carrying the member's lowered filter; the
+engine's group lanes are not used. **Run-time sources:** the engine binary is prod's `9bc1563`,
+built in the run. Keyed lists come from the fixture by main's `_read_keyed_audience_lists` rules,
+with derived access off.
+
+**New workloads (`run.py`):**
+
+- **`paced-delete`:** deletes the large account in commits of at most 10 tracked rows (500 in all),
+  as indexed's `BulkWriteSettings` and `PacedCommits` do. After each commit the writer polls
+  `/_runtime/drained-through/{marker}` every 50 ms and records the commit-to-receipt time.
+- **`import+paced-delete`:** the unpaced first import and the paced deletion on two threads,
+  closed by one marker-only commit.
+- **Sampling:** every workload samples `/metrics` once a second for `sequencer_held_run` and
+  `sequencer_held_bytes`, and records `/memory` subquery cardinality changes.
