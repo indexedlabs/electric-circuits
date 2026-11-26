@@ -112,3 +112,4 @@ does not cover. The last line is what the brief expected.
 
 
 Follow-up variants S-assign-today and S-chat-narrow (Nov 25): `S-ASSIGN-CHAT.md` beside this file.
+Follow-up variant S-chat-thread (Nov 26, phone chat demands only): `S-CHAT-THREAD.md` beside this file.
