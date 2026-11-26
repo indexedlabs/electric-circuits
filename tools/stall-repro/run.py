@@ -11,17 +11,18 @@ import subprocess
 import time
 from collections import Counter
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import psutil
 import psycopg
 
 from catalog import RECORD_FAMILY, GatewayShapes, TARGETS, control_catalog, plain_control_body
+from export_fixture import synthetic_id
 from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
-from simple_keys import IMPORT_REST_TABLES, MAIN3_VARIANTS, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
+from simple_keys import H1_DATA_ACCOUNTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, h1_body, h1_catalog, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -82,6 +83,92 @@ def wait_for_receipt(http, validator, source_commit_id, user_id, generation, tim
 # its untracked rows (sync state and the like) are not published and cost the engine nothing.
 EVENT_TRACKED_ROWS = (("calendar_event", 1), ("record", 1), ("record_date_index", 1), ("assignment", 1), ("graph_edge", 2))
 PACED_IMPORT_EVENTS = 1000
+
+
+# Coverage audit (AUDIT-1.md) one-commit workloads. Each returns its journal; the caller's marker
+# commit closes it.
+COLD_TABLES = ("space_member", "file_share", "resource_share", "record_share", "suggestion", "tag")
+COLD_ACCOUNT = 3
+FLIP_SPACES = (4, 5, 6, 7, 8)
+SUBTREE_SPACE, SUBTREE_TARGET, SUBTREE_MEMBERS = 5, 6, 30
+FILES_ACCOUNT, FILES_DELETED = 6, 500
+AUDIT_WORKLOADS = ("h1-commit", *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
+
+
+def audit_prepare(data, url, variant, workloads):
+    """Rows the audit workloads act on, written before the engine starts (part of the initial snapshot)."""
+    with psycopg.connect(url) as connection:
+        connection.execute("SET LOCAL session_replication_role = replica")
+        if variant in H1_VARIANTS:
+            for account in H1_DATA_ACCOUNTS:
+                if account >= 20:
+                    data.insert(connection, "record", account, 20)
+        if "writer-subtree" in workloads:
+            for index in range(SUBTREE_MEMBERS):
+                connection.execute("INSERT INTO public.space_member (id, space_id, user_id, created_at, updated_at) VALUES (%s, %s, %s, now(), now())", (synthetic_id(f"subtree/{index}"), row_id("space", SUBTREE_SPACE), synthetic_id(f"subtree-user/{index}")))
+        if "writer-files" in workloads:
+            data.insert(connection, "file", FILES_ACCOUNT, FILES_DELETED)
+
+
+def audit_operation(data, workload):
+    """The one commit an audit workload makes, as (connection) -> journal."""
+    if workload == "h1-commit":
+        # 1,000 Record updates, 20 in each of the 50 Spaces that hold Records.
+        return lambda connection: [{"table": "record", "operation": "update", "rows": data.update(connection, "record", account, 20)} for account in H1_DATA_ACCOUNTS]
+    if workload.startswith("cold-"):
+        table = workload.removeprefix("cold-")
+        return lambda connection: [{"table": table, "operation": "insert", "rows": data.insert(connection, table, COLD_ACCOUNT, 1000)}]
+    if workload == "flip-add":
+        def add(connection):
+            for space in FLIP_SPACES:
+                connection.execute("INSERT INTO public.space_member (id, space_id, user_id, created_at, updated_at) VALUES (%s, %s, %s, now(), now())", (synthetic_id(f"flip/{space}"), row_id("space", space), row_id("user", COLD_ACCOUNT)))
+            return [{"table": "space_member", "operation": "insert", "rows": len(FLIP_SPACES)}]
+        return add
+    if workload == "flip-remove":
+        def remove(connection):
+            changed = connection.execute("DELETE FROM public.space_member WHERE id = ANY(%s)", ([synthetic_id(f"flip/{space}") for space in FLIP_SPACES],)).rowcount
+            return [{"table": "space_member", "operation": "delete", "rows": changed}]
+        return remove
+    if workload == "writer-subtree":
+        def subtree(connection):
+            changed = connection.execute("UPDATE public.space_member SET space_id = %s, updated_at = now() WHERE id = ANY(%s)", (row_id("space", SUBTREE_TARGET), [synthetic_id(f"subtree/{index}") for index in range(SUBTREE_MEMBERS)])).rowcount
+            return [{"table": "space_member", "operation": "update", "rows": changed}]
+        return subtree
+    if workload == "writer-user":
+        return lambda connection: [{"table": "user", "operation": "update", "rows": connection.execute('UPDATE public."user" SET updated_at = now()').rowcount}]
+    if workload == "writer-merge":
+        def merge(connection):
+            target = row_id("resource", 5, 0)
+            superseded = connection.execute("UPDATE public.resource SET superseded_by_resource_id = %s, updated_at = now() WHERE id = ANY(%s)", (target, [row_id("resource", 5, ordinal) for ordinal in range(1, 100)])).rowcount
+            facts = connection.execute("UPDATE public.resource_fact SET resource_id = %s, updated_at = now() WHERE resource_id = ANY(%s)", (target, [row_id("resource", account, ordinal) for account in (5, 6) for ordinal in range(100)])).rowcount
+            return [{"table": "resource", "operation": "update", "rows": superseded}, {"table": "resource_fact", "operation": "update", "rows": facts}]
+        return merge
+    if workload == "writer-files":
+        def files(connection):
+            start = len(data.rows[("file", FILES_ACCOUNT)]) - FILES_DELETED
+            ids = [row[ "id"] for row in data.rows[("file", FILES_ACCOUNT)][start:]]
+            return [{"table": "file", "operation": "update", "rows": connection.execute("UPDATE public.file SET deleted_at = now(), updated_at = now() WHERE id = ANY(%s)", (ids,)).rowcount}]
+        return files
+    raise ValueError(workload)
+
+
+def import_without_resources(data, url, marker_callback):
+    """`SyntheticData.calendar_import` without its 40 `resource` rows per commit."""
+    from data import IMPORT_TRANSACTIONS
+    journal = []
+    for transaction, target in enumerate(IMPORT_TRANSACTIONS):
+        with psycopg.connect(url) as connection:
+            connection.execute("SET LOCAL session_replication_role = replica")
+            operations = [("record", "insert", 350), ("record", "update", 250), ("record_date_index", "insert", 300), ("record_date_index", "delete", 100), ("record_recurrence", "insert", 200), ("record_recurrence", "update", 200), ("record_recurrence", "delete", 100), ("assignment", "insert", 200), ("calendar_event", "insert", 100), ("calendar_event", "update", 50), ("calendar", "update", 75), ("resource", "insert", 20), ("resource", "update", 20)]
+            if transaction == 0:
+                operations.insert(0, ("calendar", "insert", 15))
+            operations.append(("graph_edge", "insert", target - sum(count for _, _, count in operations)))
+            for table, operation, count in operations:
+                if table == "resource":
+                    continue
+                journal.append({"transaction": transaction, "table": table, "operation": operation, "rows": getattr(data, operation)(connection, table, IMPORT_ACCOUNT, count)})
+            marker_callback(connection, transaction)
+    return journal
 
 
 def paced_first_import(data, url, events_per_commit, fence_user, fence_generation, validator, transactions, receipts, events=PACED_IMPORT_EVENTS):
@@ -209,7 +296,7 @@ PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTI
 # B-cold-key-edges: B-cold with every graph_edge branch keyed, to attribute B-cold's remaining cost.
 COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
-ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS
+ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | set(H1_VARIANTS)
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -267,6 +354,7 @@ async def run(args):
     save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
     save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS | SIMPLE_VARIANTS | MAIN3_VARIANTS or "share-delete" in args.workloads))
+    await asyncio.to_thread(audit_prepare, data, PG_URL, args.variant, args.workloads)
     lists = {}
     keyed_lists = {}
     if args.variant in SIMPLE_VARIANTS | MAIN3_VARIANTS:
@@ -312,7 +400,8 @@ async def run(args):
         "ELECTRIC_CIRCUITS_PG_TABLES": ",".join(gateway.loader.bundle["publication"]),
         "ELECTRIC_CIRCUITS_PG_SLOT": "stall_repro",
         "ELECTRIC_CIRCUITS_BIND": "127.0.0.1:7010",
-        "ELECTRIC_CIRCUITS_MAX_SHAPES": "20000",
+        # H1 measures up to 20,000 shapes plus the probe, so its cap sits above that.
+        "ELECTRIC_CIRCUITS_MAX_SHAPES": "25000" if args.variant in H1_VARIANTS else "20000",
         "ELECTRIC_CIRCUITS_FLIP_WORKERS": "8",
         "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "0",
         "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "0",
@@ -347,7 +436,9 @@ async def run(args):
             if args.variant in SIMPLE_VARIANTS:
                 catalog = await simple_catalog(gateway, args.variant, catalog, lists)
             if args.variant in MAIN3_VARIANTS:
-                catalog = await main3_catalog(gateway, catalog, keyed_lists, args.variant != "S-main3-off", history=args.variant != "S-main3-live", keyed_all=args.variant == "S-main3-keyed-all")
+                catalog = await main3_catalog(gateway, catalog, keyed_lists, args.variant != "S-main3-off", history=args.variant not in {"S-main3-live", "S-main3-live-plus"}, keyed_all=args.variant == "S-main3-keyed-all", plus=args.variant == "S-main3-live-plus")
+            if args.variant in H1_VARIANTS:
+                catalog = await h1_catalog(gateway, *H1_VARIANTS[args.variant])
                 save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
@@ -374,8 +465,10 @@ async def run(args):
                 import_tables = tuple(dict.fromkeys((*import_tables, *IMPORT_REST_TABLES)))
             if args.variant in MAIN3_VARIANTS:
                 # The importing account's phone holds the same demands as every other account.
-                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all"):
+                for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all", plus=args.variant == "S-main3-live-plus"):
                     await create({"body": request["body"]})
+                import_tables = ()
+            if args.variant in H1_VARIANTS:
                 import_tables = ()
             for table in import_tables:
                 if args.variant in SIMPLE_VARIANTS:
@@ -396,7 +489,11 @@ async def run(args):
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            if args.variant in MAIN3_VARIANTS:
+            if args.variant in H1_VARIANTS:
+                record_sync = gateway.loader.module("api.models.record_sync_authority")
+                probe_lists = record_sync.KeyedAudienceLists(space_ids=(UUID(str(row_id("space", 0))),), partner_space_ids=(), calendar_ids=(), partner_calendar_ids=(), shared_record_ids=(), shared_resource_ids=(), generation="h1-probe")
+                probe_body = await h1_body(gateway, 99999, probe_lists, identity="other-account-probe")
+            elif args.variant in MAIN3_VARIANTS:
                 # The bystander's session-long Record feed (workflow roots): keyed with the flags on.
                 probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all") if request["body"]["table"] == "public.record" and request["demand"]["origin"] == "session")
                 probe_body = {**probe_body, "subscription": gateway._subscription("record", 0, "other-account-probe")}
@@ -431,6 +528,8 @@ async def run(args):
             memory = await client.get(f"{ENGINE_URL}/memory")
             memory.raise_for_status()
             save(output / "catalog-calibration.json", {"target": TARGETS[args.catalog], "actual": memory.json(), "source_shape_requests": len(catalog), "smoke_only": args.smoke})
+            subqueries = await client.get(f"{ENGINE_URL}/subqueries", timeout=60)
+            save(output / "catalog-subqueries.json", {"status": subqueries.status_code, "body": subqueries.json() if subqueries.status_code == 200 else subqueries.text[:2000]})
             print(json.dumps({"calibration": memory.json()["cardinalities"]}), flush=True)
             if args.calibrate_only:
                 return
@@ -456,7 +555,8 @@ async def run(args):
                 fence_id = uuid4()
                 transactions = []
                 def mark(connection, transaction):
-                    current = fence_id if transaction in {5, "final"} and workload in {"import", "import+paced-delete"} or workload not in {"import", "import+paced-delete"} else uuid4()
+                    multi = {"import", "import+paced-delete", "import-noresource"}
+                    current = fence_id if transaction in {5, "final"} and workload in multi or workload not in multi else uuid4()
                     marker(connection, fence_user, fence_generation, current)
                     transactions.append({"transaction": transaction, "txid": connection.execute("SELECT pg_current_xact_id()::text").fetchone()[0], "before_commit": time.time(), "marker": str(current)})
                 began_wall = time.time()
@@ -473,6 +573,15 @@ async def run(args):
                 try:
                     if workload == "import":
                         operation = data.calendar_import
+                    elif workload == "import-noresource":
+                        operation = lambda url, callback: import_without_resources(data, url, callback)
+                    elif workload in AUDIT_WORKLOADS:
+                        def operation(url, callback, write=audit_operation(data, workload)):
+                            with psycopg.connect(url) as connection:
+                                connection.execute("SET LOCAL session_replication_role = replica")
+                                journal = write(connection)
+                                callback(connection, "final")
+                            return journal
                     elif workload.startswith("paced-import-"):
                         def operation(url, callback, size=int(workload.removeprefix("paced-import-"))):
                             journal = paced_first_import(data, url, size, fence_user, fence_generation, validator, transactions, receipts)
@@ -558,10 +667,12 @@ async def run(args):
                 empty = Counter()
                 result["pinned_warnings"] = 0
                 result["large_transactions"] = []
+                backfill_times = []
                 for event in events:
                     fields = event.get("fields", {})
                     if fields.get("message") == "backfill finished":
                         by_table[fields["table"]] += 1
+                        backfill_times.append(event["timestamp"])
                         if fields.get("rows") == 0:
                             empty[fields["table"]] += 1
                     if "replay position is pinned" in str(fields.get("message", "")):
@@ -569,6 +680,11 @@ async def run(args):
                     if fields.get("message") == "large transaction appended to the change log":
                         result["large_transactions"].append(fields)
                 result["backfills"] = sum(by_table.values())
+                if backfill_times:
+                    # The flip walks' query-backs: first to last `backfill finished` in the workload window.
+                    stamps = sorted(datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp() for stamp in backfill_times)
+                    result["backfill_window_s"] = stamps[-1] - stamps[0]
+                    result["backfill_last_after_start_s"] = stamps[-1] - began_wall
                 result["backfills_by_table"] = dict(by_table)
                 result["empty_backfills_by_table"] = dict(empty)
                 result["backfills_per_minute"] = result["backfills"] * 60 / result["elapsed_s"]
@@ -623,5 +739,5 @@ if __name__ == "__main__":
     parser.add_argument("--variant", choices=("A", "A-observed", *sorted(ALL_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100"), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

@@ -110,6 +110,13 @@ does not cover. The last line is what the brief expected.
 - Parent moves (a Record changing Space), production data, and any client.
 - `monitored_url_*` and `standing_grant_backfill_status`, which the synthetic catalog does not hold.
 
+### Not modelled
+
+- The gateway's own Postgres authority reads and rechecks (single read off). They load the database,
+  not the engine. The harness's drain probe (`probes.py:49-69`) is the drain-on path prod runs, and
+  neither `SYNC_AUTHORITY_*` setting is read on the lowering path the harness uses, so the numbers
+  here stand (coverage audit H3).
+
 
 Follow-up variants S-assign-today and S-chat-narrow (Nov 25): `S-ASSIGN-CHAT.md` beside this file.
 Follow-up variant S-chat-thread (Nov 26, phone chat demands only): `S-CHAT-THREAD.md` beside this file.

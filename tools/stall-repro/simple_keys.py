@@ -328,7 +328,11 @@ async def today_predicate(gateway, table, lists):
 # S-main3-keyed-all: S-main3 with the pieces main still leaves on subquery filters keyed too
 # (`graph_edge`, `assignment`, and the day-window `record` / `record_date_index` members); see
 # `keyed_all_lowering`.
-MAIN3_VARIANTS = {"S-main3", "S-main3-off", "S-main3-live", "S-main3-keyed-all"}
+# S-main3-live-plus: S-main3-live with the `file` and `standing_grant_backfill_status` feeds phones
+# hold: `file` (nil predicate) for the session on every account (RecordRailCircuitsSubscription.
+# inventoryTables, the shell's TierThree), `standing_grant_backfill_status` (nil predicate) on the
+# Settings family screen (SettingsFamilyView.swift:455), taken here as one account in ten.
+MAIN3_VARIANTS = {"S-main3", "S-main3-off", "S-main3-live", "S-main3-keyed-all", "S-main3-live-plus"}
 KEYED_ALL_TABLES = {"graph_edge", "assignment", "record", "record_date_index"}
 
 
@@ -550,7 +554,7 @@ def app_thread(record):
 DAY_WINDOW_TABLES = {"record", "record_date_index", "record_recurrence", "assignment", "graph_edge", "calendar_event"}
 
 
-def main3_app_demands(account, keyed_lists, fixture_counts):
+def main3_app_demands(account, keyed_lists, fixture_counts, plus=False):
     """(table, predicate, operation, origin) one account's phones hold.
 
     Fixture demands map in order onto the shapes phones send: the i-th demand on a day-window table
@@ -560,6 +564,10 @@ def main3_app_demands(account, keyed_lists, fixture_counts):
     from data import row_id
     spaces = [str(space) for space in (*keyed_lists.space_ids, *keyed_lists.partner_space_ids)]
     demands = [(table, predicate, "feed", "session") for table, predicate in app_session(account, spaces)]
+    if plus:
+        demands.append(("file", None, "feed", "session-tier-three"))
+        if account % 10 == 0:
+            demands.append(("standing_grant_backfill_status", None, "feed", "settings-family"))
     for offset, origin in ((0, "home-today"), (1, "home-tomorrow")):
         start = HOME_TODAY + datetime.timedelta(days=offset)
         demands += [(table, predicate, "group", origin) for table, predicate in app_day_window(start, start + datetime.timedelta(days=1))]
@@ -576,10 +584,10 @@ def main3_app_demands(account, keyed_lists, fixture_counts):
     return demands
 
 
-async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None, flags=True, keyed_all=False):
+async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None, flags=True, keyed_all=False, plus=False):
     """Every demand of one account's phone, lowered by main; duplicates (same table and filter) once."""
     result = {}
-    for table, predicate, operation, origin in main3_app_demands(account, keyed_lists, fixture_counts or {}):
+    for table, predicate, operation, origin in main3_app_demands(account, keyed_lists, fixture_counts or {}, plus):
         where, keyed = await main3_lower(gateway, table, predicate, operation, account, keyed_lists, flags, keyed_all)
         key = (table, json.dumps(where, sort_keys=True))
         if key in result:
@@ -589,12 +597,51 @@ async def main3_bodies(gateway, account, keyed_lists, fixture_counts=None, flags
     return list(result.values())
 
 
-async def main3_catalog(gateway, requests, keyed_lists, flags=True, history=True, keyed_all=False):
+async def main3_catalog(gateway, requests, keyed_lists, flags=True, history=True, keyed_all=False, plus=False):
     counts = {}
     for request in requests:
         key = (request["account"], request["body"]["table"].removeprefix("public."))
         counts[key] = counts.get(key, 0) + 1
     catalog = []
     for account in sorted({account for account, _ in counts}):
-        catalog += await main3_bodies(gateway, account, keyed_lists[account], {table: count for (owner, table), count in counts.items() if owner == account and (history or table not in DAY_WINDOW_TABLES)}, flags, keyed_all)
+        catalog += await main3_bodies(gateway, account, keyed_lists[account], {table: count for (owner, table), count in counts.items() if owner == account and (history or table not in DAY_WINDOW_TABLES)}, flags, keyed_all, plus)
+    return catalog
+
+
+# Coverage audit H1: N keyed `record` shapes as main lowers them (`keyed_authorization_predicate`
+# through `authorize_predicate`, 52e79b875b), one whole-table feed per synthetic account, each
+# account reading 1-3 of the 50 Spaces that hold Records plus two shared Records. With `half`, every
+# other shape also carries a client `id = X` equality (a Record's own key), which the engine indexes.
+H1_VARIANTS = {f"S-main3-h1-{count}": (count, False) for count in (40, 1000, 10000, 20000)} | {"S-main3-h1-10000-half": (10000, True)}
+H1_DATA_ACCOUNTS = [*range(19), *range(20, 51)]
+
+
+def h1_lists(gateway, ordinal):
+    from data import row_id
+    record_sync = gateway.loader.module("api.models.record_sync_authority")
+    spaces = [H1_DATA_ACCOUNTS[(ordinal * step) % len(H1_DATA_ACCOUNTS)] for step in (1, 7, 13)][: 1 + ordinal % 3]
+    owner = H1_DATA_ACCOUNTS[(ordinal * 11 + 5) % len(H1_DATA_ACCOUNTS)]
+    return record_sync.KeyedAudienceLists(
+        space_ids=tuple(sorted({UUID(str(synthetic_id(f"space/{account}"))) for account in spaces})),
+        partner_space_ids=(), calendar_ids=(), partner_calendar_ids=(),
+        shared_record_ids=tuple(UUID(str(row_id("record", owner, index))) for index in (ordinal % 19, ordinal % 19 + 1)),
+        shared_resource_ids=(), generation=f"h1-{ordinal}",
+    )
+
+
+async def h1_body(gateway, ordinal, lists, client=None, identity=None):
+    sync = gateway.gateway
+    user = UUID(str(synthetic_id(f"user/h1/{ordinal}")))
+    authority = replace(gateway.authority(0), record_scoped=True, keyed=gateway.authority_module.KeyedSyncAuthority(user_id=user, lists=lists, index_tables=True, chat_rows=True))
+    where = await sync.authorize_predicate(client, sync.registered_collection("record", allow_chat_projection_dependency=True), user, authority=authority)
+    return gateway._plain_body("record", 1000 + ordinal, where, identity or f"h1:{ordinal}", keyed=False)
+
+
+async def h1_catalog(gateway, count, half):
+    from data import row_id
+    catalog = []
+    for ordinal in range(count):
+        client = {"col": "id", "op": "eq", "value": str(row_id("record", H1_DATA_ACCOUNTS[ordinal % len(H1_DATA_ACCOUNTS)], ordinal % 20))} if half and ordinal % 2 else None
+        body = await h1_body(gateway, ordinal, h1_lists(gateway, ordinal), client)
+        catalog.append({"kind": "h1-indexed" if client else "h1-scan", "account": 1000 + ordinal, "body": body, "has_subquery": contains_subquery(body["where"])})
     return catalog
