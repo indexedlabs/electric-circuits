@@ -110,8 +110,57 @@ The run label is the same-runner pair.
 | `workflow_run` (keyed run threads, one `workflow` node each) | 44 | 44 | — |
 | `resource`, `resource_fact`, `user`, `calendar` (today's filter) | 132 | 132 | 71 |
 
-Every `record_recurrence`, `calendar_event`, `record_assignee_index`, `record_completed_index`,
-`message` and `suggestion` demand keys (plain). So does the session `record` feed.
+**Which demands key and which stay subquery.** This follows main's own rules, and agrees with
+circuits-coord's 24 h classification with the gateway's rules.
+
+- **Keyed (plain filters):** the `record_recurrence`, `record_completed_index` and
+  `record_assignee_index` group members, every `calendar_event` member, the chat demands
+  (`message`, `suggestion`, run threads), and the session `record` feed.
+- **Record family, still subquery:** only the Home and day-window `record_date_index` and `record`
+  members, which reach into `record_recurrence` (`recurrenceDateIndicesForDayWindow`,
+  `allRecordDateIndicesForDayWindow`, and the `record` members' `in` branches).
+- **Outside the keyed program at `52e79b875b`:** `assignment` and `graph_edge` are not in
+  `KEYED_COLLECTIONS` (`assignment` keeps today's filter; `graph_edge` is "lowered, but not served
+  yet"). So every `assignment` and `graph_edge` demand stays on today's subquery filter as well:
+  day-window, rail and family graph alike. They are 1,228 of S-main3's 2,816 subquery shapes, and
+  290 of S-main3-live's 615.
+- **Also outside it:** the 132 shapes on `resource`, `resource_fact`, `user` and `calendar`.
+
+**Tables outside the keyed program.** About 16% of phone requests go to tables the keyed program
+does not cover: `resource` (about 279 a day), `resource_fact` (168), `file` (80), `user` (77) and
+`standing_grant_backfill_status` (58).
+
+- **In S-main3's mix:** `resource` (by family Space, plus the session's unscoped feed),
+  `resource_fact` (by Space) and `user` (unscoped). That is 57, 38 and 19 shapes, one feed per
+  account or Space. A day's repeated requests for the same filter are the same shape, so request
+  rates don't add shapes. `calendar` (18) is also on today's filter.
+- **Not in the mix:** `file` and `standing_grant_backfill_status`. The shell holders the iOS
+  inventory traced at `52e79b875b` include neither (the `session` scope that lists `file` has no
+  production caller).
+- **What those three tables cost during bulk writes:**
+
+  | Workload | `resource` | `resource_fact` | `user` | Share of move-in queries |
+  | --- | ---: | ---: | ---: | ---: |
+  | Import | 120 | 120 | — | 240 of 21,420 (1.1%) |
+  | Paced deletion | 302 | 200 | 3 | 505 of 17,618 (2.9%); same counts in S-main3-live |
+  | Both | 422 | 320 | 3 | 745 of about 39,000 |
+
+  The import writes 40 `resource` rows per commit, and the deletion removes the account's
+  Resources and facts.
+- **Can they stall readers on their own?** Not in these runs. The stall's move-ins and CPU come
+  from the Record-family day-window members and `assignment`/`graph_edge`. S, which keeps 71
+  subquery shapes on `file`, `user`, `resource` and `resource_fact` with every Record-family table
+  keyed, finishes the import in 2–3 s with zero move-ins and serves every probe. Its share
+  deletion (1,000 shares and memberships removed in one commit) makes 1,888 move-ins on those
+  tables and still finishes in 1.4–2.6 s. S's Resource filters are B-cold's rewritten form, not
+  today's, so this is evidence, not proof, for today's filters.
+- **What adding the two missing tables would take:** one session feed each per account in
+  `app_session`, with `file` unscoped or by Record ids as the app sends it, and
+  `standing_grant_backfill_status` unscoped. Then a paired run of S-main3-live against S with
+  those two added (about 30 minutes of Actions). To isolate the five tables outside the program,
+  a second run would key every Record-family, `assignment` and `graph_edge` demand and leave only
+  those five on today's filters. That needs a lowering main does not make today, so it would
+  measure a choice, not main.
 
 **Membership work per workload** (S-main3 / S-main3-live):
 
@@ -134,10 +183,10 @@ Every `record_recurrence`, `calendar_event`, `record_assignee_index`, `record_co
 
 ## Can Monday's stall still happen?
 
-Yes, through the day-window group members and the today-filter tables. Main keys a group member
-only when its filter reads no other table, but every day-window `record`, `record_date_index`,
-`assignment` and attendee `graph_edge` member the app sends reads through `record_date_index` or
-`record_recurrence`. `assignment` and `graph_edge` keep today's filters everywhere. A first import
+Yes, through two sets of subquery shapes. The first is the Home and day-window `record_date_index`
+and `record` members, which reach into `record_recurrence`. The second is `assignment` and
+`graph_edge`, which main at `52e79b875b` leaves on today's filters everywhere, being outside
+`KEYED_COLLECTIONS`. A first import
 writes exactly those tables, so every inserted row is checked against those subquery shapes and
 flips their membership sets (21,420 move-in queries).
 
