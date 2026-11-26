@@ -1,0 +1,218 @@
+{
+  "workload": "import",
+  "measurement": "source SQL start to workload receipt and zero pending flips/appends",
+  "first_change_read_time": 1795715422.235,
+  "timeout_s": 3600,
+  "row_changes": 13081,
+  "source_write_s": 3.0374421639999696,
+  "completion": {
+    "receipt": {
+      "drained": true,
+      "receipt": {
+        "commitLsn": "0/5E2B8D8",
+        "generation": "ed59de3117b14f47c3c415381dafe3ad5691890473bfd831e744acbc3ae6b889",
+        "sourceCommitId": "a49a8bd1-c54b-4102-b65d-1fb83ba59d19",
+        "userId": "f67df0d4-d079-5aab-a250-53e9e684b718"
+      },
+      "sourceCommitId": "a49a8bd1-c54b-4102-b65d-1fb83ba59d19"
+    },
+    "queue": {
+      "changes": {
+        "offset": "0000000000000000_0000000076569141",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "epoch": {
+        "boundAt": "2026-11-26T17:49:15.875Z",
+        "reason": null,
+        "slot": "stall_repro",
+        "state": "ok",
+        "systemIdentifier": "7712538649169494065",
+        "timelineId": 1
+      },
+      "failingAppends": 0,
+      "flipFailures": 0,
+      "lsn": "0/5E2C318",
+      "pendingFlips": 0,
+      "replayFailed": false,
+      "settle": {
+        "boundHits": 0,
+        "checks": 453,
+        "fencedTables": 0,
+        "forgotten": 0,
+        "overflowRefusals": 0,
+        "pollerFailures": 0,
+        "pollerTicks": 15,
+        "recordBytes": 144,
+        "rejections": 0,
+        "retakes": 0,
+        "sequencedXids": 1,
+        "sequencedXidsPeak": 9,
+        "tables": 1,
+        "timeouts": 0,
+        "waitMs": {
+          "buckets": {
+            "le_10000ms": 0,
+            "le_1000ms": 0,
+            "le_100ms": 0,
+            "le_10ms": 0,
+            "le_1ms": 0,
+            "le_2500ms": 0,
+            "le_250ms": 0,
+            "le_25ms": 0,
+            "le_2ms": 0,
+            "le_30000ms": 0,
+            "le_5000ms": 0,
+            "le_500ms": 0,
+            "le_50ms": 0,
+            "le_5ms": 0,
+            "le_infms": 0
+          },
+          "count": 0,
+          "maxMs": 0,
+          "p50Ms": null,
+          "p90Ms": null,
+          "p99Ms": null,
+          "sumMs": 0
+        },
+        "waiting": 0,
+        "xidsDropped": 0
+      },
+      "sync": 0,
+      "visibilityWaits": 0
+    }
+  },
+  "completed": true,
+  "elapsed_s": 6.059169159000021,
+  "ended_wall": 1795715427.6701026,
+  "sequencer_held": {
+    "peak_held_bytes": 0,
+    "longest_held_run_s": 0.0,
+    "sampled_every_s": 1
+  },
+  "subquery_change": {
+    "shapes": 0,
+    "standalone": 0,
+    "subquery_contributors": 240,
+    "subquery_distinct_values": 240,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 240,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0
+  },
+  "began_wall": 1795715421.610932,
+  "transactions": [
+    {
+      "transaction": 0,
+      "txid": "1400",
+      "before_commit": 1795715421.9775667,
+      "marker": "d4fe4037-21f5-4659-a560-e762407bf2bf"
+    },
+    {
+      "transaction": 1,
+      "txid": "1401",
+      "before_commit": 1795715422.4423854,
+      "marker": "54b49192-77d2-452b-8d5e-833d1f47cdc1"
+    },
+    {
+      "transaction": 2,
+      "txid": "1402",
+      "before_commit": 1795715423.1922116,
+      "marker": "963293c1-c4b1-483e-a2f8-4c4b82206dea"
+    },
+    {
+      "transaction": 3,
+      "txid": "1405",
+      "before_commit": 1795715423.6632237,
+      "marker": "a13f0918-73f9-43a2-a4c3-fb71d2181075"
+    },
+    {
+      "transaction": 4,
+      "txid": "1408",
+      "before_commit": 1795715424.1412518,
+      "marker": "60f5f40f-8de7-40e9-a9a0-bba38268cd52"
+    },
+    {
+      "transaction": 5,
+      "txid": "1409",
+      "before_commit": 1795715424.6474285,
+      "marker": "a49a8bd1-c54b-4102-b65d-1fb83ba59d19"
+    }
+  ],
+  "engine_cpu_percent": 60.40432118591041,
+  "changes_per_s": 2158.876845445066,
+  "probe": {
+    "drain": {
+      "attempts": 6,
+      "successes": 2,
+      "success_rate": 0.3333333333333333,
+      "successful_p50_s": 0.024763617000019167,
+      "successful_p95_s": 0.024763617000019167,
+      "successful_max_s": 1.0771985050000126,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 6,
+      "successes": 6,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.026177093999990575,
+      "successful_p95_s": 0.1582998839999732,
+      "successful_max_s": 0.2850167120000151,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 6,
+      "successes": 3,
+      "success_rate": 0.5,
+      "successful_p50_s": 0.9704468110000448,
+      "successful_p95_s": 0.9704468110000448,
+      "successful_max_s": 1.970046611999976,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "idle_probe": {
+    "drain": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.026044580000018414,
+      "successful_p95_s": 0.026239840000016557,
+      "successful_max_s": 0.09046576600002254,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.00888958999996703,
+      "successful_p95_s": 0.009059342999989894,
+      "successful_max_s": 0.020256528000004437,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.024111769000001004,
+      "successful_p95_s": 0.06454569499999252,
+      "successful_max_s": 0.08020701200001668,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "pinned_warnings": 0,
+  "large_transactions": [],
+  "backfills": 240,
+  "backfills_by_table": {
+    "public.resource": 120,
+    "public.resource_fact": 120
+  },
+  "empty_backfills_by_table": {
+    "public.resource_fact": 120
+  },
+  "backfills_per_minute": 2376.5634564948364,
+  "first_read_to_empty_s": 5.435102701187134,
+  "first_read_definition": "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy",
+  "engine_changes_per_s": 2406.762248879465,
+  "cpu_sample_window_s": 5.019699811935425,
+  "engine_cpu_after_first_read_percent": 63.94804709969962
+}
