@@ -1,0 +1,790 @@
+{
+  "workload": "paced-import-10",
+  "measurement": "source SQL start to workload receipt and zero pending flips/appends",
+  "first_change_read_time": 1795719434.414,
+  "timeout_s": 3600,
+  "row_changes": 6000,
+  "source_write_s": 6.959872549000011,
+  "completion": {
+    "receipt": {
+      "drained": true,
+      "receipt": {
+        "commitLsn": "0/59E6938",
+        "generation": "ed59de3117b14f47c3c415381dafe3ad5691890473bfd831e744acbc3ae6b889",
+        "sourceCommitId": "a05e364a-efd7-4332-9b64-52f46b563ca9",
+        "userId": "f67df0d4-d079-5aab-a250-53e9e684b718"
+      },
+      "sourceCommitId": "a05e364a-efd7-4332-9b64-52f46b563ca9"
+    },
+    "queue": {
+      "changes": {
+        "offset": "0000000000000000_0000000042453417",
+        "path": "changes/0",
+        "segment": 0
+      },
+      "epoch": {
+        "boundAt": "2026-11-26T18:56:26.016Z",
+        "reason": null,
+        "slot": "stall_repro",
+        "state": "ok",
+        "systemIdentifier": "7712555976375189552",
+        "timelineId": 1
+      },
+      "failingAppends": 0,
+      "flipFailures": 0,
+      "lsn": "0/59E6938",
+      "pendingFlips": 0,
+      "replayFailed": false,
+      "settle": {
+        "boundHits": 0,
+        "checks": 94,
+        "fencedTables": 0,
+        "forgotten": 0,
+        "overflowRefusals": 0,
+        "pollerFailures": 0,
+        "pollerTicks": 54,
+        "recordBytes": 0,
+        "rejections": 0,
+        "retakes": 0,
+        "sequencedXids": 0,
+        "sequencedXidsPeak": 11,
+        "tables": 0,
+        "timeouts": 0,
+        "waitMs": {
+          "buckets": {
+            "le_10000ms": 0,
+            "le_1000ms": 0,
+            "le_100ms": 0,
+            "le_10ms": 0,
+            "le_1ms": 0,
+            "le_2500ms": 0,
+            "le_250ms": 0,
+            "le_25ms": 0,
+            "le_2ms": 0,
+            "le_30000ms": 0,
+            "le_5000ms": 0,
+            "le_500ms": 0,
+            "le_50ms": 0,
+            "le_5ms": 0,
+            "le_infms": 0
+          },
+          "count": 0,
+          "maxMs": 0,
+          "p50Ms": null,
+          "p90Ms": null,
+          "p99Ms": null,
+          "sumMs": 0
+        },
+        "waiting": 0,
+        "xidsDropped": 0
+      },
+      "sync": 0,
+      "visibilityWaits": 0
+    }
+  },
+  "completed": true,
+  "elapsed_s": 6.962073474000022,
+  "ended_wall": 1795719441.3443923,
+  "sequencer_held": {
+    "peak_held_bytes": 0,
+    "longest_held_run_s": 0.0,
+    "sampled_every_s": 1
+  },
+  "receipts": {
+    "commits": 100,
+    "p50_s": 0.051737226999989616,
+    "p95_s": 0.05271585800005596,
+    "max_s": 0.05818356199995378,
+    "sum_s": 5.194813241000475
+  },
+  "subquery_change": {
+    "shapes": 0,
+    "standalone": 0,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0
+  },
+  "began_wall": 1795719434.3823178,
+  "transactions": [
+    {
+      "transaction": "paced-import-0",
+      "txid": "1394",
+      "before_commit": 1795719434.4101582,
+      "marker": "bed61c73-dd6c-44d0-9a5e-48983eb73494"
+    },
+    {
+      "transaction": "paced-import-1",
+      "txid": "1395",
+      "before_commit": 1795719434.483368,
+      "marker": "5ede0778-9fac-4d92-99de-2a5910c746f9"
+    },
+    {
+      "transaction": "paced-import-2",
+      "txid": "1396",
+      "before_commit": 1795719434.553357,
+      "marker": "4cc9a3b6-6a82-4e67-b782-24a8324fc06a"
+    },
+    {
+      "transaction": "paced-import-3",
+      "txid": "1397",
+      "before_commit": 1795719434.62218,
+      "marker": "dc884fbd-0bde-4e6e-8f68-e75ae5552223"
+    },
+    {
+      "transaction": "paced-import-4",
+      "txid": "1398",
+      "before_commit": 1795719434.6911123,
+      "marker": "dd3f9b04-26f7-49a8-a980-827aa42740a4"
+    },
+    {
+      "transaction": "paced-import-5",
+      "txid": "1399",
+      "before_commit": 1795719434.7615342,
+      "marker": "fc90172b-e56a-457c-ac2d-bb97e0dea142"
+    },
+    {
+      "transaction": "paced-import-6",
+      "txid": "1400",
+      "before_commit": 1795719434.8300633,
+      "marker": "bab06669-0023-4ca3-b4cc-afe762b027f0"
+    },
+    {
+      "transaction": "paced-import-7",
+      "txid": "1401",
+      "before_commit": 1795719434.8998153,
+      "marker": "49c6d8a3-8650-4d23-a46d-8c0f2d8304a8"
+    },
+    {
+      "transaction": "paced-import-8",
+      "txid": "1402",
+      "before_commit": 1795719434.9695344,
+      "marker": "82048db3-6799-4f04-afc3-747193212650"
+    },
+    {
+      "transaction": "paced-import-9",
+      "txid": "1403",
+      "before_commit": 1795719435.0379908,
+      "marker": "fad61d28-a2da-4dea-a997-87e419f65f8a"
+    },
+    {
+      "transaction": "paced-import-10",
+      "txid": "1404",
+      "before_commit": 1795719435.1088004,
+      "marker": "a33f3ef5-4e52-48ba-bc4a-0b751ce783c4"
+    },
+    {
+      "transaction": "paced-import-11",
+      "txid": "1405",
+      "before_commit": 1795719435.1781542,
+      "marker": "94bcbf53-97ac-443d-ab91-f12b94598c23"
+    },
+    {
+      "transaction": "paced-import-12",
+      "txid": "1406",
+      "before_commit": 1795719435.246614,
+      "marker": "9263f98b-8c46-4eb6-a25b-3a42bf249325"
+    },
+    {
+      "transaction": "paced-import-13",
+      "txid": "1407",
+      "before_commit": 1795719435.3159814,
+      "marker": "85c23e49-cc13-44bf-b756-ea62199a64e1"
+    },
+    {
+      "transaction": "paced-import-14",
+      "txid": "1408",
+      "before_commit": 1795719435.3871818,
+      "marker": "6353bf7d-57d7-4bd3-aa37-7f78ceaac48f"
+    },
+    {
+      "transaction": "paced-import-15",
+      "txid": "1411",
+      "before_commit": 1795719435.4570198,
+      "marker": "3a61bfe9-202c-493e-8a49-aef696eceb44"
+    },
+    {
+      "transaction": "paced-import-16",
+      "txid": "1412",
+      "before_commit": 1795719435.5248682,
+      "marker": "28617529-7344-4d2a-a022-cb9fdfd93208"
+    },
+    {
+      "transaction": "paced-import-17",
+      "txid": "1413",
+      "before_commit": 1795719435.5952573,
+      "marker": "a7cb7920-26b9-4822-9504-eedd53724502"
+    },
+    {
+      "transaction": "paced-import-18",
+      "txid": "1414",
+      "before_commit": 1795719435.6638901,
+      "marker": "4b8c3b0c-c683-41d4-9246-c4d09e0b2520"
+    },
+    {
+      "transaction": "paced-import-19",
+      "txid": "1415",
+      "before_commit": 1795719435.7342796,
+      "marker": "51853e2f-3383-4858-a55f-ad34e05a33b3"
+    },
+    {
+      "transaction": "paced-import-20",
+      "txid": "1416",
+      "before_commit": 1795719435.8027751,
+      "marker": "58d596be-d0ef-426a-a9be-5252b91caa22"
+    },
+    {
+      "transaction": "paced-import-21",
+      "txid": "1417",
+      "before_commit": 1795719435.8717036,
+      "marker": "3a0311b0-fb9f-4ea1-a0f2-125459da85a2"
+    },
+    {
+      "transaction": "paced-import-22",
+      "txid": "1418",
+      "before_commit": 1795719435.9412158,
+      "marker": "89aa4161-13cd-4bcd-9294-ad902672dda1"
+    },
+    {
+      "transaction": "paced-import-23",
+      "txid": "1419",
+      "before_commit": 1795719436.0102122,
+      "marker": "491c8ece-f795-4ac1-a2b5-220c2b29dcb8"
+    },
+    {
+      "transaction": "paced-import-24",
+      "txid": "1420",
+      "before_commit": 1795719436.079682,
+      "marker": "f8438e93-a98b-495b-b5af-53ce6d07d521"
+    },
+    {
+      "transaction": "paced-import-25",
+      "txid": "1421",
+      "before_commit": 1795719436.1495273,
+      "marker": "bfb14a34-16ff-473b-b95b-38cf1ae9f60c"
+    },
+    {
+      "transaction": "paced-import-26",
+      "txid": "1422",
+      "before_commit": 1795719436.218275,
+      "marker": "d33a952b-0ffe-4132-b0fa-38ada033230e"
+    },
+    {
+      "transaction": "paced-import-27",
+      "txid": "1423",
+      "before_commit": 1795719436.2881286,
+      "marker": "79d0bd8a-1c0e-4f08-baed-20f1029ea8a0"
+    },
+    {
+      "transaction": "paced-import-28",
+      "txid": "1424",
+      "before_commit": 1795719436.3573775,
+      "marker": "ffb6deb3-935e-4759-b297-73054b9382d2"
+    },
+    {
+      "transaction": "paced-import-29",
+      "txid": "1427",
+      "before_commit": 1795719436.425426,
+      "marker": "81541ef7-f790-44d1-a497-e4f96a3fd376"
+    },
+    {
+      "transaction": "paced-import-30",
+      "txid": "1428",
+      "before_commit": 1795719436.4944348,
+      "marker": "f4c44101-29e4-431e-a0b1-ffca85438662"
+    },
+    {
+      "transaction": "paced-import-31",
+      "txid": "1429",
+      "before_commit": 1795719436.5641198,
+      "marker": "6e2b24d3-2a80-4610-b63c-4acb9ade3a9d"
+    },
+    {
+      "transaction": "paced-import-32",
+      "txid": "1430",
+      "before_commit": 1795719436.6344466,
+      "marker": "456d6f4c-36ab-4958-834f-c7ef37bd08ed"
+    },
+    {
+      "transaction": "paced-import-33",
+      "txid": "1431",
+      "before_commit": 1795719436.7044857,
+      "marker": "acea3d47-e4b9-471d-bef1-99099b82bda0"
+    },
+    {
+      "transaction": "paced-import-34",
+      "txid": "1432",
+      "before_commit": 1795719436.773913,
+      "marker": "aa84e802-d31b-4d38-a356-a055d67e3d5f"
+    },
+    {
+      "transaction": "paced-import-35",
+      "txid": "1433",
+      "before_commit": 1795719436.842863,
+      "marker": "7cc6b8fa-eb19-41f3-8671-32dcd4817c69"
+    },
+    {
+      "transaction": "paced-import-36",
+      "txid": "1434",
+      "before_commit": 1795719436.9123309,
+      "marker": "2a7184bf-3722-4013-8dbf-4e6f54cb6a1a"
+    },
+    {
+      "transaction": "paced-import-37",
+      "txid": "1435",
+      "before_commit": 1795719436.9812121,
+      "marker": "f1146ea7-fd1b-4a41-9984-886cf33c5dff"
+    },
+    {
+      "transaction": "paced-import-38",
+      "txid": "1436",
+      "before_commit": 1795719437.0500176,
+      "marker": "8ccb0331-f537-49b6-b739-ea302b040a0b"
+    },
+    {
+      "transaction": "paced-import-39",
+      "txid": "1437",
+      "before_commit": 1795719437.11833,
+      "marker": "219887c6-97da-4da3-ba2f-bd610906e5bf"
+    },
+    {
+      "transaction": "paced-import-40",
+      "txid": "1438",
+      "before_commit": 1795719437.1895823,
+      "marker": "c4ffde20-2818-4f34-ba92-63d9fb80bfee"
+    },
+    {
+      "transaction": "paced-import-41",
+      "txid": "1439",
+      "before_commit": 1795719437.2584627,
+      "marker": "68382240-b539-4ed3-9a4c-99443ba62a4e"
+    },
+    {
+      "transaction": "paced-import-42",
+      "txid": "1440",
+      "before_commit": 1795719437.3278816,
+      "marker": "786cd2bb-cd5f-45fe-9e64-70e175f794cc"
+    },
+    {
+      "transaction": "paced-import-43",
+      "txid": "1443",
+      "before_commit": 1795719437.4013028,
+      "marker": "854d6da8-60be-49a0-9d03-b4bb0aa07ec3"
+    },
+    {
+      "transaction": "paced-import-44",
+      "txid": "1444",
+      "before_commit": 1795719437.4693823,
+      "marker": "b92b475e-caed-40e6-b824-85b3dfba7ff7"
+    },
+    {
+      "transaction": "paced-import-45",
+      "txid": "1445",
+      "before_commit": 1795719437.5391307,
+      "marker": "e0dbeb65-da48-48c0-a025-6280f0a91ac6"
+    },
+    {
+      "transaction": "paced-import-46",
+      "txid": "1446",
+      "before_commit": 1795719437.6082234,
+      "marker": "15301902-091d-4dc2-a1a2-b6e041ec71a4"
+    },
+    {
+      "transaction": "paced-import-47",
+      "txid": "1447",
+      "before_commit": 1795719437.677957,
+      "marker": "93defbd6-0fcf-4005-875f-4169bb581783"
+    },
+    {
+      "transaction": "paced-import-48",
+      "txid": "1448",
+      "before_commit": 1795719437.7464898,
+      "marker": "e35c5773-1456-429f-b554-51bd549ef5f3"
+    },
+    {
+      "transaction": "paced-import-49",
+      "txid": "1449",
+      "before_commit": 1795719437.8144841,
+      "marker": "669e1b23-c213-4c92-a38f-394e75b0ac1a"
+    },
+    {
+      "transaction": "paced-import-50",
+      "txid": "1450",
+      "before_commit": 1795719437.8835294,
+      "marker": "47ca5661-631a-44de-9313-b3ef9a719130"
+    },
+    {
+      "transaction": "paced-import-51",
+      "txid": "1451",
+      "before_commit": 1795719437.9593408,
+      "marker": "26faf4fb-80a7-44eb-9ed7-d97a4ceb86e6"
+    },
+    {
+      "transaction": "paced-import-52",
+      "txid": "1452",
+      "before_commit": 1795719438.0280886,
+      "marker": "7772c007-e8ac-418e-a2a0-f48df8e4714f"
+    },
+    {
+      "transaction": "paced-import-53",
+      "txid": "1453",
+      "before_commit": 1795719438.0981426,
+      "marker": "57e4d422-2519-441d-bfc0-b947aacd4bbe"
+    },
+    {
+      "transaction": "paced-import-54",
+      "txid": "1454",
+      "before_commit": 1795719438.16673,
+      "marker": "354e9ecb-9450-4b35-90c8-b8b6e021c71d"
+    },
+    {
+      "transaction": "paced-import-55",
+      "txid": "1455",
+      "before_commit": 1795719438.235868,
+      "marker": "382821f6-6011-4c93-bbd5-ef817f53e5ee"
+    },
+    {
+      "transaction": "paced-import-56",
+      "txid": "1456",
+      "before_commit": 1795719438.3042705,
+      "marker": "b81f33f5-48f8-4219-b21c-03f1976ba5ea"
+    },
+    {
+      "transaction": "paced-import-57",
+      "txid": "1457",
+      "before_commit": 1795719438.373353,
+      "marker": "01b69893-9197-4397-99f0-3254a0599744"
+    },
+    {
+      "transaction": "paced-import-58",
+      "txid": "1460",
+      "before_commit": 1795719438.4430192,
+      "marker": "581e3976-e747-4b61-9794-59dabab392ed"
+    },
+    {
+      "transaction": "paced-import-59",
+      "txid": "1461",
+      "before_commit": 1795719438.5115607,
+      "marker": "65ef7f3f-e722-4615-a55f-7f7ddbb094ae"
+    },
+    {
+      "transaction": "paced-import-60",
+      "txid": "1462",
+      "before_commit": 1795719438.5802708,
+      "marker": "f108e718-cff4-48d9-9feb-8392cdedbea1"
+    },
+    {
+      "transaction": "paced-import-61",
+      "txid": "1463",
+      "before_commit": 1795719438.6496778,
+      "marker": "c3619653-e338-4ece-9b35-389300bc57cc"
+    },
+    {
+      "transaction": "paced-import-62",
+      "txid": "1464",
+      "before_commit": 1795719438.7189455,
+      "marker": "576ea375-20d0-49ef-b197-ef1aa3de9746"
+    },
+    {
+      "transaction": "paced-import-63",
+      "txid": "1465",
+      "before_commit": 1795719438.7879236,
+      "marker": "af5ab965-a56c-4d88-908d-ed9df22221d6"
+    },
+    {
+      "transaction": "paced-import-64",
+      "txid": "1466",
+      "before_commit": 1795719438.8568776,
+      "marker": "86ae1cdb-4f43-440b-8e56-d560b60f84ef"
+    },
+    {
+      "transaction": "paced-import-65",
+      "txid": "1467",
+      "before_commit": 1795719438.9261537,
+      "marker": "2a361a4b-b287-4c3d-899b-848e5f7e93ea"
+    },
+    {
+      "transaction": "paced-import-66",
+      "txid": "1468",
+      "before_commit": 1795719438.9957566,
+      "marker": "e1ebd77c-9bb0-4a1e-a509-2636ae8760cc"
+    },
+    {
+      "transaction": "paced-import-67",
+      "txid": "1469",
+      "before_commit": 1795719439.0650544,
+      "marker": "1ba45d05-77d5-41ab-aa84-69611a0f854d"
+    },
+    {
+      "transaction": "paced-import-68",
+      "txid": "1470",
+      "before_commit": 1795719439.135224,
+      "marker": "e1334a3c-7306-4455-9c37-9cfa0f8f1f67"
+    },
+    {
+      "transaction": "paced-import-69",
+      "txid": "1471",
+      "before_commit": 1795719439.2041864,
+      "marker": "658ad4a1-60f1-46e4-8563-ef95de3f6f10"
+    },
+    {
+      "transaction": "paced-import-70",
+      "txid": "1472",
+      "before_commit": 1795719439.2724926,
+      "marker": "afb39887-a991-4bc0-b392-772fddb2809f"
+    },
+    {
+      "transaction": "paced-import-71",
+      "txid": "1473",
+      "before_commit": 1795719439.3410814,
+      "marker": "3dfd693a-4823-4f2b-803e-03d2034320f7"
+    },
+    {
+      "transaction": "paced-import-72",
+      "txid": "1476",
+      "before_commit": 1795719439.4105499,
+      "marker": "b8f321d9-9f10-4934-a2ea-49f656be83a7"
+    },
+    {
+      "transaction": "paced-import-73",
+      "txid": "1477",
+      "before_commit": 1795719439.479328,
+      "marker": "6e785244-aeea-422b-b312-35b3c852b066"
+    },
+    {
+      "transaction": "paced-import-74",
+      "txid": "1478",
+      "before_commit": 1795719439.5488217,
+      "marker": "1766f759-2961-4687-bece-b6e8a20581ab"
+    },
+    {
+      "transaction": "paced-import-75",
+      "txid": "1479",
+      "before_commit": 1795719439.6176405,
+      "marker": "f368b863-0d99-4e02-9f57-0827b0188e94"
+    },
+    {
+      "transaction": "paced-import-76",
+      "txid": "1480",
+      "before_commit": 1795719439.6857126,
+      "marker": "5e5d8040-c36b-4100-a45d-609dc3d65f23"
+    },
+    {
+      "transaction": "paced-import-77",
+      "txid": "1481",
+      "before_commit": 1795719439.7558775,
+      "marker": "b0b0ac10-56e5-46c1-9dcb-12f48ee64ed6"
+    },
+    {
+      "transaction": "paced-import-78",
+      "txid": "1482",
+      "before_commit": 1795719439.824971,
+      "marker": "677d120f-9783-48b6-8cc8-d2e7743426e2"
+    },
+    {
+      "transaction": "paced-import-79",
+      "txid": "1483",
+      "before_commit": 1795719439.893215,
+      "marker": "610bb3cc-7a31-401d-afb6-c81a8c25baca"
+    },
+    {
+      "transaction": "paced-import-80",
+      "txid": "1484",
+      "before_commit": 1795719439.9616528,
+      "marker": "f852468d-73de-438f-835c-996df0127a36"
+    },
+    {
+      "transaction": "paced-import-81",
+      "txid": "1485",
+      "before_commit": 1795719440.0296993,
+      "marker": "13e674d9-6238-45cc-9747-d4f07329d695"
+    },
+    {
+      "transaction": "paced-import-82",
+      "txid": "1486",
+      "before_commit": 1795719440.1004763,
+      "marker": "4577485f-bb4e-4541-8061-e6fda2680909"
+    },
+    {
+      "transaction": "paced-import-83",
+      "txid": "1487",
+      "before_commit": 1795719440.1702046,
+      "marker": "6108bde4-9a70-40f9-a174-520dcb78f08d"
+    },
+    {
+      "transaction": "paced-import-84",
+      "txid": "1488",
+      "before_commit": 1795719440.2385697,
+      "marker": "da421679-36f0-4bb2-abc1-f877e5e47244"
+    },
+    {
+      "transaction": "paced-import-85",
+      "txid": "1489",
+      "before_commit": 1795719440.3069766,
+      "marker": "04075f96-1404-4042-b393-a84e62dfa392"
+    },
+    {
+      "transaction": "paced-import-86",
+      "txid": "1490",
+      "before_commit": 1795719440.376583,
+      "marker": "cf9d3859-3f0d-4302-8979-60de9eaa3e68"
+    },
+    {
+      "transaction": "paced-import-87",
+      "txid": "1493",
+      "before_commit": 1795719440.4461534,
+      "marker": "a82db26a-6fe3-408b-b831-9ced420a85a9"
+    },
+    {
+      "transaction": "paced-import-88",
+      "txid": "1494",
+      "before_commit": 1795719440.5169475,
+      "marker": "d7a99eb8-4a39-4f7e-8b1e-451271ba2f50"
+    },
+    {
+      "transaction": "paced-import-89",
+      "txid": "1495",
+      "before_commit": 1795719440.5861742,
+      "marker": "ece0fbd0-7a4a-4e98-aaad-72cfaf2c7715"
+    },
+    {
+      "transaction": "paced-import-90",
+      "txid": "1496",
+      "before_commit": 1795719440.6551087,
+      "marker": "1f5b6249-cac1-4fac-9b0c-9a31ca50b790"
+    },
+    {
+      "transaction": "paced-import-91",
+      "txid": "1497",
+      "before_commit": 1795719440.7250643,
+      "marker": "0c95a0ea-9ff3-4dba-9b88-78fcc797d999"
+    },
+    {
+      "transaction": "paced-import-92",
+      "txid": "1498",
+      "before_commit": 1795719440.7958786,
+      "marker": "a29f6253-b98b-443e-b4ae-51f69d80297a"
+    },
+    {
+      "transaction": "paced-import-93",
+      "txid": "1499",
+      "before_commit": 1795719440.8651814,
+      "marker": "ea70ca90-d38a-4044-968d-431a21564598"
+    },
+    {
+      "transaction": "paced-import-94",
+      "txid": "1500",
+      "before_commit": 1795719440.9345655,
+      "marker": "816ad144-8d6c-4648-8dc5-d2c3b1a1f7e0"
+    },
+    {
+      "transaction": "paced-import-95",
+      "txid": "1501",
+      "before_commit": 1795719441.0055227,
+      "marker": "2e98eeb5-75d2-478b-baa3-c03982f3d313"
+    },
+    {
+      "transaction": "paced-import-96",
+      "txid": "1502",
+      "before_commit": 1795719441.074172,
+      "marker": "37a77e08-cb48-4e18-8826-0bc469036a86"
+    },
+    {
+      "transaction": "paced-import-97",
+      "txid": "1503",
+      "before_commit": 1795719441.1449013,
+      "marker": "908a0c9f-b339-4eba-bdf0-6aca8c96f503"
+    },
+    {
+      "transaction": "paced-import-98",
+      "txid": "1504",
+      "before_commit": 1795719441.214778,
+      "marker": "d17253f3-3245-4e64-abe0-2712d14efaa9"
+    },
+    {
+      "transaction": "paced-import-99",
+      "txid": "1505",
+      "before_commit": 1795719441.2838593,
+      "marker": "de03185d-5f67-4c54-9cc7-84bad2e74502"
+    },
+    {
+      "transaction": "final",
+      "txid": "1506",
+      "before_commit": 1795719441.3409402,
+      "marker": "a05e364a-efd7-4332-9b64-52f46b563ca9"
+    }
+  ],
+  "engine_cpu_percent": 6.607227023930122,
+  "changes_per_s": 861.8122205126244,
+  "probe": {
+    "drain": {
+      "attempts": 6,
+      "successes": 6,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.0215200970000069,
+      "successful_p95_s": 0.024211868000065806,
+      "successful_max_s": 0.03184700700001031,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 6,
+      "successes": 6,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.004900005000081364,
+      "successful_p95_s": 0.007089608000001135,
+      "successful_max_s": 0.00851599999998598,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 6,
+      "successes": 6,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.021798427999897285,
+      "successful_p95_s": 0.023036774000047444,
+      "successful_max_s": 0.02801512799999273,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "idle_probe": {
+    "drain": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.022574775999942176,
+      "successful_p95_s": 0.02478153899994595,
+      "successful_max_s": 0.02668600500010143,
+      "timeouts_censored_at_s": 2
+    },
+    "subset": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.006088480000016716,
+      "successful_p95_s": 0.007909294000000955,
+      "successful_max_s": 0.008176164000019526,
+      "timeouts_censored_at_s": 2
+    },
+    "live": {
+      "attempts": 4,
+      "successes": 4,
+      "success_rate": 1.0,
+      "successful_p50_s": 0.02152775100000781,
+      "successful_p95_s": 0.022130449999963275,
+      "successful_max_s": 0.024739601999954175,
+      "timeouts_censored_at_s": 2
+    }
+  },
+  "pinned_warnings": 0,
+  "large_transactions": [],
+  "backfills": 0,
+  "backfills_by_table": {},
+  "empty_backfills_by_table": {},
+  "backfills_per_minute": 0.0,
+  "first_read_to_empty_s": 6.930392265319824,
+  "first_read_definition": "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy",
+  "engine_changes_per_s": 865.7518608325285,
+  "cpu_sample_window_s": 5.005330562591553,
+  "engine_cpu_after_first_read_percent": 6.592971150923139
+}

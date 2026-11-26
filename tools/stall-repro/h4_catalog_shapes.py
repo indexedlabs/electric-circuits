@@ -77,5 +77,68 @@ async def main():
     json.dump(out, sys.stdout, indent=1)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and len(sys.argv) == 1:
     asyncio.run(main())
+
+
+def leaf_column(where):
+    """The column of the leaf `access_leaf` would pick: an equality first, else the first range."""
+    found = []
+    def walk(node):
+        if node is None:
+            return
+        if "and" in node:
+            for child in node["and"]:
+                walk(child)
+        elif node.get("op") in INDEXING_OPS and node.get("value") is not None and "in" not in node:
+            found.append((node["op"] != "eq", node["col"]))
+    walk(where)
+    return sorted(found)[0][1] if found else None
+
+
+def inner_tables(where, out=None):
+    out = set() if out is None else out
+    if isinstance(where, dict):
+        if "in" in where and isinstance(where["in"], dict):
+            out.add(where["in"]["table"].removeprefix("public."))
+            inner_tables(where["in"].get("where"), out)
+        for key, value in where.items():
+            if key != "in":
+                inner_tables(value, out)
+    elif isinstance(where, list):
+        for value in where:
+            inner_tables(value, out)
+    return out
+
+
+def per_table(requests):
+    """Per outer table: indexed shapes by leaf column, scan-list shapes, subquery shapes by inner table."""
+    tables = {}
+    for request in requests:
+        body = request["body"]
+        entry = tables.setdefault(body["table"].removeprefix("public."), {"indexed": Counter(), "scan": 0, "subquery": 0, "inner": Counter()})
+        kind = placement(body)
+        if kind == "plain-indexed":
+            entry["indexed"][leaf_column(body["where"])] += 1
+        elif kind == "plain-scan":
+            entry["scan"] += 1
+        else:
+            entry["subquery"] += 1
+            for inner in inner_tables(body["where"]):
+                entry["inner"][inner] += 1
+    return tables
+
+
+async def detail():
+    folder = Path(__file__).parent
+    pinned = GatewayShapes(folder / "indexed-source.json.gz")
+    requests = await pinned.generate("nov24")
+    out = {"A (Nov 24 fixture, today's gateway)": per_table(requests)}
+    async for name, catalog in catalogs():
+        if name.startswith("S ("):
+            out[name] = per_table(catalog)
+    json.dump(out, sys.stdout, indent=1, default=dict)
+
+
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "detail":
+    asyncio.run(detail())

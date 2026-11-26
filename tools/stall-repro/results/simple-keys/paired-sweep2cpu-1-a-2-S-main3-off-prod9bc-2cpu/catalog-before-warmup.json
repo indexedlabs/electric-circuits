@@ -1,0 +1,41 @@
+{
+  "cardinalities": {
+    "bytes_circuit_integral": 12618676,
+    "bytes_circuit_snapshots": 11657964,
+    "bytes_electric_adapter": 0,
+    "bytes_executors": 57510,
+    "bytes_feed_sets": 0,
+    "bytes_membership_circuit": 24276640,
+    "bytes_pk_dict": 2263400,
+    "bytes_retention": 1357734,
+    "bytes_shape_records": 99691678,
+    "bytes_subquery_registry": 386422994,
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 5262,
+    "shapes_dormant": 0,
+    "standalone": 126,
+    "subquery_contributors": 248285,
+    "subquery_distinct_values": 248285,
+    "subquery_edges": 33575,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 2311,
+    "subquery_shapes": 5136,
+    "tables": 44,
+    "tailers": 5
+  },
+  "process": {
+    "allocator_allocated_bytes": 875084440,
+    "allocator_config": {
+      "background_thread": true,
+      "dirty_decay_ms": 1000,
+      "muzzy_decay_ms": 1000
+    },
+    "allocator_resident_bytes": 909991936,
+    "allocator_retained_bytes": 79450112,
+    "rss_bytes": 927121408,
+    "rss_mib": 884,
+    "virtual_bytes": 1616605184
+  },
+  "samples": 358
+}
