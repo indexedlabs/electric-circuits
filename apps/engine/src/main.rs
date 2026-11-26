@@ -158,6 +158,7 @@ async fn main() -> Result<()> {
     // Set the capacity policy for each Engine Postgres pool (backfills, query-backs, subset queries) and publish the
     // backfill streaming budget before first use.
     electric_circuits_engine::pg::set_pool_size(config.db_pool_size);
+    electric_circuits_engine::pg::set_pool_idle(config.db_pool_idle);
     electric_circuits_engine::pg::set_backfill_config(config.backfill);
 
     // Postgres mode: data lives in Postgres, ingested via logical replication and read back for

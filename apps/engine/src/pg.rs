@@ -191,7 +191,7 @@ impl PgConnectionConfig {
                 check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
-                        tracing::error!("postgres connection error: {error}");
+                        log_connection_end("postgres connection", &error);
                     }
                 });
                 Ok(client)
@@ -203,7 +203,7 @@ impl PgConnectionConfig {
                 check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
-                        tracing::error!("postgres TLS connection error: {error}");
+                        log_connection_end("postgres TLS connection", &error);
                     }
                 });
                 Ok(client)
@@ -242,6 +242,46 @@ impl PgConnectionConfig {
             // text the walsender prints, and the replication connection has never been given the
             // URL's options, which were written for query sessions.
             .with_options(SESSION_OPTIONS))
+    }
+}
+
+/// SQLSTATEs a server sends when it ends a session on purpose: `57P05` when the session sat idle
+/// past `idle_session_timeout`, `57P01` when an administrator (or `pg_terminate_backend`) ended it.
+/// Neither means the engine or the network is broken; the next checkout simply dials again.
+const EXPECTED_SERVER_CLOSES: &[&str] = &["57P05", "57P01"];
+
+/// How a query connection's task reports the connection ending with an error: the level to log at
+/// and what to say. A server error names its SQLSTATE and message (a bare `db error` hid both); an
+/// [`EXPECTED_SERVER_CLOSES`] close is INFO, everything else ERROR. Any other error names its cause.
+fn connection_end(error: &tokio_postgres::Error) -> (tracing::Level, String) {
+    match error.as_db_error() {
+        Some(db) => {
+            let code = db.code().code();
+            let level =
+                if EXPECTED_SERVER_CLOSES.contains(&code) { tracing::Level::INFO } else { tracing::Level::ERROR };
+            (level, format!("{} {code}: {}", db.severity(), db.message()))
+        }
+        None => {
+            // tokio-postgres displays only the error's kind ("error communicating with the server");
+            // the cause, such as a reset or a TLS alert, is in its source chain.
+            let mut detail = error.to_string();
+            let mut source = std::error::Error::source(error);
+            while let Some(cause) = source {
+                detail.push_str(": ");
+                detail.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            (tracing::Level::ERROR, detail)
+        }
+    }
+}
+
+fn log_connection_end(what: &str, error: &tokio_postgres::Error) {
+    let (level, detail) = connection_end(error);
+    if level == tracing::Level::INFO {
+        tracing::info!("{what} closed by the server: {detail}");
+    } else {
+        tracing::error!("{what} error: {detail}");
     }
 }
 
@@ -587,6 +627,22 @@ pub(crate) fn configured_pool_size() -> usize {
     *POOL_SIZE.get_or_init(|| 20)
 }
 
+/// How long a [`Pool`] keeps an idle connection for reuse when `ELECTRIC_DB_POOL_IDLE_SECS` is unset:
+/// 30 minutes, well inside the 2-hour `idle_session_timeout` prod Postgres ends idle sessions at.
+pub const DEFAULT_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Idle limit per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_IDLE_SECS`.
+static POOL_IDLE: OnceLock<std::time::Duration> = OnceLock::new();
+
+/// Host-wide idle limit; a connection idle longer than this is retired at checkout, not reused.
+pub fn set_pool_idle(idle: std::time::Duration) {
+    let _ = POOL_IDLE.set(idle);
+}
+
+pub(crate) fn configured_pool_idle() -> std::time::Duration {
+    *POOL_IDLE.get_or_init(|| DEFAULT_POOL_IDLE)
+}
+
 fn spawn_connection(
     owner: Option<&crate::shutdown::ShutdownToken>,
     future: impl std::future::Future<Output = ()> + Send + 'static,
@@ -641,7 +697,8 @@ pub struct CheckoutTiming {
     pub last: Option<QueryPhase>,
 }
 
-/// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
+/// A small connection pool: at most `size` concurrent checkouts, idle connections reused until they
+/// have been idle longer than the pool's idle limit, after which a checkout closes them and dials.
 /// Backfills/query-backs mark their explicit transaction bracket, so check-in only rolls back a
 /// checkout that may actually have left a transaction open or aborted.
 #[derive(Clone)]
@@ -652,7 +709,12 @@ pub struct Pool {
 struct PoolInner {
     shutdown: crate::shutdown::ShutdownToken,
     url: String,
-    idle: std::sync::Mutex<Vec<Client>>,
+    /// Connections waiting for reuse, each with when it went idle, oldest first ([`Self::check_in`]
+    /// stamps under the lock, so a push never lands before an older one).
+    idle: std::sync::Mutex<Vec<(Client, std::time::Instant)>>,
+    /// How long a connection may sit in `idle` and still be reused (`ELECTRIC_DB_POOL_IDLE_SECS`). Past
+    /// it the pool closes the connection itself, before the server's `idle_session_timeout` does.
+    idle_limit: std::time::Duration,
     sem: Arc<tokio::sync::Semaphore>,
     /// The checkout cap `sem` was created with, so [`Pool::in_use`] can report occupancy.
     size: usize,
@@ -664,10 +726,15 @@ struct PoolInner {
 
 impl Pool {
     pub fn new(url: String, size: usize) -> Pool {
-        Self::owned(url, size, crate::shutdown::ShutdownToken::new())
+        Self::owned(url, size, configured_pool_idle(), crate::shutdown::ShutdownToken::new())
     }
 
-    pub(crate) fn owned(url: String, size: usize, shutdown: crate::shutdown::ShutdownToken) -> Pool {
+    pub(crate) fn owned(
+        url: String,
+        size: usize,
+        idle_limit: std::time::Duration,
+        shutdown: crate::shutdown::ShutdownToken,
+    ) -> Pool {
         let pool = Pool {
             inner: Arc::new(PoolInner {
                 sequenced: Arc::new(SequencedXids::owned(
@@ -679,6 +746,7 @@ impl Pool {
                 shutdown,
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
+                idle_limit,
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
                 size: size.max(1),
             }),
@@ -750,8 +818,7 @@ impl PoolInner {
         timing.slot_wait = started.elapsed();
         timing.in_progress = None;
         let permit = permit.context("pg pool closed")?;
-        let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
-        let client = match reused {
+        let client = match self.take_idle() {
             Some(c) => c,
             None => {
                 let dialing = std::time::Instant::now();
@@ -764,6 +831,34 @@ impl PoolInner {
             }
         };
         Ok((client, permit))
+    }
+
+    /// Return a healthy connection to the idle list, stamped with when it went idle.
+    fn check_in(&self, client: Client) {
+        let mut idle = self.idle.lock().unwrap();
+        idle.push((client, std::time::Instant::now()));
+    }
+
+    /// The most recently returned idle connection, unless it has closed. Connections idle longer
+    /// than `idle_limit` are taken out and dropped first, which ends their sessions cleanly from this
+    /// side (the connection task sees its client gone and finishes without an error).
+    fn take_idle(&self) -> Option<Client> {
+        let now = std::time::Instant::now();
+        let (newest, expired) = {
+            let mut idle = self.idle.lock().unwrap();
+            let stale = idle.partition_point(|(_, since)| now.saturating_duration_since(*since) > self.idle_limit);
+            let expired: Vec<_> = idle.drain(..stale).collect();
+            (idle.pop(), expired)
+        };
+        if !expired.is_empty() {
+            tracing::debug!(
+                retired = expired.len(),
+                "pg pool: closing connections idle longer than {:?}",
+                self.idle_limit
+            );
+        }
+        drop(expired);
+        newest.map(|(client, _)| client).filter(|c| !c.is_closed())
     }
 }
 
@@ -805,7 +900,7 @@ impl PooledClient {
             && !client.is_closed()
             && !self.inner.sem.is_closed()
         {
-            self.inner.idle.lock().unwrap().push(client);
+            self.inner.check_in(client);
         }
         self.permit = None;
     }
@@ -829,7 +924,7 @@ impl Drop for PooledClient {
             return; // permit drops here, freeing the slot
         }
         if !self.transaction_open.load(Ordering::SeqCst) {
-            self.inner.idle.lock().unwrap().push(client);
+            self.inner.check_in(client);
             return;
         }
         let inner = self.inner.clone();
@@ -840,7 +935,7 @@ impl Drop for PooledClient {
         // so a rare warning is preferable to reusing a connection whose state is uncertain.
         self.inner.shutdown.spawn(async move {
             if client.batch_execute("ROLLBACK").await.is_ok() && !inner.sem.is_closed() {
-                inner.idle.lock().unwrap().push(client);
+                inner.check_in(client);
             }
             drop(permit);
         });
@@ -2665,6 +2760,9 @@ pub fn lsn_to_u64(lsn: &str) -> u64 {
         None => 0,
     }
 }
+
+#[cfg(test)]
+mod pool_idle_tests;
 
 #[cfg(test)]
 mod ownership_tests {
