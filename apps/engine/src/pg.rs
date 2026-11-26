@@ -252,7 +252,7 @@ const EXPECTED_SERVER_CLOSES: &[&str] = &["57P05", "57P01"];
 
 /// How a query connection's task reports the connection ending with an error: the level to log at
 /// and what to say. A server error names its SQLSTATE and message (a bare `db error` hid both); an
-/// [`EXPECTED_SERVER_CLOSES`] close is INFO, everything else ERROR.
+/// [`EXPECTED_SERVER_CLOSES`] close is INFO, everything else ERROR. Any other error names its cause.
 fn connection_end(error: &tokio_postgres::Error) -> (tracing::Level, String) {
     match error.as_db_error() {
         Some(db) => {
@@ -261,7 +261,18 @@ fn connection_end(error: &tokio_postgres::Error) -> (tracing::Level, String) {
                 if EXPECTED_SERVER_CLOSES.contains(&code) { tracing::Level::INFO } else { tracing::Level::ERROR };
             (level, format!("{} {code}: {}", db.severity(), db.message()))
         }
-        None => (tracing::Level::ERROR, error.to_string()),
+        None => {
+            // tokio-postgres displays only the error's kind ("error communicating with the server");
+            // the cause, such as a reset or a TLS alert, is in its source chain.
+            let mut detail = error.to_string();
+            let mut source = std::error::Error::source(error);
+            while let Some(cause) = source {
+                detail.push_str(": ");
+                detail.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            (tracing::Level::ERROR, detail)
+        }
     }
 }
 

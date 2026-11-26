@@ -159,11 +159,13 @@ async fn a_server_side_close_names_its_sqlstate_at_the_right_level() -> Result<(
     Ok(())
 }
 
-/// A connection ending without a server error (an I/O failure, a protocol error) stays ERROR.
+/// A connection ending without a server error (an I/O failure, a protocol error) stays ERROR, and
+/// names its cause from the error's source chain rather than only the error's kind.
 #[test]
-fn a_close_without_a_server_error_stays_an_error() {
+fn a_close_without_a_server_error_stays_an_error_and_names_its_cause() {
     let error = "port=notaport".parse::<tokio_postgres::Config>().expect_err("not a port");
+    let cause = std::error::Error::source(&error).expect("a config error carries its cause").to_string();
     let (level, detail) = connection_end(&error);
     assert_eq!(level, tracing::Level::ERROR);
-    assert_eq!(detail, error.to_string());
+    assert_eq!(detail, format!("{error}: {cause}"));
 }
