@@ -617,14 +617,16 @@ H1_DATA_ACCOUNTS = [*range(19), *range(20, 51)]
 
 
 def h1_lists(gateway, ordinal):
-    from data import row_id
+    """One synthetic account's lists: its own home Space (unique, as every prod account has one),
+    0-2 of the 50 Spaces that hold Records (so about 1-3 Spaces in all), and two Records shared with
+    it alone. Every account's filter therefore differs, so the engine cannot fold two into one shape."""
     record_sync = gateway.loader.module("api.models.record_sync_authority")
-    spaces = [H1_DATA_ACCOUNTS[(ordinal * step) % len(H1_DATA_ACCOUNTS)] for step in (1, 7, 13)][: 1 + ordinal % 3]
-    owner = H1_DATA_ACCOUNTS[(ordinal * 11 + 5) % len(H1_DATA_ACCOUNTS)]
+    data_spaces = [H1_DATA_ACCOUNTS[(ordinal * step) % len(H1_DATA_ACCOUNTS)] for step in (1, 7)][: ordinal % 3]
+    spaces = {UUID(str(synthetic_id(f"h1-home/{ordinal}")))} | {UUID(str(synthetic_id(f"space/{account}"))) for account in data_spaces}
     return record_sync.KeyedAudienceLists(
-        space_ids=tuple(sorted({UUID(str(synthetic_id(f"space/{account}"))) for account in spaces})),
+        space_ids=tuple(sorted(spaces)),
         partner_space_ids=(), calendar_ids=(), partner_calendar_ids=(),
-        shared_record_ids=tuple(UUID(str(row_id("record", owner, index))) for index in (ordinal % 19, ordinal % 19 + 1)),
+        shared_record_ids=tuple(UUID(str(synthetic_id(f"h1-shared/{ordinal}/{index}"))) for index in range(2)),
         shared_resource_ids=(), generation=f"h1-{ordinal}",
     )
 
