@@ -142,3 +142,47 @@ Same-runner S for the keyed-all jobs:
 | Main today (keyed flags on) | None within 1.1× S. 1 event per commit serves everyone; 10 is the largest with a 2–3 s receipt but loses drains | 139 s at 1, 102 s at 10 | 23 min at 1, 17 min at 10 |
 | Main today, flags off | Same | 160 s at 1, 116 s at 10 | 27 min at 1, 19 min at 10 |
 | Keyed-all | 100 events (600 tracked rows) or more: receipt 0.16 / 0.30 s, every reader served, bystander p95 a few hundredths of a second (1.0–2.5× S's) | about 1.5 s | about 15 s |
+
+## 2 CPU
+
+Actions run `45878203381`, harness `69e396a` (`[paired-13]`). The same paced first import of 1,000
+events at 1 and 10 events per commit, the same bystander load (S-main3's full catalog), Nov 24
+catalog, engine `9bc1563`, 50 ms receipt polling.
+
+**How the engine gets 2 CPUs.** `run.py --cpus 2` starts it under systemd with `CPUQuota=200%`
+from process start, on 4-core runners. That is how `--cpus 1` pins 1 CPU (`CPUQuota=100%`), and
+each run's `cpu.max` records the quota. Prod's 7 GB memory is not limited in the harness.
+
+**Pairing.** Each job ran S and both of main's flag states on one runner, and a second job reversed
+the order. I can't read prod's flag state from here (no prod access), so both are reported.
+
+**The bar** for other readers: no timeouts, and drain, subset and live-change p95 each under 0.5 s.
+
+| Events per commit (tracked rows) | Lowering | Runner | Timeouts (all probes) | Drain p95 s | Subset p95 s | Live p95 s | CPU % (one core) | Sequencer held peak / longest | Receipt p50 / p95 s | Bar |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 1 (6) | S | EPYC 7763 | 0 | 0.03 | 0.01 | 0.03 | 5 | 0 B / 0 s | 0.05 / 0.05 | **pass** |
+| 1 (6) | main, flags off | EPYC 7763 | 0 | 0.42 | 0.02 | 0.36 | 86 | 0 B / 0 s | 0.26 / 0.42 | **pass** |
+| 1 (6) | main, keyed flags on | EPYC 7763 | 0 | 0.34 | 0.02 | 0.36 | 92 | 0 B / 0 s | 0.31 / 0.41 | **pass** |
+| 1 (6) | main, keyed flags on | Xeon 6975P-C | 0 | 0.33 | 0.01 | 0.22 | 88 | 0 B / 0 s | 0.16 / 0.26 | **pass** |
+| 1 (6) | main, flags off | Xeon 6975P-C | 0 | 0.33 | 0.01 | 0.25 | 84 | 0 B / 0 s | 0.19 / 0.31 | **pass** |
+| 1 (6) | S | Xeon 6975P-C | 0 | 0.03 | 0.01 | 0.02 | 4 | 0 B / 0 s | 0.05 / 0.05 | **pass** |
+| 10 (60) | S | EPYC 9V45 | 0 | 0.03 | 0.01 | 0.03 | 6 | 0 B / 0 s | 0.05 / 0.05 | **pass** |
+| 10 (60) | main, flags off | EPYC 9V45 | 0 | 1.55 | 0.01 | 1.49 | 102 | 0 B / 0 s | 1.59 / 1.73 | fail |
+| 10 (60) | main, keyed flags on | EPYC 9V45 | 0 | 1.15 | 0.01 | 1.13 | 103 | 0 B / 0 s | 1.22 / 1.28 | fail |
+| 10 (60) | main, keyed flags on | Xeon 6975P-C | 0 | 1.54 | 0.01 | 1.44 | 102 | 0 B / 0 s | 1.53 / 1.64 | fail |
+| 10 (60) | main, flags off | Xeon 6975P-C | 4 | 1.95 | 0.01 | 1.89 | 101 | 0 B / 0 s | 1.02 / 2.00 | fail |
+| 10 (60) | S | Xeon 6975P-C | 0 | 0.02 | 0.01 | 0.02 | 7 | 0 B / 0 s | 0.05 / 0.05 | **pass** |
+
+**At 1 event per commit, both flag states pass at 2 CPUs on both runners.** There are no timeouts;
+drain p95 is 0.33–0.42 s, live-change p95 0.22–0.36 s, and subset p95 0.01–0.02 s. On 1 CPU the
+same cell measured drain p95 0.38–0.48 s, live 0.28–0.47 s and subset 0.19–0.26 s. The second CPU
+helps subsets the most. Drains and live changes gain only about 0.05–0.1 s, because the engine's
+serialized membership path still uses about one core (84–92% of one core under a 200% quota). The
+margin under 0.5 s stays thin: 0.08–0.17 s on drains.
+
+**At 10 events per commit, both fail at 2 CPUs.** With the keyed flags on there are no timeouts,
+but drain p95 is 1.15–1.54 s. With flags off, one runner also times out 2 drains and 2 live
+changes. Receipts take 1.0–1.6 s at p50 and 1.3–2.0 s at p95. The engine sits at 101–103% of one
+core.
+
+The sequencer-held gauges stayed at 0 throughout.
