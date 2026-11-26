@@ -191,7 +191,7 @@ impl PgConnectionConfig {
                 check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
-                        tracing::error!("postgres connection error: {error}");
+                        log_connection_end("postgres connection", &error);
                     }
                 });
                 Ok(client)
@@ -203,7 +203,7 @@ impl PgConnectionConfig {
                 check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
-                        tracing::error!("postgres TLS connection error: {error}");
+                        log_connection_end("postgres TLS connection", &error);
                     }
                 });
                 Ok(client)
@@ -242,6 +242,35 @@ impl PgConnectionConfig {
             // text the walsender prints, and the replication connection has never been given the
             // URL's options, which were written for query sessions.
             .with_options(SESSION_OPTIONS))
+    }
+}
+
+/// SQLSTATEs a server sends when it ends a session on purpose: `57P05` when the session sat idle
+/// past `idle_session_timeout`, `57P01` when an administrator (or `pg_terminate_backend`) ended it.
+/// Neither means the engine or the network is broken; the next checkout simply dials again.
+const EXPECTED_SERVER_CLOSES: &[&str] = &["57P05", "57P01"];
+
+/// How a query connection's task reports the connection ending with an error: the level to log at
+/// and what to say. A server error names its SQLSTATE and message (a bare `db error` hid both); an
+/// [`EXPECTED_SERVER_CLOSES`] close is INFO, everything else ERROR.
+fn connection_end(error: &tokio_postgres::Error) -> (tracing::Level, String) {
+    match error.as_db_error() {
+        Some(db) => {
+            let code = db.code().code();
+            let level =
+                if EXPECTED_SERVER_CLOSES.contains(&code) { tracing::Level::INFO } else { tracing::Level::ERROR };
+            (level, format!("{} {code}: {}", db.severity(), db.message()))
+        }
+        None => (tracing::Level::ERROR, error.to_string()),
+    }
+}
+
+fn log_connection_end(what: &str, error: &tokio_postgres::Error) {
+    let (level, detail) = connection_end(error);
+    if level == tracing::Level::INFO {
+        tracing::info!("{what} closed by the server: {detail}");
+    } else {
+        tracing::error!("{what} error: {detail}");
     }
 }
 
@@ -587,6 +616,22 @@ pub(crate) fn configured_pool_size() -> usize {
     *POOL_SIZE.get_or_init(|| 20)
 }
 
+/// How long a [`Pool`] keeps an idle connection for reuse when `ELECTRIC_DB_POOL_IDLE_SECS` is unset:
+/// 30 minutes, well inside the 2-hour `idle_session_timeout` prod Postgres ends idle sessions at.
+pub const DEFAULT_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Idle limit per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_IDLE_SECS`.
+static POOL_IDLE: OnceLock<std::time::Duration> = OnceLock::new();
+
+/// Host-wide idle limit; a connection idle longer than this is retired at checkout, not reused.
+pub fn set_pool_idle(idle: std::time::Duration) {
+    let _ = POOL_IDLE.set(idle);
+}
+
+pub(crate) fn configured_pool_idle() -> std::time::Duration {
+    *POOL_IDLE.get_or_init(|| DEFAULT_POOL_IDLE)
+}
+
 fn spawn_connection(
     owner: Option<&crate::shutdown::ShutdownToken>,
     future: impl std::future::Future<Output = ()> + Send + 'static,
@@ -653,6 +698,9 @@ struct PoolInner {
     shutdown: crate::shutdown::ShutdownToken,
     url: String,
     idle: std::sync::Mutex<Vec<Client>>,
+    /// How long a connection may sit in `idle` and still be reused (`ELECTRIC_DB_POOL_IDLE_SECS`).
+    #[allow(dead_code)]
+    idle_limit: std::time::Duration,
     sem: Arc<tokio::sync::Semaphore>,
     /// The checkout cap `sem` was created with, so [`Pool::in_use`] can report occupancy.
     size: usize,
@@ -664,10 +712,15 @@ struct PoolInner {
 
 impl Pool {
     pub fn new(url: String, size: usize) -> Pool {
-        Self::owned(url, size, crate::shutdown::ShutdownToken::new())
+        Self::owned(url, size, configured_pool_idle(), crate::shutdown::ShutdownToken::new())
     }
 
-    pub(crate) fn owned(url: String, size: usize, shutdown: crate::shutdown::ShutdownToken) -> Pool {
+    pub(crate) fn owned(
+        url: String,
+        size: usize,
+        idle_limit: std::time::Duration,
+        shutdown: crate::shutdown::ShutdownToken,
+    ) -> Pool {
         let pool = Pool {
             inner: Arc::new(PoolInner {
                 sequenced: Arc::new(SequencedXids::owned(
@@ -679,6 +732,7 @@ impl Pool {
                 shutdown,
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
+                idle_limit,
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
                 size: size.max(1),
             }),
@@ -2665,6 +2719,9 @@ pub fn lsn_to_u64(lsn: &str) -> u64 {
         None => 0,
     }
 }
+
+#[cfg(test)]
+mod pool_idle_tests;
 
 #[cfg(test)]
 mod ownership_tests {
