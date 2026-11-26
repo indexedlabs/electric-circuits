@@ -686,7 +686,8 @@ pub struct CheckoutTiming {
     pub last: Option<QueryPhase>,
 }
 
-/// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
+/// A small connection pool: at most `size` concurrent checkouts, idle connections reused until they
+/// have been idle longer than the pool's idle limit, after which a checkout closes them and dials.
 /// Backfills/query-backs mark their explicit transaction bracket, so check-in only rolls back a
 /// checkout that may actually have left a transaction open or aborted.
 #[derive(Clone)]
@@ -697,9 +698,11 @@ pub struct Pool {
 struct PoolInner {
     shutdown: crate::shutdown::ShutdownToken,
     url: String,
-    idle: std::sync::Mutex<Vec<Client>>,
-    /// How long a connection may sit in `idle` and still be reused (`ELECTRIC_DB_POOL_IDLE_SECS`).
-    #[allow(dead_code)]
+    /// Connections waiting for reuse, each with when it went idle, oldest first ([`Self::check_in`]
+    /// stamps under the lock, so a push never lands before an older one).
+    idle: std::sync::Mutex<Vec<(Client, std::time::Instant)>>,
+    /// How long a connection may sit in `idle` and still be reused (`ELECTRIC_DB_POOL_IDLE_SECS`). Past
+    /// it the pool closes the connection itself, before the server's `idle_session_timeout` does.
     idle_limit: std::time::Duration,
     sem: Arc<tokio::sync::Semaphore>,
     /// The checkout cap `sem` was created with, so [`Pool::in_use`] can report occupancy.
@@ -804,8 +807,7 @@ impl PoolInner {
         timing.slot_wait = started.elapsed();
         timing.in_progress = None;
         let permit = permit.context("pg pool closed")?;
-        let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
-        let client = match reused {
+        let client = match self.take_idle() {
             Some(c) => c,
             None => {
                 let dialing = std::time::Instant::now();
@@ -818,6 +820,34 @@ impl PoolInner {
             }
         };
         Ok((client, permit))
+    }
+
+    /// Return a healthy connection to the idle list, stamped with when it went idle.
+    fn check_in(&self, client: Client) {
+        let mut idle = self.idle.lock().unwrap();
+        idle.push((client, std::time::Instant::now()));
+    }
+
+    /// The most recently returned idle connection, unless it has closed. Connections idle longer
+    /// than `idle_limit` are taken out and dropped first, which ends their sessions cleanly from this
+    /// side (the connection task sees its client gone and finishes without an error).
+    fn take_idle(&self) -> Option<Client> {
+        let now = std::time::Instant::now();
+        let (newest, expired) = {
+            let mut idle = self.idle.lock().unwrap();
+            let stale = idle.partition_point(|(_, since)| now.saturating_duration_since(*since) > self.idle_limit);
+            let expired: Vec<_> = idle.drain(..stale).collect();
+            (idle.pop(), expired)
+        };
+        if !expired.is_empty() {
+            tracing::debug!(
+                retired = expired.len(),
+                "pg pool: closing connections idle longer than {:?}",
+                self.idle_limit
+            );
+        }
+        drop(expired);
+        newest.map(|(client, _)| client).filter(|c| !c.is_closed())
     }
 }
 
@@ -859,7 +889,7 @@ impl PooledClient {
             && !client.is_closed()
             && !self.inner.sem.is_closed()
         {
-            self.inner.idle.lock().unwrap().push(client);
+            self.inner.check_in(client);
         }
         self.permit = None;
     }
@@ -883,7 +913,7 @@ impl Drop for PooledClient {
             return; // permit drops here, freeing the slot
         }
         if !self.transaction_open.load(Ordering::SeqCst) {
-            self.inner.idle.lock().unwrap().push(client);
+            self.inner.check_in(client);
             return;
         }
         let inner = self.inner.clone();
@@ -894,7 +924,7 @@ impl Drop for PooledClient {
         // so a rare warning is preferable to reusing a connection whose state is uncertain.
         self.inner.shutdown.spawn(async move {
             if client.batch_execute("ROLLBACK").await.is_ok() && !inner.sem.is_closed() {
-                inner.idle.lock().unwrap().push(client);
+                inner.check_in(client);
             }
             drop(permit);
         });

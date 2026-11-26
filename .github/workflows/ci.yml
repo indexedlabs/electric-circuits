@@ -59,6 +59,8 @@ jobs:
           cargo test -p electric-circuits-engine --features test-support --lib ingest_projection_real_postgres -- --ignored
           # A group load's members reading concurrently on one exported snapshot.
           cargo test -p electric-circuits-engine --features test-support --lib pg::subset_batch_tests -- --ignored
+          # The pool retires connections idle past its limit; a server-side close names its SQLSTATE.
+          cargo test -p electric-circuits-engine --features test-support --lib pg::pool_idle_tests -- --ignored
           # Boot never parks REPLICA IDENTITY FULL behind a reader of the table.
           cargo test -p electric-circuits-engine --features test-support --lib engine::boot_identity_tests -- --ignored
 
