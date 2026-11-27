@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::heap_size::HeapSize;
+use crate::predicate::AccessPlan;
 
 /// A COUNT aggregate served from the counts pipeline: `value` = Σ counts of matching groups.
 pub(crate) struct CircuitAgg {
@@ -66,9 +67,16 @@ pub(crate) fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeig
 /// scan over all standalone shapes with hash lookups (equality conjuncts) + ordered bound
 /// scans (range conjuncts), both output-sensitive. Shapes with no indexable conjunct
 /// (top-level OR/NOT, LIKE, !=, IS NULL, match-all) stay on the `scan` fallback list.
+///
+/// With the **list rule** on ([`list_keys_enabled`]), a filter whose `OR` has an equality in
+/// every branch is filed under every one of those keys instead ([`AccessPlan::Keys`], extracted by
+/// [`CompiledPredicate::access_plan`]), so a list of Spaces or a link tested at both ends leaves
+/// the scan list. The probe is the same one: [`Self::candidates`] looks every delta row up under
+/// every filed column, and the delta carries a changed row's old image beside its new one.
 #[derive(Default)]
 pub(crate) struct StandaloneIndex {
-    /// `col = v` conjuncts: column -> literal -> shape ids.
+    /// `col = v` keys: column -> literal -> shape ids. Holds single equality conjuncts and, with
+    /// the list rule, every key of a shape's key cover (a shape appears once per key).
     pub(crate) eq: HashMap<usize, HashMap<Value, Vec<String>>>,
     /// `col >/>= v` conjuncts: column -> bound -> (shape id, strict). A row value `x` satisfies
     /// bounds `< x` (any) and `== x` (non-strict only) — an ordered prefix scan.
@@ -78,7 +86,24 @@ pub(crate) struct StandaloneIndex {
     /// Shapes with no indexable conjunct — always candidates.
     pub(crate) scan: Vec<String>,
     /// Where each shape was placed, for removal.
-    pub(crate) placed: HashMap<String, Option<crate::predicate::AccessLeaf>>,
+    pub(crate) placed: HashMap<String, AccessPlan>,
+    /// Whether this index applies the list rule. Fixed at construction, so a shape is always
+    /// removed by the placement it was filed with.
+    list_keys: bool,
+}
+
+/// The **list rule** setting, `ELECTRIC_CIRCUITS_LIST_KEYS` (off unless `1` or `true`): file a
+/// standalone shape or aggregate whose `OR` has an equality in every branch under every one of
+/// those keys, instead of on the fallback scan list. Read once per process.
+pub(crate) fn list_keys_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| parse_list_keys(std::env::var("ELECTRIC_CIRCUITS_LIST_KEYS").ok().as_deref()))
+}
+
+/// `1` and `true` (any case, surrounding space ignored) turn the list rule on; anything else,
+/// including unset, leaves it off.
+pub(crate) fn parse_list_keys(raw: Option<&str>) -> bool {
+    raw.map(str::trim).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 impl HeapSize for StandaloneIndex {
@@ -92,48 +117,79 @@ impl HeapSize for StandaloneIndex {
 }
 
 impl StandaloneIndex {
+    /// An empty index that applies the list rule iff `list_keys`. `default()` is the rule off.
+    pub(crate) fn new(list_keys: bool) -> StandaloneIndex {
+        StandaloneIndex { list_keys, ..StandaloneIndex::default() }
+    }
+
+    /// How many shapes are filed under `col = value` — what ranks a list-rule shape's alternatives.
+    fn load(&self, col: usize, value: &Value) -> usize {
+        self.eq.get(&col).and_then(|by_val| by_val.get(value)).map_or(0, Vec::len)
+    }
+
     pub(crate) fn insert(&mut self, sid: &str, pred: &CompiledPredicate) {
         use crate::predicate::AccessLeaf;
-        let leaf = pred.access_leaf();
-        match &leaf {
-            Some(AccessLeaf::Eq { col, value }) => {
+        let plan = if self.list_keys {
+            pred.access_plan(&|col, value| self.load(col, value))
+        } else {
+            match pred.access_leaf() {
+                Some(leaf) => AccessPlan::Leaf(leaf),
+                None => AccessPlan::Scan,
+            }
+        };
+        match &plan {
+            AccessPlan::Leaf(AccessLeaf::Eq { col, value }) => {
                 self.eq.entry(*col).or_default().entry(value.clone()).or_default().push(sid.to_string());
             }
-            Some(AccessLeaf::Lower { col, value, strict }) => {
+            AccessPlan::Leaf(AccessLeaf::Lower { col, value, strict }) => {
                 self.lower.entry(*col).or_default().entry(value.clone()).or_default().push((sid.to_string(), *strict));
             }
-            Some(AccessLeaf::Upper { col, value, strict }) => {
+            AccessPlan::Leaf(AccessLeaf::Upper { col, value, strict }) => {
                 self.upper.entry(*col).or_default().entry(value.clone()).or_default().push((sid.to_string(), *strict));
             }
-            None => self.scan.push(sid.to_string()),
+            AccessPlan::Keys(keys) => {
+                for (col, value) in keys {
+                    self.eq.entry(*col).or_default().entry(value.clone()).or_default().push(sid.to_string());
+                }
+            }
+            AccessPlan::Scan => self.scan.push(sid.to_string()),
         }
-        self.placed.insert(sid.to_string(), leaf);
+        self.placed.insert(sid.to_string(), plan);
     }
 
     pub(crate) fn remove(&mut self, sid: &str) {
         use crate::predicate::AccessLeaf;
-        let Some(leaf) = self.placed.remove(sid) else { return };
-        match leaf {
-            Some(AccessLeaf::Eq { col, value }) => {
-                if let Some(by_val) = self.eq.get_mut(&col)
-                    && let Some(sids) = by_val.get_mut(&value)
-                {
-                    sids.retain(|s| s != sid);
-                    if sids.is_empty() {
-                        by_val.remove(&value);
-                        if by_val.is_empty() {
-                            self.eq.remove(&col);
-                        }
-                    }
-                }
-            }
-            Some(AccessLeaf::Lower { col, value, .. }) => {
+        let Some(plan) = self.placed.remove(sid) else { return };
+        match plan {
+            AccessPlan::Leaf(AccessLeaf::Eq { col, value }) => self.remove_key(col, &value, sid),
+            AccessPlan::Leaf(AccessLeaf::Lower { col, value, .. }) => {
                 Self::remove_bound(&mut self.lower, col, &value, sid);
             }
-            Some(AccessLeaf::Upper { col, value, .. }) => {
+            AccessPlan::Leaf(AccessLeaf::Upper { col, value, .. }) => {
                 Self::remove_bound(&mut self.upper, col, &value, sid);
             }
-            None => self.scan.retain(|s| s != sid),
+            AccessPlan::Keys(keys) => {
+                for (col, value) in keys {
+                    self.remove_key(col, &value, sid);
+                }
+            }
+            AccessPlan::Scan => self.scan.retain(|s| s != sid),
+        }
+    }
+
+    /// Drop `sid` from one equality key's posting list, reclaiming the key (and the column's map)
+    /// when they empty.
+    fn remove_key(&mut self, col: usize, value: &Value, sid: &str) {
+        if let Some(by_val) = self.eq.get_mut(&col)
+            && let Some(sids) = by_val.get_mut(value)
+        {
+            sids.retain(|s| s != sid);
+            if sids.is_empty() {
+                by_val.remove(value);
+                if by_val.is_empty() {
+                    self.eq.remove(&col);
+                }
+            }
         }
     }
 

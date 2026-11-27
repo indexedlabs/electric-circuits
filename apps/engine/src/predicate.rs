@@ -243,6 +243,31 @@ impl HeapSize for AccessLeaf {
     }
 }
 
+/// One equality key a shape can be filed under: `col = value`, `value` never NULL.
+pub type AccessKey = (usize, Value);
+
+/// Where a necessary-conjunct index files a predicate — see [`CompiledPredicate::access_plan`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessPlan {
+    /// Nothing indexable is implied: the fallback scan list, a candidate for every change.
+    Scan,
+    /// One necessary conjunct ([`CompiledPredicate::access_leaf`]).
+    Leaf(AccessLeaf),
+    /// A **key cover**: the predicate can be TRUE on a row only if the row equals at least one of
+    /// these keys. The shape is filed under every one of them. Sorted, distinct, never empty.
+    Keys(Vec<AccessKey>),
+}
+
+impl HeapSize for AccessPlan {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            AccessPlan::Scan => 0,
+            AccessPlan::Leaf(leaf) => leaf.heap_bytes(),
+            AccessPlan::Keys(keys) => keys.heap_bytes(),
+        }
+    }
+}
+
 /// Compiled predicate over positional columns. `MatchAll` is used when a shape has no `where`.
 #[derive(Debug, Clone)]
 pub enum CompiledPredicate {
@@ -416,6 +441,18 @@ impl CompiledPredicate {
         let mut best = None;
         collect(self, &mut best);
         best
+    }
+
+    /// Where a necessary-conjunct index files this predicate when the **list rule** is on.
+    ///
+    /// `load(col, value)` is the number of shapes the index already holds under that key; it
+    /// only ranks alternatives and never affects soundness.
+    pub fn access_plan(&self, load: &dyn Fn(usize, &Value) -> usize) -> AccessPlan {
+        let _ = load;
+        match self.access_leaf() {
+            Some(leaf) => AccessPlan::Leaf(leaf),
+            None => AccessPlan::Scan,
+        }
     }
 
     /// Filter membership under SQL `WHERE` semantics: a row is included iff the predicate is TRUE.

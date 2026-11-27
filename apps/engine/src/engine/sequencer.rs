@@ -286,11 +286,11 @@ impl TableExec {
         TableExec {
             ts,
             shapes: HashMap::new(),
-            shape_index: StandaloneIndex::default(),
+            shape_index: StandaloneIndex::new(list_keys_enabled()),
             families: HashMap::new(),
             family_of: HashMap::new(),
             aggregates: HashMap::new(),
-            agg_index: StandaloneIndex::default(),
+            agg_index: StandaloneIndex::new(list_keys_enabled()),
             circuit_aggs: HashMap::new(),
             pending: HashMap::new(),
             envelopes_total: 0,

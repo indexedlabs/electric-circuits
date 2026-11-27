@@ -355,6 +355,9 @@ pub struct StateSnapshot {
 pub struct TableStats {
     pub families: Vec<FamilyStat>,
     pub standalone: usize,
+    /// Standalone shapes on the fallback scan list: every change to the table is checked against
+    /// each of them. The rest of `standalone` is filed under a necessary conjunct or key cover.
+    pub scan: usize,
     /// Circuit-served shapes + aggregates on this table.
     #[serde(default)]
     pub circuit: usize,
@@ -672,7 +675,12 @@ pub(crate) fn stats_of(exec: &TableExec) -> TableStats {
     let mut fams: Vec<FamilyStat> =
         exec.families.iter().map(|(k, f)| FamilyStat { key_cols: k.clone(), shapes: f.member_count() }).collect();
     fams.sort_by(|a, b| a.key_cols.cmp(&b.key_cols));
-    TableStats { families: fams, standalone: exec.shapes.len(), circuit: exec.circuit_aggs.len() }
+    TableStats {
+        families: fams,
+        standalone: exec.shapes.len(),
+        scan: exec.shape_index.scan.len(),
+        circuit: exec.circuit_aggs.len(),
+    }
 }
 
 /// Owned-heap estimate of one table's executor structures: standalone shapes + their
