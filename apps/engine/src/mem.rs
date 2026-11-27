@@ -861,6 +861,12 @@ pub(crate) fn init_otel(
         sequencer_orphan_fragments,
         ""
     );
+    engine_counter!(
+        "engine_node_state_builds",
+        "Times the sequencer built the visualizer's node-state map (an entry per shape)",
+        node_state_builds,
+        ""
+    );
     engine_gauge!(
         "engine_changes_segments_retained",
         "Change-log segments that exist right now",

@@ -203,6 +203,7 @@ pub(crate) fn spawn_sequencer(
 /// Rebuild + publish the merged node-state map and per-table stats to the sequencer's shared
 /// handles and, when anyone is subscribed to `/trace`, broadcast the merged map (plus the
 /// subquery registry's summaries) as a `{"type":"state"}` event.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish_all(
     execs: &HashMap<String, TableExec>,
     offset: &str,
@@ -211,9 +212,11 @@ pub(crate) async fn publish_all(
     node_states: &std::sync::Mutex<HashMap<String, NodeStateSummary>>,
     subqueries: &Arc<Mutex<SubqueryRegistry>>,
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+    metrics: &crate::metrics::Metrics,
 ) {
     let mut stats_map = HashMap::new();
     let mut merged: HashMap<String, NodeStateSummary> = HashMap::new();
+    metrics.node_state_builds.fetch_add(1, Ordering::Relaxed);
     for exec in execs.values() {
         stats_map.insert(exec.ts.table.clone(), stats_of(exec));
         merged.extend(build_node_states(
@@ -573,7 +576,7 @@ pub(crate) async fn sequencer_loop(
                         tracing::error!("activate_shape failed: {e:#}");
                     }
                     let _ = ready.send(res);
-                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx, ds.metrics()).await;
                 }
                 Some(SequencerCmd::AbortShape { table, shape_id }) => {
                     if let Some(exec) = execs.get_mut(table.as_str()) {
@@ -617,7 +620,7 @@ pub(crate) async fn sequencer_loop(
                         emitted.remove(&shape_id);
                     }
                     let _ = resp.send(gate.map(|g| (published(&pos, &held_from), g)));
-                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx, ds.metrics()).await;
                 }
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
                     if let Some(exec) = execs.get_mut(table.as_str()) {
@@ -645,7 +648,7 @@ pub(crate) async fn sequencer_loop(
                         }
                     }
                     emitted.remove(&shape_id);
-                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx, ds.metrics()).await;
                 }
                 Some(SequencerCmd::Barrier { done }) => {
                     let _ = done.send(());
@@ -663,7 +666,7 @@ pub(crate) async fn sequencer_loop(
                     if execs.remove(table.as_str()).is_some() {
                         tracing::warn!("sequencer: dropped the executor for '{table}' (schema drift)");
                     }
-                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx, ds.metrics()).await;
                 }
                 Some(SequencerCmd::CreateCircuitAgg { table, shape_id, stream_path, constraints, ready }) => {
                     let res = create_circuit_agg(
@@ -675,7 +678,7 @@ pub(crate) async fn sequencer_loop(
                         emitted.insert(shape_id.clone(), 1);
                     }
                     let _ = ready.send(res.map_err(|e| format!("{e:#}")));
-                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                    publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx, ds.metrics()).await;
                 }
                 Some(SequencerCmd::DumpNode { table, node_id, resp }) => {
                     let val =
@@ -1125,7 +1128,7 @@ pub(crate) async fn sequencer_loop(
                         catalog_tx.send(CatalogEvent::Offset { pos: ckpt, highwater, groups });
                     }
                     if touched {
-                        publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+                        publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx, ds.metrics()).await;
                     }
                 }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
@@ -3461,6 +3464,54 @@ mod held_spill_tests {
         assert_eq!(h.engine.source_drain_receipt("commit-1").unwrap().commit_lsn, "0/10");
         assert_eq!(h.processed.lock().unwrap().offset, "p2");
         assert!(h.files().is_empty(), "completed transaction scratch must be removed");
+    }
+
+    /// The `{"type":"state"}` events waiting on a `/trace` subscription, oldest first.
+    fn state_events(trace: &mut tokio::sync::broadcast::Receiver<Arc<String>>) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        while let Ok(json) = trace.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&json).unwrap();
+            if event["type"] == "state" {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// OTTO-14463: the node-state map has an entry per shape, so building it costs time in
+    /// proportion to every shape the engine holds. The sequencer builds it only for a reader. With
+    /// nobody on `/trace`, creating a shape and processing commit pages must not build it; while a
+    /// subscriber is connected every page sends it the current map; and the building stops again
+    /// when the subscriber leaves.
+    #[tokio::test]
+    async fn node_states_are_built_after_a_page_only_while_trace_has_a_subscriber() {
+        let mut h = Harness::new(u64::MAX);
+        let builds = |h: &Harness| h.engine.metrics.node_state_builds.load(Ordering::Relaxed);
+        h.shape().await;
+        let start = LogPosition::start_of(0);
+        h.page(&start.offset, "p1", vec![change("1", "0/10", 0, true)]).await;
+        h.page("p1", "p2", vec![change("2", "0/20", 0, true)]).await;
+        assert_eq!(h.output().len(), 2, "the shape received both commits");
+        assert_eq!(builds(&h), 0, "nobody is reading: a new shape and two commit pages must not build the map");
+
+        let mut trace = h.engine.trace_tx.subscribe();
+        h.page("p2", "p3", vec![change("3", "0/30", 0, true)]).await;
+        assert_eq!(builds(&h), 1, "one build for the one page processed while subscribed");
+        let events = state_events(&mut trace);
+        assert_eq!(events.len(), 1, "one state event for that page: {events:?}");
+        let nodes = &events[0]["nodes"];
+        assert_eq!(
+            nodes["table:public.items"],
+            serde_json::json!({"kind": "table", "processedOffset": "changes/0@p3", "envelopes": 3}),
+            "the event carries the state as of the page just processed, not as of the subscription"
+        );
+        assert_eq!(nodes["shape:s1"], serde_json::json!({"kind": "shape", "emitted": 3}));
+        assert_eq!(nodes["filter:s1"], serde_json::json!({"kind": "filter", "emitted": 3}));
+
+        drop(trace);
+        h.page("p3", "p4", vec![change("4", "0/40", 0, true)]).await;
+        assert_eq!(h.output().len(), 4, "the shape still receives commits");
+        assert_eq!(builds(&h), 1, "the subscriber left: the next page must not build the map");
     }
 
     #[tokio::test]
