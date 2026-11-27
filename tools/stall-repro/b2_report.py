@@ -34,12 +34,13 @@ def counted(entry, has_scan):
     families = sum(family["shapes"] for family in after["families"]) - sum(family["shapes"] for family in before["families"])
     standalone = after["standalone"] - before["standalone"]
     if families == 1 and standalone == 0:
-        return "family +1 (an equality family: hash lookup by key)", "family"
+        key = [family["key_cols"] for family in after["families"]][0]
+        return f"equality family +1 (key column {key[0]}), standalone +0", "family"
     if standalone == 1 and has_scan:
         scan = after.get("scan", 0) - before.get("scan", 0)
-        return (f"standalone +1, scan +{scan}: " + ("on the scan list" if scan else "filed under an equality or range, not on the scan list")), "scan" if scan else "filed"
+        return (f"standalone +1, scan +{scan}: " + ("on the scan list" if scan else "filed, not on the scan list")), "scan" if scan else "filed"
     if standalone == 1:
-        return "standalone +1 (this binary does not say filed or scan list)", "standalone"
+        return "standalone +1", "standalone"
     return f"families {families:+d}, standalone {standalone:+d}", None
 
 
@@ -60,8 +61,8 @@ def cost(root, flag, readers, table):
 def main(root):
     main_counts = {flag: placement(root, "main46d", flag) for flag in ("off", "on")}
     prod_counts = {flag: placement(root, "prod9bc", flag) for flag in ("off", "on")}
-    print("| Collection | Single key | Expected placement | Observed on main (counts) | Observed on 9bc1563 (counts) | Observed on 9bc1563 (cost, 40 → 1,000 readers; median of 3 commits, s) | Match |")
-    print("| --- | --- | --- | --- | --- | --- | --- |")
+    print("| Collection | Single key | Expected placement | Observed on main (counts) | Observed on 9bc1563 (cost, 40 → 1,000 readers) | Match |")
+    print("| --- | --- | --- | --- | --- | --- |")
     matches, misses = 0, []
     for entry in filters():
         table = entry["table"]
@@ -73,7 +74,7 @@ def main(root):
             if small and large:
                 low, high = statistics.median(small), statistics.median(large)
                 grows = high - low >= GROWS_S and high >= low * GROWS_RATIO
-                cost_words = f"{low:.2f} → {high:.2f} ({min(large):.2f}–{max(large):.2f}): " + ("grows with readers" if grows else "flat")
+                cost_words = f"{low:.2f} s → {high:.2f} s: " + ("grows" if grows else "flat") + f"; its count: {prod_words}"
             else:
                 grows, cost_words = None, "not observed"
             if expected.startswith("scan list"):
@@ -86,7 +87,7 @@ def main(root):
             matches += ok
             if not ok:
                 misses.append(f"{table}, single key {flag}")
-            print(f"| `{table}` | {flag} | {expected} | {words} | {prod_words} | {cost_words} | {'yes: ' + reading if ok else 'NO'} |")
+            print(f"| `{table}` | {flag} | {expected} | {words} | {cost_words} | {'yes' if ok else 'NO'} |")
     print(f"\n{matches} of {2 * len(filters())} rows match" + ("." if not misses else "; not matching: " + "; ".join(misses) + "."))
 
 
