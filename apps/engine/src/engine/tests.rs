@@ -404,6 +404,36 @@ fn node_states_cover_every_node_kind() {
     }
 }
 
+/// OTTO-14463: publishing after a page of commits must not rebuild the node-state map when nobody
+/// is on `/trace`. The rebuild walks every shape the engine holds, so at 76,000 shapes it was 70% of
+/// the engine's CPU. Per-table stats are still published every time (`GET /tables/{t}/families`
+/// reads them), and with a subscriber the map is built and broadcast as before.
+#[tokio::test]
+async fn publish_all_without_a_trace_subscriber_does_not_build_node_states() {
+    let calls = || BUILD_NODE_STATES_CALLS.with(|calls| calls.get());
+    let ts = users();
+    let mut execs = HashMap::new();
+    execs.insert(ts.table.to_string(), TableExec::new(ts.clone()));
+    let emitted = HashMap::new();
+    let stats = std::sync::Mutex::new(HashMap::new());
+    let node_states = std::sync::Mutex::new(HashMap::new());
+    let subq = test_subq();
+    let (trace_tx, receiver) = tokio::sync::broadcast::channel::<Arc<String>>(16);
+    drop(receiver);
+
+    let before = calls();
+    publish_all(&execs, "7", &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+    assert_eq!(calls() - before, 0, "no subscriber: the node-state map must not be rebuilt");
+    assert!(stats.lock().unwrap().contains_key(&ts.table), "per-table stats are still published");
+
+    let mut subscriber = trace_tx.subscribe();
+    let before = calls();
+    publish_all(&execs, "8", &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
+    assert_eq!(calls() - before, 1, "with a subscriber the map is built, once per table");
+    let event = subscriber.try_recv().expect("the state event is broadcast");
+    assert!(event.contains("table:public.users"), "{event}");
+}
+
 /// The exploded circuit decomposition is internally consistent: every edge endpoint is an
 /// emitted operator, every hop is a trace-hop id, every `state` is a `GET /state` key, shared
 /// structures (family, subquery node) are emitted once, and each strategy decomposes into its

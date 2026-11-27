@@ -555,6 +555,13 @@ pub(crate) fn arrangement_graph(
     ArrangementGraph { served: 0, fallback: 0, inputs, indexes: Vec::new(), counts, consumers }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has called [`build_node_states`]: lets a test prove a caller
+    /// did not rebuild the map (OTTO-14463).
+    pub(crate) static BUILD_NODE_STATES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rebuild the tailer's full per-node state map from its live structures. Pure so it's unit-testable;
 /// cost is O(shapes on this table) small clones, the same order as the fan-out work per batch.
 #[allow(clippy::too_many_arguments)]
@@ -569,6 +576,8 @@ pub(crate) fn build_node_states(
     circuit_aggs: &HashMap<String, CircuitAgg>,
     emitted: &HashMap<String, u64>,
 ) -> HashMap<String, NodeStateSummary> {
+    #[cfg(test)]
+    BUILD_NODE_STATES_CALLS.with(|calls| calls.set(calls.get() + 1));
     let mut out = HashMap::new();
     out.insert(
         format!("table:{}", ts.table),
