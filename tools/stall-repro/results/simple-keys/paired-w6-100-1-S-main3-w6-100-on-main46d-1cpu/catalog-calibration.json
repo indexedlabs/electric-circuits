@@ -18,7 +18,7 @@
       "bytes_circuit_integral": 0,
       "bytes_circuit_snapshots": 0,
       "bytes_electric_adapter": 0,
-      "bytes_executors": 564925,
+      "bytes_executors": 564589,
       "bytes_feed_sets": 0,
       "bytes_membership_circuit": 0,
       "bytes_pk_dict": 0,
@@ -40,19 +40,19 @@
       "tailers": 2
     },
     "process": {
-      "allocator_allocated_bytes": 24163792,
+      "allocator_allocated_bytes": 24270696,
       "allocator_config": {
         "background_thread": true,
         "dirty_decay_ms": 1000,
         "muzzy_decay_ms": 1000
       },
-      "allocator_resident_bytes": 54923264,
-      "allocator_retained_bytes": 21164032,
-      "rss_bytes": 67362816,
-      "rss_mib": 64,
-      "virtual_bytes": 632860672
+      "allocator_resident_bytes": 46305280,
+      "allocator_retained_bytes": 19288064,
+      "rss_bytes": 62693376,
+      "rss_mib": 59,
+      "virtual_bytes": 618180608
     },
-    "samples": 100
+    "samples": 99
   },
   "source_shape_requests": 100,
   "smoke_only": false

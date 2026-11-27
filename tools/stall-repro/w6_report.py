@@ -100,7 +100,7 @@ def cell(root, key, label):
             changed = step_of(folder, "w6-placement-access")
             fifth = commits(folder, ("e1-commit-r5",))
             gained = sum(entry["change"] == "gain" for entry in access["accounts"])
-            print(f"| Access changes | {gained} accounts gain a partner Space and {len(access['accounts']) - gained} lose theirs (new feeds made, old ones released: {access['released']}); {access['edges_moved']} edges change Space | {times(fifth)} | {bystander(fifth, 'drain') if fifth else '—'} | {placement(changed)[0]} | {placement(changed)[1]} |")
+            print(f"| Access changes | {gained} accounts gain a partner Space and {len(access['accounts']) - gained} lose theirs (new feeds made; {sum(access['released'].values())} old feeds released, {access['released'].get('200', 0)} answered 200); {access['edges_moved']} edges change Space | {times(fifth)} | {bystander(fifth, 'drain') if fifth else '—'} | {placement(changed)[0]} | {placement(changed)[1]} |")
         check = step_of(folder, "w6-check")
         if check:
             print(f"\nFinal check after both: {check['mismatched_shapes']} of {check['shapes_checked']:,} shapes differ from Postgres ({check['shapes_with_rows']:,} hold rows, {check['rows_expected']:,} rows expected, {check['envelopes_read']:,} changes replayed).")

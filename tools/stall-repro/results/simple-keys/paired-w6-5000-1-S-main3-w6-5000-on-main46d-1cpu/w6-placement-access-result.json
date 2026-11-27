@@ -1,0 +1,56 @@
+{
+  "workload": "w6-placement-access",
+  "at": 1795773617.2712774,
+  "engine_table": {
+    "families": [],
+    "standalone": 5110,
+    "scan": 0,
+    "circuit": 0
+  },
+  "cardinalities": {
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 5111,
+    "shapes_dormant": 0,
+    "standalone": 5111,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0,
+    "tables": 44,
+    "tailers": 2
+  },
+  "harness_copy_of_the_rule": {
+    "shapes": 4995,
+    "filed_under_keys": 4995,
+    "filed_under_one_leaf": 0,
+    "scan_list": 0,
+    "by_columns": {
+      "from_space_id+to_space_id": 1062,
+      "from_id": 3913,
+      "from_id+from_space_id+to_space_id": 20
+    },
+    "scan_reasons": {},
+    "distinct_keys": 5827,
+    "largest_buckets": [
+      {
+        "column": "from_space_id",
+        "value": "11cea902-7775-5317-9fd6-d0770a34fcf5",
+        "shapes": 10
+      },
+      {
+        "column": "to_space_id",
+        "value": "11cea902-7775-5317-9fd6-d0770a34fcf5",
+        "shapes": 10
+      },
+      {
+        "column": "from_space_id",
+        "value": "eac59583-ec65-58a5-96cf-bf93f838932f",
+        "shapes": 9
+      }
+    ]
+  },
+  "rss_bytes": 328142848
+}

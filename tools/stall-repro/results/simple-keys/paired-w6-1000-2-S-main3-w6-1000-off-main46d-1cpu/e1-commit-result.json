@@ -1,53 +1,53 @@
 {
   "workload": "e1-commit",
   "measurement": "source SQL start to workload receipt and zero pending flips/appends",
-  "first_change_read_time": 1795772214.176,
+  "first_change_read_time": 1795773708.741,
   "timeout_s": 3600,
   "row_changes": 1000,
-  "source_write_s": 0.22455512099998032,
+  "source_write_s": 0.3410645499999987,
   "completion": {
     "receipt": {
       "drained": true,
       "receipt": {
-        "commitLsn": "0/53E4060",
+        "commitLsn": "0/53E58E8",
         "generation": "ed59de3117b14f47c3c415381dafe3ad5691890473bfd831e744acbc3ae6b889",
-        "sourceCommitId": "1f302bfb-d2ac-4b2d-b289-532834ac0042",
+        "sourceCommitId": "bad29db9-ca93-45ce-bc40-c9b29eb59d8c",
         "userId": "f67df0d4-d079-5aab-a250-53e9e684b718"
       },
-      "sourceCommitId": "1f302bfb-d2ac-4b2d-b289-532834ac0042"
+      "sourceCommitId": "bad29db9-ca93-45ce-bc40-c9b29eb59d8c"
     },
     "queue": {
       "changes": {
-        "offset": "0000000000000000_0000000021571339",
+        "offset": "0000000000000000_0000000021587692",
         "path": "changes/0",
         "segment": 0
       },
       "epoch": {
-        "boundAt": "2026-11-27T09:36:04.592Z",
+        "boundAt": "2026-11-27T10:00:28.604Z",
         "reason": null,
         "slot": "stall_repro",
         "state": "ok",
-        "systemIdentifier": "7712782659964977200",
+        "systemIdentifier": "7712788923026260017",
         "timelineId": 1
       },
       "failingAppends": 0,
       "flipFailures": 0,
-      "lsn": "0/53E53A0",
+      "lsn": "0/53E6C40",
       "pendingFlips": 0,
       "replayFailed": false,
       "settle": {
         "boundHits": 0,
-        "checks": 19,
+        "checks": 20,
         "fencedTables": 0,
         "forgotten": 0,
         "overflowRefusals": 0,
         "pollerFailures": 0,
-        "pollerTicks": 17,
+        "pollerTicks": 22,
         "recordBytes": 0,
         "rejections": 0,
         "retakes": 0,
         "sequencedXids": 0,
-        "sequencedXidsPeak": 5,
+        "sequencedXidsPeak": 1,
         "tables": 0,
         "timeouts": 0,
         "waitMs": {
@@ -83,8 +83,8 @@
     }
   },
   "completed": true,
-  "elapsed_s": 1.7182039979999786,
-  "ended_wall": 1795772215.4373567,
+  "elapsed_s": 1.8902912320000382,
+  "ended_wall": 1795773710.0654662,
   "sequencer_held": {
     "peak_held_bytes": 0,
     "longest_held_run_s": 0.0,
@@ -100,43 +100,43 @@
     "subquery_nodes": 0,
     "subquery_shapes": 0
   },
-  "began_wall": 1795772213.7191513,
+  "began_wall": 1795773708.1751733,
   "transactions": [
     {
       "transaction": "final",
       "txid": "1408",
-      "before_commit": 1795772213.94273,
-      "marker": "1f302bfb-d2ac-4b2d-b289-532834ac0042"
+      "before_commit": 1795773708.5149856,
+      "marker": "bad29db9-ca93-45ce-bc40-c9b29eb59d8c"
     }
   ],
-  "engine_cpu_percent": 66.3483498657308,
-  "changes_per_s": 582.0030689976386,
+  "engine_cpu_percent": 66.12737650364208,
+  "changes_per_s": 529.0190120291368,
   "probe": {
     "drain": {
-      "attempts": 6,
-      "successes": 6,
+      "attempts": 7,
+      "successes": 7,
       "success_rate": 1.0,
-      "successful_p50_s": 0.6711557809999817,
-      "successful_p95_s": 1.1066982840000037,
-      "successful_max_s": 1.3714065149999897,
+      "successful_p50_s": 0.6163598570000204,
+      "successful_p95_s": 1.2371447120000312,
+      "successful_max_s": 1.40977516199996,
       "timeouts_censored_at_s": 2
     },
     "subset": {
-      "attempts": 6,
-      "successes": 6,
+      "attempts": 7,
+      "successes": 7,
       "success_rate": 1.0,
-      "successful_p50_s": 0.2815585619999865,
-      "successful_p95_s": 0.5410662639999941,
-      "successful_max_s": 0.7851300649999757,
+      "successful_p50_s": 0.22395533899998554,
+      "successful_p95_s": 0.722565225999972,
+      "successful_max_s": 0.9611841549999554,
       "timeouts_censored_at_s": 2
     },
     "live": {
-      "attempts": 6,
-      "successes": 6,
+      "attempts": 7,
+      "successes": 7,
       "success_rate": 1.0,
-      "successful_p50_s": 0.6020302700000002,
-      "successful_p95_s": 1.1017712089999918,
-      "successful_max_s": 1.3518243319999783,
+      "successful_p50_s": 0.6068305530000089,
+      "successful_p95_s": 1.1054149349999989,
+      "successful_max_s": 1.3446258999999827,
       "timeouts_censored_at_s": 2
     }
   },
@@ -145,27 +145,27 @@
       "attempts": 13,
       "successes": 13,
       "success_rate": 1.0,
-      "successful_p50_s": 0.023335701000007703,
-      "successful_p95_s": 0.03309174999998277,
-      "successful_max_s": 0.05060947799995574,
+      "successful_p50_s": 0.027274384999998347,
+      "successful_p95_s": 0.03148268699999335,
+      "successful_max_s": 0.03446718100002499,
       "timeouts_censored_at_s": 2
     },
     "subset": {
       "attempts": 13,
       "successes": 13,
       "success_rate": 1.0,
-      "successful_p50_s": 0.007078341000010369,
-      "successful_p95_s": 0.011409512000000177,
-      "successful_max_s": 0.012367726000036328,
+      "successful_p50_s": 0.007040735999964909,
+      "successful_p95_s": 0.011816787000043405,
+      "successful_max_s": 0.014054255000019111,
       "timeouts_censored_at_s": 2
     },
     "live": {
       "attempts": 13,
       "successes": 13,
       "success_rate": 1.0,
-      "successful_p50_s": 0.02212150200000451,
-      "successful_p95_s": 0.026714875999971355,
-      "successful_max_s": 0.04740176000001384,
+      "successful_p50_s": 0.026188972999989346,
+      "successful_p95_s": 0.03080155600002854,
+      "successful_max_s": 0.03220754999995279,
       "timeouts_censored_at_s": 2
     }
   },
@@ -175,7 +175,7 @@
   "backfills_by_table": {},
   "empty_backfills_by_table": {},
   "backfills_per_minute": 0.0,
-  "first_read_to_empty_s": 1.2613565921783447,
+  "first_read_to_empty_s": 1.3244662284851074,
   "first_read_definition": "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy",
-  "engine_changes_per_s": 792.797220231762
+  "engine_changes_per_s": 755.0211386996073
 }

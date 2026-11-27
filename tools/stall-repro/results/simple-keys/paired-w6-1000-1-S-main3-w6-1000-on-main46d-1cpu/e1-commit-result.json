@@ -1,53 +1,53 @@
 {
   "workload": "e1-commit",
   "measurement": "source SQL start to workload receipt and zero pending flips/appends",
-  "first_change_read_time": 1795772111.53,
+  "first_change_read_time": 1795773568.624,
   "timeout_s": 3600,
   "row_changes": 1000,
-  "source_write_s": 0.2201975240000138,
+  "source_write_s": 0.3630750549999959,
   "completion": {
     "receipt": {
       "drained": true,
       "receipt": {
-        "commitLsn": "0/53E4060",
+        "commitLsn": "0/53E5920",
         "generation": "ed59de3117b14f47c3c415381dafe3ad5691890473bfd831e744acbc3ae6b889",
-        "sourceCommitId": "88cfde7a-942b-4400-921f-6bc0033352c2",
+        "sourceCommitId": "2d456b4d-414c-4e0c-b168-d5e7f32e45e5",
         "userId": "f67df0d4-d079-5aab-a250-53e9e684b718"
       },
-      "sourceCommitId": "88cfde7a-942b-4400-921f-6bc0033352c2"
+      "sourceCommitId": "2d456b4d-414c-4e0c-b168-d5e7f32e45e5"
     },
     "queue": {
       "changes": {
-        "offset": "0000000000000000_0000000021505927",
+        "offset": "0000000000000000_0000000021522280",
         "path": "changes/0",
         "segment": 0
       },
       "epoch": {
-        "boundAt": "2026-11-27T09:34:21.283Z",
+        "boundAt": "2026-11-27T09:58:08.519Z",
         "reason": null,
         "slot": "stall_repro",
         "state": "ok",
-        "systemIdentifier": "7712782216486416434",
+        "systemIdentifier": "7712788318785093682",
         "timelineId": 1
       },
       "failingAppends": 0,
       "flipFailures": 0,
-      "lsn": "0/53E46B0",
+      "lsn": "0/53E5F70",
       "pendingFlips": 0,
       "replayFailed": false,
       "settle": {
         "boundHits": 0,
-        "checks": 15,
+        "checks": 16,
         "fencedTables": 0,
         "forgotten": 0,
         "overflowRefusals": 0,
         "pollerFailures": 0,
-        "pollerTicks": 15,
+        "pollerTicks": 18,
         "recordBytes": 0,
         "rejections": 0,
         "retakes": 0,
         "sequencedXids": 0,
-        "sequencedXidsPeak": 3,
+        "sequencedXidsPeak": 1,
         "tables": 0,
         "timeouts": 0,
         "waitMs": {
@@ -83,8 +83,8 @@
     }
   },
   "completed": true,
-  "elapsed_s": 0.6318906150000032,
-  "ended_wall": 1795772111.710439,
+  "elapsed_s": 0.98125691300001,
+  "ended_wall": 1795773569.0156856,
   "sequencer_held": {
     "peak_held_bytes": 0,
     "longest_held_run_s": 0.0,
@@ -100,43 +100,43 @@
     "subquery_nodes": 0,
     "subquery_shapes": 0
   },
-  "began_wall": 1795772111.0785472,
+  "began_wall": 1795773568.0344272,
   "transactions": [
     {
       "transaction": "final",
       "txid": "1408",
-      "before_commit": 1795772111.2932742,
-      "marker": "88cfde7a-942b-4400-921f-6bc0033352c2"
+      "before_commit": 1795773568.3961165,
+      "marker": "2d456b4d-414c-4e0c-b168-d5e7f32e45e5"
     }
   ],
-  "engine_cpu_percent": 23.738285779097918,
-  "changes_per_s": 1582.552385273193,
+  "engine_cpu_percent": 20.382022011802952,
+  "changes_per_s": 1019.1011005901468,
   "probe": {
     "drain": {
-      "attempts": 2,
-      "successes": 2,
+      "attempts": 3,
+      "successes": 3,
       "success_rate": 1.0,
-      "successful_p50_s": 0.17369281099999512,
-      "successful_p95_s": 0.17369281099999512,
-      "successful_max_s": 0.3656073999999876,
+      "successful_p50_s": 0.06387225800000351,
+      "successful_p95_s": 0.06387225800000351,
+      "successful_max_s": 0.3549561659999938,
       "timeouts_censored_at_s": 2
     },
     "subset": {
-      "attempts": 2,
-      "successes": 2,
+      "attempts": 3,
+      "successes": 3,
       "success_rate": 1.0,
-      "successful_p50_s": 0.021087267000012844,
-      "successful_p95_s": 0.021087267000012844,
-      "successful_max_s": 0.04709349899999893,
+      "successful_p50_s": 0.012231848999988415,
+      "successful_p95_s": 0.012231848999988415,
+      "successful_max_s": 0.016121222999998963,
       "timeouts_censored_at_s": 2
     },
     "live": {
-      "attempts": 2,
-      "successes": 2,
+      "attempts": 3,
+      "successes": 3,
       "success_rate": 1.0,
-      "successful_p50_s": 0.10735883500001364,
-      "successful_p95_s": 0.10735883500001364,
-      "successful_max_s": 0.35318505000000755,
+      "successful_p50_s": 0.06657028700001888,
+      "successful_p95_s": 0.06657028700001888,
+      "successful_max_s": 0.3191958279999767,
       "timeouts_censored_at_s": 2
     }
   },
@@ -145,27 +145,27 @@
       "attempts": 13,
       "successes": 13,
       "success_rate": 1.0,
-      "successful_p50_s": 0.023537365000009913,
-      "successful_p95_s": 0.026365655999995852,
-      "successful_max_s": 0.027327954999975645,
+      "successful_p50_s": 0.029405099000001655,
+      "successful_p95_s": 0.033985281000013856,
+      "successful_max_s": 0.03465959400000429,
       "timeouts_censored_at_s": 2
     },
     "subset": {
       "attempts": 13,
       "successes": 13,
       "success_rate": 1.0,
-      "successful_p50_s": 0.007036381000006031,
-      "successful_p95_s": 0.01183139299999425,
-      "successful_max_s": 0.01299025500000539,
+      "successful_p50_s": 0.00876934499999038,
+      "successful_p95_s": 0.013466949000019213,
+      "successful_max_s": 0.014645692000016197,
       "timeouts_censored_at_s": 2
     },
     "live": {
       "attempts": 13,
       "successes": 13,
       "success_rate": 1.0,
-      "successful_p50_s": 0.02190330400000562,
-      "successful_p95_s": 0.02324172300001237,
-      "successful_max_s": 0.025563516999994818,
+      "successful_p50_s": 0.02694564800000876,
+      "successful_p95_s": 0.03154082599999697,
+      "successful_max_s": 0.03271964099999991,
       "timeouts_censored_at_s": 2
     }
   },
@@ -175,7 +175,7 @@
   "backfills_by_table": {},
   "empty_backfills_by_table": {},
   "backfills_per_minute": 0.0,
-  "first_read_to_empty_s": 0.18043899536132812,
+  "first_read_to_empty_s": 0.39168548583984375,
   "first_read_definition": "first completed change-log HTTP delivery containing a workload xid, at the out-of-cgroup loopback proxy",
-  "engine_changes_per_s": 5542.0392803534805
+  "engine_changes_per_s": 2553.0688170786343
 }

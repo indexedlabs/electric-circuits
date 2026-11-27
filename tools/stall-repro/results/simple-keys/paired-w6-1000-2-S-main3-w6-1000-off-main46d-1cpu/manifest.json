@@ -1,6 +1,6 @@
 {
   "command": "tools/stall-repro/run.py --engine tools/stall-repro/bin/main46d/electric-circuits-engine --store tools/stall-repro/bin/durable-streams-server --name run-paired-w6-1000-2-S-main3-w6-1000-off-main46d-1cpu --label paired-w6-1000-2-S-main3-w6-1000-off-main46d-1cpu --catalog nov24 --variant S-main3-w6-1000-off --cpus 1 --engine-source 46d15563767006e4d24f9f4e3ef70b21c35a8165 --workloads w6-placement e1-commit e1-commit-r2 e1-commit-r3 w6-check --probe-interval 0.25",
-  "harness_commit": "80c80bfd005f19bbf013350caf2aa0751eb28d6b",
+  "harness_commit": "ec8e045d917e638744b043a11d30ea6a062cb3a3",
   "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363",
   "engine_sha256": "0d427003d30499b7d15877a07e416a3a426f8166215c4574a7b77ac0866eb45c",
   "indexed_commit": "52e79b875bc80564285d63fb4a8db1165c7c8145",
@@ -23,7 +23,7 @@
     "ELECTRIC_CIRCUITS_DS_CLIENT_CERT": "",
     "ELECTRIC_CIRCUITS_DS_CLIENT_KEY": "",
     "ELECTRIC_CIRCUITS_INITIALIZE_NAMESPACE": "1",
-    "ELECTRIC_CIRCUITS_DS_URL": "http://127.0.0.1:34523",
+    "ELECTRIC_CIRCUITS_DS_URL": "http://127.0.0.1:46613",
     "ELECTRIC_CIRCUITS_PG_URL": "postgresql://postgres:synthetic@127.0.0.1:55432/stall_repro?sslmode=disable",
     "ELECTRIC_CIRCUITS_PG_TABLES": "public.conversation,public.calendar_event,public.calendar,public.record_date_index,public.record,public.record_recurrence,public.graph_edge,public.circuits_source_fence,public.native_sync_authority_fence,public.space,public.record_share,public.monitored_url_source,public.monitored_url_subscription,public.resource,public.resource_share,public.assignment,public.standing_grant,public.partner_calendar_event_mirror,public.message,public.composer_submission,public.workflow,public.record_completed_index,public.workflow_run,public.suggestion,public.user,public.space_member,public.external_account,public.invite,public.assistant_state,public.feedback,public.upcoming_summary,public.calendar_highlight,public.suggestion_seen,public.activity,public.email_inbox,public.generated_image,public.assistant_stream_event,public.resource_fact,public.record_assignee_index,public.tag,public.tagged_item,public.file,public.file_share,public.standing_grant_backfill_status,public.external_link",
     "ELECTRIC_CIRCUITS_PG_SLOT": "stall_repro",

@@ -1,6 +1,6 @@
 {
   "workload": "w6-placement",
-  "at": 1795772118.2328618,
+  "at": 1795773559.9296937,
   "engine_table": {
     "families": [],
     "standalone": 100,
@@ -33,24 +33,24 @@
       "from_id+from_space_id+partner_hidden+to_space_id": 1
     },
     "scan_reasons": {},
-    "distinct_keys": 121,
+    "distinct_keys": 119,
     "largest_buckets": [
       {
-        "column": "from_space_id",
-        "value": "2b55ad11-6ab5-5fb5-a941-86ce7df4f56d",
+        "column": "from_id",
+        "value": "0ef534d0-4040-5349-876b-d6b55b82f906",
         "shapes": 2
       },
       {
-        "column": "to_space_id",
-        "value": "2b55ad11-6ab5-5fb5-a941-86ce7df4f56d",
+        "column": "from_id",
+        "value": "d31d0d2b-558a-528f-ab9f-426cb5096355",
         "shapes": 2
       },
       {
         "column": "from_space_id",
-        "value": "4687fed2-36e4-507f-a0ea-3644b748e88e",
-        "shapes": 1
+        "value": "2b55ad11-6ab5-5fb5-a941-86ce7df4f56d",
+        "shapes": 2
       }
     ]
   },
-  "rss_bytes": 67403776
+  "rss_bytes": 62734336
 }

@@ -1,0 +1,50 @@
+{
+  "workload": "w6-placement-access",
+  "at": 1795773854.9883401,
+  "engine_table": {
+    "families": [],
+    "standalone": 5110,
+    "scan": 0,
+    "circuit": 0
+  },
+  "cardinalities": {
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 5111,
+    "shapes_dormant": 0,
+    "standalone": 5111,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0,
+    "tables": 44,
+    "tailers": 2
+  },
+  "harness_copy_of_the_rule": {
+    "shapes": 4995,
+    "filed_under_keys": 0,
+    "filed_under_one_leaf": 4995,
+    "scan_list": 0,
+    "by_columns": {
+      "to_type": 1054,
+      "from_type": 3941
+    },
+    "scan_reasons": {},
+    "distinct_keys": 2,
+    "largest_buckets": [
+      {
+        "column": "from_type",
+        "value": "record",
+        "shapes": 3941
+      },
+      {
+        "column": "to_type",
+        "value": "resource",
+        "shapes": 1054
+      }
+    ]
+  },
+  "rss_bytes": 298405888
+}

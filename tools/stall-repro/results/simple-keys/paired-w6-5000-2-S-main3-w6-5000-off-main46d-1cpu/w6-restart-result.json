@@ -1,0 +1,20 @@
+{
+  "workload": "w6-restart",
+  "at": 1795773821.9408102,
+  "restart_to_ready_s": 10.173745032,
+  "cardinalities": {
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 5001,
+    "shapes_dormant": 0,
+    "standalone": 5001,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0,
+    "tables": 44,
+    "tailers": 2
+  }
+}
