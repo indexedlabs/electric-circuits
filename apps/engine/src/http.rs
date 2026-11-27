@@ -2223,7 +2223,13 @@ async fn epoch_reset(State(engine): State<Engine>) -> Result<Json<serde_json::Va
 }
 
 async fn get_metrics(State(engine): State<Engine>) -> Json<serde_json::Value> {
-    Json(engine.metrics.snapshot())
+    let mut snapshot = engine.metrics.snapshot();
+    // How many clients are on `/trace` right now. While it is above zero the sequencer builds the
+    // visualizer's node-state map after every commit page (`node_state_builds_total`).
+    if let Some(gauges) = snapshot["gauges"].as_object_mut() {
+        gauges.insert("trace_subscribers".into(), engine.trace_sender().receiver_count().into());
+    }
+    Json(snapshot)
 }
 
 async fn reset_metrics(State(engine): State<Engine>) -> Json<serde_json::Value> {

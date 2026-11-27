@@ -183,6 +183,11 @@ pub struct Metrics {
     /// first, or an epoch reset abandoning the fragment). Never zero-cost silence: the fragment is
     /// re-delivered in full or was abandoned, and either way an operator should be able to see it.
     pub sequencer_orphan_fragments: AtomicU64,
+    /// Times the sequencer built the visualizer's node-state map, which has an entry per shape
+    /// (OTTO-14463). It moves only for a reader: once for the `GET /state` readers waiting together,
+    /// and once per publish while `/trace` has a subscriber. With no reader it stays still however
+    /// many commits are processed.
+    pub node_state_builds: AtomicU64,
     /// GAUGE, not a counter: how many change-log segments exist right now (republished by every
     /// retention sweep). `reset()` leaves it alone — a gauge describes the world, not the window.
     pub changes_segments_retained: AtomicU64,
@@ -290,6 +295,7 @@ impl Metrics {
             electric_snapshot_joins: AtomicU64::new(0),
             electric_snapshot_reuses: AtomicU64::new(0),
             sequencer_orphan_fragments: AtomicU64::new(0),
+            node_state_builds: AtomicU64::new(0),
             sequencer_held_run: AtomicU64::new(0),
             group_detaches: AtomicU64::new(0),
             group_reattaches: AtomicU64::new(0),
@@ -352,6 +358,7 @@ impl Metrics {
                 ("electric_snapshot_reuses_total", &self.electric_snapshot_reuses),
                 ("stream_ttl_touches_total", &self.stream_ttl_touches),
                 ("stream_ttl_touch_failures_total", &self.stream_ttl_touch_failures),
+                ("node_state_builds_total", &self.node_state_builds),
             ] {
                 counters.insert(name.into(), counter.load(Ordering::Relaxed).into());
             }
@@ -489,6 +496,7 @@ impl Metrics {
         self.electric_snapshot_joins.store(0, Ordering::Relaxed);
         self.electric_snapshot_reuses.store(0, Ordering::Relaxed);
         self.sequencer_orphan_fragments.store(0, Ordering::Relaxed);
+        self.node_state_builds.store(0, Ordering::Relaxed);
         // The gauges below are deliberately NOT reset: a gauge describes the world, not the window
         // (`catalog_bytes`, `changes_segments_retained`, `sequencer_held_run`, `sequencer_held_bytes`,
         // `shutdown_in_progress`,

@@ -404,6 +404,47 @@ fn node_states_cover_every_node_kind() {
     }
 }
 
+/// `GET /state` asks the sequencer for the node-state map and lays the answer over the table
+/// defaults. A sequencer that stops without answering leaves the reader with the defaults, not
+/// waiting.
+#[tokio::test]
+async fn state_snapshot_asks_the_sequencer_and_falls_back_to_the_table_defaults() {
+    fn poll_once<F: std::future::Future>(future: &mut std::pin::Pin<Box<F>>) -> std::task::Poll<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        future.as_mut().poll(&mut cx)
+    }
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let ts = users();
+    let (cmd_tx, mut commands) = mpsc::unbounded_channel();
+    {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        st.sequencer = Some(SequencerHandle {
+            cmd_tx,
+            processed: Arc::new(std::sync::Mutex::new(LogPosition::start())),
+            stats: Default::default(),
+        });
+    }
+    let mut answered = Box::pin(engine.state_snapshot());
+    assert!(poll_once(&mut answered).is_pending(), "the reader waits for the sequencer");
+    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("the reader asked the sequencer") };
+    let built = NodeStateSummary::Table { processed_offset: "changes/0@p1".into(), envelopes: 4 };
+    resp.send(Arc::new(HashMap::from([("table:public.users".to_string(), built.clone())]))).unwrap();
+    let snapshot = answered.await;
+    assert_eq!(snapshot.nodes["table:public.users"], built, "the sequencer's entry replaces the default");
+
+    let mut unanswered = Box::pin(engine.state_snapshot());
+    assert!(poll_once(&mut unanswered).is_pending());
+    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("the reader asked the sequencer") };
+    drop(resp);
+    let snapshot = unanswered.await;
+    assert_eq!(
+        snapshot.nodes["table:public.users"],
+        NodeStateSummary::Table { processed_offset: "-1".into(), envelopes: 0 },
+        "a sequencer that stopped without answering leaves the table default"
+    );
+}
+
 /// The exploded circuit decomposition is internally consistent: every edge endpoint is an
 /// emitted operator, every hop is a trace-hop id, every `state` is a `GET /state` key, shared
 /// structures (family, subquery node) are emitted once, and each strategy decomposes into its
