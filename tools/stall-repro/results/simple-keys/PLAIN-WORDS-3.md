@@ -14,6 +14,7 @@ Tables are printed by `tools/stall-repro/plain_words_report.py`.
 | --- | --- | --- | --- |
 | 1 | `45917533904` | `6532584` | `paired-pw1-*` |
 | 2 | `45917699001`, repeats `45919688237` | `b4b6b41`, `644272b` | `paired-pw2-*` |
+| 3 | `45920764926` | `eea63a7` | `paired-pw3-*` |
 
 ## Run 1: the 1,000-row `record` write, with one-family filters written as a plain test
 
@@ -199,3 +200,147 @@ line overstates the middle: read between the measured 1,000 and 5,000 points, 2 
   5,000). Splitting their feeds per Space, as S does, is not measured here.
 - **Not measured:** the split's extra shapes on phones, and whether the gateway can address two
   streams for one session feed. This run only shows what the engine does with those filters.
+
+## Run 3: a day and a week, table by table against the bundled group load
+
+**Answer.** In the engine, turning bundles off costs nothing per load and makes nothing worse for
+other readers. What it changes is outside what this harness measures: the gateway makes twelve
+requests for a window where it made one.
+
+- **Per load, wall time:** table by table in turn takes the same time as the bundle: 0.09–0.11 s
+  at p50 and 0.10–0.13 s at p95 for both, at either row count, day and week. The six members at
+  once take 0.055–0.065 s (p95 0.07–0.08 s), about 40% less.
+- **Per load, engine and Postgres:** table by table uses less of both. Engine CPU is 55–67 ms per
+  load against 67–92 ms; Postgres time is 50–65 ms against 129–132 ms, over 7 row selects against 8.
+- **Per window, shapes:** a bundle creates 6 shapes for every window, 4 of them subquery shapes.
+  Table by table creates 2 per window (both subquery: `assignment` and `graph_edge`) and 4 per
+  account once, which every window of that account then shares.
+- **These are job b's numbers,** the quieter of two runners; job a's are 30–50% higher and order
+  the same way.
+- **Other readers:** no request was lost in any cell. Their p95 during the loads is about 2× S
+  idle whichever way the windows are loaded (0.04–0.05 s against 0.023 s).
+- **Not measured, and it decides this:** the gateway's side. Each of the twelve requests is
+  authorized on its own, where a bundle's members share one authority read. The bundle also reads
+  its six members in one snapshot; table by table reads six.
+
+**Why table by table is cheaper in Postgres.** It is main's keyed rule, not the bundling. A
+one-shot query is keyed whenever its table is; a group member is keyed only when its filter reads
+no other table. So the bundle's `record` and `record_date_index` members keep today's
+authorization, and their selects take 42 ms and 24 ms. The same two tables as one-shot queries
+take 3–5 ms and 2–3 ms. `assignment` and `graph_edge` are keyed neither way and cost the same in
+both (15–25 ms each).
+
+**What table by table leaves in the engine.** Per account, four whole-account keyed feeds:
+`record`, `record_date_index` and `record_recurrence` on the scan list, and `calendar_event`
+indexed under `is_busy_block`, a value every account shares. Those are run 1's filters: without
+run 1's fix they cost every `record` write as run 1's control shows. The bundle's members are
+per-window subquery shapes, which is what the first-import sweep found stalls imports. This run
+made no writes while the windows were held, so it does not say which is worse at write time.
+
+**Setup** (`simple_keys.window_plan`, `run.window_operation`).
+
+- **The windows:** `app_day_window`'s six members (`record_date_index`, `record`,
+  `record_recurrence`, `assignment`, `graph_edge`, `calendar_event`) for 1 day and for 7 days.
+- **Rows:** for each of the 19 fixture accounts, the start dates whose windows return closest to
+  prod's sizes, within 25%: 109 and 392 rows for a day, 172 and 584 for a week. That gives 140
+  loads: 37 and 38 day windows, 27 and 38 week windows. The medians returned are 108, 392, 172 and
+  584 rows, and every load returned exactly the rows Postgres counts for it.
+- **(a) bundle:** one `/v1/subsets/load` with six members.
+- **(b) table by table:** per member, a changes-only feed (`/v1/subset-feeds`) and then its rows
+  (`/v1/subsets/query`). "In turn" is the six members one after another; "at once" is the six
+  together, each still feed then query.
+- **Lowering:** main's (`52e79b875b`), keyed flags on, each request as `_authorize_collection_read`
+  lowers that operation. A group member keeps its window. A feed drops the window before the keyed
+  test, so four of the six feeds are whole-account. A one-shot query keeps it.
+- **Each way on its own engine**, with the same accounts and dates, on S-main3-live-plus's
+  catalog (1,147 shapes, 637 of them subquery shapes). Loads run one after another, 0.5 s apart,
+  day windows first and then week windows.
+- **S** is S's catalog idle on the same runner, 60 s. Each engine also idles 60 s before its loads.
+- **Fixture change:** calendar events get an hour on their creation day. The fixture's events had
+  no time, so a window's `calendar_event` member returned nothing.
+- **Postgres** is counted with `pg_stat_statements`, less the bystander's own probe queries.
+
+**Job a (EPYC 9V74), the noisier runner.** Its idle engine was already 1.5–2.3× S before any load.
+
+| Window | Rows wanted | Way | Loads | Rows returned, median | Wall to a complete window p50 / p95 s | Engine CPU inside the request, median ms | Shapes created per load (subquery) | Subquery nodes per load |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| day | p50 | (a) bundled group load | 37 | 108 | 0.138 / 0.379 | 32.2 | 6.0 (4.0) | 2.0 |
+| day | p95 | (a) bundled group load | 38 | 392 | 0.143 / 0.377 | 52.6 | 6.0 (4.0) | 2.0 |
+| week | p50 | (a) bundled group load | 27 | 172 | 0.150 / 0.305 | 54.2 | 6.0 (4.0) | 2.0 |
+| week | p95 | (a) bundled group load | 38 | 584 | 0.154 / 0.192 | 50.0 | 6.0 (4.0) | 2.0 |
+| day | p50 | (b) table by table, in turn | 37 | 108 | 0.119 / 0.245 | 23.2 | 4.1 (2.0) | 1.0 |
+| day | p95 | (b) table by table, in turn | 38 | 392 | 0.132 / 0.240 | 27.8 | 2.0 (2.0) | 1.0 |
+| week | p50 | (b) table by table, in turn | 27 | 172 | 0.131 / 0.202 | 25.7 | 2.0 (2.0) | 1.0 |
+| week | p95 | (b) table by table, in turn | 38 | 584 | 0.152 / 0.221 | 37.7 | 2.0 (2.0) | 1.0 |
+| day | p50 | (b) table by table, at once | 37 | 108 | 0.088 / 0.256 | 26.4 | 4.1 (2.0) | 1.0 |
+| day | p95 | (b) table by table, at once | 38 | 392 | 0.085 / 0.236 | 30.7 | 2.0 (2.0) | 1.0 |
+| week | p50 | (b) table by table, at once | 27 | 172 | 0.078 / 0.105 | 23.6 | 2.0 (2.0) | 1.0 |
+| week | p95 | (b) table by table, at once | 38 | 584 | 0.085 / 0.111 | 30.7 | 2.0 (2.0) | 1.0 |
+
+| Window | Way | Loads | Phase s | Engine CPU % | Engine CPU per load, net of idle, ms | Postgres row selects per load | Read transactions per load | Postgres time per load ms | Other readers' receipts: ok/attempts, p95 s (× S idle) | Subset p95 s (× S idle) | Live change p95 s (× S idle) | Shapes added (subquery) | Query-backs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: |
+| — | idle before the loads (1) | 0 | 60 | 7 | — | — | — | — | 240/240; 0.056 (2.3×) | 240/240; 0.009 (1.1×) | 240/240; 0.090 (3.7×) | 0 | 0 |
+| — | idle before the loads (2) | 0 | 60 | 7 | — | — | — | — | 241/241; 0.045 (1.8×) | 241/241; 0.009 (1.1×) | 241/241; 0.124 (5.1×) | 0 | 0 |
+| — | idle before the loads (3) | 0 | 60 | 7 | — | — | — | — | 240/240; 0.036 (1.5×) | 240/240; 0.009 (1.1×) | 240/240; 0.073 (3.0×) | 0 | 0 |
+| — | S idle (4) | 0 | 60 | 2 | — | — | — | — | 240/240; 0.024 (1.0×) | 240/240; 0.008 (1.0×) | 240/240; 0.024 (1.0×) | 0 | 0 |
+| day | (a) bundled group load | 75 | 57 | 19 | 93 | 8.0 | 5.0 | 181 | 227/227; 0.123 (5.1×) | 227/227; 0.039 (4.7×) | 227/227; 0.227 (9.4×) | 450 (300) | 150 |
+| week | (a) bundled group load | 65 | 48 | 25 | 130 | 8.0 | 5.0 | 190 | 192/192; 0.143 (5.9×) | 192/192; 0.041 (5.1×) | 192/192; 0.164 (6.8×) | 390 (260) | 130 |
+| day | (b) table by table, in turn | 75 | 53 | 17 | 73 | 7.0 | 7.0 | 70 | 211/211; 0.067 (2.7×) | 211/211; 0.027 (3.3×) | 211/211; 0.127 (5.3×) | 226 (150) | 75 |
+| week | (b) table by table, in turn | 65 | 46 | 19 | 84 | 7.0 | 7.0 | 74 | 185/185; 0.074 (3.0×) | 185/185; 0.024 (2.9×) | 185/185; 0.113 (4.7×) | 130 (130) | 65 |
+| day | (b) table by table, at once | 75 | 51 | 19 | 75 | 7.0 | 7.0 | 84 | 203/203; 0.173 (7.1×) | 203/203; 0.036 (4.4×) | 203/203; 0.279 (11.6×) | 226 (150) | 75 |
+| week | (b) table by table, at once | 65 | 42 | 20 | 84 | 7.0 | 7.0 | 88 | 168/168; 0.062 (2.5×) | 168/168; 0.026 (3.2×) | 168/168; 0.063 (2.6×) | 130 (130) | 65 |
+
+**Job b (EPYC 9V45).**
+
+| Window | Rows wanted | Way | Loads | Rows returned, median | Wall to a complete window p50 / p95 s | Engine CPU inside the request, median ms | Shapes created per load (subquery) | Subquery nodes per load |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| day | p50 | (a) bundled group load | 37 | 108 | 0.087 / 0.105 | 15.0 | 6.0 (4.0) | 2.0 |
+| day | p95 | (a) bundled group load | 38 | 392 | 0.104 / 0.115 | 29.5 | 6.0 (4.0) | 2.0 |
+| week | p50 | (a) bundled group load | 27 | 172 | 0.099 / 0.127 | 27.9 | 6.0 (4.0) | 2.0 |
+| week | p95 | (a) bundled group load | 38 | 584 | 0.104 / 0.123 | 32.2 | 6.0 (4.0) | 2.0 |
+| day | p50 | (b) table by table, in turn | 37 | 108 | 0.087 / 0.100 | 15.4 | 4.1 (2.0) | 1.0 |
+| day | p95 | (b) table by table, in turn | 38 | 392 | 0.096 / 0.115 | 21.1 | 2.0 (2.0) | 1.0 |
+| week | p50 | (b) table by table, in turn | 27 | 172 | 0.093 / 0.116 | 15.6 | 2.0 (2.0) | 1.0 |
+| week | p95 | (b) table by table, in turn | 38 | 584 | 0.105 / 0.132 | 23.5 | 2.0 (2.0) | 1.0 |
+| day | p50 | (b) table by table, at once | 37 | 108 | 0.059 / 0.079 | 16.0 | 4.1 (2.0) | 1.0 |
+| day | p95 | (b) table by table, at once | 38 | 392 | 0.061 / 0.076 | 22.2 | 2.0 (2.0) | 1.0 |
+| week | p50 | (b) table by table, at once | 27 | 172 | 0.055 / 0.066 | 14.2 | 2.0 (2.0) | 1.0 |
+| week | p95 | (b) table by table, at once | 38 | 584 | 0.065 / 0.081 | 21.6 | 2.0 (2.0) | 1.0 |
+
+| Window | Way | Loads | Phase s | Engine CPU % | Engine CPU per load, net of idle, ms | Postgres row selects per load | Read transactions per load | Postgres time per load ms | Other readers' receipts: ok/attempts, p95 s (× S idle) | Subset p95 s (× S idle) | Live change p95 s (× S idle) | Shapes added (subquery) | Query-backs |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: |
+| — | idle before the loads (1) | 0 | 60 | 5 | — | — | — | — | 240/240; 0.028 (1.2×) | 240/240; 0.007 (0.9×) | 240/240; 0.030 (1.4×) | 0 | 0 |
+| — | idle before the loads (2) | 0 | 60 | 6 | — | — | — | — | 240/240; 0.026 (1.1×) | 240/240; 0.008 (1.1×) | 240/240; 0.022 (1.0×) | 0 | 0 |
+| — | idle before the loads (3) | 0 | 60 | 6 | — | — | — | — | 240/240; 0.028 (1.2×) | 240/240; 0.008 (1.1×) | 240/240; 0.025 (1.1×) | 0 | 0 |
+| — | S idle (4) | 0 | 60 | 1 | — | — | — | — | 240/240; 0.023 (1.0×) | 240/240; 0.007 (1.0×) | 240/240; 0.022 (1.0×) | 0 | 0 |
+| day | (a) bundled group load | 75 | 48 | 16 | 67 | 8.0 | 5.0 | 129 | 192/192; 0.047 (2.0×) | 192/192; 0.023 (3.2×) | 192/192; 0.051 (2.4×) | 450 (300) | 150 |
+| week | (a) bundled group load | 65 | 43 | 19 | 92 | 8.0 | 5.0 | 132 | 171/171; 0.046 (2.0×) | 171/171; 0.022 (3.0×) | 171/171; 0.054 (2.5×) | 390 (260) | 130 |
+| day | (b) table by table, in turn | 75 | 48 | 14 | 55 | 7.0 | 7.0 | 50 | 190/190; 0.043 (1.9×) | 190/190; 0.022 (3.0×) | 190/190; 0.041 (1.9×) | 226 (150) | 75 |
+| week | (b) table by table, in turn | 65 | 42 | 16 | 65 | 7.0 | 7.0 | 54 | 169/169; 0.039 (1.7×) | 169/169; 0.018 (2.5×) | 169/169; 0.042 (1.9×) | 130 (130) | 65 |
+| day | (b) table by table, at once | 75 | 46 | 16 | 63 | 7.0 | 7.0 | 63 | 182/182; 0.045 (2.0×) | 182/182; 0.019 (2.6×) | 182/182; 0.043 (2.0×) | 226 (150) | 75 |
+| week | (b) table by table, at once | 65 | 40 | 17 | 67 | 7.0 | 7.0 | 65 | 158/158; 0.044 (1.9×) | 158/158; 0.022 (3.1×) | 158/158; 0.043 (2.0×) | 130 (130) | 65 |
+
+**Reading the tables.**
+
+- **Engine CPU, two ways.** "Inside the request" is the engine's CPU between the request and its
+  answer. "Net of idle" is the phase's CPU less the idle rate, per load: it also holds the work
+  after the answer (filling the new subquery nodes) and the probe's higher cost as shapes pile up.
+- **The first load per account** table by table creates 6 shapes (the 4 whole-account feeds and
+  the window's 2); every later one creates 2. That is the 4.1 in the day p50 row.
+- **Where the bundle's time goes** (the engine's own `group load finished` events, job b medians):
+  92 ms in all, 26 ms creating the six members and 53 ms in the selects, over three connections on
+  one exported snapshot.
+- **Where table by table's time goes** (job b, in turn): `graph_edge`'s query 29–31 ms,
+  `assignment`'s feed 12 ms and query 18 ms, `record`'s query 8–11 ms. Every other step is under
+  6 ms.
+- **Job a** is shown for the spread. Its bundle cells look worse for other readers (5–6× S against
+  about 3× in turn), but its idle engines differed by as much before any load, so job b is the fairer
+  comparison.
+
+**Not measured.**
+
+- **The gateway:** its authority reads, drains and rechecks per request (`SUMMARY.md`, "Not
+  modelled"). Unkeyed members need the drain either way; a bundle does it once for the group.
+- **Writes while the windows are held**, each way.
+- **Retirement:** idle-shape retirement is off in the harness, so nothing let go of a window.
+- **Renewing a window** the phone already holds: every load here is a first load.

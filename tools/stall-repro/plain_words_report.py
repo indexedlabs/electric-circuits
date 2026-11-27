@@ -180,10 +180,12 @@ def run3(root):
             if "-S-prod9bc" in folder.name and (folder / "idle-60-result.json").exists():
                 floor = load(folder / "idle-60-result.json")["probe"]
         print(f"### Job {job} ({runner(folders[0]) if folders else '?'})\n")
-        print("| Window | Rows wanted | Way | Loads | Rows returned, median | Wall to a complete window p50 / p95 s | Engine CPU per load, median ms | Postgres statements per load | Postgres time per load ms | Shapes created per load (subquery) | Subquery nodes per load |")
-        print("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        print("| Window | Rows wanted | Way | Loads | Rows returned, median | Wall to a complete window p50 / p95 s | Engine CPU inside the request, median ms | Shapes created per load (subquery) | Subquery nodes per load |")
+        print("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         phases = []
         for folder in folders:
+            idle = folder / "idle-60-result.json"
+            idle_rate = load(idle)["engine_cpu_percent"] / 100 if idle.exists() else 0
             for kind in ("day", "week"):
                 for way, label in ways.items():
                     path = folder / f"window-{kind}-{way}-writes.json"
@@ -192,9 +194,8 @@ def run3(root):
                     journal = load(path)
                     loads = [entry for entry in journal if entry["table"] == "window"]
                     statements = next((entry for entry in journal if entry["table"] == "pg_stat_statements"), {})
-                    engine = [entry for entry in statements.get("statements", []) if not entry["harness"]]
                     result = load(folder / f"window-{kind}-{way}-result.json")
-                    phases.append((kind, label, folder, result, loads))
+                    phases.append((kind, label, folder, result, loads, statements.get("statements", []), idle_rate))
                     failed = [entry for entry in loads if entry["status"] != 200]
                     for size in ("p50", "p95"):
                         chosen = [entry for entry in loads if entry["size"] == size and entry["status"] == 200]
@@ -204,14 +205,12 @@ def run3(root):
                         created = statistics.mean(entry["created"].get("shapes", 0) for entry in chosen)
                         subquery = statistics.mean(entry["created"].get("subquery_shapes", 0) for entry in chosen)
                         nodes = statistics.mean(entry["created"].get("subquery_nodes", 0) for entry in chosen)
-                        # Postgres totals are per phase (both size classes): shared out by load.
-                        calls = sum(entry["calls"] for entry in engine) / max(1, len(loads))
-                        time_ms = sum(entry["total_ms"] for entry in engine) / max(1, len(loads))
-                        print(f"| {kind} | {size} | {label} | {len(chosen)} | {statistics.median(entry['rows'] for entry in chosen):,.0f} | {percentile(walls, 0.5):.3f} / {percentile(walls, 0.95):.3f} | {statistics.median(entry['engine_cpu_s'] for entry in chosen) * 1e3:.1f} | {calls:.1f} | {time_ms:.1f} | {created:.1f} ({subquery:.1f}) | {nodes:.1f} |")
+                        print(f"| {kind} | {size} | {label} | {len(chosen)} | {statistics.median(entry['rows'] for entry in chosen):,.0f} | {percentile(walls, 0.5):.3f} / {percentile(walls, 0.95):.3f} | {statistics.median(entry['engine_cpu_s'] for entry in chosen) * 1e3:.1f} | {created:.1f} ({subquery:.1f}) | {nodes:.1f} |")
                     if failed:
-                        print(f"| {kind} | — | {label} | {len(failed)} failed | {Counter(entry['status'] for entry in failed)} | {failed[0].get('error', failed[0].get('steps'))!s:.200} | | | | | |")
-        print("\n| Window | Way | Phase s | Engine CPU % | Other readers' receipts: ok/attempts, p95 s (× S idle) | Subset p95 s (× S idle) | Live change p95 s (× S idle) | Shapes added (subquery) | Query-backs |")
-        print("| --- | --- | ---: | ---: | --- | --- | --- | ---: | ---: |")
+                        print(f"| {kind} | — | {label} | {len(failed)} failed | {Counter(entry['status'] for entry in failed)} | {failed[0].get('error', failed[0].get('steps'))!s:.200} | | | |")
+        # The phase table: Postgres and engine CPU are per phase, net of the bystander's own probes.
+        print("\n| Window | Way | Loads | Phase s | Engine CPU % | Engine CPU per load, net of idle, ms | Postgres row selects per load | Read transactions per load | Postgres time per load ms | Other readers' receipts: ok/attempts, p95 s (× S idle) | Subset p95 s (× S idle) | Live change p95 s (× S idle) | Shapes added (subquery) | Query-backs |")
+        print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: |")
         def against(result, kind):
             entry = result["probe"][kind]
             if not entry["attempts"]:
@@ -224,10 +223,17 @@ def run3(root):
             if idle.exists():
                 result = load(idle)
                 name = "S idle" if "-S-prod9bc" in folder.name else "idle before the loads"
-                print(f"| — | {name} ({folder.name.split('-')[3]}) | {result['elapsed_s']:.0f} | {result['engine_cpu_percent']:.0f} | {against(result, 'drain')} | {against(result, 'subset')} | {against(result, 'live')} | 0 | 0 |")
-        for kind, label, folder, result, loads in phases:
+                print(f"| — | {name} ({folder.name.split('-')[3]}) | 0 | {result['elapsed_s']:.0f} | {result['engine_cpu_percent']:.0f} | — | — | — | — | {against(result, 'drain')} | {against(result, 'subset')} | {against(result, 'live')} | 0 | 0 |")
+        for kind, label, folder, result, loads, statements, idle_rate in phases:
             change = result.get("subquery_change", {})
-            print(f"| {kind} | {label} | {result['elapsed_s']:.0f} | {result['engine_cpu_percent']:.0f} | {against(result, 'drain')} | {against(result, 'subset')} | {against(result, 'live')} | {change.get('shapes', 0)} ({change.get('subquery_shapes', 0)}) | {result['backfills']} |")
+            count = len(loads)
+            # The bystander's subset probe is one row select in one read transaction per attempt.
+            probes_made = result["probe"]["subset"]["attempts"]
+            engine = [entry for entry in statements if not entry["harness"]]
+            selects = [entry for entry in engine if "jsonb_build_object" in entry["query"][:60]]
+            transactions = sum(entry["calls"] for entry in engine if entry["query"].startswith("BEGIN ISOLATION LEVEL REPEATABLE READ"))
+            net = (result["engine_cpu_percent"] / 100 - idle_rate) * result["elapsed_s"] / count
+            print(f"| {kind} | {label} | {count} | {result['elapsed_s']:.0f} | {result['engine_cpu_percent']:.0f} | {net * 1e3:.0f} | {(sum(entry['calls'] for entry in selects) - probes_made) / count:.1f} | {(transactions - probes_made) / count:.1f} | {sum(entry['total_ms'] for entry in selects) / count:.0f} | {against(result, 'drain')} | {against(result, 'subset')} | {against(result, 'live')} | {change.get('shapes', 0)} ({change.get('subquery_shapes', 0)}) | {result['backfills']} |")
         print()
 
 

@@ -1,0 +1,2102 @@
+[
+  {
+    "account": 0,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 105,
+    "expected_by_table": {
+      "record_date_index": 33,
+      "record": 33,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 0,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 120,
+    "expected_by_table": {
+      "record_date_index": 38,
+      "record": 38,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 0,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 0,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 1,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 107,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 1,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 120,
+    "expected_by_table": {
+      "record_date_index": 38,
+      "record": 38,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 1,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 1,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 387,
+    "expected_by_table": {
+      "record_date_index": 128,
+      "record": 128,
+      "record_recurrence": 119,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 2,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 105,
+    "expected_by_table": {
+      "record_date_index": 33,
+      "record": 33,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 2,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 122,
+    "expected_by_table": {
+      "record_date_index": 39,
+      "record": 39,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 2,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 399,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 123,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 2,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 3,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 107,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 3,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 120,
+    "expected_by_table": {
+      "record_date_index": 38,
+      "record": 38,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 3,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 3,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 385,
+    "expected_by_table": {
+      "record_date_index": 128,
+      "record": 128,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 4,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 107,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 4,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 122,
+    "expected_by_table": {
+      "record_date_index": 39,
+      "record": 39,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 4,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 397,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 4,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 382,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 118,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 5,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 108,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 26,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 5,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 95,
+    "expected_by_table": {
+      "record_date_index": 30,
+      "record": 30,
+      "record_recurrence": 21,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 5,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 397,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 5,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 6,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 110,
+    "expected_by_table": {
+      "record_date_index": 35,
+      "record": 35,
+      "record_recurrence": 26,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 6,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 95,
+    "expected_by_table": {
+      "record_date_index": 29,
+      "record": 29,
+      "record_recurrence": 21,
+      "assignment": 6,
+      "graph_edge": 6,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 6,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 6,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 385,
+    "expected_by_table": {
+      "record_date_index": 128,
+      "record": 128,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 7,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 113,
+    "expected_by_table": {
+      "record_date_index": 35,
+      "record": 35,
+      "record_recurrence": 27,
+      "assignment": 6,
+      "graph_edge": 6,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 7,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 96,
+    "expected_by_table": {
+      "record_date_index": 30,
+      "record": 30,
+      "record_recurrence": 22,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 7,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 388,
+    "expected_by_table": {
+      "record_date_index": 128,
+      "record": 128,
+      "record_recurrence": 120,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 7,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 400,
+    "expected_by_table": {
+      "record_date_index": 133,
+      "record": 133,
+      "record_recurrence": 124,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 8,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 111,
+    "expected_by_table": {
+      "record_date_index": 35,
+      "record": 35,
+      "record_recurrence": 27,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 8,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 100,
+    "expected_by_table": {
+      "record_date_index": 31,
+      "record": 31,
+      "record_recurrence": 22,
+      "assignment": 6,
+      "graph_edge": 6,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 8,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 386,
+    "expected_by_table": {
+      "record_date_index": 128,
+      "record": 128,
+      "record_recurrence": 120,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 8,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 400,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 124,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 9,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 115,
+    "expected_by_table": {
+      "record_date_index": 36,
+      "record": 36,
+      "record_recurrence": 27,
+      "assignment": 6,
+      "graph_edge": 6,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 9,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 93,
+    "expected_by_table": {
+      "record_date_index": 29,
+      "record": 29,
+      "record_recurrence": 21,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 9,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 390,
+    "expected_by_table": {
+      "record_date_index": 129,
+      "record": 129,
+      "record_recurrence": 120,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 9,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 398,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 124,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 10,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 108,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 26,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 10,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 93,
+    "expected_by_table": {
+      "record_date_index": 29,
+      "record": 29,
+      "record_recurrence": 21,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 10,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 10,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 402,
+    "expected_by_table": {
+      "record_date_index": 133,
+      "record": 133,
+      "record_recurrence": 124,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 11,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 108,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 26,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 11,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 123,
+    "expected_by_table": {
+      "record_date_index": 39,
+      "record": 39,
+      "record_recurrence": 31,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 11,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 11,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 12,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 107,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 12,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 123,
+    "expected_by_table": {
+      "record_date_index": 39,
+      "record": 39,
+      "record_recurrence": 31,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 12,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 12,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 382,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 118,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 13,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 108,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 26,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 13,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 95,
+    "expected_by_table": {
+      "record_date_index": 30,
+      "record": 30,
+      "record_recurrence": 21,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 13,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 397,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 13,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 14,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 110,
+    "expected_by_table": {
+      "record_date_index": 35,
+      "record": 35,
+      "record_recurrence": 26,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 14,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 95,
+    "expected_by_table": {
+      "record_date_index": 29,
+      "record": 29,
+      "record_recurrence": 21,
+      "assignment": 6,
+      "graph_edge": 6,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 14,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 14,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 385,
+    "expected_by_table": {
+      "record_date_index": 128,
+      "record": 128,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 15,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 110,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 26,
+      "assignment": 6,
+      "graph_edge": 6,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 15,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-02",
+    "expected_rows": 93,
+    "expected_by_table": {
+      "record_date_index": 29,
+      "record": 29,
+      "record_recurrence": 21,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 15,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 397,
+    "expected_by_table": {
+      "record_date_index": 132,
+      "record": 132,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 15,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-22",
+    "expected_rows": 385,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 16,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 105,
+    "expected_by_table": {
+      "record_date_index": 33,
+      "record": 33,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 16,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 120,
+    "expected_by_table": {
+      "record_date_index": 38,
+      "record": 38,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 16,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-24",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 16,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 17,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-03",
+    "expected_rows": 105,
+    "expected_by_table": {
+      "record_date_index": 33,
+      "record": 33,
+      "record_recurrence": 25,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 17,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-04",
+    "expected_rows": 120,
+    "expected_by_table": {
+      "record_date_index": 38,
+      "record": 38,
+      "record_recurrence": 30,
+      "assignment": 5,
+      "graph_edge": 5,
+      "calendar_event": 4
+    }
+  },
+  {
+    "account": 17,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-24",
+    "expected_rows": 395,
+    "expected_by_table": {
+      "record_date_index": 131,
+      "record": 131,
+      "record_recurrence": 123,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 17,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-23",
+    "expected_rows": 383,
+    "expected_by_table": {
+      "record_date_index": 127,
+      "record": 127,
+      "record_recurrence": 119,
+      "assignment": 4,
+      "graph_edge": 4,
+      "calendar_event": 2
+    }
+  },
+  {
+    "account": 18,
+    "kind": "day",
+    "size": "p50",
+    "start": "2026-09-01",
+    "expected_rows": 123,
+    "expected_by_table": {
+      "record_date_index": 34,
+      "record": 34,
+      "record_recurrence": 26,
+      "assignment": 8,
+      "graph_edge": 5,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 18,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-11",
+    "expected_rows": 394,
+    "expected_by_table": {
+      "record_date_index": 124,
+      "record": 124,
+      "record_recurrence": 116,
+      "assignment": 9,
+      "graph_edge": 6,
+      "calendar_event": 15
+    }
+  },
+  {
+    "account": 18,
+    "kind": "day",
+    "size": "p95",
+    "start": "2026-09-10",
+    "expected_rows": 367,
+    "expected_by_table": {
+      "record_date_index": 115,
+      "record": 115,
+      "record_recurrence": 107,
+      "assignment": 9,
+      "graph_edge": 6,
+      "calendar_event": 15
+    }
+  },
+  {
+    "account": 0,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 167,
+    "expected_by_table": {
+      "record_date_index": 50,
+      "record": 50,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 0,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-29",
+    "expected_rows": 212,
+    "expected_by_table": {
+      "record_date_index": 63,
+      "record": 63,
+      "record_recurrence": 30,
+      "assignment": 20,
+      "graph_edge": 20,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 0,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 580,
+    "expected_by_table": {
+      "record_date_index": 188,
+      "record": 188,
+      "record_recurrence": 128,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 0,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 590,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 1,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 169,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 1,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-29",
+    "expected_rows": 214,
+    "expected_by_table": {
+      "record_date_index": 64,
+      "record": 64,
+      "record_recurrence": 30,
+      "assignment": 20,
+      "graph_edge": 20,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 1,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 592,
+    "expected_by_table": {
+      "record_date_index": 192,
+      "record": 192,
+      "record_recurrence": 132,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 1,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 575,
+    "expected_by_table": {
+      "record_date_index": 186,
+      "record": 186,
+      "record_recurrence": 127,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 2,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 169,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 2,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 587,
+    "expected_by_table": {
+      "record_date_index": 190,
+      "record": 190,
+      "record_recurrence": 131,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 2,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 577,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 127,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 3,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 169,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 3,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-29",
+    "expected_rows": 214,
+    "expected_by_table": {
+      "record_date_index": 64,
+      "record": 64,
+      "record_recurrence": 30,
+      "assignment": 20,
+      "graph_edge": 20,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 3,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 579,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 127,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 3,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 589,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 131,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 4,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 169,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 4,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 591,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 131,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 4,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 575,
+    "expected_by_table": {
+      "record_date_index": 186,
+      "record": 186,
+      "record_recurrence": 127,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 5,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 172,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 5,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 582,
+    "expected_by_table": {
+      "record_date_index": 188,
+      "record": 188,
+      "record_recurrence": 128,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 5,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 590,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 6,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 172,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 6,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 577,
+    "expected_by_table": {
+      "record_date_index": 186,
+      "record": 186,
+      "record_recurrence": 127,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 6,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 594,
+    "expected_by_table": {
+      "record_date_index": 192,
+      "record": 192,
+      "record_recurrence": 132,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 7,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 177,
+    "expected_by_table": {
+      "record_date_index": 52,
+      "record": 52,
+      "record_recurrence": 27,
+      "assignment": 17,
+      "graph_edge": 17,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 7,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-27",
+    "expected_rows": 130,
+    "expected_by_table": {
+      "record_date_index": 39,
+      "record": 39,
+      "record_recurrence": 22,
+      "assignment": 11,
+      "graph_edge": 11,
+      "calendar_event": 8
+    }
+  },
+  {
+    "account": 7,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 578,
+    "expected_by_table": {
+      "record_date_index": 186,
+      "record": 186,
+      "record_recurrence": 128,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 7,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 592,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 8,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 175,
+    "expected_by_table": {
+      "record_date_index": 52,
+      "record": 52,
+      "record_recurrence": 27,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 8,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-27",
+    "expected_rows": 130,
+    "expected_by_table": {
+      "record_date_index": 39,
+      "record": 39,
+      "record_recurrence": 22,
+      "assignment": 11,
+      "graph_edge": 11,
+      "calendar_event": 8
+    }
+  },
+  {
+    "account": 8,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 580,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 128,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 8,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 590,
+    "expected_by_table": {
+      "record_date_index": 190,
+      "record": 190,
+      "record_recurrence": 132,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 9,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 175,
+    "expected_by_table": {
+      "record_date_index": 52,
+      "record": 52,
+      "record_recurrence": 27,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 9,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 578,
+    "expected_by_table": {
+      "record_date_index": 186,
+      "record": 186,
+      "record_recurrence": 128,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 9,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 592,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 10,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 170,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 10,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 578,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 128,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 10,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 590,
+    "expected_by_table": {
+      "record_date_index": 190,
+      "record": 190,
+      "record_recurrence": 132,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 11,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 170,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 11,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-29",
+    "expected_rows": 215,
+    "expected_by_table": {
+      "record_date_index": 64,
+      "record": 64,
+      "record_recurrence": 31,
+      "assignment": 20,
+      "graph_edge": 20,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 11,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 580,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 128,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 11,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 590,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 12,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 169,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 12,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 592,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 32,
+      "graph_edge": 32,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 12,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 573,
+    "expected_by_table": {
+      "record_date_index": 185,
+      "record": 185,
+      "record_recurrence": 127,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 13,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 172,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 13,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 588,
+    "expected_by_table": {
+      "record_date_index": 190,
+      "record": 190,
+      "record_recurrence": 132,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 13,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 578,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 128,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 14,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 172,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 14,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 590,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 132,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 14,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 575,
+    "expected_by_table": {
+      "record_date_index": 186,
+      "record": 186,
+      "record_recurrence": 127,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 15,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 172,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 26,
+      "assignment": 16,
+      "graph_edge": 16,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 15,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-19",
+    "expected_rows": 587,
+    "expected_by_table": {
+      "record_date_index": 190,
+      "record": 190,
+      "record_recurrence": 131,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 15,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-18",
+    "expected_rows": 573,
+    "expected_by_table": {
+      "record_date_index": 185,
+      "record": 185,
+      "record_recurrence": 127,
+      "assignment": 31,
+      "graph_edge": 31,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 16,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 165,
+    "expected_by_table": {
+      "record_date_index": 49,
+      "record": 49,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 16,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-29",
+    "expected_rows": 210,
+    "expected_by_table": {
+      "record_date_index": 62,
+      "record": 62,
+      "record_recurrence": 30,
+      "assignment": 20,
+      "graph_edge": 20,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 16,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-21",
+    "expected_rows": 587,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 135,
+      "assignment": 28,
+      "graph_edge": 28,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 16,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-20",
+    "expected_rows": 577,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 131,
+      "assignment": 29,
+      "graph_edge": 29,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 17,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-28",
+    "expected_rows": 165,
+    "expected_by_table": {
+      "record_date_index": 49,
+      "record": 49,
+      "record_recurrence": 25,
+      "assignment": 15,
+      "graph_edge": 15,
+      "calendar_event": 12
+    }
+  },
+  {
+    "account": 17,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-29",
+    "expected_rows": 210,
+    "expected_by_table": {
+      "record_date_index": 62,
+      "record": 62,
+      "record_recurrence": 30,
+      "assignment": 20,
+      "graph_edge": 20,
+      "calendar_event": 16
+    }
+  },
+  {
+    "account": 17,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-21",
+    "expected_rows": 587,
+    "expected_by_table": {
+      "record_date_index": 191,
+      "record": 191,
+      "record_recurrence": 135,
+      "assignment": 28,
+      "graph_edge": 28,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 17,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-20",
+    "expected_rows": 577,
+    "expected_by_table": {
+      "record_date_index": 187,
+      "record": 187,
+      "record_recurrence": 131,
+      "assignment": 29,
+      "graph_edge": 29,
+      "calendar_event": 14
+    }
+  },
+  {
+    "account": 18,
+    "kind": "week",
+    "size": "p50",
+    "start": "2026-08-27",
+    "expected_rows": 197,
+    "expected_by_table": {
+      "record_date_index": 51,
+      "record": 51,
+      "record_recurrence": 35,
+      "assignment": 17,
+      "graph_edge": 11,
+      "calendar_event": 32
+    }
+  },
+  {
+    "account": 18,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-02",
+    "expected_rows": 596,
+    "expected_by_table": {
+      "record_date_index": 145,
+      "record": 145,
+      "record_recurrence": 89,
+      "assignment": 63,
+      "graph_edge": 42,
+      "calendar_event": 112
+    }
+  },
+  {
+    "account": 18,
+    "kind": "week",
+    "size": "p95",
+    "start": "2026-09-01",
+    "expected_rows": 567,
+    "expected_by_table": {
+      "record_date_index": 136,
+      "record": 136,
+      "record_recurrence": 80,
+      "assignment": 62,
+      "graph_edge": 41,
+      "calendar_event": 112
+    }
+  }
+]

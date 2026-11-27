@@ -1,0 +1,6601 @@
+[
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 0,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 105,
+    "wall_s": 0.10006666699996458,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0048141749998649175,
+        "query_s": 0.03883318800012603,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.005586434999941048,
+        "query_s": 0.04116297700011273,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.010560755000142308,
+        "query_s": 0.006537045999948532,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.043706346000135454,
+        "query_s": 0.039432313999895996,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.04366967500004648,
+        "query_s": 0.05333404500015604,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.009260429000050863,
+        "query_s": 0.0369734769999468,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 33,
+      "public.record": 33,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.04172400000000209,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 2976,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 262898,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 60579,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2,
+      "tailers": 1
+    },
+    "rows": 105
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 0,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 120,
+    "wall_s": 0.12136287700013781,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.010056009999971138,
+        "query_s": 0.05387046700002429,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.011572316999945542,
+        "query_s": 0.06432661100006953,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.06588080999995327,
+        "query_s": 0.011471080000092115,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.06961610600001222,
+        "query_s": 0.03583715700005996,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.06765152799994212,
+        "query_s": 0.052321331000030114,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.011591897000016615,
+        "query_s": 0.05424638500016954,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 38,
+      "public.record": 38,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.02410899999999927,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 754,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60631,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 120
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 0,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.2360720429999219,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.16617780100000346,
+        "query_s": 0.01283292299990535,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.17085069999984626,
+        "query_s": 0.020290375000058702,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.16912640099985765,
+        "query_s": 0.008677703000103065,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.17880694900009075,
+        "query_s": 0.038331636999828334,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.1790707029999794,
+        "query_s": 0.05625631499992778,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.1616743750000751,
+        "query_s": 0.010635876999913307,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.02727700000000155,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 696,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 58923,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 0,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.09922219000009136,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.053772670999933325,
+        "query_s": 0.011940798000068753,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.005982958000004146,
+        "query_s": 0.016335650999963036,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.05494840899996234,
+        "query_s": 0.009347188999981881,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.04897112499998002,
+        "query_s": 0.037186719999908746,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.04950242400013849,
+        "query_s": 0.048763999999891894,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.005277677999856678,
+        "query_s": 0.005584963000046628,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.040160000000000196,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 696,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 158641,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 1,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 107,
+    "wall_s": 0.06823939700007031,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.012562407999894276,
+        "query_s": 0.009612244999971153,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.01153466099981415,
+        "query_s": 0.013514201000134562,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009907856999916476,
+        "query_s": 0.009116494999943825,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.022398735000024317,
+        "query_s": 0.030366950000143333,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02266669000005095,
+        "query_s": 0.04381861399997433,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.009011787999952503,
+        "query_s": 0.0057837700001073244,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.01560699999999926,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 70351,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 107
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 1,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 120,
+    "wall_s": 0.07078014700005042,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.008806640999864612,
+        "query_s": 0.011803798000073584,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009287229999927149,
+        "query_s": 0.012765596999997797,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.007808777999798622,
+        "query_s": 0.010661946000027456,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.023912844000051336,
+        "query_s": 0.03040203799992014,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02553001699993729,
+        "query_s": 0.04449924200002897,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008649606000062704,
+        "query_s": 0.010534454999969967,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 38,
+      "public.record": 38,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.025959000000000287,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60579,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 120
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 1,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.07449616400003833,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.009321271000089837,
+        "query_s": 0.009821077999959016,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009999906000075498,
+        "query_s": 0.022723528999904374,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.00755376699999033,
+        "query_s": 0.006877045000010185,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.025616221000063888,
+        "query_s": 0.03340144499998132,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02549449900016043,
+        "query_s": 0.04833777299995745,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.00710683300007986,
+        "query_s": 0.005471713999895655,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.03381499999999704,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 58871,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 1,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 387,
+    "wall_s": 0.39496992699992006,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.2167196899999908,
+        "query_s": 0.1777971989999969,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.18646910899997238,
+        "query_s": 0.03148031099999571,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.2011004050000338,
+        "query_s": 0.18497277099982057,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.034169758000189177,
+        "query_s": 0.024916744999927687,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.19036899599996104,
+        "query_s": 0.19618790799995622,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.19717835500000547,
+        "query_s": 0.1871228699999392,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 128,
+      "public.record": 128,
+      "public.record_recurrence": 119,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.05452699999999666,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62391,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 387
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 2,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 105,
+    "wall_s": 0.20259671799999524,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.12313732000006894,
+        "query_s": 0.01471314499985965,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.14081401299995377,
+        "query_s": 0.01488452600005985,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.1293646340000123,
+        "query_s": 0.007262441000193576,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.15842533099998946,
+        "query_s": 0.027760512999975617,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.15587068099989665,
+        "query_s": 0.04456804500000544,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.1381152070000553,
+        "query_s": 0.005207717999837769,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 33,
+      "public.record": 33,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.030984000000000123,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 65291,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 105
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 2,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 122,
+    "wall_s": 0.08827694500018879,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.009893987000168636,
+        "query_s": 0.028417810999826543,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.0101456480001616,
+        "query_s": 0.02995373799990375,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.007293167999932848,
+        "query_s": 0.005266176000077394,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.0384475509999902,
+        "query_s": 0.030771672000128092,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03806446900011906,
+        "query_s": 0.048898535000034826,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008653642000126638,
+        "query_s": 0.006529614999863043,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 39,
+      "public.record": 39,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.03519199999999856,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62287,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 122
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 2,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 399,
+    "wall_s": 0.07935868599997775,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007139253000104873,
+        "query_s": 0.011940541999820198,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.007301816000108374,
+        "query_s": 0.023316066000006685,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.00873681600000964,
+        "query_s": 0.005925202000071295,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.027719249999790918,
+        "query_s": 0.03644426500000009,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02841318399987358,
+        "query_s": 0.04942920500002401,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.010288832000014736,
+        "query_s": 0.00631420300010177,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 123,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.027885999999998745,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62287,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 399
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 2,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.07930769500012502,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007240323000132776,
+        "query_s": 0.02077638199989451,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.007218565999892235,
+        "query_s": 0.029078599000058603,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.0078093839999837655,
+        "query_s": 0.012753554000028089,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02492139099990709,
+        "query_s": 0.0386715560000539,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02539853000007497,
+        "query_s": 0.0530321940000249,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008937786999922537,
+        "query_s": 0.012530629999901066,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.02476599999999962,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61227,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 3,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 107,
+    "wall_s": 0.11440410399995926,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.04584703799991985,
+        "query_s": 0.010338086000047042,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.05358779399989544,
+        "query_s": 0.010916096000073594,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.04628642000011496,
+        "query_s": 0.0056145769999602635,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.0512080060000244,
+        "query_s": 0.04710381199993208,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.050505864999877303,
+        "query_s": 0.06313466799997514,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.0471985090000544,
+        "query_s": 0.0075843129998247605,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.03245199999999926,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 1028,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 66947,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 107
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 3,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 120,
+    "wall_s": 0.067778608000026,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007870585999853574,
+        "query_s": 0.013619789000131277,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.008289758000046277,
+        "query_s": 0.013185634999899776,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009069048999890583,
+        "query_s": 0.005925896999997349,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02635855099993023,
+        "query_s": 0.02750590200002989,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.025015873000029387,
+        "query_s": 0.041034780000018145,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.010265458000048966,
+        "query_s": 0.0047675299999809795,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 38,
+      "public.record": 38,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.013763999999998333,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60579,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 120
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 3,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.09880241600012596,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.02235990100007257,
+        "query_s": 0.014068114999872705,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.02620172599995385,
+        "query_s": 0.04568731399990611,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.025325224999960483,
+        "query_s": 0.026410699000052773,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.020179434000056062,
+        "query_s": 0.07543252499999653,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.01974355800007288,
+        "query_s": 0.07852318200002628,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.019267656000010902,
+        "query_s": 0.009102664000010918,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.055958000000000396,
+    "created": {
+      "bytes_circuit_integral": 216,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 1688,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 58923,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 3,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 385,
+    "wall_s": 0.07262871099987933,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.00902803199983282,
+        "query_s": 0.01470256400011749,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.011087847999988298,
+        "query_s": 0.021311212000000523,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009511700999837558,
+        "query_s": 0.008607173000200419,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.027343959000063478,
+        "query_s": 0.029796908999969673,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02900468899997577,
+        "query_s": 0.0430837750000137,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008235557000034532,
+        "query_s": 0.014460322000104497,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 128,
+      "public.record": 128,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.018057000000002432,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62883,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 385
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 4,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 107,
+    "wall_s": 0.30841952300011144,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.2499352249999447,
+        "query_s": 0.010579432999975324,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.2287813579998783,
+        "query_s": 0.009675259999994523,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.2305209809999269,
+        "query_s": 0.008126813999979277,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02664443900016522,
+        "query_s": 0.025499545999991824,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.2518983110001045,
+        "query_s": 0.05458739899995635,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.22601392000001397,
+        "query_s": 0.010070820999999341,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.036730999999999625,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 296,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 64695,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 107
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 4,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 122,
+    "wall_s": 0.09513318799986337,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.014676639999834151,
+        "query_s": 0.028289828999959354,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.03444564500000524,
+        "query_s": 0.01571008099995197,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.012629563000018607,
+        "query_s": 0.02789627099991776,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.038463295000155995,
+        "query_s": 0.03670481399990422,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.036771544999965045,
+        "query_s": 0.05752250900013678,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.01492118000010123,
+        "query_s": 0.027899365999928705,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 39,
+      "public.record": 39,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.05154399999999981,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62339,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 122
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 4,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 397,
+    "wall_s": 0.1589858039999399,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0918528019999485,
+        "query_s": 0.012083511999890106,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.09144351500003722,
+        "query_s": 0.0195039939999333,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.09099696599992058,
+        "query_s": 0.005980845000067347,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.11028805299997657,
+        "query_s": 0.03425625299996682,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.1090940579999824,
+        "query_s": 0.048827715000015814,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.09136763100013923,
+        "query_s": 0.008922002999952383,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.0295810000000003,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 65239,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 397
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 4,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 382,
+    "wall_s": 0.08301185999994232,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.009980517000030886,
+        "query_s": 0.01270165599999018,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.006154775000140944,
+        "query_s": 0.018365526999787107,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.008362086000033742,
+        "query_s": 0.006923403999962829,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 118
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.028373820000069827,
+        "query_s": 0.04185395600006814,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.027453774000150588,
+        "query_s": 0.054726752999840755,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.006790755999872999,
+        "query_s": 0.007068321000133437,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 118,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.0389290000000031,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60631,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 382
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 5,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 108,
+    "wall_s": 0.07411786800003028,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006534662999911234,
+        "query_s": 0.011288393000086216,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.012396008999985497,
+        "query_s": 0.00989531900017937,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.008346153000047707,
+        "query_s": 0.004645127000003413,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02644593700006226,
+        "query_s": 0.03425799499996174,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.026215035999939573,
+        "query_s": 0.046333865999940826,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.01182364300007066,
+        "query_s": 0.006281915000045046,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 26,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.016512999999999778,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 62883,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 108
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 5,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 95,
+    "wall_s": 0.09242488800009596,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.03492528900005709,
+        "query_s": 0.015197212999964904,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.029666187999964677,
+        "query_s": 0.016809729999977208,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.03553228099985972,
+        "query_s": 0.010399664000033226,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.050792738999916764,
+        "query_s": 0.026039153000056103,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.049209577000056015,
+        "query_s": 0.04260776299997815,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.04309119100003045,
+        "query_s": 0.005232596000041667,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 30,
+      "public.record": 30,
+      "public.record_recurrence": 21,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.04335900000000237,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 812,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62339,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 95
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 5,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 397,
+    "wall_s": 0.11754998400010663,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.1093345980000322,
+        "query_s": 0.006504947999928845,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009607189000007565,
+        "query_s": 0.01891632000001664,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.010181727999906798,
+        "query_s": 0.004965566000009858,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.029797744999996212,
+        "query_s": 0.03152164299990545,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03008879000003617,
+        "query_s": 0.04581635199997436,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.006161725000083607,
+        "query_s": 0.003844840000056138,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.0190550000000016,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 65187,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 397
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 5,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.07691765499998837,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.010090279999985796,
+        "query_s": 0.014584342000034667,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.011833668000008402,
+        "query_s": 0.019748214999935954,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.01332025200008502,
+        "query_s": 0.006577836999895226,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.024420922999979666,
+        "query_s": 0.03564606200006892,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.024211769999965327,
+        "query_s": 0.04862599800003409,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.010250390000010157,
+        "query_s": 0.006122365999999602,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.017175999999999192,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 58871,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 6,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 110,
+    "wall_s": 0.22441957000000912,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.15094898500001364,
+        "query_s": 0.017951487999880555,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.151613148000024,
+        "query_s": 0.02137779200006662,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.1688626770001065,
+        "query_s": 0.00488216099984129,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.17577874499988866,
+        "query_s": 0.03212727900017853,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.17623782700002266,
+        "query_s": 0.04714671100009582,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.15170807999993485,
+        "query_s": 0.014426205000063419,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 35,
+      "public.record": 35,
+      "public.record_recurrence": 26,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.07570300000000074,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 64643,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 110
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 6,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 95,
+    "wall_s": 0.2557142489999933,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006995422000045437,
+        "query_s": 0.010156589999951393,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.006339707000051931,
+        "query_s": 0.011286950000112483,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.20932162999997672,
+        "query_s": 0.009072174000039013,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.024280082000132097,
+        "query_s": 0.029132911000033346,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.20682573299995965,
+        "query_s": 0.047706188000120164,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.20638216900010775,
+        "query_s": 0.012864414999967266,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 29,
+      "public.record": 29,
+      "public.record_recurrence": 21,
+      "public.assignment": 6,
+      "public.graph_edge": 6,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.023198000000000718,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62339,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 95
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 6,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.1338111539998863,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.05225608299997475,
+        "query_s": 0.00811149099990871,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.05468233200008399,
+        "query_s": 0.022934409999834315,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.055240841999875556,
+        "query_s": 0.007249356000102125,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.07400820499992733,
+        "query_s": 0.04258899499996005,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.07508382299988625,
+        "query_s": 0.05696012800012795,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.05027243099993939,
+        "query_s": 0.006365856000002168,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.050000999999998186,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 63479,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 6,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 385,
+    "wall_s": 0.08714408000014373,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0075284140000349,
+        "query_s": 0.012231062999944697,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009097541999835812,
+        "query_s": 0.017483682000147382,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.00924324900006468,
+        "query_s": 0.005557070999884672,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.028669176999983392,
+        "query_s": 0.04232365799998661,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.029933402999859027,
+        "query_s": 0.05646231300011095,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.005963743000165778,
+        "query_s": 0.008871578999787744,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 128,
+      "public.record": 128,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.02724500000000063,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60631,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 385
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 7,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 113,
+    "wall_s": 0.127605764000009,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0813864450001347,
+        "query_s": 0.01031405999992785,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.02428703299983681,
+        "query_s": 0.009715009000046848,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.06811504099982812,
+        "query_s": 0.003162940000038361,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 27
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.07070332200009943,
+        "query_s": 0.028226505000020552,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.08206488299992998,
+        "query_s": 0.0424961969999913,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.024501708999878247,
+        "query_s": 0.004401578000170048,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 35,
+      "public.record": 35,
+      "public.record_recurrence": 27,
+      "public.assignment": 6,
+      "public.graph_edge": 6,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.017102000000001283,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 1722,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 64591,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 113
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 7,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 96,
+    "wall_s": 0.0732393549999415,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.02082409399986318,
+        "query_s": 0.01063143500005026,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.018847658000140655,
+        "query_s": 0.01161716499996146,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.016650462000143307,
+        "query_s": 0.006375314000024446,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 22
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.03102758900013214,
+        "query_s": 0.02774380799996834,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.030784009999933915,
+        "query_s": 0.0405785380000907,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.0203249930000311,
+        "query_s": 0.006161628999961977,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 30,
+      "public.record": 30,
+      "public.record_recurrence": 22,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.021316000000002333,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60631,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 96
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 7,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 388,
+    "wall_s": 0.14640259599991623,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0067739599999185884,
+        "query_s": 0.008059744000092905,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.12276665099989259,
+        "query_s": 0.02064645800010112,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.12285224399988692,
+        "query_s": 0.012637411000014254,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 120
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.020990162000089185,
+        "query_s": 0.03324824500009527,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.021212660000173855,
+        "query_s": 0.05768913799988695,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.007742640000060419,
+        "query_s": 0.0034944760000144015,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 128,
+      "public.record": 128,
+      "public.record_recurrence": 120,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.04731899999999811,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 65239,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 388
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 7,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 400,
+    "wall_s": 0.10514597900009903,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.03758562199982407,
+        "query_s": 0.0300431870000466,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 133
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.030314526999973168,
+        "query_s": 0.01937238300001809,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 133
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.04637436699999853,
+        "query_s": 0.01945029900002737,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 124
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.061589076000018395,
+        "query_s": 0.031756964000123844,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.057324421999965125,
+        "query_s": 0.04711228999985906,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.040555873999892356,
+        "query_s": 0.02260462699996424,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 133,
+      "public.record": 133,
+      "public.record_recurrence": 124,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.06251499999999766,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60683,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 400
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 8,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 111,
+    "wall_s": 0.3963389369998822,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.3102957289997903,
+        "query_s": 0.019799797000132457,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.3185559429998648,
+        "query_s": 0.018968659000165644,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.3134918190000917,
+        "query_s": 0.012818721999792615,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 27
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.3391700929998933,
+        "query_s": 0.04271578399993814,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.3398962630001279,
+        "query_s": 0.0558608839999124,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.31068078099997365,
+        "query_s": 0.01555912900016665,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 35,
+      "public.record": 35,
+      "public.record_recurrence": 27,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.051022999999997154,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 488,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 64715,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 111
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 8,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 100,
+    "wall_s": 0.06999597899994114,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.05082113599996774,
+        "query_s": 0.006580311000107031,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 31
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.04934442199987643,
+        "query_s": 0.011162725000076534,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 31
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.0059777900000881345,
+        "query_s": 0.002872355999897991,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 22
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.021599213000172313,
+        "query_s": 0.02930228399986845,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.020812466000052154,
+        "query_s": 0.04685215099993911,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.01824142599980405,
+        "query_s": 0.006509400000140886,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 31,
+      "public.record": 31,
+      "public.record_recurrence": 22,
+      "public.assignment": 6,
+      "public.graph_edge": 6,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.02400000000000091,
+    "created": {
+      "bytes_circuit_integral": 1508,
+      "bytes_circuit_snapshots": 1820,
+      "bytes_membership_circuit": 3328,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 64873,
+      "shapes": 2,
+      "subquery_contributors": 15,
+      "subquery_distinct_values": 15,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 100
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 8,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 386,
+    "wall_s": 0.13881320399991637,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0755499399999735,
+        "query_s": 0.01822199200000796,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.0854334610000933,
+        "query_s": 0.04994030900002144,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.08868679700003668,
+        "query_s": 0.03871734400013338,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 120
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.08130428100002973,
+        "query_s": 0.04661106000003201,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.07351853199998004,
+        "query_s": 0.05538515800003552,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.08199773799992727,
+        "query_s": 0.04019223000000238,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 128,
+      "public.record": 128,
+      "public.record_recurrence": 120,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.05667500000000203,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61227,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 386
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 8,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 400,
+    "wall_s": 0.20463730799997393,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.1457352360000641,
+        "query_s": 0.01848763499992856,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.1522794239999712,
+        "query_s": 0.02598718500007635,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.15010094600006596,
+        "query_s": 0.010393840000006094,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 124
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.1471807580001041,
+        "query_s": 0.04436328799988587,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.1459399929999563,
+        "query_s": 0.057884730000068885,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.15417145299988988,
+        "query_s": 0.012745522000159326,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 124,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.036398999999999404,
+    "created": {
+      "bytes_circuit_integral": 428,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2016,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 65291,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 400
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 9,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 115,
+    "wall_s": 0.07643493899990972,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.008064935999982481,
+        "query_s": 0.011839848000136044,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 36
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.005932721999897694,
+        "query_s": 0.013007583999979033,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 36
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.012200936999988699,
+        "query_s": 0.005859643999883701,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 27
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02716996500021196,
+        "query_s": 0.030060997999953543,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02892747199985024,
+        "query_s": 0.046245984000051976,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.007968312000002697,
+        "query_s": 0.005448532999935196,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 36,
+      "public.record": 36,
+      "public.record_recurrence": 27,
+      "public.assignment": 6,
+      "public.graph_edge": 6,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.023368999999998863,
+    "created": {
+      "bytes_circuit_integral": 1508,
+      "bytes_circuit_snapshots": 1820,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 3328,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 64925,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 15,
+      "subquery_distinct_values": 15,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 115
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 9,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 93,
+    "wall_s": 0.07150527699991471,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.008602896999946097,
+        "query_s": 0.01030604300012783,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009025932999975339,
+        "query_s": 0.01299576600013097,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.013079851999918901,
+        "query_s": 0.006442455000069458,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.024602980999816282,
+        "query_s": 0.04540331300017897,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.024542309000025853,
+        "query_s": 0.0451283519998924,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.011416523999969286,
+        "query_s": 0.006946298000002571,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 29,
+      "public.record": 29,
+      "public.record_recurrence": 21,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.03966100000000239,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61731,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 93
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 9,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 390,
+    "wall_s": 0.2882257999999638,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.22622044700005972,
+        "query_s": 0.02141566399996009,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 129
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.22117372000002433,
+        "query_s": 0.03548816500006069,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 129
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.22689997900010894,
+        "query_s": 0.006052771999975448,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 120
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.2107709569997951,
+        "query_s": 0.03810735700017176,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.22113980299991454,
+        "query_s": 0.06674061500007156,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.2280702890000157,
+        "query_s": 0.00764314100001684,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 129,
+      "public.record": 129,
+      "public.record_recurrence": 120,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.07487099999999813,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": -5780,
+      "bytes_membership_circuit": -4364,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 66423,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 390
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 9,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 398,
+    "wall_s": 0.06989052999983869,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.008267443999784518,
+        "query_s": 0.009687979000091218,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.010447179000038886,
+        "query_s": 0.018984853000119983,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.005492754999977478,
+        "query_s": 0.008338940999919942,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 124
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.025389988000142694,
+        "query_s": 0.029875936000053116,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.023911305999945398,
+        "query_s": 0.045218938000061826,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008456387000023824,
+        "query_s": 0.007683590999931766,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 124,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.018716000000001287,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61175,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 398
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 10,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 108,
+    "wall_s": 0.12131677699994725,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006451838999964821,
+        "query_s": 0.0055838409998614225,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.06619767699999102,
+        "query_s": 0.022134634000167352,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.028041087000019616,
+        "query_s": 0.011335913000039,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.06203140699994947,
+        "query_s": 0.0423590460000014,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.06580293199999687,
+        "query_s": 0.054940077000082965,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.06780186200012395,
+        "query_s": 0.014259455999990678,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 26,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.05884,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102967,
+      "bytes_subquery_registry": 60631,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 108
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 10,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 93,
+    "wall_s": 0.06621954499996718,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.010090199999922334,
+        "query_s": 0.011615993000077651,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.00889025599985871,
+        "query_s": 0.012918501000058313,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.010572647000117286,
+        "query_s": 0.0070514760000151,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02591167800005678,
+        "query_s": 0.026381074000028093,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02419012800010023,
+        "query_s": 0.04044060199998967,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008166213000095013,
+        "query_s": 0.00660003100006179,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 29,
+      "public.record": 29,
+      "public.record_recurrence": 21,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.013522999999999286,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61731,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 93
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 10,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.0839758269999038,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.015734818000055384,
+        "query_s": 0.012819225999919581,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.0220040889998927,
+        "query_s": 0.019707654000058028,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.019920351999871855,
+        "query_s": 0.012978941000028499,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.030651942000076815,
+        "query_s": 0.034230964000016684,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03300636300014048,
+        "query_s": 0.05073785199988379,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.017551389000118434,
+        "query_s": 0.007884140999976808,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.02813499999999891,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62955,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 10,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 402,
+    "wall_s": 0.07088037600010466,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006327372999976433,
+        "query_s": 0.010676056999955108,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 133
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009462562000180696,
+        "query_s": 0.016117164999968736,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 133
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.0089360240001497,
+        "query_s": 0.008447843999874749,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 124
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.028294450999965193,
+        "query_s": 0.02697864800006755,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02863093999985722,
+        "query_s": 0.04147716100010257,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008945207999886406,
+        "query_s": 0.006125941999925999,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 133,
+      "public.record": 133,
+      "public.record_recurrence": 124,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.017853999999999814,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 64591,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 402
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 11,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 108,
+    "wall_s": 0.07460551700000906,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.01866259100006573,
+        "query_s": 0.008883394999884331,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.021897188999901118,
+        "query_s": 0.01197572000000946,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.021863833999987037,
+        "query_s": 0.008065471999998408,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.030913794000070993,
+        "query_s": 0.028565851999928782,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03139625500011789,
+        "query_s": 0.041849744000046485,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.018571635000171227,
+        "query_s": 0.006977595999842379,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 26,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.02372299999999683,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102551,
+      "bytes_subquery_registry": 60631,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 108
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 11,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 123,
+    "wall_s": 0.09804131399982907,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.02357455200012737,
+        "query_s": 0.012729282000009334,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.025719329999901674,
+        "query_s": 0.011894528000084392,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.02691404600000169,
+        "query_s": 0.006711577000032776,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 31
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.03986502899988409,
+        "query_s": 0.04362138800001958,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.0395661069999278,
+        "query_s": 0.057314384999926915,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.023218048999979146,
+        "query_s": 0.009964587000013125,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 39,
+      "public.record": 39,
+      "public.record_recurrence": 31,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.030444999999996725,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": -4804,
+      "bytes_membership_circuit": -3480,
+      "bytes_pk_dict": 754,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61783,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 123
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 11,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.07668539500014049,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.010988152999971135,
+        "query_s": 0.016901170999972237,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.007898307000004934,
+        "query_s": 0.02438453800004936,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.013509284000065236,
+        "query_s": 0.012130590999959168,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.0356250730001193,
+        "query_s": 0.027885288999868862,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.033728526999993846,
+        "query_s": 0.041144002000010005,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.014569048000112161,
+        "query_s": 0.008613762000095448,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.019688999999999623,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62903,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 11,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.08401884300019447,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007366586999978608,
+        "query_s": 0.011254406000034578,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.007402315000035742,
+        "query_s": 0.023135871000022235,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009397298000067167,
+        "query_s": 0.0072965629999544035,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.0248094730000048,
+        "query_s": 0.04326747800018893,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.025026116999924852,
+        "query_s": 0.0579292649999843,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.006724196000050142,
+        "query_s": 0.008562995999909617,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.041080000000000894,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61227,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 12,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 107,
+    "wall_s": 0.2244590549998975,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.1445942859998013,
+        "query_s": 0.012598942000067836,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.14720079800008534,
+        "query_s": 0.016135441999949762,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.14724602599994796,
+        "query_s": 0.010344020000047749,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.17052900099997714,
+        "query_s": 0.04038285399997221,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.17086978599991198,
+        "query_s": 0.052593210000168256,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.1486154300000635,
+        "query_s": 0.009605308999880435,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.04410000000000025,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102551,
+      "bytes_subquery_registry": 62339,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 107
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 12,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 123,
+    "wall_s": 0.07447162099992966,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0078195850001066,
+        "query_s": 0.006542469999885725,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.015112936999912563,
+        "query_s": 0.012560163999978613,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 39
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.013233650999836755,
+        "query_s": 0.005935106000151791,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 31
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.025508279000177936,
+        "query_s": 0.03506579199984117,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.025759254000149667,
+        "query_s": 0.04771325699994122,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.012239995000072668,
+        "query_s": 0.007005406999951447,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 39,
+      "public.record": 39,
+      "public.record_recurrence": 31,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.01415500000000236,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61731,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 123
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 12,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.16694464099987272,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.11013176200003727,
+        "query_s": 0.02057588599996052,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.11866535299986936,
+        "query_s": 0.02370418000009522,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.11232747400003973,
+        "query_s": 0.016153188000089358,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.021265819000063857,
+        "query_s": 0.025431002999994234,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.11069436200000382,
+        "query_s": 0.05544411799996851,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.12071257000002333,
+        "query_s": 0.009336533000123381,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.028255000000001473,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62955,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 12,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 382,
+    "wall_s": 0.09379880999995294,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006868743000040922,
+        "query_s": 0.010230569999976069,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.008346106999852054,
+        "query_s": 0.023614750999968237,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.008779890999903728,
+        "query_s": 0.013542658999995183,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 118
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.03663071799996942,
+        "query_s": 0.04645079900001292,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03524887100002161,
+        "query_s": 0.057546582999975726,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008128901999953086,
+        "query_s": 0.013713288999952056,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 118,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.054964999999999264,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62935,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 382
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 13,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 108,
+    "wall_s": 0.09875520700006746,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.005961651000006896,
+        "query_s": 0.00553767099995639,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.03916278999986389,
+        "query_s": 0.010669721000112986,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.036957106000045314,
+        "query_s": 0.004817214000013337,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.054640816999835806,
+        "query_s": 0.027969989999974132,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.05471637000005103,
+        "query_s": 0.04275825599984273,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.03381560200000422,
+        "query_s": 0.003944510000110313,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 26,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.026360000000000383,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102551,
+      "bytes_subquery_registry": 60579,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 108
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 13,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 95,
+    "wall_s": 0.09707796299994698,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.030258501999924192,
+        "query_s": 0.013288013000192223,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.039275859000099445,
+        "query_s": 0.014635728000030213,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.04267479099985394,
+        "query_s": 0.005639890000111336,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.054177424000044994,
+        "query_s": 0.02909642999998141,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.054690416999847,
+        "query_s": 0.041432923999991544,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.04307162899999639,
+        "query_s": 0.007055562000005011,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 30,
+      "public.record": 30,
+      "public.record_recurrence": 21,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.023253000000000412,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 754,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 63491,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 95
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 13,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 397,
+    "wall_s": 0.14014861600003314,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.07051528800002416,
+        "query_s": 0.012747959999842351,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.09019254099985119,
+        "query_s": 0.022982015000025058,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.07822077700006957,
+        "query_s": 0.009751208000125189,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.08936470399999052,
+        "query_s": 0.0391062440000951,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.0895146720001776,
+        "query_s": 0.04882421399997838,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.09132960199985973,
+        "query_s": 0.008036313000047812,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.041232000000000824,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 64663,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 397
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 13,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.09072896799989394,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.036142140999800176,
+        "query_s": 0.021469798999987688,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009785213999975895,
+        "query_s": 0.04879040800005896,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.008198872000093615,
+        "query_s": 0.033256816999937655,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.035968247000027986,
+        "query_s": 0.03902985499985334,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03638817499995639,
+        "query_s": 0.05289494599992395,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008659560999831228,
+        "query_s": 0.035295875999963755,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.041921000000002095,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61175,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 14,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 110,
+    "wall_s": 0.07222281199983627,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.02175916600003802,
+        "query_s": 0.00989349599990419,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.015468919999875652,
+        "query_s": 0.013574484999935521,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 35
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.01780279500007964,
+        "query_s": 0.0056595040000502195,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.027215151000063997,
+        "query_s": 0.027211695999994845,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03098644100009551,
+        "query_s": 0.04099863499982348,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.019988507999869398,
+        "query_s": 0.010954599000115195,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 35,
+      "public.record": 35,
+      "public.record_recurrence": 26,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.023882000000000403,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 3338,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102551,
+      "bytes_subquery_registry": 62339,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 110
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 14,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 95,
+    "wall_s": 0.07623404699984349,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.009834156999886545,
+        "query_s": 0.010168206000116697,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009611993999897095,
+        "query_s": 0.012565698000116754,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.011786877000076856,
+        "query_s": 0.007268529999919338,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.024699258000055124,
+        "query_s": 0.037602514000127485,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.024756281999998464,
+        "query_s": 0.050086309000107576,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008378118999871731,
+        "query_s": 0.009581823999951666,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 29,
+      "public.record": 29,
+      "public.record_recurrence": 21,
+      "public.assignment": 6,
+      "public.graph_edge": 6,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.014111999999997238,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 406,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 63439,
+      "shapes": 2,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 95
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 14,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.0701278309998088,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.0063974770000641,
+        "query_s": 0.009920485999828088,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.0069492119998812996,
+        "query_s": 0.018454347999977472,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.008862419000024602,
+        "query_s": 0.009891137000067829,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.027965216999973563,
+        "query_s": 0.02709231699986958,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02804642299997795,
+        "query_s": 0.04133848099991155,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.010030882000137353,
+        "query_s": 0.00987563799981217,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.018807999999999936,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62903,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 14,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 385,
+    "wall_s": 0.07195606000004773,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.009383467999896311,
+        "query_s": 0.01795392400003948,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.008018998000125066,
+        "query_s": 0.018186507999871537,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 128
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009643375999985437,
+        "query_s": 0.01036428999987038,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.028735740000001897,
+        "query_s": 0.028757216000030894,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.029176973999938127,
+        "query_s": 0.04195480400017004,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008030355000073541,
+        "query_s": 0.006736027999977523,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 128,
+      "public.record": 128,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.02994099999999733,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62883,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 385
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 15,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 110,
+    "wall_s": 0.08759973500013984,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.022168957999838312,
+        "query_s": 0.011817819000043528,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.026587225999946895,
+        "query_s": 0.009892880000052173,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.023206802000004245,
+        "query_s": 0.0054224590001012984,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.04053487999999561,
+        "query_s": 0.032800548000068375,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.04168099399998937,
+        "query_s": 0.04534531900003458,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.02150772999993933,
+        "query_s": 0.007844572000067274,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 26,
+      "public.assignment": 6,
+      "public.graph_edge": 6,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.03235899999999958,
+    "created": {
+      "bytes_circuit_integral": 1416,
+      "bytes_circuit_snapshots": 1704,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 3120,
+      "bytes_pk_dict": 290,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102551,
+      "bytes_subquery_registry": 62287,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 14,
+      "subquery_distinct_values": 14,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 110
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 15,
+    "start": "2026-09-02",
+    "size": "p50",
+    "expected_rows": 93,
+    "wall_s": 0.10166417400000682,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.02092651000020851,
+        "query_s": 0.009447117999798138,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.01708805500015842,
+        "query_s": 0.013563124000029347,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 29
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.018527522999875146,
+        "query_s": 0.009402340999940861,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 21
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.034527376000141885,
+        "query_s": 0.06492970199997217,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03633871499982888,
+        "query_s": 0.06474899199997708,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.017608533999919018,
+        "query_s": 0.007513516000017262,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 29,
+      "public.record": 29,
+      "public.record_recurrence": 21,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.05295500000000075,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 61783,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 93
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 15,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 397,
+    "wall_s": 0.07779143700008717,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007373717000064062,
+        "query_s": 0.009702930999992532,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.00844011699996372,
+        "query_s": 0.02091300000006413,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 132
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009696776999817303,
+        "query_s": 0.008631964000187509,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.027138545000070735,
+        "query_s": 0.036265715000126875,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.029212696999820764,
+        "query_s": 0.04805371400016156,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.008949052999923879,
+        "query_s": 0.006248024000115038,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 132,
+      "public.record": 132,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.018501000000000545,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 64611,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 397
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 15,
+    "start": "2026-09-22",
+    "size": "p95",
+    "expected_rows": 385,
+    "wall_s": 0.08512182399999801,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006767821000039476,
+        "query_s": 0.013041703999988385,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.009833211000113806,
+        "query_s": 0.02314441299995451,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.010277895000172066,
+        "query_s": 0.026790985999923578,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.029121827000153644,
+        "query_s": 0.043377695999879506,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.02732559600008244,
+        "query_s": 0.055854429999953936,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.00670824700000594,
+        "query_s": 0.006240517999913209,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.03145499999999757,
+    "created": {
+      "bytes_circuit_integral": 428,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2016,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 62935,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 385
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 16,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 105,
+    "wall_s": 0.09087671600013891,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.006321930000012799,
+        "query_s": 0.008858512999950108,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.011573712999961572,
+        "query_s": 0.029115597000100024,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.008481613999947513,
+        "query_s": 0.009409978000121555,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.042188828999996986,
+        "query_s": 0.03440290900016407,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.04220472200017866,
+        "query_s": 0.04723656199985271,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.009070921000102317,
+        "query_s": 0.00814290199991774,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 33,
+      "public.record": 33,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.03575599999999923,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 13808,
+      "bytes_membership_circuit": 2912,
+      "bytes_retention": 30,
+      "bytes_shape_records": 102551,
+      "bytes_subquery_registry": 64899,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 105
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 16,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 120,
+    "wall_s": 0.07436908800013953,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.01604798999983359,
+        "query_s": 0.01086625100015226,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.014252634000058606,
+        "query_s": 0.010513662999983353,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.016525743999864062,
+        "query_s": 0.008265161000053922,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.030253844000071695,
+        "query_s": 0.02657485299982909,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.03287800399994012,
+        "query_s": 0.04064272100004018,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.005668753000009019,
+        "query_s": 0.012363460000187843,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 38,
+      "public.record": 38,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.021615000000000606,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_pk_dict": 464,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60631,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 120
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 16,
+    "start": "2026-09-24",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.07402169900001354,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007647236999900997,
+        "query_s": 0.00887419100013176,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.00994690599986825,
+        "query_s": 0.021793831999957547,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.00943569099990782,
+        "query_s": 0.009844453000141584,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.02543151300005775,
+        "query_s": 0.032944137999948,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.025429640000083964,
+        "query_s": 0.04777894199992261,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.011105969000027471,
+        "query_s": 0.008053493000033995,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.033000999999998726,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 696,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 58871,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 16,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.07541063600001507,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.016144574000009015,
+        "query_s": 0.013790217999940069,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.015605286999971213,
+        "query_s": 0.019910897000045225,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.01605632699988746,
+        "query_s": 0.008085141000037765,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.031438155999921946,
+        "query_s": 0.031066660000078627,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.029556036000030872,
+        "query_s": 0.04426709499989556,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.017864306000092256,
+        "query_s": 0.0077739260000271315,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.025311999999999557,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60075,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 17,
+    "start": "2026-09-03",
+    "size": "p50",
+    "expected_rows": 105,
+    "wall_s": 0.04265288299984604,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.013326373999916541,
+        "query_s": 0.007722154000020964,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.008095726999954422,
+        "query_s": 0.01002394500005721,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 33
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.005913056999816035,
+        "query_s": 0.003728116000047521,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 25
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.01632678200007831,
+        "query_s": 0.017625243000111368,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.019481820000009975,
+        "query_s": 0.022615706999886243,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.014288056999930632,
+        "query_s": 0.004223997000053714,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 33,
+      "public.record": 33,
+      "public.record_recurrence": 25,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.027024000000000825,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 2912,
+      "bytes_retention": 30,
+      "bytes_shape_records": 81335,
+      "bytes_subquery_registry": 64899,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 105
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 17,
+    "start": "2026-09-04",
+    "size": "p50",
+    "expected_rows": 120,
+    "wall_s": 0.08177330100011204,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.05228815199984638,
+        "query_s": 0.008770726000193463,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.05186702200012405,
+        "query_s": 0.011270815999978367,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 38
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.04854755299993485,
+        "query_s": 0.004595863000076861,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 30
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.058887060000188285,
+        "query_s": 0.014346699999805423,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.058655259000033766,
+        "query_s": 0.02184553999995842,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.0504695320000792,
+        "query_s": 0.005864400000064052,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 38,
+      "public.record": 38,
+      "public.record_recurrence": 30,
+      "public.assignment": 5,
+      "public.graph_edge": 5,
+      "public.calendar_event": 4
+    },
+    "engine_cpu_s": 0.05900799999999862,
+    "created": {
+      "bytes_circuit_integral": 1324,
+      "bytes_circuit_snapshots": 1588,
+      "bytes_membership_circuit": 2912,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60631,
+      "shapes": 2,
+      "subquery_contributors": 13,
+      "subquery_distinct_values": 13,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 120
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 17,
+    "start": "2026-09-24",
+    "size": "p95",
+    "expected_rows": 395,
+    "wall_s": 0.044846295999832364,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.007384853000075964,
+        "query_s": 0.0078085879999889585,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.008953142999871488,
+        "query_s": 0.015595873000165739,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 131
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.009285617000159618,
+        "query_s": 0.011429391999854488,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 123
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.015528662999940934,
+        "query_s": 0.02259304700010034,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.015569152999887592,
+        "query_s": 0.02797155999996903,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.009869428999991214,
+        "query_s": 0.01285106800014546,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 131,
+      "public.record": 131,
+      "public.record_recurrence": 123,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.01675600000000088,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_pk_dict": 348,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 58871,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 395
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 17,
+    "start": "2026-09-23",
+    "size": "p95",
+    "expected_rows": 383,
+    "wall_s": 0.05002114399985658,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.01058319699995991,
+        "query_s": 0.01758596900003795,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.016908411000031265,
+        "query_s": 0.016397452000092017,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 127
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.010835393999968801,
+        "query_s": 0.019636355000102412,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 119
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.019721602999879906,
+        "query_s": 0.022435476000055132,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.020255400999985795,
+        "query_s": 0.028768055999989883,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 4
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.02152944700014814,
+        "query_s": 0.014004812999928618,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 2
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 127,
+      "public.record": 127,
+      "public.record_recurrence": 119,
+      "public.assignment": 4,
+      "public.graph_edge": 4,
+      "public.calendar_event": 2
+    },
+    "engine_cpu_s": 0.02691899999999947,
+    "created": {
+      "bytes_circuit_integral": 1232,
+      "bytes_circuit_snapshots": 1472,
+      "bytes_membership_circuit": 2704,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 60075,
+      "shapes": 2,
+      "subquery_contributors": 12,
+      "subquery_distinct_values": 12,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 383
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 18,
+    "start": "2026-09-01",
+    "size": "p50",
+    "expected_rows": 123,
+    "wall_s": 0.06941761999996743,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.011511786000028223,
+        "query_s": 0.011728889999858438,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.008972202999984802,
+        "query_s": 0.01575175599987233,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 34
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.014078448999953252,
+        "query_s": 0.0052027249998900515,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 26
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.027521356999841373,
+        "query_s": 0.02717257500012238,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 8
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.027908029999935025,
+        "query_s": 0.04049373700013348,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 5
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.0064961149998907786,
+        "query_s": 0.007519223999906899,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 16
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 34,
+      "public.record": 34,
+      "public.record_recurrence": 26,
+      "public.assignment": 8,
+      "public.graph_edge": 5,
+      "public.calendar_event": 16
+    },
+    "engine_cpu_s": 0.01768700000000223,
+    "created": {
+      "bytes_circuit_integral": 1600,
+      "bytes_circuit_snapshots": 1936,
+      "bytes_executors": 104,
+      "bytes_membership_circuit": 3536,
+      "bytes_pk_dict": 928,
+      "bytes_retention": 30,
+      "bytes_shape_records": 123767,
+      "bytes_subquery_registry": 70901,
+      "shapes": 6,
+      "standalone": 4,
+      "subquery_contributors": 16,
+      "subquery_distinct_values": 16,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 123
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 18,
+    "start": "2026-09-11",
+    "size": "p95",
+    "expected_rows": 394,
+    "wall_s": 0.0883313960000578,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.010146964999876218,
+        "query_s": 0.028055194999978994,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 124
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.007278469999846493,
+        "query_s": 0.03192747100001725,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 124
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.01169938600014575,
+        "query_s": 0.020965863999890644,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 116
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.029822939000041515,
+        "query_s": 0.04384589500000402,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 9
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.032312566999962655,
+        "query_s": 0.05525223700010429,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.010974456999974791,
+        "query_s": 0.011587809000047855,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 15
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 124,
+      "public.record": 124,
+      "public.record_recurrence": 116,
+      "public.assignment": 9,
+      "public.graph_edge": 6,
+      "public.calendar_event": 15
+    },
+    "engine_cpu_s": 0.04345999999999961,
+    "created": {
+      "bytes_circuit_integral": 1692,
+      "bytes_circuit_snapshots": -5944,
+      "bytes_membership_circuit": -4252,
+      "bytes_pk_dict": 986,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 68341,
+      "shapes": 2,
+      "subquery_contributors": 17,
+      "subquery_distinct_values": 17,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 394
+  },
+  {
+    "table": "window",
+    "operation": "par",
+    "account": 18,
+    "start": "2026-09-10",
+    "size": "p95",
+    "expected_rows": 367,
+    "wall_s": 0.08794415600004868,
+    "steps": [
+      {
+        "table": "public.record_date_index",
+        "feed_s": 0.02508370600003218,
+        "query_s": 0.017671592999931818,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 115
+      },
+      {
+        "table": "public.record",
+        "feed_s": 0.02581079299989142,
+        "query_s": 0.023335487000167632,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 115
+      },
+      {
+        "table": "public.record_recurrence",
+        "feed_s": 0.027211483999963093,
+        "query_s": 0.009913805000223874,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 107
+      },
+      {
+        "table": "public.assignment",
+        "feed_s": 0.04311947400015015,
+        "query_s": 0.02975433599999633,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 9
+      },
+      {
+        "table": "public.graph_edge",
+        "feed_s": 0.042921967999973276,
+        "query_s": 0.04333176000000094,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 6
+      },
+      {
+        "table": "public.calendar_event",
+        "feed_s": 0.02479900599996654,
+        "query_s": 0.009497692999957508,
+        "feed_status": 200,
+        "query_status": 200,
+        "rows": 15
+      }
+    ],
+    "status": 200,
+    "rows_by_table": {
+      "public.record_date_index": 115,
+      "public.record": 115,
+      "public.record_recurrence": 107,
+      "public.assignment": 9,
+      "public.graph_edge": 6,
+      "public.calendar_event": 15
+    },
+    "engine_cpu_s": 0.035107,
+    "created": {
+      "bytes_circuit_integral": 1692,
+      "bytes_circuit_snapshots": 2052,
+      "bytes_membership_circuit": 3744,
+      "bytes_pk_dict": 986,
+      "bytes_retention": 10,
+      "bytes_shape_records": 62280,
+      "bytes_subquery_registry": 68289,
+      "shapes": 2,
+      "subquery_contributors": 17,
+      "subquery_distinct_values": 17,
+      "subquery_edges": 22,
+      "subquery_nodes": 1,
+      "subquery_shapes": 2
+    },
+    "rows": 367
+  },
+  {
+    "table": "pg_stat_statements",
+    "operation": "summary",
+    "rows": 0,
+    "error": null,
+    "statements": [
+      {
+        "query": "select jsonb_build_object($159, t.\"client_id\"::text, $160, t.\"created_at\"::text, $161, t.\"created_by_user_id\"::text, $162, t.\"deleted_at\"::text, $163, t.\"detached_at\"::text, $164, t.\"edge_type\"::text, $165, t.\"fields_loro_snapshot\"::text, $166, t.\"from_id\"::text, $167, t.\"from_space_id\"::text, $168,",
+        "calls": 75,
+        "total_ms": 2510.2885399999996,
+        "rows": 354,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($43, t.\"client_id\"::text, $44, t.\"created_at\"::text, $45, t.\"created_by_user_id\"::text, $46, t.\"deleted_at\"::text, $47, t.\"id\"::text, $48, t.\"instance_date\"::text, $49, t.\"record_id\"::text, $50, t.\"scope\"::text, $51, t.\"source\"::text, $52, t.\"space_id\"::text, $53, t.\"status",
+        "calls": 75,
+        "total_ms": 1900.964419,
+        "rows": 363,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($25, t.\"date_value\"::text, $26, t.\"datetime_value\"::text, $27, t.\"end_date_value\"::text, $28, t.\"end_datetime_value\"::text, $29, t.\"field_id\"::text, $30, t.\"field_type\"::text, $31, t.\"record_id\"::text, $32, t.\"space_id\"::text) from \"public\".\"record_date_index\" t where (((\"r",
+        "calls": 75,
+        "total_ms": 1111.4635469999994,
+        "rows": 989,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($316, t.\"app_event_ref\"::text, $317, t.\"archived_at\"::text, $318, t.\"client_id\"::text, $319, t.\"created_at\"::text, $320, t.\"created_by_user_id\"::text, $321, t.\"deleted_at\"::text, $322, t.\"event_log_id\"::text, $323, t.\"fields_loro_snapshot\"::text, $324, t.\"ical_uid\"::text, $",
+        "calls": 44,
+        "total_ms": 194.50903799999992,
+        "rows": 3601,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($161, t.\"date_value\"::text, $162, t.\"datetime_value\"::text, $163, t.\"end_date_value\"::text, $164, t.\"end_datetime_value\"::text, $165, t.\"field_id\"::text, $166, t.\"field_type\"::text, $167, t.\"record_id\"::text, $168, t.\"space_id\"::text) from \"public\".\"record_date_index\" t whe",
+        "calls": 44,
+        "total_ms": 174.34605899999994,
+        "rows": 3601,
+        "harness": false
+      },
+      {
+        "query": "UPDATE public.record SET name=$1, version=version+$3 WHERE id=$2",
+        "calls": 202,
+        "total_ms": 102.31947500000007,
+        "rows": 202,
+        "harness": true
+      },
+      {
+        "query": "select jsonb_build_object($312, t.\"app_event_ref\"::text, $313, t.\"archived_at\"::text, $314, t.\"client_id\"::text, $315, t.\"created_at\"::text, $316, t.\"created_by_user_id\"::text, $317, t.\"deleted_at\"::text, $318, t.\"event_log_id\"::text, $319, t.\"fields_loro_snapshot\"::text, $320, t.\"ical_uid\"::text, $",
+        "calls": 24,
+        "total_ms": 102.16435100000001,
+        "rows": 1959,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($159, t.\"date_value\"::text, $160, t.\"datetime_value\"::text, $161, t.\"end_date_value\"::text, $162, t.\"end_datetime_value\"::text, $163, t.\"field_id\"::text, $164, t.\"field_type\"::text, $165, t.\"record_id\"::text, $166, t.\"space_id\"::text) from \"public\".\"record_date_index\" t whe",
+        "calls": 24,
+        "total_ms": 94.90458100000001,
+        "rows": 1959,
+        "harness": false
+      },
+      {
+        "query": "INSERT INTO public.native_sync_authority_fence (user_id, generation, source_commit_id) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET generation=EXCLUDED.generation, source_commit_id=EXCLUDED.source_commit_id",
+        "calls": 202,
+        "total_ms": 74.78617399999997,
+        "rows": 202,
+        "harness": true
+      },
+      {
+        "query": "select jsonb_build_object($32, t.\"calendar_id\"::text, $33, t.\"created_at\"::text, $34, t.\"deleted_at\"::text, $35, t.\"dirty_at\"::text, $36, t.\"dirty_by_user_id\"::text, $37, t.\"end_date\"::text, $38, t.\"end_datetime\"::text, $39, t.\"end_timezone\"::text, $40, t.\"enrichment\"::text, $41, t.\"fields_loro_snap",
+        "calls": 75,
+        "total_ms": 54.660700000000006,
+        "rows": 262,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($79, t.\"created_at\"::text, $80, t.\"dtstart\"::text, $81, to_jsonb(t.\"duration_seconds\"), $82, t.\"exdates\"::text, $83, t.\"record_id\"::text, $84, t.\"recurring_until\"::text, $85, t.\"rrule\"::text, $86, t.\"space_id\"::text, $87, t.\"timezone\"::text, $88, t.\"updated_at\"::text) from ",
+        "calls": 44,
+        "total_ms": 40.91773699999999,
+        "rows": 3230,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($78, t.\"created_at\"::text, $79, t.\"dtstart\"::text, $80, to_jsonb(t.\"duration_seconds\"), $81, t.\"exdates\"::text, $82, t.\"record_id\"::text, $83, t.\"recurring_until\"::text, $84, t.\"rrule\"::text, $85, t.\"space_id\"::text, $86, t.\"timezone\"::text, $87, t.\"updated_at\"::text) from ",
+        "calls": 24,
+        "total_ms": 31.473054000000005,
+        "rows": 1760,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($516, t.\"app_event_ref\"::text, $517, t.\"archived_at\"::text, $518, t.\"client_id\"::text, $519, t.\"created_at\"::text, $520, t.\"created_by_user_id\"::text, $521, t.\"deleted_at\"::text, $522, t.\"event_log_id\"::text, $523, t.\"fields_loro_snapshot\"::text, $524, t.\"ical_uid\"::text, $",
+        "calls": 3,
+        "total_ms": 16.284353,
+        "rows": 273,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($108, t.\"app_event_ref\"::text, $109, t.\"archived_at\"::text, $110, t.\"client_id\"::text, $111, t.\"created_at\"::text, $112, t.\"created_by_user_id\"::text, $113, t.\"deleted_at\"::text, $114, t.\"event_log_id\"::text, $115, t.\"fields_loro_snapshot\"::text, $116, t.\"ical_uid\"::text, $",
+        "calls": 4,
+        "total_ms": 15.430356999999997,
+        "rows": 329,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($57, t.\"date_value\"::text, $58, t.\"datetime_value\"::text, $59, t.\"end_date_value\"::text, $60, t.\"end_datetime_value\"::text, $61, t.\"field_id\"::text, $62, t.\"field_type\"::text, $63, t.\"record_id\"::text, $64, t.\"space_id\"::text) from \"public\".\"record_date_index\" t where ((((\"",
+        "calls": 4,
+        "total_ms": 13.789722,
+        "rows": 329,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($261, t.\"date_value\"::text, $262, t.\"datetime_value\"::text, $263, t.\"end_date_value\"::text, $264, t.\"end_datetime_value\"::text, $265, t.\"field_id\"::text, $266, t.\"field_type\"::text, $267, t.\"record_id\"::text, $268, t.\"space_id\"::text) from \"public\".\"record_date_index\" t whe",
+        "calls": 3,
+        "total_ms": 12.981852,
+        "rows": 273,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($81, t.\"app_event_ref\"::text, $82, t.\"archived_at\"::text, $83, t.\"client_id\"::text, $84, t.\"created_at\"::text, $85, t.\"created_by_user_id\"::text, $86, t.\"deleted_at\"::text, $87, t.\"event_log_id\"::text, $88, t.\"fields_loro_snapshot\"::text, $89, t.\"ical_uid\"::text, $90, t.\"id",
+        "calls": 202,
+        "total_ms": 12.797941999999994,
+        "rows": 202,
+        "harness": false
+      },
+      {
+        "query": "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY",
+        "calls": 727,
+        "total_ms": 10.052192999999994,
+        "rows": 0,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($27, t.\"created_at\"::text, $28, t.\"dtstart\"::text, $29, to_jsonb(t.\"duration_seconds\"), $30, t.\"exdates\"::text, $31, t.\"record_id\"::text, $32, t.\"recurring_until\"::text, $33, t.\"rrule\"::text, $34, t.\"space_id\"::text, $35, t.\"timezone\"::text, $36, t.\"updated_at\"::text) from ",
+        "calls": 4,
+        "total_ms": 5.966744,
+        "rows": 297,
+        "harness": false
+      },
+      {
+        "query": "select pg_current_wal_lsn()::text, pg_current_snapshot()::text, pg_current_wal_insert_lsn()::text",
+        "calls": 727,
+        "total_ms": 4.952517999999996,
+        "rows": 727,
+        "harness": false
+      },
+      {
+        "query": "select jsonb_build_object($129, t.\"created_at\"::text, $130, t.\"dtstart\"::text, $131, to_jsonb(t.\"duration_seconds\"), $132, t.\"exdates\"::text, $133, t.\"record_id\"::text, $134, t.\"recurring_until\"::text, $135, t.\"rrule\"::text, $136, t.\"space_id\"::text, $137, t.\"timezone\"::text, $138, t.\"updated_at\"::t",
+        "calls": 3,
+        "total_ms": 3.777209,
+        "rows": 249,
+        "harness": false
+      },
+      {
+        "query": "BEGIN",
+        "calls": 404,
+        "total_ms": 2.2560220000000015,
+        "rows": 0,
+        "harness": false
+      },
+      {
+        "query": "select pg_current_snapshot()::text",
+        "calls": 192,
+        "total_ms": 1.3625070000000012,
+        "rows": 192,
+        "harness": false
+      },
+      {
+        "query": "SELECT pg_stat_statements_reset()",
+        "calls": 1,
+        "total_ms": 1.217206,
+        "rows": 1,
+        "harness": true
+      },
+      {
+        "query": "COMMIT",
+        "calls": 1131,
+        "total_ms": 0.5580760000000003,
+        "rows": 0,
+        "harness": false
+      },
+      {
+        "query": "select pg_current_wal_lsn()::text, restart_lsn::text, confirmed_flush_lsn::text, active from pg_replication_slots where slot_name = $1",
+        "calls": 5,
+        "total_ms": 0.096445,
+        "rows": 5,
+        "harness": false
+      }
+    ]
+  }
+]
