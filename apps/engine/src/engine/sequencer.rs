@@ -3562,6 +3562,48 @@ mod held_spill_tests {
         assert_eq!(builds(&h), 1, "the reader left before its turn: no build");
     }
 
+    /// The sequencer serves commands before the change log, and a `/state` build walks every
+    /// shape. So readers must not be able to hold commits up: when a page of commits is ready to
+    /// read, it is processed before the next build, however many readers are queued, and the
+    /// readers waiting together are answered by one build.
+    #[tokio::test]
+    async fn node_states_readers_wait_for_a_ready_page_and_share_one_build() {
+        let mut h = Harness::new(u64::MAX);
+        let builds = |h: &Harness| h.engine.metrics.node_state_builds.load(Ordering::Relaxed);
+        let ask = |h: &Harness| {
+            let (resp, built) = tokio::sync::oneshot::channel();
+            h.commands.send(SequencerCmd::NodeStates { resp }).unwrap();
+            built
+        };
+        h.shape().await;
+        let first = ask(&h);
+        let nodes = h.receive(first).await;
+        assert!(nodes.contains_key("shape:s1"), "with nothing to read, a reader is answered at once");
+        assert_eq!(builds(&h), 1);
+
+        // A page of commits becomes readable with two more readers already queued ahead of it.
+        let start = LogPosition::start_of(0);
+        let page = serde_json::to_string(&[change("1", "0/10", 0, true)]).unwrap();
+        h.store.pages_by_offset.lock().unwrap().insert(start.offset.clone(), ("p1".into(), true, page));
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::PauseReads { done }).unwrap();
+        let (done, _) = tokio::sync::oneshot::channel();
+        h.commands.send(SequencerCmd::ResumeReads { done }).unwrap();
+        let second = ask(&h);
+        let third = ask(&h);
+
+        let nodes = h.receive(second).await;
+        assert_eq!(
+            nodes["table:public.items"],
+            NodeStateSummary::Table { processed_offset: "changes/0@p1".into(), envelopes: 1 },
+            "the ready page of commits must be processed before the next build"
+        );
+        assert_eq!(h.output().len(), 1, "the shape received the commit");
+        let nodes = h.receive(third).await;
+        assert_eq!(nodes["shape:s1"], NodeStateSummary::Shape { emitted: 1 });
+        assert_eq!(builds(&h), 2, "the two readers that waited together share one build");
+    }
+
     #[tokio::test]
     async fn held_spill_is_removed_when_a_different_transaction_discards_the_fragment() {
         let mut h = Harness::new(512);
