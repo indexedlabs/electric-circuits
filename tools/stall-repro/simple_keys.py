@@ -1037,6 +1037,11 @@ def w6_account_filters(gateway, ordinal, change=None):
     identity = main_stream_identity(gateway)
     written = not multi and rank < len(H1_DATA_ACCOUNTS) - 1
     records = [str(row_id("record", H1_DATA_ACCOUNTS[rank + 1], index)) if written else str(synthetic_id(f"w6-record/{ordinal}/{index}")) for index in range(EDGE_RAILS)]
+    if multi:
+        # A partnered account's first rails are on the Records whose edges the access round moves
+        # into its partner Space (from the written Space before it), so those rows enter its shapes.
+        before = H1_DATA_ACCOUNTS[(ordinal - 1) % len(H1_DATA_ACCOUNTS)]
+        records[:W6_MOVED_EDGES] = [str(row_id("record", before, index)) for index in range(W6_MOVED_EDGES)]
     spaces = [str(space) for space in (*lists.space_ids, *lists.partner_space_ids)]
     clients = [(f"session:{index}", "session", next(predicate for table, predicate in app_session(ordinal, [space]) if table == "graph_edge" and predicate is not None)) for index, space in enumerate(spaces)]
     clients += [(f"rail:{index}", "rail", next(predicate for table, predicate in app_thread_rail(record) if table == "graph_edge")) for index, record in enumerate(records)]
