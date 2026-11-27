@@ -807,3 +807,72 @@ def edge_catalog(gateway, count, way):
         today += held
         ordinal += 1
     return catalog
+
+
+# PLAIN-WORDS-3 run 3: one window of the calendar's six-table group (`app_day_window`), for one
+# account and start date, as the three requests a phone could make for it. Each is lowered by main
+# (52e79b875b, keyed scopes, index tables and chat rows on) the way `_authorize_collection_read`
+# lowers that operation:
+# - `bundle`: today's group load, one `/v1/subsets/load` of six members ("group": a member keeps its
+#   window, and is keyed only when its filter reads no other table);
+# - `feeds` and `subsets`: table by table, a changes-only feed ("feed": the window is dropped before
+#   the keyed test) and a one-shot query ("subset": keyed whenever the table is, window kept) per member.
+WINDOW_DAYS = {"day": 1, "week": 7}
+# Rows one window returns in prod (Nov 23-26): Home's day window and the calendar's window.
+WINDOW_TARGETS = {"day": {"p50": 109, "p95": 392}, "week": {"p50": 172, "p95": 584}}
+WINDOW_TOLERANCE = 0.25
+WINDOWS_PER_CLASS = 2
+WINDOW_ACCOUNTS = range(19)
+# Candidate start dates: daily from before the fixture's first row (2026-09-01), then every third day.
+WINDOW_STARTS = [datetime.date(2026, 8, 22) + datetime.timedelta(days=offset) for offset in (*range(40), *range(40, 91, 3))]
+
+
+async def window_subsets(gateway, account, keyed_lists, kind, start):
+    sync = gateway.gateway
+    subsets = []
+    for table, predicate in app_day_window(start, start + datetime.timedelta(days=WINDOW_DAYS[kind])):
+        where, _ = await main3_lower(gateway, table, predicate, "subset", account, keyed_lists)
+        subsets.append({"table": f"public.{table}", "where": where, "columns": sorted(sync.registered_collection(table, allow_chat_projection_dependency=True).columns)})
+    return subsets
+
+
+async def window_requests(gateway, account, keyed_lists, kind, start, subsets):
+    sync = gateway.gateway
+    members, feeds = [], []
+    for (table, predicate), subset in zip(app_day_window(start, start + datetime.timedelta(days=WINDOW_DAYS[kind])), subsets):
+        group_where, group_keyed = await main3_lower(gateway, table, predicate, "group", account, keyed_lists)
+        feed_where, feed_keyed = await main3_lower(gateway, table, predicate, "feed", account, keyed_lists)
+        members.append({"key": table, "table": f"public.{table}", "where": group_where, "columns": subset["columns"]})
+        feeds.append(gateway._plain_body(table, account, feed_where, f"pw3:{kind}:{start}:feed", keyed=False))
+    subscription = sync._internal_subscription(synthetic_id(f"user/{account}"), f"pw3:{kind}:{start}:group", gateway.authority(account))
+    return {"bundle": {"subscription": subscription, "members": members}, "feeds": feeds, "subsets": subsets}
+
+
+def window_row_counts(connection, subsets):
+    """Rows each member's one-shot query returns, counted in Postgres (no engine)."""
+    counts = {}
+    for body in subsets:
+        table = body["table"].removeprefix("public.")
+        statement = sql.SQL("SELECT count(*) FROM {} q WHERE {}").format(sql.Identifier("public", table), predicate_sql(body["where"], "q"))
+        counts[table] = connection.execute(statement).fetchone()[0]
+    return counts
+
+
+async def window_plan(gateway, keyed_lists, connection):
+    """The loads every way of run 3 makes: per account, window kind and size class, the start dates
+    whose windows return closest to prod's p50 and p95 row counts (within WINDOW_TOLERANCE)."""
+    plan = []
+    for kind, targets in WINDOW_TARGETS.items():
+        for account in WINDOW_ACCOUNTS:
+            sized = []
+            for start in WINDOW_STARTS:
+                subsets = await window_subsets(gateway, account, keyed_lists[account], kind, start)
+                counts = window_row_counts(connection, subsets)
+                sized.append((sum(counts.values()), start, counts, subsets))
+            taken = set()
+            for size, target in targets.items():
+                near = sorted((entry for entry in sized if abs(entry[0] - target) <= target * WINDOW_TOLERANCE and entry[1] not in taken), key=lambda entry: (abs(entry[0] - target), entry[1]))
+                for rows, start, counts, subsets in near[:WINDOWS_PER_CLASS]:
+                    taken.add(start)
+                    plan.append({"account": account, "kind": kind, "size": size, "start": start.isoformat(), "expected_rows": rows, "expected_by_table": counts, "requests": await window_requests(gateway, account, keyed_lists[account], kind, start, subsets)})
+    return plan

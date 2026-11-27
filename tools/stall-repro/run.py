@@ -23,7 +23,7 @@ from export_fixture import synthetic_id
 from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
-from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
+from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog, window_plan
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -100,6 +100,84 @@ EDGE_COMMITS = ("e1-commit", "e1-commit-r2", "e1-commit-r3")
 AUDIT_WORKLOADS = (*H1_COMMITS, *EDGE_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
 
 
+# PLAIN-WORDS-3 run 3: window loads, each way on its own engine. `window-<kind>-<way>` loads every
+# planned window of that kind (`simple_keys.window_plan`) one after another: `bundle` as one group
+# load, `seq` as a feed and a query per member in turn, `par` as the six members at once.
+WINDOW_WORKLOADS = tuple(f"window-{kind}-{way}" for kind in ("day", "week") for way in ("bundle", "seq", "par"))
+IDLE_WORKLOADS = ("idle-60",)
+WINDOW_GAP_S = 0.5
+HARNESS_STATEMENTS = ("pg_stat_statements", "native_sync_authority_fence", "UPDATE public.record SET name", "pg_current_xact_id", "SET LOCAL session_replication_role")
+
+
+def cgroup_cpu_s(cgroup):
+    return next(int(line.split()[1]) for line in (cgroup / "cpu.stat").read_text().splitlines() if line.startswith("usage_usec")) / 1e6
+
+
+def window_member(http, feed, subset):
+    """One member table by table: its changes-only feed, then its rows."""
+    started = time.monotonic()
+    created = http.post(f"{ENGINE_URL}/v1/subset-feeds", json=feed)
+    fed = time.monotonic()
+    queried = http.post(f"{ENGINE_URL}/v1/subsets/query", json=subset)
+    step = {"table": subset["table"], "feed_s": fed - started, "query_s": time.monotonic() - fed, "feed_status": created.status_code, "query_status": queried.status_code}
+    if created.status_code != 200:
+        step["feed_error"] = created.text[:500]
+    if queried.status_code == 200:
+        step["rows"] = len(queried.json()["rows"])
+    else:
+        step["query_error"] = queried.text[:500]
+    return step
+
+
+def window_operation(plan, kind, way, cgroup):
+    def operation(url, callback):
+        journal = []
+        with httpx.Client(headers={"Authorization": f"Bearer {SECRET}"}, timeout=120) as http, psycopg.connect(url, autocommit=True) as statistics, concurrent.futures.ThreadPoolExecutor(6) as pool:
+            def shapes():
+                return (http.get(f"{ENGINE_URL}/memory").json()).get("cardinalities", {})
+            try:
+                statistics.execute("SELECT pg_stat_statements_reset()")
+                statements_error = None
+            except psycopg.Error as error:
+                statements_error = repr(error)
+            for load in (entry for entry in plan if entry["kind"] == kind):
+                requests = load["requests"]
+                before = shapes()
+                cpu_before = cgroup_cpu_s(cgroup)
+                started = time.monotonic()
+                entry = {"table": "window", "operation": way, "account": load["account"], "start": load["start"], "size": load["size"], "expected_rows": load["expected_rows"]}
+                if way == "bundle":
+                    response = http.post(f"{ENGINE_URL}/v1/subsets/load", json=requests["bundle"])
+                    entry["wall_s"] = time.monotonic() - started
+                    entry["status"] = response.status_code
+                    if response.status_code == 200:
+                        entry["rows_by_table"] = dict(Counter(row["table"] for row in response.json()["rows"]))
+                    else:
+                        entry["error"] = response.text[:500]
+                else:
+                    members = list(zip(requests["feeds"], requests["subsets"]))
+                    steps = [window_member(http, feed, subset) for feed, subset in members] if way == "seq" else list(pool.map(lambda member: window_member(http, *member), members))
+                    entry["wall_s"] = time.monotonic() - started
+                    entry["steps"] = steps
+                    entry["status"] = max(max(step["feed_status"], step["query_status"]) for step in steps)
+                    entry["rows_by_table"] = {step["table"]: step.get("rows", 0) for step in steps}
+                entry["engine_cpu_s"] = cgroup_cpu_s(cgroup) - cpu_before
+                after = shapes()
+                entry["created"] = {key: after[key] - before.get(key, 0) for key in after if isinstance(after[key], (int, float)) and after[key] != before.get(key, 0)}
+                entry["rows"] = sum(entry.get("rows_by_table", {}).values())
+                journal.append(entry)
+                time.sleep(WINDOW_GAP_S)
+            summary = {"table": "pg_stat_statements", "operation": "summary", "rows": 0, "error": statements_error}
+            if statements_error is None:
+                rows = statistics.execute("SELECT left(query, 300), calls, total_exec_time, rows FROM pg_stat_statements ORDER BY total_exec_time DESC").fetchall()
+                summary["statements"] = [{"query": query, "calls": calls, "total_ms": total, "rows": returned, "harness": any(text in query for text in HARNESS_STATEMENTS)} for query, calls, total, returned in rows]
+            journal.append(summary)
+        with psycopg.connect(url) as connection:
+            callback(connection, "final")
+        return journal
+    return operation
+
+
 def audit_prepare(data, url, variant, workloads):
     """Rows the audit workloads act on, written before the engine starts (part of the initial snapshot)."""
     with psycopg.connect(url) as connection:
@@ -113,6 +191,16 @@ def audit_prepare(data, url, variant, workloads):
                 connection.execute("INSERT INTO public.space_member (id, space_id, user_id, created_at, updated_at) VALUES (%s, %s, %s, now(), now())", (synthetic_id(f"subtree/{index}"), row_id("space", SUBTREE_SPACE), synthetic_id(f"subtree-user/{index}")))
         if "writer-files" in workloads:
             data.insert(connection, "file", FILES_ACCOUNT, FILES_DELETED)
+        if any(workload in WINDOW_WORKLOADS for workload in workloads):
+            # The fixture's calendar events carry no time; give each an hour on its creation day so a
+            # window's `calendar_event` member returns rows.
+            connection.execute("UPDATE public.calendar_event SET start_datetime = created_at + interval '9 hours', end_datetime = created_at + interval '10 hours'")
+    if any(workload in WINDOW_WORKLOADS for workload in workloads):
+        try:
+            with psycopg.connect(url, autocommit=True) as connection:
+                connection.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+        except psycopg.Error as error:
+            print(f"pg_stat_statements unavailable: {error!r}", flush=True)
 
 
 def audit_operation(data, workload):
@@ -576,6 +664,13 @@ async def run(args):
             subset = {key: value for key, value in probe_body.items() if key not in {"subscription", "changesOnly"}}
             subset["where"] = {"and": [subset["where"], {"col": "id", "op": "eq", "value": str(row_id("record", 0))}]}
             subset["limit"] = 1
+            plan = []
+            if any(workload in WINDOW_WORKLOADS for workload in args.workloads):
+                print("Sizing window loads", flush=True)
+                with psycopg.connect(PG_URL, autocommit=True) as connection:
+                    plan = await window_plan(gateway, keyed_lists, connection)
+                save(output / "window-plan.json", [{key: value for key, value in load.items() if key != "requests"} for load in plan])
+                print(json.dumps({"window_loads": dict(Counter((load["kind"], load["size"]) for load in plan))}, default=str), flush=True)
             for workload in args.workloads:
                 probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl", interval=args.probe_interval)
                 probe_task = asyncio.create_task(probe.run())
@@ -608,6 +703,14 @@ async def run(args):
                         operation = data.calendar_import
                     elif workload == "import-noresource":
                         operation = lambda url, callback: import_without_resources(data, url, callback)
+                    elif workload in WINDOW_WORKLOADS:
+                        operation = window_operation(plan, *workload.removeprefix("window-").split("-"), quota.parent)
+                    elif workload in IDLE_WORKLOADS:
+                        def operation(url, callback, seconds=int(workload.removeprefix("idle-"))):
+                            time.sleep(seconds)
+                            with psycopg.connect(url) as connection:
+                                callback(connection, "final")
+                            return []
                     elif workload in AUDIT_WORKLOADS:
                         def operation(url, callback, write=audit_operation(data, workload)):
                             with psycopg.connect(url) as connection:
@@ -773,5 +876,5 @@ if __name__ == "__main__":
     parser.add_argument("--probe-interval", type=float, default=1.0, help="seconds between the bystander's probe ticks")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))
