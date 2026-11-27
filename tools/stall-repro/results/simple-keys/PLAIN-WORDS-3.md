@@ -13,6 +13,7 @@ Tables are printed by `tools/stall-repro/plain_words_report.py`.
 | Run | Actions run | Harness | Run folders |
 | --- | --- | --- | --- |
 | 1 | `45917533904` | `6532584` | `paired-pw1-*` |
+| 2 | `45917699001`, repeats `45919688237` | `b4b6b41`, `644272b` | `paired-pw2-*` |
 
 ## Run 1: the 1,000-row `record` write, with one-family filters written as a plain test
 
@@ -95,3 +96,106 @@ two-child OR and stays on the scan list.
 - **Memory:** peak RSS is 43–239 MiB for (a) and 465 MiB for (b) at 20,000, against H1's
   4.5 GiB.
 - The sequencer-held gauges stayed at 0, and there were no move-in queries.
+
+## Run 2: the same for links (`graph_edge`)
+
+**Answer.** Run 1's fix does nothing for links. A 1,000-link write passes 0.5 s at about 100
+accounts and 2 s at about 340–450 accounts, with or without it.
+
+- **Today:** 0.30 s at 100 filters (20 accounts), 0.78 s at 1,000 (199 accounts) and 4.7–7.6 s at
+  5,000 (991 accounts). At 5,000 the bystander loses more than half its drains.
+- **With the plain-test fix:** the same: 0.35 s, 0.67 s and 5.5–9.0 s. In the paired repeats it
+  is 10–20% faster than today at 5,000, because the filters are a little smaller. No filter moves.
+- **What would index them (hypothetical, more than the fix):** a selective equality written
+  first. Then the commit is 0.17 s, 0.22 s and 0.29 s, every drain arrives, and the 1 in 20
+  accounts left as they are set the slope.
+- **Against the old estimate** (about 2 s at around 200 accounts): 2 s comes at about 340–450
+  accounts, because an edge filter costs 0.6–1.5 µs per changed row, not `record`'s 2 µs. The
+  0.5 s line comes at about 100.
+
+**Which edge filters the fix can and can't make indexable.** None of them, selectively. The engine
+takes the first `=` in the top-level AND, and no filter has a Space or Record equality there:
+
+| Edge filter | Leaf today | With run 1's fix | What would index it |
+| --- | --- | --- | --- |
+| Main's edge authorization alone (`_keyed_graph_edge_predicate`) | none: `AND(deleted_at IS NULL, detached_at IS NULL, OR(six branches))` | none. Each branch's Space test becomes a plain `=`, but the six branches stay an OR: five read `from_space_id` and one (`bidirectional` Resource edges) reads `to_space_id` | two filters, one per end |
+| Session Resource-edge feed, one per Space | `to_type = 'resource'`, from the phone's filter | the same | two filters, one per end |
+| Thread rail's attendee member | `from_type = 'record'`, from the phone's filter | the same. The phone's `OR(from_id = R)` becomes `from_id = R`, but `from_type = 'record'` is written before it | `from_id = R` written first |
+| Day-window attendee member | not keyed: it looks into `record_date_index`, so main keeps today's subquery filter | not applicable | — |
+
+So today's keyed edge filters are not on the scan list. They are indexed under a value every
+account shares, which costs the same: a changed attendee edge (`record` to `resource`) is checked
+against every session feed and every rail filter.
+
+**Setup** (`S-main3-e1-N-*`, `simple_keys.edge_catalog`).
+
+- **Filters:** what a phone holds live (S-main3-live's phone model): one session Resource-edge
+  feed per Space and four open thread rails' attendee members, 5 per one-Space account. Each is
+  `AND(AND(main's edge authorization, the phone's filter), stream identity)`, the order main's
+  `authorize_predicate` writes. The fixture's own count is 7.6 edge filters per account (2 session
+  feeds, 4.6 rails, 1 day-window member); at that count the account numbers here are a third lower.
+- **Accounts:** prod's mix, as in run 1 (b). N counts today's filters: 100 is 20 accounts,
+  1,000 is 199 and 5,000 is 991.
+- **The commit:** 1,000 `graph_edge` updates, 20 in each of 50 Spaces, one transaction. They are
+  attendee edges. The first 49 one-Space accounts live in written Spaces and hold rails on four
+  Records whose edges change.
+- **`today`:** main's lowering as it is.
+- **`fix` (hypothetical):** run 1's rewrite over every filter.
+- **`split` (hypothetical, more than the fix):** `fix`, and for one-Space accounts a rail filter
+  starts with its own `from_id = R`, and a session feed becomes two filters, one starting
+  `from_space_id = S` and one starting `to_space_id = S AND from_space_id != S`. Together they
+  admit the rows `fix` admits. It adds one shape per session feed. The 1 in 20 keep `fix`.
+- **Catalog:** these filters and the bystander's `record` probe feed only.
+
+| Keyed `graph_edge` filters today | Lowering | Engine shapes (with probe) | Runner | Sequencer time, 3 commits: median (range) s | Per row | Per row per filter | Engine CPU % | Peak RSS | Bystander receipts (drains ok/attempts) | Bystander live changes | Under 0.5 s |
+| ---: | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 100 | today | 101 | Xeon 8573C | 0.30 (0.16–0.34) | 0.30 ms | 3.03 µs | 25 | 47 MiB | 8/8; p95 0.36 s, max 0.61 s | 8/8; p95 0.23 s, max 0.48 s | yes |
+| 100 | plain-test fix | 101 | Xeon 8573C | 0.35 (0.17–0.37) | 0.35 ms | 3.46 µs | 26 | 46 MiB | 8/8; p95 0.22 s, max 0.60 s | 8/8; p95 0.21 s, max 0.45 s | yes |
+| 100 | selective equality first | 120 | Xeon 8573C | 0.17 (0.15–0.28) | 0.17 ms | 1.66 µs | 22 | 47 MiB | 7/7; p95 0.19 s, max 0.41 s | 7/7; p95 0.16 s, max 0.41 s | yes |
+| 1,000 | today | 1,001 | EPYC 9V45 | 0.78 (0.65–0.78) | 0.78 ms | 0.78 µs | 58 | 104 MiB | 11/11; p95 0.55 s, max 0.89 s | 11/11; p95 0.49 s, max 0.74 s | no |
+| 1,000 | plain-test fix | 1,001 | EPYC 9V45 | 0.67 (0.66–0.73) | 0.67 ms | 0.67 µs | 58 | 97 MiB | 11/11; p95 0.54 s, max 0.85 s | 11/11; p95 0.52 s, max 0.77 s | no |
+| 1,000 | selective equality first | 1,191 | EPYC 9V45 | 0.22 (0.21–0.25) | 0.22 ms | 0.22 µs | 25 | 89 MiB | 6/6; p95 0.02 s, max 0.34 s | 6/6; p95 0.02 s, max 0.22 s | yes |
+| 5,000 | today | 5,001 | EPYC 9V45 | 4.65 (4.53–4.66) | 4.65 ms | 0.93 µs | 91 | 275 MiB | 25/58; p95 1.72 s, max 1.97 s | 26/58; p95 1.74 s, max 1.99 s | no |
+| 5,000 | plain-test fix | 5,001 | EPYC 9V45 | 9.04 (8.06–9.48) | 9.04 ms | 1.81 µs | 95 | 252 MiB | 23/109; p95 1.69 s, max 1.93 s | 13/109; p95 1.65 s, max 1.90 s | no |
+| 5,000 | selective equality first | 5,943 | EPYC 9V45 | 0.29 (0.29–0.45) | 0.29 ms | 0.06 µs | 50 | 274 MiB | 7/7; p95 0.27 s, max 0.62 s | 7/7; p95 0.20 s, max 0.44 s | yes |
+
+"Per row per filter" divides the whole commit by rows and by today's filter count, floor included;
+the 100-filter cells are mostly floor.
+
+**The 5,000-filter repeats.** The first pass had the fix at twice today's time, which the rewrite
+cannot cause. Repeated in both orders on two more runners, the fix is 10–20% faster than today on
+each, and the same lowering differs by up to 1.6× between runners (today: 4.65, 6.15, 7.6 s). So
+the first pass's 9.04 s was that runner, and a 5,000-filter commit is 4.7–7.6 s.
+
+| Job | Order | Lowering | Runner | Sequencer time, 3 commits: median (range) s | Engine CPU % | Bystander receipts (drains ok/attempts) |
+| --- | ---: | --- | --- | ---: | ---: | --- |
+| b | 1 | plain-test fix | EPYC 9V74 | 6.10 (6.09–6.11) | 92 | 25/78; p95 1.75 s, max 2.00 s |
+| b | 2 | today | EPYC 9V74 | 7.56 (7.43–7.58) | 94 | 25/95; p95 1.75 s, max 1.99 s |
+| b | 3 | plain-test fix | EPYC 9V74 | 6.07 (6.06–6.08) | 92 | 26/78; p95 1.77 s, max 1.99 s |
+| b | 4 | today | EPYC 9V74 | 7.61 (7.61–7.66) | 94 | 23/96; p95 1.68 s, max 1.94 s |
+| c | 1 | today | Xeon 8573C | 6.13 (6.06–6.21) | 93 | 25/78; p95 1.72 s, max 1.97 s |
+| c | 2 | plain-test fix | Xeon 8573C | 5.54 (5.54–5.57) | 92 | 25/70; p95 1.73 s, max 1.98 s |
+| c | 3 | today | Xeon 8573C | 6.18 (6.15–6.22) | 93 | 24/78; p95 1.73 s, max 1.98 s |
+| c | 4 | plain-test fix | Xeon 8573C | 5.61 (5.52–5.91) | 91 | 24/72; p95 1.70 s, max 1.95 s |
+
+**Where the commit passes 0.5 s and 2 s.** A straight line through the three sizes, with the
+5,000-filter point the median of its passes, at 5 filters per account:
+
+| Lowering | Fit: commit s = a + b × filters | Passes 0.5 s at | Passes 2 s at |
+| --- | --- | --- | --- |
+| today | −0.11 + 1.25 ms × filters | 492 filters, about 100 accounts | 1,696 filters, about 340 accounts |
+| plain-test fix | −0.13 + 1.22 ms × filters | 512 filters, about 100 accounts | 1,737 filters, about 350 accounts |
+| selective equality first | 0.18 + 0.022 ms × filters | about 14,000 filters, 2,900 accounts (extrapolated; 5,000 is the largest measured) | not reached; far outside what was measured |
+
+The cost per filter rises with size (0.6 µs per row at 1,000 filters, 0.9–1.5 µs at 5,000), so the
+line overstates the middle: read between the measured 1,000 and 5,000 points, 2 s falls at
+1,700–2,260 filters, about 340–450 accounts.
+
+**Reading.**
+
+- **Other readers, today:** at 1,000 filters every drain arrives but waits about 0.5 s; at 5,000
+  the bystander gets 25 of 58 drains (a third to a half across passes).
+- **The split's remaining slope** is the 1 in 20 accounts left on shared values (294 filters at
+  5,000). Splitting their feeds per Space, as S does, is not measured here.
+- **Not measured:** the split's extra shapes on phones, and whether the gateway can address two
+  streams for one session feed. This run only shows what the engine does with those filters.

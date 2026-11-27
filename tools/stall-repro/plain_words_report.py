@@ -27,7 +27,7 @@ def runner(folder):
         return "?"
     match = re.search(r"Model name:\s+(.*)", machine.read_text())
     name = match.group(1) if match else "?"
-    return re.sub(r"\s+", " ", name.replace("AMD ", "").replace("Intel(R) Xeon(R) Platinum ", "Xeon ").replace("Intel(R) Xeon(R) ", "Xeon ").replace(" 80-Core Processor", "").replace(" 64-Core Processor", "").replace(" 96-Core Processor", "").replace(" CPU @ 2.80GHz", "")).strip()
+    return re.sub(r"\s+", " ", name.replace("AMD ", "").replace("Intel(R) Xeon(R) Platinum ", "Xeon ").replace("INTEL(R) XEON(R) PLATINUM ", "Xeon ").replace("Intel(R) Xeon(R) ", "Xeon ").replace(" 80-Core Processor", "").replace(" 64-Core Processor", "").replace(" 96-Core Processor", "").replace(" CPU @ 2.80GHz", "")).strip()
 
 
 def seconds(value, digits=2):
@@ -142,13 +142,24 @@ def run2(root, per_account=5):
                 print(f"| {count:,} | {label} | | — | did not complete | | | | | | | |")
                 continue
             points[way].append((count, cell["median"]))
-            accounts = len({request["account"] for request in []}) if False else None
             print(f"| {count:,} | {label} | {cell['shapes']:,} | {cell['runner']} | {spread(cell)} | {cell['median']:.2f} ms | {cell['median'] / cell['rows'] / count * 1e6:.2f} µs | {cell['cpu']:.0f} | {cell['rss_mib']:,.0f} MiB | {cell['drain']} | {cell['live']} | {'yes' if cell['high'] < BAR_S else 'no'} |")
+    print("\nRepeats of the 5,000-filter cells, in run order on each runner:\n")
+    print("| Job | Order | Lowering | Runner | Sequencer time, 3 commits: median (range) s | Engine CPU % | Bystander receipts (drains ok/attempts) |")
+    print("| --- | ---: | --- | --- | ---: | ---: | --- |")
+    for folder in sorted(root.glob("paired-pw2-5000-[a-z]-*")):
+        _, _, _, job, order, *rest = folder.name.split("-")
+        cell = commit_cell(folder, "e1-commit")
+        way = next(way for way in ways if f"-5000-{way}-" in folder.name)
+        points[f"repeat-{way}"].append(cell["median"])
+        print(f"| {job} | {order} | {ways[way]} | {cell['runner']} | {spread(cell)} | {cell['cpu']:.0f} | {cell['drain']} |")
     print("\n| Lowering | Fit: commit s = a + b × filters | Passes 0.5 s at | Passes 2 s at |")
     print("| --- | --- | --- | --- |")
     for way, label in ways.items():
         if len(points[way]) < 2:
             continue
+        # The 5,000-filter point is the median over the first pass and the repeats.
+        at_5000 = [time for count, time in points[way] if count == 5000] + points[f"repeat-{way}"]
+        points[way] = [(count, time) for count, time in points[way] if count != 5000] + [(5000, statistics.median(at_5000))]
         intercept, slope = fit(points[way])
         def crossing(limit):
             if slope <= 0 or (limit - intercept) / slope > 1e6:
