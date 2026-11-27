@@ -19,6 +19,15 @@ This file is replaced by the answer when the cell lands.
   module's unit tests on each (`cargo test --release --features test-support --lib engine::`, output
   in the artifact `stall-historical-build-<sha>/tests.txt`), and runs two cells.
 
+## The engine tests (measured in CI, 12:05 UTC)
+
+`cargo test --release --features test-support --lib engine::` on each commit; full output in
+`w1-nr-engine-tests/` beside this file.
+
+- `273b8b78` (test only): the new test fails as intended, `left: 1, right: 0` on "no subscriber: the
+  node-state map must not be rebuilt". 382 passed, 1 failed, 5 ignored.
+- `19f3f834` (the change): 383 passed, 0 failed, 5 ignored. The new test passes.
+
 ## The run in flight
 
 Actions run `45994130788` (started 11:53 UTC):
