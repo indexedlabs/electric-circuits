@@ -661,6 +661,11 @@ async def run(args):
         save(output / "account-lists.json", {account: vars(entry) for account, entry in lists.items()})
     store_log = (output / "store.log").open("w")
     store = subprocess.Popen(store_arguments, stdout=store_log, stderr=subprocess.STDOUT)
+    if args.variant in W1_VARIANTS:
+        # The file-backed store holds a file per stream; 2,000 families are about 76,000 streams, more
+        # than a hosted runner's 65,536 open files.
+        raised = subprocess.run(["sudo", "prlimit", f"--pid={store.pid}", "--nofile=1048576:1048576"], capture_output=True, text=True)
+        print(f"store open-file limit raised: exit {raised.returncode} {raised.stderr.strip()}", flush=True)
     async with httpx.AsyncClient(timeout=1) as store_client:
         for attempt in range(100):
             try:
@@ -707,7 +712,7 @@ async def run(args):
         "ELECTRIC_STORAGE_DIR": str(output / "engine-data"),
     }
     env.update(BRIDGE_ENVIRONMENT.get(args.variant, {}))
-    command("sudo", "systemd-run", "--unit", unit, "--collect", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
+    command("sudo", "systemd-run", "--unit", unit, "--collect", "--property=LimitNOFILE=1048576", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
     manifest["variant"] = args.variant
     manifest["label"] = args.label
@@ -758,7 +763,14 @@ async def run(args):
                     if created % 500 == 0:
                         print(f"Created {created}/{len(catalog)} shapes", flush=True)
                     return response.json()
-            handles = await asyncio.gather(*(create(request) for request in catalog))
+            try:
+                handles = await asyncio.gather(*(create(request) for request in catalog))
+            except RuntimeError:
+                # Say what the store held when a shape's stream could not be made.
+                descriptors = len(os.listdir(f"/proc/{store.pid}/fd")) if store.poll() is None else None
+                limits = [line for line in Path(f"/proc/{store.pid}/limits").read_text().splitlines() if "open files" in line] if store.poll() is None else None
+                print(json.dumps({"store_open_files": descriptors, "store_limit": limits, "store_log_tail": (output / "store.log").read_text(errors="replace")[-1500:], "proxy_log_tail": (output / "store-proxy.log").read_text(errors="replace")[-800:]}), flush=True)
+                raise
             save(output / "shape-handles.json", handles if args.variant not in W1_VARIANTS else {"created": len(handles)})
             import_tables = ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource")
             if args.variant == "S-rest-today":

@@ -885,7 +885,8 @@ async def window_plan(gateway, keyed_lists, connection):
 # it left out and `calendar_event` by the family too). Loads are one-shot subset queries.
 # W1-N: N active synthetic families, each with its own Space as its key, plus the bystander (fixture
 # account 0), the importing family (19) and the family that is deleted (W1_DELETED, prod p95 size).
-W1_VARIANTS = {f"W1-{count}": count for count in (20, 200, 2000)}
+# W1-1600 is the largest cell whose streams (38 a family) fit a store limited to 65,536 open files.
+W1_VARIANTS = {f"W1-{count}": count for count in (20, 200, 1600, 2000)}
 W1_DELETED = 30
 # Rows per family, from the circuits-plain-words prod reads: median, and p95 for 1 family in 20.
 # Records, date index, edges, assignments and files are prod's; the last three are the harness's.

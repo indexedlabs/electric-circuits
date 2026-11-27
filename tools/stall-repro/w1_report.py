@@ -136,5 +136,5 @@ def cell(root, count):
 
 if __name__ == "__main__":
     base = Path(sys.argv[1])
-    for size in (20, 200, 2000):
+    for size in (20, 200, 1600, 2000):
         cell(base, size)
