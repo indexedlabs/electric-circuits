@@ -23,7 +23,7 @@ from export_fixture import synthetic_id
 from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
-from simple_keys import H1_DATA_ACCOUNTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, h1_body, h1_catalog, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
+from simple_keys import H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -93,14 +93,16 @@ COLD_ACCOUNT = 3
 FLIP_SPACES = (4, 5, 6, 7, 8)
 SUBTREE_SPACE, SUBTREE_TARGET, SUBTREE_MEMBERS = 5, 6, 30
 FILES_ACCOUNT, FILES_DELETED = 6, 500
-AUDIT_WORKLOADS = ("h1-commit", *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
+# `h1-commit-r2` and `-r3` repeat `h1-commit` on the same engine, for a spread and more bystander samples.
+H1_COMMITS = ("h1-commit", "h1-commit-r2", "h1-commit-r3")
+AUDIT_WORKLOADS = (*H1_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
 
 
 def audit_prepare(data, url, variant, workloads):
     """Rows the audit workloads act on, written before the engine starts (part of the initial snapshot)."""
     with psycopg.connect(url) as connection:
         connection.execute("SET LOCAL session_replication_role = replica")
-        if variant in H1_VARIANTS:
+        if variant in H1_LIKE:
             for account in H1_DATA_ACCOUNTS:
                 if account >= 20:
                     data.insert(connection, "record", account, 20)
@@ -113,7 +115,7 @@ def audit_prepare(data, url, variant, workloads):
 
 def audit_operation(data, workload):
     """The one commit an audit workload makes, as (connection) -> journal."""
-    if workload == "h1-commit":
+    if workload in H1_COMMITS:
         # 1,000 Record updates, 20 in each of the 50 Spaces that hold Records.
         return lambda connection: [{"table": "record", "operation": "update", "rows": data.update(connection, "record", account, 20)} for account in H1_DATA_ACCOUNTS]
     if workload == "cold-resource_share":
@@ -311,7 +313,11 @@ PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTI
 # B-cold-key-edges: B-cold with every graph_edge branch keyed, to attribute B-cold's remaining cost.
 COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
-ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | set(H1_VARIANTS)
+# The catalogs made of one table's keyed filters and the bystander's probe feed only: H1 and
+# PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix).
+H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS)
+FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed}
+ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -416,7 +422,7 @@ async def run(args):
         "ELECTRIC_CIRCUITS_PG_SLOT": "stall_repro",
         "ELECTRIC_CIRCUITS_BIND": "127.0.0.1:7010",
         # H1 measures up to 20,000 shapes plus the probe, so its cap sits above that.
-        "ELECTRIC_CIRCUITS_MAX_SHAPES": "25000" if args.variant in H1_VARIANTS else "20000",
+        "ELECTRIC_CIRCUITS_MAX_SHAPES": "25000" if args.variant in H1_LIKE else "20000",
         "ELECTRIC_CIRCUITS_FLIP_WORKERS": "8",
         "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "0",
         "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "0",
@@ -430,6 +436,7 @@ async def run(args):
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
     manifest["variant"] = args.variant
     manifest["label"] = args.label
+    manifest["probe_interval_s"] = args.probe_interval
     manifest["engine_source"] = args.engine_source
     save(output / "manifest.json", manifest)
     try:
@@ -455,6 +462,8 @@ async def run(args):
                 save(output / "main3-demands.json", [{key: request[key] for key in ("account", "kind", "has_subquery", "demand")} | {"table": request["body"]["table"]} for request in catalog])
             if args.variant in H1_VARIANTS:
                 catalog = await h1_catalog(gateway, *H1_VARIANTS[args.variant])
+            if args.variant in H1P_VARIANTS:
+                catalog = await h1p_catalog(gateway, *H1P_VARIANTS[args.variant])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -483,7 +492,7 @@ async def run(args):
                 for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all", plus=args.variant == "S-main3-live-plus"):
                     await create({"body": request["body"]})
                 import_tables = ()
-            if args.variant in H1_VARIANTS:
+            if args.variant in H1_LIKE:
                 import_tables = ()
             for table in import_tables:
                 if args.variant in SIMPLE_VARIANTS:
@@ -504,10 +513,13 @@ async def run(args):
                     if args.variant == "plain-only":
                         body = plain_control_body(body, IMPORT_ACCOUNT, f"import-{table}")
                     await create({"body": body})
-            if args.variant in H1_VARIANTS:
+            if args.variant in H1_LIKE:
                 record_sync = gateway.loader.module("api.models.record_sync_authority")
                 probe_lists = record_sync.KeyedAudienceLists(space_ids=(UUID(str(row_id("space", 0))),), partner_space_ids=(), calendar_ids=(), partner_calendar_ids=(), shared_record_ids=(), shared_resource_ids=(), generation="h1-probe")
                 probe_body = await h1_body(gateway, 99999, probe_lists, identity="other-account-probe")
+                if args.variant in FIXED_VARIANTS:
+                    # The bystander is a one-family account, so the hypothetical fix covers its feed too.
+                    probe_body = {**probe_body, "where": unwrap_single_or(probe_body["where"])}
             elif args.variant in MAIN3_VARIANTS:
                 # The bystander's session-long Record feed (workflow roots): keyed with the flags on.
                 probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all") if request["body"]["table"] == "public.record" and request["demand"]["origin"] == "session")
@@ -559,7 +571,7 @@ async def run(args):
             subset["where"] = {"and": [subset["where"], {"col": "id", "op": "eq", "value": str(row_id("record", 0))}]}
             subset["limit"] = 1
             for workload in args.workloads:
-                probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl")
+                probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl", interval=args.probe_interval)
                 probe_task = asyncio.create_task(probe.run())
                 await asyncio.sleep(3)
                 memory_before = (await client.get(f"{ENGINE_URL}/memory")).json()
@@ -752,6 +764,7 @@ if __name__ == "__main__":
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--calibrate-only", action="store_true")
     parser.add_argument("--variant", choices=("A", "A-observed", *sorted(ALL_VARIANTS), *BRIDGE_ENVIRONMENT, "coalesced-base", "coalesced-head", "half-subqueries", "plain-only"), default="A")
+    parser.add_argument("--probe-interval", type=float, default=1.0, help="seconds between the bystander's probe ticks")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
     parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS), default=["import", "large-delete", "small-delete"])

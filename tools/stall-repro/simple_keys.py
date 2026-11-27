@@ -647,3 +647,89 @@ async def h1_catalog(gateway, count, half):
         body = await h1_body(gateway, ordinal, h1_lists(gateway, ordinal), client)
         catalog.append({"kind": "h1-indexed" if client else "h1-scan", "account": 1000 + ordinal, "body": body, "has_subquery": contains_subquery(body["where"])})
     return catalog
+
+
+# PLAIN-WORDS-3 run 1. The plain-test fix is HYPOTHETICAL and gateway-side: main does not do it.
+# The harness applies it as a rewrite of the filter main's own code lowers (`unwrap_single_or`):
+# every `{"or": [x]}` with exactly one child becomes `x`, at every level. Main's `_any_equal` writes
+# a one-value list as a one-child OR and `keyed_authorization_predicate` wraps its paths in another,
+# so this one rewrite is both halves of the fix (a one-value keyed list as a plain equality, and a
+# one-child OR unwrapped). A one-family account's `record` filter then reads
+# `AND(space_id = X, type test, stream identity)`, which the engine indexes under `space_id`.
+def unwrap_single_or(predicate):
+    if not isinstance(predicate, dict):
+        return predicate
+    for operator in ("and", "or"):
+        if operator in predicate:
+            children = [unwrap_single_or(child) for child in predicate[operator]]
+            return children[0] if operator == "or" and len(children) == 1 else {operator: children}
+    if "not" in predicate:
+        return {"not": unwrap_single_or(predicate["not"])}
+    if isinstance(predicate.get("in"), dict) and predicate["in"].get("where") is not None:
+        return {**predicate, "in": {**predicate["in"], "where": unwrap_single_or(predicate["in"]["where"])}}
+    return predicate
+
+
+def access_leaf(where):
+    """The leaf engine 9bc1563 indexes a standalone shape under (`CompiledPredicate::access_leaf`,
+    predicate.rs:369-416): the first equality on a non-NULL value in the top-level AND chain, nested
+    ANDs included, in order; else the first range bound; else None (the table's scan list)."""
+    best = None
+    def collect(node):
+        nonlocal best
+        if node is None:
+            return
+        if "and" in node:
+            for child in node["and"]:
+                collect(child)
+        elif node.get("op") in {"eq", "gt", "gte", "lt", "lte"} and node.get("value") is not None and "in" not in node:
+            if best is None or (best[1] != "eq" and node["op"] == "eq"):
+                best = (node["col"], node["op"], node["value"])
+    collect(where)
+    return best
+
+
+# S-main3-h1p-N-one: N one-family accounts (one Space, no partner Spaces, no shared Records), every
+# filter lowered by main and then rewritten by the fix. Each account has its own home Space, so the
+# N filters differ; 49 of them are the homes the commit writes to, and the bystander's is the 50th.
+# S-main3-h1p-N-mix: prod's mix. 19 accounts in 20 as above; 1 in 20 keeps H1's lists (its home,
+# 0-2 of the written Spaces and two shared Records), which the same rewrite leaves on the scan list.
+# S-main3-h1p-N-one-today: the control. The same N one-family accounts as `-one`, lowered by main
+# as it is today (no rewrite), so every filter is on the scan list and only the lowering differs.
+H1P_COUNTS = (40, 1000, 10000, 20000)
+H1P_VARIANTS = {f"S-main3-h1p-{count}-{name}": (count, mix, fixed) for count in H1P_COUNTS for name, mix, fixed in (("one", "one", True), ("mix", "mix", True), ("one-today", "one", False))}
+MIX_EVERY = 20
+
+
+def plain_words_account(ordinal, mix):
+    """(multi, rank): whether this account is the 1 in 20 with several Spaces or shares, and its
+    rank among the one-family accounts otherwise."""
+    if mix == "mix" and ordinal % MIX_EVERY == MIX_EVERY - 1:
+        return True, None
+    return False, ordinal - (ordinal + 1) // MIX_EVERY if mix == "mix" else ordinal
+
+
+def one_family_space(rank, ordinal):
+    """A one-family account's only Space: one of the 49 written Spaces that are not the bystander's
+    for the first 49 such accounts, its own unwritten home after that."""
+    if rank < len(H1_DATA_ACCOUNTS) - 1:
+        return UUID(str(synthetic_id(f"space/{H1_DATA_ACCOUNTS[rank + 1]}")))
+    return UUID(str(synthetic_id(f"h1p-home/{ordinal}")))
+
+
+def h1p_lists(gateway, ordinal, mix):
+    multi, rank = plain_words_account(ordinal, mix)
+    if multi:
+        return h1_lists(gateway, ordinal)
+    record_sync = gateway.loader.module("api.models.record_sync_authority")
+    return record_sync.KeyedAudienceLists(space_ids=(one_family_space(rank, ordinal),), partner_space_ids=(), calendar_ids=(), partner_calendar_ids=(), shared_record_ids=(), shared_resource_ids=(), generation=f"h1p-{ordinal}")
+
+
+async def h1p_catalog(gateway, count, mix, fixed):
+    catalog = []
+    for ordinal in range(count):
+        body = await h1_body(gateway, ordinal, h1p_lists(gateway, ordinal, mix))
+        if fixed:
+            body = {**body, "where": unwrap_single_or(body["where"])}
+        catalog.append({"kind": "h1p-indexed" if access_leaf(body["where"]) else "h1p-scan", "account": 1000 + ordinal, "body": body, "has_subquery": contains_subquery(body["where"])})
+    return catalog

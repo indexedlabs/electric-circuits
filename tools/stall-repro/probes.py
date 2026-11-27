@@ -20,7 +20,7 @@ def require_isolated(engine_url: str, postgres_url: str) -> None:
 
 
 class OtherAccountProbe:
-    def __init__(self, *, engine_url, postgres_url, user_id, record_id, generation, feed, subset, receipt_validator, output: Path, secret="stall-repro-synthetic-secret"):
+    def __init__(self, *, engine_url, postgres_url, user_id, record_id, generation, feed, subset, receipt_validator, output: Path, secret="stall-repro-synthetic-secret", interval=1.0):
         require_isolated(engine_url, postgres_url)
         require_isolated(feed["streamUrl"], postgres_url)
         self.engine_url = engine_url
@@ -33,6 +33,7 @@ class OtherAccountProbe:
         self.receipt_validator = receipt_validator
         self.output = output
         self.secret = secret
+        self.interval = interval
         self.observed = {}
         self.expected = {}
         self.stopped = asyncio.Event()
@@ -131,7 +132,7 @@ class OtherAccountProbe:
                         task.add_done_callback(self.tasks.discard)
                     tick += 1
                     try:
-                        await asyncio.wait_for(self.stopped.wait(), timeout=max(0.001, self.started + tick - time.monotonic()))
+                        await asyncio.wait_for(self.stopped.wait(), timeout=max(0.001, self.started + tick * self.interval - time.monotonic()))
                     except TimeoutError:
                         pass
             finally:
