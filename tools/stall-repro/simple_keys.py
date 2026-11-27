@@ -733,3 +733,77 @@ async def h1p_catalog(gateway, count, mix, fixed):
             body = {**body, "where": unwrap_single_or(body["where"])}
         catalog.append({"kind": "h1p-indexed" if access_leaf(body["where"]) else "h1p-scan", "account": 1000 + ordinal, "body": body, "has_subquery": contains_subquery(body["where"])})
     return catalog
+
+
+# PLAIN-WORDS-3 run 2: N live keyed `graph_edge` filters, as phones hold them (S-main3-live's phone
+# model): per account one session Resource-edge feed per Space (`app_session`) and four open
+# thread rails' attendee members (`app_thread_rail`), each ANDed after main's
+# `keyed_authorization_predicate(table="graph_edge")` (`_keyed_graph_edge_predicate`, the same text
+# at 52e79b875b and at main 8fe2aadd) and followed by main's stream identity, in the order main's
+# `authorize_predicate` writes them. Accounts are prod's mix (`plain_words_account`): 19 in 20 with
+# one Space, 1 in 20 with H1's lists. N counts today's filters; accounts are added until N is reached.
+# - `today`: main's lowering as it is.
+# - `fix`: run 1's HYPOTHETICAL plain-test rewrite (`unwrap_single_or`) over every filter.
+# - `split` (HYPOTHETICAL, more than run 1's fix): `fix`, and for one-Space accounts a selective
+#   equality written first, where the engine takes its leaf: a rail filter starts with its own
+#   `from_id = R`; a session feed becomes two filters, one starting `from_space_id = S` and one
+#   starting `to_space_id = S AND from_space_id != S`. Together they admit exactly the rows `fix`
+#   admits. The 1 in 20 keep `fix`.
+EDGE_COUNTS = (100, 1000, 5000)
+EDGE_WAYS = ("today", "fix", "split")
+EDGE_VARIANTS = {f"S-main3-e1-{count}-{way}": (count, way) for count in EDGE_COUNTS for way in EDGE_WAYS}
+EDGE_RAILS = 4
+
+
+def main_stream_identity(gateway, column="id"):
+    """Main's `_stream_identity` for the harness authority every H1-style filter uses."""
+    import hashlib
+    identity = str(UUID(bytes=hashlib.sha256(gateway.authority(0).fingerprint.encode()).digest()[:16]))
+    return {"or": [{"col": column, "op": "eq", "value": identity}, {"col": column, "op": "neq", "value": identity}]}
+
+
+def edge_account_filters(gateway, ordinal, way):
+    """[(identity, where, kind)] for one synthetic account's keyed `graph_edge` filters, and how many
+    filters it holds today."""
+    from data import row_id
+    multi, rank = plain_words_account(ordinal, "mix")
+    lists = h1p_lists(gateway, ordinal, "mix")
+    user = UUID(str(synthetic_id(f"user/e1/{ordinal}")))
+    authority = gateway.authority_module.KeyedSyncAuthority(user_id=user, lists=lists, index_tables=True, chat_rows=True)
+    authorization = gateway.authority_module.keyed_authorization_predicate(table="graph_edge", authority=authority)
+    identity = main_stream_identity(gateway)
+    spaces = [str(space) for space in lists.space_ids]
+    # A one-Space account in a written Space holds rails on four Records whose edges the commit updates.
+    written = not multi and rank < len(H1_DATA_ACCOUNTS) - 1
+    records = [str(row_id("record", H1_DATA_ACCOUNTS[rank + 1], index)) if written else str(synthetic_id(f"e1-record/{ordinal}/{index}")) for index in range(EDGE_RAILS)]
+    clients = [(f"session:{index}", "session", predicate, space) for index, (space, (table, predicate)) in enumerate((space, demand) for space in spaces for demand in app_session(ordinal, [space]) if demand[0] == "graph_edge" and demand[1] is not None)]
+    clients += [(f"rail:{index}", "rail", next(predicate for table, predicate in app_thread_rail(record) if table == "graph_edge"), record) for index, record in enumerate(records)]
+    filters = []
+    for name, kind, client, key in clients:
+        where = {"and": [{"and": [authorization, client]}, identity]}
+        if way != "today":
+            where = unwrap_single_or(where)
+        if way == "split" and not multi and kind == "rail":
+            filters.append((name, {"and": [eq("from_id", key), where]}, kind))
+        elif way == "split" and not multi:
+            filters.append((f"{name}:from", {"and": [eq("from_space_id", key), where]}, kind))
+            filters.append((f"{name}:to", {"and": [eq("to_space_id", key), neq("from_space_id", key), where]}, kind))
+        else:
+            filters.append((name, where, kind))
+    return filters, len(clients)
+
+
+def edge_catalog(gateway, count, way):
+    catalog, today, ordinal = [], 0, 0
+    while today < count:
+        filters, held = edge_account_filters(gateway, ordinal, way)
+        if today + held > count:
+            # The last account holds only the filters that fit: drop its last rails.
+            dropped = {f"rail:{index}" for index in range(EDGE_RAILS - (today + held - count), EDGE_RAILS)}
+            filters, held = [entry for entry in filters if entry[0] not in dropped], count - today
+        for name, where, kind in filters:
+            body = gateway._plain_body("graph_edge", 1000 + ordinal, where, f"e1:{ordinal}:{name}", keyed=False)
+            catalog.append({"kind": f"e1-{kind}", "account": 1000 + ordinal, "body": body, "has_subquery": contains_subquery(where)})
+        today += held
+        ordinal += 1
+    return catalog

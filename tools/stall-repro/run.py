@@ -23,7 +23,7 @@ from export_fixture import synthetic_id
 from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHARE_TABLES, load_data, row_id
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
-from simple_keys import H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
+from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -95,7 +95,9 @@ SUBTREE_SPACE, SUBTREE_TARGET, SUBTREE_MEMBERS = 5, 6, 30
 FILES_ACCOUNT, FILES_DELETED = 6, 500
 # `h1-commit-r2` and `-r3` repeat `h1-commit` on the same engine, for a spread and more bystander samples.
 H1_COMMITS = ("h1-commit", "h1-commit-r2", "h1-commit-r3")
-AUDIT_WORKLOADS = (*H1_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
+# PLAIN-WORDS-3 run 2: 1,000 `graph_edge` updates, 20 in each of the 50 written Spaces, and repeats.
+EDGE_COMMITS = ("e1-commit", "e1-commit-r2", "e1-commit-r3")
+AUDIT_WORKLOADS = (*H1_COMMITS, *EDGE_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
 
 
 def audit_prepare(data, url, variant, workloads):
@@ -105,7 +107,7 @@ def audit_prepare(data, url, variant, workloads):
         if variant in H1_LIKE:
             for account in H1_DATA_ACCOUNTS:
                 if account >= 20:
-                    data.insert(connection, "record", account, 20)
+                    data.insert(connection, "graph_edge" if variant in EDGE_VARIANTS else "record", account, 20)
         if "writer-subtree" in workloads:
             for index in range(SUBTREE_MEMBERS):
                 connection.execute("INSERT INTO public.space_member (id, space_id, user_id, created_at, updated_at) VALUES (%s, %s, %s, now(), now())", (synthetic_id(f"subtree/{index}"), row_id("space", SUBTREE_SPACE), synthetic_id(f"subtree-user/{index}")))
@@ -118,6 +120,8 @@ def audit_operation(data, workload):
     if workload in H1_COMMITS:
         # 1,000 Record updates, 20 in each of the 50 Spaces that hold Records.
         return lambda connection: [{"table": "record", "operation": "update", "rows": data.update(connection, "record", account, 20)} for account in H1_DATA_ACCOUNTS]
+    if workload in EDGE_COMMITS:
+        return lambda connection: [{"table": "graph_edge", "operation": "update", "rows": data.update(connection, "graph_edge", account, 20)} for account in H1_DATA_ACCOUNTS]
     if workload == "cold-resource_share":
         # One Resource per share: the table's active-provenance key (Resource, target, source, grant;
         # NULLs not distinct) allows one live direct share per Resource and target.
@@ -314,9 +318,9 @@ PARTLY_KEYED.update({variant: {"graph_edge"} for variant, mode in EDGE_ATTRIBUTI
 COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
 # The catalogs made of one table's keyed filters and the bystander's probe feed only: H1 and
-# PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix).
-H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS)
-FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed}
+# PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix) and run 2 (keyed `graph_edge` filters).
+H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS)
+FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed} | {variant for variant, (_, way) in EDGE_VARIANTS.items() if way != "today"}
 ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
@@ -464,6 +468,8 @@ async def run(args):
                 catalog = await h1_catalog(gateway, *H1_VARIANTS[args.variant])
             if args.variant in H1P_VARIANTS:
                 catalog = await h1p_catalog(gateway, *H1P_VARIANTS[args.variant])
+            if args.variant in EDGE_VARIANTS:
+                catalog = edge_catalog(gateway, *EDGE_VARIANTS[args.variant])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)

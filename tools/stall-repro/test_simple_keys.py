@@ -5,7 +5,7 @@ from pathlib import Path
 
 from catalog import GatewayShapes, contains_subquery, validate_predicate
 from parity import check_fixtures
-from simple_keys import H1P_VARIANTS, HIDDEN_RECORD_TYPES, SIMPLE_KEYED, AccountLists, access_leaf, h1_catalog, h1p_catalog, predicate_sql, simple_bodies, simple_feeds, unwrap_single_or
+from simple_keys import EDGE_VARIANTS, H1P_VARIANTS, HIDDEN_RECORD_TYPES, SIMPLE_KEYED, AccountLists, access_leaf, edge_catalog, h1_catalog, h1p_catalog, predicate_sql, simple_bodies, simple_feeds, unwrap_single_or
 
 FOLDER = Path(__file__).parent
 LISTS = AccountLists(0, "u", ("s0",), ("s1",), ("g",), ("c0", "c1"), ("r0", "r1"))
@@ -75,6 +75,18 @@ class PlainWordsTests(unittest.TestCase):
         self.assertEqual(len({json.dumps(request["body"]["where"]) for request in fixed}), 40)
         mix = asyncio.run(h1p_catalog(self.main, *H1P_VARIANTS["S-main3-h1p-40-mix"]))
         self.assertEqual(sum(access_leaf(request["body"]["where"]) is None for request in mix), 2)
+
+    def test_edge_filters_keep_an_unselective_leaf_until_a_selective_equality_is_written_first(self):
+        def leaves(way):
+            return {(request["kind"], (access_leaf(request["body"]["where"]) or (None,))[0]) for request in edge_catalog(self.main, 100, way)}
+        self.assertEqual(leaves("today"), {("e1-session", "to_type"), ("e1-rail", "from_type")})
+        self.assertEqual(leaves("fix"), leaves("today"))
+        self.assertEqual(leaves("split"), leaves("today") | {("e1-session", "from_space_id"), ("e1-session", "to_space_id"), ("e1-rail", "from_id")})
+        for variant, (count, way) in EDGE_VARIANTS.items():
+            if count == 100:
+                catalog = edge_catalog(self.main, count, way)
+                self.assertEqual(len({json.dumps(request["body"]["where"]) for request in catalog}), len(catalog))
+                self.assertEqual(len(catalog), 100 if way != "split" else 119)
 
 
 if __name__ == "__main__":
