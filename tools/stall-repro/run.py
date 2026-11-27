@@ -26,7 +26,7 @@ from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
 from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog, window_plan
 from simple_keys import HOME_TODAY, W6_ACCESS_ACCOUNTS, W6_MOVED_EDGES, W6_VARIANTS, placement_summary, plain_words_account, predicate_sql, w6_catalog, w6_requests, window_subsets
-from simple_keys import B2_TABLES, B2_VARIANTS, B2_WRITER, b2_catalog
+from simple_keys import B2_TABLES, B2_VARIANTS, B2_WRITER, B2B_VARIANTS, b2_catalog, b2b_catalog
 from simple_keys import W1_DELETED, W1_FAMILY_ROWS, W1_VARIANTS, w1_catalog, w1_feeds, w1_seed_accounts, w1_seed_families
 
 
@@ -155,7 +155,7 @@ async def table_counts(client, table):
     response = await client.get(f"{ENGINE_URL}/tables/public.{table}/families")
     counts = response.json() if response.status_code == 200 else {"families": [], "standalone": 0, "scan": 0, "circuit": 0, "no_tailer": True}
     cardinalities = (await client.get(f"{ENGINE_URL}/memory")).json()["cardinalities"]
-    return {"table": counts, "engine": {key: cardinalities[key] for key in ("shapes", "standalone", "families", "family_shapes", "subquery_shapes")}}
+    return {"table": counts, "engine": {key: cardinalities[key] for key in ("shapes", "standalone", "families", "family_shapes", "subquery_shapes", "subquery_nodes", "subquery_edges")}}
 
 W7_QUERIES = 100
 W7_WAIT_S = 120
@@ -682,7 +682,9 @@ COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
 # The catalogs made of one table's keyed filters and the bystander's probe feed only: H1 and
 # PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix) and run 2 (keyed `graph_edge` filters).
-H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS) | set(W6_VARIANTS) | set(B2_VARIANTS)
+H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS) | set(W6_VARIANTS) | set(B2_VARIANTS) | set(B2B_VARIANTS)
+# B2 and B2b cells with one reader: the counts cells.
+B2_ONE_READER = {variant: flag for variant, (flag, readers) in B2_VARIANTS.items() if readers == 1} | {variant: form for variant, (form, _, readers) in B2B_VARIANTS.items() if readers == 1}
 FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed} | {variant for variant, (_, way) in EDGE_VARIANTS.items() if way != "today"}
 ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE | set(W1_VARIANTS)
 BRIDGE_ENVIRONMENT = {
@@ -851,6 +853,8 @@ async def run(args):
                 catalog = w6_catalog(gateway, W6_VARIANTS[args.variant][0])
             if args.variant in B2_VARIANTS:
                 catalog = b2_catalog(gateway, *B2_VARIANTS[args.variant])
+            if args.variant in B2B_VARIANTS:
+                catalog = b2b_catalog(gateway, *B2B_VARIANTS[args.variant])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -876,16 +880,17 @@ async def run(args):
                     if created % 500 == 0:
                         print(f"Created {created}/{len(catalog)} shapes", flush=True)
                     return response.json()
-            if args.variant in B2_VARIANTS and B2_VARIANTS[args.variant][1] == 1:
+            if args.variant in B2_ONE_READER:
                 # The one-reader cell: each filter is created on its own, with the engine's counts for
                 # its table read just before and just after, before any other shape exists on it.
                 placements = []
                 for request in catalog:
                     table = request["body"]["table"].removeprefix("public.")
                     before = await table_counts(client, table)
-                    handle = await create(request)
+                    # B2b: a predicate the engine refuses is recorded with its reason, and the rest go on.
+                    response = await client.post(f"{ENGINE_URL}/v1/subset-feeds", json=request["body"])
                     after = await table_counts(client, table)
-                    placements.append({"table": table, "single_key": B2_VARIANTS[args.variant][0], "shape": handle["shapeId"], "where": request["body"]["where"], "before": before, "after": after})
+                    placements.append({"table": table, "single_key": B2_ONE_READER[args.variant], "status": response.status_code, "shape": response.json().get("shapeId") if response.status_code == 200 else None, "refused": None if response.status_code == 200 else response.text[:1000], "has_subquery": request["has_subquery"], "where": request["body"]["where"], "before": before, "after": after})
                 save(output / "b2-placement-result.json", {"workload": "b2-placement", "engine_source": args.engine_source, "list_keys": env.get("ELECTRIC_CIRCUITS_LIST_KEYS"), "placements": placements})
                 catalog = []
             try:

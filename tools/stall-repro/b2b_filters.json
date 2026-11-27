@@ -1,0 +1,1600 @@
+{
+ "source": "circuits-coord, 2026-11-27: served predicates built by the gateway in prod from real request bodies, every id and date replaced. `group` is each table's predicate as a group member served today (single key not applied); `feed` is the same request as a standalone feed or subset query (single key applied), which differs only in the reader's own key being a plain equality.",
+ "reader": "reader internal, spaces 1 calendars 9 record_scoped True",
+ "tables": [
+  {
+   "table": "record_date_index",
+   "group": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "or": [
+          {
+           "col": "space_id",
+           "op": "eq",
+           "value": "<SPACE>"
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "or": [
+            {
+             "and": [
+              {
+               "col": "date_value",
+               "op": "lt",
+               "value": "<DATE_1>"
+              },
+              {
+               "col": "end_date_value",
+               "op": "gte",
+               "value": "<DATE_2>"
+              }
+             ]
+            },
+            {
+             "and": [
+              {
+               "col": "date_value",
+               "op": "gte",
+               "value": "<DATE_2>"
+              },
+              {
+               "col": "date_value",
+               "op": "lt",
+               "value": "<DATE_1>"
+              },
+              {
+               "col": "end_date_value",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "and": [
+              {
+               "col": "datetime_value",
+               "op": "lt",
+               "value": "<DATE_3>"
+              },
+              {
+               "col": "end_datetime_value",
+               "op": "gte",
+               "value": "<DATE_4>"
+              }
+             ]
+            },
+            {
+             "and": [
+              {
+               "col": "datetime_value",
+               "op": "gte",
+               "value": "<DATE_4>"
+              },
+              {
+               "col": "datetime_value",
+               "op": "lt",
+               "value": "<DATE_3>"
+              },
+              {
+               "col": "end_datetime_value",
+               "isNull": true
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "col": "record_id",
+           "in": {
+            "project": "record_id",
+            "table": "record_recurrence",
+            "where": {
+             "and": [
+              {
+               "or": [
+                {
+                 "col": "space_id",
+                 "op": "eq",
+                 "value": "<SPACE>"
+                }
+               ]
+              },
+              {
+               "and": [
+                {
+                 "or": [
+                  {
+                   "col": "recurring_until",
+                   "isNull": true
+                  },
+                  {
+                   "col": "recurring_until",
+                   "op": "gte",
+                   "value": "<DATE_5>"
+                  }
+                 ]
+                },
+                {
+                 "col": "dtstart",
+                 "op": "lt",
+                 "value": "<DATE_6>"
+                }
+               ]
+              }
+             ]
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "feed": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        },
+        {
+         "or": [
+          {
+           "or": [
+            {
+             "and": [
+              {
+               "col": "date_value",
+               "op": "lt",
+               "value": "<DATE_1>"
+              },
+              {
+               "col": "end_date_value",
+               "op": "gte",
+               "value": "<DATE_2>"
+              }
+             ]
+            },
+            {
+             "and": [
+              {
+               "col": "date_value",
+               "op": "gte",
+               "value": "<DATE_2>"
+              },
+              {
+               "col": "date_value",
+               "op": "lt",
+               "value": "<DATE_1>"
+              },
+              {
+               "col": "end_date_value",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "and": [
+              {
+               "col": "datetime_value",
+               "op": "lt",
+               "value": "<DATE_3>"
+              },
+              {
+               "col": "end_datetime_value",
+               "op": "gte",
+               "value": "<DATE_4>"
+              }
+             ]
+            },
+            {
+             "and": [
+              {
+               "col": "datetime_value",
+               "op": "gte",
+               "value": "<DATE_4>"
+              },
+              {
+               "col": "datetime_value",
+               "op": "lt",
+               "value": "<DATE_3>"
+              },
+              {
+               "col": "end_datetime_value",
+               "isNull": true
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "col": "record_id",
+           "in": {
+            "project": "record_id",
+            "table": "record_recurrence",
+            "where": {
+             "and": [
+              {
+               "or": [
+                {
+                 "col": "space_id",
+                 "op": "eq",
+                 "value": "<SPACE>"
+                }
+               ]
+              },
+              {
+               "and": [
+                {
+                 "or": [
+                  {
+                   "col": "recurring_until",
+                   "isNull": true
+                  },
+                  {
+                   "col": "recurring_until",
+                   "op": "gte",
+                   "value": "<DATE_5>"
+                  }
+                 ]
+                },
+                {
+                 "col": "dtstart",
+                 "op": "lt",
+                 "value": "<DATE_6>"
+                }
+               ]
+              }
+             ]
+            }
+           }
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "record",
+   "group": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "and": [
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "col": "type",
+             "isNull": true
+            },
+            {
+             "and": [
+              {
+               "col": "type",
+               "op": "neq",
+               "value": "busy_block"
+              },
+              {
+               "col": "type",
+               "op": "neq",
+               "value": "legacy_preference"
+              },
+              {
+               "col": "type",
+               "op": "neq",
+               "value": "family_context_report"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "col": "id",
+           "in": {
+            "project": "record_id",
+            "table": "record_date_index",
+            "where": {
+             "and": [
+              {
+               "or": [
+                {
+                 "col": "space_id",
+                 "op": "eq",
+                 "value": "<SPACE>"
+                }
+               ]
+              },
+              {
+               "or": [
+                {
+                 "and": [
+                  {
+                   "col": "date_value",
+                   "op": "lt",
+                   "value": "<DATE_1>"
+                  },
+                  {
+                   "col": "end_date_value",
+                   "op": "gte",
+                   "value": "<DATE_2>"
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "col": "date_value",
+                   "op": "gte",
+                   "value": "<DATE_2>"
+                  },
+                  {
+                   "col": "date_value",
+                   "op": "lt",
+                   "value": "<DATE_1>"
+                  },
+                  {
+                   "col": "end_date_value",
+                   "isNull": true
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "col": "datetime_value",
+                   "op": "lt",
+                   "value": "<DATE_3>"
+                  },
+                  {
+                   "col": "end_datetime_value",
+                   "op": "gte",
+                   "value": "<DATE_4>"
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "col": "datetime_value",
+                   "op": "gte",
+                   "value": "<DATE_4>"
+                  },
+                  {
+                   "col": "datetime_value",
+                   "op": "lt",
+                   "value": "<DATE_3>"
+                  },
+                  {
+                   "col": "end_datetime_value",
+                   "isNull": true
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            }
+           }
+          },
+          {
+           "col": "id",
+           "in": {
+            "project": "record_id",
+            "table": "record_recurrence",
+            "where": {
+             "and": [
+              {
+               "or": [
+                {
+                 "col": "space_id",
+                 "op": "eq",
+                 "value": "<SPACE>"
+                }
+               ]
+              },
+              {
+               "and": [
+                {
+                 "or": [
+                  {
+                   "col": "recurring_until",
+                   "isNull": true
+                  },
+                  {
+                   "col": "recurring_until",
+                   "op": "gte",
+                   "value": "<DATE_5>"
+                  }
+                 ]
+                },
+                {
+                 "col": "dtstart",
+                 "op": "lt",
+                 "value": "<DATE_6>"
+                }
+               ]
+              }
+             ]
+            }
+           }
+          },
+          {
+           "and": [
+            {
+             "col": "recurring_parent_id",
+             "in": {
+              "project": "record_id",
+              "table": "record_recurrence",
+              "where": {
+               "and": [
+                {
+                 "or": [
+                  {
+                   "col": "space_id",
+                   "op": "eq",
+                   "value": "<SPACE>"
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "or": [
+                    {
+                     "col": "recurring_until",
+                     "isNull": true
+                    },
+                    {
+                     "col": "recurring_until",
+                     "op": "gte",
+                     "value": "<DATE_5>"
+                    }
+                   ]
+                  },
+                  {
+                   "col": "dtstart",
+                   "op": "lt",
+                   "value": "<DATE_6>"
+                  }
+                 ]
+                }
+               ]
+              }
+             }
+            },
+            {
+             "col": "original_start_time",
+             "op": "gte",
+             "value": "<DATE_7>"
+            },
+            {
+             "col": "original_start_time",
+             "op": "lt",
+             "value": "<DATE_8>"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "feed": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "and": [
+          {
+           "col": "space_id",
+           "op": "eq",
+           "value": "<SPACE>"
+          },
+          {
+           "or": [
+            {
+             "col": "type",
+             "isNull": true
+            },
+            {
+             "and": [
+              {
+               "col": "type",
+               "op": "neq",
+               "value": "busy_block"
+              },
+              {
+               "col": "type",
+               "op": "neq",
+               "value": "legacy_preference"
+              },
+              {
+               "col": "type",
+               "op": "neq",
+               "value": "family_context_report"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "col": "id",
+           "in": {
+            "project": "record_id",
+            "table": "record_date_index",
+            "where": {
+             "and": [
+              {
+               "or": [
+                {
+                 "col": "space_id",
+                 "op": "eq",
+                 "value": "<SPACE>"
+                }
+               ]
+              },
+              {
+               "or": [
+                {
+                 "and": [
+                  {
+                   "col": "date_value",
+                   "op": "lt",
+                   "value": "<DATE_1>"
+                  },
+                  {
+                   "col": "end_date_value",
+                   "op": "gte",
+                   "value": "<DATE_2>"
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "col": "date_value",
+                   "op": "gte",
+                   "value": "<DATE_2>"
+                  },
+                  {
+                   "col": "date_value",
+                   "op": "lt",
+                   "value": "<DATE_1>"
+                  },
+                  {
+                   "col": "end_date_value",
+                   "isNull": true
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "col": "datetime_value",
+                   "op": "lt",
+                   "value": "<DATE_3>"
+                  },
+                  {
+                   "col": "end_datetime_value",
+                   "op": "gte",
+                   "value": "<DATE_4>"
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "col": "datetime_value",
+                   "op": "gte",
+                   "value": "<DATE_4>"
+                  },
+                  {
+                   "col": "datetime_value",
+                   "op": "lt",
+                   "value": "<DATE_3>"
+                  },
+                  {
+                   "col": "end_datetime_value",
+                   "isNull": true
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            }
+           }
+          },
+          {
+           "col": "id",
+           "in": {
+            "project": "record_id",
+            "table": "record_recurrence",
+            "where": {
+             "and": [
+              {
+               "or": [
+                {
+                 "col": "space_id",
+                 "op": "eq",
+                 "value": "<SPACE>"
+                }
+               ]
+              },
+              {
+               "and": [
+                {
+                 "or": [
+                  {
+                   "col": "recurring_until",
+                   "isNull": true
+                  },
+                  {
+                   "col": "recurring_until",
+                   "op": "gte",
+                   "value": "<DATE_5>"
+                  }
+                 ]
+                },
+                {
+                 "col": "dtstart",
+                 "op": "lt",
+                 "value": "<DATE_6>"
+                }
+               ]
+              }
+             ]
+            }
+           }
+          },
+          {
+           "and": [
+            {
+             "col": "recurring_parent_id",
+             "in": {
+              "project": "record_id",
+              "table": "record_recurrence",
+              "where": {
+               "and": [
+                {
+                 "or": [
+                  {
+                   "col": "space_id",
+                   "op": "eq",
+                   "value": "<SPACE>"
+                  }
+                 ]
+                },
+                {
+                 "and": [
+                  {
+                   "or": [
+                    {
+                     "col": "recurring_until",
+                     "isNull": true
+                    },
+                    {
+                     "col": "recurring_until",
+                     "op": "gte",
+                     "value": "<DATE_5>"
+                    }
+                   ]
+                  },
+                  {
+                   "col": "dtstart",
+                   "op": "lt",
+                   "value": "<DATE_6>"
+                  }
+                 ]
+                }
+               ]
+              }
+             }
+            },
+            {
+             "col": "original_start_time",
+             "op": "gte",
+             "value": "<DATE_7>"
+            },
+            {
+             "col": "original_start_time",
+             "op": "lt",
+             "value": "<DATE_8>"
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "record_recurrence",
+   "group": {
+    "expected": "range on dtstart",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "or": [
+          {
+           "col": "space_id",
+           "op": "eq",
+           "value": "<SPACE>"
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "or": [
+            {
+             "col": "recurring_until",
+             "isNull": true
+            },
+            {
+             "col": "recurring_until",
+             "op": "gte",
+             "value": "<DATE_5>"
+            }
+           ]
+          },
+          {
+           "col": "dtstart",
+           "op": "lt",
+           "value": "<DATE_6>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "feed": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        },
+        {
+         "and": [
+          {
+           "or": [
+            {
+             "col": "recurring_until",
+             "isNull": true
+            },
+            {
+             "col": "recurring_until",
+             "op": "gte",
+             "value": "<DATE_5>"
+            }
+           ]
+          },
+          {
+           "col": "dtstart",
+           "op": "lt",
+           "value": "<DATE_6>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "calendar_event",
+   "group": {
+    "expected": "filed under a shared value: is_busy_block = False",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "and": [
+          {
+           "or": [
+            {
+             "col": "user_id",
+             "op": "eq",
+             "value": "<USER>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "is_busy_block",
+             "op": "eq",
+             "value": false
+            },
+            {
+             "or": [
+              {
+               "and": [
+                {
+                 "col": "deleted_at",
+                 "isNull": true
+                },
+                {
+                 "col": "status",
+                 "op": "neq",
+                 "value": "cancelled"
+                }
+               ]
+              },
+              {
+               "and": [
+                {
+                 "col": "status",
+                 "op": "eq",
+                 "value": "cancelled"
+                },
+                {
+                 "col": "original_start_time",
+                 "isNull": false
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "and": [
+            {
+             "col": "original_start_time",
+             "isNull": false
+            },
+            {
+             "col": "original_start_time",
+             "op": "gte",
+             "value": "<DATE_7>"
+            },
+            {
+             "col": "original_start_time",
+             "op": "lt",
+             "value": "<DATE_8>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "is_recurring",
+             "op": "eq",
+             "value": true
+            },
+            {
+             "or": [
+              {
+               "col": "recurring_until",
+               "isNull": true
+              },
+              {
+               "col": "recurring_until",
+               "op": "gte",
+               "value": "<DATE_9>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_datetime",
+             "isNull": true
+            },
+            {
+             "col": "start_date",
+             "op": "lt",
+             "value": "<DATE_1>"
+            },
+            {
+             "col": "end_date",
+             "op": "gte",
+             "value": "<DATE_2>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_datetime",
+             "isNull": true
+            },
+            {
+             "col": "start_date",
+             "op": "gte",
+             "value": "<DATE_2>"
+            },
+            {
+             "col": "start_date",
+             "op": "lt",
+             "value": "<DATE_1>"
+            },
+            {
+             "col": "end_date",
+             "isNull": true
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_date",
+             "isNull": true
+            },
+            {
+             "col": "start_datetime",
+             "op": "lt",
+             "value": "<DATE_3>"
+            },
+            {
+             "col": "end_datetime",
+             "op": "gte",
+             "value": "<DATE_4>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_date",
+             "isNull": true
+            },
+            {
+             "col": "start_datetime",
+             "op": "gte",
+             "value": "<DATE_4>"
+            },
+            {
+             "col": "start_datetime",
+             "op": "lt",
+             "value": "<DATE_3>"
+            },
+            {
+             "col": "end_datetime",
+             "isNull": true
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "feed": {
+    "expected": "filed under the reader's own key: user_id = <USER>",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "and": [
+          {
+           "col": "user_id",
+           "op": "eq",
+           "value": "<USER>"
+          },
+          {
+           "and": [
+            {
+             "col": "is_busy_block",
+             "op": "eq",
+             "value": false
+            },
+            {
+             "or": [
+              {
+               "and": [
+                {
+                 "col": "deleted_at",
+                 "isNull": true
+                },
+                {
+                 "col": "status",
+                 "op": "neq",
+                 "value": "cancelled"
+                }
+               ]
+              },
+              {
+               "and": [
+                {
+                 "col": "status",
+                 "op": "eq",
+                 "value": "cancelled"
+                },
+                {
+                 "col": "original_start_time",
+                 "isNull": false
+                }
+               ]
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "and": [
+            {
+             "col": "original_start_time",
+             "isNull": false
+            },
+            {
+             "col": "original_start_time",
+             "op": "gte",
+             "value": "<DATE_7>"
+            },
+            {
+             "col": "original_start_time",
+             "op": "lt",
+             "value": "<DATE_8>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "is_recurring",
+             "op": "eq",
+             "value": true
+            },
+            {
+             "or": [
+              {
+               "col": "recurring_until",
+               "isNull": true
+              },
+              {
+               "col": "recurring_until",
+               "op": "gte",
+               "value": "<DATE_9>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_datetime",
+             "isNull": true
+            },
+            {
+             "col": "start_date",
+             "op": "lt",
+             "value": "<DATE_1>"
+            },
+            {
+             "col": "end_date",
+             "op": "gte",
+             "value": "<DATE_2>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_datetime",
+             "isNull": true
+            },
+            {
+             "col": "start_date",
+             "op": "gte",
+             "value": "<DATE_2>"
+            },
+            {
+             "col": "start_date",
+             "op": "lt",
+             "value": "<DATE_1>"
+            },
+            {
+             "col": "end_date",
+             "isNull": true
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_date",
+             "isNull": true
+            },
+            {
+             "col": "start_datetime",
+             "op": "lt",
+             "value": "<DATE_3>"
+            },
+            {
+             "col": "end_datetime",
+             "op": "gte",
+             "value": "<DATE_4>"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "is_recurring",
+               "op": "eq",
+               "value": false
+              },
+              {
+               "col": "is_recurring",
+               "isNull": true
+              }
+             ]
+            },
+            {
+             "col": "start_date",
+             "isNull": true
+            },
+            {
+             "col": "start_datetime",
+             "op": "gte",
+             "value": "<DATE_4>"
+            },
+            {
+             "col": "start_datetime",
+             "op": "lt",
+             "value": "<DATE_3>"
+            },
+            {
+             "col": "end_datetime",
+             "isNull": true
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "record_completed_index",
+   "group": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "or": [
+          {
+           "col": "space_id",
+           "op": "eq",
+           "value": "<SPACE>"
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "col": "record_id",
+           "op": "eq",
+           "value": "<RECORD>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "feed": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        },
+        {
+         "or": [
+          {
+           "col": "record_id",
+           "op": "eq",
+           "value": "<RECORD>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "record_assignee_index",
+   "group": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "or": [
+          {
+           "col": "space_id",
+           "op": "eq",
+           "value": "<SPACE>"
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "col": "record_id",
+           "op": "eq",
+           "value": "<RECORD>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "feed": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "and": [
+      {
+       "and": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        },
+        {
+         "or": [
+          {
+           "col": "record_id",
+           "op": "eq",
+           "value": "<RECORD>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "record_id",
+         "op": "eq",
+         "value": "<STREAM>"
+        },
+        {
+         "col": "record_id",
+         "op": "neq",
+         "value": "<STREAM>"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}

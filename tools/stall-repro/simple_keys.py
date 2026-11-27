@@ -1201,3 +1201,42 @@ def b2_catalog(gateway, flag, readers):
             body = {"table": f"public.{table}", "columns": sorted(set(collection.columns) | b2_columns(where)), "where": where, "changesOnly": True, "subscription": gateway._subscription(table, 1000 + reader, f"b2:{flag}")}
             catalog.append({"kind": f"b2-{flag}", "account": 1000 + reader, "body": body, "has_subquery": False})
     return catalog
+
+
+# B2b: the same question for served predicates (`b2b_filters.json`, from circuits-coord): the
+# authorization filter AND the phone's filter, then AND the stream identity, for the six single-key
+# tables, as a group member served today (`group`, single key not applied) and as a standalone feed or
+# subset query (`feed`, single key applied). Registered as given. S-main3-b2b-{form}-{table}-{N}: N
+# one-Space readers each holding that ONE table's predicate (a commit to one table would otherwise
+# feed the subquery nodes of another table's predicates); `-all-1`: one reader, every table, for counts.
+# Each <DATE_n> is the same synthetic day for every reader: one day window, 2026-09-15.
+B2B_DATES = {"<DATE_1>": "2026-09-16", "<DATE_2>": "2026-09-15", "<DATE_3>": "2026-09-16T00:00:00Z", "<DATE_4>": "2026-09-15T00:00:00Z", "<DATE_5>": "2026-09-13T00:00:00Z", "<DATE_6>": "2026-09-18T00:00:00Z", "<DATE_7>": "2026-09-13", "<DATE_8>": "2026-09-18", "<DATE_9>": "2026-09-12"}
+
+
+def b2b_filters():
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / "b2b_filters.json").read_text())["tables"]
+
+
+B2B_TABLES = tuple(entry["table"] for entry in b2b_filters())
+B2B_VARIANTS = {f"S-main3-b2b-{form}-{table}-{readers}": (form, table, readers) for form in ("group", "feed") for table in B2B_TABLES for readers in (40, 1000)} | {f"S-main3-b2b-{form}-all-1": (form, None, 1) for form in ("group", "feed")}
+
+
+def b2b_catalog(gateway, form, only, readers):
+    catalog = []
+    for reader in range(readers):
+        values = B2B_DATES | {"<SPACE>": str(synthetic_id(f"b2-space/{reader}")), "<USER>": str(synthetic_id(f"b2-user/{reader}")), "<RECORD>": str(synthetic_id(f"b2-record/{reader}")), "<STREAM>": str(synthetic_id(f"b2-stream/{reader}"))}
+        for entry in b2b_filters():
+            table = entry["table"]
+            if only not in (None, table):
+                continue
+            text = json.dumps(entry[form]["where"])
+            for placeholder, value in values.items():
+                text = text.replace(placeholder, value)
+            if "<" in text:
+                raise ValueError(f"unfilled placeholder in {table} {form}")
+            where = json.loads(text)
+            collection = gateway.gateway.registered_collection(table, allow_chat_projection_dependency=True)
+            body = {"table": f"public.{table}", "columns": sorted(collection.columns), "where": where, "changesOnly": True, "subscription": gateway._subscription(table, 1000 + reader, f"b2b:{form}")}
+            catalog.append({"kind": f"b2b-{form}", "account": 1000 + reader, "body": body, "has_subquery": contains_subquery(where)})
+    return catalog
