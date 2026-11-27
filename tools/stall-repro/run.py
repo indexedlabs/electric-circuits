@@ -670,7 +670,7 @@ async def run(args):
                 with psycopg.connect(PG_URL, autocommit=True) as connection:
                     plan = await window_plan(gateway, keyed_lists, connection)
                 save(output / "window-plan.json", [{key: value for key, value in load.items() if key != "requests"} for load in plan])
-                print(json.dumps({"window_loads": dict(Counter((load["kind"], load["size"]) for load in plan))}, default=str), flush=True)
+                print(json.dumps({"window_loads": dict(Counter(f"{load['kind']}-{load['size']}" for load in plan))}), flush=True)
             for workload in args.workloads:
                 probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl", interval=args.probe_interval)
                 probe_task = asyncio.create_task(probe.run())
