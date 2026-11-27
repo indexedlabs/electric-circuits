@@ -31,6 +31,7 @@ mod memory_budget;
 pub mod metrics;
 pub mod params;
 pub mod pg;
+mod pg_temporal;
 pub mod pgoutput;
 pub mod pk_dict;
 pub mod predicate;

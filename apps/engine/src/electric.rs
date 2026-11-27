@@ -587,7 +587,9 @@ impl From<anyhow::Error> for ApiError {
         if e.downcast_ref::<FoldInterrupted>().is_some() {
             return ApiError::draining();
         }
-        if e.downcast_ref::<crate::schema::UnknownColumn>().is_some() {
+        if e.downcast_ref::<crate::schema::UnknownColumn>().is_some()
+            || e.downcast_ref::<crate::pg_temporal::UnreadableLiteral>().is_some()
+        {
             return ApiError::bad_request(format!("{e:#}"));
         }
         // Matched by TYPE, exactly as the native surface does (`http.rs`): a create that kept losing

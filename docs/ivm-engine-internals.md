@@ -221,6 +221,20 @@ satisfies; only candidates are evaluated. Predicates with no indexable conjunct 
 OR/NOT, `LIKE`, `!=`, `IS NULL`, match-all) stay on a fallback scan list and are evaluated on
 every change, so a deployment leaning on many such shapes still degrades linearly (see §4.4).
 
+**The list rule** (`ELECTRIC_CIRCUITS_LIST_KEYS=1`, off by default) takes lists off that scan
+list. A filter with an `OR` at the top, or in its top-level `AND` chain, whose every branch has
+an equality is filed under **every one of those keys**, on whichever columns they are
+(`CompiledPredicate::access_plan`): `space = a OR space = b`, or a link read by either end,
+`from_space = a OR to_space = a`. A branch may be an `AND` (any one member's key will do) or a
+nested `OR` (its keys join the list). An `OR` with a branch no key can be made of (a range,
+`!=`, `LIKE`, `IS NULL`, `NOT`, a subquery, `col = NULL`) has no such list and stays where it
+was. The probe does not change: each changed row is looked up under every filed column, for its
+old image and its new one, so a row that leaves a shape because its key changed still reaches
+that shape, as a delete. Where an `AND` offers several lists, the index files under the one
+whose most widely named key is named by the fewest other filters (a constant every filter
+carries, such as `kind = 'a'`, is named by all of them), then under the longer literals. That
+choice changes how many shapes a row is offered to, never what a shape receives.
+
 ### 3.3 Subqueries → shared inner-set nodes (`subquery.rs`)
 
 A subquery shape's `WHERE` contains `col [NOT] IN (SELECT proj FROM inner WHERE …)`, possibly
@@ -436,7 +450,10 @@ For one table change:
 - **Standalone:** output-sensitive. The necessary-conjunct index prunes to candidates by
   equality hash lookup / ordered range-bound scan; each candidate then pays one full predicate
   eval. Only shapes with no indexable conjunct (top-level OR/NOT, `LIKE`, `!=`) are evaluated
-  on every change — that fallback list is the remaining `O(K)` term to watch.
+  on every change — that fallback list is the remaining `O(K)` term to watch. With the list
+  rule on (§3.2), an `OR` with an equality in every branch is filed under each of them and
+  leaves it; `GET /tables/{name}/families` reports how many standalone shapes are still on it
+  (`scan`).
 - **Subquery:** an inner change reconciles the node (`O(1)` per changed inner row) and, per
   *flipped value*, runs one keyed `SELECT … WHERE col = v` per dependent edge plus a re-eval.
   An outer change is routed by a **necessary-conjunct index over the outer shapes**
@@ -597,11 +614,13 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/ds.rs` | durable-streams HTTP client + `Envelope` |
 | `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
-| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
+| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle, dormant eviction, and the effective live-only retirement period |
 | `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
+
+Live-only shapes (subqueries, aggregates and changes-only feeds) cannot go dormant. An unsubscribed live-only shape is retired after the effective `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` period: the smaller of that value and idle-plus-dormancy (W). Dormant TTL `0` makes W infinite; idle timeout `0` still leaves W equal to the dormant TTL. A live-only value of `0` preserves W. The lease sets no minimum period. The shape stream is closed and deleted. The `ELECTRIC_CIRCUITS_MAX_SHAPES` cap evicts dormant shapes only and reports pressure when none remain.
 
 ## 8. Related documents
 

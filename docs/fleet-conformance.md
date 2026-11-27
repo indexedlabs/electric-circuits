@@ -47,6 +47,7 @@ engine internals happens in the engine itself (preferred) or the entrypoint.
 | `ELECTRIC_LOG_LEVEL` | error/warning/info/debug → engine log filter (default info). |
 | `ELECTRIC_REPLICATION_STREAM_ID` | Suffix for slot name: `electric_slot_<id>` (default `default`). |
 | `ELECTRIC_DB_POOL_SIZE` | Sizes the engine's shared Postgres pool (backfills, query-backs, subset queries; default 20). |
+| `ELECTRIC_DB_POOL_IDLE_SECS` | Seconds a pooled Postgres connection may sit idle before a checkout closes it instead of reusing it (default 1800). Keep it below the server's `idle_session_timeout`. |
 | `ELECTRIC_LIVE_TIMEOUT_MS` (ours) / long-poll default | 20000 ms, matches Electric. |
 | Others (`ELECTRIC_CACHE_MAX_AGE`, `ELECTRIC_OTLP_ENDPOINT`, `ELECTRIC_USAGE_REPORTING`, ...) | Accept and log "accepted (no-op)" once at boot — never crash on unknown `ELECTRIC_*`. |
 

@@ -615,6 +615,7 @@ pub async fn run(config: Config) -> Result<()> {
         config.control_secret.as_deref(),
     );
     crate::pg::set_pool_size(config.db_pool_size);
+    crate::pg::set_pool_idle(config.db_pool_idle);
     crate::pg::set_backfill_config(config.backfill);
     if let Some(target) = &config.statsd {
         crate::statsd::init(target, &config.instance_id);
@@ -747,6 +748,7 @@ fn source_engine_config(base: &Config, row: &SourceRow, database_url: &str) -> R
     child.txn.spill_dir = source_root.join("txn-spill");
     child.backfill = base.backfill;
     child.db_pool_size = base.db_pool_size;
+    child.db_pool_idle = base.db_pool_idle;
     child.trace = base.trace;
     child.secret = base.secret.clone();
     child.control_secret = base.control_secret.clone();

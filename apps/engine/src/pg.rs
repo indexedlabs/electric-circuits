@@ -53,11 +53,28 @@ enum PgTlsPolicy {
 /// receives the equivalent pgwire `VerifyFull` policy.
 #[derive(Clone)]
 pub struct PgConnectionConfig {
+    /// Every query session: the URL's settings plus [`SESSION_OPTIONS`].
     query: tokio_postgres::Config,
     url: Url,
     connect_host: String,
     tls: PgTlsPolicy,
 }
+
+/// The startup options every session of the engine sends: each query session, after any options
+/// the URL carries (for a repeated setting Postgres takes the last, so these win), and the
+/// replication connection ([`PgConnectionConfig::replication_config`]).
+///
+/// The engine keeps `timestamptz`, `timestamp` and `date` cells as the text Postgres prints and
+/// compares that text (see [`crate::pg_temporal`]). Postgres prints a `timestamptz` in the
+/// session's time zone and every date in the session's style, and both default to whatever the
+/// database, the role or the server says — a database set to `America/Los_Angeles` prints 08:00
+/// UTC as `01:00:00-07`, which sorts below a `07:00:00+00` bound it is after. A setting a session
+/// sends at startup outranks all of those defaults, a server-wide one a reload changes included,
+/// so these two make a cell one spelling on every road: UTC, ISO. pgoutput sends a replicated cell
+/// as the text the walsender's session prints, so a backfill row and that row's next change carry
+/// the same bytes, timestamps inside arrays, ranges and composites included. They also fix how SQL
+/// reads a `timestamptz` literal that names no zone — as UTC, which is how the engine reads it.
+pub(crate) const SESSION_OPTIONS: &str = "-c TimeZone=UTC -c DateStyle=ISO";
 
 impl PgConnectionConfig {
     pub fn resolve(url: &str, ca_bundle: Option<&str>, server_name: Option<&str>) -> Result<Self> {
@@ -150,6 +167,11 @@ impl PgConnectionConfig {
         if query.get_connect_timeout().is_none() {
             query.connect_timeout(CONNECT_TIMEOUT);
         }
+        let options = match query.get_options() {
+            Some(own) if !own.trim().is_empty() => format!("{own} {SESSION_OPTIONS}"),
+            _ => SESSION_OPTIONS.to_string(),
+        };
+        query.options(options);
         Ok(Self { query, url: parsed, connect_host: host, tls })
     }
 
@@ -159,13 +181,17 @@ impl PgConnectionConfig {
         Self::resolve(url, ca_bundle.as_deref(), server_name.as_deref())
     }
 
+    /// Open a query session. It is handed back only if the server reports the zone and date style
+    /// [`SESSION_OPTIONS`] asked for ([`check_query_session`]); the server reports both while the
+    /// session starts, so reading them back costs no round-trip.
     async fn connect(&self, owner: Option<&crate::shutdown::ShutdownToken>) -> Result<Client> {
         match &self.tls {
             PgTlsPolicy::Disabled => {
                 let (client, connection) = self.query.connect(NoTls).await.context("connect postgres")?;
+                check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
-                        tracing::error!("postgres connection error: {error}");
+                        log_connection_end("postgres connection", &error);
                     }
                 });
                 Ok(client)
@@ -174,9 +200,10 @@ impl PgConnectionConfig {
                 let connector = MakeRustlsConnect::new(rustls_client_config(ca_bundle)?);
                 let (client, connection) =
                     self.query.connect(connector).await.context("connect postgres with verified TLS")?;
+                check_query_session(connection.parameter("TimeZone"), connection.parameter("DateStyle"))?;
                 spawn_connection(owner, async move {
                     if let Err(error) = connection.await {
-                        tracing::error!("postgres TLS connection error: {error}");
+                        log_connection_end("postgres TLS connection", &error);
                     }
                 });
                 Ok(client)
@@ -203,21 +230,58 @@ impl PgConnectionConfig {
                 tls
             }
         };
-        Ok(ReplicationConfig {
-            host: self.connect_host.clone(),
-            port: self.url.port().unwrap_or(5432),
-            user,
-            password: self.url.password().map(percent_decode).unwrap_or_default(),
-            database,
-            tls,
-            slot: slot.to_string(),
-            publication: publication.to_string(),
-            start_lsn: pgwire_replication::Lsn::ZERO,
-            stop_at_lsn: None,
-            status_interval: std::time::Duration::from_secs(1),
-            idle_wakeup_interval: std::time::Duration::from_secs(10),
-            buffer_events: 8192,
-        })
+        let password = self.url.password().map(percent_decode).unwrap_or_default();
+        Ok(ReplicationConfig::new(self.connect_host.clone(), user, password, database, slot, publication)
+            .with_port(self.url.port().unwrap_or(5432))
+            .with_tls(tls)
+            .with_start_lsn(pgwire_replication::Lsn::ZERO)
+            .with_status_interval(std::time::Duration::from_secs(1))
+            .with_wakeup_interval(std::time::Duration::from_secs(10))
+            .with_buffer_size(8192)
+            // Only the engine's own two settings, not the URL's `options`: they are what shapes the
+            // text the walsender prints, and the replication connection has never been given the
+            // URL's options, which were written for query sessions.
+            .with_options(SESSION_OPTIONS))
+    }
+}
+
+/// SQLSTATEs a server sends when it ends a session on purpose: `57P05` when the session sat idle
+/// past `idle_session_timeout`, `57P01` when an administrator (or `pg_terminate_backend`) ended it.
+/// Neither means the engine or the network is broken; the next checkout simply dials again.
+const EXPECTED_SERVER_CLOSES: &[&str] = &["57P05", "57P01"];
+
+/// How a query connection's task reports the connection ending with an error: the level to log at
+/// and what to say. A server error names its SQLSTATE and message (a bare `db error` hid both); an
+/// [`EXPECTED_SERVER_CLOSES`] close is INFO, everything else ERROR. Any other error names its cause.
+fn connection_end(error: &tokio_postgres::Error) -> (tracing::Level, String) {
+    match error.as_db_error() {
+        Some(db) => {
+            let code = db.code().code();
+            let level =
+                if EXPECTED_SERVER_CLOSES.contains(&code) { tracing::Level::INFO } else { tracing::Level::ERROR };
+            (level, format!("{} {code}: {}", db.severity(), db.message()))
+        }
+        None => {
+            // tokio-postgres displays only the error's kind ("error communicating with the server");
+            // the cause, such as a reset or a TLS alert, is in its source chain.
+            let mut detail = error.to_string();
+            let mut source = std::error::Error::source(error);
+            while let Some(cause) = source {
+                detail.push_str(": ");
+                detail.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            (tracing::Level::ERROR, detail)
+        }
+    }
+}
+
+fn log_connection_end(what: &str, error: &tokio_postgres::Error) {
+    let (level, detail) = connection_end(error);
+    if level == tracing::Level::INFO {
+        tracing::info!("{what} closed by the server: {detail}");
+    } else {
+        tracing::error!("{what} error: {detail}");
     }
 }
 
@@ -517,6 +581,38 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// `DateStyle` is `<output style>, <field order>`; only the output style shapes a printed cell.
+fn prints_iso_dates(date_style: Option<&str>) -> bool {
+    date_style
+        .is_some_and(|style| style.split(',').next().is_some_and(|output| output.trim().eq_ignore_ascii_case("ISO")))
+}
+
+/// Refuse a query session that is not in UTC with ISO dates — that did not take
+/// [`SESSION_OPTIONS`]. The engine asked for exactly `UTC`, so that is what the server reports
+/// when it was listened to; anything else, an equivalent zone included, means something between
+/// the engine and Postgres dropped the startup options, and then neither setting can be trusted.
+///
+/// The replication connection is sent the same options but cannot be checked this way:
+/// `pgwire-replication` reads the server's `ParameterStatus` messages and drops them. A pooler or
+/// proxy that strips the `options` startup parameter from a replication connection would
+/// therefore go unnoticed, and the walsender would print in the database's, the role's or the
+/// server's defaults while every query session prints UTC. Connect the engine to Postgres directly
+/// — a query session behind such a pooler is refused here, by name.
+fn check_query_session(time_zone: Option<&str>, date_style: Option<&str>) -> Result<()> {
+    if time_zone.is_some_and(|zone| zone.eq_ignore_ascii_case("UTC")) && prints_iso_dates(date_style) {
+        return Ok(());
+    }
+    bail!(
+        "a Postgres session did not take the engine's startup options ({SESSION_OPTIONS}): the server \
+         reports TimeZone={} and DateStyle={}. The engine compares timestamps as the text Postgres \
+         prints, so every session must print UTC in ISO style. A pooler between the engine and Postgres \
+         that drops the `options` startup parameter does this; connect the engine to Postgres directly, \
+         or let the pooler pass `options` through.",
+        time_zone.unwrap_or("(not reported)"),
+        date_style.unwrap_or("(not reported)"),
+    )
+}
+
 /// Maximum connections per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_SIZE` (default 20).
 static POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
@@ -529,6 +625,22 @@ pub fn set_pool_size(size: usize) {
 
 pub(crate) fn configured_pool_size() -> usize {
     *POOL_SIZE.get_or_init(|| 20)
+}
+
+/// How long a [`Pool`] keeps an idle connection for reuse when `ELECTRIC_DB_POOL_IDLE_SECS` is unset:
+/// 30 minutes, well inside the 2-hour `idle_session_timeout` prod Postgres ends idle sessions at.
+pub const DEFAULT_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Idle limit per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_IDLE_SECS`.
+static POOL_IDLE: OnceLock<std::time::Duration> = OnceLock::new();
+
+/// Host-wide idle limit; a connection idle longer than this is retired at checkout, not reused.
+pub fn set_pool_idle(idle: std::time::Duration) {
+    let _ = POOL_IDLE.set(idle);
+}
+
+pub(crate) fn configured_pool_idle() -> std::time::Duration {
+    *POOL_IDLE.get_or_init(|| DEFAULT_POOL_IDLE)
 }
 
 fn spawn_connection(
@@ -585,7 +697,8 @@ pub struct CheckoutTiming {
     pub last: Option<QueryPhase>,
 }
 
-/// A small connection pool: at most `size` concurrent checkouts, idle connections reused.
+/// A small connection pool: at most `size` concurrent checkouts, idle connections reused until they
+/// have been idle longer than the pool's idle limit, after which a checkout closes them and dials.
 /// Backfills/query-backs mark their explicit transaction bracket, so check-in only rolls back a
 /// checkout that may actually have left a transaction open or aborted.
 #[derive(Clone)]
@@ -596,7 +709,12 @@ pub struct Pool {
 struct PoolInner {
     shutdown: crate::shutdown::ShutdownToken,
     url: String,
-    idle: std::sync::Mutex<Vec<Client>>,
+    /// Connections waiting for reuse, each with when it went idle, oldest first ([`Self::check_in`]
+    /// stamps under the lock, so a push never lands before an older one).
+    idle: std::sync::Mutex<Vec<(Client, std::time::Instant)>>,
+    /// How long a connection may sit in `idle` and still be reused (`ELECTRIC_DB_POOL_IDLE_SECS`). Past
+    /// it the pool closes the connection itself, before the server's `idle_session_timeout` does.
+    idle_limit: std::time::Duration,
     sem: Arc<tokio::sync::Semaphore>,
     /// The checkout cap `sem` was created with, so [`Pool::in_use`] can report occupancy.
     size: usize,
@@ -608,10 +726,15 @@ struct PoolInner {
 
 impl Pool {
     pub fn new(url: String, size: usize) -> Pool {
-        Self::owned(url, size, crate::shutdown::ShutdownToken::new())
+        Self::owned(url, size, configured_pool_idle(), crate::shutdown::ShutdownToken::new())
     }
 
-    pub(crate) fn owned(url: String, size: usize, shutdown: crate::shutdown::ShutdownToken) -> Pool {
+    pub(crate) fn owned(
+        url: String,
+        size: usize,
+        idle_limit: std::time::Duration,
+        shutdown: crate::shutdown::ShutdownToken,
+    ) -> Pool {
         let pool = Pool {
             inner: Arc::new(PoolInner {
                 sequenced: Arc::new(SequencedXids::owned(
@@ -623,6 +746,7 @@ impl Pool {
                 shutdown,
                 url,
                 idle: std::sync::Mutex::new(Vec::new()),
+                idle_limit,
                 sem: Arc::new(tokio::sync::Semaphore::new(size.max(1))),
                 size: size.max(1),
             }),
@@ -694,8 +818,7 @@ impl PoolInner {
         timing.slot_wait = started.elapsed();
         timing.in_progress = None;
         let permit = permit.context("pg pool closed")?;
-        let reused = self.idle.lock().unwrap().pop().filter(|c| !c.is_closed());
-        let client = match reused {
+        let client = match self.take_idle() {
             Some(c) => c,
             None => {
                 let dialing = std::time::Instant::now();
@@ -708,6 +831,34 @@ impl PoolInner {
             }
         };
         Ok((client, permit))
+    }
+
+    /// Return a healthy connection to the idle list, stamped with when it went idle.
+    fn check_in(&self, client: Client) {
+        let mut idle = self.idle.lock().unwrap();
+        idle.push((client, std::time::Instant::now()));
+    }
+
+    /// The most recently returned idle connection, unless it has closed. Connections idle longer
+    /// than `idle_limit` are taken out and dropped first, which ends their sessions cleanly from this
+    /// side (the connection task sees its client gone and finishes without an error).
+    fn take_idle(&self) -> Option<Client> {
+        let now = std::time::Instant::now();
+        let (newest, expired) = {
+            let mut idle = self.idle.lock().unwrap();
+            let stale = idle.partition_point(|(_, since)| now.saturating_duration_since(*since) > self.idle_limit);
+            let expired: Vec<_> = idle.drain(..stale).collect();
+            (idle.pop(), expired)
+        };
+        if !expired.is_empty() {
+            tracing::debug!(
+                retired = expired.len(),
+                "pg pool: closing connections idle longer than {:?}",
+                self.idle_limit
+            );
+        }
+        drop(expired);
+        newest.map(|(client, _)| client).filter(|c| !c.is_closed())
     }
 }
 
@@ -749,7 +900,7 @@ impl PooledClient {
             && !client.is_closed()
             && !self.inner.sem.is_closed()
         {
-            self.inner.idle.lock().unwrap().push(client);
+            self.inner.check_in(client);
         }
         self.permit = None;
     }
@@ -773,7 +924,7 @@ impl Drop for PooledClient {
             return; // permit drops here, freeing the slot
         }
         if !self.transaction_open.load(Ordering::SeqCst) {
-            self.inner.idle.lock().unwrap().push(client);
+            self.inner.check_in(client);
             return;
         }
         let inner = self.inner.clone();
@@ -784,7 +935,7 @@ impl Drop for PooledClient {
         // so a rare warning is preferable to reusing a connection whose state is uncertain.
         self.inner.shutdown.spawn(async move {
             if client.batch_execute("ROLLBACK").await.is_ok() && !inner.sem.is_closed() {
-                inner.idle.lock().unwrap().push(client);
+                inner.check_in(client);
             }
             drop(permit);
         });
@@ -2442,6 +2593,53 @@ mod tests {
         );
     }
 
+    /// Every session asks for the two settings the engine's text handling of timestamps rests on,
+    /// whatever the database, the role or the server defaults to. A query session keeps an
+    /// operator's own `options`, and the engine's come after them: for a repeated setting Postgres
+    /// takes the last. The replication connection is sent the engine's two settings alone.
+    #[test]
+    fn every_session_asks_for_utc_and_iso_dates_after_anything_the_url_asks_for() {
+        let config =
+            PgConnectionConfig::resolve("postgresql://postgres:password@postgres:5432/app", None, None).unwrap();
+        assert_eq!(config.query.get_options(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.options.as_deref(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+
+        let config = PgConnectionConfig::resolve(
+            "postgresql://postgres:password@postgres:5432/app?options=-cTimeZone%3DAsia/Kolkata",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.query.get_options(), Some("-cTimeZone=Asia/Kolkata -c TimeZone=UTC -c DateStyle=ISO"));
+        let replication = config.replication_config("circuits", "circuits_pub").unwrap();
+        assert_eq!(replication.options.as_deref(), Some("-c TimeZone=UTC -c DateStyle=ISO"));
+    }
+
+    /// The server reports the zone and date style a session ended up with. A session that did not
+    /// take the engine's (a pooler that drops startup options) would print timestamps the engine
+    /// then compares wrongly, so it is refused rather than used — and named, not retried.
+    #[test]
+    fn a_query_session_that_did_not_take_utc_and_iso_dates_is_refused() {
+        for date_style in ["ISO, MDY", "ISO, DMY", "ISO, YMD", "ISO"] {
+            assert!(check_query_session(Some("UTC"), Some(date_style)).is_ok(), "{date_style}");
+        }
+        for (time_zone, date_style) in [
+            (Some("America/Los_Angeles"), Some("ISO, MDY")),
+            (Some("Etc/UTC"), Some("ISO, MDY")),
+            (Some("UTC"), Some("German, DMY")),
+            (Some("UTC"), Some("SQL, MDY")),
+            (None, Some("ISO, MDY")),
+            (Some("UTC"), None),
+        ] {
+            let e = check_query_session(time_zone, date_style)
+                .expect_err(&format!("TimeZone {time_zone:?}, DateStyle {date_style:?} must be refused"));
+            let msg = format!("{e:#}");
+            assert!(msg.contains("TimeZone=UTC") && msg.contains("DateStyle=ISO"), "{msg}");
+            assert_eq!(boot_disposition(&e), BootFailure::Fatal, "{msg}");
+        }
+    }
+
     /// A boot failure that is not a Postgres failure at all — an unusable `PG_TABLES` entry, an
     /// unreadable durable catalog, a `wal_level` that is not `logical` — is fatal, because none of
     /// them changes by waiting.
@@ -2562,6 +2760,9 @@ pub fn lsn_to_u64(lsn: &str) -> u64 {
         None => 0,
     }
 }
+
+#[cfg(test)]
+mod pool_idle_tests;
 
 #[cfg(test)]
 mod ownership_tests {

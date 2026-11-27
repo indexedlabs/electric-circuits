@@ -41,6 +41,8 @@ pub(crate) mod group_load_log;
 mod held;
 mod introspection;
 mod lifecycle;
+#[cfg(test)]
+mod list_keys_tests;
 pub(crate) mod membership;
 mod output;
 mod planning;
@@ -1794,6 +1796,7 @@ impl Engine {
             crate::pg::Pool::owned(
                 url.clone(),
                 config.map_or_else(crate::pg::configured_pool_size, |c| c.db_pool_size),
+                config.map_or_else(crate::pg::configured_pool_idle, |c| c.db_pool_idle),
                 shutdown.clone(),
             )
         });

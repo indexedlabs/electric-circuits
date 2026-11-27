@@ -118,6 +118,10 @@ pub struct Config {
     pub prometheus_port: Option<u16>,
     /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
+    /// How long a pooled Postgres connection may sit idle before the pool retires it instead of
+    /// reusing it (`ELECTRIC_DB_POOL_IDLE_SECS`, default 1800). Keep it under the server's
+    /// `idle_session_timeout`, so the pool closes idle connections before the server ends them.
+    pub db_pool_idle: Duration,
     /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
     /// the pipeline-visualizer backend). `ELECTRIC_CIRCUITS_TRACE=0|false|off` disables it: the routes
     /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
@@ -207,6 +211,7 @@ const HANDLED: &[&str] = &[
     "ELECTRIC_HANDLE_TTL",
     "ELECTRIC_PROMETHEUS_PORT",
     "ELECTRIC_DB_POOL_SIZE",
+    "ELECTRIC_DB_POOL_IDLE_SECS",
 ];
 
 /// The snapshot-settle knobs (`ELECTRIC_CIRCUITS_SNAPSHOT_SETTLE_*`, see `pg::SequencedXids`). Like
@@ -545,6 +550,12 @@ impl Config {
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
         let db_pool_size =
             g("ELECTRIC_DB_POOL_SIZE").and_then(|s| s.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(20);
+        let db_pool_idle = Duration::from_secs(
+            g("ELECTRIC_DB_POOL_IDLE_SECS")
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n >= 1)
+                .unwrap_or(crate::pg::DEFAULT_POOL_IDLE.as_secs()),
+        );
 
         let trace = g("ELECTRIC_CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
@@ -745,6 +756,7 @@ impl Config {
             storage_dir,
             prometheus_port,
             db_pool_size,
+            db_pool_idle,
             trace,
             memory_log_period,
             memory_bytes_log_period,
@@ -786,7 +798,7 @@ impl Config {
         if Duration::from_secs(ttl.get()) < floor {
             bail!(
                 "ELECTRIC_CIRCUITS_STREAM_TTL_SECS is {ttl}s, under {}s: twice the larger of the shape \
-                 idle-plus-dormancy window and the change-log retain window. A shorter TTL could expire a \
+                 idle-plus-dormancy window, the effective live-only period and the change-log retain window. A shorter TTL could expire a \
                  stream the engine still tracks",
                 floor.as_secs()
             );
@@ -1521,8 +1533,8 @@ mod tests {
     }
 
     /// `#c-ttl-floor`: unset or `0` is no TTL; a non-zero TTL under twice the larger of
-    /// idle-plus-dormancy and the change-log retain window (14.5 days at the defaults) refuses the
-    /// boot, and the floor follows those windows' own settings.
+    /// idle-plus-dormancy, the effective live-only period and the change-log retain window (14.5
+    /// days at the defaults) refuses the boot, and the floor follows those windows' own settings.
     #[test]
     fn stream_ttl_is_off_by_default_and_refused_under_the_floor() {
         assert_eq!(cfg(&[]).stream_ttl, None);
@@ -1539,6 +1551,24 @@ mod tests {
             .expect_err("a TTL under the floor refuses the boot");
         let msg = format!("{err:#}");
         assert!(msg.contains("ELECTRIC_CIRCUITS_STREAM_TTL_SECS") && msg.contains("1252800"), "{msg}");
+
+        // The live-only knob can only shorten the ordinary window. Even a longer lease leaves
+        // the stream-TTL floor unchanged.
+        // Keep the sweep explicit so this case reaches the floor check rather than the quarter-TTL check.
+        let live_only = [
+            ("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "50"),
+            ("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "50"),
+            ("ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS", "3600"),
+            ("ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS", "200"),
+            ("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", "0"),
+            ("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1"),
+            ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "200"),
+        ];
+        assert!(try_cfg(&live_only).is_ok(), "the TTL at twice the ordinary window boots");
+        let mut live_only_under = live_only;
+        live_only_under[6] = ("ELECTRIC_CIRCUITS_STREAM_TTL_SECS", "199");
+        let err = try_cfg(&live_only_under).expect_err("a TTL under the ordinary floor refuses");
+        assert!(format!("{err:#}").contains("200"), "{err:#}");
 
         // The retain window wins when it is the larger.
         let retain =
@@ -1612,11 +1642,27 @@ mod tests {
         assert!(format!("{err:#}").contains("whole number of seconds"));
     }
 
+    /// `ELECTRIC_DB_POOL_IDLE_SECS` defaults to 30 minutes, well under prod's 2-hour
+    /// `idle_session_timeout`; like `ELECTRIC_DB_POOL_SIZE`, an unusable value keeps the default.
+    #[test]
+    fn pool_idle_limit_resolves_with_a_default() {
+        assert_eq!(cfg(&[]).db_pool_idle, Duration::from_secs(1800));
+        assert_eq!(cfg(&[("ELECTRIC_DB_POOL_IDLE_SECS", " 600 ")]).db_pool_idle, Duration::from_secs(600));
+        for unusable in ["0", "-5", "30m", ""] {
+            assert_eq!(
+                cfg(&[("ELECTRIC_DB_POOL_IDLE_SECS", unusable)]).db_pool_idle,
+                Duration::from_secs(1800),
+                "{unusable:?} keeps the default"
+            );
+        }
+    }
+
     #[test]
     fn noop_var_detection() {
         assert!(is_noop_var("ELECTRIC_CACHE_MAX_AGE"));
         assert!(is_noop_var("ELECTRIC_OTLP_ENDPOINT"));
         assert!(!is_noop_var("ELECTRIC_DB_POOL_SIZE")); // handled: sizes the backfill pool
+        assert!(!is_noop_var("ELECTRIC_DB_POOL_IDLE_SECS")); // handled: retires idle pooled connections
         assert!(!is_noop_var("ELECTRIC_PORT")); // handled
         assert!(!is_noop_var("ELECTRIC_CIRCUITS_PG_URL")); // internal
         assert!(!is_noop_var("DATABASE_URL")); // not an ELECTRIC_ var

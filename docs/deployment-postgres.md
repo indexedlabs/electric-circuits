@@ -52,6 +52,42 @@ The engine sets everything else up for you on startup, per configured table:
 > instance. If you run more than one engine against the same database, give each a distinct
 > `ELECTRIC_CIRCUITS_PG_SLOT`.
 
+> **Time zone and date style: any.** The engine works in UTC whatever the database, the role or
+> the server defaults to: every session it opens, the replication connection included, asks for
+> `TimeZone=UTC` and `DateStyle=ISO` as it starts, and a setting asked for at startup outranks
+> every default. Connect the engine to Postgres directly, or through a pooler that passes the
+> `options` startup parameter: a query session that did not take them is refused by name, but the
+> engine cannot tell whether the replication connection took them, and one that did not would
+> print live rows in the defaults while backfills print UTC.
+>
+> **Timestamp literals.** A predicate on a `timestamptz`, `timestamp` or `date` column takes its
+> literal in ISO 8601 form (`2026-10-19T07:00:00Z`, `2026-10-19 07:00:00+05:30`, `2026-10-19`),
+> with `Z`, `UTC`, `GMT` or a numeric offset as the zone, or `infinity`. Any other spelling is
+> refused with `400`, including ones Postgres itself reads, such as `… PST` or `Oct 19 2026`.
+> So is a literal for a built-in array, range or multirange of timestamps or dates
+> (`timestamptz[]`, `tstzrange`, `datemultirange`, …). A literal for an array of a domain, a range
+> type of your own or a composite type is not refused: it is compared as text, as before, and can
+> disagree with the snapshot. Compare a scalar column instead.
+>
+> **Upgrading from a version that compared timestamp bounds as text.** Shapes are restored from
+> the catalog with their predicates as the client wrote them, and a bound such as
+> `2026-10-19T07:00:00Z` is now read as an instant. A shape created before the upgrade keeps, in
+> its retained stream, the rows the old comparison put there, some of them outside the window.
+> Nothing retracts them. **Recreate every shape that has a predicate on a `timestamptz`,
+> `timestamp` or `date` column after upgrading**: `DELETE /shapes/{id}?purge=true`, then let the
+> client create it again. The engine does not do this by itself.
+>
+> If the server, the database or the engine's role defaulted to a zone other than UTC or a date
+> style other than ISO before the upgrade, **recreate every shape on a table that has a
+> `timestamptz`, `timestamp` or `date` column, or a column that holds one** — an array, range,
+> multirange, domain or composite of those — whatever the shape's predicate. Its retained rows
+> spell those values in the old defaults (`19/10/2026 01:00:00 PDT`), and every change after the
+> upgrade spells them in UTC ISO (`2026-10-19 08:00:00+00`). Unchanged rows keep the old spelling,
+> and when such a column is part of the primary key the row's key changes too: a later update or
+> delete arrives under a key the client does not hold, and the client keeps the old row beside the
+> new one. Recreate them the same way, `DELETE /shapes/{id}?purge=true` and a new create from the
+> client, after the upgraded engine is running.
+
 ## Step 2 — Run the engine
 
 Point it at Postgres, list the tables to watch, and give it the durable-streams URL:
@@ -102,7 +138,8 @@ transaction holding the table, or to set `REPLICA IDENTITY FULL` in the migratio
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | no | `1073741824` | Change-log segment size before rotation (`0` disables the size criterion). See "Change-log disk" below. |
 | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | no | `86400` | Change-log segment age before rotation (`0` disables the age criterion). |
 | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | no | `604800` | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted and the segment deleted (`0` = pin forever). |
-| `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` | no | `0` | Sliding `Stream-TTL` on every stream the engine creates (`0` = none). Must be at least twice the larger of idle-plus-dormancy and the retain window (14.5 days at the defaults), or the boot exits 78; a non-zero TTL is refused outright while idle or dormancy is `0` (disabled), and a retain window of `0` adds nothing to the floor, since dormancy eviction still unpins the segment. A keep-alive sweep, on its own timer at the `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` interval, keeps every tracked stream (`meta/catalog`, shape and group streams, retained segments) alive with a non-live tail `GET` once it has gone a quarter of the TTL without an append or read; after a boot the first sweep reads every stream nothing has read since. `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` must be under a quarter of the TTL, or the boot exits 78. `/metrics/prometheus` reports `engine_stream_ttl_touches_total`, `engine_stream_ttl_touch_failures_total` and the gauge `engine_stream_ttl_oldest_untouched_seconds`: the oldest untouched age at the latest finished sweep plus the time since, so it keeps rising if sweeps stop. |
+| `ELECTRIC_CIRCUITS_LIVE_ONLY_IDLE_SECS` | no | `86400` | Retention: maximum idle period for an unsubscribed live-only shape (subquery, aggregate or changes-only feed) before it is retired; the effective period is the smaller of this value and idle-plus-dormancy (W). Dormant TTL `0` makes W infinite; idle timeout `0` still leaves W equal to the dormant TTL. A live-only value of `0` preserves W. The lease sets no minimum period. |
+| `ELECTRIC_CIRCUITS_STREAM_TTL_SECS` | no | `0` | Sliding `Stream-TTL` on every stream the engine creates (`0` = none). Must be at least twice the larger of idle-plus-dormancy, the effective live-only period, and the retain window (14.5 days at the defaults), or the boot exits 78; a non-zero TTL is refused outright while idle or dormancy is `0` (disabled), and a retain window of `0` adds nothing to the floor, since dormancy eviction still unpins the segment. A keep-alive sweep, on its own timer at the `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` interval, keeps every tracked stream (`meta/catalog`, shape and group streams, retained segments) alive with a non-live tail `GET` once it has gone a quarter of the TTL without an append or read; after a boot the first sweep reads every stream nothing has read since. `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` must be under a quarter of the TTL, or the boot exits 78. `/metrics/prometheus` reports `engine_stream_ttl_touches_total`, `engine_stream_ttl_touch_failures_total` and the gauge `engine_stream_ttl_oldest_untouched_seconds`: the oldest untouched age at the latest finished sweep plus the time since, so it keeps rising if sweeps stop. |
 | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | no | `21600` | Dormancy idle threshold (6 hours; `0` disables dormancy). |
 | `ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS` | no | `1800` | Native subscription lease window (30 minutes; `0` disables lease expiry). |
 | `ELECTRIC_CIRCUITS_DS_READ_MAX_BYTES` | no | `16777216` / `67108864`, floored at `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | Client-side Durable Streams response cap. 16 MiB (four times the 4 MiB server page) when readiness advertises a page within it; 64 MiB when it advertises none, because such a store returns the whole remainder in one response and a smaller cap stalls the live loop instead of bounding it. Neither derived value is ever below the append budget (64 MiB by default): the store frames one append whole on read, so the engine must be able to read back what it writes. A value larger than the cap against a store whose `max_value_bytes` exceeds it raises the cap toward `ELECTRIC_CIRCUITS_DS_READ_MAX_CEILING_BYTES` and retries; it is never truncated. An explicit value always wins, and one below the append budget is refused at boot. |

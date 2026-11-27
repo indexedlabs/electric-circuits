@@ -33,7 +33,7 @@ impl BackfillFixture {
             tokio_postgres::Config::new().user("test").connect_raw(io, tokio_postgres::NoTls).await.unwrap();
         let driver = tokio::spawn(async move { connection.await.unwrap() });
         let shutdown = crate::shutdown::ShutdownToken::with_metrics(None, metrics);
-        let pool = Pool::owned("postgres://localhost/unused".into(), 1, shutdown);
+        let pool = Pool::owned("postgres://localhost/unused".into(), 1, DEFAULT_POOL_IDLE, shutdown);
         let client = PooledClient {
             client: Some(client),
             inner: pool.inner.clone(),
