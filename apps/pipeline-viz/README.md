@@ -114,13 +114,15 @@ cd tutorials && docker compose up --build    # serves http://localhost:5180
   routing placement (`familyKey` / standalone / `isSubquery`) and predicate, plus the shared
   subquery node + edge DAG. It reads in-memory topology only — no cost to the hot path.
 - `GET /state` (→ `Engine::state_snapshot`) returns the live summary of every node — offsets,
-  emit counters, index cardinalities, fold values — assembled from per-tailer published maps.
+  emit counters, index cardinalities, fold values — built by the sequencer for that request, one
+  request at a time. The engine keeps no copy between requests, so it pays nothing for the map
+  while no visualizer is attached.
 - `GET /state/node?id=<node-id>` (→ `Engine::dump_node`) deep-dumps one node's state: a route
   join's index contents, an aggregate's fold internals (incl. the multiset), a subquery node's
   inner set.
 - `GET /trace` (SSE, `apps/engine/src/trace.rs`) streams per-envelope pipeline traces (hops with
   per-node outcomes), `shapeAdded`/`shapeDropped` lifecycle events, and `state` summary updates
-  after each batch. Hop and state ids share the graph's namespace, so everything maps without
-  translation. Lossy by design; zero cost when nobody subscribes.
+  after each batch while a client is subscribed. Hop and state ids share the graph's namespace, so
+  everything maps without translation. Lossy by design; zero cost when nobody subscribes.
 - `GET /shapes/{id}/rows` (fold to current set), `GET /shapes/{id}/log` (exact-op change log), and
   `POST /query` (one-shot paginated subset) drive the detail panel's data views.

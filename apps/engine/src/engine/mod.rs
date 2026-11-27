@@ -4026,8 +4026,8 @@ impl Engine {
     /// `bytes_executors` (standalone shapes + their conjunct index, family routers, aggregate
     /// folds + their index) is the one term this method cannot read out of already-published
     /// state: those structures are privately owned by the sequencer task's `execs` map, never
-    /// exposed through a shared mutex (unlike `stats`/`node_states`, which are republished after
-    /// every batch specifically so other tasks can read them cheaply). Walking them for real bytes
+    /// exposed through a shared mutex (unlike `stats`, which is republished after every batch
+    /// specifically so other tasks can read it cheaply). Walking them for real bytes
     /// is not cheap enough to piggyback on every batch (see `sequencer::publish_all`/`stats_of`),
     /// so instead this method round-trips the one-off `SequencerCmd::MemBytes` so the byte-walk
     /// itself only ever runs on an explicit diagnostic path, never per batch.

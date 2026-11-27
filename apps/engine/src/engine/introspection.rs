@@ -558,8 +558,9 @@ pub(crate) fn arrangement_graph(
     ArrangementGraph { served: 0, fallback: 0, inputs, indexes: Vec::new(), counts, consumers }
 }
 
-/// Rebuild the tailer's full per-node state map from its live structures. Pure so it's unit-testable;
-/// cost is O(shapes on this table) small clones, the same order as the fan-out work per batch.
+/// Build one table's full per-node state map from its live structures. Pure so it's unit-testable.
+/// It writes an entry per shape on the table, so it runs only for a reader, through
+/// `sequencer::merged_node_states`, never after every page of commits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_node_states(
     ts: &TableSchema,
@@ -870,12 +871,19 @@ impl Engine {
         })
     }
 
-    /// Full per-node state snapshot (`GET /state`): every tailer's published node map merged with
-    /// the subquery registry's node/shape summaries. Tables with no tailer yet (no shape registered)
-    /// report a default source state so the visualizer can render a chip for every graph node.
+    /// Full per-node state snapshot (`GET /state`): the sequencer's node map, built for this request,
+    /// merged with the subquery registry's node/shape summaries. Tables with no executor yet (no
+    /// shape registered) report a default source state so the visualizer can render a chip for
+    /// every graph node.
+    ///
+    /// The sequencer builds the map only when asked (OTTO-14463), so this waits for it to finish
+    /// the page of commits it is on, as [`Self::dump_node`] and [`Self::mem_bytes`] do. One request
+    /// is with the sequencer at a time (`SequencerHandle::node_states_turn`). With no sequencer, or
+    /// one that stopped before answering, the answer holds the table defaults and the subquery
+    /// summaries only.
     pub async fn state_snapshot(&self) -> StateSnapshot {
         let mut nodes: HashMap<String, NodeStateSummary> = HashMap::new();
-        {
+        let sequencer = {
             let st = self.state.lock().await;
             for name in st.tables.keys() {
                 nodes.insert(
@@ -883,12 +891,15 @@ impl Engine {
                     NodeStateSummary::Table { processed_offset: "-1".to_string(), envelopes: 0 },
                 );
             }
-            if let Some(seq) = st.sequencer.as_ref()
-                && let Ok(m) = seq.node_states.lock()
+            st.sequencer.as_ref().map(|seq| (seq.cmd_tx.clone(), seq.node_states_turn.clone()))
+        };
+        if let Some((cmd_tx, turn)) = sequencer {
+            let _turn = turn.lock().await;
+            let (resp, built) = tokio::sync::oneshot::channel();
+            if cmd_tx.send(SequencerCmd::NodeStates { resp }).is_ok()
+                && let Ok(built) = built.await
             {
-                for (k, v) in m.iter() {
-                    nodes.insert(k.clone(), v.clone());
-                }
+                nodes.extend(built);
             }
         }
         for (id, s) in self.subqueries.lock().await.state_summaries() {

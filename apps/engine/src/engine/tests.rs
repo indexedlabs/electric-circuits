@@ -404,6 +404,52 @@ fn node_states_cover_every_node_kind() {
     }
 }
 
+/// `GET /state` asks the sequencer to build the node-state map, which walks every shape, and the
+/// sequencer serves commands before its next page of commits. So one request is with it at a time:
+/// a second reader waits for the first one's answer before it asks. A sequencer that stops without
+/// answering leaves the reader with the table defaults, not waiting.
+#[tokio::test]
+async fn state_snapshot_keeps_one_request_with_the_sequencer_at_a_time() {
+    fn poll_once<F: std::future::Future>(future: &mut std::pin::Pin<Box<F>>) -> std::task::Poll<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        future.as_mut().poll(&mut cx)
+    }
+    let engine = Engine::new_for_in_process_test(DsClient::new_for_in_process_test("http://127.0.0.1:1"));
+    let ts = users();
+    let (cmd_tx, mut commands) = mpsc::unbounded_channel();
+    {
+        let mut st = engine.state.lock().await;
+        st.tables.insert(ts.table.clone(), ts.clone());
+        st.sequencer = Some(SequencerHandle {
+            cmd_tx,
+            processed: Arc::new(std::sync::Mutex::new(LogPosition::start())),
+            stats: Default::default(),
+            node_states_turn: Default::default(),
+        });
+    }
+    let mut first = Box::pin(engine.state_snapshot());
+    let mut second = Box::pin(engine.state_snapshot());
+    assert!(poll_once(&mut first).is_pending());
+    assert!(poll_once(&mut second).is_pending());
+    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("the first reader asked") };
+    assert!(commands.try_recv().is_err(), "the second reader must wait for the first one's answer");
+
+    let built = NodeStateSummary::Table { processed_offset: "changes/0@p1".into(), envelopes: 4 };
+    resp.send(HashMap::from([("table:public.users".to_string(), built.clone())])).unwrap();
+    let snapshot = first.await;
+    assert_eq!(snapshot.nodes["table:public.users"], built, "the sequencer's entry replaces the default");
+
+    assert!(poll_once(&mut second).is_pending());
+    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("then the second reader asked") };
+    drop(resp);
+    let snapshot = second.await;
+    assert_eq!(
+        snapshot.nodes["table:public.users"],
+        NodeStateSummary::Table { processed_offset: "-1".into(), envelopes: 0 },
+        "a sequencer that stopped without answering leaves the table default"
+    );
+}
+
 /// The exploded circuit decomposition is internally consistent: every edge endpoint is an
 /// emitted operator, every hop is a trace-hop id, every `state` is a `GET /state` key, shared
 /// structures (family, subquery node) are emitted once, and each strategy decomposes into its

@@ -543,7 +543,8 @@ perform the idempotent exact-generation promotion.
 - **Introspection surface:** the engine's control port also serves the pipeline-visualizer backend —
   `/trace` (per-envelope SSE), `/graph`, `/state`, and the `/state/node` deep dumps, which expose row
   data. These endpoints are **unauthenticated**; anyone who can reach the control port can read them.
-  The runtime cost is near zero while nobody subscribes (instrumentation is gated on subscriber
-  count), so leaving them on is fine when the port is private. If the control port is reachable
+  The runtime cost is near zero while nobody subscribes (instrumentation and the per-node state
+  are built only for a `/trace` subscriber or a `GET /state`; `node_state_builds_total` on
+  `/metrics` counts those builds), so leaving them on is fine when the port is private. If the control port is reachable
   beyond your trust boundary, either front it with network policy or disable the surface outright
   with `ELECTRIC_CIRCUITS_TRACE=0` (the routes are then never registered).

@@ -1368,7 +1368,11 @@ than the mechanism.
   (offsets, emit counters, routing-index/inner-set cardinalities, fold values) and on-demand deep
   dumps (a family's routing index contents, an aggregate's fold internals incl. the MIN/MAX
   multiset). Summaries are also pushed as `{"type":"state"}` events on `/trace` after each batch,
-  which is what makes the explorer's node chips reactive without polling.
+  which is what makes the explorer's node chips reactive without polling. The summary map has an
+  entry per shape, so the sequencer builds it only for a reader: once per `GET /state`, which
+  waits for the sequencer to finish the page of commits it is on, and after each batch while
+  `/trace` has a subscriber. With no reader a commit builds none of it. `/metrics` counts the
+  builds (`node_state_builds_total`) and the clients on `/trace` (`trace_subscribers`).
 - `GET /tables/<t>/families`, `GET /subqueries` — sharing topology (proof that N shapes share one
   router/node).
 
