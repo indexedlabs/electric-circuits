@@ -757,6 +757,14 @@ async def run(args):
                 nonlocal created
                 async with semaphore:
                     response = await client.post(f"{ENGINE_URL}/v1/subset-feeds", json=request["body"])
+                    for attempt in range(5 if args.variant in W1_VARIANTS else 0):
+                        # The fixture's store proxy now and then closes a kept-alive connection under the
+                        # engine's stream PUT; creating a feed again renews it, so a 5xx is retried.
+                        if response.status_code < 500:
+                            break
+                        print(f"retrying feed creation after {response.status_code}: {response.text[:300]}", flush=True)
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        response = await client.post(f"{ENGINE_URL}/v1/subset-feeds", json=request["body"])
                     if response.status_code != 200:
                         raise RuntimeError(f"Shape creation failed: {response.status_code} {response.text[:2000]} table={request['body']['table']}")
                     created += 1
