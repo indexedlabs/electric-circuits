@@ -10,16 +10,19 @@ is full at 1,600, and sheds loads at 2,000.
 | 200 (7,714) | 8% | 15% | all answered, p95 0.02 s | all arrive, p95 0.07 s |
 | 1,600 (60,914) | 63% | 92% | all answered, p95 1.6 s, started up to 17 s late | all arrive, p95 0.13 s |
 | 2,000 (76,114) | 85% | 95% | 60% answered, p95 2.6 s; 40% not started within 30 s | all arrive, p95 0.19 s |
+| 2,000 again, a slower runner | 93% | 95% | 39% answered, p95 3.8 s; 61% not started within 30 s | all arrive, p95 0.27 s |
 
 - **At 2,000, loads only:** the engine is at 85%. Every load is answered, p95 0.26–0.29 s
-  (0.07–0.08 s at 1,600).
+  (0.07–0.08 s at 1,600). On the slower of the two runners it is already full with loads alone:
+  93%, loads at 1.5 s, and 5% of them not started within 30 s.
 - **At 2,000, with the import and the deletion:** the engine is at 95–96% for the whole
   deletion. It serves 442 of the 734 requests a second asked of it. Answered loads take 2.2–2.6 s,
   and 8,121 of 20,465 loads could not start within 30 s of their time and were dropped by the
-  generator. None of the answered ones timed out or failed.
-- **The writers hold at every size.** At 2,000 the import takes 21 s (12 s at 200), a commit's
-  receipt p95 is 0.27 s, the deletion takes 159 s (81 s at 200), and a bystander's drains and live
-  changes all arrive (p95 0.19 s and 0.15 s; none of 743 timed out). The sequencer-held gauges
+  generator. None of the answered ones timed out or failed. The slower runner serves 284
+  requests a second and drops 61%.
+- **The writers hold at every size.** At 2,000 the import takes 21–27 s (12 s at 200), a commit's
+  receipt p95 is 0.27–0.46 s, the deletion takes 159–200 s (81 s at 200), and a bystander's drains
+  and live changes all arrive (p95 0.19–0.27 s and 0.15–0.22 s; none of 743 and 912 timed out). The sequencer-held gauges
   stay at 0 and no drain is lost in any cell.
 
 **Where it bends first: two costs on the engine's one CPU.** A line with two terms fits all eight
@@ -69,7 +72,7 @@ phases (predicted against measured CPU: 8/8 and 14/15 at 200, 63/63 and 90/92 at
 
 Engine `9bc1563` (prod's binary), 1 CPU, GitHub-hosted runners (4 cores, shared by the engine,
 Postgres and the load generator). Actions runs `45963541607` (20 and 200, harness `60bb84c`) and
-`45966333495` (1,600, harness `58f3443`) and `45969526371` (2,000, harness `819f883`). Folders
+`45966333495` (1,600, harness `58f3443`) and `45969526371` (2,000 on two runners, harness `819f883`). Folders
 `paired-w1-*` beside this file; tables by `tools/stall-repro/w1_report.py`.
 
 ## The setup
@@ -248,6 +251,40 @@ Engine shapes: 76,114, all of them in the engine's 38 equality families (one per
 | the importing family, all tables | 30,000 | 163.9 MB | 21 s | 87,738 | 479.4 MB | 359 rows, 2.0 MB | 2,513 rows, 13.7 MB |
 | the deleted account's family, all tables | 12,419 | 2.1 MB | 159 s | 4,696 | 0.8 MB | 147 rows, 0.0 MB | 1,019 rows, 0.2 MB |
 | its own (bystander) family, all tables | 736 | 5.8 MB | 186 s | 238 | 1.9 MB | — | — |
+
+By table, import: `assignment` 5,000 rows / 3.5 MB, `calendar_event` 5,000 rows / 40.0 MB, `graph_edge` 10,000 rows / 78.6 MB, `record` 5,000 rows / 39.3 MB, `record_date_index` 5,000 rows / 2.4 MB.
+
+By table, delete: `assignment` 4,200 rows / 0.7 MB, `calendar` 2 rows / 0.0 MB, `calendar_event` 300 rows / 0.1 MB, `external_account` 1 rows / 0.0 MB, `file` 13 rows / 0.0 MB, `graph_edge` 560 rows / 0.1 MB, `message` 200 rows / 0.0 MB, `record` 2,200 rows / 0.4 MB, `record_date_index` 4,800 rows / 0.9 MB, `record_recurrence` 100 rows / 0.0 MB, `resource` 40 rows / 0.0 MB, `space` 1 rows / 0.0 MB, `space_member` 1 rows / 0.0 MB, `user` 1 rows / 0.0 MB.
+
+### 2,000 active accounts (EPYC 9V74, `paired-w1-2000-b-1-W1-2000-prod9bc-1cpu`)
+
+Engine shapes: 76,114, all of them in the engine's 38 equality families (one per table, a hash lookup by key); subquery shapes 0, scan-list shapes 0. Family rows seeded: 2,650,900.
+
+| | loads only | loads, import and deletion |
+| --- | --- | --- |
+| Phase length | 136 s | 228 s |
+| Bystander drains (receipts) | 543/543; p50 0.090 s, p95 0.157 s, max 0.39 s; 0 timed out | 912/912; p50 0.120 s, p95 0.268 s, max 0.97 s; 0 timed out |
+| Bystander subset loads | 543/543; p50 0.481 s, p95 0.594 s, max 0.90 s; 0 timed out | 912/912; p50 1.237 s, p95 1.472 s, max 1.66 s; 0 timed out |
+| Bystander live changes | 543/543; p50 0.094 s, p95 0.119 s, max 0.46 s; 0 timed out | 912/912; p50 0.116 s, p95 0.222 s, max 0.63 s; 0 timed out |
+| Longest run of lost drains | 0.0 s | 0.0 s |
+| Other accounts' day loads | 3,298/3,472 answered; p50 1.267 s, p95 1.494 s, max 1.89 s; 0 timed out, 174 shed, 0 failed | 2,573/6,466 answered; p50 3.281 s, p95 3.760 s, max 4.12 s; 0 timed out, 3893 shed, 0 failed |
+| Other accounts' week loads | 3,323/3,473 answered; p50 1.273 s, p95 1.528 s, max 1.89 s; 0 timed out, 150 shed, 0 failed | 2,453/6,451 answered; p50 3.275 s, p95 3.790 s, max 4.13 s; 0 timed out, 3998 shed, 0 failed |
+| Other accounts' record detail opens | 6,613/6,902 answered; p50 1.267 s, p95 1.507 s, max 1.89 s; 0 timed out, 289 shed, 0 failed | 5,020/12,917 answered; p50 3.260 s, p95 3.765 s, max 4.10 s; 0 timed out, 7897 shed, 0 failed |
+| Loads started late by, p95 / max | 29.998 s / 30.112 s | 30.097 s / 30.261 s |
+| Loads served | 698 requests/s, 63.8 MB/s | 284 requests/s, 25.7 MB/s |
+| Rows per load, p50 / p95 | day 71 / 141 ; week 215 / 227 ; detail 235 / 238 | day 71 / 141 ; week 215 / 227 ; detail 235 / 238 |
+| Engine CPU (of 1) | 93% | 95% |
+| Engine peak RSS | 610 MiB | 623 MiB |
+| Runner CPU, all 4 cores | 59% mean, 64% peak | 49% mean, 67% peak |
+| Sequencer held: peak / longest run | 0 B / 0 s | 0 B / 0 s |
+| Import: wall time and per-commit receipt | — | 27 s; 50 commits, receipt p50 0.286 s, p95 0.461 s, max 0.49 s |
+| Deletion: wall time and per-commit receipt | — | 200 s; 1,242 commits, receipt p50 0.161 s, p95 0.219 s, max 0.69 s |
+
+| A phone that follows | Rows delivered | Bytes delivered | Over | Rows a minute | Bytes a minute | Of which a day-window phone would get | Of which a week-window phone would get |
+| --- | ---: | ---: | --- | ---: | ---: | --- | --- |
+| the importing family, all tables | 30,000 | 163.9 MB | 27 s | 67,364 | 368.1 MB | 359 rows, 2.0 MB | 2,513 rows, 13.7 MB |
+| the deleted account's family, all tables | 12,419 | 2.1 MB | 200 s | 3,726 | 0.6 MB | 147 rows, 0.0 MB | 1,019 rows, 0.2 MB |
+| its own (bystander) family, all tables | 903 | 7.1 MB | 228 s | 238 | 1.9 MB | — | — |
 
 By table, import: `assignment` 5,000 rows / 3.5 MB, `calendar_event` 5,000 rows / 40.0 MB, `graph_edge` 10,000 rows / 78.6 MB, `record` 5,000 rows / 39.3 MB, `record_date_index` 5,000 rows / 2.4 MB.
 

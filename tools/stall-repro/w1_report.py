@@ -60,10 +60,14 @@ def longest_gap(folder, workload, kind="drain"):
 
 
 def cell(root, count):
+    """One table per run of this size (a size run on two runners prints two)."""
     found = sorted(root.glob(f"paired-w1-{count}-*-W1-{count}-prod9bc-1cpu"))
-    if not found:
-        return False
-    folder = found[-1]
+    for folder in found:
+        one(folder, count)
+    return bool(found)
+
+
+def one(folder, count):
     results = {workload: load(folder / f"{workload}-result.json") for workload, _ in PHASES if (folder / f"{workload}-result.json").exists()}
     if not results:
         print(f"### {count:,} active accounts\n\nNo phase completed in `{folder.name}`.\n")
