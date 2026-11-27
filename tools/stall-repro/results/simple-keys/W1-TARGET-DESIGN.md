@@ -38,8 +38,12 @@ phases (predicted against measured CPU: 8/8 and 14/15 at 200, 63/63 and 90/92 at
 - **Why this matters for the design:** 38 feeds a phone makes the shape count 38 times the
   phones, and pacing writes into small commits multiplies it. Fewer shapes per phone, bigger paced
   commits, or an engine pass that does not touch every shape on every commit would each move the
-  bend. The second term is read off the fit, not profiled; a CPU profile of the 2,000 cell is the
-  next run.
+  bend.
+- **Profiled since (`W1-PROFILE.md` beside this file):** the per-commit cost is the sequencer
+  rebuilding a state summary for the visualizer after every page of commits, which walks every
+  shape (`publish_all`, 70% of the engine's CPU in the combined phase, about 48 ms a commit at
+  76,114 shapes). Finding a changed row's shapes is under 1%. So the bend is that rebuild, not
+  the plain-key filters or the 38 feeds as such.
 
 - **A whole-family follower** in the importing family is sent all 30,000 rows, 164 MB, as fast as
   the import commits (12–21 s). A phone on a day window would be sent 359 of them (2.0 MB), on a
