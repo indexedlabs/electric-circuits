@@ -11,7 +11,8 @@
 
 import type { Row, Schema, ShapeDef } from '@electric-circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { formatCompare } from './compare.js'
+import { compareShapeSets, formatCompare } from './compare.js'
+import { testPhysicalPath } from './ds-mtls-access.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'
 import { createSimulator, randomShapeDefs } from './simulator.js'
 
@@ -138,19 +139,74 @@ describe('conformance: list filters filed under every key (ELECTRIC_CIRCUITS_LIS
     for (let pk = 51; pk <= 62; pk++) await applyOp(h, 'links', { op: 'delete', pk })
     await expectEveryReaderMatchesPostgres('after the deletes')
   }, 180000)
+})
 
-  it('keeps delivering after a restart re-files every shape from the catalog', async () => {
-    await h.restartEngine()
-    const stats = await families(h)
-    expect(stats.scan).toBe(READERS)
-    for (let pk = 1; pk <= 12; pk++) {
-      await applyOp(h, 'links', {
-        op: 'update',
-        pk,
-        row: { id: pk, from_space: shared((pk + 3) % READERS), to_space: home((pk + 4) % READERS), kind: 'b', n: 1 },
-      })
+/** Fold a shape stream's raw envelopes into the current row set (upsert/delete by key). */
+async function streamRows(dsUrl: string, streamPath: string): Promise<Row[]> {
+  const rows = new Map<string, Row>()
+  let offset = '-1'
+  for (;;) {
+    const res = await fetch(`${dsUrl}/${testPhysicalPath(streamPath)}?offset=${offset}`)
+    if (!res.ok) throw new Error(`read ${streamPath} -> ${res.status}`)
+    const next = res.headers.get('stream-next-offset')
+    const body = res.status === 204 ? [] : ((await res.json()) as Array<{ key: string; value?: Row; headers: { operation: string } }>)
+    for (const env of body) {
+      if (env.headers.operation === 'delete') rows.delete(env.key)
+      else if (env.value) rows.set(env.key, env.value)
     }
-    await expectEveryReaderMatchesPostgres('after the restart')
+    if (!next || next === offset || res.headers.get('stream-up-to-date')) break
+    offset = next
+  }
+  return [...rows.values()]
+}
+
+// A restart restores every shape from the catalog and files it again. The harness's API keeps
+// pointing at the engine that was killed, so this talks to the engine and its streams directly,
+// as the other restart tests do, and holds no client shape for teardown to release.
+describe('conformance: list filters are filed again after a restart', () => {
+  let h: Harness
+  beforeAll(async () => {
+    h = await bootHarness(schema, { engineEnv: LIST_KEYS })
+  }, 60000)
+  afterAll(async () => {
+    await h?.shutdown()
+  })
+
+  it('restores each shape under its keys and keeps delivering moves and removals', async () => {
+    const created: { def: ShapeDef; streamPath: string }[] = []
+    for (let r = 0; r < READERS; r++) {
+      for (const where of [byEitherEnd(r), byKind(r), withARange(r)]) {
+        const def: ShapeDef = { table: 'links', where }
+        const res = await fetch(`${h.engineUrl}/shapes`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(def),
+        })
+        expect(res.ok, `create ${JSON.stringify(where)} -> ${res.status}`).toBe(true)
+        created.push({ def, streamPath: ((await res.json()) as { streamPath: string }).streamPath })
+      }
+    }
+    const row = (pk: number, shift: number): Row => ({
+      id: pk,
+      from_space: pk % 4 === 0 ? null : home((pk + shift) % READERS),
+      to_space: shared((pk * 5 + shift) % READERS),
+      kind: ['a', 'b', 'c'][(pk + shift) % 3]!,
+      n: pk + shift,
+    })
+    for (let pk = 1; pk <= 36; pk++) await applyOp(h, 'links', { op: 'insert', pk, row: row(pk, 0) })
+    await drainEngine(h)
+
+    await h.restartEngine()
+    expect(await families(h)).toMatchObject({ standalone: READERS * 3, scan: READERS })
+
+    // After the restart every row moves to other readers' keys, and some rows are deleted.
+    for (let pk = 1; pk <= 30; pk++) await applyOp(h, 'links', { op: 'update', pk, row: row(pk, 3) })
+    for (let pk = 31; pk <= 36; pk++) await applyOp(h, 'links', { op: 'delete', pk })
+    await drainEngine(h)
+    for (const { def, streamPath } of created) {
+      const res = compareShapeSets(COLUMNS, 'id', await h.oracle.queryShape(def), await streamRows(h.dsUrl, streamPath))
+      expect(res.equal, `after the restart: ${JSON.stringify(def.where)}\n${formatCompare(res)}`).toBe(true)
+    }
   }, 180000)
 })
 
