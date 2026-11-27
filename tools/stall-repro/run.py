@@ -25,6 +25,7 @@ from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHA
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
 from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog, window_plan
+from simple_keys import HOME_TODAY, W6_ACCESS_ACCOUNTS, W6_MOVED_EDGES, W6_VARIANTS, placement_summary, plain_words_account, predicate_sql, w6_catalog, w6_requests, window_subsets
 from simple_keys import W1_DELETED, W1_FAMILY_ROWS, W1_VARIANTS, w1_catalog, w1_feeds, w1_seed_accounts, w1_seed_families
 
 
@@ -98,7 +99,50 @@ FILES_ACCOUNT, FILES_DELETED = 6, 500
 # `h1-commit-r2` and `-r3` repeat `h1-commit` on the same engine, for a spread and more bystander samples.
 H1_COMMITS = ("h1-commit", "h1-commit-r2", "h1-commit-r3")
 # PLAIN-WORDS-3 run 2: 1,000 `graph_edge` updates, 20 in each of the 50 written Spaces, and repeats.
-EDGE_COMMITS = ("e1-commit", "e1-commit-r2", "e1-commit-r3")
+EDGE_COMMITS = ("e1-commit", "e1-commit-r2", "e1-commit-r3", "e1-commit-r4", "e1-commit-r5")
+# W6 steps between the timed commits of a list-rule cell (results/simple-keys/W6-LIST-KEYS.md):
+# where shapes are filed, one engine restart, a round of access changes, and the final check of
+# every shape's delivered rows against Postgres.
+W6_STEPS = ("w6-placement", "w6-restart", "w6-placement-restarted", "w6-access", "w6-placement-access", "w6-check")
+# W7: 100 one-shot subset queries that carry a subquery, with the engine's counts before, right
+# after and W7_WAIT_S later (results/simple-keys/W7-SUBSET-RESIDUE.md).
+W7_WORKLOADS = ("w7-subsets",)
+W7_QUERIES = 100
+W7_WAIT_S = 120
+W7_TABLES = ("record", "record_date_index", "record_recurrence", "assignment", "graph_edge", "calendar_event")
+
+
+def engine_counts(http, process):
+    """What the engine holds: shape counts from the catalog, each table's standalone index, the
+    subquery registry, the `/metrics` gauges that count shapes, and its memory."""
+    memory = http.get(f"{ENGINE_URL}/memory").json()
+    tables = {}
+    for table in W7_TABLES:
+        response = http.get(f"{ENGINE_URL}/tables/public.{table}/families")
+        tables[table] = response.json() if response.status_code == 200 else {"status": response.status_code, "body": response.text[:200]}
+    metrics = http.get(f"{ENGINE_URL}/metrics").json()
+    gauges = metrics.get("gauges", metrics)
+    subqueries = http.get(f"{ENGINE_URL}/subqueries")
+    return {"at": time.time(), "cardinalities": memory.get("cardinalities"), "tables": tables, "metrics": {key: value for key, value in gauges.items() if isinstance(value, (int, float)) and any(word in key for word in ("shape", "subquer", "circuit", "standalone", "famil", "tailer", "node"))},
+            "subqueries": subqueries.json() if subqueries.status_code == 200 else subqueries.text[:200], "rss_bytes": process.memory_info().rss}
+
+
+def w7_operation(queries, process):
+    def operation(url, callback):
+        with httpx.Client(headers={"Authorization": f"Bearer {SECRET}"}, timeout=120) as http:
+            before = engine_counts(http, process)
+            answers = []
+            for body in queries:
+                response = http.post(f"{ENGINE_URL}/v1/subsets/query", json=body)
+                answers.append({"table": body["table"], "status": response.status_code, "rows": len(response.json()["rows"]) if response.status_code == 200 else None, "error": None if response.status_code == 200 else response.text[:300]})
+            after = engine_counts(http, process)
+            time.sleep(W7_WAIT_S)
+            later = engine_counts(http, process)
+        with psycopg.connect(url) as connection:
+            callback(connection, "final")
+        return [{"table": "w7", "operation": "subset-queries", "rows": sum(answer["rows"] or 0 for answer in answers), "answers": answers, "before": before, "after": after, "after_wait": later, "wait_s": W7_WAIT_S}]
+    return operation
+
 AUDIT_WORKLOADS = (*H1_COMMITS, *EDGE_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
 
 
@@ -364,7 +408,7 @@ def audit_prepare(data, url, variant, workloads):
         if variant in H1_LIKE:
             for account in H1_DATA_ACCOUNTS:
                 if account >= 20:
-                    data.insert(connection, "graph_edge" if variant in EDGE_VARIANTS else "record", account, 20)
+                    data.insert(connection, "graph_edge" if variant in EDGE_VARIANTS or variant in W6_VARIANTS else "record", account, 20)
         if "writer-subtree" in workloads:
             for index in range(SUBTREE_MEMBERS):
                 connection.execute("INSERT INTO public.space_member (id, space_id, user_id, created_at, updated_at) VALUES (%s, %s, %s, now(), now())", (synthetic_id(f"subtree/{index}"), row_id("space", SUBTREE_SPACE), synthetic_id(f"subtree-user/{index}")))
@@ -586,7 +630,7 @@ COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
 # The catalogs made of one table's keyed filters and the bystander's probe feed only: H1 and
 # PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix) and run 2 (keyed `graph_edge` filters).
-H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS)
+H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS) | set(W6_VARIANTS)
 FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed} | {variant for variant, (_, way) in EDGE_VARIANTS.items() if way != "today"}
 ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE | set(W1_VARIANTS)
 BRIDGE_ENVIRONMENT = {
@@ -712,6 +756,9 @@ async def run(args):
         "ELECTRIC_STORAGE_DIR": str(output / "engine-data"),
     }
     env.update(BRIDGE_ENVIRONMENT.get(args.variant, {}))
+    if W6_VARIANTS.get(args.variant, (0, False))[1]:
+        # The list rule: the only difference between a W6 cell and its control.
+        env["ELECTRIC_CIRCUITS_LIST_KEYS"] = "1"
     command("sudo", "systemd-run", "--unit", unit, "--collect", "--property=LimitNOFILE=1048576", f"--property=CPUQuota={int(args.cpus * 100)}%", f"--property=StandardOutput=append:{engine_log}", f"--property=StandardError=append:{engine_log}", "/usr/bin/env", *[f"{key}={value}" for key, value in env.items()], str(Path(args.engine).resolve()))
     manifest = {"command": " ".join(os.sys.argv), "harness_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(), "engine_base": "5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363", "engine_sha256": hashlib.file_digest(Path(args.engine).open("rb"), "sha256").hexdigest(), "indexed_commit": gateway.loader.bundle["commit"], "catalog": args.catalog, "scale": args.scale, "cpu_quota": args.cpus, "visible_cpus": os.cpu_count(), "environment": {key: value for key, value in env.items() if key != "ELECTRIC_SECRET"}, "uname": os.uname(), "target": TARGETS[args.catalog]}
     manifest["variant"] = args.variant
@@ -746,6 +793,8 @@ async def run(args):
                 catalog = await h1p_catalog(gateway, *H1P_VARIANTS[args.variant])
             if args.variant in EDGE_VARIANTS:
                 catalog = edge_catalog(gateway, *EDGE_VARIANTS[args.variant])
+            if args.variant in W6_VARIANTS:
+                catalog = w6_catalog(gateway, W6_VARIANTS[args.variant][0])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -780,6 +829,8 @@ async def run(args):
                 print(json.dumps({"store_open_files": descriptors, "store_limit": limits, "store_log_tail": (output / "store.log").read_text(errors="replace")[-1500:], "proxy_log_tail": (output / "store-proxy.log").read_text(errors="replace")[-800:]}), flush=True)
                 raise
             save(output / "shape-handles.json", handles if args.variant not in W1_VARIANTS else {"created": len(handles)})
+            # W6 keeps each live shape with its request and where its stream stood when it was made.
+            w6_live = [(request, handle, await stream_offset(client, handle)) for request, handle in zip(catalog, handles)] if args.variant in W6_VARIANTS else []
             import_tables = ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource")
             if args.variant == "S-rest-today":
                 # This variant asks what today's remaining filters cost, so the importing account holds them too.
@@ -882,7 +933,92 @@ async def run(args):
                     plan = await window_plan(gateway, keyed_lists, connection)
                 save(output / "window-plan.json", [{key: value for key, value in load.items() if key != "requests"} for load in plan])
                 print(json.dumps({"window_loads": dict(Counter(f"{load['kind']}-{load['size']}" for load in plan))}), flush=True)
+            w7_queries = []
+            if any(workload in W7_WORKLOADS for workload in args.workloads):
+                for index in range(W7_QUERIES):
+                    account = index % 19
+                    subsets = await window_subsets(gateway, account, keyed_lists[account], "day", HOME_TODAY + datetime.timedelta(days=index % 30))
+                    carrying = [body for body in subsets if '"in":' in json.dumps(body["where"])]
+                    w7_queries.append(carrying[index % len(carrying)])
             for workload in args.workloads:
+                if workload in W6_STEPS:
+                    step = {"workload": workload, "at": time.time()}
+                    if workload.startswith("w6-placement"):
+                        families = await client.get(f"{ENGINE_URL}/tables/public.graph_edge/families")
+                        step["engine_table"] = families.json() if families.status_code == 200 else {"status": families.status_code, "body": families.text[:300]}
+                        step["cardinalities"] = {key: value for key, value in (await client.get(f"{ENGINE_URL}/memory")).json()["cardinalities"].items() if not key.startswith("bytes")}
+                        step["harness_copy_of_the_rule"] = placement_summary([request["body"]["where"] for request, _, _ in w6_live], W6_VARIANTS[args.variant][1])
+                        step["rss_bytes"] = process.memory_info().rss
+                    elif workload == "w6-restart":
+                        began = time.monotonic()
+                        command("sudo", "systemctl", "restart", unit)
+                        await until_ready(client, unit)
+                        step["restart_to_ready_s"] = time.monotonic() - began
+                        pid = int(subprocess.check_output(["systemctl", "show", unit, "--property=MainPID", "--value"], text=True).strip())
+                        process = psutil.Process(pid)
+                        step["cardinalities"] = {key: value for key, value in (await client.get(f"{ENGINE_URL}/memory")).json()["cardinalities"].items() if not key.startswith("bytes")}
+                    elif workload == "w6-access":
+                        ordinals = sorted({request["ordinal"] for request, _, _ in w6_live})
+                        changes = [(ordinal, "gain") for ordinal in ordinals if not plain_words_account(ordinal, "mix")[0]][:W6_ACCESS_ACCOUNTS] + [(ordinal, "lose") for ordinal in ordinals if plain_words_account(ordinal, "mix")[0]][:W6_ACCESS_ACCOUNTS]
+                        released = Counter()
+                        for ordinal, change in changes:
+                            # The gateway re-subscribes the account with its new lists, then lets the old feeds go.
+                            renewed = []
+                            for request in w6_requests(gateway, ordinal, change):
+                                handle = await create(request)
+                                renewed.append((request, handle, await stream_offset(client, handle)))
+                            for request, handle, _ in [entry for entry in w6_live if entry[0]["ordinal"] == ordinal]:
+                                response = await client.delete(f"{ENGINE_URL}/v1/shapes/{handle['shapeId']}", params={"subscription": handle["subscription"]})
+                                released[response.status_code] += 1
+                            w6_live = [entry for entry in w6_live if entry[0]["ordinal"] != ordinal] + renewed
+                        step["accounts"] = [{"ordinal": ordinal, "change": change} for ordinal, change in changes]
+                        step["released"] = dict(released)
+                        moved_marker = uuid4()
+                        def move_edges():
+                            moved = 0
+                            with psycopg.connect(PG_URL) as connection:
+                                for index, account in enumerate(H1_DATA_ACCOUNTS):
+                                    target = row_id("space", H1_DATA_ACCOUNTS[(index + 1) % len(H1_DATA_ACCOUNTS)])
+                                    ids = [row["id"] for row in data.rows[("graph_edge", account)][:W6_MOVED_EDGES]]
+                                    moved += connection.execute("UPDATE public.graph_edge SET from_space_id = %s, to_space_id = %s, version = version + 1 WHERE id = ANY(%s)", (target, target, ids)).rowcount
+                                marker(connection, fence_user, fence_generation, moved_marker)
+                            return moved
+                        step["edges_moved"] = await asyncio.to_thread(move_edges)
+                        await wait_for_marker(client, validator, moved_marker, fence_user, fence_generation, 900, process)
+                    elif workload == "w6-check":
+                        # Every live shape's delivered rows, replayed, against a direct query of its filter
+                        # over the rows the run changed (a changes-only feed carries no others).
+                        changed = [row["id"] for account in H1_DATA_ACCOUNTS for row in data.rows[("graph_edge", account)][:20]]
+                        mismatches, with_rows, delivered, expected_rows = [], 0, 0, 0
+                        with psycopg.connect(PG_URL, autocommit=True) as connection:
+                            for request, handle, offset in w6_live:
+                                expected = {str(row[0]) for row in connection.execute(sql.SQL("SELECT q.id FROM public.graph_edge q WHERE q.id = ANY(%s) AND {}").format(predicate_sql(request["body"]["where"], "q")), (changed,))}
+                                present = {}
+                                for _ in range(10000):
+                                    response = await client.get(handle["streamUrl"], params={"offset": offset}, timeout=120)
+                                    if response.status_code == 204:
+                                        break
+                                    response.raise_for_status()
+                                    envelopes = response.json()
+                                    if not envelopes:
+                                        break
+                                    for envelope in envelopes:
+                                        if "key" in envelope:
+                                            delivered += 1
+                                            present[str(envelope["key"])] = envelope.get("headers", {}).get("operation") != "delete"
+                                    following = response.headers.get("stream-next-offset", offset)
+                                    if following == offset:
+                                        break
+                                    offset = following
+                                held = {key for key, live in present.items() if live}
+                                with_rows += bool(expected)
+                                expected_rows += len(expected)
+                                if held != expected:
+                                    mismatches.append({"shape": handle["shapeId"], "account": request["ordinal"], "kind": request["kind"], "expected": len(expected), "held": len(held), "missing": sorted(expected - held)[:5], "extra": sorted(held - expected)[:5]})
+                        step.update(shapes_checked=len(w6_live), shapes_with_rows=with_rows, rows_expected=expected_rows, envelopes_read=delivered, mismatched_shapes=len(mismatches), mismatches=mismatches[:50])
+                    save(output / f"{workload}-result.json", step)
+                    print(json.dumps(step, default=str)[:3000], flush=True)
+                    continue
                 probe = OtherAccountProbe(engine_url=ENGINE_URL, postgres_url=PG_URL, user_id=row_id("user", 0), record_id=row_id("record", 0), generation=gateway.authority(0).generation, feed=probe_feed, subset=subset, receipt_validator=validator, output=output / f"{workload}-probes.jsonl", interval=args.probe_interval)
                 probe_task = asyncio.create_task(probe.run())
                 await asyncio.sleep(3)
@@ -915,6 +1051,8 @@ async def run(args):
                         operation = data.calendar_import
                     elif workload == "import-noresource":
                         operation = lambda url, callback: import_without_resources(data, url, callback)
+                    elif workload in W7_WORKLOADS:
+                        operation = w7_operation(w7_queries, process)
                     elif workload in W1_WORKLOADS:
                         operation = w1_operation(data, workload, W1_VARIANTS[args.variant], output, validator, ((fence_user, fence_generation), (row_id("user", 2), gateway.authority(2).generation)), transactions)
                     elif workload in WINDOW_WORKLOADS:
@@ -1094,5 +1232,5 @@ if __name__ == "__main__":
     parser.add_argument("--probe-interval", type=float, default=1.0, help="seconds between the bystander's probe ticks")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS, *W1_WORKLOADS), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS, *W1_WORKLOADS, *W6_STEPS, *W7_WORKLOADS), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

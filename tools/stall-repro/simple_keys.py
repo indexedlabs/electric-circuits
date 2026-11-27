@@ -993,3 +993,156 @@ def w1_seed_accounts(connection, data):
     for table, count in (("space_member", 1), ("calendar", 2), ("resource", 40)):
         data.insert(connection, table, W1_DELETED, count)
     return {f"{table}/{account}": len(rows) for (table, account), rows in data.rows.items()}
+
+
+# W6: the list rule (engine main 46d15563, ELECTRIC_CIRCUITS_LIST_KEYS=1) against the gateway's literal
+# filters. S-main3-w6-N-on / -off: N live keyed `graph_edge` filters exactly as main writes them (no
+# rewrite), on prod's mix: 19 accounts in 20 with one Space; 1 in 20 with its own home, one partner
+# Space (two for every other such account) and one Record shared with it. Per account, as in
+# PLAIN-WORDS-3 run 2: one session Resource-edge feed per Space it reads and four thread rails'
+# attendee members. The two cells differ only in the engine setting.
+W6_COUNTS = (100, 1000, 5000)
+W6_VARIANTS = {f"S-main3-w6-{count}-{cell}": (count, cell == "on") for count in W6_COUNTS for cell in ("on", "off")}
+# The access round: this many one-Space accounts gain a partner Space and as many partnered accounts
+# lose theirs; and the first W6_MOVED_EDGES edges of each written Space move to the next written Space.
+W6_ACCESS_ACCOUNTS = 10
+W6_MOVED_EDGES = 2
+
+
+def w6_lists(gateway, ordinal, change=None):
+    """One account's keyed lists. `change="gain"` gives a one-Space account a partner Space;
+    `change="lose"` takes a partnered account's partner Spaces away (it keeps its share)."""
+    record_sync = gateway.loader.module("api.models.record_sync_authority")
+    multi, rank = plain_words_account(ordinal, "mix")
+    partners = lambda count: tuple(UUID(str(synthetic_id(f"space/{H1_DATA_ACCOUNTS[(ordinal * step) % len(H1_DATA_ACCOUNTS)]}"))) for step in (1, 7)[:count])
+    if multi:
+        home = UUID(str(synthetic_id(f"w6-home/{ordinal}")))
+        partner_spaces = () if change == "lose" else partners(1 + (ordinal // MIX_EVERY) % 2)
+        shared = (UUID(str(synthetic_id(f"w6-shared/{ordinal}"))),)
+    else:
+        home = one_family_space(rank, ordinal)
+        partner_spaces = tuple(space for space in partners(2) if space != home)[:1] if change == "gain" else ()
+        shared = ()
+    return record_sync.KeyedAudienceLists(space_ids=(home,), partner_space_ids=partner_spaces, calendar_ids=(), partner_calendar_ids=(), shared_record_ids=shared, shared_resource_ids=(), generation=f"w6-{ordinal}-{change}")
+
+
+def w6_account_filters(gateway, ordinal, change=None):
+    """[(name, where, kind)]: one account's keyed `graph_edge` filters as main's gateway writes them."""
+    from data import row_id
+    multi, rank = plain_words_account(ordinal, "mix")
+    lists = w6_lists(gateway, ordinal, change)
+    user = UUID(str(synthetic_id(f"user/w6/{ordinal}")))
+    authority = gateway.authority_module.KeyedSyncAuthority(user_id=user, lists=lists, index_tables=True, chat_rows=True)
+    authorization = gateway.authority_module.keyed_authorization_predicate(table="graph_edge", authority=authority)
+    identity = main_stream_identity(gateway)
+    written = not multi and rank < len(H1_DATA_ACCOUNTS) - 1
+    records = [str(row_id("record", H1_DATA_ACCOUNTS[rank + 1], index)) if written else str(synthetic_id(f"w6-record/{ordinal}/{index}")) for index in range(EDGE_RAILS)]
+    spaces = [str(space) for space in (*lists.space_ids, *lists.partner_space_ids)]
+    clients = [(f"session:{index}", "session", next(predicate for table, predicate in app_session(ordinal, [space]) if table == "graph_edge" and predicate is not None)) for index, space in enumerate(spaces)]
+    clients += [(f"rail:{index}", "rail", next(predicate for table, predicate in app_thread_rail(record) if table == "graph_edge")) for index, record in enumerate(records)]
+    return [(name, {"and": [{"and": [authorization, client]}, identity]}, kind) for name, kind, client in clients]
+
+
+def w6_requests(gateway, ordinal, change=None):
+    suffix = "" if change is None else f":{change}"
+    return [{"kind": f"w6-{kind}", "account": 1000 + ordinal, "ordinal": ordinal, "body": gateway._plain_body("graph_edge", 1000 + ordinal, where, f"w6:{ordinal}:{name}{suffix}", keyed=False), "has_subquery": contains_subquery(where)} for name, where, kind in w6_account_filters(gateway, ordinal, change)]
+
+
+def w6_catalog(gateway, count):
+    """Accounts are added until `count` filters are reached; the last one may hold fewer rails."""
+    catalog, ordinal = [], 0
+    while len(catalog) < count:
+        catalog += w6_requests(gateway, ordinal)[: count - len(catalog)]
+        ordinal += 1
+    return catalog
+
+
+def equality_keys(where):
+    """The engine's `CompiledPredicate::equality_keys`: every non-NULL equality reachable through AND and OR."""
+    found = set()
+    def collect(node):
+        for operator in ("and", "or"):
+            if operator in node:
+                for child in node[operator]:
+                    collect(child)
+                return
+        if node.get("op") == "eq" and node.get("value") is not None and "in" not in node:
+            found.add((node["col"], str(node["value"])))
+    collect(where)
+    return found
+
+
+def access_plan(where, shared):
+    """The harness's copy of engine main's `CompiledPredicate::access_plan` (predicate.rs at 46d15563),
+    the list rule: ("keys", [...]) when a member of the top-level AND chain is an OR with an equality in
+    every branch, filed under the cover whose busiest key is named by the fewest filters; otherwise
+    ("leaf", leaf) or ("scan", None) as `access_leaf` decides. `shared(key)` is how many filters name a key."""
+    def literal_length(value):
+        return len(value) if isinstance(value, str) else 1
+    def rank(cover):
+        keys, widest, shortest = cover
+        return (widest, -shortest, len(keys))
+    def cover(node):
+        if "or" in node:
+            keys, widest, shortest = set(), 0, None
+            for child in node["or"]:
+                found = cover(child)
+                if found is None:
+                    return None
+                keys |= found[0]
+                widest = max(widest, found[1])
+                shortest = found[2] if shortest is None else min(shortest, found[2])
+            return (keys, widest, shortest) if keys else None
+        if "and" in node:
+            best = None
+            for child in node["and"]:
+                found = cover(child)
+                if found is not None and (best is None or rank(found) < rank(best)):
+                    best = found
+            return best
+        if node.get("op") == "eq" and node.get("value") is not None and "in" not in node:
+            key = (node["col"], str(node["value"]))
+            return ({key}, shared(key), literal_length(node["value"]))
+        return None
+    members = []
+    def chain(node):
+        if "and" in node:
+            for child in node["and"]:
+                chain(child)
+        else:
+            members.append(node)
+    chain(where)
+    best, has_list = None, False
+    for member in members:
+        found = cover(member)
+        if found is None:
+            continue
+        has_list = has_list or "or" in member
+        if best is None or rank(found) < rank(best):
+            best = found
+    if has_list and best is not None:
+        return ("keys", sorted(best[0]))
+    leaf = access_leaf(where)
+    return ("leaf", (leaf[0], str(leaf[2]))) if leaf else ("scan", None)
+
+
+def placement_summary(wheres, list_keys):
+    """Where the harness's copy of the rule files each filter: totals, the largest bucket and why
+    anything is on the scan list. With the rule off every filter keeps `access_leaf`'s placement."""
+    from collections import Counter
+    named = Counter(key for where in wheres for key in equality_keys(where))
+    buckets, kinds, columns, scan_reasons = Counter(), Counter(), Counter(), Counter()
+    for where in wheres:
+        kind, value = access_plan(where, lambda key: named[key]) if list_keys else (("leaf", (access_leaf(where)[0], str(access_leaf(where)[2]))) if access_leaf(where) else ("scan", None))
+        kinds[kind] += 1
+        if kind == "keys":
+            for key in value:
+                buckets[key] += 1
+            columns["+".join(sorted({column for column, _ in value}))] += 1
+        elif kind == "leaf":
+            buckets[value] += 1
+            columns[value[0]] += 1
+        else:
+            scan_reasons["no equality in the top-level AND, and no OR with an equality in every branch"] += 1
+    largest = buckets.most_common(3)
+    return {"shapes": len(wheres), "filed_under_keys": kinds["keys"], "filed_under_one_leaf": kinds["leaf"], "scan_list": kinds["scan"], "by_columns": dict(columns), "scan_reasons": dict(scan_reasons), "distinct_keys": len(buckets), "largest_buckets": [{"column": key[0], "value": key[1], "shapes": count} for key, count in largest]}
