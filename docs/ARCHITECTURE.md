@@ -866,6 +866,7 @@ bullet). Neither circuit checkpoints: both reseed on boot.
 | `ELECTRIC_CIRCUITS_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. Empty = no circuit. |
 | `ELECTRIC_CIRCUITS_FLIP_WORKERS` | `8` | concurrent flip-propagation workers (Postgres query-backs). |
 | `ELECTRIC_CIRCUITS_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
+| `ELECTRIC_CIRCUITS_LIST_KEYS` | off | `1` or `true` files a standalone shape or aggregate whose `OR` has an equality in every branch under every one of those keys instead of on the fallback scan list (`ivm-engine-internals.md` §3.2). Read once at boot; changing it re-files every shape at the next restart and changes no stream. |
 | `ELECTRIC_CIRCUITS_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
 | `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit standalone directory is operator-managed and kept on shutdown; sources own unique `<source_root>/subq/<pid>-<seq>` children, removed on close. |
 | `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types). |
@@ -1392,7 +1393,8 @@ engine compute.
 5. ~~Predicate indexing by `(column, op)` — turn O(K) into output-sensitive.~~ Done: standalone
    shapes are indexed by a necessary conjunct (equality → hash bucket, range bound → ordered
    scan); only candidates are evaluated per change. Un-indexable predicates (OR/NOT/LIKE/`!=`)
-   remain on a fallback scan list.
+   remain on a fallback scan list. With `ELECTRIC_CIRCUITS_LIST_KEYS=1`, an `OR` with an equality
+   in every branch is filed under every one of those keys instead (`ivm-engine-internals.md` §3.2).
 6. Widen the shared class beyond pure equality (e.g. single-column range templates).
 
 **Engine compute / representation**

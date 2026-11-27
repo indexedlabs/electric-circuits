@@ -445,14 +445,131 @@ impl CompiledPredicate {
 
     /// Where a necessary-conjunct index files this predicate when the **list rule** is on.
     ///
-    /// `load(col, value)` is the number of shapes the index already holds under that key; it
-    /// only ranks alternatives and never affects soundness.
-    pub fn access_plan(&self, load: &dyn Fn(usize, &Value) -> usize) -> AccessPlan {
-        let _ = load;
+    /// A predicate with an `OR` in its top-level `AND` chain (or at the top) whose every branch
+    /// has an equality is filed under a **key cover** ([`AccessPlan::Keys`]): a set of non-NULL
+    /// equality keys such that the predicate can be TRUE on a row only if the row equals at least
+    /// one of them. Every other predicate is placed exactly as [`access_leaf`](Self::access_leaf)
+    /// places it: under its one necessary conjunct, or on the scan list.
+    ///
+    /// **Why a cover is sound.** Covers are built bottom-up by three rules, each of which keeps
+    /// "TRUE on a row ⇒ the row equals a key of the cover":
+    ///
+    ///  * `col = v` (v non-NULL) is TRUE only on a row whose cell equals `v`: the cover is `{(col, v)}`.
+    ///  * an `AND` is TRUE only if every member is, so **any one** member's cover covers it;
+    ///  * an `OR` is TRUE only if some branch is, so the **union** of every branch's cover covers
+    ///    it, and an `OR` with a branch that has no cover has none.
+    ///
+    /// Nothing else has a cover: `NOT`, `!=`, `LIKE`, `IS NULL`, a range, a subquery `IN` (its
+    /// truth is not a function of the row alone) and `col = NULL` (never TRUE). The walk never
+    /// descends through a `NOT`, so a key is never taken from under a negation. A NULL cell equals
+    /// no key, exactly as it satisfies no equality.
+    ///
+    /// **Which cover.** An `AND` often offers several, and they are not equally useful: filed under
+    /// a constant every filter names (`is_busy_block = false`), a shape is offered every row that
+    /// carries it. `shared(col, value)` says how many other filters name a key, and an `AND` takes
+    /// the member whose most widely shared key is shared least; ties go to the longer literal (an
+    /// id over a flag or a type name), then to the smaller cover, then to the first. The choice
+    /// affects only how many shapes a row is offered to, never which rows a shape receives.
+    pub fn access_plan(&self, shared: &dyn Fn(usize, &Value) -> usize) -> AccessPlan {
+        /// A candidate cover with the measures that rank it against its `AND` siblings.
+        struct Cover {
+            keys: Vec<AccessKey>,
+            /// The largest `shared` count among the keys: how busy its busiest key is.
+            widest: usize,
+            /// The shortest literal among the keys.
+            shortest: usize,
+        }
+        impl Cover {
+            fn better_than(&self, other: &Cover) -> bool {
+                (self.widest, std::cmp::Reverse(self.shortest), self.keys.len())
+                    < (other.widest, std::cmp::Reverse(other.shortest), other.keys.len())
+            }
+        }
+        fn literal_len(v: &Value) -> usize {
+            match v {
+                Value::Text(s) => s.len(),
+                Value::Int(i) => i.unsigned_abs().checked_ilog10().map_or(1, |d| d as usize + 1),
+                Value::Bool(_) | Value::Float(_) | Value::Null => 1,
+            }
+        }
+        fn cover(p: &CompiledPredicate, shared: &dyn Fn(usize, &Value) -> usize) -> Option<Cover> {
+            match p {
+                CompiledPredicate::Cmp { col, op: LeafOp::Eq, value } if !matches!(value, Value::Null) => Some(Cover {
+                    keys: vec![(*col, value.clone())],
+                    widest: shared(*col, value),
+                    shortest: literal_len(value),
+                }),
+                CompiledPredicate::And(ps) => {
+                    let mut best: Option<Cover> = None;
+                    for c in ps.iter().filter_map(|q| cover(q, shared)) {
+                        if best.as_ref().is_none_or(|b| c.better_than(b)) {
+                            best = Some(c);
+                        }
+                    }
+                    best
+                }
+                CompiledPredicate::Or(ps) => {
+                    let mut all = Cover { keys: Vec::new(), widest: 0, shortest: usize::MAX };
+                    for q in ps {
+                        let c = cover(q, shared)?;
+                        all.keys.extend(c.keys);
+                        all.widest = all.widest.max(c.widest);
+                        all.shortest = all.shortest.min(c.shortest);
+                    }
+                    all.keys.sort_unstable();
+                    all.keys.dedup();
+                    // An empty `OR` is FALSE on every row; it has no branch to take a key from.
+                    (!all.keys.is_empty()).then_some(all)
+                }
+                _ => None,
+            }
+        }
+        /// The members of the top-level `AND` chain (a member of a member is still a member).
+        fn chain<'a>(p: &'a CompiledPredicate, out: &mut Vec<&'a CompiledPredicate>) {
+            match p {
+                CompiledPredicate::And(ps) => ps.iter().for_each(|q| chain(q, out)),
+                other => out.push(other),
+            }
+        }
+        let mut members = Vec::new();
+        chain(self, &mut members);
+        let mut best: Option<Cover> = None;
+        let mut has_list = false;
+        for member in members {
+            let Some(c) = cover(member, shared) else { continue };
+            has_list |= matches!(member, CompiledPredicate::Or(_));
+            if best.as_ref().is_none_or(|b| c.better_than(b)) {
+                best = Some(c);
+            }
+        }
+        // Without a list in the chain the rule does not apply, and filing stays as it was.
+        if has_list && let Some(c) = best {
+            return AccessPlan::Keys(c.keys);
+        }
         match self.access_leaf() {
             Some(leaf) => AccessPlan::Leaf(leaf),
             None => AccessPlan::Scan,
         }
+    }
+
+    /// Every key this predicate could be filed under by [`access_plan`](Self::access_plan): the
+    /// non-NULL equality leaves reachable through `AND` and `OR` alone. Sorted and distinct. An
+    /// index counts these per key to learn which keys many filters share.
+    pub fn equality_keys(&self) -> Vec<AccessKey> {
+        fn collect(p: &CompiledPredicate, out: &mut Vec<AccessKey>) {
+            match p {
+                CompiledPredicate::Cmp { col, op: LeafOp::Eq, value } if !matches!(value, Value::Null) => {
+                    out.push((*col, value.clone()));
+                }
+                CompiledPredicate::And(ps) | CompiledPredicate::Or(ps) => ps.iter().for_each(|q| collect(q, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        collect(self, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Filter membership under SQL `WHERE` semantics: a row is included iff the predicate is TRUE.
@@ -692,6 +809,150 @@ mod tests {
         );
         assert_eq!(compile(serde_json::json!({"col":"name","op":"neq","value":"a"})).access_leaf(), None);
         assert_eq!(CompiledPredicate::MatchAll.access_leaf(), None);
+    }
+
+    // The list rule: an OR at the top or in the top-level AND chain, with an equality in every
+    // branch, is filed under every branch's key; anything else is placed as `access_leaf` places it.
+    #[test]
+    fn access_plan_files_a_list_under_every_key() {
+        let ts = users();
+        let compile = |j: serde_json::Value| {
+            CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), &ts).unwrap()
+        };
+        let plan = |j: serde_json::Value| compile(j).access_plan(&|_, _| 0);
+        let name = |v: &str| (ts.column_index("name").unwrap(), Value::Text(v.into()));
+        let age = |v: i64| (ts.column_index("age").unwrap(), Value::Int(v));
+        let keys = |mut ks: Vec<AccessKey>| {
+            ks.sort();
+            AccessPlan::Keys(ks)
+        };
+        let eq = |col: &str, v: serde_json::Value| serde_json::json!({"col": col, "op": "eq", "value": v});
+
+        // At the top, on one column or on several; a one-item OR is still a list.
+        assert_eq!(
+            plan(serde_json::json!({"or": [eq("name", "a".into()), eq("name", "b".into())]})),
+            keys(vec![name("a"), name("b")])
+        );
+        assert_eq!(
+            plan(serde_json::json!({"or": [eq("name", "a".into()), eq("age", 7.into())]})),
+            keys(vec![name("a"), age(7)])
+        );
+        assert_eq!(plan(serde_json::json!({"or": [eq("name", "a".into())]})), keys(vec![name("a")]));
+        // A key named by two branches is filed once.
+        assert_eq!(
+            plan(serde_json::json!({"or": [eq("name", "a".into()), eq("name", "a".into())]})),
+            keys(vec![name("a")])
+        );
+        // In the top-level AND chain, beside conditions no key can be made of, through a nested AND.
+        assert_eq!(
+            plan(serde_json::json!({"and": [
+                {"col": "active", "isNull": false},
+                {"and": [{"col": "name", "op": "neq", "value": "z"}, {"or": [eq("age", 1.into()), eq("age", 2.into())]}]}
+            ]})),
+            keys(vec![age(1), age(2)])
+        );
+        // A branch may be an AND (any one member's key covers it) or a nested OR (its keys join).
+        assert_eq!(
+            plan(serde_json::json!({"or": [
+                {"and": [eq("name", "a".into()), {"col": "age", "op": "gt", "value": 3}]},
+                {"or": [eq("age", 1.into()), {"and": [{"col": "active", "isNull": true}, eq("age", 2.into())]}]}
+            ]})),
+            keys(vec![name("a"), age(1), age(2)])
+        );
+
+        // A branch with no equality leaves the whole OR without a cover: the scan list, as before.
+        for unkeyed in [
+            serde_json::json!({"col": "age", "op": "gt", "value": 18}),
+            serde_json::json!({"col": "name", "op": "neq", "value": "a"}),
+            serde_json::json!({"col": "name", "op": "like", "value": "a%"}),
+            serde_json::json!({"col": "name", "isNull": true}),
+            serde_json::json!({"not": eq("name", "b".into())}),
+            // `name = NULL` is UNKNOWN on every row: not an equality a row can satisfy.
+            serde_json::json!({"col": "name", "op": "eq", "value": null}),
+            serde_json::json!({"or": []}),
+        ] {
+            let mixed = serde_json::json!({"or": [eq("name", "a".into()), unkeyed.clone()]});
+            assert_eq!(plan(mixed.clone()), AccessPlan::Scan, "{unkeyed}");
+            // ... and beside a range the shape is filed under the range, as before.
+            assert_eq!(
+                plan(serde_json::json!({"and": [mixed, {"col": "age", "op": "gte", "value": 21}]})),
+                AccessPlan::Leaf(AccessLeaf::Lower { col: age(0).0, value: Value::Int(21), strict: false }),
+                "{unkeyed}"
+            );
+        }
+        // A key is never taken from under a negation.
+        assert_eq!(
+            plan(serde_json::json!({"not": {"or": [eq("name", "a".into()), eq("name", "b".into())]}})),
+            AccessPlan::Scan
+        );
+
+        // With no list in the chain, placement is `access_leaf`'s: the first equality, a bound, or nothing.
+        for filter in [
+            eq("name", "a".into()),
+            serde_json::json!({"and": [{"col": "age", "op": "gt", "value": 18}, eq("name", "a".into()), eq("age", 30.into())]}),
+            serde_json::json!({"col": "age", "op": "lt", "value": 5}),
+            serde_json::json!({"col": "name", "op": "neq", "value": "a"}),
+        ] {
+            let p = compile(filter.clone());
+            let expected = p.access_leaf().map_or(AccessPlan::Scan, AccessPlan::Leaf);
+            assert_eq!(p.access_plan(&|_, _| 0), expected, "{filter}");
+        }
+        assert_eq!(CompiledPredicate::MatchAll.access_plan(&|_, _| 0), AccessPlan::Scan);
+    }
+
+    // An AND offers one cover per member that has one. The member whose most widely shared key is
+    // shared least is taken; ties go to the longer literal, then the smaller cover, then the first.
+    #[test]
+    fn access_plan_ranks_the_alternatives_of_an_and() {
+        let ts = users();
+        let compile = |j: serde_json::Value| {
+            CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), &ts).unwrap()
+        };
+        let name = |v: &str| (ts.column_index("name").unwrap(), Value::Text(v.into()));
+        let age = |v: i64| (ts.column_index("age").unwrap(), Value::Int(v));
+        let active = (ts.column_index("active").unwrap(), Value::Bool(true));
+        // `active = true AND (name = 'reader-1' OR name = 'reader-2') AND (age = 1 OR age = 2)`.
+        let filter = compile(serde_json::json!({"and": [
+            {"col": "active", "op": "eq", "value": true},
+            {"or": [{"col": "name", "op": "eq", "value": "reader-1"}, {"col": "name", "op": "eq", "value": "reader-2"}]},
+            {"or": [{"col": "age", "op": "eq", "value": 1}, {"col": "age", "op": "eq", "value": 2}]}
+        ]}));
+        let names = AccessPlan::Keys(vec![name("reader-1"), name("reader-2")]);
+        let ages = AccessPlan::Keys(vec![age(1), age(2)]);
+
+        // Nothing is shared yet: the longest literals win, so an id beats a flag or a small number.
+        assert_eq!(filter.access_plan(&|_, _| 0), names);
+        // Other filters name the flag and the ages (constants of the query), none names these readers.
+        let constants = |col: usize, v: &Value| {
+            if col == active.0 || col == age(0).0 { 50 + (*v == Value::Int(2)) as usize } else { 0 }
+        };
+        assert_eq!(filter.access_plan(&constants), names);
+        // One of the reader's names is the most widely shared key of all: the ages are filed instead,
+        // because a cover is as busy as its busiest key.
+        let busy_name = |col: usize, v: &Value| match (col == name("").0, v) {
+            (true, Value::Text(s)) if s == "reader-2" => 99,
+            (true, _) => 0,
+            _ if col == active.0 => 60,
+            _ => 50,
+        };
+        assert_eq!(filter.access_plan(&busy_name), ages);
+        // Equal on both counts: the smaller cover, here the single flag.
+        let level = compile(serde_json::json!({"and": [
+            {"or": [{"col": "age", "op": "eq", "value": 1}, {"col": "age", "op": "eq", "value": 2}]},
+            {"col": "active", "op": "eq", "value": true}
+        ]}));
+        assert_eq!(level.access_plan(&|_, _| 0), AccessPlan::Keys(vec![active.clone()]));
+
+        // Every equality reachable through AND and OR is a key the filter names, once each.
+        let mut expected = vec![active, name("reader-1"), name("reader-2"), age(1), age(2)];
+        expected.sort();
+        assert_eq!(filter.equality_keys(), expected);
+        let negated = compile(serde_json::json!({"and": [
+            {"not": {"col": "name", "op": "eq", "value": "a"}},
+            {"col": "name", "op": "eq", "value": null},
+            {"col": "age", "op": "eq", "value": 3}
+        ]}));
+        assert_eq!(negated.equality_keys(), vec![age(3)]);
     }
 
     // Substituted `$N` param values arrive as quoted string literals; a leaf literal coerces to the

@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::heap_size::HeapSize;
-use crate::predicate::AccessPlan;
+use crate::predicate::{AccessKey, AccessPlan};
 
 /// A COUNT aggregate served from the counts pipeline: `value` = Σ counts of matching groups.
 pub(crate) struct CircuitAgg {
@@ -90,6 +90,13 @@ pub(crate) struct StandaloneIndex {
     /// Whether this index applies the list rule. Fixed at construction, so a shape is always
     /// removed by the placement it was filed with.
     list_keys: bool,
+    /// List rule only: how many shapes' filters name each equality key, filed under it or not
+    /// ([`CompiledPredicate::equality_keys`]). A key many filters name is a constant of the query
+    /// (`kind = 'a'`), a poor key to file under; a reader's own key is named by that reader's
+    /// filters alone. Ranks a shape's alternatives when it is filed, and nothing else.
+    named: HashMap<usize, HashMap<Value, usize>>,
+    /// List rule only: the keys each shape's filter names, to take its counts back out of `named`.
+    names: HashMap<String, Vec<AccessKey>>,
 }
 
 /// The **list rule** setting, `ELECTRIC_CIRCUITS_LIST_KEYS` (off unless `1` or `true`): file a
@@ -113,6 +120,8 @@ impl HeapSize for StandaloneIndex {
             + self.upper.heap_bytes()
             + self.scan.heap_bytes()
             + self.placed.heap_bytes()
+            + self.named.heap_bytes()
+            + self.names.heap_bytes()
     }
 }
 
@@ -122,15 +131,21 @@ impl StandaloneIndex {
         StandaloneIndex { list_keys, ..StandaloneIndex::default() }
     }
 
-    /// How many shapes are filed under `col = value` — what ranks a list-rule shape's alternatives.
-    fn load(&self, col: usize, value: &Value) -> usize {
-        self.eq.get(&col).and_then(|by_val| by_val.get(value)).map_or(0, Vec::len)
-    }
-
     pub(crate) fn insert(&mut self, sid: &str, pred: &CompiledPredicate) {
         use crate::predicate::AccessLeaf;
+        // Re-filing a shape that is already here replaces its placement rather than doubling it.
+        self.remove(sid);
         let plan = if self.list_keys {
-            pred.access_plan(&|col, value| self.load(col, value))
+            // Ranked against the OTHER shapes' filters, so the shape's own keys start level.
+            let plan = pred.access_plan(&|col, value| {
+                self.named.get(&col).and_then(|by_val| by_val.get(value)).copied().unwrap_or(0)
+            });
+            let names = pred.equality_keys();
+            for (col, value) in &names {
+                *self.named.entry(*col).or_default().entry(value.clone()).or_default() += 1;
+            }
+            self.names.insert(sid.to_string(), names);
+            plan
         } else {
             match pred.access_leaf() {
                 Some(leaf) => AccessPlan::Leaf(leaf),
@@ -160,6 +175,19 @@ impl StandaloneIndex {
     pub(crate) fn remove(&mut self, sid: &str) {
         use crate::predicate::AccessLeaf;
         let Some(plan) = self.placed.remove(sid) else { return };
+        for (col, value) in self.names.remove(sid).unwrap_or_default() {
+            if let Some(by_val) = self.named.get_mut(&col)
+                && let Some(count) = by_val.get_mut(&value)
+            {
+                *count -= 1;
+                if *count == 0 {
+                    by_val.remove(&value);
+                    if by_val.is_empty() {
+                        self.named.remove(&col);
+                    }
+                }
+            }
+        }
         match plan {
             AccessPlan::Leaf(AccessLeaf::Eq { col, value }) => self.remove_key(col, &value, sid),
             AccessPlan::Leaf(AccessLeaf::Lower { col, value, .. }) => {
