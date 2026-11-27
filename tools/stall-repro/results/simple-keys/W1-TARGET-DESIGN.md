@@ -1,23 +1,51 @@
 # W1: the target design under one combined load (Main, via circuits-coord)
 
-**Answer so far (20 and 200 active accounts; the 2,000 cell is still running).** The target design
-holds at both sizes with room to spare.
+**Answer so far (20, 200 and 1,600 active accounts; the 2,000 cell has not run yet).** The design
+holds easily at 200 accounts and bends at 1,600. What bends is the engine's one CPU serving the
+screen loads. Nothing is lost, and the import, the deletion and other accounts' changes stay fast.
 
-- **Other accounts:** no drain, load or live change is lost in either cell, with or without the
-  import and the deletion running. Under the combined load the bystander's receipt p95 goes from
-  0.026 s to 0.07–0.10 s, and its worst is 0.5–0.7 s.
-- **The import:** 5,000 events at 100 a commit land in 12 s; a commit's receipt takes 0.10 s at
-  p50 and 0.21 s at p95.
-- **The deletion:** a prod-p95 family (12,419 rows, 1,242 commits) takes 81–83 s. Each commit's
-  receipt is 0.052 s, which is the harness's 50 ms receipt poll, so the engine is not what paces it.
-- **The engine:** 15% of one CPU and 115 MiB at 200 accounts under the combined load. The steady
-  loads alone are 8% at 200 accounts, so by that line the loads, not the writes, are what will
-  fill the CPU first as accounts grow.
-- **A whole-family follower** in the importing family is sent all 30,000 rows, 164 MB in 12 s. A
-  phone on a day window would be sent 359 of them (2.0 MB), on a week window 2,513 (13.7 MB).
+- **At 20 and 200 accounts** the combined load changes almost nothing: no request lost, loads at
+  0.01–0.02 s, bystander receipt p95 0.07–0.10 s, engine CPU 6% and 15%.
+- **At 1,600 accounts, loads only:** the engine is at 63% of its CPU. Every load is answered, p95
+  0.07–0.08 s.
+- **At 1,600 accounts, with the import and the deletion:** the engine is at 91–95% within ten
+  seconds and stays there until the deletion ends. Every load is still answered and none times
+  out, but a load takes 1.3–1.5 s, and the phones' schedule falls behind by up to 17 s (the engine
+  serves about 85% of what is asked). It catches up once the deletion ends.
+- **The writers are not what bends.** The import takes 17 s against 12 s, a commit's receipt p95
+  is 0.23 s, the deletion takes 121 s against 82 s, and a bystander's own drains and live changes
+  all arrive (p95 0.13 s and 0.11 s, none timed out). The sequencer-held gauges stay at 0.
+- **Where the CPU goes:** a load request costs about 1.1 ms of engine CPU at every size (8% at
+  200 accounts and 74 requests a second, 63% at 1,600 and 587). By that line the loads alone fill
+  one CPU at about 2,500 accounts, at this run's load rate and row sizes.
+- **A whole-family follower** in the importing family is sent all 30,000 rows, 164 MB, as fast as
+  the import commits (12–17 s). A phone on a day window would be sent 359 of them (2.0 MB), on a
+  week window 2,513 (13.7 MB). An unrelated family's phone is sent nothing from either.
+
+**The 2,000 cell: stopped twice by the harness, not by the engine.**
+
+- **First run:** the harness's file-backed stream store refused its 65,513th stream. The store
+  keeps one open file per stream, a hosted runner allows 65,536, and 2,000 phones at 38 feeds each
+  are 76,114 streams. With the limit raised to 1,048,576 the 1,600 cell's 60,914 streams were fine.
+- **Second run:** 22,790 feeds in, the fixture's store proxy closed a connection under one stream
+  create and the harness gave up on that feed. The store was holding 22,818 open files of
+  1,048,576. Feed creation now retries, and the cell is running a third time on two runners.
+- **What this says about the design:** one stream per family per table means 38 streams a family.
+  Whatever store prod runs has to hold that many (76,000 at 2,000 families) and to create them:
+  this fixture creates about 110 feeds a second, so 1,600 phones' feeds took about 9 minutes.
+
+**Read these with three limits in mind.**
+
+- **Row size:** rows carry the fixture's 3.5 KB padding on every blob column, so a median
+  family's load is 71–235 rows and about 0.4 MB, and the engine serves 54 MB a second at 1,600
+  accounts. Smaller real rows would cost less than 1.1 ms a request.
+- **Load rate:** every account is active at once and makes four loads a minute.
+- **The generator's cap:** it keeps at most 128 loads in flight. Under saturation that cap, not
+  the engine, sets the 1.3–1.5 s a load takes; without it loads would queue longer.
 
 Engine `9bc1563` (prod's binary), 1 CPU, GitHub-hosted runners (4 cores, shared by the engine,
-Postgres and the load generator). Actions run `45963541607`, harness `60bb84c`. Folders
+Postgres and the load generator). Actions runs `45963541607` (20 and 200, harness `60bb84c`) and
+`45966333495` (1,600, harness `58f3443`). Folders
 `paired-w1-*` beside this file; tables by `tools/stall-repro/w1_report.py`.
 
 ## The setup
@@ -128,6 +156,40 @@ Engine shapes: 7,714, all of them in the engine's 38 equality families (one per 
 | the importing family, all tables | 30,000 | 163.9 MB | 12 s | 153,672 | 839.7 MB | 359 rows, 2.0 MB | 2,513 rows, 13.7 MB |
 | the deleted account's family, all tables | 12,419 | 2.1 MB | 81 s | 9,163 | 1.6 MB | 147 rows, 0.0 MB | 1,019 rows, 0.2 MB |
 | its own (bystander) family, all tables | 366 | 2.9 MB | 93 s | 236 | 1.9 MB | — | — |
+
+By table, import: `assignment` 5,000 rows / 3.5 MB, `calendar_event` 5,000 rows / 40.0 MB, `graph_edge` 10,000 rows / 78.6 MB, `record` 5,000 rows / 39.3 MB, `record_date_index` 5,000 rows / 2.4 MB.
+
+By table, delete: `assignment` 4,200 rows / 0.7 MB, `calendar` 2 rows / 0.0 MB, `calendar_event` 300 rows / 0.1 MB, `external_account` 1 rows / 0.0 MB, `file` 13 rows / 0.0 MB, `graph_edge` 560 rows / 0.1 MB, `message` 200 rows / 0.0 MB, `record` 2,200 rows / 0.4 MB, `record_date_index` 4,800 rows / 0.9 MB, `record_recurrence` 100 rows / 0.0 MB, `resource` 40 rows / 0.0 MB, `space` 1 rows / 0.0 MB, `space_member` 1 rows / 0.0 MB, `user` 1 rows / 0.0 MB.
+
+### 1,600 active accounts (Xeon 6975P-C, `paired-w1-1600-1-W1-1600-prod9bc-1cpu`)
+
+Engine shapes: 60,914, all of them in the engine's 38 equality families (one per table, a hash lookup by key); subquery shapes 0, scan-list shapes 0. Family rows seeded: 2,120,720.
+
+| | loads only | loads, import and deletion |
+| --- | --- | --- |
+| Phase length | 120 s | 142 s |
+| Bystander drains (receipts) | 481/481; p50 0.047 s, p95 0.076 s, max 0.11 s; 0 timed out | 569/569; p50 0.068 s, p95 0.134 s, max 0.27 s; 0 timed out |
+| Bystander subset loads | 481/481; p50 0.007 s, p95 0.014 s, max 0.15 s; 0 timed out | 569/569; p50 0.499 s, p95 0.645 s, max 0.68 s; 0 timed out |
+| Bystander live changes | 481/481; p50 0.054 s, p95 0.066 s, max 0.27 s; 0 timed out | 569/569; p50 0.072 s, p95 0.113 s, max 0.28 s; 0 timed out |
+| Longest run of lost drains | 0.0 s | 0.0 s |
+| Other accounts' day loads | 3,195/3,195 answered; p50 0.014 s, p95 0.074 s, max 0.20 s; 0 timed out, 0 shed, 0 failed | 3,485/3,485 answered; p50 1.341 s, p95 1.564 s, max 1.71 s; 0 timed out, 0 shed, 0 failed |
+| Other accounts' week loads | 3,194/3,194 answered; p50 0.017 s, p95 0.080 s, max 0.21 s; 0 timed out, 0 shed, 0 failed | 3,457/3,457 answered; p50 1.350 s, p95 1.570 s, max 1.71 s; 0 timed out, 0 shed, 0 failed |
+| Other accounts' record detail opens | 6,386/6,386 answered; p50 0.012 s, p95 0.073 s, max 0.20 s; 0 timed out, 0 shed, 0 failed | 6,948/6,948 answered; p50 1.335 s, p95 1.559 s, max 1.74 s; 0 timed out, 0 shed, 0 failed |
+| Loads started late by, p95 / max | 0.002 s / 0.005 s | 15.594 s / 16.869 s |
+| Loads served | 587 requests/s, 53.7 MB/s | 586 requests/s, 53.4 MB/s |
+| Rows per load, p50 / p95 | day 71 / 141 ; week 215 / 227 ; detail 235 / 238 | day 71 / 141 ; week 215 / 227 ; detail 235 / 238 |
+| Engine CPU (of 1) | 63% | 92% |
+| Engine peak RSS | 475 MiB | 557 MiB |
+| Runner CPU, all 4 cores | 43% mean, 55% peak | 57% mean, 71% peak |
+| Sequencer held: peak / longest run | 0 B / 0 s | 0 B / 0 s |
+| Import: wall time and per-commit receipt | — | 17 s; 50 commits, receipt p50 0.154 s, p95 0.226 s, max 0.23 s |
+| Deletion: wall time and per-commit receipt | — | 121 s; 1,242 commits, receipt p50 0.076 s, p95 0.119 s, max 0.31 s |
+
+| A phone that follows | Rows delivered | Bytes delivered | Over | Rows a minute | Bytes a minute | Of which a day-window phone would get | Of which a week-window phone would get |
+| --- | ---: | ---: | --- | ---: | ---: | --- | --- |
+| the importing family, all tables | 30,000 | 163.9 MB | 17 s | 105,254 | 575.2 MB | 359 rows, 2.0 MB | 2,513 rows, 13.7 MB |
+| the deleted account's family, all tables | 12,419 | 2.1 MB | 121 s | 6,180 | 1.1 MB | 147 rows, 0.0 MB | 1,019 rows, 0.2 MB |
+| its own (bystander) family, all tables | 564 | 4.5 MB | 142 s | 238 | 1.9 MB | — | — |
 
 By table, import: `assignment` 5,000 rows / 3.5 MB, `calendar_event` 5,000 rows / 40.0 MB, `graph_edge` 10,000 rows / 78.6 MB, `record` 5,000 rows / 39.3 MB, `record_date_index` 5,000 rows / 2.4 MB.
 
