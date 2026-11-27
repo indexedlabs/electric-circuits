@@ -899,7 +899,8 @@ W1_FIRST_DAY = datetime.date(2026, 1, 1)
 
 
 def w1_tables(gateway):
-    return sorted(gateway.gateway.REGISTERED_COLLECTIONS)
+    """Every table the gateway registers, by its table name (a collection's own name can differ)."""
+    return {collection.table: collection for collection in gateway.gateway.REGISTERED_COLLECTIONS.values()}
 
 
 def w1_family_key(family):
@@ -911,8 +912,7 @@ def w1_family_key(family):
 def w1_feeds(gateway, account, key, identity="w1"):
     """The 38 feeds one phone holds: `audience_key = key` on every registered table."""
     feeds = []
-    for table in w1_tables(gateway):
-        collection = gateway.gateway.registered_collection(table, allow_chat_projection_dependency=True)
+    for table, collection in sorted(w1_tables(gateway).items()):
         feeds.append({"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key"}), "where": eq("audience_key", key), "changesOnly": True, "subscription": gateway._subscription(table, account, identity)})
     return feeds
 
