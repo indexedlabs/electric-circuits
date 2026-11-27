@@ -15,8 +15,9 @@ pub(crate) struct SequencerHandle {
     pub(crate) processed: Arc<std::sync::Mutex<LogPosition>>,
     /// Per-table circuit topology (shared families + standalone count), for tests/observability.
     pub(crate) stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
-    /// Live per-node state summaries, merged across all tables, keyed by graph node id.
-    /// Republished after every processed batch and on shape add/remove; read by `GET /state`.
+    /// Per-node state summaries, merged across all tables, keyed by graph node id: the last map
+    /// broadcast to a `/trace` subscriber. `GET /state` asks the sequencer for a fresh one
+    /// ([`SequencerCmd::NodeStates`]) and reads this only if the sequencer does not answer.
     pub(crate) node_states: Arc<std::sync::Mutex<HashMap<String, NodeStateSummary>>>,
 }
 
@@ -115,6 +116,11 @@ pub(crate) enum SequencerCmd {
         node_id: String,
         resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
     },
+    /// Build the merged node-state map on request (see [`merged_node_states`]). Serves
+    /// `GET /state`; the per-page publish no longer builds it unless `/trace` has a subscriber.
+    NodeStates {
+        resp: tokio::sync::oneshot::Sender<HashMap<String, NodeStateSummary>>,
+    },
     /// On-demand owned-heap byte-walk of every table's live executor state (see
     /// `introspection::exec_heap_bytes`) — the memory probe's `bytes_executors` term. Sent only
     /// from `Engine::mem_bytes` (called by `GET /memory` or the slower diagnostic logger — never
@@ -200,22 +206,16 @@ pub(crate) fn spawn_sequencer(
     SequencerHandle { cmd_tx, processed, stats, node_states }
 }
 
-/// Rebuild + publish the merged node-state map and per-table stats to the sequencer's shared
-/// handles and, when anyone is subscribed to `/trace`, broadcast the merged map (plus the
-/// subquery registry's summaries) as a `{"type":"state"}` event.
-pub(crate) async fn publish_all(
+/// The merged node-state map across every table executor: what `GET /state` returns and `/trace`
+/// broadcasts. It holds an entry per shape, so building it costs time in proportion to every
+/// shape the engine holds; it is built only for a reader (OTTO-14463).
+pub(crate) fn merged_node_states(
     execs: &HashMap<String, TableExec>,
     offset: &str,
     emitted: &HashMap<String, u64>,
-    stats: &std::sync::Mutex<HashMap<TableRef, TableStats>>,
-    node_states: &std::sync::Mutex<HashMap<String, NodeStateSummary>>,
-    subqueries: &Arc<Mutex<SubqueryRegistry>>,
-    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
-) {
-    let mut stats_map = HashMap::new();
-    let mut merged: HashMap<String, NodeStateSummary> = HashMap::new();
+) -> HashMap<String, NodeStateSummary> {
+    let mut merged = HashMap::new();
     for exec in execs.values() {
-        stats_map.insert(exec.ts.table.clone(), stats_of(exec));
         merged.extend(build_node_states(
             &exec.ts,
             offset,
@@ -228,11 +228,32 @@ pub(crate) async fn publish_all(
             emitted,
         ));
     }
+    merged
+}
+
+/// Publish per-table stats to the sequencer's shared handle and, when anyone is subscribed to
+/// `/trace`, rebuild the merged node-state map and broadcast it (plus the subquery registry's
+/// summaries) as a `{"type":"state"}` event. With no subscriber the map is not built: `GET /state`
+/// asks for it with [`SequencerCmd::NodeStates`].
+pub(crate) async fn publish_all(
+    execs: &HashMap<String, TableExec>,
+    offset: &str,
+    emitted: &HashMap<String, u64>,
+    stats: &std::sync::Mutex<HashMap<TableRef, TableStats>>,
+    node_states: &std::sync::Mutex<HashMap<String, NodeStateSummary>>,
+    subqueries: &Arc<Mutex<SubqueryRegistry>>,
+    trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
+) {
+    let mut stats_map = HashMap::new();
+    for exec in execs.values() {
+        stats_map.insert(exec.ts.table.clone(), stats_of(exec));
+    }
     *stats.lock().unwrap() = stats_map;
-    *node_states.lock().unwrap() = merged.clone();
     if trace_tx.receiver_count() == 0 {
         return;
     }
+    let merged = merged_node_states(execs, offset, emitted);
+    *node_states.lock().unwrap() = merged.clone();
     let mut ev_nodes = merged;
     for (id, s) in subqueries.lock().await.state_summaries() {
         ev_nodes.insert(id, s);
@@ -681,6 +702,9 @@ pub(crate) async fn sequencer_loop(
                     let val =
                         execs.get(table.as_str()).and_then(|exec| dump_node_json(exec, &pos.to_string(), &emitted, &node_id));
                     let _ = resp.send(val);
+                }
+                Some(SequencerCmd::NodeStates { resp }) => {
+                    let _ = resp.send(merged_node_states(&execs, &pos.to_string(), &emitted));
                 }
                 Some(SequencerCmd::MemBytes { resp }) => {
                     // On-demand only (see the variant's doc comment): this sums `exec_heap_bytes`

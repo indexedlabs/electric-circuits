@@ -876,7 +876,9 @@ impl Engine {
     /// report a default source state so the visualizer can render a chip for every graph node.
     pub async fn state_snapshot(&self) -> StateSnapshot {
         let mut nodes: HashMap<String, NodeStateSummary> = HashMap::new();
-        {
+        // The sequencer builds its node states when asked (OTTO-14463), not after every page.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let asked = {
             let st = self.state.lock().await;
             for name in st.tables.keys() {
                 nodes.insert(
@@ -884,13 +886,20 @@ impl Engine {
                     NodeStateSummary::Table { processed_offset: "-1".to_string(), envelopes: 0 },
                 );
             }
-            if let Some(seq) = st.sequencer.as_ref()
-                && let Ok(m) = seq.node_states.lock()
-            {
-                for (k, v) in m.iter() {
-                    nodes.insert(k.clone(), v.clone());
+            match st.sequencer.as_ref() {
+                Some(seq) => {
+                    let sent = seq.cmd_tx.send(SequencerCmd::NodeStates { resp: tx }).is_ok();
+                    // No sequencer answering: fall back to the last map it broadcast, if any.
+                    if !sent && let Ok(m) = seq.node_states.lock() {
+                        nodes.extend(m.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    }
+                    sent
                 }
+                None => false,
             }
+        };
+        if asked && let Ok(built) = rx.await {
+            nodes.extend(built);
         }
         for (id, s) in self.subqueries.lock().await.state_summaries() {
             nodes.insert(id, s);
