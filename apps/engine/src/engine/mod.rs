@@ -41,6 +41,8 @@ pub(crate) mod group_load_log;
 mod held;
 mod introspection;
 mod lifecycle;
+#[cfg(test)]
+mod list_keys_tests;
 pub(crate) mod membership;
 mod output;
 mod planning;
