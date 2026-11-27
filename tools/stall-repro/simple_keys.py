@@ -1151,3 +1151,53 @@ def placement_summary(wheres, list_keys):
             scan_reasons["no equality in the top-level AND, and no OR with an equality in every branch"] += 1
     largest = buckets.most_common(3)
     return {"shapes": len(wheres), "filed_under_keys": kinds["keys"], "filed_under_one_leaf": kinds["leaf"], "scan_list": kinds["scan"], "by_columns": dict(columns), "scan_reasons": dict(scan_reasons), "distinct_keys": len(buckets), "largest_buckets": [{"column": key[0], "value": key[1], "shapes": count} for key, count in largest]}
+
+
+# B2: where the engine files the gateway's literal authorization filters for a one-Space reader, with
+# prod's single-key flag off and on (`b2_filters.json`, from circuits-coord: built by the gateway in
+# prod, ids replaced by placeholders). The harness adds nothing to them: no phone filter and no
+# stream identity. S-main3-b2-{off,on}-N: N one-Space readers, each with its own Space, user and
+# member id, one filter per collection.
+B2_READERS = (1, 40, 1000)
+B2_VARIANTS = {f"S-main3-b2-{flag}-{readers}": (flag, readers) for flag in ("off", "on") for readers in B2_READERS}
+# Rows for the timed commits are written for this account, whose Space and user no reader holds.
+B2_WRITER = 60
+
+
+def b2_filters():
+    from pathlib import Path
+    return json.loads((Path(__file__).parent / "b2_filters.json").read_text())["collections"]
+
+
+B2_TABLES = tuple(entry["table"] for entry in b2_filters())
+
+
+def b2_columns(where):
+    found = set()
+    def walk(node):
+        if isinstance(node, dict):
+            if "col" in node:
+                found.add(node["col"])
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(where)
+    return found
+
+
+def b2_catalog(gateway, flag, readers):
+    catalog = []
+    for reader in range(readers):
+        values = {"<SPACE>": str(synthetic_id(f"b2-space/{reader}")), "<USER>": str(synthetic_id(f"b2-user/{reader}")), "<ID_1>": str(synthetic_id(f"b2-member/{reader}"))}
+        for entry in b2_filters():
+            text = json.dumps(entry[flag]["where"])
+            for placeholder, value in values.items():
+                text = text.replace(placeholder, value)
+            where = json.loads(text)
+            table = entry["table"]
+            collection = gateway.gateway.registered_collection(table, allow_chat_projection_dependency=True)
+            body = {"table": f"public.{table}", "columns": sorted(set(collection.columns) | b2_columns(where)), "where": where, "changesOnly": True, "subscription": gateway._subscription(table, 1000 + reader, f"b2:{flag}")}
+            catalog.append({"kind": f"b2-{flag}", "account": 1000 + reader, "body": body, "has_subquery": False})
+    return catalog

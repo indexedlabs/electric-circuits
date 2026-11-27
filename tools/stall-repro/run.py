@@ -26,6 +26,7 @@ from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
 from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog, window_plan
 from simple_keys import HOME_TODAY, W6_ACCESS_ACCOUNTS, W6_MOVED_EDGES, W6_VARIANTS, placement_summary, plain_words_account, predicate_sql, w6_catalog, w6_requests, window_subsets
+from simple_keys import B2_TABLES, B2_VARIANTS, B2_WRITER, b2_catalog
 from simple_keys import W1_DELETED, W1_FAMILY_ROWS, W1_VARIANTS, w1_catalog, w1_feeds, w1_seed_accounts, w1_seed_families
 
 
@@ -107,6 +108,55 @@ W6_STEPS = ("w6-placement", "w6-restart", "w6-placement-restarted", "w6-access",
 # W7: 100 one-shot subset queries that carry a subquery, with the engine's counts before, right
 # after and W7_WAIT_S later (results/simple-keys/W7-SUBSET-RESIDUE.md).
 W7_WORKLOADS = ("w7-subsets",)
+# B2 (results/simple-keys/B2-SINGLE-KEY-PLACEMENT.md): `b2-commit-<table>` inserts 1,000 rows of one
+# table for an account no reader holds (`-r2`, `-r3` repeat it); `b2-placement` is the step of a
+# one-reader cell, whose counts are read while its filters are created.
+B2_COMMITS = tuple(f"b2-commit-{table}{suffix}" for table in B2_TABLES for suffix in ("", "-r2", "-r3"))
+B2_STEPS = ("b2-placement",)
+B2_ROWS = 1000
+
+
+def b2_add_columns(data, url):
+    """Columns the literal filters read that the harness's pinned schema (indexed 52e79b8) lacks."""
+    statements = []
+    if not any(column["name"] == "resource_space_id" for column in data.columns["resource_fact"]):
+        statement = "ALTER TABLE public.resource_fact ADD COLUMN resource_space_id uuid"
+        with psycopg.connect(url) as connection:
+            connection.execute(statement)
+        data.columns["resource_fact"].append({"name": "resource_space_id", "type": "UUID", "nullable": True, "primary_key": False, "server_default": None, "enum": None, "foreign_keys": []})
+        statements.append(statement)
+    return statements
+
+
+def b2_commit(data, workload):
+    """1,000 new rows of one table, all in the writer account's Space and under its user."""
+    name = workload.removeprefix("b2-commit-")
+    repeat = {"-r2": 1, "-r3": 2}.get(name[-3:], 0)
+    table = name[:-3] if repeat else name
+    def write(connection):
+        columns = [column["name"] for column in data.columns[table]]
+        rows = []
+        for ordinal in range(repeat * B2_ROWS, (repeat + 1) * B2_ROWS):
+            row = data.make(table, B2_WRITER, ordinal)
+            if table == "resource_fact":
+                # A live fact is unique per (Resource, fact type): one Resource per fact.
+                row |= {"resource_id": row_id("resource", B2_WRITER, ordinal), "resource_space_id": row_id("space", B2_WRITER)}
+            rows.append(row)
+        command = sql.SQL("COPY {} ({}) FROM STDIN").format(sql.Identifier("public", table), sql.SQL(",").join(map(sql.Identifier, columns)))
+        with connection.cursor().copy(command) as copier:
+            for row in rows:
+                copier.write_row([row[column] for column in columns])
+        return [{"table": table, "operation": "insert", "rows": len(rows)}]
+    return write
+
+
+async def table_counts(client, table):
+    """What the engine says it holds on one table: `GET /tables/{table}/families` and `/memory`'s counts."""
+    response = await client.get(f"{ENGINE_URL}/tables/public.{table}/families")
+    counts = response.json() if response.status_code == 200 else {"families": [], "standalone": 0, "scan": 0, "circuit": 0, "no_tailer": True}
+    cardinalities = (await client.get(f"{ENGINE_URL}/memory")).json()["cardinalities"]
+    return {"table": counts, "engine": {key: cardinalities[key] for key in ("shapes", "standalone", "families", "family_shapes", "subquery_shapes")}}
+
 W7_QUERIES = 100
 W7_WAIT_S = 120
 W7_TABLES = ("record", "record_date_index", "record_recurrence", "assignment", "graph_edge", "calendar_event")
@@ -143,7 +193,7 @@ def w7_operation(queries, process):
         return [{"table": "w7", "operation": "subset-queries", "rows": sum(answer["rows"] or 0 for answer in answers), "answers": answers, "before": before, "after": after, "after_wait": later, "wait_s": W7_WAIT_S}]
     return operation
 
-AUDIT_WORKLOADS = (*H1_COMMITS, *EDGE_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
+AUDIT_WORKLOADS = (*H1_COMMITS, *EDGE_COMMITS, *B2_COMMITS, *(f"cold-{table}" for table in COLD_TABLES), "flip-add", "flip-remove", "import-noresource", "writer-subtree", "writer-user", "writer-merge", "writer-files")
 
 
 # PLAIN-WORDS-3 run 3: window loads, each way on its own engine. `window-<kind>-<way>` loads every
@@ -431,6 +481,8 @@ def audit_operation(data, workload):
     if workload in H1_COMMITS:
         # 1,000 Record updates, 20 in each of the 50 Spaces that hold Records.
         return lambda connection: [{"table": "record", "operation": "update", "rows": data.update(connection, "record", account, 20)} for account in H1_DATA_ACCOUNTS]
+    if workload in B2_COMMITS:
+        return b2_commit(data, workload)
     if workload in EDGE_COMMITS:
         return lambda connection: [{"table": "graph_edge", "operation": "update", "rows": data.update(connection, "graph_edge", account, 20)} for account in H1_DATA_ACCOUNTS]
     if workload == "cold-resource_share":
@@ -544,7 +596,7 @@ def paced_delete_account(data, url, account, fence_user, fence_generation, valid
     return journal
 
 
-async def wait_for_marker(client, validator, source_commit_id, user_id, generation, timeout, process=None):
+async def wait_for_marker(client, validator, source_commit_id, user_id, generation, timeout, process=None, poll=0.2):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -560,7 +612,7 @@ async def wait_for_marker(client, validator, source_commit_id, user_id, generati
                     return {"receipt": response.json(), "queue": state.json()}
         except httpx.HTTPError as error:
             last = repr(error)
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(poll)
     raise TimeoutError(f"Workload did not drain in {timeout}s; last observation: {last}")
 
 
@@ -630,7 +682,7 @@ COLD_VARIANTS = {"B-cold", "B-cold-key-edges"}
 AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
 # The catalogs made of one table's keyed filters and the bystander's probe feed only: H1 and
 # PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix) and run 2 (keyed `graph_edge` filters).
-H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS) | set(W6_VARIANTS)
+H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS) | set(W6_VARIANTS) | set(B2_VARIANTS)
 FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed} | {variant for variant, (_, way) in EDGE_VARIANTS.items() if way != "today"}
 ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE | set(W1_VARIANTS)
 BRIDGE_ENVIRONMENT = {
@@ -682,6 +734,8 @@ async def run(args):
             published = [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]]
             statements += await asyncio.to_thread(data.add_audience_columns, PG_URL, [table for table in published if table not in SIMPLE_KEYED])
         (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
+    if args.variant in B2_VARIANTS:
+        (output / "audience-schema.sql").write_text(";\n".join(await asyncio.to_thread(b2_add_columns, data, PG_URL)) + ";\n")
     help_probe = subprocess.run([str(Path(args.store).resolve()), "--help"], capture_output=True, text=True)
     (output / "store-help.txt").write_text(help_probe.stdout + help_probe.stderr)
     supports_page_cap = b"--max-chunk-bytes" in Path(args.store).read_bytes()
@@ -795,6 +849,8 @@ async def run(args):
                 catalog = edge_catalog(gateway, *EDGE_VARIANTS[args.variant])
             if args.variant in W6_VARIANTS:
                 catalog = w6_catalog(gateway, W6_VARIANTS[args.variant][0])
+            if args.variant in B2_VARIANTS:
+                catalog = b2_catalog(gateway, *B2_VARIANTS[args.variant])
             if args.variant in {"half-subqueries", "plain-only"}:
                 retained = round(TARGETS[args.catalog]["subquery_shapes"] / 2) - 8 if args.variant == "half-subqueries" else 0
                 catalog = control_catalog(catalog, retained)
@@ -820,6 +876,18 @@ async def run(args):
                     if created % 500 == 0:
                         print(f"Created {created}/{len(catalog)} shapes", flush=True)
                     return response.json()
+            if args.variant in B2_VARIANTS and B2_VARIANTS[args.variant][1] == 1:
+                # The one-reader cell: each filter is created on its own, with the engine's counts for
+                # its table read just before and just after, before any other shape exists on it.
+                placements = []
+                for request in catalog:
+                    table = request["body"]["table"].removeprefix("public.")
+                    before = await table_counts(client, table)
+                    handle = await create(request)
+                    after = await table_counts(client, table)
+                    placements.append({"table": table, "single_key": B2_VARIANTS[args.variant][0], "shape": handle["shapeId"], "where": request["body"]["where"], "before": before, "after": after})
+                save(output / "b2-placement-result.json", {"workload": "b2-placement", "engine_source": args.engine_source, "list_keys": env.get("ELECTRIC_CIRCUITS_LIST_KEYS"), "placements": placements})
+                catalog = []
             try:
                 handles = await asyncio.gather(*(create(request) for request in catalog))
             except RuntimeError:
@@ -941,6 +1009,8 @@ async def run(args):
                     carrying = [body for body in subsets if '"in":' in json.dumps(body["where"])]
                     w7_queries.append(carrying[index % len(carrying)])
             for workload in args.workloads:
+                if workload in B2_STEPS:
+                    continue
                 if workload in W6_STEPS:
                     step = {"workload": workload, "at": time.time()}
                     if workload.startswith("w6-placement"):
@@ -1103,7 +1173,8 @@ async def run(args):
                     save(output / f"{workload}-writes.json", journal)
                     result["row_changes"] = sum(entry["rows"] for entry in journal)
                     result["source_write_s"] = time.monotonic() - began
-                    result["completion"] = await wait_for_marker(client, validator, fence_id, fence_user, fence_generation, args.timeout, process)
+                    # B2 compares commits near the 0.2 s floor, so its receipt is polled every 20 ms.
+                    result["completion"] = await wait_for_marker(client, validator, fence_id, fence_user, fence_generation, args.timeout, process, poll=0.02 if workload in B2_COMMITS else 0.2)
                     result["completed"] = True
                     if workload in W1_WORKLOADS:
                         result["loads"] = loads_summary(output, workload)
@@ -1234,5 +1305,5 @@ if __name__ == "__main__":
     parser.add_argument("--probe-interval", type=float, default=1.0, help="seconds between the bystander's probe ticks")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS, *W1_WORKLOADS, *W6_STEPS, *W7_WORKLOADS), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS, *W1_WORKLOADS, *W6_STEPS, *W7_WORKLOADS, *B2_STEPS), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

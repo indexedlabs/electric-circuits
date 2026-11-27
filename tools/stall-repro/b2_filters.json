@@ -1,0 +1,1696 @@
+{
+ "source": "circuits-coord, 2026-11-27: the gateway's literal authorization filters for a one-Space reader, built by the gateway in prod, ids replaced by placeholders",
+ "reader": "reader internal spaces 1 calendars 9 members 1",
+ "collections": [
+  {
+   "table": "record",
+   "reads_through_one_key": true,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "or": [
+          {
+           "col": "space_id",
+           "op": "eq",
+           "value": "<SPACE>"
+          }
+         ]
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "type",
+         "isNull": true
+        },
+        {
+         "and": [
+          {
+           "col": "type",
+           "op": "neq",
+           "value": "busy_block"
+          },
+          {
+           "col": "type",
+           "op": "neq",
+           "value": "legacy_preference"
+          },
+          {
+           "col": "type",
+           "op": "neq",
+           "value": "family_context_report"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "and": [
+      {
+       "col": "space_id",
+       "op": "eq",
+       "value": "<SPACE>"
+      },
+      {
+       "or": [
+        {
+         "col": "type",
+         "isNull": true
+        },
+        {
+         "and": [
+          {
+           "col": "type",
+           "op": "neq",
+           "value": "busy_block"
+          },
+          {
+           "col": "type",
+           "op": "neq",
+           "value": "legacy_preference"
+          },
+          {
+           "col": "type",
+           "op": "neq",
+           "value": "family_context_report"
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "record_assignee_index",
+   "reads_through_one_key": true,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "or": [
+      {
+       "col": "space_id",
+       "op": "eq",
+       "value": "<SPACE>"
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "col": "space_id",
+     "op": "eq",
+     "value": "<SPACE>"
+    }
+   }
+  },
+  {
+   "table": "record_completed_index",
+   "reads_through_one_key": true,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "or": [
+      {
+       "col": "space_id",
+       "op": "eq",
+       "value": "<SPACE>"
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "col": "space_id",
+     "op": "eq",
+     "value": "<SPACE>"
+    }
+   }
+  },
+  {
+   "table": "record_date_index",
+   "reads_through_one_key": true,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "or": [
+      {
+       "col": "space_id",
+       "op": "eq",
+       "value": "<SPACE>"
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "col": "space_id",
+     "op": "eq",
+     "value": "<SPACE>"
+    }
+   }
+  },
+  {
+   "table": "record_recurrence",
+   "reads_through_one_key": true,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "or": [
+      {
+       "col": "space_id",
+       "op": "eq",
+       "value": "<SPACE>"
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "filed under the reader's own key: space_id = <SPACE>",
+    "where": {
+     "col": "space_id",
+     "op": "eq",
+     "value": "<SPACE>"
+    }
+   }
+  },
+  {
+   "table": "assignment",
+   "reads_through_one_key": false,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "variable",
+         "op": "eq",
+         "value": "origin"
+        },
+        {
+         "col": "variable",
+         "op": "eq",
+         "value": "driver"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        }
+       ]
+      },
+      {
+       "or": [
+        {
+         "col": "variable",
+         "op": "eq",
+         "value": "origin"
+        },
+        {
+         "col": "variable",
+         "op": "eq",
+         "value": "driver"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "calendar_event",
+   "reads_through_one_key": true,
+   "off": {
+    "expected": "filed under a shared value: is_busy_block = False",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "user_id",
+         "op": "eq",
+         "value": "<USER>"
+        }
+       ]
+      },
+      {
+       "and": [
+        {
+         "col": "is_busy_block",
+         "op": "eq",
+         "value": false
+        },
+        {
+         "or": [
+          {
+           "and": [
+            {
+             "col": "deleted_at",
+             "isNull": true
+            },
+            {
+             "col": "status",
+             "op": "neq",
+             "value": "cancelled"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "status",
+             "op": "eq",
+             "value": "cancelled"
+            },
+            {
+             "col": "original_start_time",
+             "isNull": false
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "filed under the reader's own key: user_id = <USER>",
+    "where": {
+     "and": [
+      {
+       "col": "user_id",
+       "op": "eq",
+       "value": "<USER>"
+      },
+      {
+       "and": [
+        {
+         "col": "is_busy_block",
+         "op": "eq",
+         "value": false
+        },
+        {
+         "or": [
+          {
+           "and": [
+            {
+             "col": "deleted_at",
+             "isNull": true
+            },
+            {
+             "col": "status",
+             "op": "neq",
+             "value": "cancelled"
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "status",
+             "op": "eq",
+             "value": "cancelled"
+            },
+            {
+             "col": "original_start_time",
+             "isNull": false
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "graph_edge",
+   "reads_through_one_key": false,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "col": "deleted_at",
+       "isNull": true
+      },
+      {
+       "col": "detached_at",
+       "isNull": true
+      },
+      {
+       "or": [
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_attendee"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_driver"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_subject"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "origin_of"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "generated"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "updated"
+              }
+             ]
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "record"
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "generated"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "updated"
+              }
+             ]
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "parent_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "caregiver_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "partner_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "pet_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "in_family_circle_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "attends_school"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "parent_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "caregiver_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "partner_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "pet_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "in_family_circle_of"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "scope_type",
+               "isNull": true
+              },
+              {
+               "and": [
+                {
+                 "col": "scope_type",
+                 "op": "eq",
+                 "value": "space"
+                },
+                {
+                 "or": [
+                  {
+                   "col": "scope_id",
+                   "op": "eq",
+                   "value": "<SPACE>"
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "generated"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "triggered_by"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "accepted_as"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "references"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "tagged_with"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "attached_to"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "child_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "shared_with"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "posted_to"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "mentions"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "focuses_on"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "merged_into"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "source_audio"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "attends_school"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "participates_in"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "patient_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "client_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "provides_service_at"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "in_family_circle_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "parent_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "caregiver_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "partner_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "pet_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_teacher"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "located_at"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "lives_at"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "works_at"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "col": "edge_type",
+             "op": "eq",
+             "value": "relates_to"
+            },
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "col": "deleted_at",
+       "isNull": true
+      },
+      {
+       "col": "detached_at",
+       "isNull": true
+      },
+      {
+       "or": [
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_attendee"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_driver"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_subject"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "origin_of"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "generated"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "updated"
+              }
+             ]
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "record"
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "generated"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "updated"
+              }
+             ]
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "parent_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "caregiver_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "partner_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "pet_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "in_family_circle_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "attends_school"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "and": [
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "parent_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "caregiver_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "partner_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "pet_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "in_family_circle_of"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "or": [
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        },
+        {
+         "or": [
+          {
+           "and": [
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "scope_type",
+               "isNull": true
+              },
+              {
+               "and": [
+                {
+                 "col": "scope_type",
+                 "op": "eq",
+                 "value": "space"
+                },
+                {
+                 "or": [
+                  {
+                   "col": "scope_id",
+                   "op": "eq",
+                   "value": "<SPACE>"
+                  }
+                 ]
+                }
+               ]
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "generated"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "triggered_by"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "accepted_as"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "references"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "tagged_with"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "attached_to"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "child_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "shared_with"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "posted_to"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "mentions"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "focuses_on"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "merged_into"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "source_audio"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "attends_school"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "participates_in"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "patient_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "client_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "provides_service_at"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "in_family_circle_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "parent_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "caregiver_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "partner_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "pet_of"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "has_teacher"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "located_at"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "lives_at"
+              },
+              {
+               "col": "edge_type",
+               "op": "eq",
+               "value": "works_at"
+              }
+             ]
+            }
+           ]
+          },
+          {
+           "and": [
+            {
+             "col": "scope_type",
+             "isNull": true
+            },
+            {
+             "col": "scope_id",
+             "isNull": true
+            },
+            {
+             "col": "from_type",
+             "op": "eq",
+             "value": "record"
+            },
+            {
+             "col": "to_type",
+             "op": "eq",
+             "value": "resource"
+            },
+            {
+             "col": "edge_type",
+             "op": "eq",
+             "value": "relates_to"
+            },
+            {
+             "or": [
+              {
+               "col": "from_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            },
+            {
+             "or": [
+              {
+               "col": "to_space_id",
+               "op": "eq",
+               "value": "<SPACE>"
+              }
+             ]
+            }
+           ]
+          }
+         ]
+        }
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "user",
+   "reads_through_one_key": false,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "or": [
+      {
+       "col": "id",
+       "op": "eq",
+       "value": "<ID_1>"
+      },
+      {
+       "col": "id",
+       "op": "eq",
+       "value": "<USER>"
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "or": [
+      {
+       "col": "id",
+       "op": "eq",
+       "value": "<ID_1>"
+      },
+      {
+       "col": "id",
+       "op": "eq",
+       "value": "<USER>"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "resource_fact",
+   "reads_through_one_key": false,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "resource_space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        }
+       ]
+      },
+      {
+       "col": "deleted_at",
+       "isNull": true
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "resource_space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        }
+       ]
+      },
+      {
+       "col": "deleted_at",
+       "isNull": true
+      }
+     ]
+    }
+   }
+  },
+  {
+   "table": "resource",
+   "reads_through_one_key": false,
+   "off": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        }
+       ]
+      },
+      {
+       "col": "deleted_at",
+       "isNull": true
+      },
+      {
+       "col": "superseded_by_resource_id",
+       "isNull": true
+      },
+      {
+       "or": [
+        {
+         "col": "resource_type",
+         "isNull": true
+        },
+        {
+         "col": "resource_type",
+         "op": "neq",
+         "value": "calendar"
+        }
+       ]
+      }
+     ]
+    }
+   },
+   "on": {
+    "expected": "scan list (no plain equality in the top-level AND chain)",
+    "where": {
+     "and": [
+      {
+       "or": [
+        {
+         "col": "space_id",
+         "op": "eq",
+         "value": "<SPACE>"
+        }
+       ]
+      },
+      {
+       "col": "deleted_at",
+       "isNull": true
+      },
+      {
+       "col": "superseded_by_resource_id",
+       "isNull": true
+      },
+      {
+       "or": [
+        {
+         "col": "resource_type",
+         "isNull": true
+        },
+        {
+         "col": "resource_type",
+         "op": "neq",
+         "value": "calendar"
+        }
+       ]
+      }
+     ]
+    }
+   }
+  }
+ ]
+}
