@@ -977,6 +977,8 @@ async def run(args):
                         def move_edges():
                             moved = 0
                             with psycopg.connect(PG_URL) as connection:
+                                # As every fixture write: the written Spaces of accounts 20-50 have no `space` row.
+                                connection.execute("SET LOCAL session_replication_role = replica")
                                 for index, account in enumerate(H1_DATA_ACCOUNTS):
                                     target = row_id("space", H1_DATA_ACCOUNTS[(index + 1) % len(H1_DATA_ACCOUNTS)])
                                     ids = [row["id"] for row in data.rows[("graph_edge", account)][:W6_MOVED_EDGES]]
