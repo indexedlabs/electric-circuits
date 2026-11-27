@@ -194,7 +194,7 @@ line overstates the middle: read between the measured 1,000 and 5,000 points, 2 
 **Reading.**
 
 - **Other readers, today:** at 1,000 filters every drain arrives but waits about 0.5 s; at 5,000
-  the bystander gets 25 of 58 drains (a third to a half across passes).
+  the bystander gets 25 of 58 drains (a quarter to a half across passes).
 - **The split's remaining slope** is the 1 in 20 accounts left on shared values (294 filters at
   5,000). Splitting their feeds per Space, as S does, is not measured here.
 - **Not measured:** the split's extra shapes on phones, and whether the gateway can address two
