@@ -1,0 +1,56 @@
+{
+  "workload": "w6-placement",
+  "at": 1795772118.2328618,
+  "engine_table": {
+    "families": [],
+    "standalone": 100,
+    "scan": 0,
+    "circuit": 0
+  },
+  "cardinalities": {
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 101,
+    "shapes_dormant": 0,
+    "standalone": 101,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0,
+    "tables": 44,
+    "tailers": 2
+  },
+  "harness_copy_of_the_rule": {
+    "shapes": 100,
+    "filed_under_keys": 100,
+    "filed_under_one_leaf": 0,
+    "scan_list": 0,
+    "by_columns": {
+      "from_space_id+to_space_id": 20,
+      "from_id": 79,
+      "from_id+from_space_id+partner_hidden+to_space_id": 1
+    },
+    "scan_reasons": {},
+    "distinct_keys": 121,
+    "largest_buckets": [
+      {
+        "column": "from_space_id",
+        "value": "2b55ad11-6ab5-5fb5-a941-86ce7df4f56d",
+        "shapes": 2
+      },
+      {
+        "column": "to_space_id",
+        "value": "2b55ad11-6ab5-5fb5-a941-86ce7df4f56d",
+        "shapes": 2
+      },
+      {
+        "column": "from_space_id",
+        "value": "4687fed2-36e4-507f-a0ea-3644b748e88e",
+        "shapes": 1
+      }
+    ]
+  },
+  "rss_bytes": 67403776
+}

@@ -1,0 +1,50 @@
+{
+  "workload": "w6-placement",
+  "at": 1795772210.6567826,
+  "engine_table": {
+    "families": [],
+    "standalone": 1000,
+    "scan": 0,
+    "circuit": 0
+  },
+  "cardinalities": {
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 1001,
+    "shapes_dormant": 0,
+    "standalone": 1001,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0,
+    "tables": 44,
+    "tailers": 2
+  },
+  "harness_copy_of_the_rule": {
+    "shapes": 1000,
+    "filed_under_keys": 0,
+    "filed_under_one_leaf": 1000,
+    "scan_list": 0,
+    "by_columns": {
+      "to_type": 211,
+      "from_type": 789
+    },
+    "scan_reasons": {},
+    "distinct_keys": 2,
+    "largest_buckets": [
+      {
+        "column": "from_type",
+        "value": "record",
+        "shapes": 789
+      },
+      {
+        "column": "to_type",
+        "value": "resource",
+        "shapes": 211
+      }
+    ]
+  },
+  "rss_bytes": 95133696
+}

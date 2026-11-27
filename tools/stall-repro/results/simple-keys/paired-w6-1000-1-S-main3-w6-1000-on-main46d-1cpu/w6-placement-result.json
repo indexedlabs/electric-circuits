@@ -1,0 +1,55 @@
+{
+  "workload": "w6-placement",
+  "at": 1795772107.9475503,
+  "engine_table": {
+    "families": [],
+    "standalone": 1000,
+    "scan": 0,
+    "circuit": 0
+  },
+  "cardinalities": {
+    "families": 0,
+    "family_shapes": 0,
+    "shapes": 1001,
+    "shapes_dormant": 0,
+    "standalone": 1001,
+    "subquery_contributors": 0,
+    "subquery_distinct_values": 0,
+    "subquery_edges": 0,
+    "subquery_feed_entries": 0,
+    "subquery_nodes": 0,
+    "subquery_shapes": 0,
+    "tables": 44,
+    "tailers": 2
+  },
+  "harness_copy_of_the_rule": {
+    "shapes": 1000,
+    "filed_under_keys": 1000,
+    "filed_under_one_leaf": 0,
+    "scan_list": 0,
+    "by_columns": {
+      "from_space_id+to_space_id": 211,
+      "from_id": 789
+    },
+    "scan_reasons": {},
+    "distinct_keys": 1185,
+    "largest_buckets": [
+      {
+        "column": "from_space_id",
+        "value": "11cea902-7775-5317-9fd6-d0770a34fcf5",
+        "shapes": 3
+      },
+      {
+        "column": "to_space_id",
+        "value": "11cea902-7775-5317-9fd6-d0770a34fcf5",
+        "shapes": 3
+      },
+      {
+        "column": "from_space_id",
+        "value": "eac59583-ec65-58a5-96cf-bf93f838932f",
+        "shapes": 3
+      }
+    ]
+  },
+  "rss_bytes": 103251968
+}
