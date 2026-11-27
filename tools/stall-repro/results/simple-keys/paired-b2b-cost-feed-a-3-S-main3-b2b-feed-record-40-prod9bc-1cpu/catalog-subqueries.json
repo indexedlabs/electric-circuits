@@ -1,0 +1,567 @@
+{
+  "status": 200,
+  "body": {
+    "nodes": [
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"03cbdf55-ac29-5924-85d0-a61204f0949e\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"03cbdf55-ac29-5924-85d0-a61204f0949e\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0594e84b-7956-5e36-8666-8d05ca904b7d\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0594e84b-7956-5e36-8666-8d05ca904b7d\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"099012b0-db54-594d-9fa5-12aeada7f896\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"099012b0-db54-594d-9fa5-12aeada7f896\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0b4c8bdb-c011-5d9b-8ce9-fda13d2ad3d1\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0b4c8bdb-c011-5d9b-8ce9-fda13d2ad3d1\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0d780e9f-591a-5b96-9fef-8fde609c3343\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0d780e9f-591a-5b96-9fef-8fde609c3343\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0ec230fd-2ef2-5f19-bf1a-9fad9b4f4fb6\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"0ec230fd-2ef2-5f19-bf1a-9fad9b4f4fb6\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"11a82f69-a51e-57ff-9cad-7643a327ea4b\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"11a82f69-a51e-57ff-9cad-7643a327ea4b\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"35c831e1-7b90-5fd5-8cdd-d2b6bfef7c24\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"35c831e1-7b90-5fd5-8cdd-d2b6bfef7c24\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"40a6dec9-865b-540b-ba92-95ea52416979\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"40a6dec9-865b-540b-ba92-95ea52416979\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"4baf8281-a4ec-5ca5-b396-13b783d7307f\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"4baf8281-a4ec-5ca5-b396-13b783d7307f\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"545ec0a7-f107-50b8-9b2a-22a1b463f9ad\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"545ec0a7-f107-50b8-9b2a-22a1b463f9ad\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"5a5ca89e-3bef-5e26-ade0-5ce1ef5e6410\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"5a5ca89e-3bef-5e26-ade0-5ce1ef5e6410\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"5bf5bb77-0574-57af-9853-c761d4bb862a\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"5bf5bb77-0574-57af-9853-c761d4bb862a\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"5c5ae3d8-2e07-5f42-8b27-93f8f749f5af\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"5c5ae3d8-2e07-5f42-8b27-93f8f749f5af\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"73fee9f9-52c6-5c38-9849-a85159810263\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"73fee9f9-52c6-5c38-9849-a85159810263\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"835d28d3-48e4-5673-8f0f-b1aa08cd9c73\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"835d28d3-48e4-5673-8f0f-b1aa08cd9c73\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"89fda201-f80c-5e7d-98a1-9b017cfcd5de\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"89fda201-f80c-5e7d-98a1-9b017cfcd5de\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"8e44704e-6d85-547d-b4fa-1cb596866d6e\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"8e44704e-6d85-547d-b4fa-1cb596866d6e\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"8ec37970-4ea7-5b82-b204-d0bba95d7688\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"8ec37970-4ea7-5b82-b204-d0bba95d7688\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"9361e263-9e84-5991-a22d-9694dbba5b5b\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"9361e263-9e84-5991-a22d-9694dbba5b5b\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"9e073267-a642-59d1-b9f2-5a6718676b7c\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"9e073267-a642-59d1-b9f2-5a6718676b7c\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"9e71de90-5980-54bc-91ab-e0403fdb858a\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"9e71de90-5980-54bc-91ab-e0403fdb858a\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"a28d5a7f-b8ac-58c3-94c2-bf457a257ece\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"a28d5a7f-b8ac-58c3-94c2-bf457a257ece\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"a67657c0-09cc-58bf-85be-2fad464bcace\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"a67657c0-09cc-58bf-85be-2fad464bcace\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"b5b6c4f7-14f4-5cf8-b1de-1557325e6121\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"b5b6c4f7-14f4-5cf8-b1de-1557325e6121\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"b786f006-6bf9-5dce-a670-6bf5703c0c42\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"b786f006-6bf9-5dce-a670-6bf5703c0c42\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"b8fa75d0-673d-562b-8b28-f263cfe62be9\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"b8fa75d0-673d-562b-8b28-f263cfe62be9\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c6cd81b2-f934-513b-b1fe-9fd2210ba7c5\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c6cd81b2-f934-513b-b1fe-9fd2210ba7c5\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c867cc21-5f14-5587-b424-3fbae771f370\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c867cc21-5f14-5587-b424-3fbae771f370\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"cac677d8-8d07-5741-bc72-6208204e9f56\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"cac677d8-8d07-5741-bc72-6208204e9f56\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"cf823a9a-7a7f-5e2e-9fdd-02b9c772f9fb\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"cf823a9a-7a7f-5e2e-9fdd-02b9c772f9fb\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"d58d53bf-7182-5654-9c4e-20b56bd4ec83\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"d58d53bf-7182-5654-9c4e-20b56bd4ec83\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"e7542895-d27d-5b36-80d4-261b7f6f9e68\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"e7542895-d27d-5b36-80d4-261b7f6f9e68\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ec08a716-c887-5005-9a22-4ab587964640\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ec08a716-c887-5005-9a22-4ab587964640\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ee5d433b-33a2-5942-bab4-cd37594bf3cb\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ee5d433b-33a2-5942-bab4-cd37594bf3cb\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"f3bc0001-3e35-5db9-9c92-1ab14f78200e\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"f3bc0001-3e35-5db9-9c92-1ab14f78200e\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"fc79b74f-bc13-5ac7-80a0-8b99f354f87a\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"fc79b74f-bc13-5ac7-80a0-8b99f354f87a\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ffbc6757-6a47-5784-9121-0d8d5dbc80b5\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ffbc6757-6a47-5784-9121-0d8d5dbc80b5\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ffc126e1-841e-56bb-badb-be2b23f39a06\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"ffc126e1-841e-56bb-badb-be2b23f39a06\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"03cbdf55-ac29-5924-85d0-a61204f0949e\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"03cbdf55-ac29-5924-85d0-a61204f0949e\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"0594e84b-7956-5e36-8666-8d05ca904b7d\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"0594e84b-7956-5e36-8666-8d05ca904b7d\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"099012b0-db54-594d-9fa5-12aeada7f896\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"099012b0-db54-594d-9fa5-12aeada7f896\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"0b4c8bdb-c011-5d9b-8ce9-fda13d2ad3d1\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"0b4c8bdb-c011-5d9b-8ce9-fda13d2ad3d1\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"0d780e9f-591a-5b96-9fef-8fde609c3343\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"0d780e9f-591a-5b96-9fef-8fde609c3343\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"0ec230fd-2ef2-5f19-bf1a-9fad9b4f4fb6\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"0ec230fd-2ef2-5f19-bf1a-9fad9b4f4fb6\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"11a82f69-a51e-57ff-9cad-7643a327ea4b\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"11a82f69-a51e-57ff-9cad-7643a327ea4b\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"35c831e1-7b90-5fd5-8cdd-d2b6bfef7c24\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"35c831e1-7b90-5fd5-8cdd-d2b6bfef7c24\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"40a6dec9-865b-540b-ba92-95ea52416979\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"40a6dec9-865b-540b-ba92-95ea52416979\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"4baf8281-a4ec-5ca5-b396-13b783d7307f\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"4baf8281-a4ec-5ca5-b396-13b783d7307f\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"545ec0a7-f107-50b8-9b2a-22a1b463f9ad\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"545ec0a7-f107-50b8-9b2a-22a1b463f9ad\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"5a5ca89e-3bef-5e26-ade0-5ce1ef5e6410\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"5a5ca89e-3bef-5e26-ade0-5ce1ef5e6410\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"5bf5bb77-0574-57af-9853-c761d4bb862a\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"5bf5bb77-0574-57af-9853-c761d4bb862a\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"5c5ae3d8-2e07-5f42-8b27-93f8f749f5af\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"5c5ae3d8-2e07-5f42-8b27-93f8f749f5af\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"73fee9f9-52c6-5c38-9849-a85159810263\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"73fee9f9-52c6-5c38-9849-a85159810263\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"835d28d3-48e4-5673-8f0f-b1aa08cd9c73\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"835d28d3-48e4-5673-8f0f-b1aa08cd9c73\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"89fda201-f80c-5e7d-98a1-9b017cfcd5de\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"89fda201-f80c-5e7d-98a1-9b017cfcd5de\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"8e44704e-6d85-547d-b4fa-1cb596866d6e\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"8e44704e-6d85-547d-b4fa-1cb596866d6e\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"8ec37970-4ea7-5b82-b204-d0bba95d7688\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"8ec37970-4ea7-5b82-b204-d0bba95d7688\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"9361e263-9e84-5991-a22d-9694dbba5b5b\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"9361e263-9e84-5991-a22d-9694dbba5b5b\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"9e073267-a642-59d1-b9f2-5a6718676b7c\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"9e073267-a642-59d1-b9f2-5a6718676b7c\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"9e71de90-5980-54bc-91ab-e0403fdb858a\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"9e71de90-5980-54bc-91ab-e0403fdb858a\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"a28d5a7f-b8ac-58c3-94c2-bf457a257ece\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"a28d5a7f-b8ac-58c3-94c2-bf457a257ece\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"a67657c0-09cc-58bf-85be-2fad464bcace\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"a67657c0-09cc-58bf-85be-2fad464bcace\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"b5b6c4f7-14f4-5cf8-b1de-1557325e6121\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"b5b6c4f7-14f4-5cf8-b1de-1557325e6121\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"b786f006-6bf9-5dce-a670-6bf5703c0c42\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"b786f006-6bf9-5dce-a670-6bf5703c0c42\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"b8fa75d0-673d-562b-8b28-f263cfe62be9\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"b8fa75d0-673d-562b-8b28-f263cfe62be9\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"c6cd81b2-f934-513b-b1fe-9fd2210ba7c5\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"c6cd81b2-f934-513b-b1fe-9fd2210ba7c5\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"c867cc21-5f14-5587-b424-3fbae771f370\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"c867cc21-5f14-5587-b424-3fbae771f370\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"cac677d8-8d07-5741-bc72-6208204e9f56\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"cac677d8-8d07-5741-bc72-6208204e9f56\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"cf823a9a-7a7f-5e2e-9fdd-02b9c772f9fb\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"cf823a9a-7a7f-5e2e-9fdd-02b9c772f9fb\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"d58d53bf-7182-5654-9c4e-20b56bd4ec83\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"d58d53bf-7182-5654-9c4e-20b56bd4ec83\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"e7542895-d27d-5b36-80d4-261b7f6f9e68\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"e7542895-d27d-5b36-80d4-261b7f6f9e68\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"ec08a716-c887-5005-9a22-4ab587964640\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"ec08a716-c887-5005-9a22-4ab587964640\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"ee5d433b-33a2-5942-bab4-cd37594bf3cb\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"ee5d433b-33a2-5942-bab4-cd37594bf3cb\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"f3bc0001-3e35-5db9-9c92-1ab14f78200e\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"f3bc0001-3e35-5db9-9c92-1ab14f78200e\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"fc79b74f-bc13-5ac7-80a0-8b99f354f87a\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"fc79b74f-bc13-5ac7-80a0-8b99f354f87a\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"ffbc6757-6a47-5784-9121-0d8d5dbc80b5\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"ffbc6757-6a47-5784-9121-0d8d5dbc80b5\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 2,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"ffc126e1-841e-56bb-badb-be2b23f39a06\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"ffc126e1-841e-56bb-badb-be2b23f39a06\")))"
+      }
+    ]
+  }
+}

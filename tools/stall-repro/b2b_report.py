@@ -36,7 +36,7 @@ def counted(entry, has_scan):
     families = sum(family["shapes"] for family in after["table"]["families"]) - sum(family["shapes"] for family in before["table"]["families"])
     standalone = after["table"]["standalone"] - before["table"]["standalone"]
     if engine["subquery_shapes"] == 1:
-        return f"subquery shape +1 ({engine['subquery_nodes']} nodes), standalone +{standalone}: not in the standalone index", "subquery"
+        return f"subquery shape +1, standalone +{standalone}: not in the standalone index, so no count says where it is filed", "subquery"
     if families == 1 and standalone == 0:
         return f"equality family +1 (key column {after['table']['families'][0]['key_cols'][0]}), standalone +0", "family"
     if standalone == 1 and has_scan:
@@ -65,7 +65,7 @@ def main(root):
     counts = {(binary, form): placement(root, binary, form) for binary in ("main46d", "prod9bc") for form, _ in FORMS}
     print("| Table | Form | Expected placement | Observed on main (counts) | Observed on 9bc1563 (cost, 40 → 1,000 readers) | Match |")
     print("| --- | --- | --- | --- | --- | --- |")
-    matches, misses = 0, []
+    matches, misses, cost_only = 0, [], []
     for entry in filters():
         table = entry["table"]
         for form, label in FORMS:
@@ -76,7 +76,7 @@ def main(root):
             if small and large:
                 low, high = statistics.median(small), statistics.median(large)
                 grows = high - low >= GROWS_S and high >= low * GROWS_RATIO
-                cost_words = f"{low:.2f} s → {high:.2f} s: " + ("grows" if grows else "flat") + f"; its count: {prod_words}"
+                cost_words = f"{low:.2f} s → {high:.2f} s: " + ("grows" if grows else "flat") + f"; its count: {prod_words.split(':')[0]}"
             else:
                 grows, cost_words = None, f"not observed; its count: {prod_words}"
             if expected.startswith("scan list"):
@@ -87,11 +87,19 @@ def main(root):
                 ok = kind == "filed"
             else:
                 ok = kind in ("filed", "family") and grows is False
-            matches += ok
-            if not ok:
-                misses.append(f"{table}, {form}")
-            print(f"| `{table}` | {label} | {expected} | {words} | {cost_words} | {'yes' if ok else 'NO'} |")
-    print(f"\n{matches} of {2 * len(filters())} rows match" + ("." if not misses else "; not matching: " + "; ".join(misses) + "."))
+            verdict = "yes" if ok else "NO"
+            if kind == "subquery":
+                # No count applies to a subquery shape: the row rests on cost alone.
+                want_grows = expected.startswith("scan list") or "shared value" in expected
+                agrees = grows is want_grows
+                verdict = "cost only: " + ("as expected" if agrees else "NOT as expected")
+                cost_only.append((f"{table}, {form}", agrees))
+            else:
+                matches += ok
+                if not ok:
+                    misses.append(f"{table}, {form}")
+            print(f"| `{table}` | {label} | {expected} | {words} | {cost_words} | {verdict} |")
+    print(f"\n{matches} of {2 * len(filters())} rows match on both observations" + ("" if not misses else "; not matching: " + "; ".join(misses)) + f". {len(cost_only)} rows rest on cost alone ({'; '.join(name for name, _ in cost_only)}): {sum(agrees for _, agrees in cost_only)} of them cost what the expected placement would.")
 
 
 if __name__ == "__main__":

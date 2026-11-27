@@ -1,0 +1,1047 @@
+{
+  "workload": "b2-placement",
+  "engine_source": "9bc1563f5718db7bc502eeb79388ee189f1fd5f9",
+  "list_keys": null,
+  "placements": [
+    {
+      "table": "record_date_index",
+      "single_key": "group",
+      "status": 200,
+      "shape": "s1",
+      "refused": null,
+      "has_subquery": true,
+      "where": {
+        "and": [
+          {
+            "and": [
+              {
+                "or": [
+                  {
+                    "col": "space_id",
+                    "op": "eq",
+                    "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                  }
+                ]
+              },
+              {
+                "or": [
+                  {
+                    "or": [
+                      {
+                        "and": [
+                          {
+                            "col": "date_value",
+                            "op": "lt",
+                            "value": "2026-09-16"
+                          },
+                          {
+                            "col": "end_date_value",
+                            "op": "gte",
+                            "value": "2026-09-15"
+                          }
+                        ]
+                      },
+                      {
+                        "and": [
+                          {
+                            "col": "date_value",
+                            "op": "gte",
+                            "value": "2026-09-15"
+                          },
+                          {
+                            "col": "date_value",
+                            "op": "lt",
+                            "value": "2026-09-16"
+                          },
+                          {
+                            "col": "end_date_value",
+                            "isNull": true
+                          }
+                        ]
+                      },
+                      {
+                        "and": [
+                          {
+                            "col": "datetime_value",
+                            "op": "lt",
+                            "value": "2026-09-16T00:00:00Z"
+                          },
+                          {
+                            "col": "end_datetime_value",
+                            "op": "gte",
+                            "value": "2026-09-15T00:00:00Z"
+                          }
+                        ]
+                      },
+                      {
+                        "and": [
+                          {
+                            "col": "datetime_value",
+                            "op": "gte",
+                            "value": "2026-09-15T00:00:00Z"
+                          },
+                          {
+                            "col": "datetime_value",
+                            "op": "lt",
+                            "value": "2026-09-16T00:00:00Z"
+                          },
+                          {
+                            "col": "end_datetime_value",
+                            "isNull": true
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "col": "record_id",
+                    "in": {
+                      "project": "record_id",
+                      "table": "record_recurrence",
+                      "where": {
+                        "and": [
+                          {
+                            "or": [
+                              {
+                                "col": "space_id",
+                                "op": "eq",
+                                "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                              }
+                            ]
+                          },
+                          {
+                            "and": [
+                              {
+                                "or": [
+                                  {
+                                    "col": "recurring_until",
+                                    "isNull": true
+                                  },
+                                  {
+                                    "col": "recurring_until",
+                                    "op": "gte",
+                                    "value": "2026-09-13T00:00:00Z"
+                                  }
+                                ]
+                              },
+                              {
+                                "col": "dtstart",
+                                "op": "lt",
+                                "value": "2026-09-18T00:00:00Z"
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "or": [
+              {
+                "col": "record_id",
+                "op": "eq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              },
+              {
+                "col": "record_id",
+                "op": "neq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              }
+            ]
+          }
+        ]
+      },
+      "before": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 0,
+          "standalone": 0,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 0,
+          "subquery_nodes": 0,
+          "subquery_edges": 0
+        }
+      },
+      "after": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 1,
+          "standalone": 0,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 1,
+          "subquery_nodes": 1,
+          "subquery_edges": 1
+        }
+      }
+    },
+    {
+      "table": "record",
+      "single_key": "group",
+      "status": 200,
+      "shape": "s2",
+      "refused": null,
+      "has_subquery": true,
+      "where": {
+        "and": [
+          {
+            "and": [
+              {
+                "and": [
+                  {
+                    "or": [
+                      {
+                        "or": [
+                          {
+                            "col": "space_id",
+                            "op": "eq",
+                            "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "or": [
+                      {
+                        "col": "type",
+                        "isNull": true
+                      },
+                      {
+                        "and": [
+                          {
+                            "col": "type",
+                            "op": "neq",
+                            "value": "busy_block"
+                          },
+                          {
+                            "col": "type",
+                            "op": "neq",
+                            "value": "legacy_preference"
+                          },
+                          {
+                            "col": "type",
+                            "op": "neq",
+                            "value": "family_context_report"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "or": [
+                  {
+                    "col": "id",
+                    "in": {
+                      "project": "record_id",
+                      "table": "record_date_index",
+                      "where": {
+                        "and": [
+                          {
+                            "or": [
+                              {
+                                "col": "space_id",
+                                "op": "eq",
+                                "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                              }
+                            ]
+                          },
+                          {
+                            "or": [
+                              {
+                                "and": [
+                                  {
+                                    "col": "date_value",
+                                    "op": "lt",
+                                    "value": "2026-09-16"
+                                  },
+                                  {
+                                    "col": "end_date_value",
+                                    "op": "gte",
+                                    "value": "2026-09-15"
+                                  }
+                                ]
+                              },
+                              {
+                                "and": [
+                                  {
+                                    "col": "date_value",
+                                    "op": "gte",
+                                    "value": "2026-09-15"
+                                  },
+                                  {
+                                    "col": "date_value",
+                                    "op": "lt",
+                                    "value": "2026-09-16"
+                                  },
+                                  {
+                                    "col": "end_date_value",
+                                    "isNull": true
+                                  }
+                                ]
+                              },
+                              {
+                                "and": [
+                                  {
+                                    "col": "datetime_value",
+                                    "op": "lt",
+                                    "value": "2026-09-16T00:00:00Z"
+                                  },
+                                  {
+                                    "col": "end_datetime_value",
+                                    "op": "gte",
+                                    "value": "2026-09-15T00:00:00Z"
+                                  }
+                                ]
+                              },
+                              {
+                                "and": [
+                                  {
+                                    "col": "datetime_value",
+                                    "op": "gte",
+                                    "value": "2026-09-15T00:00:00Z"
+                                  },
+                                  {
+                                    "col": "datetime_value",
+                                    "op": "lt",
+                                    "value": "2026-09-16T00:00:00Z"
+                                  },
+                                  {
+                                    "col": "end_datetime_value",
+                                    "isNull": true
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "col": "id",
+                    "in": {
+                      "project": "record_id",
+                      "table": "record_recurrence",
+                      "where": {
+                        "and": [
+                          {
+                            "or": [
+                              {
+                                "col": "space_id",
+                                "op": "eq",
+                                "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                              }
+                            ]
+                          },
+                          {
+                            "and": [
+                              {
+                                "or": [
+                                  {
+                                    "col": "recurring_until",
+                                    "isNull": true
+                                  },
+                                  {
+                                    "col": "recurring_until",
+                                    "op": "gte",
+                                    "value": "2026-09-13T00:00:00Z"
+                                  }
+                                ]
+                              },
+                              {
+                                "col": "dtstart",
+                                "op": "lt",
+                                "value": "2026-09-18T00:00:00Z"
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  {
+                    "and": [
+                      {
+                        "col": "recurring_parent_id",
+                        "in": {
+                          "project": "record_id",
+                          "table": "record_recurrence",
+                          "where": {
+                            "and": [
+                              {
+                                "or": [
+                                  {
+                                    "col": "space_id",
+                                    "op": "eq",
+                                    "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                                  }
+                                ]
+                              },
+                              {
+                                "and": [
+                                  {
+                                    "or": [
+                                      {
+                                        "col": "recurring_until",
+                                        "isNull": true
+                                      },
+                                      {
+                                        "col": "recurring_until",
+                                        "op": "gte",
+                                        "value": "2026-09-13T00:00:00Z"
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "col": "dtstart",
+                                    "op": "lt",
+                                    "value": "2026-09-18T00:00:00Z"
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "col": "original_start_time",
+                        "op": "gte",
+                        "value": "2026-09-13"
+                      },
+                      {
+                        "col": "original_start_time",
+                        "op": "lt",
+                        "value": "2026-09-18"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "or": [
+              {
+                "col": "id",
+                "op": "eq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              },
+              {
+                "col": "id",
+                "op": "neq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              }
+            ]
+          }
+        ]
+      },
+      "before": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 1,
+          "standalone": 0,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 1,
+          "subquery_nodes": 1,
+          "subquery_edges": 1
+        }
+      },
+      "after": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 2,
+          "standalone": 0,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      }
+    },
+    {
+      "table": "record_recurrence",
+      "single_key": "group",
+      "status": 200,
+      "shape": "s3",
+      "refused": null,
+      "has_subquery": false,
+      "where": {
+        "and": [
+          {
+            "and": [
+              {
+                "or": [
+                  {
+                    "col": "space_id",
+                    "op": "eq",
+                    "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                  }
+                ]
+              },
+              {
+                "and": [
+                  {
+                    "or": [
+                      {
+                        "col": "recurring_until",
+                        "isNull": true
+                      },
+                      {
+                        "col": "recurring_until",
+                        "op": "gte",
+                        "value": "2026-09-13T00:00:00Z"
+                      }
+                    ]
+                  },
+                  {
+                    "col": "dtstart",
+                    "op": "lt",
+                    "value": "2026-09-18T00:00:00Z"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "or": [
+              {
+                "col": "record_id",
+                "op": "eq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              },
+              {
+                "col": "record_id",
+                "op": "neq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              }
+            ]
+          }
+        ]
+      },
+      "before": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 2,
+          "standalone": 0,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      },
+      "after": {
+        "table": {
+          "families": [],
+          "standalone": 1,
+          "circuit": 0
+        },
+        "engine": {
+          "shapes": 3,
+          "standalone": 1,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      }
+    },
+    {
+      "table": "calendar_event",
+      "single_key": "group",
+      "status": 200,
+      "shape": "s4",
+      "refused": null,
+      "has_subquery": false,
+      "where": {
+        "and": [
+          {
+            "and": [
+              {
+                "and": [
+                  {
+                    "or": [
+                      {
+                        "col": "user_id",
+                        "op": "eq",
+                        "value": "1f7b8589-a172-5941-80e8-6c1da04ec9d1"
+                      }
+                    ]
+                  },
+                  {
+                    "and": [
+                      {
+                        "col": "is_busy_block",
+                        "op": "eq",
+                        "value": false
+                      },
+                      {
+                        "or": [
+                          {
+                            "and": [
+                              {
+                                "col": "deleted_at",
+                                "isNull": true
+                              },
+                              {
+                                "col": "status",
+                                "op": "neq",
+                                "value": "cancelled"
+                              }
+                            ]
+                          },
+                          {
+                            "and": [
+                              {
+                                "col": "status",
+                                "op": "eq",
+                                "value": "cancelled"
+                              },
+                              {
+                                "col": "original_start_time",
+                                "isNull": false
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "or": [
+                  {
+                    "and": [
+                      {
+                        "col": "original_start_time",
+                        "isNull": false
+                      },
+                      {
+                        "col": "original_start_time",
+                        "op": "gte",
+                        "value": "2026-09-13"
+                      },
+                      {
+                        "col": "original_start_time",
+                        "op": "lt",
+                        "value": "2026-09-18"
+                      }
+                    ]
+                  },
+                  {
+                    "and": [
+                      {
+                        "col": "is_recurring",
+                        "op": "eq",
+                        "value": true
+                      },
+                      {
+                        "or": [
+                          {
+                            "col": "recurring_until",
+                            "isNull": true
+                          },
+                          {
+                            "col": "recurring_until",
+                            "op": "gte",
+                            "value": "2026-09-12"
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  {
+                    "and": [
+                      {
+                        "or": [
+                          {
+                            "col": "is_recurring",
+                            "op": "eq",
+                            "value": false
+                          },
+                          {
+                            "col": "is_recurring",
+                            "isNull": true
+                          }
+                        ]
+                      },
+                      {
+                        "col": "start_datetime",
+                        "isNull": true
+                      },
+                      {
+                        "col": "start_date",
+                        "op": "lt",
+                        "value": "2026-09-16"
+                      },
+                      {
+                        "col": "end_date",
+                        "op": "gte",
+                        "value": "2026-09-15"
+                      }
+                    ]
+                  },
+                  {
+                    "and": [
+                      {
+                        "or": [
+                          {
+                            "col": "is_recurring",
+                            "op": "eq",
+                            "value": false
+                          },
+                          {
+                            "col": "is_recurring",
+                            "isNull": true
+                          }
+                        ]
+                      },
+                      {
+                        "col": "start_datetime",
+                        "isNull": true
+                      },
+                      {
+                        "col": "start_date",
+                        "op": "gte",
+                        "value": "2026-09-15"
+                      },
+                      {
+                        "col": "start_date",
+                        "op": "lt",
+                        "value": "2026-09-16"
+                      },
+                      {
+                        "col": "end_date",
+                        "isNull": true
+                      }
+                    ]
+                  },
+                  {
+                    "and": [
+                      {
+                        "or": [
+                          {
+                            "col": "is_recurring",
+                            "op": "eq",
+                            "value": false
+                          },
+                          {
+                            "col": "is_recurring",
+                            "isNull": true
+                          }
+                        ]
+                      },
+                      {
+                        "col": "start_date",
+                        "isNull": true
+                      },
+                      {
+                        "col": "start_datetime",
+                        "op": "lt",
+                        "value": "2026-09-16T00:00:00Z"
+                      },
+                      {
+                        "col": "end_datetime",
+                        "op": "gte",
+                        "value": "2026-09-15T00:00:00Z"
+                      }
+                    ]
+                  },
+                  {
+                    "and": [
+                      {
+                        "or": [
+                          {
+                            "col": "is_recurring",
+                            "op": "eq",
+                            "value": false
+                          },
+                          {
+                            "col": "is_recurring",
+                            "isNull": true
+                          }
+                        ]
+                      },
+                      {
+                        "col": "start_date",
+                        "isNull": true
+                      },
+                      {
+                        "col": "start_datetime",
+                        "op": "gte",
+                        "value": "2026-09-15T00:00:00Z"
+                      },
+                      {
+                        "col": "start_datetime",
+                        "op": "lt",
+                        "value": "2026-09-16T00:00:00Z"
+                      },
+                      {
+                        "col": "end_datetime",
+                        "isNull": true
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "or": [
+              {
+                "col": "id",
+                "op": "eq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              },
+              {
+                "col": "id",
+                "op": "neq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              }
+            ]
+          }
+        ]
+      },
+      "before": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 3,
+          "standalone": 1,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      },
+      "after": {
+        "table": {
+          "families": [],
+          "standalone": 1,
+          "circuit": 0
+        },
+        "engine": {
+          "shapes": 4,
+          "standalone": 2,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      }
+    },
+    {
+      "table": "record_completed_index",
+      "single_key": "group",
+      "status": 200,
+      "shape": "s5",
+      "refused": null,
+      "has_subquery": false,
+      "where": {
+        "and": [
+          {
+            "and": [
+              {
+                "or": [
+                  {
+                    "col": "space_id",
+                    "op": "eq",
+                    "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                  }
+                ]
+              },
+              {
+                "or": [
+                  {
+                    "col": "record_id",
+                    "op": "eq",
+                    "value": "1d7d6b11-905c-5935-9edb-120639ae2c24"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "or": [
+              {
+                "col": "record_id",
+                "op": "eq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              },
+              {
+                "col": "record_id",
+                "op": "neq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              }
+            ]
+          }
+        ]
+      },
+      "before": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 4,
+          "standalone": 2,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      },
+      "after": {
+        "table": {
+          "families": [],
+          "standalone": 1,
+          "circuit": 0
+        },
+        "engine": {
+          "shapes": 5,
+          "standalone": 3,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      }
+    },
+    {
+      "table": "record_assignee_index",
+      "single_key": "group",
+      "status": 200,
+      "shape": "s6",
+      "refused": null,
+      "has_subquery": false,
+      "where": {
+        "and": [
+          {
+            "and": [
+              {
+                "or": [
+                  {
+                    "col": "space_id",
+                    "op": "eq",
+                    "value": "c25f3873-f407-5bd9-8da3-0c04dd5d3dc4"
+                  }
+                ]
+              },
+              {
+                "or": [
+                  {
+                    "col": "record_id",
+                    "op": "eq",
+                    "value": "1d7d6b11-905c-5935-9edb-120639ae2c24"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "or": [
+              {
+                "col": "record_id",
+                "op": "eq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              },
+              {
+                "col": "record_id",
+                "op": "neq",
+                "value": "bade4913-14ff-5aa7-8c11-850499a0dc91"
+              }
+            ]
+          }
+        ]
+      },
+      "before": {
+        "table": {
+          "families": [],
+          "standalone": 0,
+          "scan": 0,
+          "circuit": 0,
+          "no_tailer": true
+        },
+        "engine": {
+          "shapes": 5,
+          "standalone": 3,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      },
+      "after": {
+        "table": {
+          "families": [],
+          "standalone": 1,
+          "circuit": 0
+        },
+        "engine": {
+          "shapes": 6,
+          "standalone": 4,
+          "families": 0,
+          "family_shapes": 0,
+          "subquery_shapes": 2,
+          "subquery_nodes": 2,
+          "subquery_edges": 4
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "status": 200,
+  "body": {
+    "nodes": [
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_date_index",
+        "refcount": 1,
+        "sig": "public.record_date_index|record_id|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))",
+        "template": "public.record_date_index|record_id|P()|A(O(A(L(date_value,Gte,\"2026-09-15\"),L(date_value,Lt,\"2026-09-16\"),U(end_date_value,true)),A(L(date_value,Lt,\"2026-09-16\"),L(end_date_value,Gte,\"2026-09-15\")),A(L(datetime_value,Gte,\"2026-09-15T00:00:00Z\"),L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),U(end_datetime_value,true)),A(L(datetime_value,Lt,\"2026-09-16T00:00:00Z\"),L(end_datetime_value,Gte,\"2026-09-15T00:00:00Z\"))),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))"
+      },
+      {
+        "distinct_values": 0,
+        "inner_table": "public.record_recurrence",
+        "refcount": 3,
+        "sig": "public.record_recurrence|record_id|A(A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true))),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))",
+        "template": "public.record_recurrence|record_id|P()|A(L(dtstart,Lt,\"2026-09-18T00:00:00Z\"),O(L(recurring_until,Gte,\"2026-09-13T00:00:00Z\"),U(recurring_until,true)),O(L(space_id,Eq,\"c25f3873-f407-5bd9-8da3-0c04dd5d3dc4\")))"
+      }
+    ]
+  }
+}
