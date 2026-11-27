@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 from collections import Counter
 from pathlib import Path
@@ -24,6 +25,7 @@ from data import DELETE_ORDER, IMPORT_ACCOUNT, LARGE_ACCOUNT, SHARE_ACCOUNT, SHA
 from flamegraph import attribute, fold, render
 from probes import OtherAccountProbe, summarize
 from simple_keys import EDGE_VARIANTS, H1_DATA_ACCOUNTS, H1P_VARIANTS, H1_VARIANTS, IMPORT_REST_TABLES, MAIN3_VARIANTS, edge_catalog, h1_body, h1_catalog, h1p_catalog, unwrap_single_or, SIMPLE_KEYED, SIMPLE_VARIANTS, account_lists, main3_bodies, main3_catalog, main3_keyed_lists, simple_bodies, simple_catalog, window_plan
+from simple_keys import W1_DELETED, W1_FAMILY_ROWS, W1_VARIANTS, w1_catalog, w1_feeds, w1_seed_accounts, w1_seed_families
 
 
 ENGINE_URL = "http://127.0.0.1:7010"
@@ -178,6 +180,183 @@ def window_operation(plan, kind, way, cgroup):
     return operation
 
 
+# W1, the target design under one combined load (results/simple-keys/W1-TARGET-DESIGN.md).
+# `w1-control`: only the active families' steady loads, for W1_CONTROL_S seconds.
+# `w1-load`: the same loads, and at the same time one family's first import (W1_IMPORT_EVENTS events,
+# W1_IMPORT_COMMIT a commit, paced on the engine's receipt) and one prod-p95 family deleted at the
+# shipped bulk-write limits (PACED_TRACKED_ROWS a commit, engine-paced).
+W1_WORKLOADS = ("w1-control", "w1-load")
+W1_CONTROL_S = 120
+W1_IMPORT_EVENTS = 5000
+W1_IMPORT_COMMIT = 100
+W1_SETTLE_S = 5
+# The importing family's rows carry the fixture's dates (2026-09-01 plus ordinal % 84 days); a phone
+# on Home's day and the calendar's week would follow these days of them.
+W1_WINDOW_DAY = 14
+W1_WINDOW_WEEK = range(14, 21)
+
+
+def w1_seed(data, url, families):
+    with psycopg.connect(url) as connection:
+        connection.execute("SET LOCAL session_replication_role = replica")
+        accounts = w1_seed_accounts(connection, data)
+        generated = w1_seed_families(connection, data, families)
+    with psycopg.connect(url, autocommit=True) as connection:
+        # The target design reads by key, so each table a load reads has an index on it (prod's tables
+        # index `space_id` the same way); the date index adds its date for window reads.
+        for table in W1_FAMILY_ROWS:
+            connection.execute(sql.SQL("CREATE INDEX ON {} (audience_key)").format(sql.Identifier("public", table)))
+        connection.execute("CREATE INDEX ON public.record_date_index (audience_key, date_value)")
+        connection.execute("ANALYZE")
+    return {"tables": accounts, "families": families, "family_rows": generated}
+
+
+def receipt_summary(receipts):
+    ordered = sorted(receipts)
+    if not ordered:
+        return {"commits": 0}
+    return {"commits": len(ordered), "p50_s": ordered[len(ordered) // 2], "p95_s": ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))], "max_s": ordered[-1], "sum_s": sum(ordered)}
+
+
+def w1_operation(data, workload, families, output, validator, fences, transactions):
+    """Start the load generator, run the phase, stop the generator; the caller's marker closes it."""
+    folder = Path(__file__).parent
+    def operation(url, callback):
+        stop = output / f"{workload}-loads.stop"
+        shards = 2 if families >= 1000 else 1
+        generators = [subprocess.Popen([sys.executable, str(folder / "w1_loads.py"), "--families", str(families), "--shard", str(shard), "--shards", str(shards), "--out", str(output / f"{workload}-loads-{shard}.jsonl"), "--stop", str(stop), "--seed", str(shard + 1)]) for shard in range(shards)]
+        journal = []
+        try:
+            if workload == "w1-control":
+                time.sleep(W1_CONTROL_S)
+            else:
+                time.sleep(W1_SETTLE_S)
+                import_receipts, delete_receipts = [], []
+                def timed(name, write, receipts):
+                    began_wall, began = time.time(), time.monotonic()
+                    entries = write(receipts)
+                    return entries, {"table": "w1", "operation": name, "rows": 0, "began_wall": began_wall, "wall_s": time.monotonic() - began, "receipts": receipt_summary(receipts), "receipt_s": receipts}
+                (fence_user, fence_generation), (delete_user, delete_generation) = fences
+                with concurrent.futures.ThreadPoolExecutor(2) as pool:
+                    imported = pool.submit(timed, "import", lambda receipts: paced_first_import(data, url, W1_IMPORT_COMMIT, fence_user, fence_generation, validator, transactions, receipts, events=W1_IMPORT_EVENTS), import_receipts)
+                    deleted = pool.submit(timed, "delete", lambda receipts: paced_delete_account(data, url, W1_DELETED, delete_user, delete_generation, validator, transactions, receipts, tables=["file", *DELETE_ORDER]), delete_receipts)
+                    for future in (imported, deleted):
+                        entries, summary = future.result()
+                        journal += entries + [summary]
+                time.sleep(W1_SETTLE_S)
+        finally:
+            stop.touch()
+            for generator in generators:
+                try:
+                    generator.wait(timeout=40)
+                except subprocess.TimeoutExpired:
+                    generator.kill()
+        with psycopg.connect(url) as connection:
+            callback(connection, "final")
+        return journal
+    return operation
+
+
+def loads_summary(output, workload):
+    """The generator's loads by kind: how many were due, answered, shed or timed out, and how long they took."""
+    samples = [json.loads(line) for path in sorted(output.glob(f"{workload}-loads-*.jsonl")) for line in path.read_text().splitlines()]
+    summary = {}
+    for kind in ("day", "week", "detail", "all"):
+        chosen = [sample for sample in samples if kind in (sample["kind"], "all")]
+        sent = [sample for sample in chosen if not sample.get("shed")]
+        walls = sorted(sample["wall_s"] for sample in sent)
+        lags = sorted(sample["lag_s"] for sample in chosen)
+        def at(values, fraction):
+            return values[int((len(values) - 1) * fraction)] if values else None
+        summary[kind] = {"due": len(chosen), "sent": len(sent), "ok": sum(sample["ok"] for sample in sent), "shed": len(chosen) - len(sent), "timed_out": sum(bool(sample.get("timeouts")) for sample in sent), "errors": sum(bool(sample.get("errors")) for sample in sent),
+                         "wall_p50_s": at(walls, 0.5), "wall_p95_s": at(walls, 0.95), "wall_p99_s": at(walls, 0.99), "wall_max_s": walls[-1] if walls else None, "lag_p95_s": at(lags, 0.95), "lag_max_s": lags[-1] if lags else None,
+                         "rows_p50": at(sorted(sample.get("rows", 0) for sample in sent), 0.5), "rows_p95": at(sorted(sample.get("rows", 0) for sample in sent), 0.95), "bytes": sum(sample.get("bytes", 0) for sample in sent), "requests": sum({"day": 6, "week": 6, "detail": 5}[sample["kind"]] for sample in sent)}
+    if samples:
+        summary["span_s"] = max(sample["at"] for sample in samples) - min(sample["at"] for sample in samples)
+    return summary
+
+
+async def stream_offset(client, handle):
+    head = await client.head(handle["streamUrl"])
+    head.raise_for_status()
+    return head.headers["stream-next-offset"]
+
+
+async def stream_volume(client, handle, offset, ordinal_of=None):
+    """Everything one feed delivered after `offset`: rows and bytes, and (with `ordinal_of`) the share
+    a phone following only a day and a week window of the same rows would have been sent."""
+    volume = {"rows": 0, "bytes": 0}
+    windows = {"day": {"rows": 0, "bytes": 0}, "week": {"rows": 0, "bytes": 0}, "unplaced_rows": 0}
+    for _ in range(100000):
+        response = await client.get(handle["streamUrl"], params={"offset": offset}, timeout=120)
+        if response.status_code == 204:
+            break
+        response.raise_for_status()
+        envelopes = response.json()
+        if not envelopes:
+            break
+        volume["rows"] += len(envelopes)
+        volume["bytes"] += len(response.content)
+        volume.setdefault("sample", json.dumps(envelopes[0])[:400])
+        if ordinal_of is not None:
+            for envelope in envelopes:
+                ordinal = ordinal_of(envelope)
+                if ordinal is None:
+                    windows["unplaced_rows"] += 1
+                    continue
+                size = len(json.dumps(envelope, separators=(",", ":")))
+                if ordinal % 84 == W1_WINDOW_DAY:
+                    windows["day"]["rows"] += 1
+                    windows["day"]["bytes"] += size
+                if ordinal % 84 in W1_WINDOW_WEEK:
+                    windows["week"]["rows"] += 1
+                    windows["week"]["bytes"] += size
+        following = response.headers.get("stream-next-offset", offset)
+        if following == offset:
+            break
+        offset = following
+    if ordinal_of is not None:
+        volume["windows"] = windows
+    return volume
+
+
+def w1_ordinals(data, account, table):
+    """Map one of an account's delivered rows to the ordinal its date comes from, or None."""
+    column = {"record": "id", "record_date_index": "record_id", "assignment": "record_id", "graph_edge": "from_id", "calendar_event": "id", "record_recurrence": "record_id"}.get(table)
+    if column is None:
+        return lambda envelope: None
+    source = "calendar_event" if table == "calendar_event" else "record"
+    known = {}
+    def ordinal_of(envelope):
+        value = envelope.get("value") if isinstance(envelope.get("value"), dict) else {}
+        identifier = value.get(column)
+        if identifier is None:
+            # A delete may carry only its key: look for one of the account's ids in it.
+            text = json.dumps(envelope.get("key", ""))
+            identifier = next((part for part in text.replace('"', " ").replace("/", " ").split() if len(part) == 36 and part.count("-") == 4), None)
+        if identifier is None:
+            return None
+        if not known:
+            # Enough ordinals for the import's rows and the deleted family's.
+            known.update({str(row_id(source, account, ordinal)): ordinal for ordinal in range(12000)})
+        return known.get(str(identifier))
+    return ordinal_of
+
+
+async def follower_volumes(client, data, followers, offsets):
+    result = {}
+    for name, (account, handles) in followers.items():
+        tables = {}
+        for table, handle in handles:
+            tables[table] = await stream_volume(client, handle, offsets[name][table], w1_ordinals(data, account, table) if name != "bystander" else None)
+        total = {"rows": sum(entry["rows"] for entry in tables.values()), "bytes": sum(entry["bytes"] for entry in tables.values())}
+        for window in ("day", "week"):
+            total[window] = {key: sum(entry.get("windows", {}).get(window, {}).get(key, 0) for entry in tables.values()) for key in ("rows", "bytes")}
+        total["unplaced_rows"] = sum(entry.get("windows", {}).get("unplaced_rows", 0) for entry in tables.values())
+        result[name] = {"account": account, "total": total, "tables": {table: entry for table, entry in tables.items() if entry["rows"]}}
+    return result
+
+
 def audit_prepare(data, url, variant, workloads):
     """Rows the audit workloads act on, written before the engine starts (part of the initial snapshot)."""
     with psycopg.connect(url) as connection:
@@ -297,9 +476,9 @@ def paced_first_import(data, url, events_per_commit, fence_user, fence_generatio
     return journal
 
 
-def paced_delete_account(data, url, account, fence_user, fence_generation, validator, transactions, receipts):
+def paced_delete_account(data, url, account, fence_user, fence_generation, validator, transactions, receipts, tables=DELETE_ORDER):
     """Delete an account's rows as a paced bulk write: bounded commits, each followed by the engine's receipt."""
-    pending = [(table, len(data.rows.get((table, account), [])) if table != "user" else min(1, len(data.rows.get((table, account), [])))) for table in DELETE_ORDER]
+    pending = [(table, len(data.rows.get((table, account), [])) if table != "user" else min(1, len(data.rows.get((table, account), [])))) for table in tables]
     journal = []
     with httpx.Client(headers={"Authorization": f"Bearer {SECRET}"}) as http:
         while any(count for _, count in pending):
@@ -384,7 +563,7 @@ async def sample_cpu(process, cgroup, output, stopped):
     with output.open("w") as handle:
         while not stopped.is_set():
             try:
-                sample = {"at": time.time(), "cpu_s": sum(process.cpu_times()[:2]), "rss_bytes": process.memory_info().rss, "threads": process.num_threads(), "cpu_stat": (cgroup / "cpu.stat").read_text()}
+                sample = {"at": time.time(), "cpu_s": sum(process.cpu_times()[:2]), "rss_bytes": process.memory_info().rss, "threads": process.num_threads(), "cpu_stat": (cgroup / "cpu.stat").read_text(), "machine_cpu_percent": psutil.cpu_percent(None), "load_1m": os.getloadavg()[0]}
             except (psutil.NoSuchProcess, FileNotFoundError):
                 break
             handle.write(json.dumps(sample) + "\n")
@@ -409,7 +588,7 @@ AUDIENCE_VARIANTS = KEYED_VARIANTS | COLD_VARIANTS | set(PARTLY_KEYED)
 # PLAIN-WORDS-3 run 1 (H1 with the hypothetical plain-test fix) and run 2 (keyed `graph_edge` filters).
 H1_LIKE = set(H1_VARIANTS) | set(H1P_VARIANTS) | set(EDGE_VARIANTS)
 FIXED_VARIANTS = {variant for variant, (_, _, fixed) in H1P_VARIANTS.items() if fixed} | {variant for variant, (_, way) in EDGE_VARIANTS.items() if way != "today"}
-ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE
+ALL_VARIANTS = AUDIENCE_VARIANTS | set(EDGE_ATTRIBUTION) | SIMPLE_VARIANTS | MAIN3_VARIANTS | H1_LIKE | set(W1_VARIANTS)
 BRIDGE_ENVIRONMENT = {
     "marker-bypass": {"STALL_REPRO_UNSAFE_SKIP_MARKER_WAIT": "1"},
     "commit-membership": {"STALL_REPRO_COMMIT_MEMBERSHIP": "1"},
@@ -447,7 +626,8 @@ async def run(args):
     fixture = folder / "results/fixture"
     gateway = GatewayShapes(folder / "indexed-source.json.gz")
     data = load_data(fixture / "columns.json")
-    if args.variant in AUDIENCE_VARIANTS:
+    if args.variant in AUDIENCE_VARIANTS or args.variant in W1_VARIANTS:
+        data.family_keys = args.variant in W1_VARIANTS
         published = [table.removeprefix("public.") for table in gateway.loader.bundle["publication"]]
         statements = await asyncio.to_thread(data.add_audience_columns, PG_URL, [table for table in published if args.variant not in PARTLY_KEYED or table in PARTLY_KEYED[args.variant]])
         (output / "audience-schema.sql").write_text(";\n".join(statements) + ";\n")
@@ -466,7 +646,10 @@ async def run(args):
         store_arguments.extend(["--max-chunk-bytes", "4194304"])
     save(output / "store-config.json", {"command": store_arguments, "sha256": hashlib.file_digest(Path(args.store).open("rb"), "sha256").hexdigest(), "matches_indexed_4mib_page_setting": supports_page_cap, "cap_detection": "option literal in pinned binary, then validated by server startup", "help_exit": help_probe.returncode})
     print("Seeding synthetic database", flush=True)
-    save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS | SIMPLE_VARIANTS | MAIN3_VARIANTS or "share-delete" in args.workloads))
+    if args.variant in W1_VARIANTS:
+        save(output / "seed.json", await asyncio.to_thread(w1_seed, data, PG_URL, W1_VARIANTS[args.variant]))
+    else:
+        save(output / "seed.json", await asyncio.to_thread(data.seed, PG_URL, args.variant in COLD_VARIANTS | SIMPLE_VARIANTS | MAIN3_VARIANTS or "share-delete" in args.workloads))
     await asyncio.to_thread(audit_prepare, data, PG_URL, args.variant, args.workloads)
     lists = {}
     keyed_lists = {}
@@ -514,7 +697,7 @@ async def run(args):
         "ELECTRIC_CIRCUITS_PG_SLOT": "stall_repro",
         "ELECTRIC_CIRCUITS_BIND": "127.0.0.1:7010",
         # H1 measures up to 20,000 shapes plus the probe, so its cap sits above that.
-        "ELECTRIC_CIRCUITS_MAX_SHAPES": "25000" if args.variant in H1_LIKE else "20000",
+        "ELECTRIC_CIRCUITS_MAX_SHAPES": "100000" if args.variant in W1_VARIANTS else "25000" if args.variant in H1_LIKE else "20000",
         "ELECTRIC_CIRCUITS_FLIP_WORKERS": "8",
         "ELECTRIC_CIRCUITS_SUBSCRIPTION_LEASE_SECS": "0",
         "ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS": "0",
@@ -538,7 +721,7 @@ async def run(args):
             pid = int(subprocess.check_output(["systemctl", "show", unit, "--property=MainPID", "--value"], text=True).strip())
             process = psutil.Process(pid)
             save(output / "engine-threads-at-ready.json", {thread.id: Path(f"/proc/{pid}/task/{thread.id}/comm").read_text().strip() for thread in process.threads()})
-            catalog = await gateway.generate(args.catalog, args.scale)
+            catalog = w1_catalog(gateway, W1_VARIANTS[args.variant]) if args.variant in W1_VARIANTS else await gateway.generate(args.catalog, args.scale)
             if args.variant in KEYED_VARIANTS:
                 catalog = await gateway.keyed_catalog(catalog, preserved=preserved_tables(args.variant))
             if args.variant in EDGE_ATTRIBUTION:
@@ -563,7 +746,7 @@ async def run(args):
                 catalog = control_catalog(catalog, retained)
             if args.smoke:
                 catalog = catalog[:20] + catalog[-20:]
-            semaphore = asyncio.Semaphore(8)
+            semaphore = asyncio.Semaphore(32 if args.variant in W1_VARIANTS else 8)
             created = 0
             async def create(request):
                 nonlocal created
@@ -576,7 +759,7 @@ async def run(args):
                         print(f"Created {created}/{len(catalog)} shapes", flush=True)
                     return response.json()
             handles = await asyncio.gather(*(create(request) for request in catalog))
-            save(output / "shape-handles.json", handles)
+            save(output / "shape-handles.json", handles if args.variant not in W1_VARIANTS else {"created": len(handles)})
             import_tables = ("record", "record_date_index", "record_recurrence", "assignment", "calendar_event", "graph_edge", "resource")
             if args.variant == "S-rest-today":
                 # This variant asks what today's remaining filters cost, so the importing account holds them too.
@@ -586,8 +769,14 @@ async def run(args):
                 for request in await main3_bodies(gateway, IMPORT_ACCOUNT, keyed_lists[IMPORT_ACCOUNT], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all", plus=args.variant == "S-main3-live-plus"):
                     await create({"body": request["body"]})
                 import_tables = ()
-            if args.variant in H1_LIKE:
+            if args.variant in H1_LIKE or args.variant in W1_VARIANTS:
                 import_tables = ()
+            followers = {}
+            if args.variant in W1_VARIANTS:
+                # The bystander's phone, a phone in the importing family and one in the family that is deleted.
+                for name, account in (("bystander", 0), ("import", IMPORT_ACCOUNT), ("delete", W1_DELETED)):
+                    feeds = w1_feeds(gateway, account, str(row_id("space", account)))
+                    followers[name] = (account, [(body["table"].removeprefix("public."), await create({"body": body})) for body in feeds])
             for table in import_tables:
                 if args.variant in SIMPLE_VARIANTS:
                     for body in await simple_bodies(gateway, args.variant, table, IMPORT_ACCOUNT, lists[IMPORT_ACCOUNT]):
@@ -614,6 +803,8 @@ async def run(args):
                 if args.variant in FIXED_VARIANTS:
                     # The bystander is a one-family account, so the hypothetical fix covers its feed too.
                     probe_body = {**probe_body, "where": unwrap_single_or(probe_body["where"])}
+            elif args.variant in W1_VARIANTS:
+                probe_body = next(body for body in w1_feeds(gateway, 0, str(row_id("space", 0))) if body["table"] == "public.record")
             elif args.variant in MAIN3_VARIANTS:
                 # The bystander's session-long Record feed (workflow roots): keyed with the flags on.
                 probe_body = next(request["body"] for request in await main3_bodies(gateway, 0, keyed_lists[0], flags=args.variant != "S-main3-off", keyed_all=args.variant == "S-main3-keyed-all") if request["body"]["table"] == "public.record" and request["demand"]["origin"] == "session")
@@ -632,7 +823,7 @@ async def run(args):
             memory.raise_for_status()
             save(output / "catalog-before-warmup.json", memory.json())
             print(json.dumps({"before_warmup": memory.json()["cardinalities"]}), flush=True)
-            for endpoint in ("graph", "state"):
+            for endpoint in ("graph", "state") if args.variant not in W1_VARIANTS else ():
                 response = await client.get(f"{ENGINE_URL}/{endpoint}")
                 save(output / f"catalog-{endpoint}.json", {"status": response.status_code, "body": response.json() if response.status_code == 200 else response.text})
             validator = gateway.gateway._is_drained_receipt
@@ -641,7 +832,7 @@ async def run(args):
             warm_marker = uuid4()
             def warm():
                 with psycopg.connect(PG_URL) as connection:
-                    for account in range(19):
+                    for account in range(19) if args.variant not in W1_VARIANTS else (0,):
                         data.update(connection, "record", account, 1 if args.smoke else 9 if args.catalog == "nov23" else 19)
                     marker(connection, fence_user, fence_generation, warm_marker)
             await asyncio.to_thread(warm)
@@ -678,6 +869,7 @@ async def run(args):
                 memory_before = (await client.get(f"{ENGINE_URL}/memory")).json()
                 profile_before = memory_before.get("stall_profile")
                 receipts = []
+                follower_offsets = {name: {table: await stream_offset(client, handle) for table, handle in handles} for name, (_, handles) in followers.items()}
                 metrics_stopped = asyncio.Event()
                 metrics_task = asyncio.create_task(sample_metrics(client, output / f"{workload}-metrics.jsonl", metrics_stopped))
                 fence_id = uuid4()
@@ -703,6 +895,8 @@ async def run(args):
                         operation = data.calendar_import
                     elif workload == "import-noresource":
                         operation = lambda url, callback: import_without_resources(data, url, callback)
+                    elif workload in W1_WORKLOADS:
+                        operation = w1_operation(data, workload, W1_VARIANTS[args.variant], output, validator, ((fence_user, fence_generation), (row_id("user", 2), gateway.authority(2).generation)), transactions)
                     elif workload in WINDOW_WORKLOADS:
                         operation = window_operation(plan, *workload.removeprefix("window-").split("-"), quota.parent)
                     elif workload in IDLE_WORKLOADS:
@@ -751,6 +945,10 @@ async def run(args):
                     result["source_write_s"] = time.monotonic() - began
                     result["completion"] = await wait_for_marker(client, validator, fence_id, fence_user, fence_generation, args.timeout, process)
                     result["completed"] = True
+                    if workload in W1_WORKLOADS:
+                        result["loads"] = loads_summary(output, workload)
+                        result["followers"] = await follower_volumes(client, data, followers, follower_offsets)
+                        result["w1"] = [{key: value for key, value in entry.items() if key != "receipt_s"} for entry in journal if entry.get("table") == "w1"]
                 except Exception as error:
                     result["completed"] = False
                     result["error"] = repr(error)
@@ -876,5 +1074,5 @@ if __name__ == "__main__":
     parser.add_argument("--probe-interval", type=float, default=1.0, help="seconds between the bystander's probe ticks")
     parser.add_argument("--label", default=None, help="retained folder name; paired runs on one runner set it so they do not collide")
     parser.add_argument("--engine-source", default="5b2cf3e2731d7fcecc3f95b9c05a5963b9c6b363")
-    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS), default=["import", "large-delete", "small-delete"])
+    parser.add_argument("--workloads", nargs="+", choices=("import", "large-delete", "small-delete", "share-delete", "paced-delete", "import+paced-delete", "paced-import-1", "paced-import-10", "paced-import-50", "paced-import-100", *AUDIT_WORKLOADS, *WINDOW_WORKLOADS, *IDLE_WORKLOADS, *W1_WORKLOADS), default=["import", "large-delete", "small-delete"])
     asyncio.run(run(parser.parse_args()))

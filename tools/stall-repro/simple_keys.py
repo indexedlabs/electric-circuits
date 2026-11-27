@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from dataclasses import dataclass, replace
 from uuid import UUID
 
@@ -876,3 +877,118 @@ async def window_plan(gateway, keyed_lists, connection):
                     taken.add(start)
                     plan.append({"account": account, "kind": kind, "size": size, "start": start.isoformat(), "expected_rows": rows, "expected_by_table": counts, "requests": await window_requests(gateway, account, keyed_lists[account], kind, start, subsets)})
     return plan
+
+
+# W1, the target design: every table the app syncs on one plain-equality feed per audience key.
+# A phone holds `audience_key = <its family's key>` on each of the 38 tables the gateway registers
+# (B, the audience-key prototype, covered 24 and keyed `calendar_event` by calendar; W1 keys the 14
+# it left out and `calendar_event` by the family too). Loads are one-shot subset queries.
+# W1-N: N active synthetic families, each with its own Space as its key, plus the bystander (fixture
+# account 0), the importing family (19) and the family that is deleted (W1_DELETED, prod p95 size).
+W1_VARIANTS = {f"W1-{count}": count for count in (20, 200, 2000)}
+W1_DELETED = 30
+# Rows per family, from the circuits-plain-words prod reads: median, and p95 for 1 family in 20.
+# Records, date index, edges, assignments and files are prod's; the last three are the harness's.
+W1_FAMILY_ROWS = {
+    "record": (3, 2200), "record_date_index": (491, 4800), "graph_edge": (7, 560), "assignment": (196, 4200), "file": (5, 13),
+    "record_recurrence": (2, 100), "calendar_event": (30, 300), "message": (10, 200),
+}
+W1_BIG_EVERY = 20
+W1_DATE_DAYS = 365
+W1_FIRST_DAY = datetime.date(2026, 1, 1)
+
+
+def w1_tables(gateway):
+    return sorted(gateway.gateway.REGISTERED_COLLECTIONS)
+
+
+def w1_family_key(family):
+    """A synthetic family's Space and audience key; the SQL seed writes the same value."""
+    import hashlib
+    return str(UUID(hashlib.md5(f"w1/space/{family}".encode()).hexdigest()))
+
+
+def w1_feeds(gateway, account, key, identity="w1"):
+    """The 38 feeds one phone holds: `audience_key = key` on every registered table."""
+    feeds = []
+    for table in w1_tables(gateway):
+        collection = gateway.gateway.registered_collection(table, allow_chat_projection_dependency=True)
+        feeds.append({"table": f"public.{table}", "columns": sorted(set(collection.columns) | {"audience_key"}), "where": eq("audience_key", key), "changesOnly": True, "subscription": gateway._subscription(table, account, identity)})
+    return feeds
+
+
+def w1_catalog(gateway, count):
+    return [{"kind": "w1", "account": 1000 + family, "body": body, "has_subquery": False} for family in range(count) for body in w1_feeds(gateway, 1000 + family, w1_family_key(family))]
+
+
+def w1_seed_families(connection, data, count):
+    """`count` synthetic families' rows, generated in Postgres from one template row per table.
+
+    Every row carries its family's key in `audience_key` (and `space_id` where the table has one).
+    Date index rows and calendar events spread over W1_DATE_DAYS days; index rows, assignments,
+    edges and messages point at the family's own Records.
+    """
+    connection.execute("CREATE TEMP TABLE w1_family AS SELECT f, (f %% %s = %s) AS big FROM generate_series(0, %s - 1) AS f", (W1_BIG_EVERY, W1_BIG_EVERY - 1, count))
+    key = "md5('w1/space/' || fam.f)::uuid"
+    records = W1_FAMILY_ROWS["record"]
+    def record(ordinal):
+        return f"md5('w1/record/' || fam.f || '/' || ({ordinal}))::uuid"
+    own_record = f"(g.ord % (CASE WHEN fam.big THEN {records[1]} ELSE {records[0]} END))"
+    day = f"(DATE '{W1_FIRST_DAY}' + (g.ord % {W1_DATE_DAYS})::int)"
+    overrides = {
+        "record": {"id": record("g.ord")},
+        "record_date_index": {"record_id": record(own_record), "field_id": "'f' || g.ord", "date_value": day},
+        "graph_edge": {"from_id": record(own_record), "from_space_id": key, "to_space_id": key},
+        "assignment": {"record_id": record(own_record)},
+        "record_recurrence": {"record_id": record("g.ord")},
+        "calendar_event": {"start_datetime": f"({day}::timestamptz + interval '9 hours')", "end_datetime": f"({day}::timestamptz + interval '10 hours')"},
+        "message": {"target_id": record(own_record)},
+    }
+    written = {}
+    for table, (median, big) in W1_FAMILY_ROWS.items():
+        template = data.make(table, 0, 0)
+        columns = data.columns[table]
+        names = [column["name"] for column in columns]
+        connection.execute(sql.SQL("CREATE TEMP TABLE {} (LIKE {})").format(sql.Identifier(f"w1_tpl_{table}"), sql.Identifier("public", table)))
+        with connection.cursor().copy(sql.SQL("COPY {} ({}) FROM STDIN").format(sql.Identifier(f"w1_tpl_{table}"), sql.SQL(",").join(map(sql.Identifier, names)))) as copier:
+            copier.write_row([template[name] for name in names])
+        expressions = []
+        for column in columns:
+            name, value = column["name"], template[column["name"]]
+            quoted = sql.Identifier(name).as_string(connection)
+            if name in overrides.get(table, {}):
+                expression = overrides[table][name]
+            elif name in {"audience_key", "space_id"}:
+                expression = key
+            elif name == "reader_class":
+                expression = "'live'"
+            elif value is not None and column["type"] == "UUID" and (name == "id" or not column["foreign_keys"]):
+                expression = f"md5('w1/{table}/{name}/' || fam.f || '/' || g.ord)::uuid"
+            elif isinstance(value, str) and value.startswith("synthetic-"):
+                # Free text is unique per row, so unique indexes on it hold.
+                limit = re.search(r"\((\d+)\)", column["type"])
+                expression = f"fam.f || '-' || g.ord || '-' || tpl.{quoted}"
+                expression = f"left({expression}, {limit.group(1)})" if limit else expression
+            else:
+                expression = f"tpl.{quoted}"
+            expressions.append(expression)
+        statement = sql.SQL("INSERT INTO {} ({}) SELECT {} FROM {} tpl, w1_family fam, LATERAL generate_series(0, (CASE WHEN fam.big THEN {} ELSE {} END) - 1) AS g(ord)").format(
+            sql.Identifier("public", table), sql.SQL(",").join(map(sql.Identifier, names)), sql.SQL(", ".join(expressions)), sql.Identifier(f"w1_tpl_{table}"), sql.Literal(big), sql.Literal(median))
+        written[table] = connection.execute(statement).rowcount
+    return written
+
+
+def w1_seed_accounts(connection, data):
+    """The three fixture-style accounts, written through the harness's own row maker so the import
+    and the deletion can use its paced writers: the bystander (0), the fence users (1, 2), the
+    importing family (19) and the family that is deleted (W1_DELETED, prod's p95 family size)."""
+    from data import IMPORT_ACCOUNT
+    for account in (0, 1, 2, IMPORT_ACCOUNT, W1_DELETED):
+        for table in ("user", "space", "external_account"):
+            data.insert(connection, table, account, 1)
+    data.insert(connection, "record", 0, 20)
+    for table, (_, big) in W1_FAMILY_ROWS.items():
+        data.insert(connection, table, W1_DELETED, big)
+    for table, count in (("space_member", 1), ("calendar", 2), ("resource", 40)):
+        data.insert(connection, table, W1_DELETED, count)
+    return {f"{table}/{account}": len(rows) for (table, account), rows in data.rows.items()}

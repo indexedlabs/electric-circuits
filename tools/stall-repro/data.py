@@ -49,6 +49,7 @@ class SyntheticData:
         self.padding = padding
         self.rows = {}
         self.next_ordinal = {}
+        self.family_keys = False
 
     def make(self, table, account, ordinal):
         values = {}
@@ -117,7 +118,8 @@ class SyntheticData:
         if table == "user" and ordinal > 0:
             values.update({"id": member_id(account, ordinal), "email": f"synthetic-member-{account}-{ordinal}@example.invalid"})
         if "audience_key" in values:
-            values["audience_key"] = row_id("calendar", account, ordinal % 15) if table == "calendar_event" else row_id("space", account)
+            # B keys a calendar event by its calendar; W1's target design keys every table by the family.
+            values["audience_key"] = row_id("calendar", account, ordinal % 15) if table == "calendar_event" and not self.family_keys else row_id("space", account)
             values["reader_class"] = "live"
         return values
 

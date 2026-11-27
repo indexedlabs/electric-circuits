@@ -5,7 +5,7 @@ from pathlib import Path
 
 from catalog import GatewayShapes, contains_subquery, validate_predicate
 from parity import check_fixtures
-from simple_keys import EDGE_VARIANTS, H1P_VARIANTS, HIDDEN_RECORD_TYPES, SIMPLE_KEYED, AccountLists, access_leaf, edge_catalog, h1_catalog, h1p_catalog, predicate_sql, simple_bodies, simple_feeds, unwrap_single_or
+from simple_keys import EDGE_VARIANTS, H1P_VARIANTS, w1_catalog, HIDDEN_RECORD_TYPES, SIMPLE_KEYED, AccountLists, access_leaf, edge_catalog, h1_catalog, h1p_catalog, predicate_sql, simple_bodies, simple_feeds, unwrap_single_or
 
 FOLDER = Path(__file__).parent
 LISTS = AccountLists(0, "u", ("s0",), ("s1",), ("g",), ("c0", "c1"), ("r0", "r1"))
@@ -87,6 +87,16 @@ class PlainWordsTests(unittest.TestCase):
                 catalog = edge_catalog(self.main, count, way)
                 self.assertEqual(len({json.dumps(request["body"]["where"]) for request in catalog}), len(catalog))
                 self.assertEqual(len(catalog), 100 if way != "split" else 119)
+
+
+class TargetDesignTests(unittest.TestCase):
+    def test_every_registered_table_is_one_indexed_equality_per_family(self):
+        gateway = GatewayShapes(FOLDER / "indexed-source.json.gz")
+        catalog = w1_catalog(gateway, 3)
+        self.assertEqual(len(catalog), 3 * len(gateway.gateway.REGISTERED_COLLECTIONS))
+        self.assertEqual({tuple(request["body"]["where"]) for request in catalog}, {("col", "op", "value")})
+        self.assertEqual({access_leaf(request["body"]["where"])[:2] for request in catalog}, {("audience_key", "eq")})
+        self.assertEqual(len({request["body"]["subscription"] for request in catalog}), len(catalog))
 
 
 if __name__ == "__main__":
