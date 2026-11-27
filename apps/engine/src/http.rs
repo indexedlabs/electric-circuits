@@ -1080,6 +1080,10 @@ struct GroupMemberReq {
     table: TableRef,
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
+    /// Predicate used by the changes-only member feed. When omitted, the member's
+    /// snapshot predicate is also used for the feed for backwards compatibility.
+    #[serde(default, rename = "feedWhere")]
+    feed_where: Option<PredicateJson>,
     #[serde(default)]
     columns: Option<Vec<String>>,
 }
@@ -1087,6 +1091,10 @@ struct GroupMemberReq {
 impl GroupMemberReq {
     fn key(&self) -> String {
         self.key.clone().unwrap_or_else(|| self.table.to_string())
+    }
+
+    fn feed_where(&self) -> Option<PredicateJson> {
+        self.feed_where.clone().or_else(|| self.where_.clone())
     }
 }
 
@@ -1244,14 +1252,18 @@ async fn run_subset_load_group(
     }
     validate_new_subscription(subscription.clone())?;
     for member in &members {
+        let feed_where = member.feed_where();
         let create = CreateShapeReq {
             table: member.table.clone(),
-            where_: member.where_.clone(),
+            where_: feed_where.clone(),
             columns: member.columns.clone(),
             changes_only: true,
             subscription: None,
         };
         validate_create_shape_request(engine, &create).await?;
+        engine.validate_subset(&member.table, feed_where, member.columns.clone(), None, None, None).await.map_err(
+            |error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false },
+        )?;
         engine
             .validate_subset(&member.table, member.where_.clone(), member.columns.clone(), None, None, None)
             .await
@@ -1269,6 +1281,9 @@ async fn run_subset_load_group(
         if let Some(where_) = &member.where_ {
             group_tables.extend(crate::subquery::referenced_tables(where_));
         }
+        if let Some(feed_where) = member.feed_where() {
+            group_tables.extend(crate::subquery::referenced_tables(&feed_where));
+        }
     }
     group_tables.sort();
     group_tables.dedup();
@@ -1281,13 +1296,23 @@ async fn run_subset_load_group(
     while let Some(existing) = engine.group_record(&group_sub).await {
         log.group(&existing.stream_path);
         log.phase(GroupLoadPhase::Renew);
-        let same = existing.members.len() == members.len()
-            && existing.members.iter().zip(&members).all(|(old, new)| {
-                old.key == new.key()
+        let mut same = existing.members.len() == members.len();
+        if same {
+            for (old, new) in existing.members.iter().zip(&members) {
+                let feed_matches =
+                    engine.get_shape(&old.shape_id).await.and_then(|shape| serde_json::to_value(shape.where_json).ok())
+                        == serde_json::to_value(new.feed_where()).ok();
+                if !(old.key == new.key()
                     && old.table == new.table.to_string()
                     && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
                     && old.columns == new.columns
-            });
+                    && feed_matches)
+                {
+                    same = false;
+                    break;
+                }
+            }
+        }
         if !same {
             return Err(AppError {
                 status: StatusCode::CONFLICT,
@@ -1381,7 +1406,7 @@ async fn run_subset_load_group(
         match engine
             .create_shape_as_on_stream(
                 &member.table,
-                member.where_.clone(),
+                member.feed_where(),
                 member.columns.clone(),
                 true,
                 Some(sub.clone()),
@@ -1455,7 +1480,7 @@ async fn run_subset_load_group(
                 where_: member.where_.clone(),
                 columns: member.columns.clone(),
                 subscription: sub.clone(),
-                is_subquery: member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery),
+                is_subquery: member.feed_where().as_ref().is_some_and(crate::subquery::predicate_has_subquery),
             })
             .collect(),
         lsn: page.lsn.clone(),
