@@ -515,6 +515,18 @@ async fn filed_lookup_and_the_scan_list_emit_the_same_changes() {
                 assert_eq!(agg.count, expected as i64, "seed {seed}: {cid} count under {:?}", world.filing);
             }
         }
+        // Every shape leaves: no key, placement or count may outlive the shapes that made it.
+        for world in &mut worlds {
+            for sid in filters.keys() {
+                world.remove_shape(sid);
+            }
+            let counts: Vec<String> = world.aggregates.keys().cloned().collect();
+            for cid in counts {
+                world.agg_index.remove(&cid);
+            }
+            assert!(world.shape_index.is_empty(), "seed {seed}: {:?} shape index kept something", world.filing);
+            assert!(world.agg_index.is_empty(), "seed {seed}: {:?} aggregate index kept something", world.filing);
+        }
     }
     // The run is only evidence if it exercised what the rule can get wrong.
     assert!(total_keys >= 200, "only {total_keys} shapes were filed under a list of keys");
@@ -730,7 +742,7 @@ fn removing_a_filed_shape_clears_every_one_of_its_keys() {
     assert!(index.candidates(&[Tup2(row("s2", "s0"), 1)]).is_empty());
     assert!(index.candidates(&[Tup2(row("s0", "s1"), 1)]).is_empty());
     index.remove("one");
-    assert!(index.eq.is_empty() && index.placed.is_empty() && index.scan.is_empty(), "nothing is left behind");
+    assert!(index.is_empty(), "nothing is left behind: no key, no placement, no count");
 }
 
 /// With the setting off, nothing is filed differently: a list filter is on the scan list and a

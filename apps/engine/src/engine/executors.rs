@@ -131,6 +131,18 @@ impl StandaloneIndex {
         StandaloneIndex { list_keys, ..StandaloneIndex::default() }
     }
 
+    /// Is nothing filed and nothing counted? What removing every shape must leave behind.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.eq.is_empty()
+            && self.lower.is_empty()
+            && self.upper.is_empty()
+            && self.scan.is_empty()
+            && self.placed.is_empty()
+            && self.named.is_empty()
+            && self.names.is_empty()
+    }
+
     pub(crate) fn insert(&mut self, sid: &str, pred: &CompiledPredicate) {
         use crate::predicate::AccessLeaf;
         // Re-filing a shape that is already here replaces its placement rather than doubling it.
