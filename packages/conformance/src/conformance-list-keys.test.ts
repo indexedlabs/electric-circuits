@@ -125,7 +125,7 @@ describe('conformance: list filters filed under every key (ELECTRIC_CIRCUITS_LIS
     // A value moves from one end's column to the other's.
     for (let pk = 21; pk <= 32; pk++) {
       const row = rows.get(pk)!
-      await write('update', { ...row, from_space: row.to_space, to_space: row.from_space })
+      await write('update', { ...row, from_space: row.to_space ?? null, to_space: row.from_space ?? null })
     }
     // Both keys become NULL: a NULL key equals nothing, so the row leaves every keyed reader.
     for (let pk = 33; pk <= 40; pk++) await write('update', { ...rows.get(pk)!, from_space: null, to_space: null })
