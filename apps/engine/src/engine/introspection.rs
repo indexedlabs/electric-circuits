@@ -871,16 +871,17 @@ impl Engine {
         })
     }
 
-    /// Full per-node state snapshot (`GET /state`): the sequencer's node map, built for this request,
-    /// merged with the subquery registry's node/shape summaries. Tables with no executor yet (no
-    /// shape registered) report a default source state so the visualizer can render a chip for
-    /// every graph node.
+    /// Full per-node state snapshot (`GET /state`): the sequencer's node map, built for the readers
+    /// waiting on it, merged with the subquery registry's node/shape summaries. Tables with no
+    /// executor yet (no shape registered) report a default source state so the visualizer can
+    /// render a chip for every graph node.
     ///
-    /// The sequencer builds the map only when asked (OTTO-14463), so this waits for it to finish
-    /// the page of commits it is on, as [`Self::dump_node`] and [`Self::mem_bytes`] do. One request
-    /// is with the sequencer at a time (`SequencerHandle::node_states_turn`). With no sequencer, or
-    /// one that stopped before answering, the answer holds the table defaults and the subquery
-    /// summaries only.
+    /// The sequencer builds the map only when asked (OTTO-14463), and it decides when: readers
+    /// waiting together share one build, and a page of commits that is ready to read goes before
+    /// the next build (`SequencerCmd::NodeStates`). So this waits for the sequencer to finish what
+    /// it is on, as [`Self::dump_node`] and [`Self::mem_bytes`] do. With no sequencer, or one that
+    /// stopped before answering, the answer holds the table defaults and the subquery summaries
+    /// only.
     pub async fn state_snapshot(&self) -> StateSnapshot {
         let mut nodes: HashMap<String, NodeStateSummary> = HashMap::new();
         let sequencer = {
@@ -891,15 +892,15 @@ impl Engine {
                     NodeStateSummary::Table { processed_offset: "-1".to_string(), envelopes: 0 },
                 );
             }
-            st.sequencer.as_ref().map(|seq| (seq.cmd_tx.clone(), seq.node_states_turn.clone()))
+            st.sequencer.as_ref().map(|seq| seq.cmd_tx.clone())
         };
-        if let Some((cmd_tx, turn)) = sequencer {
-            let _turn = turn.lock().await;
+        if let Some(cmd_tx) = sequencer {
             let (resp, built) = tokio::sync::oneshot::channel();
             if cmd_tx.send(SequencerCmd::NodeStates { resp }).is_ok()
                 && let Ok(built) = built.await
             {
-                nodes.extend(built);
+                // The map is this reader's own unless another reader shared the build.
+                nodes.extend(Arc::unwrap_or_clone(built));
             }
         }
         for (id, s) in self.subqueries.lock().await.state_summaries() {

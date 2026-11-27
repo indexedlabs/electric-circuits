@@ -15,11 +15,6 @@ pub(crate) struct SequencerHandle {
     pub(crate) processed: Arc<std::sync::Mutex<LogPosition>>,
     /// Per-table circuit topology (shared families + standalone count), for tests/observability.
     pub(crate) stats: Arc<std::sync::Mutex<HashMap<TableRef, TableStats>>>,
-    /// Held by a `GET /state` while its [`SequencerCmd::NodeStates`] is with the sequencer, so the
-    /// command queue never holds more than one of them. Each costs the sequencer a walk over
-    /// every shape, and commands are served before the next page of commits: a burst of readers
-    /// queueing their builds back to back would hold ingest up for all of them.
-    pub(crate) node_states_turn: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(crate) enum SequencerCmd {
@@ -117,11 +112,17 @@ pub(crate) enum SequencerCmd {
         node_id: String,
         resp: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
     },
-    /// Build the merged node-state map (see [`merged_node_states`]) for one reader. Serves
-    /// `GET /state`. Nothing else builds it unless `/trace` has a subscriber, because it holds an
-    /// entry per shape (OTTO-14463).
+    /// A reader asks for the merged node-state map (see [`merged_node_states`]). Serves
+    /// `GET /state`. Nothing else builds the map unless `/trace` has a subscriber, because it holds
+    /// an entry per shape (OTTO-14463).
+    ///
+    /// Unlike the other commands this one is not served where it is received. The loop serves
+    /// commands before the change log, and a build walks every shape, so a steady stream of readers
+    /// served in that arm would hold commits up. A reader waits for its turn instead (see
+    /// [`answer_state_readers`]): readers waiting together share one build, and a page of commits
+    /// that is ready to read is processed before the next build.
     NodeStates {
-        resp: tokio::sync::oneshot::Sender<HashMap<String, NodeStateSummary>>,
+        resp: tokio::sync::oneshot::Sender<Arc<HashMap<String, NodeStateSummary>>>,
     },
     /// On-demand owned-heap byte-walk of every table's live executor state (see
     /// `introspection::exec_heap_bytes`) — the memory probe's `bytes_executors` term. Sent only
@@ -203,7 +204,7 @@ pub(crate) fn spawn_sequencer(
         shutdown,
         party,
     ));
-    SequencerHandle { cmd_tx, processed, stats, node_states_turn: Default::default() }
+    SequencerHandle { cmd_tx, processed, stats }
 }
 
 /// The node-state map merged across every table executor: what `GET /state` returns and what a
@@ -232,6 +233,27 @@ pub(crate) fn merged_node_states(
         ));
     }
     merged
+}
+
+/// Answer every waiting `GET /state` reader with one build of the node-state map. A reader that
+/// gave up while it waited is dropped first, and with nobody left there is no build. Returns
+/// whether the map was built.
+pub(crate) fn answer_state_readers(
+    readers: &mut Vec<tokio::sync::oneshot::Sender<Arc<HashMap<String, NodeStateSummary>>>>,
+    execs: &HashMap<String, TableExec>,
+    offset: &str,
+    emitted: &HashMap<String, u64>,
+    metrics: &crate::metrics::Metrics,
+) -> bool {
+    readers.retain(|resp| !resp.is_closed());
+    if readers.is_empty() {
+        return false;
+    }
+    let built = Arc::new(merged_node_states(execs, offset, emitted, metrics));
+    for resp in readers.drain(..) {
+        let _ = resp.send(built.clone());
+    }
+    true
 }
 
 /// Publish the per-table stats to the sequencer's shared handle and, when anyone is subscribed to
@@ -549,6 +571,11 @@ pub(crate) async fn sequencer_loop(
     // Own the positioned read across command arms. Cancelling/recreating it would abandon
     // admission and rejoin the FIFO behind later readers during a control-plane burst.
     let mut pending_read = None;
+    // `GET /state` readers waiting for the node-state map, and whether the change-log read has
+    // completed since the map was last built for one. Between two builds the read gets its turn:
+    // see the two reader branches of the select below.
+    let mut state_readers = Vec::new();
+    let mut read_since_state_build = true;
 
     loop {
         let (read_path, read_off) = (pos.path(), pos.offset.clone());
@@ -699,12 +726,8 @@ pub(crate) async fn sequencer_loop(
                         execs.get(table.as_str()).and_then(|exec| dump_node_json(exec, &pos.to_string(), &emitted, &node_id));
                     let _ = resp.send(val);
                 }
-                Some(SequencerCmd::NodeStates { resp }) => {
-                    // A reader that gave up while this waited in the queue gets no build.
-                    if !resp.is_closed() {
-                        let _ = resp.send(merged_node_states(&execs, &pos.to_string(), &emitted, ds.metrics()));
-                    }
-                }
+                // Not answered here: see the two reader branches below.
+                Some(SequencerCmd::NodeStates { resp }) => state_readers.push(resp),
                 Some(SequencerCmd::MemBytes { resp }) => {
                     // On-demand only (see the variant's doc comment): this sums `exec_heap_bytes`
                     // across every live table executor, which is exactly the walk `stats_of` used
@@ -724,8 +747,18 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested at {}", published(&pos, &held_from));
                 break;
             }
+            // Waiting `/state` readers, once the change-log read has completed since the last
+            // build. Placed AFTER commands, so the answer reflects every command queued before the
+            // reader asked, and BEFORE the read, so a backlog of ready pages cannot starve readers:
+            // under load they alternate, one build then one page.
+            _ = std::future::ready(()), if read_since_state_build && !state_readers.is_empty() => {
+                if answer_state_readers(&mut state_readers, &execs, &pos.to_string(), &emitted, ds.metrics()) {
+                    read_since_state_build = false;
+                }
+            }
             res = async { pending_read.as_mut().expect("unpaused read exists").await }, if !paused && !sequencer_read_failed => {
                 pending_read = None;
+                read_since_state_build = true;
                 match res {
                 Ok((rr, page_permit)) => {
                     // A PauseReads command may win immediately after an in-flight HTTP read returns.
@@ -1221,6 +1254,14 @@ pub(crate) async fn sequencer_loop(
                 }
                 }
             },
+            // Waiting `/state` readers when nothing above was ready: no page of commits to read
+            // right now, so they need not wait for one. The read is polled before this branch, so
+            // a page that is ready always goes first and waits behind at most one build.
+            _ = std::future::ready(()), if !state_readers.is_empty() => {
+                if answer_state_readers(&mut state_readers, &execs, &pos.to_string(), &emitted, ds.metrics()) {
+                    read_since_state_build = false;
+                }
+            }
         }
     }
     drop(pending_read);

@@ -114,9 +114,10 @@ cd tutorials && docker compose up --build    # serves http://localhost:5180
   routing placement (`familyKey` / standalone / `isSubquery`) and predicate, plus the shared
   subquery node + edge DAG. It reads in-memory topology only — no cost to the hot path.
 - `GET /state` (→ `Engine::state_snapshot`) returns the live summary of every node — offsets,
-  emit counters, index cardinalities, fold values — built by the sequencer for that request, one
-  request at a time. The engine keeps no copy between requests, so it pays nothing for the map
-  while no visualizer is attached.
+  emit counters, index cardinalities, fold values — built by the sequencer when a reader asks.
+  Readers waiting together share one build, and a ready page of commits goes before the next
+  build. The engine keeps no copy between requests, so it pays nothing for the map while no
+  visualizer is attached.
 - `GET /state/node?id=<node-id>` (→ `Engine::dump_node`) deep-dumps one node's state: a route
   join's index contents, an aggregate's fold internals (incl. the multiset), a subquery node's
   inner set.

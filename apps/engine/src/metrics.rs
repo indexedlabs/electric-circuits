@@ -184,8 +184,9 @@ pub struct Metrics {
     /// re-delivered in full or was abandoned, and either way an operator should be able to see it.
     pub sequencer_orphan_fragments: AtomicU64,
     /// Times the sequencer built the visualizer's node-state map, which has an entry per shape
-    /// (OTTO-14463). It moves only for a reader: once per `GET /state`, and once per publish while
-    /// `/trace` has a subscriber. With no reader it stays still however many commits are processed.
+    /// (OTTO-14463). It moves only for a reader: once for the `GET /state` readers waiting together,
+    /// and once per publish while `/trace` has a subscriber. With no reader it stays still however
+    /// many commits are processed.
     pub node_state_builds: AtomicU64,
     /// GAUGE, not a counter: how many change-log segments exist right now (republished by every
     /// retention sweep). `reset()` leaves it alone — a gauge describes the world, not the window.

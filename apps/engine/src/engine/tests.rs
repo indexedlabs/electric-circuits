@@ -404,12 +404,11 @@ fn node_states_cover_every_node_kind() {
     }
 }
 
-/// `GET /state` asks the sequencer to build the node-state map, which walks every shape, and the
-/// sequencer serves commands before its next page of commits. So one request is with it at a time:
-/// a second reader waits for the first one's answer before it asks. A sequencer that stops without
-/// answering leaves the reader with the table defaults, not waiting.
+/// `GET /state` asks the sequencer for the node-state map and lays the answer over the table
+/// defaults. A sequencer that stops without answering leaves the reader with the defaults, not
+/// waiting.
 #[tokio::test]
-async fn state_snapshot_keeps_one_request_with_the_sequencer_at_a_time() {
+async fn state_snapshot_asks_the_sequencer_and_falls_back_to_the_table_defaults() {
     fn poll_once<F: std::future::Future>(future: &mut std::pin::Pin<Box<F>>) -> std::task::Poll<F::Output> {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         future.as_mut().poll(&mut cx)
@@ -424,25 +423,21 @@ async fn state_snapshot_keeps_one_request_with_the_sequencer_at_a_time() {
             cmd_tx,
             processed: Arc::new(std::sync::Mutex::new(LogPosition::start())),
             stats: Default::default(),
-            node_states_turn: Default::default(),
         });
     }
-    let mut first = Box::pin(engine.state_snapshot());
-    let mut second = Box::pin(engine.state_snapshot());
-    assert!(poll_once(&mut first).is_pending());
-    assert!(poll_once(&mut second).is_pending());
-    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("the first reader asked") };
-    assert!(commands.try_recv().is_err(), "the second reader must wait for the first one's answer");
-
+    let mut answered = Box::pin(engine.state_snapshot());
+    assert!(poll_once(&mut answered).is_pending(), "the reader waits for the sequencer");
+    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("the reader asked the sequencer") };
     let built = NodeStateSummary::Table { processed_offset: "changes/0@p1".into(), envelopes: 4 };
-    resp.send(HashMap::from([("table:public.users".to_string(), built.clone())])).unwrap();
-    let snapshot = first.await;
+    resp.send(Arc::new(HashMap::from([("table:public.users".to_string(), built.clone())]))).unwrap();
+    let snapshot = answered.await;
     assert_eq!(snapshot.nodes["table:public.users"], built, "the sequencer's entry replaces the default");
 
-    assert!(poll_once(&mut second).is_pending());
-    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("then the second reader asked") };
+    let mut unanswered = Box::pin(engine.state_snapshot());
+    assert!(poll_once(&mut unanswered).is_pending());
+    let Ok(SequencerCmd::NodeStates { resp }) = commands.try_recv() else { panic!("the reader asked the sequencer") };
     drop(resp);
-    let snapshot = second.await;
+    let snapshot = unanswered.await;
     assert_eq!(
         snapshot.nodes["table:public.users"],
         NodeStateSummary::Table { processed_offset: "-1".into(), envelopes: 0 },
