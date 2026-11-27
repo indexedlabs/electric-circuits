@@ -81,7 +81,7 @@ interface GroupLoad {
   rows: { table: string; value: { id: number; title?: string } }[]
 }
 
-async function loadGroup(members: { table: string; where?: Predicate }[]): Promise<GroupLoad> {
+async function loadGroup(members: { table: string; where?: Predicate; feedWhere?: Predicate }[]): Promise<GroupLoad> {
   const res = await fetch(`${h.engineUrl}/v1/subsets/load`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -197,6 +197,23 @@ async function groupStream(group: GroupLoad, count: number): Promise<StreamEnvel
 }
 
 describe('a group stream keeps each key’s envelopes in the order they were evaluated', () => {
+  it('uses a member’s feed predicate for live changes and its snapshot predicate for the page', async () => {
+    const group = await loadGroup([
+      {
+        table: 'items',
+        where: inActiveGrants,
+        feedWhere: { col: 'ws', op: 'eq', value: 10 },
+      },
+    ])
+    expect(label(snapshot(group))).toEqual(['public.items 1', 'public.items 2', 'public.items 3'])
+
+    await write(`INSERT INTO items (id, ws, title) VALUES (4, 20, 'feed-excluded'), (5, 10, 'feed-included')`)
+    await drainEngine(h)
+    const envs = await groupStream(group, 1)
+
+    expect(said(envs)).toEqual(['upsert public.items 5'])
+  })
+
   it('ends on what Postgres holds when a nested flip’s verdict follows a newer live change to the same key', async () => {
     const group = await loadGroup([{ table: 'items', where: inActiveGrants }])
     expect(label(snapshot(group))).toEqual(['public.items 1', 'public.items 2', 'public.items 3'])
