@@ -12,6 +12,7 @@ from pathlib import Path
 from plain_words_report import load, runner
 
 PHASES = (("w1-control", "loads only"), ("w1-load", "loads, import and deletion"))
+DATED = ("record", "record_date_index", "assignment", "graph_edge", "calendar_event", "record_recurrence")
 
 
 def number(value, digits=2):
@@ -22,13 +23,13 @@ def probe(entry):
     if not entry["attempts"]:
         return "none"
     lost = entry["attempts"] - entry["successes"]
-    return f"{entry['successes']:,}/{entry['attempts']:,}; p95 {number(entry['successful_p95_s'], 3)} s, max {number(entry['successful_max_s'], 2)} s; {lost} timed out"
+    return f"{entry['successes']:,}/{entry['attempts']:,}; p50 {number(entry['successful_p50_s'], 3)} s, p95 {number(entry['successful_p95_s'], 3)} s, max {number(entry['successful_max_s'], 2)} s; {lost} timed out"
 
 
 def loads(entry):
     if not entry["due"]:
         return "none"
-    return f"{entry['ok']:,}/{entry['due']:,} answered; p50 {number(entry['wall_p50_s'], 3)} s, p95 {number(entry['wall_p95_s'], 3)} s, max {number(entry['wall_max_s'], 2)} s; {entry['timed_out']} timed out, {entry['shed']} shed, {entry['errors']} failed; started p95 {number(entry['lag_p95_s'], 3)} s late"
+    return f"{entry['ok']:,}/{entry['due']:,} answered; p50 {number(entry['wall_p50_s'], 3)} s, p95 {number(entry['wall_p95_s'], 3)} s, max {number(entry['wall_max_s'], 2)} s; {entry['timed_out']} timed out, {entry['shed']} shed, {entry['errors']} failed"
 
 
 def megabytes(value):
@@ -70,7 +71,7 @@ def cell(root, count):
     calibration = load(folder / "catalog-calibration.json")["actual"]["cardinalities"]
     seed = load(folder / "seed.json") if (folder / "seed.json").exists() else {}
     print(f"### {count:,} active accounts ({runner(folder)}, `{folder.name}`)\n")
-    print(f"Engine shapes: {calibration['shapes']:,} (all standalone: {calibration['standalone']:,}; subquery shapes {calibration['subquery_shapes']}). Family rows seeded: {sum(seed.get('family_rows', {}).values()):,}.\n")
+    print(f"Engine shapes: {calibration['shapes']:,}, all of them in the engine's {calibration['families']} equality families (one per table, a hash lookup by key); subquery shapes {calibration['subquery_shapes']}, scan-list shapes {calibration['standalone']}. Family rows seeded: {sum(seed.get('family_rows', {}).values()):,}.\n")
     print("| | " + " | ".join(label for workload, label in PHASES if workload in results) + " |")
     print("| --- | " + " | ".join("---" for workload, _ in PHASES if workload in results) + " |")
     def row(label, value):
@@ -82,6 +83,7 @@ def cell(root, count):
     row("Longest run of lost drains", lambda workload, result: f"{number(longest_gap(folder, workload), 1)} s")
     for kind, label in (("day", "Day loads"), ("week", "Week loads"), ("detail", "Record detail opens")):
         row(f"Other accounts' {label.lower()}", lambda workload, result, kind=kind: loads(result["loads"][kind]))
+    row("Loads started late by, p95 / max", lambda workload, result: f"{number(result['loads']['all']['lag_p95_s'], 3)} s / {number(result['loads']['all']['lag_max_s'], 3)} s")
     row("Loads served", lambda workload, result: f"{result['loads']['all']['requests'] / max(1, result['loads'].get('span_s', 1)):,.0f} requests/s, {megabytes(result['loads']['all']['bytes'] / max(1, result['loads'].get('span_s', 1)))}/s")
     row("Rows per load, p50 / p95", lambda workload, result: " ; ".join(f"{kind} {result['loads'][kind]['rows_p50']:,} / {result['loads'][kind]['rows_p95']:,}" for kind in ("day", "week", "detail")))
     row("Engine CPU (of 1)", lambda workload, result: f"{result['engine_cpu_percent']:.0f}%")
@@ -115,13 +117,20 @@ def cell(root, count):
             if follower is None or not span:
                 continue
             total = follower["total"]
+            if name == "delete":
+                # A delete carries only its row's key, so its window share is counted from the deleted
+                # family's own rows: row i of each dated table belongs to day i % 84 of the fixture's dates.
+                dated = {table: entry for table, entry in follower["tables"].items() if table in DATED}
+                for window, days in (("day", {14}), ("week", set(range(14, 21)))):
+                    rows = {table: sum(ordinal % 84 in days for ordinal in range(entry["rows"])) for table, entry in dated.items()}
+                    total[window] = {"rows": sum(rows.values()), "bytes": sum(rows[table] * entry["bytes"] / entry["rows"] for table, entry in dated.items())}
             windows = " | ".join(f"{total[window]['rows']:,} rows, {megabytes(total[window]['bytes'])}" if name != "bystander" else "—" for window in ("day", "week"))
             print(f"| {label} | {total['rows']:,} | {megabytes(total['bytes'])} | {span:.0f} s | {total['rows'] * 60 / span:,.0f} | {megabytes(total['bytes'] * 60 / span)} | {windows} |")
         print()
         for name in ("import", "delete"):
             follower = result["followers"].get(name)
             if follower:
-                print(f"By table, {name}: " + ", ".join(f"`{table}` {entry['rows']:,} rows / {megabytes(entry['bytes'])}" for table, entry in follower["tables"].items()) + f". Rows with no date to place: {follower['total'].get('unplaced_rows', 0):,}.\n")
+                print(f"By table, {name}: " + ", ".join(f"`{table}` {entry['rows']:,} rows / {megabytes(entry['bytes'])}" for table, entry in follower["tables"].items()) + ".\n")
     return True
 
 
