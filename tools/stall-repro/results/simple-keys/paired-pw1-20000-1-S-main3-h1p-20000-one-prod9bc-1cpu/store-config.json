@@ -1,0 +1,17 @@
+{
+  "command": [
+    "/home/runner/work/electric-circuits/electric-circuits/tools/stall-repro/bin/durable-streams-server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "8791",
+    "--data-dir",
+    "/home/runner/work/electric-circuits/electric-circuits/tools/stall-repro/results/run-paired-pw1-20000-1-S-main3-h1p-20000-one-prod9bc-1cpu/store-data",
+    "--durability",
+    "wal"
+  ],
+  "sha256": "019145e5a0d4f403ca5168ed89580b41ccc6c9e8fd4ba49aca2a3498a8a818e8",
+  "matches_indexed_4mib_page_setting": false,
+  "cap_detection": "option literal in pinned binary, then validated by server startup",
+  "help_exit": 2
+}
