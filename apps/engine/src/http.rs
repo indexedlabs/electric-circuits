@@ -1083,7 +1083,9 @@ struct GroupMemberReq {
     where_: Option<PredicateJson>,
     /// The predicate its changes-only feed is filed with. Omitted, the feed takes `where`. A page
     /// may look into another table while its feed reads only the row, so the member is a plain
-    /// shape rather than a subquery shape.
+    /// shape rather than a subquery shape. The caller chooses a feed that admits every row `where`
+    /// can return; the engine does not check it, and a page row the feed does not admit is never
+    /// updated or removed on the stream.
     #[serde(default, rename = "feedWhere")]
     feed_where: Option<PredicateJson>,
     #[serde(default)]

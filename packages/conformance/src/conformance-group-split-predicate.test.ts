@@ -6,6 +6,10 @@
 // engine files by its own row: no subquery shape, no membership node, no flip. A member that names
 // no `feedWhere` keeps one predicate for both, as before.
 //
+// The caller chooses a feed that admits every row the page can return, as the gateway does: the page
+// is a window, the feed is every row in the reader's workspaces. A page row the feed did not admit
+// would never be updated or removed on the stream, so the fixture's feed covers its page.
+//
 // The predicates are part of the group's identity: a load that repeats both renews the group, and
 // one that changes either is another group. A split member is a plain shape, so its group survives
 // an engine restart, which a group with a subquery member does not.
@@ -28,10 +32,12 @@ const schema: Schema = {
 
 /** The page: `items.ws IN (SELECT ws FROM grants)`, a membership into another table. */
 const inGrants: Predicate = { col: 'ws', in: { table: 'grants', project: 'ws' } }
-/** The feed: the row's own audience key, no lookup. */
-const inWorkspace10: Predicate = { col: 'ws', op: 'eq', value: 10 }
+/** The feed: the reader's workspaces 10, 20 and 30 on the row's own column, no lookup. */
+const inMyWorkspaces: Predicate = {
+  or: [10, 20, 30].map((value) => ({ col: 'ws', op: 'eq', value }) as Predicate),
+}
 
-const split = { table: 'items', where: inGrants, feedWhere: inWorkspace10 }
+const split = { table: 'items', where: inGrants, feedWhere: inMyWorkspaces }
 
 interface GroupLoad {
   groupId: string
@@ -51,7 +57,8 @@ interface GraphShape {
 let h: Harness
 beforeEach(async () => {
   h = await bootHarness(schema)
-  // Granted workspaces 10 and 30; item 3 sits in workspace 20, which nothing grants.
+  // The page's grants cover workspaces 10 and 30; item 3 sits in workspace 20, which the reader's
+  // feed covers and nothing grants.
   await pgQuery(h, 'INSERT INTO grants (id, ws) VALUES (1, 10), (2, 30)')
   await pgQuery(h, `INSERT INTO items (id, ws, title) VALUES (1, 10, 'a'), (2, 30, 'b'), (3, 20, 'c')`)
   await drainEngine(h)
@@ -107,20 +114,27 @@ describe('a group member reads its page and files its feed with separate predica
     const shape = (await graphShapes()).find((s) => s.id === member)
     expect(shape, `member ${member} on /graph`).toBeDefined()
     expect(shape!.isSubquery).toBe(false)
-    expect(shape!.where).toEqual(inWorkspace10)
+    expect(shape!.where).toEqual(inMyWorkspaces)
     expect(await subqueryShapes()).toBe(0)
     expect(await subqueryNodes()).toEqual([])
 
-    // Live, the feed predicate decides. Item 4 is granted but outside the feed; granting workspace
-    // 20 would move item 3 into the page's predicate, and a plain feed has no membership to flip;
-    // item 5 is in the feed. Commits land on the group stream in order, so once item 5 is there
-    // anything the earlier two produced would be too.
-    await pgQuery(h, `INSERT INTO items (id, ws, title) VALUES (4, 30, 'granted, outside the feed')`)
+    // Live, the feed predicate decides. Item 4 is outside the reader's workspaces. Granting workspace
+    // 20 would move item 3 into the page's predicate, and a plain feed has no membership to flip.
+    // The page's own rows change inside the feed, so the stream carries them, and a new row in the
+    // feed arrives. Commits land on the group stream in order, so once the last one is there
+    // anything the earlier ones produced would be too.
+    await pgQuery(h, `INSERT INTO items (id, ws, title) VALUES (4, 40, 'outside the feed')`)
     await pgQuery(h, 'INSERT INTO grants (id, ws) VALUES (3, 20)')
+    await pgQuery(h, `UPDATE items SET title = 'b2' WHERE id = 2`)
+    await pgQuery(h, 'DELETE FROM items WHERE id = 1')
     await pgQuery(h, `INSERT INTO items (id, ws, title) VALUES (5, 10, 'in the feed')`)
     await drainEngine(h)
 
-    expect(said(await groupStream(group, 1))).toEqual(['upsert public.items 5'])
+    expect(said(await groupStream(group, 3))).toEqual([
+      'upsert public.items 2',
+      'delete public.items 1',
+      'upsert public.items 5',
+    ])
     expect(await subqueryNodes()).toEqual([])
   })
 
@@ -134,7 +148,7 @@ describe('a group member reads its page and files its feed with separate predica
 
     const otherFeed = await load({
       subscription: 'split-renew',
-      members: [{ ...split, feedWhere: { col: 'ws', op: 'eq', value: 30 } }],
+      members: [{ ...split, feedWhere: { col: 'ws', op: 'eq', value: 10 } }],
     })
     expect(otherFeed.status, JSON.stringify(otherFeed.body)).toBe(409)
 
