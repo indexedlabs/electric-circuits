@@ -3266,6 +3266,25 @@ impl Engine {
         Ok(())
     }
 
+    /// The schema of each of `tables`, keyed by table, for a group member whose page reads them,
+    /// refused like a create while one of them is unresolved or being resolved. A resolution bumps
+    /// the table's generation before it swaps the new schema in, so a fingerprint read in between
+    /// would record the old schema against the new generation. Refusing then keeps every recorded
+    /// fingerprint the one the engine serves; a resolution that begins after this read moves a
+    /// generation the caller captured before it. A table with no fingerprint (library mode) is left
+    /// out.
+    pub(crate) async fn page_schemas(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<std::collections::BTreeMap<String, crate::schema::SchemaFingerprint>> {
+        let st = self.state.lock().await;
+        self.ensure_schema_resolved(&st, tables)?;
+        Ok(tables
+            .iter()
+            .filter_map(|table| Some((table.to_string(), st.tables.get(table)?.fingerprint.clone()?)))
+            .collect())
+    }
+
     /// The create's closing check, the schema counterpart of [`Self::ensure_create_not_degraded`]:
     /// did any table this create read drift while it was reading it?
     ///

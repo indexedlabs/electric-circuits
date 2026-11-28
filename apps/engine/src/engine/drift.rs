@@ -1046,6 +1046,32 @@ mod tests {
         assert!(!err.contains("being resolved"), "the gate must clear with the lock: {err}");
     }
 
+    /// A group member keeps the schema of each table its page reads, and the read is refused while
+    /// one of them is being resolved, as a create on it is: a resolution bumps the generation before
+    /// it swaps the schema in, so a fingerprint read in between would record the old schema.
+    #[tokio::test]
+    async fn a_page_schema_read_during_a_resolution_is_refused() {
+        let (engine, items) = engine_with_items().await;
+        let fingerprint = SchemaFingerprint {
+            columns: vec![crate::schema::FingerprintColumn { name: "id".into(), type_oid: 23, typmod: -1 }],
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        };
+        engine.state.lock().await.tables.get_mut(&items).unwrap().fingerprint = Some(fingerprint.clone());
+        let tables = std::slice::from_ref(&items);
+        assert_eq!(engine.page_schemas(tables).await.unwrap().get("public.items"), Some(&fingerprint));
+
+        let lock = engine.force_resolve_lock(&items).await;
+        let err = engine.page_schemas(tables).await.unwrap_err().to_string();
+        assert!(err.contains("being resolved"), "unexpected refusal: {err}");
+        drop(lock);
+        assert!(engine.page_schemas(tables).await.is_ok(), "the refusal clears with the lock");
+
+        engine.unresolved(&items, "test").await;
+        let err = engine.page_schemas(tables).await.unwrap_err().to_string();
+        assert!(err.contains("unresolved"), "unexpected refusal: {err}");
+    }
+
     /// A create that overlapped an epoch reset must never be installed (ADR-0004). Two independent
     /// gates say so, and this exercises both against the reset's real critical section.
     ///
