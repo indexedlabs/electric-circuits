@@ -2382,6 +2382,39 @@ mod tests {
     use crate::predicate::PredicateJson;
     use crate::{ds::DsClient, engine::Engine};
 
+    /// A group record written before members could split their predicates has no `feedWhere` and no
+    /// `pageSchemas`: it reads back with its feed on `where`, so a load that names no `feedWhere`, or
+    /// one equal to `where`, renews it, and one with another feed predicate is another group.
+    #[test]
+    fn a_record_from_before_the_split_renews_with_its_feed_on_where() {
+        let in_lists = serde_json::json!({"col": "list_id", "in": {"table": "lists", "project": "id"}});
+        let old: crate::engine::GroupMember = serde_json::from_value(serde_json::json!({
+            "key": "items",
+            "shape_id": "s1",
+            "table": "public.items",
+            "where": in_lists,
+            "columns": null,
+            "subscription": "scope",
+            "is_subquery": true,
+        }))
+        .unwrap();
+        assert!(old.feed_where.is_none() && old.page_schemas.is_empty());
+        assert_eq!(old.feed(), old.where_.as_ref());
+
+        let load = |member: serde_json::Value| serde_json::from_value::<super::GroupMemberReq>(member).unwrap();
+        assert!(load(serde_json::json!({"key": "items", "table": "items", "where": in_lists})).is(&old));
+        assert!(
+            load(serde_json::json!({"key": "items", "table": "items", "where": in_lists, "feedWhere": in_lists}))
+                .is(&old)
+        );
+        let plain = serde_json::json!({"col": "id", "op": "gte", "value": 0});
+        assert!(
+            !load(serde_json::json!({"key": "items", "table": "items", "where": in_lists, "feedWhere": plain}))
+                .is(&old)
+        );
+        assert!(!load(serde_json::json!({"key": "items", "table": "items", "where": plain})).is(&old));
+    }
+
     // The fleet's healthcheck does an awk string-compare against the exact body, so byte-for-byte
     // exactness (no whitespace) matters more than JSON equivalence.
     #[test]

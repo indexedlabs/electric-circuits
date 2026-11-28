@@ -4378,6 +4378,46 @@ mod cancellation_tests {
         (engine, group)
     }
 
+    /// A split member's feed shape does not read its page's tables, so no shape is a dependent of
+    /// one. A retirement of such a table releases the group all the same, member shapes and all;
+    /// a retirement of a table no member's page reads leaves it alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retiring_a_table_only_a_page_reads_releases_its_group() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-page-table".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let mut split = group.clone();
+        split.members[0].where_ = Some(
+            serde_json::from_value(serde_json::json!({"col": "id", "in": {"table": "grants", "project": "id"}}))
+                .unwrap(),
+        );
+        split.members[0].feed_where =
+            Some(serde_json::from_value(serde_json::json!({"col": "id", "op": "gte", "value": 0})).unwrap());
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+            st.group_claims.complete(split);
+        }
+
+        engine.force_retire_dependents(&crate::table_ref::TableRef::parse("other").unwrap()).await;
+        assert!(engine.group_record("scope").await.is_some(), "no page reads the retired table");
+
+        let grants = crate::table_ref::TableRef::parse("grants").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.force_retire_dependents(&grants))
+            .await
+            .expect("the retirement and its group release must complete");
+        assert!(engine.group_record("scope").await.is_none(), "the group whose page reads the table is released");
+        let st = engine.state.lock().await;
+        assert!(
+            group.members.iter().all(|member| !st.shapes.contains_key(&member.shape_id)),
+            "its member shapes go with it"
+        );
+        drop(st);
+        engine.close(std::time::Duration::from_secs(1)).await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn transient_group_head_failure_preserves_claim_for_retry() {
         let store = std::sync::Arc::new(crate::ds::ScriptedStore { head_error: true, ..Default::default() });

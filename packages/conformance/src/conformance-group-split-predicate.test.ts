@@ -174,6 +174,12 @@ describe('a group member reads its page and files its feed with separate predica
     })
     expect(otherFeed.status, JSON.stringify(otherFeed.body)).toBe(409)
 
+    const otherPage = await load({
+      subscription: 'split-renew',
+      members: [{ ...split, where: { col: 'ws', op: 'eq', value: 10 } }],
+    })
+    expect(otherPage.status, JSON.stringify(otherPage.body)).toBe(409)
+
     // Naming no feed predicate files the feed on the snapshot predicate: another group.
     const oneFilter = await load({ subscription: 'split-renew', members: [{ table: 'items', where: inGrants }] })
     expect(oneFilter.status, JSON.stringify(oneFilter.body)).toBe(409)
