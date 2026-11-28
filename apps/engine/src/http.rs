@@ -2401,7 +2401,7 @@ mod tests {
         }))
         .unwrap();
         assert!(old.feed_where.is_none() && old.page_schemas.is_empty());
-        assert_eq!(old.feed(), old.where_.as_ref());
+        assert_eq!(serde_json::to_value(old.feed()).unwrap(), serde_json::to_value(&old.where_).unwrap());
 
         let load = |member: serde_json::Value| serde_json::from_value::<super::GroupMemberReq>(member).unwrap();
         assert!(load(serde_json::json!({"key": "items", "table": "items", "where": in_lists})).is(&old));
