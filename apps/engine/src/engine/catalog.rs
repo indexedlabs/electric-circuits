@@ -2373,6 +2373,57 @@ mod tests {
     use crate::shutdown::ShutdownToken;
     use testing::FakeDs;
 
+    /// A restart judges the tables a group member's page reads by the schemas the group kept, since
+    /// no shape depends on them: one that still serves passes, and one that changed, is no longer
+    /// tracked or was never recorded drops the group. A page with no subquery reads no other table.
+    #[test]
+    fn a_page_table_changed_while_down_is_found_from_the_kept_schemas() {
+        use crate::schema::{FingerprintColumn, REPLICA_IDENTITY_FULL, Schema, SchemaFingerprint, compile_schema};
+        let schema: Schema = serde_json::from_value(serde_json::json!({ "tables": {
+            "items": { "columns": { "id": {"type": "int"}, "ws": {"type": "int"} }, "primaryKey": "id" },
+            "grants": { "columns": { "id": {"type": "int"}, "ws": {"type": "int"} }, "primaryKey": "id" },
+        }}))
+        .unwrap();
+        let mut compiled = compile_schema(&schema).unwrap();
+        let fingerprint = |columns: &[&str]| SchemaFingerprint {
+            columns: columns
+                .iter()
+                .map(|name| FingerprintColumn { name: (*name).into(), type_oid: 23, typmod: -1 })
+                .collect(),
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        };
+        let grants = TableRef::parse("grants").unwrap();
+        compiled.get_mut(&grants).unwrap().fingerprint = Some(fingerprint(&["id", "ws"]));
+        let member = |where_: serde_json::Value, kept: Option<SchemaFingerprint>| crate::engine::group::GroupMember {
+            key: "items".into(),
+            shape_id: "s1".into(),
+            table: "public.items".into(),
+            where_: Some(serde_json::from_value(where_).unwrap()),
+            feed_where: Some(
+                serde_json::from_value(serde_json::json!({"col": "ws", "op": "eq", "value": 10})).unwrap(),
+            ),
+            page_schemas: kept.into_iter().map(|kept| ("public.grants".to_string(), kept)).collect(),
+            columns: None,
+            subscription: "scope".into(),
+            is_subquery: false,
+        };
+        let in_grants = serde_json::json!({"col": "ws", "in": {"table": "grants", "project": "ws"}});
+        let plain = serde_json::json!({"col": "ws", "op": "eq", "value": 10});
+
+        let kept = member(in_grants.clone(), Some(fingerprint(&["id", "ws"])));
+        assert_eq!(page_schema_moved_while_down(&kept, &compiled), None);
+        let changed = page_schema_moved_while_down(&member(in_grants.clone(), Some(fingerprint(&["id"]))), &compiled);
+        assert!(changed.as_deref().is_some_and(|what| what.starts_with("public.grants")), "{changed:?}");
+        assert!(
+            page_schema_moved_while_down(&member(in_grants.clone(), None), &compiled).is_some(),
+            "a page table the group kept no schema for cannot be vouched for"
+        );
+        assert_eq!(page_schema_moved_while_down(&member(plain, None), &compiled), None);
+        compiled.remove(&grants);
+        assert!(page_schema_moved_while_down(&kept, &compiled).is_some(), "a page table the engine no longer tracks");
+    }
+
     fn boot_race_store() -> (Arc<crate::ds::ScriptedStore>, tokio::sync::mpsc::UnboundedReceiver<LogPosition>) {
         let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

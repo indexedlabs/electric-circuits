@@ -83,6 +83,19 @@ async function loaded(body: { subscription?: string; members: unknown[] }): Prom
   return res.body
 }
 
+/**
+ * A load once the engine has settled a change to a table the page reads: while that table is being
+ * resolved a load is refused, retryably, as a create on it is.
+ */
+async function loadedAfterResolution(body: { subscription?: string; members: unknown[] }): Promise<GroupLoad> {
+  let last: { status: number; body: GroupLoad } | undefined
+  await waitFor(async () => {
+    last = await load(body)
+    return last.status === 200
+  }, 'a load after the resolution settles')
+  return last!.body
+}
+
 async function engineGet<T>(path: string): Promise<T> {
   const res = await fetch(`${h.engineUrl}${path}`)
   expect(res.ok, `GET ${path} -> ${res.status}`).toBe(true)
@@ -195,10 +208,28 @@ describe('a group member reads its page and files its feed with separate predica
       'the group whose page reads the truncated table to be released',
     )
 
-    const again = await loaded({ subscription: 'split-drift', members: [split] })
+    const again = await loadedAfterResolution({ subscription: 'split-drift', members: [split] })
     expect(again.groupId).not.toBe(first.groupId)
     expect(again.streamPath).not.toBe(first.streamPath)
     expect(snapshot(again), 'the reload reads the page after the truncate').toEqual([])
+  })
+
+  it('releases a split group when a table only its page reads changes schema', async () => {
+    const first = await loaded({ subscription: 'split-alter', members: [split] })
+    const member = first.results[0]!.shapeId
+
+    // The engine sees the new schema with the next change to the table, in its `Relation` message.
+    await pgQuery(h, 'ALTER TABLE grants ADD COLUMN note text')
+    await pgQuery(h, 'INSERT INTO grants (id, ws) VALUES (3, 40)')
+    await drainEngine(h)
+    await waitFor(
+      async () => (await fetch(`${h.engineUrl}/shapes/${member}`)).status === 404,
+      'the group whose page reads the changed table to be released',
+    )
+
+    const again = await loadedAfterResolution({ subscription: 'split-alter', members: [split] })
+    expect(again.groupId).not.toBe(first.groupId)
+    expect(snapshot(again)).toEqual(['public.items 1', 'public.items 2'])
   })
 
   it('drops a split group at restart when a table only its page reads changed while the engine was down', async () => {
@@ -209,8 +240,9 @@ describe('a group member reads its page and files its feed with separate predica
     })
 
     // Nothing on the live path saw the change, so the group's record is the only witness of the
-    // schema its page was read with; it no longer matches, and the group is not restored.
-    const again = await loaded({ subscription: 'split-ddl-down', members: [split] })
+    // schema its page was read with; it no longer matches, and the group is not restored. The new
+    // engine resolves the changed table as it starts, and a load waits that out.
+    const again = await loadedAfterResolution({ subscription: 'split-ddl-down', members: [split] })
     expect(again.groupId).not.toBe(first.groupId)
     expect(again.streamPath).not.toBe(first.streamPath)
     expect(snapshot(again)).toEqual(['public.items 1', 'public.items 2'])
