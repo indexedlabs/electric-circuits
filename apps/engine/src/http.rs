@@ -1304,6 +1304,18 @@ async fn run_subset_load_group(
     group_tables.sort();
     group_tables.dedup();
     let group_gens = engine.capture_schema_gens(&group_tables).await;
+    // The schema of each table a member's page reads through a subquery, kept on the group's record:
+    // no shape depends on a table only the page reads, so a restart that finds one changed can tell
+    // only from this (`page_schema_moved_while_down`). The read is refused while such a table is
+    // unresolved or being resolved, as a create on it is, and it comes before a renewal as well as a
+    // create, so neither a new group nor a renewed page is read against a schema a running
+    // resolution is about to replace. A resolution that begins after it moves a generation captured
+    // above, which a create's completion check sees, and releases the group a renewal renewed.
+    let mut page_schemas = Vec::with_capacity(members.len());
+    for member in &members {
+        let tables = member.where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default();
+        page_schemas.push(engine.page_schemas(&tables).await.map_err(AppError::from)?);
+    }
     let _control = engine.admit_control()?;
     let group_sub = engine.resolve_subscription(subscription).await;
     // Each pass either answers, or waits for a release of the group it read to finish and then
@@ -1380,16 +1392,6 @@ async fn run_subset_load_group(
             // group again rather than answering the old stream or a conflict.
             engine.release_group_claim(&group_sub, &existing.id).await.map_err(AppError::from)?;
         }
-    }
-    // The schema of each table a member's page reads through a subquery, kept on the group's record:
-    // no shape depends on a table only the page reads, so a restart that finds one changed can tell
-    // only from this (`page_schema_moved_while_down`). The read is refused while such a table is
-    // being resolved, as a create on it is; a resolution that begins after it moves a generation
-    // captured above, which the completion check sees.
-    let mut page_schemas = Vec::with_capacity(members.len());
-    for member in &members {
-        let tables = member.where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default();
-        page_schemas.push(engine.page_schemas(&tables).await.map_err(AppError::from)?);
     }
     let group_path = engine.group_stream_path();
     log.group(&group_path);
