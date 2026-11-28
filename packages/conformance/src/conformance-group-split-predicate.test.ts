@@ -84,16 +84,24 @@ async function loaded(body: { subscription?: string; members: unknown[] }): Prom
 }
 
 /**
- * A load once the engine has settled a change to a table the page reads: while that table is being
- * resolved a load is refused, retryably, as a create on it is.
+ * A load once the engine has settled a change to a table the page reads. While that table is
+ * unresolved or being resolved a load gets the refusal a create on it gets, a `500` that says to
+ * retry; that is the only answer this waits out, and any other one fails the test at once.
  */
 async function loadedAfterResolution(body: { subscription?: string; members: unknown[] }): Promise<GroupLoad> {
-  let last: { status: number; body: GroupLoad } | undefined
+  let loaded: GroupLoad | undefined
   await waitFor(async () => {
-    last = await load(body)
-    return last.status === 200
+    const res = await load(body)
+    if (res.status === 200) {
+      loaded = res.body
+      return true
+    }
+    const error = (res.body as unknown as { error?: string }).error ?? ''
+    expect(res.status, JSON.stringify(res.body)).toBe(500)
+    expect(error, 'only a resolution refusal is waited out').toMatch(/is (being resolved|unresolved) after a change/)
+    return false
   }, 'a load after the resolution settles')
-  return last!.body
+  return loaded!
 }
 
 async function engineGet<T>(path: string): Promise<T> {

@@ -2923,8 +2923,8 @@ async fn group_admission_gate(f: &Fixture) -> Result<()> {
 
 /// A split member's feed shape reads only its own table, so the shape create's own gate never sees
 /// a table only its page reads. The load gates that table itself: while it is being resolved the
-/// load is refused, retryably, and leaves no group, so no group is installed against the schema a
-/// running resolution is about to replace.
+/// load gets the refusal a create on it gets (a `500` that says to retry) and leaves no group, so
+/// no group is installed against the schema a running resolution is about to replace.
 async fn group_load_waits_out_a_page_table_resolution(f: &Fixture) -> Result<()> {
     let (engine, app) = group_engine(f).await?;
     let result = async {
@@ -2945,7 +2945,7 @@ async fn group_load_waits_out_a_page_table_resolution(f: &Fixture) -> Result<()>
         ensure!(
             status == StatusCode::INTERNAL_SERVER_ERROR
                 && refused["error"].as_str().is_some_and(|message| message.contains("being resolved")),
-            "a load whose page reads a table being resolved must be refused retryably: {status} {refused}"
+            "a load whose page reads a table being resolved must get the create gate's retry refusal: {status} {refused}"
         );
         ensure!(!engine.has_group_record("group-page-resolution").await, "the refused load left a group record");
         drop(lock);
