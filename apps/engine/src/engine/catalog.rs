@@ -940,6 +940,29 @@ fn schema_moved_while_down(rec: &ShapeRecord, compiled: &HashMap<TableRef, Table
     }
 }
 
+/// What changed while the engine was down in a table `member`'s page reads through a subquery, if
+/// anything. No shape depends on such a table when the member's feed does not read it, so the
+/// schemas the group kept at creation are the only witness. A table the page reads that the group
+/// kept no schema for cannot be vouched for, and counts as changed.
+fn page_schema_moved_while_down(
+    member: &crate::engine::group::GroupMember,
+    compiled: &HashMap<TableRef, TableSchema>,
+) -> Option<String> {
+    for table in referenced_tables(member.where_.as_ref()?) {
+        let Some(ts) = compiled.get(&table) else {
+            return Some(format!("{table} is no longer tracked"));
+        };
+        // Library mode keeps no fingerprint, and checks no drift.
+        let Some(now) = ts.fingerprint.as_ref() else { continue };
+        match member.page_schemas.get(&table.to_string()) {
+            Some(then) if then.still_serves(now) => {}
+            Some(then) => return Some(format!("{table}: {}", crate::schema::describe_drift(then, now).join("; "))),
+            None => return Some(format!("{table}: the group kept no schema for it")),
+        }
+    }
+    None
+}
+
 /// The timestamp literal in `rec`'s predicate that the engine cannot read, if it has one (see
 /// [`crate::pg_temporal::UnreadableLiteral`]). A subquery record is not judged here: it cannot be
 /// compiled without the registry, and the restore drops it for its own reasons.
@@ -1769,10 +1792,20 @@ impl Engine {
                 self.group_lanes.note_restored_highwater(lsn);
             }
             for (subscription, group) in groups {
-                let restorable = group
-                    .members
-                    .iter()
-                    .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
+                let page_moved = group.members.iter().find_map(|member| page_schema_moved_while_down(member, compiled));
+                if let Some(what) = &page_moved {
+                    tracing::warn!(
+                        %subscription,
+                        "restore: dropping group {} — a table its page reads changed while the engine was down \
+                         ({what}); its readers reload",
+                        group.id
+                    );
+                }
+                let restorable = page_moved.is_none()
+                    && group
+                        .members
+                        .iter()
+                        .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
                 let lease_live = self.retention.subscription_lease_timeout.is_zero()
                     || group.members.iter().all(|member| {
                         st.feed_shares
@@ -2339,6 +2372,57 @@ mod tests {
     use super::*;
     use crate::shutdown::ShutdownToken;
     use testing::FakeDs;
+
+    /// A restart judges the tables a group member's page reads by the schemas the group kept, since
+    /// no shape depends on them: one that still serves passes, and one that changed, is no longer
+    /// tracked or was never recorded drops the group. A page with no subquery reads no other table.
+    #[test]
+    fn a_page_table_changed_while_down_is_found_from_the_kept_schemas() {
+        use crate::schema::{FingerprintColumn, REPLICA_IDENTITY_FULL, Schema, SchemaFingerprint, compile_schema};
+        let schema: Schema = serde_json::from_value(serde_json::json!({ "tables": {
+            "items": { "columns": { "id": {"type": "int"}, "ws": {"type": "int"} }, "primaryKey": "id" },
+            "grants": { "columns": { "id": {"type": "int"}, "ws": {"type": "int"} }, "primaryKey": "id" },
+        }}))
+        .unwrap();
+        let mut compiled = compile_schema(&schema).unwrap();
+        let fingerprint = |columns: &[&str]| SchemaFingerprint {
+            columns: columns
+                .iter()
+                .map(|name| FingerprintColumn { name: (*name).into(), type_oid: 23, typmod: -1 })
+                .collect(),
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        };
+        let grants = TableRef::parse("grants").unwrap();
+        compiled.get_mut(&grants).unwrap().fingerprint = Some(fingerprint(&["id", "ws"]));
+        let member = |where_: serde_json::Value, kept: Option<SchemaFingerprint>| crate::engine::group::GroupMember {
+            key: "items".into(),
+            shape_id: "s1".into(),
+            table: "public.items".into(),
+            where_: Some(serde_json::from_value(where_).unwrap()),
+            feed_where: Some(
+                serde_json::from_value(serde_json::json!({"col": "ws", "op": "eq", "value": 10})).unwrap(),
+            ),
+            page_schemas: kept.into_iter().map(|kept| ("public.grants".to_string(), kept)).collect(),
+            columns: None,
+            subscription: "scope".into(),
+            is_subquery: false,
+        };
+        let in_grants = serde_json::json!({"col": "ws", "in": {"table": "grants", "project": "ws"}});
+        let plain = serde_json::json!({"col": "ws", "op": "eq", "value": 10});
+
+        let kept = member(in_grants.clone(), Some(fingerprint(&["id", "ws"])));
+        assert_eq!(page_schema_moved_while_down(&kept, &compiled), None);
+        let changed = page_schema_moved_while_down(&member(in_grants.clone(), Some(fingerprint(&["id"]))), &compiled);
+        assert!(changed.as_deref().is_some_and(|what| what.starts_with("public.grants")), "{changed:?}");
+        assert!(
+            page_schema_moved_while_down(&member(in_grants.clone(), None), &compiled).is_some(),
+            "a page table the group kept no schema for cannot be vouched for"
+        );
+        assert_eq!(page_schema_moved_while_down(&member(plain, None), &compiled), None);
+        compiled.remove(&grants);
+        assert!(page_schema_moved_while_down(&kept, &compiled).is_some(), "a page table the engine no longer tracks");
+    }
 
     fn boot_race_store() -> (Arc<crate::ds::ScriptedStore>, tokio::sync::mpsc::UnboundedReceiver<LogPosition>) {
         let store = Arc::new(crate::ds::ScriptedStore { read_appended: true, ..Default::default() });
@@ -3588,6 +3672,8 @@ mod tests {
                 shape_id: id.into(),
                 table: "public.users".into(),
                 where_: None,
+                feed_where: None,
+                page_schemas: Default::default(),
                 columns: None,
                 subscription: sub.into(),
                 is_subquery: false,

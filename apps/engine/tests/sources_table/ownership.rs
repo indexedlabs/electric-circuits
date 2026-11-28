@@ -88,6 +88,7 @@ fn isolated(name: &str, case: Case) -> Result<()> {
             Case::GroupAdmission => group_admission_gate(&fixture).await,
             Case::GroupStall => group_stall_holds_back_no_other_stream(&fixture).await,
             Case::GroupRestartBehind => group_restart_restores_a_behind_group_detached(&fixture).await,
+            Case::GroupPageResolution => group_load_waits_out_a_page_table_resolution(&fixture).await,
         };
         // Result assertions, rather than panics, let fixture cleanup run on semantic failures.
         let cleanup = fixture.cleanup().await;
@@ -134,6 +135,7 @@ enum Case {
     GroupAdmission,
     GroupStall,
     GroupRestartBehind,
+    GroupPageResolution,
 }
 
 #[test]
@@ -350,6 +352,12 @@ fn group_restart_restores_a_behind_group_detached_and_a_drained_one_attached() -
         "ownership::group_restart_restores_a_behind_group_detached_and_a_drained_one_attached",
         Case::GroupRestartBehind,
     )
+}
+
+#[test]
+#[ignore = "isolated PostgreSQL 18 required via ELECTRIC_CIRCUITS_TEST_PG_URL"]
+fn group_load_whose_page_reads_a_table_being_resolved_is_refused() -> Result<()> {
+    isolated("ownership::group_load_whose_page_reads_a_table_being_resolved_is_refused", Case::GroupPageResolution)
 }
 
 #[derive(Clone)]
@@ -2906,6 +2914,59 @@ async fn group_admission_gate(f: &Fixture) -> Result<()> {
             .context("held admission group did not finish")?
             .context("held admission task failed")??;
         ensure!(status == StatusCode::OK, "held admission group failed: {status} {body}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    engine.close(Duration::from_secs(10)).await;
+    result
+}
+
+/// A split member's feed shape reads only its own table, so the shape create's own gate never sees
+/// a table only its page reads. The load gates that table itself: while it is being resolved the
+/// load gets the refusal a create on it gets (a `500` that says to retry). A first load leaves no
+/// group, and a load that would renew a group reads no page, so neither a new group nor a renewed
+/// page is read against the schema a running resolution is about to replace.
+async fn group_load_waits_out_a_page_table_resolution(f: &Fixture) -> Result<()> {
+    let (engine, app) = group_engine(f).await?;
+    let result = async {
+        let outer = format!("public.{}", f.outer);
+        let inner = format!("public.{}", f.inner);
+        let body = serde_json::json!({
+            "subscription": "group-page-resolution",
+            "members": [{
+                "key": "split",
+                "table": outer,
+                "columns": ["id", "body"],
+                "where": { "col": "id", "in": { "table": inner, "project": "id" } },
+                "feedWhere": { "col": "id", "op": "gte", "value": 0 },
+            }],
+        });
+        let lock = engine.force_resolve_lock(&electric_circuits_engine::table_ref::TableRef::parse(&inner)?).await;
+        let (status, refused) = post_group(&app, body.clone()).await?;
+        ensure!(
+            status == StatusCode::INTERNAL_SERVER_ERROR
+                && refused["error"].as_str().is_some_and(|message| message.contains("being resolved")),
+            "a load whose page reads a table being resolved must get the create gate's retry refusal: {status} {refused}"
+        );
+        ensure!(!engine.has_group_record("group-page-resolution").await, "the refused load left a group record");
+        drop(lock);
+        let (status, loaded) = post_group(&app, body.clone()).await?;
+        ensure!(status == StatusCode::OK, "the load must succeed once the resolution ends: {status} {loaded}");
+        ensure!(engine.has_group_record("group-page-resolution").await, "the load after the resolution has no group");
+
+        // The same load again would renew that group, and is refused the same way while a
+        // resolution of the page's table runs; once it ends, the load renews the group.
+        let lock = engine.force_resolve_lock(&electric_circuits_engine::table_ref::TableRef::parse(&inner)?).await;
+        let (status, refused) = post_group(&app, body.clone()).await?;
+        ensure!(
+            status == StatusCode::INTERNAL_SERVER_ERROR
+                && refused["error"].as_str().is_some_and(|message| message.contains("being resolved")),
+            "a renewal whose page reads a table being resolved must get the create gate's retry refusal: {status} {refused}"
+        );
+        drop(lock);
+        let (status, renewed) = post_group(&app, body).await?;
+        ensure!(status == StatusCode::OK, "the renewal must succeed once the resolution ends: {status} {renewed}");
+        ensure!(renewed["groupId"] == loaded["groupId"], "the load after the resolution renews the group: {renewed}");
         Ok::<_, anyhow::Error>(())
     }
     .await;

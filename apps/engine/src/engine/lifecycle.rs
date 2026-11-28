@@ -3266,6 +3266,25 @@ impl Engine {
         Ok(())
     }
 
+    /// The schema of each of `tables`, keyed by table, for a group member whose page reads them,
+    /// refused like a create while one of them is unresolved or being resolved. A resolution bumps
+    /// the table's generation before it swaps the new schema in, so a fingerprint read in between
+    /// would record the old schema against the new generation. Refusing then keeps every recorded
+    /// fingerprint the one the engine serves; a resolution that begins after this read moves a
+    /// generation the caller captured before it. A table with no fingerprint (library mode) is left
+    /// out.
+    pub(crate) async fn page_schemas(
+        &self,
+        tables: &[TableRef],
+    ) -> Result<std::collections::BTreeMap<String, crate::schema::SchemaFingerprint>> {
+        let st = self.state.lock().await;
+        self.ensure_schema_resolved(&st, tables)?;
+        Ok(tables
+            .iter()
+            .filter_map(|table| Some((table.to_string(), st.tables.get(table)?.fingerprint.clone()?)))
+            .collect())
+    }
+
     /// The create's closing check, the schema counterpart of [`Self::ensure_create_not_degraded`]:
     /// did any table this create read drift while it was reading it?
     ///
@@ -4329,6 +4348,8 @@ mod cancellation_tests {
                     shape_id: "member-0".into(),
                     table: "items-a".into(),
                     where_: None,
+                    feed_where: None,
+                    page_schemas: Default::default(),
                     columns: None,
                     subscription: "scope".into(),
                     is_subquery: false,
@@ -4338,6 +4359,8 @@ mod cancellation_tests {
                     shape_id: "member-1".into(),
                     table: "items-b".into(),
                     where_: None,
+                    feed_where: None,
+                    page_schemas: Default::default(),
                     columns: None,
                     subscription: "scope:member:1".into(),
                     is_subquery: false,
@@ -4353,6 +4376,46 @@ mod cancellation_tests {
         st.group_claims.complete(group.clone());
         drop(st);
         (engine, group)
+    }
+
+    /// A split member's feed shape does not read its page's tables, so no shape is a dependent of
+    /// one. A retirement of such a table releases the group all the same, member shapes and all;
+    /// a retirement of a table no member's page reads leaves it alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retiring_a_table_only_a_page_reads_releases_its_group() {
+        let store = std::sync::Arc::new(crate::ds::ScriptedStore::default());
+        let ds = DsClient::with_test_store("scripted://group-page-table".into(), store);
+        let (engine, group) = engine_with_group_claim_ds(ds).await;
+        let mut split = group.clone();
+        split.members[0].where_ = Some(
+            serde_json::from_value(serde_json::json!({"col": "id", "in": {"table": "grants", "project": "id"}}))
+                .unwrap(),
+        );
+        split.members[0].feed_where =
+            Some(serde_json::from_value(serde_json::json!({"col": "id", "op": "gte", "value": 0})).unwrap());
+        {
+            let mut st = engine.state.lock().await;
+            st.group_claims.release("scope");
+            st.group_claims.reserve("scope", "group:scope").unwrap();
+            st.group_claims.reserve_private_members("scope", ["scope:member:1".into()]);
+            st.group_claims.complete(split);
+        }
+
+        engine.force_retire_dependents(&crate::table_ref::TableRef::parse("other").unwrap()).await;
+        assert!(engine.group_record("scope").await.is_some(), "no page reads the retired table");
+
+        let grants = crate::table_ref::TableRef::parse("grants").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), engine.force_retire_dependents(&grants))
+            .await
+            .expect("the retirement and its group release must complete");
+        assert!(engine.group_record("scope").await.is_none(), "the group whose page reads the table is released");
+        let st = engine.state.lock().await;
+        assert!(
+            group.members.iter().all(|member| !st.shapes.contains_key(&member.shape_id)),
+            "its member shapes go with it"
+        );
+        drop(st);
+        engine.close(std::time::Duration::from_secs(1)).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5437,6 +5500,8 @@ mod subscription_tests {
                 shape_id: id,
                 table,
                 where_: None,
+                feed_where: None,
+                page_schemas: Default::default(),
                 columns: None,
                 subscription,
                 is_subquery: false,

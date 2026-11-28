@@ -502,7 +502,7 @@ impl Engine {
         // Every trigger funnels through here exactly once, so this is the whole `schema_drift_total`
         // count: tables whose dependents were retired, whatever noticed.
         self.metrics.schema_drift.fetch_add(1, Ordering::Relaxed);
-        let ids: Vec<String> = {
+        let (ids, groups): (Vec<String>, Vec<(String, String)>) = {
             let mut st = self.state.lock().await;
             let ids = st
                 .shapes
@@ -512,10 +512,19 @@ impl Engine {
                 })
                 .map(|rec| rec.id.clone())
                 .collect();
+            // A group member's page can read a table its feed shape does not (`feedWhere`), so no
+            // shape above depends on it. The group reads it all the same: release the group, as a
+            // member's retirement would, so its readers reload a page read after the change.
+            let groups = st
+                .group_claims
+                .records_iter()
+                .filter(|group| group.members.iter().any(|member| member.page_reads(table)))
+                .map(|group| (group.subscription.clone(), group.id.clone()))
+                .collect();
             *st.schema_gen.entry(table.clone()).or_insert(0) += 1;
-            ids
+            (ids, groups)
         };
-        if ids.is_empty() {
+        if ids.is_empty() && groups.is_empty() {
             tracing::info!("{why} on {table}: no dependent shapes to retire");
             return ids;
         }
@@ -523,6 +532,13 @@ impl Engine {
         for id in &ids {
             if let Err(e) = self.purge_shape(id).await {
                 tracing::error!("{why} on {table}: retiring shape {id} failed: {e:#}");
+            }
+        }
+        // A group a member purge above already released is gone, and its release is a no-op here.
+        for (subscription, group_id) in groups {
+            tracing::warn!("{why} on {table}: releasing group {group_id}, whose page reads it");
+            if let Err(e) = self.release_group_claim(&subscription, &group_id).await {
+                tracing::error!("{why} on {table}: releasing group {group_id} failed: {e:#}");
             }
         }
         ids
@@ -1028,6 +1044,32 @@ mod tests {
         // on the gate).
         let err = engine.create_shape(&items, None, None, false, true).await.unwrap_err().to_string();
         assert!(!err.contains("being resolved"), "the gate must clear with the lock: {err}");
+    }
+
+    /// A group member keeps the schema of each table its page reads, and the read is refused while
+    /// one of them is being resolved, as a create on it is: a resolution bumps the generation before
+    /// it swaps the schema in, so a fingerprint read in between would record the old schema.
+    #[tokio::test]
+    async fn a_page_schema_read_during_a_resolution_is_refused() {
+        let (engine, items) = engine_with_items().await;
+        let fingerprint = SchemaFingerprint {
+            columns: vec![crate::schema::FingerprintColumn { name: "id".into(), type_oid: 23, typmod: -1 }],
+            replident: REPLICA_IDENTITY_FULL,
+            pk: Some(vec!["id".into()]),
+        };
+        engine.state.lock().await.tables.get_mut(&items).unwrap().fingerprint = Some(fingerprint.clone());
+        let tables = std::slice::from_ref(&items);
+        assert_eq!(engine.page_schemas(tables).await.unwrap().get("public.items"), Some(&fingerprint));
+
+        let lock = engine.force_resolve_lock(&items).await;
+        let err = engine.page_schemas(tables).await.unwrap_err().to_string();
+        assert!(err.contains("being resolved"), "unexpected refusal: {err}");
+        drop(lock);
+        assert!(engine.page_schemas(tables).await.is_ok(), "the refusal clears with the lock");
+
+        engine.unresolved(&items, "test").await;
+        let err = engine.page_schemas(tables).await.unwrap_err().to_string();
+        assert!(err.contains("unresolved"), "unexpected refusal: {err}");
     }
 
     /// A create that overlapped an epoch reset must never be installed (ADR-0004). Two independent

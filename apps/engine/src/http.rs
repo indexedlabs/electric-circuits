@@ -1078,8 +1078,16 @@ struct GroupMemberReq {
     #[serde(default)]
     key: Option<String>,
     table: TableRef,
+    /// The member's snapshot predicate: what its page reads.
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
+    /// The predicate its changes-only feed is filed with. Omitted, the feed takes `where`. A page
+    /// may look into another table while its feed reads only the row, so the member is a plain
+    /// shape rather than a subquery shape. The caller chooses a feed that admits every row `where`
+    /// can return; the engine does not check it, and a page row the feed does not admit is never
+    /// updated or removed on the stream.
+    #[serde(default, rename = "feedWhere")]
+    feed_where: Option<PredicateJson>,
     #[serde(default)]
     columns: Option<Vec<String>>,
 }
@@ -1087,6 +1095,26 @@ struct GroupMemberReq {
 impl GroupMemberReq {
     fn key(&self) -> String {
         self.key.clone().unwrap_or_else(|| self.table.to_string())
+    }
+
+    /// The predicate the member's feed shape is filed with.
+    fn feed(&self) -> Option<&PredicateJson> {
+        self.feed_where.as_ref().or(self.where_.as_ref())
+    }
+
+    /// Whether `existing` is this member as an earlier load created it: the same key, table,
+    /// columns, snapshot predicate and feed predicate. Read from the group's record alone, so a
+    /// member whose shape a release has already purged is still recognised and the load joins that
+    /// release instead of answering a conflict.
+    fn is(&self, existing: &GroupMember) -> bool {
+        let same = |a: Option<&PredicateJson>, b: Option<&PredicateJson>| {
+            serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+        };
+        existing.key == self.key()
+            && existing.table == self.table.to_string()
+            && same(existing.where_.as_ref(), self.where_.as_ref())
+            && same(existing.feed(), self.feed())
+            && existing.columns == self.columns
     }
 }
 
@@ -1246,33 +1274,48 @@ async fn run_subset_load_group(
     for member in &members {
         let create = CreateShapeReq {
             table: member.table.clone(),
-            where_: member.where_.clone(),
+            where_: member.feed().cloned(),
             columns: member.columns.clone(),
             changes_only: true,
             subscription: None,
         };
         validate_create_shape_request(engine, &create).await?;
-        engine
-            .validate_subset(&member.table, member.where_.clone(), member.columns.clone(), None, None, None)
-            .await
-            .map_err(|error| AppError {
-                status: StatusCode::BAD_REQUEST,
-                msg: format!("{error:#}"),
-                retry_after: false,
-            })?;
+        // Both predicates are planned as reads before anything is claimed, so an invalid one is the
+        // caller's 400 and leaves nothing behind.
+        let mut predicates = vec![member.where_.clone()];
+        if member.feed_where.is_some() {
+            predicates.push(member.feed_where.clone());
+        }
+        for where_ in predicates {
+            engine.validate_subset(&member.table, where_, member.columns.clone(), None, None, None).await.map_err(
+                |error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false },
+            )?;
+        }
     }
     // Capture every table the group reads before member creation begins. The completion path
     // rechecks this generation/epoch snapshot after GroupCreated is durable.
     let mut group_tables = Vec::new();
     for member in &members {
         group_tables.push(member.table.clone());
-        if let Some(where_) = &member.where_ {
+        for where_ in member.where_.iter().chain(member.feed_where.iter()) {
             group_tables.extend(crate::subquery::referenced_tables(where_));
         }
     }
     group_tables.sort();
     group_tables.dedup();
     let group_gens = engine.capture_schema_gens(&group_tables).await;
+    // The schema of each table a member's page reads through a subquery, kept on the group's record:
+    // no shape depends on a table only the page reads, so a restart that finds one changed can tell
+    // only from this (`page_schema_moved_while_down`). The read is refused while such a table is
+    // unresolved or being resolved, as a create on it is, and it comes before a renewal as well as a
+    // create, so neither a new group nor a renewed page is read against a schema a running
+    // resolution is about to replace. A resolution that begins after it moves a generation captured
+    // above, which a create's completion check sees, and releases the group a renewal renewed.
+    let mut page_schemas = Vec::with_capacity(members.len());
+    for member in &members {
+        let tables = member.where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default();
+        page_schemas.push(engine.page_schemas(&tables).await.map_err(AppError::from)?);
+    }
     let _control = engine.admit_control()?;
     let group_sub = engine.resolve_subscription(subscription).await;
     // Each pass either answers, or waits for a release of the group it read to finish and then
@@ -1282,12 +1325,7 @@ async fn run_subset_load_group(
         log.group(&existing.stream_path);
         log.phase(GroupLoadPhase::Renew);
         let same = existing.members.len() == members.len()
-            && existing.members.iter().zip(&members).all(|(old, new)| {
-                old.key == new.key()
-                    && old.table == new.table.to_string()
-                    && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
-                    && old.columns == new.columns
-            });
+            && existing.members.iter().zip(&members).all(|(old, new)| new.is(old));
         if !same {
             return Err(AppError {
                 status: StatusCode::CONFLICT,
@@ -1381,7 +1419,7 @@ async fn run_subset_load_group(
         match engine
             .create_shape_as_on_stream(
                 &member.table,
-                member.where_.clone(),
+                member.feed().cloned(),
                 member.columns.clone(),
                 true,
                 Some(sub.clone()),
@@ -1448,14 +1486,17 @@ async fn run_subset_load_group(
         members: members
             .iter()
             .zip(created.iter())
-            .map(|(member, (rec, sub))| GroupMember {
+            .zip(page_schemas)
+            .map(|((member, (rec, sub)), page_schemas)| GroupMember {
                 key: member.key(),
                 shape_id: rec.id.clone(),
                 table: member.table.to_string(),
                 where_: member.where_.clone(),
+                feed_where: member.feed_where.clone(),
+                page_schemas,
                 columns: member.columns.clone(),
                 subscription: sub.clone(),
-                is_subquery: member.where_.as_ref().is_some_and(crate::subquery::predicate_has_subquery),
+                is_subquery: rec.is_subquery,
             })
             .collect(),
         lsn: page.lsn.clone(),
@@ -2342,6 +2383,39 @@ mod tests {
     };
     use crate::predicate::PredicateJson;
     use crate::{ds::DsClient, engine::Engine};
+
+    /// A group record written before members could split their predicates has no `feedWhere` and no
+    /// `pageSchemas`: it reads back with its feed on `where`, so a load that names no `feedWhere`, or
+    /// one equal to `where`, renews it, and one with another feed predicate is another group.
+    #[test]
+    fn a_record_from_before_the_split_renews_with_its_feed_on_where() {
+        let in_lists = serde_json::json!({"col": "list_id", "in": {"table": "lists", "project": "id"}});
+        let old: crate::engine::GroupMember = serde_json::from_value(serde_json::json!({
+            "key": "items",
+            "shape_id": "s1",
+            "table": "public.items",
+            "where": in_lists,
+            "columns": null,
+            "subscription": "scope",
+            "is_subquery": true,
+        }))
+        .unwrap();
+        assert!(old.feed_where.is_none() && old.page_schemas.is_empty());
+        assert_eq!(serde_json::to_value(old.feed()).unwrap(), serde_json::to_value(&old.where_).unwrap());
+
+        let load = |member: serde_json::Value| serde_json::from_value::<super::GroupMemberReq>(member).unwrap();
+        assert!(load(serde_json::json!({"key": "items", "table": "items", "where": in_lists})).is(&old));
+        assert!(
+            load(serde_json::json!({"key": "items", "table": "items", "where": in_lists, "feedWhere": in_lists}))
+                .is(&old)
+        );
+        let plain = serde_json::json!({"col": "id", "op": "gte", "value": 0});
+        assert!(
+            !load(serde_json::json!({"key": "items", "table": "items", "where": in_lists, "feedWhere": plain}))
+                .is(&old)
+        );
+        assert!(!load(serde_json::json!({"key": "items", "table": "items", "where": plain})).is(&old));
+    }
 
     // The fleet's healthcheck does an awk string-compare against the exact body, so byte-for-byte
     // exactness (no whitespace) matters more than JSON equivalence.

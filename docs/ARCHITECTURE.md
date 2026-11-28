@@ -908,8 +908,11 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 *only* here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
-The page is judged by Postgres and the feed by the engine, so the two must read one predicate the
-same way. Timestamps are where they did not: a `timestamptz`/`timestamp`/`date` cell is text as
+The page is judged by Postgres and the feed by the engine, so the two must read a predicate the
+same way. A group-load member may give its feed a predicate of its own (`feedWhere`) beside its
+page's `where`, so a page that reads another table needs no subquery shape; that feed predicate
+admits every row the page can return, and each predicate is still read the same way by both sides
+(`specs/electric-circuits/execution.md`, "Group loads"). Timestamps are where they did not: a `timestamptz`/`timestamp`/`date` cell is text as
 Postgres prints it (`2026-10-19 16:00:00+00`) and the engine compares text, while a client may send
 any spelling of the bound (`2026-10-19T07:00:00Z`). A literal for such a column is therefore
 respelled at compile time the way Postgres prints it (`pg_temporal`), which keeps every comparison
