@@ -12,7 +12,8 @@
 //
 // The predicates are part of the group's identity: a load that repeats both renews the group, and
 // one that changes either is another group. A split member is a plain shape, so its group survives
-// an engine restart, which a group with a subquery member does not.
+// an engine restart, which a group with a subquery member does not. A table only the page reads is
+// still one the group reads: a change to it releases the group, live or while the engine was down.
 
 import type { Predicate, Schema, StreamEnvelope } from '@electric-circuits/protocol'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -179,5 +180,39 @@ describe('a group member reads its page and files its feed with separate predica
       async () => said(await readEnvelopes(again.streamUrl)).includes('upsert public.items 6'),
       'the restored group to deliver a change made after the restart',
     )
+  })
+
+  it('releases a split group when a table only its page reads is truncated', async () => {
+    const first = await loaded({ subscription: 'split-drift', members: [split] })
+    const member = first.results[0]!.shapeId
+
+    // No shape reads `grants`: the member's feed reads only `items`. The group's page does, so the
+    // group goes with it, as it did when the member was a subquery shape.
+    await pgQuery(h, 'TRUNCATE grants')
+    await drainEngine(h)
+    await waitFor(
+      async () => (await fetch(`${h.engineUrl}/shapes/${member}`)).status === 404,
+      'the group whose page reads the truncated table to be released',
+    )
+
+    const again = await loaded({ subscription: 'split-drift', members: [split] })
+    expect(again.groupId).not.toBe(first.groupId)
+    expect(again.streamPath).not.toBe(first.streamPath)
+    expect(snapshot(again), 'the reload reads the page after the truncate').toEqual([])
+  })
+
+  it('drops a split group at restart when a table only its page reads changed while the engine was down', async () => {
+    const first = await loaded({ subscription: 'split-ddl-down', members: [split] })
+
+    await h.restartEngine(async () => {
+      await pgQuery(h, 'ALTER TABLE grants ADD COLUMN note text')
+    })
+
+    // Nothing on the live path saw the change, so the group's record is the only witness of the
+    // schema its page was read with; it no longer matches, and the group is not restored.
+    const again = await loaded({ subscription: 'split-ddl-down', members: [split] })
+    expect(again.groupId).not.toBe(first.groupId)
+    expect(again.streamPath).not.toBe(first.streamPath)
+    expect(snapshot(again)).toEqual(['public.items 1', 'public.items 2'])
   })
 })
