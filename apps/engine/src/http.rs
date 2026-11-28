@@ -1078,10 +1078,12 @@ struct GroupMemberReq {
     #[serde(default)]
     key: Option<String>,
     table: TableRef,
+    /// The member's snapshot predicate: what its page reads.
     #[serde(default, rename = "where")]
     where_: Option<PredicateJson>,
-    /// Predicate used by the changes-only member feed. When omitted, the member's
-    /// snapshot predicate is also used for the feed for backwards compatibility.
+    /// The predicate its changes-only feed is filed with. Omitted, the feed takes `where`. A page
+    /// may look into another table while its feed reads only the row, so the member is a plain
+    /// shape rather than a subquery shape.
     #[serde(default, rename = "feedWhere")]
     feed_where: Option<PredicateJson>,
     #[serde(default)]
@@ -1093,8 +1095,24 @@ impl GroupMemberReq {
         self.key.clone().unwrap_or_else(|| self.table.to_string())
     }
 
-    fn feed_where(&self) -> Option<PredicateJson> {
-        self.feed_where.clone().or_else(|| self.where_.clone())
+    /// The predicate the member's feed shape is filed with.
+    fn feed(&self) -> Option<&PredicateJson> {
+        self.feed_where.as_ref().or(self.where_.as_ref())
+    }
+
+    /// Whether `existing` is this member as an earlier load created it: the same key, table,
+    /// columns, snapshot predicate and feed predicate. Read from the group's record alone, so a
+    /// member whose shape a release has already purged is still recognised and the load joins that
+    /// release instead of answering a conflict.
+    fn is(&self, existing: &GroupMember) -> bool {
+        let same = |a: Option<&PredicateJson>, b: Option<&PredicateJson>| {
+            serde_json::to_value(a).ok() == serde_json::to_value(b).ok()
+        };
+        existing.key == self.key()
+            && existing.table == self.table.to_string()
+            && same(existing.where_.as_ref(), self.where_.as_ref())
+            && same(existing.feed(), self.feed())
+            && existing.columns == self.columns
     }
 }
 
@@ -1252,37 +1270,33 @@ async fn run_subset_load_group(
     }
     validate_new_subscription(subscription.clone())?;
     for member in &members {
-        let feed_where = member.feed_where();
         let create = CreateShapeReq {
             table: member.table.clone(),
-            where_: feed_where.clone(),
+            where_: member.feed().cloned(),
             columns: member.columns.clone(),
             changes_only: true,
             subscription: None,
         };
         validate_create_shape_request(engine, &create).await?;
-        engine.validate_subset(&member.table, feed_where, member.columns.clone(), None, None, None).await.map_err(
-            |error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false },
-        )?;
-        engine
-            .validate_subset(&member.table, member.where_.clone(), member.columns.clone(), None, None, None)
-            .await
-            .map_err(|error| AppError {
-                status: StatusCode::BAD_REQUEST,
-                msg: format!("{error:#}"),
-                retry_after: false,
-            })?;
+        // Both predicates are planned as reads before anything is claimed, so an invalid one is the
+        // caller's 400 and leaves nothing behind.
+        let mut predicates = vec![member.where_.clone()];
+        if member.feed_where.is_some() {
+            predicates.push(member.feed_where.clone());
+        }
+        for where_ in predicates {
+            engine.validate_subset(&member.table, where_, member.columns.clone(), None, None, None).await.map_err(
+                |error| AppError { status: StatusCode::BAD_REQUEST, msg: format!("{error:#}"), retry_after: false },
+            )?;
+        }
     }
     // Capture every table the group reads before member creation begins. The completion path
     // rechecks this generation/epoch snapshot after GroupCreated is durable.
     let mut group_tables = Vec::new();
     for member in &members {
         group_tables.push(member.table.clone());
-        if let Some(where_) = &member.where_ {
+        for where_ in member.where_.iter().chain(member.feed_where.iter()) {
             group_tables.extend(crate::subquery::referenced_tables(where_));
-        }
-        if let Some(feed_where) = member.feed_where() {
-            group_tables.extend(crate::subquery::referenced_tables(&feed_where));
         }
     }
     group_tables.sort();
@@ -1296,23 +1310,8 @@ async fn run_subset_load_group(
     while let Some(existing) = engine.group_record(&group_sub).await {
         log.group(&existing.stream_path);
         log.phase(GroupLoadPhase::Renew);
-        let mut same = existing.members.len() == members.len();
-        if same {
-            for (old, new) in existing.members.iter().zip(&members) {
-                let feed_matches =
-                    engine.get_shape(&old.shape_id).await.and_then(|shape| serde_json::to_value(shape.where_json).ok())
-                        == serde_json::to_value(new.feed_where()).ok();
-                if !(old.key == new.key()
-                    && old.table == new.table.to_string()
-                    && serde_json::to_value(&old.where_).ok() == serde_json::to_value(&new.where_).ok()
-                    && old.columns == new.columns
-                    && feed_matches)
-                {
-                    same = false;
-                    break;
-                }
-            }
-        }
+        let same = existing.members.len() == members.len()
+            && existing.members.iter().zip(&members).all(|(old, new)| new.is(old));
         if !same {
             return Err(AppError {
                 status: StatusCode::CONFLICT,
@@ -1406,7 +1405,7 @@ async fn run_subset_load_group(
         match engine
             .create_shape_as_on_stream(
                 &member.table,
-                member.feed_where(),
+                member.feed().cloned(),
                 member.columns.clone(),
                 true,
                 Some(sub.clone()),
@@ -1478,9 +1477,10 @@ async fn run_subset_load_group(
                 shape_id: rec.id.clone(),
                 table: member.table.to_string(),
                 where_: member.where_.clone(),
+                feed_where: member.feed_where.clone(),
                 columns: member.columns.clone(),
                 subscription: sub.clone(),
-                is_subquery: member.feed_where().as_ref().is_some_and(crate::subquery::predicate_has_subquery),
+                is_subquery: rec.is_subquery,
             })
             .collect(),
         lsn: page.lsn.clone(),

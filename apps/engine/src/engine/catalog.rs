@@ -3588,6 +3588,7 @@ mod tests {
                 shape_id: id.into(),
                 table: "public.users".into(),
                 where_: None,
+                feed_where: None,
                 columns: None,
                 subscription: sub.into(),
                 is_subquery: false,

@@ -13,12 +13,26 @@ pub(crate) struct GroupMember {
     pub key: String,
     pub shape_id: String,
     pub table: String,
+    /// The member's snapshot predicate: what its page reads, at load and at every renewal.
     #[serde(rename = "where", default)]
     pub where_: Option<crate::predicate::PredicateJson>,
+    /// The predicate its changes-only feed was filed with, when the load named one apart from
+    /// `where`. `None` means the feed takes `where`, which is also how a record written before
+    /// members could split their predicates reads back.
+    #[serde(rename = "feedWhere", default, skip_serializing_if = "Option::is_none")]
+    pub feed_where: Option<crate::predicate::PredicateJson>,
     #[serde(default)]
     pub columns: Option<Vec<String>>,
     pub subscription: String,
+    /// Whether the member's shape, filed with its feed predicate, is a subquery shape.
     pub is_subquery: bool,
+}
+
+impl GroupMember {
+    /// The predicate the member's feed shape was filed with.
+    pub(crate) fn feed(&self) -> Option<&crate::predicate::PredicateJson> {
+        self.feed_where.as_ref().or(self.where_.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
