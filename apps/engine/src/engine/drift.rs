@@ -502,7 +502,7 @@ impl Engine {
         // Every trigger funnels through here exactly once, so this is the whole `schema_drift_total`
         // count: tables whose dependents were retired, whatever noticed.
         self.metrics.schema_drift.fetch_add(1, Ordering::Relaxed);
-        let ids: Vec<String> = {
+        let (ids, groups): (Vec<String>, Vec<(String, String)>) = {
             let mut st = self.state.lock().await;
             let ids = st
                 .shapes
@@ -512,10 +512,19 @@ impl Engine {
                 })
                 .map(|rec| rec.id.clone())
                 .collect();
+            // A group member's page can read a table its feed shape does not (`feedWhere`), so no
+            // shape above depends on it. The group reads it all the same: release the group, as a
+            // member's retirement would, so its readers reload a page read after the change.
+            let groups = st
+                .group_claims
+                .records_iter()
+                .filter(|group| group.members.iter().any(|member| member.page_reads(table)))
+                .map(|group| (group.subscription.clone(), group.id.clone()))
+                .collect();
             *st.schema_gen.entry(table.clone()).or_insert(0) += 1;
-            ids
+            (ids, groups)
         };
-        if ids.is_empty() {
+        if ids.is_empty() && groups.is_empty() {
             tracing::info!("{why} on {table}: no dependent shapes to retire");
             return ids;
         }
@@ -523,6 +532,13 @@ impl Engine {
         for id in &ids {
             if let Err(e) = self.purge_shape(id).await {
                 tracing::error!("{why} on {table}: retiring shape {id} failed: {e:#}");
+            }
+        }
+        // A group a member purge above already released is gone, and its release is a no-op here.
+        for (subscription, group_id) in groups {
+            tracing::warn!("{why} on {table}: releasing group {group_id}, whose page reads it");
+            if let Err(e) = self.release_group_claim(&subscription, &group_id).await {
+                tracing::error!("{why} on {table}: releasing group {group_id} failed: {e:#}");
             }
         }
         ids

@@ -940,6 +940,29 @@ fn schema_moved_while_down(rec: &ShapeRecord, compiled: &HashMap<TableRef, Table
     }
 }
 
+/// What changed while the engine was down in a table `member`'s page reads through a subquery, if
+/// anything. No shape depends on such a table when the member's feed does not read it, so the
+/// schemas the group kept at creation are the only witness. A table the page reads that the group
+/// kept no schema for cannot be vouched for, and counts as changed.
+fn page_schema_moved_while_down(
+    member: &crate::engine::group::GroupMember,
+    compiled: &HashMap<TableRef, TableSchema>,
+) -> Option<String> {
+    for table in referenced_tables(member.where_.as_ref()?) {
+        let Some(ts) = compiled.get(&table) else {
+            return Some(format!("{table} is no longer tracked"));
+        };
+        // Library mode keeps no fingerprint, and checks no drift.
+        let Some(now) = ts.fingerprint.as_ref() else { continue };
+        match member.page_schemas.get(&table.to_string()) {
+            Some(then) if then.still_serves(now) => {}
+            Some(then) => return Some(format!("{table}: {}", crate::schema::describe_drift(then, now).join("; "))),
+            None => return Some(format!("{table}: the group kept no schema for it")),
+        }
+    }
+    None
+}
+
 /// The timestamp literal in `rec`'s predicate that the engine cannot read, if it has one (see
 /// [`crate::pg_temporal::UnreadableLiteral`]). A subquery record is not judged here: it cannot be
 /// compiled without the registry, and the restore drops it for its own reasons.
@@ -1769,10 +1792,20 @@ impl Engine {
                 self.group_lanes.note_restored_highwater(lsn);
             }
             for (subscription, group) in groups {
-                let restorable = group
-                    .members
-                    .iter()
-                    .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
+                let page_moved = group.members.iter().find_map(|member| page_schema_moved_while_down(member, compiled));
+                if let Some(what) = &page_moved {
+                    tracing::warn!(
+                        %subscription,
+                        "restore: dropping group {} — a table its page reads changed while the engine was down \
+                         ({what}); its readers reload",
+                        group.id
+                    );
+                }
+                let restorable = page_moved.is_none()
+                    && group
+                        .members
+                        .iter()
+                        .all(|member| st.shapes.get(&member.shape_id).is_some_and(|rec| !rec.is_subquery));
                 let lease_live = self.retention.subscription_lease_timeout.is_zero()
                     || group.members.iter().all(|member| {
                         st.feed_shares
@@ -3589,6 +3622,7 @@ mod tests {
                 table: "public.users".into(),
                 where_: None,
                 feed_where: None,
+                page_schemas: Default::default(),
                 columns: None,
                 subscription: sub.into(),
                 is_subquery: false,

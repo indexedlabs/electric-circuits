@@ -1304,6 +1304,20 @@ async fn run_subset_load_group(
     group_tables.sort();
     group_tables.dedup();
     let group_gens = engine.capture_schema_gens(&group_tables).await;
+    // The schema of each table a member's page reads through a subquery, kept on the group's record:
+    // no shape depends on a table only the page reads, so a restart that finds one changed can tell
+    // only from this (`page_schema_moved_while_down`). Read after the generations, so a change in
+    // between fails the completion check below rather than being recorded as current.
+    let mut page_schemas = Vec::with_capacity(members.len());
+    for member in &members {
+        let mut schemas = std::collections::BTreeMap::new();
+        for table in member.where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default() {
+            if let Some(fingerprint) = engine.table_schema(&table).await.and_then(|schema| schema.fingerprint) {
+                schemas.insert(table.to_string(), fingerprint);
+            }
+        }
+        page_schemas.push(schemas);
+    }
     let _control = engine.admit_control()?;
     let group_sub = engine.resolve_subscription(subscription).await;
     // Each pass either answers, or waits for a release of the group it read to finish and then
@@ -1474,12 +1488,14 @@ async fn run_subset_load_group(
         members: members
             .iter()
             .zip(created.iter())
-            .map(|(member, (rec, sub))| GroupMember {
+            .zip(page_schemas)
+            .map(|((member, (rec, sub)), page_schemas)| GroupMember {
                 key: member.key(),
                 shape_id: rec.id.clone(),
                 table: member.table.to_string(),
                 where_: member.where_.clone(),
                 feed_where: member.feed_where.clone(),
+                page_schemas,
                 columns: member.columns.clone(),
                 subscription: sub.clone(),
                 is_subquery: rec.is_subquery,

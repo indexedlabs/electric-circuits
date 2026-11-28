@@ -5,7 +5,7 @@
 //! a claim is reserved atomically before any member is created, and a group keeps one
 //! durable member list so releasing the public claim can release every private member.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -21,6 +21,11 @@ pub(crate) struct GroupMember {
     /// members could split their predicates reads back.
     #[serde(rename = "feedWhere", default, skip_serializing_if = "Option::is_none")]
     pub feed_where: Option<crate::predicate::PredicateJson>,
+    /// The schema of each other table `where` reads, keyed by table, as it was when the group was
+    /// created. No shape depends on a table only the page reads, so a restart that finds one of
+    /// them changed has only this to go on: it drops the group rather than restore it.
+    #[serde(rename = "pageSchemas", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub page_schemas: BTreeMap<String, crate::schema::SchemaFingerprint>,
     #[serde(default)]
     pub columns: Option<Vec<String>>,
     pub subscription: String,
@@ -32,6 +37,21 @@ impl GroupMember {
     /// The predicate the member's feed shape was filed with.
     pub(crate) fn feed(&self) -> Option<&crate::predicate::PredicateJson> {
         self.feed_where.as_ref().or(self.where_.as_ref())
+    }
+
+    /// Every table either predicate looks into, besides the member's own.
+    pub(crate) fn referenced_tables(&self) -> Vec<crate::table_ref::TableRef> {
+        let mut tables: Vec<_> =
+            self.where_.iter().chain(self.feed_where.iter()).flat_map(crate::subquery::referenced_tables).collect();
+        tables.sort();
+        tables.dedup();
+        tables
+    }
+
+    /// Whether the member's page reads `table` through another table, which its feed shape may
+    /// not: a group reads every table its pages read.
+    pub(crate) fn page_reads(&self, table: &crate::table_ref::TableRef) -> bool {
+        self.where_.as_ref().is_some_and(|where_| crate::subquery::referenced_tables(where_).contains(table))
     }
 }
 

@@ -3283,9 +3283,7 @@ impl Engine {
             if let Ok(table) = TableRef::parse(&member.table) {
                 tables.push(table);
             }
-            if let Some(where_) = &member.where_ {
-                tables.extend(referenced_tables(where_));
-            }
+            tables.extend(member.referenced_tables());
         }
         tables.sort();
         tables.dedup();
